@@ -190,17 +190,6 @@ fn supported_carrier_model(path: &str) -> bool {
     )
 }
 
-/// Files served opportunistically: staged when the fighter ships them, but never required
-/// for Ready. The LOD descriptor is the case in point — without the fighter's own mapping
-/// the carrier builds the model under the wrong LOD assignment and high/low weapon meshes
-/// draw together, yet a carrier graph that never reads it must not stall the whole preview.
-fn is_opportunistic_carrier_file(carrier_path: &str) -> bool {
-    carrier_path
-        .rsplit_once('/')
-        .map(|(_, file)| file == "lod.xmb")
-        .unwrap_or(false)
-}
-
 fn supported_carrier_motion(path: &str) -> bool {
     let Some(file) = path.strip_prefix(ASSET_CARRIER_MOTION_ROOT) else {
         return false;
@@ -413,7 +402,7 @@ pub fn stage(bundle: AssetBundle) -> Result<(), String> {
             .or_else(reject)?;
         // Every other file belongs to the constructor's boot-installed load graph and
         // gates Ready; opportunistic files are served when read but never stall it.
-        let gated = !is_opportunistic_carrier_file(&carrier_path);
+        let gated = !super::asset_path::is_opportunistic_carrier_file(&carrier_path);
         let hash = smash::hash40(&carrier_path);
         if next.contains_key(&hash) {
             return reject(format!("duplicate or colliding game path: {}", item.path));
@@ -529,6 +518,17 @@ fn register_snapshot_files(snapshot: &Snapshot) -> Result<(), String> {
     }
     for (&hash, file) in &snapshot.files {
         if super::resource_reload::hash_to_index_for_path_hash(hash).is_none() {
+            // Opportunistic files ride along only when the carrier graph references them.
+            // Skipping one must not fail the snapshot it travels with: Alucard's native
+            // tables carry no lod.xmb entry, and rejecting the whole preview over it is
+            // worse than loading without it.
+            if super::asset_path::is_opportunistic_carrier_file(&file.carrier_path) {
+                super::effect_reload::mark(&format!(
+                    "asset_bundle skipped_unresolved {} gen={}",
+                    file.carrier_path, snapshot.generation
+                ));
+                continue;
+            }
             return Err(format!(
                 "Live asset support is not loaded ({}). Start Visionary once, enable Visionary Live Assets in ARCropolis, then restart the game.",
                 file.carrier_path,
@@ -542,6 +542,12 @@ fn register_snapshot_files(snapshot: &Snapshot) -> Result<(), String> {
             .files
             .iter()
             .filter_map(|(&hash, file)| {
+                // Files skipped above as unresolvable never get a callback reservation.
+                if super::asset_path::is_opportunistic_carrier_file(&file.carrier_path)
+                    && super::resource_reload::hash_to_index_for_path_hash(hash).is_none()
+                {
+                    return None;
+                }
                 if let Some(path) = registered_paths.get(&hash) {
                     if path != &file.carrier_path {
                         return Some(Err(format!(

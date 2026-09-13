@@ -67,6 +67,17 @@ fn motion_file_allowed(file: &str) -> bool {
         || file.ends_with(".nuanmb")
 }
 
+/// Files staged opportunistically: served when the carrier graph references them, but never
+/// allowed to fail the whole snapshot when it does not. `lod.xmb` is the case in point —
+/// Alucard's native tables carry no such entry, so requiring it would reject every snapshot
+/// that stages it instead of loading the preview without it.
+pub fn is_opportunistic_carrier_file(carrier_path: &str) -> bool {
+    carrier_path
+        .rsplit_once('/')
+        .map(|(_, file)| file == "lod.xmb")
+        .unwrap_or(false)
+}
+
 /// Validate one canonical game path and return the resource family it belongs to.
 ///
 /// Only existing fighter costume resources are accepted. In particular, this excludes effects,
@@ -174,8 +185,23 @@ mod tests {
     }
 
     #[test]
-    fn payload_location_is_exact_and_deterministic() {
-        let game = "fighter/mario/motion/body/c00/swing.prc";
+    fn only_the_lod_descriptor_is_opportunistic() {
+        assert!(is_opportunistic_carrier_file(
+            "assist/alucard/model/body/c00/lod.xmb"
+        ));
+        for path in [
+            "assist/alucard/model/body/c00/model.numdlb",
+            "assist/alucard/model/body/c00/model.xmb",
+            "assist/alucard/motion/body/c00/swing.prc",
+            "assist/alucard/model/body/c00/visionary_tex_0001.nutexb",
+            "",
+        ] {
+            assert!(!is_opportunistic_carrier_file(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn payload_location_is_exact_and_deterministic() {        let game = "fighter/mario/motion/body/c00/swing.prc";
         assert!(validate_payload_path(
             7,
             game,
