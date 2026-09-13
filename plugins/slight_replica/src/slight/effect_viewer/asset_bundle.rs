@@ -186,7 +186,19 @@ fn supported_carrier_model(path: &str) -> bool {
             | "model.nuhlpb"
             | "model.numshexb"
             | "model.nusrcmdlb"
+            | "lod.xmb"
     )
+}
+
+/// Files served opportunistically: staged when the fighter ships them, but never required
+/// for Ready. The LOD descriptor is the case in point — without the fighter's own mapping
+/// the carrier builds the model under the wrong LOD assignment and high/low weapon meshes
+/// draw together, yet a carrier graph that never reads it must not stall the whole preview.
+fn is_opportunistic_carrier_file(carrier_path: &str) -> bool {
+    carrier_path
+        .rsplit_once('/')
+        .map(|(_, file)| file == "lod.xmb")
+        .unwrap_or(false)
 }
 
 fn supported_carrier_motion(path: &str) -> bool {
@@ -320,6 +332,12 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
         let inserted = SERVED.lock().insert((entry.generation, hash));
         if inserted {
             STATUS_DIRTY.store(true, Ordering::Release);
+            // First-serve proof per file: opportunistic entries (lod.xmb) never appear in the
+            // staged/served counters, so this line is the only record they were read at all.
+            super::effect_reload::mark(&format!(
+                "asset_bundle served {} gen={}",
+                entry.carrier_path, entry.generation
+            ));
         }
     }
     true
@@ -393,8 +411,9 @@ pub fn stage(bundle: AssetBundle) -> Result<(), String> {
         let carrier_path = carrier_path(&item.path)
             .map_err(|why| format!("{}: {why}", item.path))
             .or_else(reject)?;
-        // Every file belongs to the constructor's boot-installed load graph.
-        let gated = true;
+        // Every other file belongs to the constructor's boot-installed load graph and
+        // gates Ready; opportunistic files are served when read but never stall it.
+        let gated = !is_opportunistic_carrier_file(&carrier_path);
         let hash = smash::hash40(&carrier_path);
         if next.contains_key(&hash) {
             return reject(format!("duplicate or colliding game path: {}", item.path));

@@ -32,8 +32,8 @@ fn plugin_allowlist_accepts_complete_fighter_asset_families() {
             AssetFamily::Motion,
         ),
         (
-            "fighter/pickel/motion/body/c07/motion_list.bin",
-            AssetFamily::Motion,
+            "fighter/pickel/model/body/c07/lod.xmb",
+            AssetFamily::Model,
         ),
         (
             "fighter/pickel/motion/body/c07/swing.prc",
