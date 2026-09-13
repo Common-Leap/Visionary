@@ -536,7 +536,10 @@ unsafe fn bind_visibility_groups(visibility: usize, model: *const Shared, masks:
         std::mem::transmute(method(visibility, 0x130));
     bind(visibility, model);
     let names = mesh_visibility((*model).0.object);
-    let state = super::fighter_visibility::remap_masks(masks, names.iter().map(|&(name, _)| name));
+    let state = super::fighter_visibility::final_masks_after_motion_restore(
+        masks,
+        names.iter().map(|&(name, _)| name),
+    );
     let set: unsafe extern "C" fn(usize, i32, u8) = std::mem::transmute(method(visibility, 0x140));
     for (index, mask) in state.into_iter().enumerate() {
         set(visibility, index as i32, mask);
@@ -808,6 +811,19 @@ unsafe fn bind(
             );
         }
     }
+    // Restoring the motion re-evaluates visibility animation on the fresh instance and can
+    // reset its masks to animation defaults. Publish the captured live selection last so only
+    // the correct weapon variants show (Hero hand vs back sword/shield both visible otherwise).
+    // Native gameplay updates keep flowing afterwards through the rebound group maps.
+    bind_visibility_groups(
+        visibility,
+        (model_module + 0x10) as *const Shared,
+        &visibility_state,
+    );
+    for &(name, state) in &render_overrides {
+        set_mesh_render_override(*((model_module + 0x10) as *const usize), name, state);
+    }
+    rebuild_mesh_cache(model_module);
     PhysicsModule::reset_swing(host);
     for (slot, (names, targets, weight)) in ik_state.iter().enumerate() {
         let record = slots + slot * 0x40;
