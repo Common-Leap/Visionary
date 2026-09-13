@@ -414,10 +414,6 @@ pub const CARRIER_MAX_TOTAL_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Alucard's model resource graph. The carrier has no safe fallback for these files: a custom
 /// descriptor, mesh, or skeleton must be accompanied by the matching helper/visibility files.
-///
-/// `lod.xmb` is optional: without the fighter's own LOD configuration the carrier builds the
-/// model under the wrong LOD mapping and high/low weapon meshes draw together. Fighters
-/// without one anywhere keep the previous behavior instead of failing the whole snapshot.
 pub const CARRIER_MODEL_FILES: &[&str] = &[
     "model.xmb",
     "model.nusktb",
@@ -428,7 +424,6 @@ pub const CARRIER_MODEL_FILES: &[&str] = &[
     "model.nuhlpb",
     "model.numshexb",
     "model.nusrcmdlb",
-    "lod.xmb",
 ];
 
 /// Canonical body-model and body-motion directories for one project costume.
@@ -786,11 +781,6 @@ pub fn prepare_carrier_assets(
         {
             continue;
         }
-        // LOD configuration is optional: a fighter without one anywhere keeps the
-        // previous behavior instead of failing the whole snapshot.
-        if canonical == "lod.xmb" && !model_files.contains_key(canonical) {
-            continue;
-        }
         let source = source_for_model_file(&model_files, canonical)?;
         checked_asset_size(&source, canonical)?;
         selected_model.insert(canonical.to_string(), source);
@@ -1045,11 +1035,6 @@ pub fn prepare_carrier_assets(
         Ok(())
     };
     for &canonical in CARRIER_MODEL_FILES {
-        // Optional files absent from both sides were skipped during selection and must
-        // not reach the required-source lookup below.
-        if canonical == "lod.xmb" && !selected_model.contains_key(canonical) {
-            continue;
-        }
         let output = output_asset_path(output_dir, &fighter, slot, "model", canonical);
         let size = match canonical {
             "model.nuanmb" if !selected_model.contains_key(canonical) => write_prepared_ssbh(
@@ -2329,59 +2314,9 @@ mod tests {
     }
 
     #[test]
-    fn carrier_preparation_stages_lod_config_when_present_and_skips_it_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        write_carrier_fixture(&workspace);
-        // Absent everywhere: the snapshot keeps its previous shape instead of failing.
-        let without = prepare_carrier_assets(
-            &workspace,
-            "mario",
-            0,
-            None,
-            None,
-            None,
-            &dir.path().join("out_none"),
-        )
-        .unwrap();
-        assert_eq!(without.files.len(), 14);
-        assert!(
-            !without
-                .files
-                .iter()
-                .any(|file| file.game_path.ends_with("/lod.xmb"))
-        );
-        // Present in the model folder: staged verbatim under the model graph and accepted
-        // by the plugin allowlist, so the carrier can build the fighter's own LOD mapping.
-        std::fs::write(
-            workspace.join("romfs/fighter/mario/model/body/c00/lod.xmb"),
-            b"lod",
-        )
-        .unwrap();
-        let with = prepare_carrier_assets(
-            &workspace,
-            "mario",
-            0,
-            None,
-            None,
-            None,
-            &dir.path().join("out_lod"),
-        )
-        .unwrap();
-        assert_eq!(with.files.len(), 15);
-        let staged = with
-            .files
-            .iter()
-            .find(|file| file.game_path.ends_with("/lod.xmb"))
-            .unwrap();
-        assert_eq!(staged.game_path, "fighter/mario/model/body/c00/lod.xmb");
-        assert_eq!(std::fs::read(&staged.workspace_path).unwrap(), b"lod");
-        assert!(carrier_paths::validate_game_path("mario", &staged.game_path).is_ok());
-    }
-
-    #[test]
     #[ignore = "requires a local asset workspace and vanilla dump"]
-    fn carrier_local_asset_smoke() {        let workspace = PathBuf::from(std::env::var_os("VISIONARY_ASSET_WORKSPACE").unwrap());
+    fn carrier_local_asset_smoke() {
+        let workspace = PathBuf::from(std::env::var_os("VISIONARY_ASSET_WORKSPACE").unwrap());
         let vanilla = PathBuf::from(std::env::var_os("VISIONARY_ASSET_VANILLA").unwrap());
         let output = PathBuf::from(std::env::var_os("VISIONARY_ASSET_OUTPUT").unwrap());
         let fighter = std::env::var("VISIONARY_ASSET_FIGHTER").unwrap();

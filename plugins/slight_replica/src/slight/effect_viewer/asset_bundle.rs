@@ -186,7 +186,6 @@ fn supported_carrier_model(path: &str) -> bool {
             | "model.nuhlpb"
             | "model.numshexb"
             | "model.nusrcmdlb"
-            | "lod.xmb"
     )
 }
 
@@ -321,12 +320,6 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
         let inserted = SERVED.lock().insert((entry.generation, hash));
         if inserted {
             STATUS_DIRTY.store(true, Ordering::Release);
-            // First-serve proof per file: opportunistic entries (lod.xmb) never appear in the
-            // staged/served counters, so this line is the only record they were read at all.
-            super::effect_reload::mark(&format!(
-                "asset_bundle served {} gen={}",
-                entry.carrier_path, entry.generation
-            ));
         }
     }
     true
@@ -400,9 +393,8 @@ pub fn stage(bundle: AssetBundle) -> Result<(), String> {
         let carrier_path = carrier_path(&item.path)
             .map_err(|why| format!("{}: {why}", item.path))
             .or_else(reject)?;
-        // Every other file belongs to the constructor's boot-installed load graph and
-        // gates Ready; opportunistic files are served when read but never stall it.
-        let gated = !super::asset_path::is_opportunistic_carrier_file(&carrier_path);
+        // Every file belongs to the constructor's boot-installed load graph.
+        let gated = true;
         let hash = smash::hash40(&carrier_path);
         if next.contains_key(&hash) {
             return reject(format!("duplicate or colliding game path: {}", item.path));
@@ -518,17 +510,6 @@ fn register_snapshot_files(snapshot: &Snapshot) -> Result<(), String> {
     }
     for (&hash, file) in &snapshot.files {
         if super::resource_reload::hash_to_index_for_path_hash(hash).is_none() {
-            // Opportunistic files ride along only when the carrier graph references them.
-            // Skipping one must not fail the snapshot it travels with: Alucard's native
-            // tables carry no lod.xmb entry, and rejecting the whole preview over it is
-            // worse than loading without it.
-            if super::asset_path::is_opportunistic_carrier_file(&file.carrier_path) {
-                super::effect_reload::mark(&format!(
-                    "asset_bundle skipped_unresolved {} gen={}",
-                    file.carrier_path, snapshot.generation
-                ));
-                continue;
-            }
             return Err(format!(
                 "Live asset support is not loaded ({}). Start Visionary once, enable Visionary Live Assets in ARCropolis, then restart the game.",
                 file.carrier_path,
@@ -542,12 +523,6 @@ fn register_snapshot_files(snapshot: &Snapshot) -> Result<(), String> {
             .files
             .iter()
             .filter_map(|(&hash, file)| {
-                // Files skipped above as unresolvable never get a callback reservation.
-                if super::asset_path::is_opportunistic_carrier_file(&file.carrier_path)
-                    && super::resource_reload::hash_to_index_for_path_hash(hash).is_none()
-                {
-                    return None;
-                }
                 if let Some(path) = registered_paths.get(&hash) {
                     if path != &file.carrier_path {
                         return Some(Err(format!(

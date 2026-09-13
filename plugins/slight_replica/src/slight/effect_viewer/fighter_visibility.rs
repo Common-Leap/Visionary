@@ -40,21 +40,6 @@ pub fn remap_masks(old: &[(u64, u8)], names: impl IntoIterator<Item = u64>) -> V
         .collect()
 }
 
-/// Final masks to publish after the motion restore.
-///
-/// `change_motion` re-evaluates visibility animation and can reset a fresh
-/// instance's masks to animation defaults. Publishing the captured live
-/// selection last keeps only the correct weapon variants visible (e.g. Hero
-/// hand vs back sword/shield) while leaving genuinely new custom meshes
-/// animation-controlled. Gameplay selection updates keep flowing afterwards
-/// through the rebound group maps; this is a one-time publish, not a freeze.
-pub fn final_masks_after_motion_restore(
-    captured: &[(u64, u8)],
-    names: impl IntoIterator<Item = u64>,
-) -> Vec<u8> {
-    remap_masks(captured, names)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,22 +79,5 @@ mod tests {
         live[2] = 1;
         let current: Vec<_> = preview_names.into_iter().zip(live).collect();
         assert_eq!(remap_masks(&current, [10, 20, 30]), [1, 0, 2]);
-    }
-    #[test]
-    fn motion_restore_keeps_captured_weapon_selection_instead_of_showing_all() {
-        // Hero at capture: hand sword/shield selected, back variants hidden.
-        let captured = [(10, 1), (20, 1), (30, 0), (40, 0)];
-        // A fresh render instance resets to animation defaults; publishing the
-        // captured selection last must win so both hand and back do not show.
-        assert_eq!(
-            final_masks_after_motion_restore(&captured, [10, 20, 30, 40]),
-            [1, 1, 0, 0]
-        );
-        // Genuinely new custom meshes stay animation-controlled instead of
-        // inheriting a neighbouring weapon's forced state.
-        assert_eq!(
-            final_masks_after_motion_restore(&captured, [30, 40, 50, 10]),
-            [0, 0, 2, 1]
-        );
     }
 }
