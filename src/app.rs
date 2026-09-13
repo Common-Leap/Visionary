@@ -16862,6 +16862,7 @@ impl VisionaryApp {
             files: staged,
             vanilla_motion_used,
             omitted_swing,
+            stripped_lod_meshes,
         } = files;
         let file_count = staged.len();
         let mut wire_files = Vec::with_capacity(file_count);
@@ -16904,6 +16905,13 @@ impl VisionaryApp {
                 }
                 if omitted_swing {
                     notes.push("no swing.prc on this fighter".to_owned());
+                }
+                if stripped_lod_meshes > 0 {
+                    notes.push(format!(
+                        "{} far-range mesh{} omitted from the preview only",
+                        stripped_lod_meshes,
+                        if stripped_lod_meshes == 1 { "" } else { "es" }
+                    ));
                 }
                 if notes.is_empty() {
                     String::new()

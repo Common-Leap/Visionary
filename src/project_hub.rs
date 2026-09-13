@@ -722,11 +722,30 @@ fn rename_carrier_texture(path: &Path, name: &str) -> anyhow::Result<()> {
 /// listed in `vanilla_motion_used` was filled in from the vanilla dump because the workspace
 /// motion folder did not provide it; `omitted_swing` means neither side had a `swing.prc`
 /// (several fighters, Mario included, ship none) and the carrier proceeds without one.
+/// `stripped_lod_meshes` counts far-range meshes omitted from the snapshot (see
+/// [`is_low_lod_mesh`]); the workspace overlay and exports keep them.
 #[derive(Debug, Clone)]
 pub struct CarrierBundle {
     pub files: Vec<WorkspaceAssetFile>,
     pub vanilla_motion_used: Vec<String>,
     pub omitted_swing: bool,
+    pub stripped_lod_meshes: usize,
+}
+
+/// Far-range LOD variant in Smash mesh naming: `<base>_lowShape` is the decimated twin of a
+/// visibility-controlled base mesh. These twins carry no visibility tracks of their own and
+/// rely on LOD selection, which a carrier-baked preview cannot reproduce faithfully — so a
+/// preview built from them draws both ranges at once (hand and back weapons together).
+fn is_low_lod_mesh(name: &str) -> bool {
+    name.ends_with("_lowShape")
+}
+
+/// Omit far-range meshes from carrier descriptors. Returns how many descriptor entries were
+/// removed. Whole names are filtered, so surviving entries keep their subindices.
+fn strip_low_lod_entries(entries: &mut Vec<ssbh_data::modl_data::ModlEntryData>) -> usize {
+    let before = entries.len();
+    entries.retain(|entry| !is_low_lod_mesh(&entry.mesh_object_name));
+    before - entries.len()
 }
 
 /// Prepare one immutable generation for the Alucard asset carrier.
@@ -1019,6 +1038,38 @@ pub fn prepare_carrier_assets(
         }
     }
 
+    // Far-range meshes bypass the visibility groups the preview transfers and rely on LOD
+    // selection, which a carrier-baked instance cannot reproduce: it draws both ranges, so
+    // hand and back weapons appear together. Omit them from the snapshot only (the overlay
+    // and exports keep them). Files that fail to parse keep today's verbatim behavior along
+    // with their descriptors, so an unfamiliar mesh blob can never half-strip a snapshot.
+    let mut stripped_lod_meshes = 0usize;
+    let mut rewritten_numshb = None;
+    let mut rewritten_numshexb = None;
+    if let (Some(numshb_source), Some(numshexb_source)) = (
+        selected_model.get("model.numshb"),
+        selected_model.get("model.numshexb"),
+    ) {
+        if let (Ok(mut mesh), Ok(mut meshex)) = (
+            ssbh_data::mesh_data::MeshData::from_file(numshb_source),
+            ssbh_data::meshex_data::MeshExData::from_file(numshexb_source),
+        ) {
+            let objects_before = mesh.objects.len();
+            mesh.objects
+                .retain(|object| !is_low_lod_mesh(&object.name));
+            stripped_lod_meshes = objects_before - mesh.objects.len();
+            meshex
+                .mesh_object_groups
+                .retain(|group| !is_low_lod_mesh(&group.mesh_object_full_name));
+            if stripped_lod_meshes > 0 {
+                strip_low_lod_entries(&mut modl.entries);
+                strip_low_lod_entries(&mut command_modl.entries);
+                rewritten_numshb = Some(mesh);
+                rewritten_numshexb = Some(meshex);
+            }
+        }
+    }
+
     let mut outputs = Vec::with_capacity(CARRIER_MODEL_FILES.len() + texture_outputs.len() + 3);
     let mut total_size = 0u64;
     let mut add_output = |output: WorkspaceAssetFile, size: u64| -> anyhow::Result<()> {
@@ -1057,6 +1108,18 @@ pub fn prepare_carrier_assets(
                 &command_modl,
                 &output.workspace_path,
                 "prepared model.nusrcmdlb",
+            )?,
+            "model.numshb" if rewritten_numshb.is_some() => write_prepared_ssbh(
+                rewritten_numshb.as_ref().expect("stripped mesh was staged"),
+                &output.workspace_path,
+                "prepared model.numshb",
+            )?,
+            "model.numshexb" if rewritten_numshexb.is_some() => write_prepared_ssbh(
+                rewritten_numshexb
+                    .as_ref()
+                    .expect("stripped mesh extra was staged"),
+                &output.workspace_path,
+                "prepared model.numshexb",
             )?,
             _ => write_prepared_file(
                 selected_model
@@ -1119,6 +1182,7 @@ pub fn prepare_carrier_assets(
         files: outputs,
         vanilla_motion_used,
         omitted_swing,
+        stripped_lod_meshes,
     })
 }
 
@@ -2310,6 +2374,138 @@ mod tests {
         assert!(
             !animation.exists(),
             "preparation must not modify the imported model"
+        );
+    }
+
+    #[test]
+    fn low_lod_meshes_are_detected_and_stripped_by_name() {
+        for name in ["blade_lowShape", "brave_sword_lowShape"] {
+            assert!(is_low_lod_mesh(name), "{name}");
+        }
+        for name in [
+            "mesh",
+            "brave_sword_VIS_O_OBJShape",
+            "lowShape",
+            "blade_lowshape",
+            "blade_lowShapeX",
+            "Body",
+        ] {
+            assert!(!is_low_lod_mesh(name), "{name}");
+        }
+        use ssbh_data::modl_data::ModlEntryData;
+        let mut entries = ["mesh", "blade_lowShape", "mesh", "shield_lowShape"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mesh_object_name)| ModlEntryData {
+                mesh_object_name: mesh_object_name.into(),
+                mesh_object_subindex: (index % 2) as u64,
+                material_label: "body_mat".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(strip_low_lod_entries(&mut entries), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.mesh_object_name.as_str())
+                .collect::<Vec<_>>(),
+            ["mesh", "mesh"]
+        );
+    }
+
+    #[test]
+    fn carrier_preparation_omits_low_lod_meshes_from_the_snapshot_only() {
+        use ssbh_data::meshex_data::MeshExData;
+        use ssbh_data::mesh_data::{MeshData, MeshObjectData};
+        use ssbh_data::modl_data::{ModlData, ModlEntryData};
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        write_carrier_fixture(&workspace);
+        let model = workspace.join("romfs/fighter/mario/model/body/c00");
+        // Descriptors, mesh objects, and mesh-extra groups each gain a far-range twin.
+        for file in ["model.numdlb", "model.nusrcmdlb"] {
+            let mut descriptor = ModlData::from_file(model.join(file)).unwrap();
+            descriptor.entries.push(ModlEntryData {
+                mesh_object_name: "blade_lowShape".into(),
+                mesh_object_subindex: 0,
+                material_label: "body_mat".into(),
+            });
+            descriptor.write_to_file(model.join(file)).unwrap();
+        }
+        let object = |name: &str| MeshObjectData {
+            name: name.into(),
+            subindex: 0,
+            parent_bone_name: String::new(),
+            sort_bias: 0,
+            disable_depth_write: false,
+            disable_depth_test: false,
+            vertex_indices: Vec::new(),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            binormals: Vec::new(),
+            tangents: Vec::new(),
+            texture_coordinates: Vec::new(),
+            color_sets: Vec::new(),
+            bone_influences: Vec::new(),
+        };
+        let mesh = MeshData {
+            major_version: 1,
+            minor_version: 8,
+            objects: vec![object("mesh"), object("blade_lowShape")],
+        };
+        mesh.write_to_file(model.join("model.numshb")).unwrap();
+        MeshExData::from_mesh_objects(&mesh.objects)
+            .write_to_file(model.join("model.numshexb"))
+            .unwrap();
+
+        let bundle = prepare_carrier_assets(
+            &workspace,
+            "mario",
+            0,
+            Some("edited.nuanmb"),
+            None,
+            None,
+            &dir.path().join("output"),
+        )
+        .unwrap();
+        assert_eq!(bundle.stripped_lod_meshes, 1);
+        assert_eq!(bundle.files.len(), 14);
+        // The workspace sources keep their far-range twins; only the snapshot drops them.
+        assert!(
+            ModlData::from_file(model.join("model.numdlb"))
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.mesh_object_name == "blade_lowShape")
+        );
+        let staged = dir.path().join("output/fighter/mario/model/body/c00");
+        assert!(
+            ModlData::from_file(staged.join("model.numdlb"))
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name))
+        );
+        assert!(
+            ModlData::from_file(staged.join("model.nusrcmdlb"))
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name))
+        );
+        assert!(
+            MeshData::from_file(staged.join("model.numshb"))
+                .unwrap()
+                .objects
+                .iter()
+                .all(|object| !is_low_lod_mesh(&object.name))
+        );
+        assert!(
+            MeshExData::from_file(staged.join("model.numshexb"))
+                .unwrap()
+                .mesh_object_groups
+                .iter()
+                .all(|group| !is_low_lod_mesh(&group.mesh_object_full_name))
         );
     }
 
