@@ -841,7 +841,21 @@ macro_rules! stop_kind_hook {
 }
 
 stop_kind_hook!(hook_end_kind, EffectModule::end_kind, "end_kind");
-stop_kind_hook!(hook_detach_kind, EffectModule::detach_kind, "detach_kind");
+
+// `EffectModule::detach_kind` is deliberately NOT hooked, for the same reason as
+// `kill_kind` below.
+//
+// Bisection on a real shield freeze (Training, Hero jab -> shield, full plugin):
+// `off=effect` clean, `off=reqs` still froze, `off=kills` clean, `off=endkind`
+// still froze, `off=detachkind` clean, and full plugin with `libone_slot_eff.nro`
+// moved out clean. So the `detach_kind` replace hook wedges the game exactly when
+// One Slot Effects is present — the third instance of this patch-vs-inline-hook
+// conflict after `kill_kind` (match load) and `sv_animcmd::EFFECT_DETACH_KIND`
+// (Ganon fsmash). `end_kind` stays hooked: it was present in the clean
+// `detachkind`-off run, so it does not conflict.
+//
+// The cost matches `kill_kind`: no alias/carrier correction on direct `detach_kind`
+// calls; the tracker still drops those entries a frame later via `reconcile`.
 
 // `EffectModule::kill_kind` is deliberately NOT hooked.
 //
@@ -855,8 +869,8 @@ stop_kind_hook!(hook_detach_kind, EffectModule::detach_kind, "detach_kind");
 // Established by bisection on a real failing moveset, one boot at a time: the hook freezes the
 // load with its body reduced to a bare `original!()`, and it freezes whether this plugin loads
 // before or after One Slot Effects, so it is the patch itself and not the code or the ordering.
-// Every other EffectModule hook, including `end_kind` and `detach_kind`, was verified installed
-// and harmless in the same session.
+// `end_kind` was verified installed and harmless alongside One Slot Effects; `detach_kind`
+// was not — see above — so the earlier blanket claim is narrowed to what was measured.
 //
 // The cost is small and was already known here: ACMD's `EFFECT_OFF_KIND` stops effects through
 // `end_kind` / `detach_kind`, not through this, which is why aliasing only `kill_kind` once
@@ -974,7 +988,8 @@ fn install_effect_module_hooks() {
     install!(hook_req_time_follow, "reqtimefollow", "reqs");
     install!(hook_kill, "kill", "kills");
     install!(hook_end_kind, "endkind", "kills");
-    install!(hook_detach_kind, "detachkind", "kills");
+    // No `detachkind` line: `detach_kind` is not hooked at all (see above). An old
+    // `off.txt` naming it is silently ignored.
     install!(hook_kill_all, "killall", "kills");
     install!(hook_remove, "remove", "kills");
     install!(hook_remove_common, "removecommon", "kills");

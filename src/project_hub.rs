@@ -1055,8 +1055,7 @@ pub fn prepare_carrier_assets(
             ssbh_data::meshex_data::MeshExData::from_file(numshexb_source),
         ) {
             let objects_before = mesh.objects.len();
-            mesh.objects
-                .retain(|object| !is_low_lod_mesh(&object.name));
+            mesh.objects.retain(|object| !is_low_lod_mesh(&object.name));
             stripped_lod_meshes = objects_before - mesh.objects.len();
             meshex
                 .mesh_object_groups
@@ -2414,8 +2413,8 @@ mod tests {
 
     #[test]
     fn carrier_preparation_omits_low_lod_meshes_from_the_snapshot_only() {
-        use ssbh_data::meshex_data::MeshExData;
         use ssbh_data::mesh_data::{MeshData, MeshObjectData};
+        use ssbh_data::meshex_data::MeshExData;
         use ssbh_data::modl_data::{ModlData, ModlEntryData};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2471,42 +2470,32 @@ mod tests {
         assert_eq!(bundle.stripped_lod_meshes, 1);
         assert_eq!(bundle.files.len(), 14);
         // The workspace sources keep their far-range twins; only the snapshot drops them.
-        assert!(
-            ModlData::from_file(model.join("model.numdlb"))
-                .unwrap()
-                .entries
-                .iter()
-                .any(|entry| entry.mesh_object_name == "blade_lowShape")
-        );
+        assert!(ModlData::from_file(model.join("model.numdlb"))
+            .unwrap()
+            .entries
+            .iter()
+            .any(|entry| entry.mesh_object_name == "blade_lowShape"));
         let staged = dir.path().join("output/fighter/mario/model/body/c00");
-        assert!(
-            ModlData::from_file(staged.join("model.numdlb"))
-                .unwrap()
-                .entries
-                .iter()
-                .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name))
-        );
-        assert!(
-            ModlData::from_file(staged.join("model.nusrcmdlb"))
-                .unwrap()
-                .entries
-                .iter()
-                .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name))
-        );
-        assert!(
-            MeshData::from_file(staged.join("model.numshb"))
-                .unwrap()
-                .objects
-                .iter()
-                .all(|object| !is_low_lod_mesh(&object.name))
-        );
-        assert!(
-            MeshExData::from_file(staged.join("model.numshexb"))
-                .unwrap()
-                .mesh_object_groups
-                .iter()
-                .all(|group| !is_low_lod_mesh(&group.mesh_object_full_name))
-        );
+        assert!(ModlData::from_file(staged.join("model.numdlb"))
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name)));
+        assert!(ModlData::from_file(staged.join("model.nusrcmdlb"))
+            .unwrap()
+            .entries
+            .iter()
+            .all(|entry| !is_low_lod_mesh(&entry.mesh_object_name)));
+        assert!(MeshData::from_file(staged.join("model.numshb"))
+            .unwrap()
+            .objects
+            .iter()
+            .all(|object| !is_low_lod_mesh(&object.name)));
+        assert!(MeshExData::from_file(staged.join("model.numshexb"))
+            .unwrap()
+            .mesh_object_groups
+            .iter()
+            .all(|group| !is_low_lod_mesh(&group.mesh_object_full_name)));
     }
 
     #[test]
