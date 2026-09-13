@@ -2615,6 +2615,15 @@ pub struct VisionaryApp {
     credits: crate::credits::CreditsWindow,
     show_edit_log: bool,
     show_workspace: bool,
+    /// Costume slot targeted by Project Files model/motion imports. Session-only: the imported
+    /// files themselves live canonically in the project workspace and are rediscovered on open.
+    workspace_asset_slot: u8,
+    workspace_asset_sent_slot: Option<u8>,
+    workspace_asset_cache_root: Option<PathBuf>,
+    workspace_asset_reclaimed: u64,
+    /// Fresh generation for disk-staged model/motion carrier snapshots. Timestamp-seeded on send
+    /// so reconnecting or restarting the editor cannot move the plugin backwards.
+    workspace_asset_generation: u64,
     export_dir: Option<PathBuf>,
     /// Extra roots holding modded content — added-character mods and slot-add packs. Each
     /// has the same `fighter/<name>/…` + `effect/fighter/<name>/…` layout as the data root.
@@ -2998,6 +3007,11 @@ impl VisionaryApp {
             credits: crate::credits::CreditsWindow::default(),
             show_edit_log: false,
             show_workspace: false,
+            workspace_asset_slot: 0,
+            workspace_asset_sent_slot: None,
+            workspace_asset_cache_root: None,
+            workspace_asset_reclaimed: 0,
+            workspace_asset_generation: 0,
             export_dir: saved_export_dir,
             extra_roots: resolved_mod_roots,
             roster,
@@ -3636,6 +3650,7 @@ impl VisionaryApp {
         self.current_anim_path = None;
 
         let fighter = &self.state.fighters[idx];
+        self.workspace_asset_slot = fighter.base_slot();
         let model_dir = fighter.model_dir.clone();
         let motion_dir = fighter.motion_dir.clone();
         self.current_default_eyelid_path = find_default_eyelid_nuanmb(&motion_dir);
@@ -16140,7 +16155,15 @@ impl VisionaryApp {
 
     fn export_project(&mut self) {
         let project = self.build_project();
-        if project.is_empty() {
+        // A project may intentionally contain only the binary `romfs/` overlay (for example a
+        // model/animation iteration with no ACMD or EFF edits). Keep that useful project
+        // exportable instead of treating the serialized edit model as the whole project.
+        let has_workspace_overlay = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(crate::project_hub::workspace_romfs_has_files);
+        if project.is_empty() && !has_workspace_overlay {
             self.state.status = "No edits to export yet.".into();
             return;
         }
@@ -16168,11 +16191,37 @@ impl VisionaryApp {
             .map(crate::mod_export::slugify)
             .unwrap_or_else(|| "project".into());
         let asset_dir = format!("{stem}_assets");
+        let previous_project = self.project_path.clone();
         match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
             Ok(()) => {
+                let overlay_report = previous_project
+                    .as_deref()
+                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
                 // Export adopts the path: the next Save writes here silently.
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Project exported to {}", path.display());
+                match overlay_report {
+                    Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
+                        self.state.status.push_str(&format!(
+                            " — copied {copied} workspace overlay file{}{}",
+                            if copied == 1 { "" } else { "s" },
+                            if skipped.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "; skipped {} generated conflict{}",
+                                    skipped.len(),
+                                    if skipped.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ));
+                    }
+                    Some(Err(error)) => self
+                        .state
+                        .status
+                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
+                    _ => {}
+                }
             }
             Err(e) => self.state.status = format!("Project export failed: {e}"),
         }
@@ -16287,10 +16336,36 @@ impl VisionaryApp {
             .map(crate::mod_export::slugify)
             .unwrap_or_else(|| "project".into());
         let asset_dir = format!("{stem}_assets");
+        let previous_project = self.project_path.clone();
         match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
             Ok(()) => {
+                let overlay_report = previous_project
+                    .as_deref()
+                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Saved {}", path.display());
+                match overlay_report {
+                    Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
+                        self.state.status.push_str(&format!(
+                            " — copied {copied} workspace overlay file{}{}",
+                            if copied == 1 { "" } else { "s" },
+                            if skipped.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "; kept {} destination conflict{}",
+                                    skipped.len(),
+                                    if skipped.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ));
+                    }
+                    Some(Err(error)) => self
+                        .state
+                        .status
+                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
+                    _ => {}
+                }
             }
             Err(e) => self.state.status = format!("Save failed: {e}"),
         }
@@ -16692,19 +16767,218 @@ impl VisionaryApp {
         }
     }
 
+    fn next_workspace_asset_generation(&mut self) -> u64 {
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(1);
+        let generation = clock
+            .max(self.workspace_asset_generation.saturating_add(1))
+            .max(
+                self.game_link
+                    .asset_bundle_status()
+                    .generation
+                    .saturating_add(1),
+            )
+            .max(1);
+        self.workspace_asset_generation = generation;
+        generation
+    }
+
+    /// Stage the selected workspace model/motion files on the emulator SD and publish one full
+    /// carrier snapshot. The plugin reports callback reads separately; queuing this snapshot is
+    /// not presented as proof that a parsed game resource has already changed.
+    fn send_workspace_asset_bundle(
+        &mut self,
+        workspace: &std::path::Path,
+        fighter: &str,
+        slot: u8,
+    ) {
+        self.game_link.ensure_started();
+        if self.game_link.status() != crate::game_link::LinkStatus::Connected {
+            self.state.status = "Connect to the game before reloading the asset preview.".into();
+            return;
+        }
+        let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
+            self.state.status = "Emulator SD card not found. Set it in Visionary before sending model or animation files."
+                .into();
+            return;
+        };
+        if let Err(error) = crate::carrier_support::install(&sd) {
+            self.state.status = format!("Could not install live asset support: {error:#}");
+            return;
+        }
+        let generation = self.next_workspace_asset_generation();
+        let cache_root = sd.join("effect_viewer").join("live_assets").join("files");
+        let live_root = match crate::asset_snapshots::reserve(&cache_root, generation) {
+            Ok(path) => path,
+            Err(error) => {
+                self.state.status = format!("Could not stage preview snapshot: {error:#}");
+                return;
+            }
+        };
+        let fighter_entry = self
+            .state
+            .fighters
+            .iter()
+            .find(|entry| entry.name == fighter);
+        let slot_component = format!("c{slot:02}");
+        let vanilla_motion = fighter_entry.map(|entry| {
+            entry
+                .fighter_dir
+                .join("motion")
+                .join("body")
+                .join(&slot_component)
+        });
+        let vanilla_model = fighter_entry.map(|entry| {
+            entry
+                .fighter_dir
+                .join("model")
+                .join("body")
+                .join(&slot_component)
+        });
+        let files = match crate::project_hub::prepare_carrier_assets(
+            workspace,
+            fighter,
+            slot,
+            None,
+            vanilla_motion.as_deref(),
+            vanilla_model.as_deref(),
+            &live_root,
+        ) {
+            Ok(bundle) if !bundle.files.is_empty() => bundle,
+            Ok(_) => {
+                let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                self.state.status = format!("No preview assets are staged for c{slot:02}.");
+                return;
+            }
+            Err(error) => {
+                let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                self.state.status = format!("Could not prepare carrier preview: {error:#}");
+                return;
+            }
+        };
+        let crate::project_hub::CarrierBundle {
+            files: staged,
+            vanilla_motion_used,
+            omitted_swing,
+        } = files;
+        let file_count = staged.len();
+        let mut wire_files = Vec::with_capacity(file_count);
+        for asset in staged {
+            let size = match std::fs::metadata(&asset.workspace_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                    self.state.status = format!(
+                        "Could not stage {}: {error:#}",
+                        asset.workspace_path.display()
+                    );
+                    return;
+                }
+            };
+            wire_files.push(crate::game_link::AssetBundleFileWire {
+                path: asset.game_path.clone(),
+                file: format!(
+                    "effect_viewer/live_assets/files/{generation}/{}",
+                    asset.game_path
+                ),
+                size,
+            });
+        }
+        self.workspace_asset_sent_slot = Some(slot);
+        self.workspace_asset_cache_root = Some(cache_root);
+        self.game_link
+            .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                generation,
+                target: fighter.to_ascii_lowercase(),
+                files: wire_files,
+            });
+        self.state.status = format!(
+            "Queued {} preview file(s) for {fighter} c{slot:02}{}; waiting for the asset carrier to reload.",
+            file_count,
+            {
+                let mut notes = Vec::new();
+                if !vanilla_motion_used.is_empty() {
+                    notes.push(format!("vanilla {}", vanilla_motion_used.join(", ")));
+                }
+                if omitted_swing {
+                    notes.push("no swing.prc on this fighter".to_owned());
+                }
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", notes.join("; "))
+                }
+            }
+        );
+    }
+
     /// Project Files: one folder holds every edit. Supported edits live in
-    /// `modproject.json` / `assets/`; anything the tool does not model
-    /// (models, animations, …) lives in the manual `romfs/` overlay and ships
-    /// verbatim on export.
+    /// `modproject.json` / `assets/`; binary assets live in the `romfs/` overlay, can be sent to
+    /// the carrier for iteration, and ship verbatim on export.
     fn draw_workspace_panel(&mut self, ctx: &egui::Context) {
+        let status = self.game_link.asset_bundle_status();
+        if status.generation > self.workspace_asset_reclaimed
+            && status.generation == status.serving_generation
+            && (status.ready || (status.phase == "idle" && status.staged == 0))
+        {
+            if let Some(root) = &self.workspace_asset_cache_root {
+                match crate::asset_snapshots::retire_before(root, status.generation) {
+                    Ok(()) => self.workspace_asset_reclaimed = status.generation,
+                    Err(error) => {
+                        eprintln!("Could not reclaim retired asset snapshots: {error:#}");
+                        // Avoid retrying a failing filesystem operation on every UI frame.
+                        self.workspace_asset_reclaimed = status.generation;
+                    }
+                }
+            }
+        }
         if !self.show_workspace {
             return;
         }
+        if let Some(error) = self.game_link.take_asset_bundle_error() {
+            let mut message = format!("Asset carrier: {error}");
+            if error.contains("reserved slot") {
+                message.push_str(
+                    " — the carrier was dropped (death, Training reset, or touching items clears it). Press Reload asset preview again and keep the host idle.",
+                );
+            }
+            self.state.status = message;
+        }
+        enum WorkspaceAction {
+            ImportModelFolder,
+            ImportModelFiles,
+            ImportAnimations,
+            ImportSwing,
+            Send,
+            Stop,
+            Reveal,
+        }
+
         let mut open = self.show_workspace;
         let workspace = self
             .project_path
             .as_ref()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.display_name.clone(),
+                    entry.slots.clone(),
+                    entry.base_slot(),
+                )
+            });
+        if let Some((_, _, slots, base_slot)) = &fighter {
+            if !slots.contains(&self.workspace_asset_slot) {
+                self.workspace_asset_slot = *base_slot;
+            }
+        }
+        let mut action = None;
         egui::Window::new("Project Files")
             .open(&mut open)
             .resizable(true)
@@ -16731,7 +17005,149 @@ impl VisionaryApp {
                         );
                     }
                 }
+
                 ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Model & animation iteration (experimental)").strong());
+                    if let Some((_, display, slots, _)) = &fighter {
+                        ui.label(display);
+                        egui::ComboBox::from_id_salt("workspace_asset_slot")
+                            .selected_text(format!("c{:02}", self.workspace_asset_slot))
+                            .width(58.0)
+                            .show_ui(ui, |ui| {
+                                for slot in slots {
+                                    ui.selectable_value(
+                                        &mut self.workspace_asset_slot,
+                                        *slot,
+                                        format!("c{slot:02}"),
+                                    );
+                                }
+                            });
+                    }
+                });
+                match (&workspace, &fighter) {
+                    (Some(workspace), Some((fighter, _, _, _))) => {
+                        let inventory = crate::project_hub::workspace_asset_inventory(
+                            workspace,
+                            fighter,
+                            self.workspace_asset_slot,
+                        )
+                        .unwrap_or_default();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} model file{} · {} animation{} · swing.prc {}",
+                                inventory.model_files.len(),
+                                if inventory.model_files.len() == 1 { "" } else { "s" },
+                                inventory.animations.len(),
+                                if inventory.animations.len() == 1 { "" } else { "s" },
+                                if inventory.swing_prc { "ready" } else { "not added" },
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                        let asset_status = self.game_link.asset_bundle_status();
+                        if asset_status.target == fighter.to_ascii_lowercase()
+                            && asset_status.generation == self.workspace_asset_generation
+                            && self.workspace_asset_sent_slot == Some(self.workspace_asset_slot)
+                        {
+                            let message = format!("Asset carrier: {} · {}/{} files loaded",
+                                if asset_status.ready { "preview ready" }
+                                else if asset_status.phase == "ready" { "awaiting carrier confirmation" }
+                                else { &asset_status.phase },
+                                asset_status.served, asset_status.staged);
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(125, 190, 235)),
+                            );
+                        }
+                        ui.label(egui::RichText::new("Loads resources onto the main fighter. The temporary loader retires; Stop preview restores the original assets.").small());
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Model folder…").on_hover_text(
+                                "Copy a complete model folder into this project's selected fighter/costume",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportModelFolder);
+                            }
+                            if ui.button("Model files…").on_hover_text(
+                                "Copy selected model, material, skeleton, helper, or texture files",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportModelFiles);
+                            }
+                            if ui.button("Animations…").on_hover_text(
+                                "Copy one or more .nuanmb files into the selected motion folder",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportAnimations);
+                            }
+                            if ui.button("swing.prc…").on_hover_text(
+                                "Copy a .prc file into the selected motion folder as swing.prc",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportSwing);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    inventory.total_files() > 0,
+                                    egui::Button::new("Reload asset preview"),
+                                )
+                                .on_hover_text(
+                                    "Load model, animation, and swing resources onto the main fighter through a temporary hidden carrier. Keep the ordinary item slot empty while loading.",
+                                )
+                                .clicked()
+                            {
+                                action = Some(WorkspaceAction::Send);
+                            }
+                            if ui.button("Open slot folder").clicked() {
+                                action = Some(WorkspaceAction::Reveal);
+                            }
+                            if ui.button("Stop preview").clicked() {
+                                action = Some(WorkspaceAction::Stop);
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Edit the imported copies under romfs/, then reload to preview changes in a separate carrier. Original filenames are preserved for mod export; the preview remaps resources into carrier slots.",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                        egui::CollapsingHeader::new("How to preview a model edit")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for step in [
+                                    "1. Start Visionary before the game. Enable Visionary Live Assets in ARCropolis and restart the game after the first installation; later edits reload within the match.",
+                                    "2. Import the model, texture, animation, or swing files you changed. Missing files use the selected costume's vanilla model and motion folders, including motion_list.bin.",
+                                    "3. Connect in Training Mode and press Reload asset preview with the fighter's ordinary item slot empty. The preview follows the fighter's current animation and frame; the item slot is released after construction.",
+                                    "4. Edit the imported copies, then reload again. Stop preview restores the original model. Do not spawn a normal Alucard assist during a preview.",
+                                    "The preview changes appearance and swing physics; the fighter's gameplay collision and attacks remain unchanged. Export Mod Folder retains the original asset filenames.",
+                                ] {
+                                    ui.label(egui::RichText::new(step).small());
+                                }
+                            });
+                    }
+                    (None, _) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Open or create a project before importing iteration files.",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
+                    (_, None) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Select a fighter to choose its model and motion paths.",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(380.0)
                     .show(ui, |ui| {
@@ -16781,6 +17197,107 @@ impl VisionaryApp {
                 });
             });
         self.show_workspace = open;
+
+        let (Some(action), Some(workspace), Some((fighter, _, _, _))) =
+            (action, workspace, fighter)
+        else {
+            return;
+        };
+        let slot = self.workspace_asset_slot;
+        let result: anyhow::Result<Vec<std::path::PathBuf>> = match action {
+            WorkspaceAction::ImportModelFolder => {
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose model folder")
+                    .pick_folder()
+                else {
+                    return;
+                };
+                crate::project_hub::import_model_folder(&workspace, &fighter, slot, &source)
+            }
+            WorkspaceAction::ImportModelFiles => {
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose model files")
+                    .add_filter(
+                        "Smash model files",
+                        crate::project_hub::MODEL_ASSET_EXTENSIONS,
+                    )
+                    .pick_files()
+                else {
+                    return;
+                };
+                crate::project_hub::import_model_files(&workspace, &fighter, slot, &sources)
+            }
+            WorkspaceAction::ImportAnimations => {
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose animations")
+                    .add_filter("Smash animation", &["nuanmb"])
+                    .pick_files()
+                else {
+                    return;
+                };
+                crate::project_hub::import_animation_files(&workspace, &fighter, slot, &sources)
+            }
+            WorkspaceAction::ImportSwing => {
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose swing.prc")
+                    .add_filter("Swing parameters", &["prc"])
+                    .pick_file()
+                else {
+                    return;
+                };
+                crate::project_hub::import_swing_prc(&workspace, &fighter, slot, &source)
+                    .map(|path| vec![path])
+            }
+            WorkspaceAction::Send => {
+                self.send_workspace_asset_bundle(&workspace, &fighter, slot);
+                return;
+            }
+            WorkspaceAction::Stop => {
+                let generation = self.next_workspace_asset_generation();
+                self.game_link
+                    .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                        generation,
+                        target: String::new(),
+                        files: Vec::new(),
+                    });
+                self.state.status = "Asset preview stop queued.".into();
+                return;
+            }
+            WorkspaceAction::Reveal => {
+                let (model, _) = match crate::project_hub::workspace_fighter_slot_dirs(
+                    &workspace, &fighter, slot,
+                ) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        self.state.status = format!("Could not open slot folder: {error:#}");
+                        return;
+                    }
+                };
+                let slot_root = model
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .and_then(std::path::Path::parent)
+                    .unwrap_or(&model);
+                match crate::roster::reveal::reveal(slot_root) {
+                    Ok(()) => self.state.status = format!("Opened {}", slot_root.display()),
+                    Err(error) => {
+                        self.state.status =
+                            format!("Could not open {}: {error:#}", slot_root.display())
+                    }
+                }
+                return;
+            }
+        };
+        match result {
+            Ok(files) => {
+                self.state.status = format!(
+                    "Imported {} file{} for {fighter} c{slot:02}; ready to send or export.",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                );
+            }
+            Err(error) => self.state.status = format!("Asset import failed: {error:#}"),
+        }
     }
 
     /// Export one directly installable ARCropolis mod folder. The generated Skyline plugin
@@ -16797,7 +17314,14 @@ impl VisionaryApp {
 
     fn export_mod(&mut self, developer: bool) {
         let project = self.build_project();
-        if project.is_empty() {
+        // The manual workspace overlay is a first-class export even when there are no serialized
+        // ACMD/EFF edits. This is the common model/animation iteration case.
+        let has_workspace_overlay = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(crate::project_hub::workspace_romfs_has_files);
+        if project.is_empty() && !has_workspace_overlay {
             self.state.status = "No edits to export yet.".into();
             return;
         }
@@ -16863,6 +17387,15 @@ impl VisionaryApp {
             built_source_root,
             has_source,
         } = outcome;
+
+        // `run_export` has no generated source to create the destination for an overlay-only
+        // project. Create it after verification succeeds, preserving the all-or-nothing refusal
+        // behavior documented by `run_export`.
+        if has_workspace_overlay {
+            if let Err(error) = std::fs::create_dir_all(&dest) {
+                errors.push(format!("workspace overlay destination: {error}"));
+            }
+        }
 
         // Roster files ride along in the same folder as their own section in the
         // export tree. They are written after `run_export` succeeds so a refused
@@ -16977,6 +17510,20 @@ impl VisionaryApp {
                     }
                     Err(e) => errors.push(format!("workspace overlay failed: {e:#}")),
                 }
+            }
+        }
+
+        // A binary-overlay-only export has neither generated EFF nor ACMD source, so
+        // `run_export` correctly has no generated-data reason to write this descriptor. It is
+        // still an ARCropolis mod folder and needs a descriptor to be discoverable.
+        if !developer && has_workspace_overlay && !dest.join("info.toml").is_file() {
+            let display_name = serde_json::to_string(&self.project_name)
+                .unwrap_or_else(|_| "\"Visionary mod\"".into());
+            let info = format!(
+                "display_name = {display_name}\nauthors = \"Visionary\"\nversion = \"1.0.0\"\ndescription = \"Model, animation, and other binary assets exported by Visionary\"\ncategory = \"Misc\"\n"
+            );
+            if let Err(error) = std::fs::write(dest.join("info.toml"), info) {
+                errors.push(format!("workspace overlay info.toml: {error}"));
             }
         }
 
@@ -17640,6 +18187,16 @@ impl VisionaryApp {
         self.game_link.send_effect_control_rules(&[]);
         self.game_link.send_hitbox_rules(&[]);
         self.game_link.send_effect_aliases(&[]);
+        // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
+        // on project replacement too, otherwise a later genuine fighter load could read files
+        // staged for the project that was just closed.
+        let asset_generation = self.next_workspace_asset_generation();
+        self.game_link
+            .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                generation: asset_generation,
+                target: String::new(),
+                files: Vec::new(),
+            });
         // Tear the live CARRIER down too. Authored colour edits are cloned into it (the
         // fighter's own eff cannot be reloaded mid-match), so without this they survive a
         // "clear all" and keep rendering — the carrier's donor bytes stay resident in the
@@ -30668,6 +31225,9 @@ impl eframe::App for VisionaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_t = self.perf.start();
         let ctx = ui.ctx().clone();
+        // Background workers and game reports must be polled even without pointer or keyboard
+        // events. This deadline also keeps an unfocused window's progress/status current.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
         // Keep the game link alive whenever the app runs — live offsets, hitbox rules,
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
@@ -34550,6 +35110,12 @@ fn run_export(
         .as_ref()
         .map(|generated| generated.warnings.clone())
         .unwrap_or_default();
+
+    // A project with only a manual workspace overlay has no generated EFF/source directory to
+    // create `dest` for. Verification has completed above, so creating it here still leaves a
+    // refused export untouched while allowing the shared README/overlay path below to work.
+    std::fs::create_dir_all(dest)
+        .map_err(|error| format!("creating export destination {}: {error}", dest.display()))?;
 
     let mut report: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();

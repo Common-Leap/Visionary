@@ -237,6 +237,28 @@ pub struct DonorBytesWire {
     pub file: String,
 }
 
+/// One immutable SD-backed model, animation, or swing file for the preview carrier.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssetBundleFileWire {
+    /// Lowercase ARC path, e.g. `fighter/mario/model/body/c00/model.numdlb`.
+    pub path: String,
+    /// SD-relative payload path. The plugin requires this to mirror `path` under
+    /// `effect_viewer/live_assets/files/<generation>/`.
+    pub file: String,
+    /// Exact payload length. A mismatch rejects the whole snapshot and preserves the previous one.
+    pub size: u64,
+}
+
+/// Full replacement snapshot activated by retiring and recreating the asset carrier.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssetBundleWire {
+    /// Nonzero and monotonically increasing across sends. UNIX milliseconds are suitable.
+    pub generation: u64,
+    /// Lowercase internal fighter name. Every file path must belong to this fighter.
+    pub target: String,
+    pub files: Vec<AssetBundleFileWire>,
+}
+
 // ── Live ACMD capture + hitbox rules (wire forms match slight_replica hitbox_viewer) ──
 
 /// One typed lua argument (plugin `LuaArg`): losslessly round-trips capture → edit → inject.
@@ -1047,6 +1069,23 @@ pub enum LinkStatus {
     Connected,
 }
 
+/// Plugin acknowledgement for the hidden asset-carrier lifecycle.
+///
+/// `served` counts current-generation files genuinely read through Arcropolis. `ready` is only
+/// true after the game-thread carrier owner is live and every file in that generation has served;
+/// a queued or retiring snapshot is never presented as active.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AssetBundleStatus {
+    pub target: String,
+    pub generation: u64,
+    pub staged: usize,
+    pub served: usize,
+    pub serving_generation: u64,
+    pub phase: String,
+    pub ready: bool,
+    pub reports: u64,
+}
+
 /// Sparse pins-only form the plugin reports alongside merged values (newer plugins) —
 /// mirrors slight_replica kinds::Pinned. `Some` fields are active user overrides in-game.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1119,6 +1158,16 @@ struct Shared {
     /// it into a status line and stops waiting — a rejected push never advances `carrier_gen`,
     /// so without this the editor waits for a carrier that is never coming.
     carrier_error: Option<String>,
+    /// Asset-carrier progress. These files are never installed by resident-buffer mutation.
+    asset_bundle_target: String,
+    asset_bundle_generation: u64,
+    asset_bundle_staged: usize,
+    asset_bundle_served: usize,
+    asset_bundle_serving_generation: u64,
+    asset_bundle_phase: String,
+    asset_bundle_ready: bool,
+    asset_bundle_seq: u64,
+    asset_bundle_error: Option<String>,
     /// (fighter kind, motion hash) → number of completed playbacks the plugin reported.
     /// A bump means "every line that motion produces has now been streamed".
     capture_ends: BTreeMap<(i32, u64), u64>,
@@ -1179,6 +1228,15 @@ impl Default for Shared {
             carrier_seq: 0,
             carrier_gen: 0,
             carrier_error: None,
+            asset_bundle_target: String::new(),
+            asset_bundle_generation: 0,
+            asset_bundle_staged: 0,
+            asset_bundle_served: 0,
+            asset_bundle_serving_generation: 0,
+            asset_bundle_phase: String::new(),
+            asset_bundle_ready: false,
+            asset_bundle_seq: 0,
+            asset_bundle_error: None,
             capture_ends: BTreeMap::new(),
             capture_completed_runs: BTreeSet::new(),
             ignored_capture_kinds: BTreeSet::new(),
@@ -1372,6 +1430,26 @@ impl GameLink {
         if let Ok(mut s) = self.shared.lock() {
             s.outbox.push(frame);
             s.edits_tx += 1;
+        }
+    }
+
+    /// Queue a complete SD-backed asset snapshot for the plugin's carrier reload lifecycle.
+    /// Activation is acknowledged separately after the owner is recreated and files are loaded.
+    pub fn send_asset_bundle(&self, bundle: &AssetBundleWire) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let mut asset_bundle = serde_json::json!(bundle);
+        asset_bundle["fighter_binding_version"] = serde_json::json!(1);
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "asset_bundle": asset_bundle
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.outbox.push(frame);
+            shared.edits_tx += 1;
         }
     }
 
@@ -1578,6 +1656,31 @@ impl GameLink {
             .lock()
             .ok()
             .and_then(|mut s| s.carrier_error.take())
+    }
+
+    /// Latest hidden asset-carrier progress reported by the plugin.
+    pub fn asset_bundle_status(&self) -> AssetBundleStatus {
+        self.shared
+            .lock()
+            .map(|shared| AssetBundleStatus {
+                target: shared.asset_bundle_target.clone(),
+                generation: shared.asset_bundle_generation,
+                staged: shared.asset_bundle_staged,
+                served: shared.asset_bundle_served,
+                serving_generation: shared.asset_bundle_serving_generation,
+                phase: shared.asset_bundle_phase.clone(),
+                ready: shared.asset_bundle_ready,
+                reports: shared.asset_bundle_seq,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Take the reason the plugin rejected the last asset snapshot, preserving prior staging.
+    pub fn take_asset_bundle_error(&self) -> Option<String> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.asset_bundle_error.take())
     }
 
     pub fn captures_seq(&self) -> u64 {
@@ -1943,6 +2046,85 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 .get("CarrierError")
                 .and_then(|c| c.get("reason"))
                 .and_then(|r| r.as_str())
+                .map(str::to_owned);
+        }
+        "AssetBundleStatus" => {
+            let Some(status) = body.get("AssetBundleStatus") else {
+                return;
+            };
+            // Only accept the carrier lifecycle produced by the current plugin. A stale plugin
+            // that still reports the old next-owner-load contract must not turn file service into
+            // a false hot-reload success.
+            if status.get("activation").and_then(|value| value.as_str()) != Some("carrier_recreate")
+            {
+                return;
+            }
+            let Some(target) = status.get("target").and_then(|value| value.as_str()) else {
+                return;
+            };
+            let Some(generation) = status.get("generation").and_then(|value| value.as_u64()) else {
+                return;
+            };
+            let Some(staged_wire) = status.get("staged").and_then(|value| value.as_u64()) else {
+                return;
+            };
+            let Some(served_wire) = status.get("served").and_then(|value| value.as_u64()) else {
+                return;
+            };
+            let (Ok(staged), Ok(served)) =
+                (usize::try_from(staged_wire), usize::try_from(served_wire))
+            else {
+                return;
+            };
+            let serving_generation = status
+                .get("serving_generation")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(generation);
+            let phase = status
+                .get("phase")
+                .and_then(|value| value.as_str())
+                .unwrap_or("staged");
+            let ready = status
+                .get("ready")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            // A callback can only serve an entry from the staged snapshot. Reject malformed or
+            // stale acknowledgements so an old plugin/status packet cannot make the UI regress.
+            if served > staged
+                || generation < s.asset_bundle_generation
+                || serving_generation > generation
+                || !matches!(
+                    phase,
+                    "idle" | "staged" | "retiring" | "loading" | "ready" | "failed"
+                )
+                || ready
+                    && (phase != "ready" || served != staged || serving_generation != generation)
+            {
+                return;
+            }
+            if target.len() > 64
+                || !target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+                || (generation == 0 && (!target.is_empty() || staged != 0 || served != 0))
+                || (generation != 0 && target.is_empty() && (staged != 0 || served != 0))
+            {
+                return;
+            }
+            s.asset_bundle_target = target.to_owned();
+            s.asset_bundle_generation = generation;
+            s.asset_bundle_staged = staged;
+            s.asset_bundle_served = served;
+            s.asset_bundle_serving_generation = serving_generation;
+            s.asset_bundle_phase = phase.to_owned();
+            s.asset_bundle_ready = ready;
+            s.asset_bundle_seq += 1;
+        }
+        "AssetBundleError" => {
+            s.asset_bundle_error = body
+                .get("AssetBundleError")
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str())
                 .map(str::to_owned);
         }
         "Remove" => {
@@ -5149,6 +5331,16 @@ mod tests {
     #[test]
     fn project_batches_hold_every_live_family_until_the_replacement_is_ready() {
         let link = GameLink::default();
+        let asset_bundle = AssetBundleWire {
+            generation: 1,
+            target: "mario".into(),
+            files: vec![AssetBundleFileWire {
+                path: "fighter/mario/motion/body/c00/wait1.nuanmb".into(),
+                file: "effect_viewer/live_assets/files/fighter/mario/motion/body/c00/wait1.nuanmb"
+                    .into(),
+                size: 123,
+            }],
+        };
         link.begin_project_batch();
         link.send_spawn_rules(&[]);
         link.send_effect_control_rules(&[]);
@@ -5156,6 +5348,7 @@ mod tests {
         link.send_effect_aliases(&[]);
         link.send_donor_effs(&[]);
         link.send_donor_bytes(&[]);
+        link.send_asset_bundle(&asset_bundle);
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
@@ -5173,6 +5366,7 @@ mod tests {
         link.send_effect_aliases(&[]);
         link.send_donor_effs(&[]);
         link.send_donor_bytes(&[]);
+        link.send_asset_bundle(&asset_bundle);
         link.send_effect_names(&["example".into()]);
         link.send_reset_pins();
         link.send_live_eff_reload();
@@ -5180,8 +5374,175 @@ mod tests {
         link.send_modifier_edit(0x1234, &RpmEffectData::default(), false);
         assert_eq!(
             link.shared.lock().unwrap().outbox.len(),
-            11,
+            12,
             "the finished import can publish one message per protocol family"
         );
+    }
+
+    #[test]
+    fn asset_bundle_wire_and_carrier_status_round_trip() {
+        let link = GameLink::default();
+        let bundle = AssetBundleWire {
+            generation: 1_725_000_000_123,
+            target: "mario".into(),
+            files: vec![AssetBundleFileWire {
+                path: "fighter/mario/motion/body/c00/swing.prc".into(),
+                file: "effect_viewer/live_assets/files/1725000000123/fighter/mario/motion/body/c00/swing.prc"
+                    .into(),
+                size: 4096,
+            }],
+        };
+        link.send_asset_bundle(&bundle);
+        let shared = link.shared.lock().unwrap();
+        assert_eq!(shared.outbox.len(), 1);
+        let frame = &shared.outbox[0];
+        let payload = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(value["asset_bundle"]["generation"], bundle.generation);
+        assert_eq!(value["asset_bundle"]["target"], "mario");
+        assert_eq!(value["asset_bundle"]["fighter_binding_version"], 1);
+        assert_eq!(value["asset_bundle"]["files"][0]["size"], 4096);
+        drop(shared);
+
+        let status_frame = plugin_frame(
+            "AssetBundleStatus",
+            &serde_json::json!({
+                "AssetBundleStatus": {
+                    "target": "mario",
+                    "generation": bundle.generation,
+                    "staged": 3,
+                    "served": 2,
+                    "activation": "carrier_recreate",
+                    "serving_generation": bundle.generation,
+                    "phase": "loading",
+                    "ready": false
+                }
+            }),
+        );
+        let mut receive = status_frame;
+        for payload in extract_frames(&mut receive) {
+            handle_frame(&link.shared, &payload);
+        }
+        assert_eq!(
+            link.asset_bundle_status(),
+            AssetBundleStatus {
+                target: "mario".into(),
+                generation: bundle.generation,
+                staged: 3,
+                served: 2,
+                serving_generation: bundle.generation,
+                phase: "loading".into(),
+                ready: false,
+                reports: 1,
+            }
+        );
+
+        let error_frame = plugin_frame(
+            "AssetBundleError",
+            &serde_json::json!({
+                "AssetBundleError": { "reason": "payload missing" }
+            }),
+        );
+        let mut receive = error_frame;
+        for payload in extract_frames(&mut receive) {
+            handle_frame(&link.shared, &payload);
+        }
+        assert_eq!(
+            link.take_asset_bundle_error().as_deref(),
+            Some("payload missing")
+        );
+        assert!(link.take_asset_bundle_error().is_none());
+    }
+
+    #[test]
+    fn asset_bundle_status_ignores_stale_or_impossible_acknowledgements() {
+        let link = GameLink::default();
+        let accepted = |generation, target, staged, served| {
+            let mut receive = plugin_frame(
+                "AssetBundleStatus",
+                &serde_json::json!({
+                    "AssetBundleStatus": {
+                        "target": target,
+                        "generation": generation,
+                        "staged": staged,
+                        "served": served,
+                        "activation": "carrier_recreate"
+                    }
+                }),
+            );
+            for payload in extract_frames(&mut receive) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        accepted(7, "mario", 2, 1);
+        assert_eq!(link.asset_bundle_status().reports, 1);
+        for (generation, target, staged, served, activation) in [
+            (6, "mario", 2, 2, "carrier_recreate"),
+            (7, "mario", 1, 2, "carrier_recreate"),
+            (8, "Mario", 2, 2, "carrier_recreate"),
+            (8, "mario", 2, 2, "next_owner_load"),
+            (8, "mario", 2, 2, "resident_buffer"),
+        ] {
+            let mut receive = plugin_frame(
+                "AssetBundleStatus",
+                &serde_json::json!({
+                    "AssetBundleStatus": {
+                        "target": target,
+                        "generation": generation,
+                        "staged": staged,
+                        "served": served,
+                        "activation": activation
+                    }
+                }),
+            );
+            for payload in extract_frames(&mut receive) {
+                handle_frame(&link.shared, &payload);
+            }
+        }
+        assert_eq!(
+            link.asset_bundle_status(),
+            AssetBundleStatus {
+                target: "mario".into(),
+                generation: 7,
+                staged: 2,
+                served: 1,
+                serving_generation: 7,
+                phase: "staged".into(),
+                ready: false,
+                reports: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn asset_carrier_ready_requires_current_generation_and_clear_is_acknowledged() {
+        let link = GameLink::default();
+        let report = |generation, serving_generation, target, staged, phase, ready| {
+            let mut receive = plugin_frame(
+                "AssetBundleStatus",
+                &serde_json::json!({
+                    "AssetBundleStatus": {
+                        "target": target, "generation": generation,
+                        "serving_generation": serving_generation,
+                        "staged": staged, "served": staged,
+                        "activation": "carrier_recreate", "phase": phase, "ready": ready
+                    }
+                }),
+            );
+            for payload in extract_frames(&mut receive) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        report(9, 8, "mario", 2, "ready", true);
+        report(9, 9, "mario", 2, "unknown", false);
+        assert_eq!(link.asset_bundle_status().reports, 0);
+        report(9, 9, "mario", 2, "ready", true);
+        assert!(link.asset_bundle_status().ready);
+        report(10, 10, "", 0, "idle", false);
+        let cleared = link.asset_bundle_status();
+        assert_eq!(cleared.generation, 10);
+        assert!(cleared.target.is_empty());
+        assert!(!cleared.ready);
+        assert_eq!(cleared.reports, 2);
     }
 }

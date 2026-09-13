@@ -75,6 +75,10 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     handle_init(lua_state);
     if let Some(boma) = boma_from_lua(lua_state) {
         crate::slight::effect_viewer::effect_reload::pump_auto_carrier(boma);
+        // Model/motion iteration has its own Alucard owner and lifecycle gate. Keep this on the
+        // per-fighter game callback so ItemModule/resource operations never run on the TCP thread;
+        // the owner function internally selects the target fighter and validates recycled IDs.
+        crate::slight::effect_viewer::effect_reload::pump_asset_carrier(boma);
         crate::slight::effect_viewer::acmd_hooks::pump_carrier_follows(boma);
     }
     // Live hitbox injection still runs from the per-agent callback. Effect/control retiming is
@@ -171,6 +175,7 @@ fn run_one_frame() {
     crate::slight::effect_viewer::effect_reload::pump_donor_queue();
     crate::slight::effect_viewer::effect_reload::pump_coload_tick();
     crate::slight::effect_viewer::effect_reload::pump_carrier_status();
+    crate::slight::effect_viewer::asset_bundle::pump_status();
 
     let after_win = crate::slight::frame_context::is_after_win();
     if !after_win && !FIGHT_STARTED.swap(true, Ordering::Relaxed) {

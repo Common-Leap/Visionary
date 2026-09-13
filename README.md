@@ -772,6 +772,51 @@ transplant edits together:
 - **Export Developer Files** writes rebuilt effect files to `effect_mod/` and
   the buildable Rust ACMD project to `acmd_source/`.
 
+### Model, animation, and swing preview
+
+Open **Project Files**, select a fighter costume, and import a model folder,
+`.nuanmb` animations, or `swing.prc`. Imports are copied into the project's
+`romfs/fighter/<fighter>/` folders. Edit those copies in your external tools;
+the original import locations are not watched.
+
+Start Visionary once before starting the game. It installs **Visionary Live
+Assets** in the configured emulator SD directory; enable that support package
+in ARCropolis and restart the game after its first installation. Subsequent
+asset reloads work within the match.
+
+Click **Reload asset preview** while connected to the game. A temporary hidden
+Alucard carrier loads the edited resources into memory and then retires. The main
+fighter uses the loaded model, textures, animations, and swing resources through
+its own native modules. Its gameplay scripts continue running on the same fighter.
+**Stop preview** restores the original resources; reloading restores them before
+loading the next edited snapshot.
+
+Import only the files you changed: model components, textures, animations, or
+swing parameters. Missing files come from the selected costume's vanilla dump.
+The dump must include its complete model and motion folders, including
+`motion_list.bin`. Animation filenames must match the entries they replace in
+that list, just as in an exported mod. When supplying a new skeleton, retain the
+fighter's vanilla bones so its motion set remains compatible.
+
+Preview copies use a reusable pool of 512 textures and 2,048 animation resources;
+materials, embedded texture names, and motion references are remapped together.
+The project's original names and files remain intact for mod export. Reloading
+restores the fighter before loading the next immutable snapshot.
+Keep the ordinary item slot empty when starting a preview; the slot is released
+after loading and remains usable during the preview. Do not
+spawn a normal Alucard assist while previewing, since it shares the carrier's
+resource graph.
+
+The status distinguishes queued files, owner retirement, loading, and a ready
+preview. A successful file copy alone does not mean the game has reloaded its
+resources. This preview requires the matching Visionary plugin and the configured
+emulator SD directory. This preview is experimental; save your work before
+testing it in-game.
+
+Preview snapshots are immutable and old generations are reclaimed after the
+plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
+limit; stop the game before manually clearing that cache.
+
 ## Additional tools
 
 Reusable game-analysis utilities are available in `research/decomp/ssbu-re/`.

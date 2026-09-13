@@ -5,6 +5,7 @@
 //! PARSED emitter data, so to apply an edited/merged eff live we make the effect manager
 //! UNLOAD then LOAD the slot — forcing a real re-parse of the (arcrop-redirected) file.
 
+use super::asset_identity::{host_id, NO_HOST};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
@@ -1361,6 +1362,40 @@ static DONOR_BYTES_GEN: AtomicU64 = AtomicU64::new(0);
 /// GPU-ready; hand-repointing the resident buffer only rebuilds CPU-side entry registrations.
 static CARRIER_DISK_LOADED_GEN: AtomicU64 = AtomicU64::new(0);
 
+// ── Model/motion asset carrier ──────────────────────────────────────────────
+//
+// Alucard is kept as a second, hidden carrier for fighter model/motion files. Unlike a fighter
+// that is already in the match, the Alucard item owns a complete model/body/c00 and
+// motion/body/c00 graph, so its native item construction asks Arcropolis for the files the
+// editor staged. Its kind and id are deliberately separate from the effect carrier above: an
+// effect swap must never tear down an asset owner (or vice versa).
+// Asset construction uses an independent item, never the fighter's held-item slots.
+// Acquiring a held item invokes fighter-specific weapon/visibility behavior even if
+// the item is hidden immediately afterward.
+const ASSET_CARRIER_SWAP_MAX_WAIT: u64 = 1800;
+/// Exact ARC directory paths and their verified 13.0.4 DirInfo indices. Keep the hashes free of
+/// a leading/trailing slash: these are the native Alucard model/motion groups (13526/14439), not
+/// display paths or their parent directories.
+const ASSET_CARRIER_DIRECTORIES: [(&str, u32); 2] = [
+    ("assist/alucard/model/body/c00", 13526),
+    ("assist/alucard/motion/body/c00", 14439),
+];
+/// 0 = no owner, 1 = retiring/draining, 2 = waiting for resources, 3 = loading, 4 = live,
+/// 5 = clearing an empty snapshot, 6 = retiring the constructor before fighter binding.
+static ASSET_CARRIER_STATE: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_ID: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_HOST: AtomicU64 = AtomicU64::new(NO_HOST);
+static ASSET_CARRIER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_REQUEST: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_POLL: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_EFFECT_DRAIN: AtomicU64 = AtomicU64::new(0);
+static ASSET_CARRIER_RETIRING_ID: AtomicU64 = AtomicU64::new(0);
+/// Guards the one-shot native directory-release submission for the retiring owner. Repeating
+/// `queue_directory_release` after the first call can underflow a directory with a pending worker
+/// request, so state-2 polls must not submit it more than once.
+static ASSET_CARRIER_RELEASE_SUBMITTED: AtomicBool = AtomicBool::new(false);
+static ASSET_CARRIER_RELEASE_STALLED: AtomicBool = AtomicBool::new(false);
+
 /// Preserve the live carrier's kind names before an editor snapshot replaces the current
 /// mapping. A remove followed immediately by an add produces two snapshots; do not overwrite
 /// the first snapshot with the second one's not-yet-loaded kinds.
@@ -1736,6 +1771,34 @@ fn eff_dir(path: &str) -> &str {
         path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(path)
     } else {
         path
+    }
+}
+
+/// Queue an asset-carrier replacement. This function is intentionally a state-only handoff: the
+/// asset-bundle socket thread and the once-per-frame game thread may call it, but all ItemModule,
+/// EffectModule, and resource-owner operations happen in [`pump_asset_carrier`] on the game
+/// thread. Keeping this boundary explicit prevents a TCP callback from entering the game's item
+/// or resource manager while it is already locked by a loading thread.
+pub fn request_asset_carrier_reload(generation: u64) {
+    if generation == 0 {
+        return;
+    }
+    let mut current = ASSET_CARRIER_REQUEST.load(Ordering::Acquire);
+    while generation > current {
+        match ASSET_CARRIER_REQUEST.compare_exchange_weak(
+            current,
+            generation,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                dlog(&format!(
+                    "asset_carrier_reload_requested generation={generation}"
+                ));
+                return;
+            }
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -2244,6 +2307,579 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     ));
 }
 
+/// Resolve the separate Alucard asset carrier by its exact item kind and active object identity.
+/// Asset carriers never use a bare battle-object id: IDs are recycled, and an old Alucard id must
+/// not be allowed to hide/remove an unrelated item after a match transition.
+unsafe fn asset_carrier_boma_for_id(
+    held_id: u64,
+) -> Option<*mut smash::app::BattleObjectModuleAccessor> {
+    if held_id == 0
+        || held_id > u32::MAX as u64
+        || !smash::app::sv_battle_object::is_active(held_id as u32)
+    {
+        return None;
+    }
+    let boma = smash::app::sv_battle_object::module_accessor(held_id as u32);
+    if boma.is_null() {
+        return None;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_ITEM
+    {
+        return None;
+    }
+    (smash::app::utility::get_kind(&mut *boma) == *smash::lib::lua_const::ITEM_KIND_ALUCARD)
+        .then_some(boma)
+}
+
+// Native sv_item::create_item_init_normal_safe_pos (13.0.4). Its implementation
+// returns the ItemManager-created BattleObject pointer and does not attach HAVE.
+// Use 16-byte positions because the native wrapper loads a full vector register.
+#[skyline::from_offset(0x2284310)]
+fn create_unheld_asset_item(
+    kind: i32,
+    variation: i32,
+    founder_id: u32,
+    position: *const [f32; 4],
+    previous_position: *const [f32; 4],
+    facing: f32,
+    owner_id: u32,
+) -> *mut smash::app::BattleObject;
+
+unsafe fn spawn_asset_carrier() -> Option<u64> {
+    if item_manager().is_null() {
+        return None;
+    }
+    let offstage = [0.0, -1000.0, 0.0, 0.0];
+    let invalid = *smash::lib::lua_const::BATTLE_OBJECT_ID_INVALID as u32;
+    let item = create_unheld_asset_item(
+        *smash::lib::lua_const::ITEM_KIND_ALUCARD,
+        0,
+        invalid,
+        &offstage,
+        &offstage,
+        1.0,
+        invalid,
+    );
+    if item.is_null() {
+        return None;
+    }
+    let id = (*item).battle_object_id as u64;
+    asset_carrier_boma_for_id(id).map(|_| id)
+}
+
+/// Keep the constructor owner inert and hidden until its native resources can be retained.
+unsafe fn stabilize_asset_carrier(
+    _host: *mut smash::app::BattleObjectModuleAccessor,
+    held_id: u64,
+) {
+    let Some(item) = asset_carrier_boma_for_id(held_id) else {
+        return;
+    };
+    smash::app::lua_bind::MotionAnimcmdModule::set_sleep(item, true);
+    smash::app::lua_bind::StopModule::set_special_stop(item, true);
+    smash::app::lua_bind::VisibilityModule::set_whole(item, false);
+    smash::app::lua_bind::ModelModule::set_visibility(item, false);
+    smash::app::lua_bind::PostureModule::set_pos(
+        item,
+        &smash::phx::Vector3f {
+            x: 0.0,
+            y: -1000.0,
+            z: 0.0,
+        },
+    );
+    smash::app::lua_bind::AttackModule::clear_all(item);
+    smash::app::lua_bind::HitModule::set_whole(
+        item,
+        smash::app::HitStatus(*smash::lib::lua_const::HIT_STATUS_OFF),
+        0,
+    );
+    for field in [
+        *smash::lib::lua_const::ITEM_INSTANCE_WORK_INT_LIFE_TIME,
+        *smash::lib::lua_const::ITEM_INSTANCE_WORK_INT_LIFE_TIME_MAX,
+    ] {
+        smash::app::lua_bind::WorkModule::set_int(item, 60 * 60 * 60, field);
+    }
+    smash::app::lua_bind::WorkModule::on_flag(
+        item,
+        *smash::lib::lua_const::ITEM_INSTANCE_WORK_FLAG_IMMORTAL,
+    );
+    smash::app::lua_bind::WorkModule::off_flag(
+        item,
+        *smash::lib::lua_const::ITEM_INSTANCE_WORK_FLAG_AUTO_PLAY_LOST_EFFECT,
+    );
+}
+
+unsafe fn conceal_asset_carrier(held_id: u64) {
+    // Keep the temporary constructor hidden while its native destructor drains.
+    if let Some(boma) = asset_carrier_boma_for_id(held_id) {
+        smash::app::lua_bind::VisibilityModule::set_whole(boma, false);
+    }
+}
+
+/// Resolve the fighter that owns the asset carrier, validating the recycled battle-object id
+/// before using its item slot. A missing host is handled by the game-thread state machine through
+/// the guarded loose-item removal path.
+unsafe fn asset_carrier_host_boma(
+    host_id: u64,
+) -> Option<*mut smash::app::BattleObjectModuleAccessor> {
+    let host_id = super::asset_identity::host_id(host_id)?;
+    if !smash::app::sv_battle_object::is_active(host_id) {
+        return None;
+    }
+    let boma = smash::app::sv_battle_object::module_accessor(host_id as u32);
+    if boma.is_null()
+        || smash::app::utility::get_category(&mut *boma)
+            != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return None;
+    }
+    Some(boma)
+}
+
+/// Validate the lifecycle owner and exact independent constructor identity.
+unsafe fn asset_carrier_owned_by(
+    host: *mut smash::app::BattleObjectModuleAccessor,
+    expected_id: u64,
+) -> bool {
+    if asset_carrier_boma_for_id(expected_id).is_none() {
+        return false;
+    }
+    !host.is_null()
+        && ASSET_CARRIER_HOST.load(Ordering::Acquire) == (*host).battle_object_id as u64
+        && ASSET_CARRIER_ID.load(Ordering::Acquire) == expected_id
+}
+
+/// Check the two directories owned by Alucard's model/motion graph. The item destructor performs
+/// the actual recursive release; we only wait for the worker to finish it. Raw resident-buffer
+/// clearing here would make a live target fighter or a concurrent Alucard read freed data.
+fn asset_carrier_resources_released() -> bool {
+    use crate::slight::effect_viewer::resource_reload as rr;
+    ASSET_CARRIER_DIRECTORIES
+        .into_iter()
+        .all(|(path, expected_index)| {
+            let hash = smash::hash40(path);
+            let parent_released = rr::resident_directory_state(hash).is_some_and(|state| {
+                // A wrong path/index pair is not proof of release. Keep this explicit check next
+                // to the verified native indices so a future path typo cannot open a second owner
+                // against an unrelated directory group.
+                state.directory_index == expected_index
+                    && state.ref_count == 0
+                    && state.incoming_request_count == 0
+            });
+            parent_released && rr::resident_directory_files_released(hash) == Some(true)
+        })
+}
+
+/// Drain effects, remove the independent item through ItemManager, and let the native
+/// resource worker release its model/motion directories. Fighter inventory is never touched.
+unsafe fn remove_asset_carrier(host: *mut smash::app::BattleObjectModuleAccessor) -> bool {
+    let expected = ASSET_CARRIER_ID.load(Ordering::Acquire);
+    if expected == 0 {
+        return true;
+    }
+    // Only the exact lifecycle owner can keep a stopped constructor alive for the
+    // effect-drain grace period. Orphaned items are retired immediately.
+    if asset_carrier_owned_by(host, expected) {
+        let drain = ASSET_CARRIER_EFFECT_DRAIN.load(Ordering::Acquire);
+        if drain == 0 {
+            if let Some(carrier) = asset_carrier_boma_for_id(expected) {
+                smash::app::lua_bind::EffectModule::kill_all(carrier, 0, false, false);
+                ASSET_CARRIER_EFFECT_DRAIN.store(1, Ordering::Release);
+                dlog(&format!("ASSET_CARRIER_EFFECT_DRAIN id={expected:#x}"));
+                return false;
+            }
+        } else if drain < 4 {
+            conceal_asset_carrier(expected);
+            ASSET_CARRIER_EFFECT_DRAIN.store(drain + 1, Ordering::Release);
+            return false;
+        }
+    }
+    ASSET_CARRIER_EFFECT_DRAIN.store(0, Ordering::Release);
+
+    let expected = ASSET_CARRIER_ID.swap(0, Ordering::AcqRel);
+    if expected == 0 {
+        return true;
+    }
+
+    ASSET_CARRIER_RETIRING_ID.store(expected, Ordering::Release);
+    if !remove_loose_auto_carrier(expected, *smash::lib::lua_const::ITEM_KIND_ALUCARD)
+        && asset_carrier_boma_for_id(expected).is_some()
+    {
+        if let Some(carrier) = asset_carrier_boma_for_id(expected) {
+            smash::app::lua_bind::StopModule::set_special_stop(carrier, false);
+        }
+        retire_auto_carrier_id(expected, *smash::lib::lua_const::ITEM_KIND_ALUCARD);
+    }
+    true
+}
+
+/// Submit the native recursive release for both directories owned by an outgoing Alucard asset
+/// owner. The item destructor normally performs this work, but an explicit guarded submission
+/// mirrors the proven effect-carrier path and gives the state machine a concrete release event to
+/// wait on. Each directory call is idempotent at zero; the one-shot latch prevents refcount
+/// underflow while an asynchronous worker is still draining.
+fn submit_asset_directory_release() {
+    if ASSET_CARRIER_RELEASE_SUBMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    use crate::slight::effect_viewer::resource_reload as rr;
+    for &(path, _) in &ASSET_CARRIER_DIRECTORIES {
+        let result = rr::release_resident_directory(smash::hash40(path));
+        mark(&format!(
+            "asset_carrier_native_directory_release path={path} result={result:?}"
+        ));
+        dlog(&format!(
+            "ASSET_CARRIER_DIRECTORY_RELEASE path={path} result={result:?}"
+        ));
+    }
+}
+
+/// Game-thread lifecycle for custom model, animation, and swing files.
+///
+/// The asset bundle itself is received on the TCP thread, but this function is called from the
+/// per-fighter game callback. It is the only place that creates/removes the Alucard owner. The
+/// normal ItemModule constructor then requests the fixed `assist/alucard/model/body/c00` and
+/// `motion/body/c00` graph, whose Arcropolis callbacks read the pending generation.
+pub unsafe fn pump_asset_carrier(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    if boma.is_null() {
+        return;
+    }
+    super::fighter_assets::trace_restored_frame(boma);
+    let state = ASSET_CARRIER_STATE.load(Ordering::Acquire);
+    let request = ASSET_CARRIER_REQUEST.load(Ordering::Acquire);
+    let active_generation = ASSET_CARRIER_GENERATION.load(Ordering::Acquire);
+    let pending_generation =
+        crate::slight::effect_viewer::asset_bundle::pending_carrier_generation();
+    let pending_clear = pending_generation.is_some()
+        && crate::slight::effect_viewer::asset_bundle::pending_carrier_is_clear();
+    // `begin_carrier_load` consumes PENDING, so Loading/Retiring/Ready must continue from the
+    // latched state even when no pending snapshot remains. Only an idle owner with no queued
+    // generation may return here.
+    let requested = pending_generation.unwrap_or(request).max(request);
+    if state == 0 {
+        if pending_generation.is_none() || requested <= active_generation {
+            return;
+        }
+    }
+
+    let boid = (*boma).battle_object_id as u64;
+    let current_host = ASSET_CARRIER_HOST.load(Ordering::Acquire);
+    let is_fighter = smash::app::utility::get_category(&mut *boma)
+        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER;
+    let target = crate::slight::effect_viewer::asset_bundle::pending_carrier_target();
+    let is_target = target.as_deref().is_some_and(|target| {
+        !target.is_empty()
+            && is_fighter
+            && crate::slight::slight_consts::fighters::game_kind_name(
+                smash::app::utility::get_kind(&mut *boma),
+            )
+            .is_some_and(|name| name == target)
+    });
+    // The old host must still be allowed to retire if the editor switches the selected target to
+    // another fighter. Only a matching target may claim a new carrier.
+    let is_old_host = host_id(current_host).is_some() && current_host == boid;
+    let host_boma = (host_id(current_host).is_some())
+        .then(|| asset_carrier_host_boma(current_host))
+        .flatten();
+    let is_frame_driver = is_fighter && crate::slight::agents::is_frame_driver(boid as u32);
+    // A valid host is the sole lifecycle driver. If it disappeared, use the stable global frame
+    // driver as the orphan fallback; allowing every fighter to enter this state machine advances
+    // effect/resource teardown several times per game frame and can submit duplicate releases.
+    let lifecycle_driver = if host_boma.is_some() {
+        is_old_host
+    } else {
+        is_frame_driver
+    };
+    if state != 0 {
+        if !lifecycle_driver {
+            return;
+        }
+    } else if host_id(current_host).is_some() {
+        // State 0 is only allowed to create a fresh owner after state 2 has cleared the old host.
+        // A stale host latch must never let a non-target fighter create the replacement.
+        return;
+    } else if pending_clear {
+        // An empty snapshot has no target fighter. Drive its callback commit once from the stable
+        // frame driver rather than letting every fighter consume the same clear transition.
+        if !is_frame_driver {
+            return;
+        }
+    } else if !is_target {
+        // A new owner is created only by the fighter named by the pending snapshot.
+        return;
+    }
+    let owner_host = host_boma.unwrap_or(boma);
+
+    if state == 4 && requested <= active_generation && host_boma.is_some() {
+        super::fighter_assets::observe(owner_host);
+        // The fighter owns the native model, animation controllers, and swing simulation now.
+        // There is no second actor to render, reposition, or synchronize.
+        return;
+    }
+
+    if state == 6 {
+        if requested > active_generation || host_boma.is_none() {
+            ASSET_CARRIER_STATE.store(1, Ordering::Release);
+            return;
+        }
+        if !remove_asset_carrier(owner_host) {
+            return;
+        }
+        let retiring = ASSET_CARRIER_RETIRING_ID.load(Ordering::Acquire);
+        if asset_carrier_boma_for_id(retiring).is_some() {
+            return;
+        }
+        ASSET_CARRIER_RETIRING_ID.store(0, Ordering::Release);
+        dlog(&format!("ASSET_CARRIER_BIND_FIGHTER_BEGIN generation={active_generation} host={current_host:#x}"));
+        if let Err(error) = super::fighter_assets::apply(owner_host) {
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                active_generation,
+                &error,
+            );
+            ASSET_CARRIER_STATE.store(1, Ordering::Release);
+            return;
+        }
+        if crate::slight::effect_viewer::asset_bundle::finish_carrier_load(active_generation) {
+            ASSET_CARRIER_STATE.store(4, Ordering::Release);
+            dlog(&format!("ASSET_CARRIER_READY generation={active_generation} fighter={current_host:#x}; constructor retired"));
+        } else {
+            ASSET_CARRIER_STATE.store(1, Ordering::Release);
+        }
+        return;
+    }
+
+    if state == 0 {
+        if requested <= active_generation {
+            return;
+        }
+        // A clear snapshot has no owner to create. Publish its empty callback view only after any
+        // old owner has reached state 0; `finish_carrier_load` reports Idle for this case.
+        if pending_clear {
+            if let Err(error) =
+                crate::slight::effect_viewer::asset_bundle::begin_carrier_load(requested)
+            {
+                crate::slight::effect_viewer::asset_bundle::fail_carrier_load(requested, &error);
+                return;
+            }
+            ASSET_CARRIER_GENERATION.store(requested, Ordering::Release);
+            ASSET_CARRIER_REQUEST.store(requested, Ordering::Release);
+            ASSET_CARRIER_STATE.store(5, Ordering::Release);
+            if crate::slight::effect_viewer::asset_bundle::finish_carrier_load(requested) {
+                ASSET_CARRIER_HOST.store(NO_HOST, Ordering::Release);
+                ASSET_CARRIER_ID.store(0, Ordering::Release);
+
+                ASSET_CARRIER_RELEASE_SUBMITTED.store(false, Ordering::Release);
+                ASSET_CARRIER_STATE.store(0, Ordering::Release);
+                dlog(&format!("ASSET_CARRIER_CLEARED generation={requested}"));
+            }
+            return;
+        }
+        if !is_target {
+            return;
+        }
+        // Alucard is deliberately a separate owner from the effect carrier. Reusing its item
+        // kind for both graphs makes one teardown invalidate the other graph's resources.
+        if AUTO_CARRIER_ITEM_KIND.load(Ordering::Acquire)
+            == *smash::lib::lua_const::ITEM_KIND_ALUCARD as i64
+        {
+            let reason =
+                "Alucard is already the effect carrier; asset carrier needs its separate owner";
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(requested, reason);
+            return;
+        }
+        let active_items = smash::app::lua_bind::ItemManager::get_num_of_active_item(
+            *smash::lib::lua_const::ITEM_KIND_ALUCARD,
+        );
+        if active_items != 0 && ASSET_CARRIER_ID.load(Ordering::Acquire) == 0 {
+            let reason = "an Alucard item is already active; asset carrier refused to share its resource graph";
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(requested, reason);
+            return;
+        }
+        super::fighter_assets::trace_visibility(owner_host, "before_carrier_load", true);
+        if let Err(error) =
+            crate::slight::effect_viewer::asset_bundle::begin_carrier_load(requested)
+        {
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(requested, &error);
+            return;
+        }
+        let Some(id) = spawn_asset_carrier() else {
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                requested,
+                "Alucard asset carrier could not create an independent item",
+            );
+            return;
+        };
+        // The fighter is only the lifecycle owner; no inventory or HAVE link is used.
+        ASSET_CARRIER_HOST.store(boid, Ordering::Release);
+        ASSET_CARRIER_ID.store(id, Ordering::Release);
+        ASSET_CARRIER_GENERATION.store(requested, Ordering::Release);
+        ASSET_CARRIER_POLL.store(0, Ordering::Release);
+        ASSET_CARRIER_STATE.store(3, Ordering::Release);
+        stabilize_asset_carrier(owner_host, id);
+        conceal_asset_carrier(id);
+        super::fighter_assets::trace_visibility(owner_host, "after_carrier_spawn", false);
+        dlog(&format!(
+            "ASSET_CARRIER_INDEPENDENT generation={requested} host={boid:#x} id={id:#x}"
+        ));
+        return;
+    }
+
+    if state == 4 {
+        // A newer generation is pending. Retire the old owner before changing the callback view.
+        crate::slight::effect_viewer::asset_bundle::mark_carrier_retiring(requested);
+        ASSET_CARRIER_STATE.store(1, Ordering::Release);
+    }
+
+    let state = ASSET_CARRIER_STATE.load(Ordering::Acquire);
+    if state == 1 {
+        // Restore the original fighter bindings before releasing the incoming ARC graph.
+        if let Err(error) = super::fighter_assets::restore(host_boma) {
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                active_generation,
+                &error,
+            );
+            return;
+        }
+        if ASSET_CARRIER_ID.load(Ordering::Acquire) != 0 {
+            if !remove_asset_carrier(owner_host) {
+                return;
+            }
+        }
+        ASSET_CARRIER_POLL.store(0, Ordering::Release);
+        ASSET_CARRIER_RELEASE_SUBMITTED.store(false, Ordering::Release);
+        ASSET_CARRIER_RELEASE_STALLED.store(false, Ordering::Release);
+        ASSET_CARRIER_STATE.store(2, Ordering::Release);
+        return;
+    }
+
+    if state == 2 {
+        let retiring = ASSET_CARRIER_RETIRING_ID.load(Ordering::Acquire);
+        if retiring != 0 {
+            if asset_carrier_boma_for_id(retiring).is_some() {
+                conceal_asset_carrier(retiring);
+                return;
+            }
+            ASSET_CARRIER_RETIRING_ID.store(0, Ordering::Release);
+        }
+        // Re-check immediately before touching the shared native directories. A different
+        // Alucard may have spawned after the retiring object disappeared; releasing its model or
+        // motion graph here would invalidate that live owner. Do not submit either release until
+        // the active-item count is zero.
+        let active_items = smash::app::lua_bind::ItemManager::get_num_of_active_item(
+            *smash::lib::lua_const::ITEM_KIND_ALUCARD,
+        );
+        if active_items != 0 {
+            let waited = ASSET_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
+            if waited % 30 == 0 {
+                dlog(&format!(
+                    "ASSET_CARRIER_AWAIT_ACTIVE_ALUCARD wait={waited} active={active_items}"
+                ));
+            }
+            if waited >= ASSET_CARRIER_SWAP_MAX_WAIT
+                && !ASSET_CARRIER_RELEASE_STALLED.swap(true, Ordering::AcqRel)
+            {
+                let reason = "another Alucard item became active before asset release";
+                crate::slight::effect_viewer::asset_bundle::fail_carrier_load(requested, reason);
+                ASSET_CARRIER_HOST.store(NO_HOST, Ordering::Release);
+                ASSET_CARRIER_STATE.store(0, Ordering::Release);
+                dlog("ASSET_CARRIER_ACTIVE_ALUCARD_BLOCKED; refusing replacement");
+            }
+            return;
+        }
+        submit_asset_directory_release();
+        let waited = ASSET_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
+        if !asset_carrier_resources_released() {
+            if waited % 120 == 0 {
+                dlog(&format!(
+                    "ASSET_CARRIER_AWAIT_RESOURCE_RELEASE wait={waited}"
+                ));
+            }
+            if waited >= ASSET_CARRIER_SWAP_MAX_WAIT {
+                if !ASSET_CARRIER_RELEASE_STALLED.swap(true, Ordering::AcqRel) {
+                    let reason = "Alucard model/motion resource release did not complete";
+                    crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                        requested, reason,
+                    );
+                    dlog("ASSET_CARRIER_RESOURCE_RELEASE_STALLED; refusing replacement");
+                }
+            }
+            return;
+        }
+        ASSET_CARRIER_RELEASE_STALLED.store(false, Ordering::Release);
+        ASSET_CARRIER_POLL.store(0, Ordering::Release);
+        ASSET_CARRIER_HOST.store(NO_HOST, Ordering::Release);
+
+        ASSET_CARRIER_STATE.store(0, Ordering::Release);
+        return;
+    }
+
+    if state == 5 {
+        let generation = ASSET_CARRIER_GENERATION.load(Ordering::Acquire);
+        if crate::slight::effect_viewer::asset_bundle::finish_carrier_load(generation) {
+            ASSET_CARRIER_HOST.store(NO_HOST, Ordering::Release);
+            ASSET_CARRIER_ID.store(0, Ordering::Release);
+            ASSET_CARRIER_RELEASE_SUBMITTED.store(false, Ordering::Release);
+            ASSET_CARRIER_STATE.store(0, Ordering::Release);
+            dlog(&format!("ASSET_CARRIER_CLEARED generation={generation}"));
+        }
+        return;
+    }
+
+    if state == 3 {
+        let id = ASSET_CARRIER_ID.load(Ordering::Acquire);
+        let generation = ASSET_CARRIER_GENERATION.load(Ordering::Acquire);
+        if !host_boma.is_some_and(|host| asset_carrier_owned_by(host, id)) {
+            crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                generation,
+                "asset loader lost its lifecycle owner while loading",
+            );
+            ASSET_CARRIER_STATE.store(1, Ordering::Release);
+            let _ = remove_asset_carrier(owner_host);
+            return;
+        }
+        let Some(carrier) = asset_carrier_boma_for_id(id) else {
+            ASSET_CARRIER_STATE.store(1, Ordering::Release);
+            return;
+        };
+        stabilize_asset_carrier(owner_host, id);
+        if crate::slight::effect_viewer::asset_bundle::all_files_served(generation) {
+            super::fighter_assets::trace_visibility(owner_host, "carrier_files_ready", false);
+            match super::fighter_assets::capture(owner_host, carrier) {
+                Ok(()) => {
+                    ASSET_CARRIER_STATE.store(6, Ordering::Release);
+                    dlog(&format!(
+                        "ASSET_CARRIER_HANDOFF_RETAINED generation={generation} id={id:#x}"
+                    ));
+                }
+                Err(error) => {
+                    crate::slight::effect_viewer::asset_bundle::fail_carrier_load(
+                        generation, &error,
+                    );
+                    ASSET_CARRIER_STATE.store(1, Ordering::Release);
+                }
+            }
+        } else {
+            let waited = ASSET_CARRIER_POLL.fetch_add(1, Ordering::Relaxed);
+            if waited % 120 == 0 {
+                dlog(&format!(
+                    "ASSET_CARRIER_LOADING generation={generation} id={id:#x} served={}/{}",
+                    crate::slight::effect_viewer::asset_bundle::served_count(generation),
+                    crate::slight::effect_viewer::asset_bundle::staged_count(generation),
+                ));
+            }
+            if waited >= ASSET_CARRIER_SWAP_MAX_WAIT {
+                let reason = "Alucard asset carrier did not request every staged file";
+                crate::slight::effect_viewer::asset_bundle::fail_carrier_load(generation, reason);
+                ASSET_CARRIER_STATE.store(1, Ordering::Release);
+            }
+        }
+        // Keep this binding explicit so future owner-specific checks cannot accidentally remove
+        // the carrier through a stale pointer after this scope.
+        let _ = carrier;
+    }
+}
+
 /// Resolve a carrier battle-object id, but ONLY if it still refers to an item of the carrier's
 /// kind. Battle-object ids are recycled, so a stale id can name a completely different object —
 /// including a fighter. Everything that hides, pins or kills the carrier goes through here: an
@@ -2701,6 +3337,10 @@ fn enqueue_donors_for(target_handle: u32, target_path_hash: u64) {
 
 /// Append-only donor-coload log (marks.txt gets wiped by each force_reread, hiding this path).
 fn dlog(s: &str) {
+    // Keep sparse asset lifecycle transitions in the session log even without full tracing.
+    if s.starts_with("ASSET_CARRIER_") {
+        crate::slight::diag::note(s.to_owned());
+    }
     if !crate::slight::smash_utils::trace_enabled() {
         return;
     }

@@ -5525,6 +5525,7 @@ dependencies = [
  "image",
  "image_dds",
  "motion_list_rs",
+ "nutexb",
  "prc-rs",
  "proc-macro2",
  "reqwest",

@@ -4,6 +4,9 @@ mod acmd_src;
 mod acmd_verify;
 mod app;
 mod app_icon;
+mod asset_snapshots;
+mod carrier_motion;
+mod carrier_support;
 mod credits;
 mod data;
 mod eff_attrs;
@@ -29,6 +32,21 @@ mod texture_import;
 mod wayland_icon;
 
 fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new("--install-carrier-support")) {
+        let sd = args
+            .next()
+            .map(std::path::PathBuf::from)
+            .or_else(scratch_dirs::emulator_sd_root)
+            .ok_or_else(|| anyhow::anyhow!("emulator SD directory is not configured"))?;
+        println!("{}", carrier_support::install(&sd)?.display());
+        return Ok(());
+    }
+    if let Some(sd) = scratch_dirs::emulator_sd_root() {
+        if let Err(error) = carrier_support::install(&sd) {
+            eprintln!("[visionary] Live asset support: {error:#}");
+        }
+    }
     // Best-effort auto-deploy the Skyline plugin to the local Eden install so the
     // user only has to run Eden + Visionary to test. This is non-blocking and
     // never fails the desktop launch — check stderr for "[visionary] Plugin auto-deploy".

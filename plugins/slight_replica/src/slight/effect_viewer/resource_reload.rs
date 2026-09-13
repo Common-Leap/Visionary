@@ -330,6 +330,21 @@ pub fn resident_directory_state(dir_hash: u64) -> Option<ResidentDirectoryState>
     })
 }
 
+/// Whether every file directly owned by a directory has completed its native release.
+///
+/// The directory counters only cover the parent `DirInfo` group. The resource worker can still
+/// be holding a child model, texture, or animation buffer after those counters reach zero, so a
+/// replacement owner must wait on the child `LoadedData` records as well. `None` means the ARC or
+/// filesystem table could not resolve the directory; callers must treat that as "not released".
+pub fn resident_directory_files_released(dir_hash: u64) -> Option<bool> {
+    let directory_index = dir_info_index_for_path_hash(dir_hash)?;
+    let children = dir_child_file_hashes(directory_index);
+    Some(children.into_iter().all(|file_hash| {
+        resident_file_state(file_hash)
+            .is_some_and(|state| !state.filepath_loaded && state.data == 0 && state.ref_count == 0)
+    }))
+}
+
 /// Release one live owner of a directory through the same recursive queue used by the game.
 ///
 /// Returns `(before, after, released)`. A zero count means the retiring item already submitted

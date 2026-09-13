@@ -35,6 +35,7 @@ pub fn on_rpm_client_connected(client_id: u64) {
     // Force the next carrier-status pump to re-send: everything emitted before this client
     // connected went to the SD fallback, so without this the editor starts blind.
     crate::slight::effect_viewer::effect_reload::reset_carrier_status_latch();
+    crate::slight::effect_viewer::asset_bundle::reset_status_latch();
 
     // Do NOT touch shared state (kinds/tracker) from this SERVER thread: a contended
     // parking_lot lock parks the waiter, and parked threads never wake in this environment
@@ -471,6 +472,25 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         return None;
     }
 
+    // SD-backed fighter model/motion assets for the next genuine owner load. This deliberately
+    // does not patch resident buffers: model GPU state, animation bindings, and swing physics are
+    // rebuilt only by the fighter's normal resource lifecycle.
+    if let Some(bundle_v) = v.get("asset_bundle") {
+        match serde_json::from_value::<crate::slight::effect_viewer::asset_bundle::AssetBundle>(
+            bundle_v.clone(),
+        ) {
+            Ok(bundle) => {
+                let _ = crate::slight::effect_viewer::asset_bundle::stage(bundle);
+            }
+            Err(error) => {
+                let reason = format!("asset_bundle parse error: {error}");
+                crate::slight::diag::note(&reason);
+                notify_asset_bundle_error(&reason);
+            }
+        }
+        return None;
+    }
+
     // Custom effect names (transplant copies) for hash→name display resolution.
     if let Some(names_v) = v.get("effect_names") {
         if let Ok(names) = serde_json::from_value::<Vec<String>>(names_v.clone()) {
@@ -830,5 +850,41 @@ pub fn notify_carrier_status(state: u8, kinds: usize, spawned: bool, generation:
                 "state": state, "kinds": kinds, "spawned": spawned, "gen": generation
             }
         }),
+    );
+}
+
+/// Report the asset-carrier lifecycle. `served` means Arcropolis genuinely requested that many
+/// files from the current carrier generation; `ready` is only true after the game-thread owner is
+/// live and every file in that generation has been served.
+pub fn notify_asset_bundle_status(
+    target: &str,
+    generation: u64,
+    staged: usize,
+    served: usize,
+    serving_generation: u64,
+    phase: &str,
+    ready: bool,
+) {
+    emit(
+        "AssetBundleStatus",
+        &serde_json::json!({
+            "AssetBundleStatus": {
+                "target": target,
+                "generation": generation,
+                "staged": staged,
+                "served": served,
+                "serving_generation": serving_generation,
+                "phase": phase,
+                "ready": ready,
+                "activation": "carrier_recreate"
+            }
+        }),
+    );
+}
+
+pub fn notify_asset_bundle_error(reason: &str) {
+    emit(
+        "AssetBundleError",
+        &serde_json::json!({ "AssetBundleError": { "reason": reason } }),
     );
 }
