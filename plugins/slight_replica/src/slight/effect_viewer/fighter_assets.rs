@@ -510,6 +510,96 @@ pub unsafe fn trace_visibility(host: *mut BattleObjectModuleAccessor, phase: &st
     }
 }
 
+/// Read-only retained-model check: the vanilla/original instance stays registered while
+/// the preview is live, deliberately kept alive for Stop/reload. If any of its meshes still
+/// report rendered after the handoff, both models draw at once (vanilla weapons doubled with
+/// the preview's) even though the fighter's own trace looks correct. Bounded to counts plus a
+/// few names; never writes.
+unsafe fn trace_retained_object(object: usize) {
+    use std::io::Write;
+    if object == 0
+        || method(object, 0x188) != text_base() + 0x35d4300
+        || method(object, 0x1b0) != text_base() + 0x35d44d0
+    {
+        return;
+    }
+    let meshes = mesh_visibility(object);
+    let rendered: Vec<u64> = meshes
+        .iter()
+        .filter(|(_, visible)| *visible)
+        .map(|(name, _)| *name)
+        .collect();
+    let mut line = format!(
+        "build={} phase=retained_original mesh_count={} rendered_count={}",
+        super::live_eff::BUILD_TAG,
+        meshes.len(),
+        rendered.len(),
+    );
+    for name in rendered.iter().take(12) {
+        line.push_str(&format!(" {name:#x}"));
+    }
+    if rendered.len() > 12 {
+        line.push_str(" ...");
+    }
+    line.push('\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open("sd:/effect_viewer_visibility_trace.txt")
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Compact per-observation weapon/group flip log. The full visibility trace only samples fixed
+/// phases, so a sheath/draw transition that misbehaves between samples is invisible. This emits
+/// one line only when the rendered set actually changes (plus on motion-kind changes), naming up
+/// to a few flipped groups; steady idle/training play stays quiet apart from blinks.
+static LAST_OBSERVED_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static LAST_VISIBILITY: Mutex<Option<Vec<(u64, bool)>>> = Mutex::new(None);
+
+unsafe fn trace_visibility_flips(host: *mut BattleObjectModuleAccessor, meshes: &[(u64, bool)]) {
+    let kind = MotionModule::motion_kind(host);
+    let frame = MotionModule::frame(host);
+    let kind_changed = LAST_OBSERVED_KIND.swap(kind, std::sync::atomic::Ordering::Relaxed) != kind;
+    let mut last = LAST_VISIBILITY.lock();
+    let flips: Vec<(u64, bool, bool)> = match last.as_ref() {
+        Some(previous) if previous.len() == meshes.len()
+            && previous.iter().map(|(name, _)| name).eq(meshes.iter().map(|(name, _)| name)) =>
+        {
+            previous
+                .iter()
+                .zip(meshes.iter())
+                .filter(|(old, new)| old.1 != new.1)
+                .map(|(old, new)| (new.0, old.1, new.1))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let baseline_reset = last
+        .as_ref()
+        .is_none_or(|previous| previous.len() != meshes.len());
+    *last = Some(meshes.to_vec());
+    drop(last);
+    if flips.is_empty() && !kind_changed && !baseline_reset {
+        return;
+    }
+    let visible = meshes.iter().filter(|(_, v)| *v).count();
+    let mut line = format!(
+        "weapon_flip kind={kind:#x} frame={frame} visible={visible}/{} kind_changed={kind_changed} flips={}",
+        meshes.len(),
+        flips.len(),
+    );
+    for (name, was, now) in flips.iter().take(6) {
+        line.push_str(&format!(" {name:#x}:{}->{}", u8::from(*was), u8::from(*now)));
+    }
+    if flips.len() > 6 {
+        line.push_str(" ...");
+    }
+    super::effect_reload::mark(&line);
+}
+
 unsafe fn visibility_masks(module: usize) -> *const usize {
     let get: unsafe extern "C" fn(usize) -> *const usize =
         std::mem::transmute(method(module, 0x138));
@@ -891,6 +981,8 @@ pub unsafe fn apply(host: *mut BattleObjectModuleAccessor) -> Result<(), String>
     );
     trace_visibility(host, "after_handoff", false);
     OBSERVE_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAST_OBSERVED_KIND.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    *LAST_VISIBILITY.lock() = None;
     *ORIGINAL.lock() = Some(Original {
         host: host as usize,
         id: pending.id,
@@ -901,6 +993,9 @@ pub unsafe fn apply(host: *mut BattleObjectModuleAccessor) -> Result<(), String>
         visibility_defaults,
         _preview_motion: pending.motion,
     });
+    if let Some(saved) = ORIGINAL.lock().as_ref() {
+        trace_retained_object(saved.model.0.object);
+    }
     let helper = helper_controller(motion_module);
     if helper == 0
         || *((helper + 0xc8) as *const u32) == 0xffffff
@@ -944,6 +1039,8 @@ pub unsafe fn restore(host: Option<*mut BattleObjectModuleAccessor>) -> Result<(
             drop(outgoing_motion);
             super::effect_reload::mark("fighter_assets original fighter restored");
             trace_visibility(host, "after_restore", false);
+            LAST_OBSERVED_KIND.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+            *LAST_VISIBILITY.lock() = None;
             *RESTORE_TRACE.lock() = Some((host as usize, (*host).battle_object_id, 0));
             return Ok(());
         }
@@ -1058,4 +1155,5 @@ pub unsafe fn observe(host: *mut BattleObjectModuleAccessor) {
             if controller != 0 { *((controller + 0x88) as *const usize) } else { 0 },
             if controller != 0 { *((controller + 0x98) as *const u8) } else { 0 }, joints);
     }
+    trace_visibility_flips(host, &meshes);
 }

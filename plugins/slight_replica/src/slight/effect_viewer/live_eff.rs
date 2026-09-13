@@ -33,7 +33,7 @@ const MANIFEST: &str = "sd:/effect_viewer/live_eff/manifest.json";
 const DIR: &str = "sd:/effect_viewer/live_eff/";
 /// Written into every diag file so on-device logs are attributable to a specific build.
 /// Keep this in step with plugin changes so captured diagnostics identify the running binary.
-pub const BUILD_TAG: &str = "2026-09-10-render-overrides-v23";
+pub const BUILD_TAG: &str = "2026-09-13-weapon-diag-v24";
 
 /// Times [`disk_cb`] served bytes. Split by initiator so we can DECISIVELY answer the
 /// one open question of the whole cross-fighter-live effort: does the game's own resource
