@@ -380,6 +380,57 @@ unsafe fn mesh_render_flags(model: usize) -> Vec<(u64, u8)> {
     result
 }
 
+// Object-local hide/show for every mesh of one render instance, without touching the
+// fighter's shared module cache (which serves whichever instance is currently bound).
+//
+// The retired instance stays registered while retained for Stop/reload, and whole-model
+// visibility lives on the shared module — it flips back with the incoming model, so the
+// retired vanilla keeps its per-mesh states (v24 proved 15 still rendered: it double-draws
+// its sword/shield/scabbard with the preview's). The per-mesh flag byte observed across
+// hundreds of device samples gates on bit 0 (0x11 drawn, 0x00/0x10 hidden); the layout and
+// bounds below mirror `mesh_render_flags`, covering every visibility buffer so a buffer
+// flip cannot resurrect a hidden instance. Read-modify-write preserves the other bits.
+unsafe fn set_all_mesh_rendered(model: usize, rendered: bool) {
+    if model == 0 || method(model, 0x1b8) != text_base() + 0x35d44e0 {
+        return;
+    }
+    let descriptor = *((model + 0x438) as *const usize);
+    if descriptor == 0 {
+        return;
+    }
+    let count = *((descriptor + 0x18) as *const u32) as usize;
+    let buffers = *((descriptor + 0x1c) as *const u32) as usize;
+    let begin = *(descriptor as *const usize);
+    let end = *((descriptor + 8) as *const usize);
+    if count == 0
+        || count > 4096
+        || buffers == 0
+        || buffers > 8
+        || begin == 0
+        || end < begin
+        || (end - begin) / 8 < buffers
+    {
+        return;
+    }
+    for slot in 0..buffers {
+        let data = *((begin + slot * 8) as *const usize);
+        if data == 0 {
+            continue;
+        }
+        for index in 0..count {
+            let cell = (data + index) as *mut u8;
+            if rendered {
+                *cell |= 1;
+            } else {
+                *cell &= !1;
+            }
+        }
+    }
+    super::effect_reload::mark(&format!(
+        "fighter_assets all_mesh_rendered={rendered} model={model:#x} meshes={count}"
+    ));
+}
+
 // Native hash-based setter updates every submesh while preserving animation bits.
 #[skyline::from_offset(0x35e23b0)]
 fn set_mesh_render_override(model: usize, name: u64, state: u8) -> bool;
@@ -748,12 +799,14 @@ unsafe fn bind(
 
     // Move strong ownership into the FIGHTER'S existing ModelModule. The saved original remains
     // alive for Stop/reload, and the carrier can no longer render or advance this instance.
-    // Retained original render resources must not stay registered as a visible old mesh.
+    // The retired instance stays registered while retained, so hide it at the object level:
+    // whole-model visibility lives on the shared module and flips back with the incoming
+    // model, leaving the retired vanilla to double-draw its weapons with the preview.
     // Visibility returns on the same fighter immediately after the binding changes.
     super::effect_reload::mark("fighter_assets bind model");
     ModelModule::set_visibility(host, false);
-    // The original is only hidden while retained for Stop: unregistering it also invalidates
-    // render lifetime state. Only the outgoing preview instance is retired permanently.
+    // Only the outgoing preview instance is retired permanently (it is unregistered and
+    // dropped). The retained original keeps its registration while hidden above.
     if retire_outgoing {
         unregister_render_model((model_module + 0x10) as *const Shared);
     }
@@ -761,6 +814,18 @@ unsafe fn bind(
     let rebuild_mesh_cache: unsafe extern "C" fn(usize) =
         std::mem::transmute(method(model_module, 0x430));
     rebuild_mesh_cache(model_module);
+    if retire_outgoing {
+        // The saved original returns to the stage: start it fully visible so model-only
+        // groups absent from the preview seed at their own defaults; the live selection
+        // captured below overwrites the shared groups before the cache is seeded.
+        set_all_mesh_rendered(*((model_module + 0x10) as *const usize), true);
+    } else {
+        // The replaced original stays registered while retained for Stop/reload: hide it
+        // here so it cannot double-draw with the preview. Its per-mesh states are frozen
+        // (its controllers are destroyed and the module now serves the incoming model),
+        // and Stop re-seeds them through the normal restore below.
+        set_all_mesh_rendered(original.0.object, false);
+    }
     bind_visibility_groups(
         visibility,
         (model_module + 0x10) as *const Shared,
