@@ -5383,6 +5383,12 @@ impl VisionaryApp {
                 }
                 Err(e) => notes.push(e.to_string()),
             }
+            // An effect value can change the byte length of its function. Re-index before
+            // the game passes, or a stale span truncates the game body when both live in
+            // the same file with the effect first (alphabetical order) and the hitbox
+            // write lands on the wrong bytes — the shape issue 37 reports as "only
+            // syncs the effect script edits".
+            refresh_acmd_index(&mut index, &mut notes);
         }
         if index
             .script(&fighter, &crate::acmd::acmd_script_name("game", &move_name))
@@ -5812,6 +5818,12 @@ impl VisionaryApp {
                 }
                 Err(e) => notes.push(e.to_string()),
             }
+            // The last game pass above has no later game family to protect, but sound
+            // and expression live in their own functions that can share the file. Without
+            // this, a game write that changes the byte length leaves their spans stale
+            // and their syncs read the wrong body — the same staleness the effect/game
+            // boundary above had for issue 37.
+            refresh_acmd_index(&mut index, &mut notes);
         }
         // Sounds get a pass of their own, and unlike the three above it writes a *different
         // function*: `sound_`, not `game_`. It sat inside the `game_` guard until D1e, which is

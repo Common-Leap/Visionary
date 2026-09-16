@@ -10215,6 +10215,86 @@ pub fn install() { let agent = &mut smashline::Agent::new("test_fighter"); }
         assert!(after.contains("*ATTACK_SETOFF_KIND_ON"), "{after}");
     }
 
+    /// Effect-first files share one file for both categories, so an effect write that
+    /// changes the byte length shifts the game function's span. A game sync reusing the
+    /// pre-write index then reads the wrong body — the shape issue 37 reports as hitbox
+    /// edits never reaching the game script while effect edits land. The caller
+    /// (`sync_edits_to_source`) must re-index between the two passes; this pins that
+    /// the refreshed sequence lands both edits.
+    #[test]
+    fn effect_then_hitbox_syncs_share_one_file_effect_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Same two functions as MARIO, but effect first: alphabetical layouts put
+        // `effect_` before `game_`, so an effect write moves the game span.
+        let body = r#"
+use smash::{lua2cpp::*, phx::*};
+
+unsafe extern "C" fn effect_attackairn(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new("sys_hit_l"), Hash40::new("sys_hit_r"), Hash40::new("haver"), 1.0, 2.0, 3.0, 0.0, 90.0, 45.0, 1.5, true, *EF_FLIP_YZ);
+    }
+}
+
+unsafe extern "C" fn game_attackairn(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 8.0, 361, 100, 0, 40, 4.5, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+}
+
+pub fn install(agent: &mut smashline::Agent) {
+    agent.acmd("game_attackairn", game_attackairn, smashline::Priority::Default);
+    agent.acmd("effect_attackairn", effect_attackairn, smashline::Priority::Default);
+}
+"#;
+        write(tmp.path(), "src/mario/acmd.rs", body);
+        write(
+            tmp.path(),
+            "src/mario/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"mario\"); }",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let merged = index.script_source("mario", "attack_air_n").unwrap().body;
+        let hit_pristine = crate::acmd::parse_acmd_script(&merged).to_hitboxes();
+        let eff_pristine = crate::acmd::parse_effect_script(&merged).to_effect_calls();
+        assert_eq!(hit_pristine.len(), 1);
+        assert_eq!(eff_pristine.len(), 1);
+
+        let mut hit_edited = hit_pristine.clone();
+        hit_edited[0].damage = 12.5;
+        let mut eff_edited = eff_pristine.clone();
+        // 1.5 -> 12.5 grows the effect function by one byte, shifting the game span.
+        eff_edited[0].scale = 12.5;
+
+        // Effect pass first, exactly as `sync_edits_to_source` orders it.
+        let effect_report =
+            sync_effect_calls(&index, "mario", "attack_air_n", &eff_pristine, &eff_edited).unwrap();
+        assert!(effect_report.changed > 0, "{effect_report:?}");
+
+        // Re-index before the game pass — without this the stale game span points into
+        // the wrong bytes and the hitbox write misses. This is the refresh the caller
+        // must do; the test fails if the two passes share one stale index.
+        let fresh = SourceIndex::build(tmp.path()).unwrap();
+        let hit_report =
+            sync_hitboxes(&fresh, "mario", "attack_air_n", &hit_pristine, &hit_edited).unwrap();
+        assert_eq!(hit_report.changed, 1, "{hit_report:?}");
+
+        let after = std::fs::read_to_string(tmp.path().join("src/mario/acmd.rs")).unwrap();
+        assert!(
+            after.contains(r#"macros::ATTACK(agent, 0, 0, Hash40::new("top"), 12.5, 361,"#),
+            "hitbox damage must land: {after}"
+        );
+        assert!(
+            !after.contains("0.0, 90.0, 45.0, 1.5, true"),
+            "old effect scale must be gone: {after}"
+        );
+        assert!(
+            after.contains("0.0, 90.0, 45.0, 12.5, true"),
+            "effect scale must land: {after}"
+        );
+    }
+
     /// A wrapper-form trail, in the shape `smash-script` actually declares.
     ///
     /// Hand-written, because no corpus script calls this spelling — the four vanilla trails are
