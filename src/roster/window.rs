@@ -837,10 +837,9 @@ impl RosterWindow {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("▦  Mod library");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("  ⟳ Rescan  ").small()))
+                            .add(egui::Button::new("Rescan"))
                             .on_hover_text("Re-read every imported mod's files from disk")
                             .clicked()
                         {
@@ -848,7 +847,7 @@ impl RosterWindow {
                         }
                         ui.add_space(4.0);
                         if ui
-                            .add(egui::Button::new(RichText::new("  ＋ Import folder  ").small().strong()))
+                            .add(egui::Button::new("Import folder…"))
                             .on_hover_text(
                                 "Pick a folder containing fighter/, effect/, or ui/ — or a folder that \
                                  wraps one.",
@@ -863,7 +862,7 @@ impl RosterWindow {
                             }
                         }
                         if ui
-                            .add(egui::Button::new(RichText::new("  ＋ Import archives  ").small().strong()))
+                            .add(egui::Button::new("Import archives…"))
                             .on_hover_text(
                                 "Pick any number of .zip / .7z mod archives. Archives are extracted for you; \
                                  folders are used in place, so your own edits stay visible.",
@@ -883,8 +882,7 @@ impl RosterWindow {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Import compiled mods here — folders or .zip/.7z archives, many at once. \
-                         Load order decides conflicts: later mods win any file two mods both provide.",
+                        "Later mods take priority when files overlap.",
                     )
                     .small()
                     .weak(),

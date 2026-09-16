@@ -181,13 +181,15 @@ host-side FTP bridge is not needed there.
 
 The plugin creates its SLight runtime directories automatically. The optional
 setup helper writes `gateway.txt`, whose port value changes the plugin's listen
-port. Keep port `7878` when using Visionary because the editor currently expects
-that port.
+port. Visionary reads the same file from the configured emulator SD card. For
+other layouts, set `VISIONARY_PLUGIN_PORT` or a full `VISIONARY_PLUGIN_ADDR` in
+the environment before starting the editor.
 
 ## Troubleshooting
 
 - If Visionary remains offline, confirm that the game has reached a mode where
-  frames are advancing and that TCP port `7878` is reachable.
+  frames are advancing and that the configured TCP port is reachable (`7878`
+  by default).
 - If the plugin does not start, verify the Skyline loader and all three runtime
   dependencies, then fully restart the game.
 - If live effects never appear, verify that the installed Smashline plugin is

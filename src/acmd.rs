@@ -16,6 +16,129 @@ pub fn move_name_to_pascal(name: &str) -> String {
         .collect()
 }
 
+/// Motion names whose ACMD scripts do not share the motion's spelling.
+///
+/// The motion list labels the mid forward tilt/smash `attack_s3_s` / `attack_s4_s`,
+/// but the game's scripts (and the dumped-script archive) spell the mid variants
+/// without the side indicator: `attacks3` / `attacks4` (`AttackS3.txt`,
+/// `game_attacks3`). The angled variants keep theirs (`attack_s3_hi` →
+/// `attacks3hi`), so only the `_s` forms need an alias. Ryu and Ken are the
+/// exception that proves it: their `attack_s3_s` really is `attacks3s`
+/// (`AttackS3S.txt`), so callers must try the motion's own spelling first and
+/// fall back to the alias rather than remapping unconditionally.
+///
+/// The numbered follow-ups behave the same way: `attack_s3_s2` / `attack_s3_s3`
+/// are `attacks32` / `attacks33` (`AttackS32.txt`), while Link's `attack_s4_s2`
+/// keeps its `s` (`AttackS4S2.txt`) and is listed for completeness.
+pub fn move_script_aliases(move_name: &str) -> Vec<String> {
+    let mut out = vec![move_name.to_string()];
+    let lower = move_name.to_ascii_lowercase();
+    let alias: Option<&str> = match lower.as_str() {
+        "attack_s3_s" => Some("attack_s3"),
+        "attack_s4_s" => Some("attack_s4"),
+        "attack_s3_s2" => Some("attack_s3_2"),
+        "attack_s3_s3" => Some("attack_s3_3"),
+        "attack_s4_s2" => Some("attack_s4_2"),
+        "attack_s4_s3" => Some("attack_s4_3"),
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        if alias != lower.as_str() {
+            out.push(alias.to_string());
+        }
+    }
+    out
+}
+
+/// ACMD script names to try for a motion + category prefix, in order.
+pub fn acmd_script_candidates(prefix: &str, move_name: &str) -> Vec<String> {
+    move_script_aliases(move_name)
+        .iter()
+        .map(|alias| acmd_script_name(prefix, alias))
+        .collect()
+}
+
+/// Script-name spellings to try for one ACMD function, in order.
+///
+/// This is the [`move_script_aliases`] mapping in script-name space (`game_…`,
+/// no underscores): `game_attacks3s` ↔ `game_attacks3`, `game_attacks4s` ↔
+/// `game_attacks4`, `game_attacks3s2` ↔ `game_attacks32`, and so on. Both
+/// directions are listed because both spellings are real scripts on different
+/// fighters — Ryu/Ken really do install `game_attacks3s` — so a lookup for
+/// either spelling must find the other as a fallback.
+pub fn script_name_aliases(script_name: &str) -> Vec<String> {
+    let mut out = vec![script_name.to_string()];
+    const PREFIXES: &[&str] = &["game_", "effect_", "sound_", "expression_"];
+    let lower = script_name.to_ascii_lowercase();
+    for prefix in PREFIXES {
+        if let Some(suffix) = lower.strip_prefix(prefix) {
+            let counterpart: Option<&str> = match suffix {
+                "attacks3s" => Some("attacks3"),
+                "attacks3" => Some("attacks3s"),
+                "attacks4s" => Some("attacks4"),
+                "attacks4" => Some("attacks4s"),
+                "attacks3s2" => Some("attacks32"),
+                "attacks32" => Some("attacks3s2"),
+                "attacks3s3" => Some("attacks33"),
+                "attacks33" => Some("attacks3s3"),
+                "attacks4s2" => Some("attacks42"),
+                "attacks42" => Some("attacks4s2"),
+                "attacks4s3" => Some("attacks43"),
+                "attacks43" => Some("attacks4s3"),
+                _ => None,
+            };
+            if let Some(other) = counterpart {
+                // Keep the caller's prefix spelling; only the suffix varies.
+                let prefix_len = prefix.len();
+                let original_prefix = &script_name[..prefix_len.min(script_name.len())];
+                out.push(format!("{original_prefix}{other}"));
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// The move spelling to use when *writing* a script name for a motion.
+///
+/// Fetching and linked-source reads try every spelling and take what exists,
+/// but an export has to pick one name without a network round trip. This is
+/// that pick: the cached hit when the move was viewed, else the game's own
+/// spelling — the de-`_s` alias for everyone except Ryu/Ken's real `attacks3s`,
+/// which is why the fighter matters here and nowhere else.
+///
+/// `attack_s4_s` always maps to `attack_s4` (no fighter ships `AttackS4S.txt`);
+/// `attack_s3_s2`/`s3` map to `attack_s3_2`/`_3` (`AttackS32/33.txt`); Link's
+/// `attack_s4_s2` keeps its `s` and needs no resolution.
+pub fn resolve_script_move_name(fighter: &str, move_name: &str) -> String {
+    let aliases = move_script_aliases(move_name);
+    if aliases.len() <= 1 {
+        return move_name.to_string();
+    }
+    // A viewed move already proved which spelling the archive carries.
+    for alias in &aliases {
+        if let Some(body) = cached_script_body_at(&script_cache_path(fighter, alias)) {
+            if !body.is_empty() {
+                return alias.clone();
+            }
+        }
+    }
+    let lower_fighter = fighter
+        .strip_prefix("fighter_")
+        .unwrap_or(fighter)
+        .to_ascii_lowercase();
+    let lower_move = move_name.to_ascii_lowercase();
+    match lower_move.as_str() {
+        "attack_s3_s" if lower_fighter == "ryu" || lower_fighter == "ken" => move_name.to_string(),
+        "attack_s3_s" => "attack_s3".to_string(),
+        "attack_s4_s" => "attack_s4".to_string(),
+        "attack_s3_s2" => "attack_s3_2".to_string(),
+        "attack_s3_s3" => "attack_s3_3".to_string(),
+        // `attack_s4_s2` is `AttackS4S2.txt` upstream; the alias never exists.
+        _ => move_name.to_string(),
+    }
+}
+
 /// Fetch and parse hitboxes for a fighter+move from GitHub.
 #[allow(dead_code)]
 pub fn fetch_acmd_script(fighter: &str, move_name: &str) -> anyhow::Result<AcmdScript> {
@@ -123,8 +246,32 @@ fn script_source_from_body(raw: &str) -> String {
 ///
 /// [`Some`] means "this move has been fetched", **not** "this move has a script": a cached miss
 /// comes back as `Some("")`. See [`script_source_from_body`].
+///
+/// Motions whose scripts drop the `_s` side indicator (`attack_s3_s` →
+/// `AttackS3.txt`) resolve through [`move_script_aliases`]: the first cached
+/// candidate with a body wins, so Ryu/Ken's `AttackS3S.txt` still wins for them
+/// while everyone else falls through to `AttackS3.txt`. When every candidate is
+/// cached but all are empty the move is a known miss (`Some("")`); when any
+/// candidate is uncached the answer needs the network (`None`).
 pub fn cached_script_body(fighter: &str, move_name: &str) -> Option<String> {
-    cached_script_body_at(&script_cache_path(fighter, move_name))
+    let mut seen_uncached = false;
+    let mut seen_cached = false;
+    for alias in move_script_aliases(move_name) {
+        match cached_script_body_at(&script_cache_path(fighter, &alias)) {
+            Some(body) if !body.is_empty() => return Some(body),
+            Some(_) => seen_cached = true,
+            None => seen_uncached = true,
+        }
+    }
+    if seen_cached && !seen_uncached {
+        Some(String::new())
+    } else if seen_cached {
+        // The exact spelling missed but an alias was never fetched: the network
+        // still has the answer, so this is not a definitive miss.
+        None
+    } else {
+        None
+    }
 }
 
 /// [`cached_script_body`] against an explicit path, so a test can exercise the real read and
@@ -141,16 +288,26 @@ pub(crate) fn cached_script_body_at(path: &std::path::Path) -> Option<String> {
 /// A move with no upstream script is an ordinary outcome, not an error, and is reported as an
 /// empty body. **`send()?` does not fail on a 404** — the request succeeded, and it is the
 /// status that says the file is missing, so this has to be checked explicitly.
+///
+/// Tries [`move_script_aliases`] in order, so `attack_s3_s` finds `AttackS3.txt`
+/// when `AttackS3S.txt` 404s, while Ryu/Ken's real `AttackS3S.txt` still wins
+/// for them because it is tried first.
 pub fn fetch_script_body(fighter: &str, move_name: &str) -> anyhow::Result<String> {
-    let pascal = move_name_to_pascal(move_name);
-    let url = format!(
-        "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
-    );
-    let response = HTTP.get(&url).send()?;
-    if !response.status().is_success() {
-        return Ok(String::new());
+    for alias in move_script_aliases(move_name) {
+        let pascal = move_name_to_pascal(&alias);
+        let url = format!(
+            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
+        );
+        let response = HTTP.get(&url).send()?;
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = script_source_from_body(&response.text()?);
+        if !body.is_empty() {
+            return Ok(body);
+        }
     }
-    Ok(response.text()?)
+    Ok(String::new())
 }
 
 /// Disk-cached [`fetch_script_body`]: bodies (**including misses**, stored as an empty file) are
@@ -160,15 +317,39 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
     if let Some(body) = cached_script_body(fighter, move_name) {
         return Ok(body);
     }
-    // Normalised before it is stored *and* before it is returned, so the cold path and the warm
-    // path cannot disagree: what goes on disk is exactly what a later read gives back.
-    let body = script_source_from_body(&fetch_script_body(fighter, move_name)?);
-    let path = script_cache_path(fighter, move_name);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    // Fetch each candidate in order, caching every result (including misses) under
+    // its own file, and return the first hit. Caching per candidate keeps the warm
+    // path consistent: what goes on disk is exactly what a later read gives back,
+    // and a miss for the exact spelling never masks a hit for its alias.
+    for alias in move_script_aliases(move_name) {
+        if let Some(body) = cached_script_body_at(&script_cache_path(fighter, &alias)) {
+            if !body.is_empty() {
+                return Ok(body);
+            }
+            continue;
+        }
+        // Normalised before it is stored *and* before it is returned, so the cold path and the warm
+        // path cannot disagree: what goes on disk is exactly what a later read gives back.
+        let pascal = move_name_to_pascal(&alias);
+        let url = format!(
+            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
+        );
+        let response = HTTP.get(&url).send()?;
+        let body = if !response.status().is_success() {
+            String::new()
+        } else {
+            script_source_from_body(&response.text()?)
+        };
+        let path = script_cache_path(fighter, &alias);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, &body);
+        if !body.is_empty() {
+            return Ok(body);
+        }
     }
-    let _ = std::fs::write(&path, &body);
-    Ok(body)
+    Ok(String::new())
 }
 
 pub fn parse_acmd_script(source: &str) -> AcmdScript {
@@ -3984,6 +4165,14 @@ fn script_function_name(prefix: &str, move_name: &str) -> String {
     )
 }
 
+/// The Rust function a source block declares (`fn game_attacks3(` → `game_attacks3`).
+fn declared_fn_name(source: &str) -> Option<String> {
+    let start = source.find("fn ")? + 3;
+    let open = source[start..].find('(')?;
+    let name = source[start..start + open].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 fn rust_module_name(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -4372,6 +4561,120 @@ fn emit_spawn_stop(call: &crate::data::EffectCall, indent: &str) -> String {
     )
 }
 
+/// Source lines for one added effect call, without frame wrapper or indentation.
+///
+/// This is what source sync inserts for a spawn the script never had: the same
+/// spawn line the export emits, plus its `LAST_EFFECT_SET_*` modifier lines.
+/// Colour and control calls are already complete single lines. Disabled calls
+/// produce nothing, matching the export which omits them.
+pub(crate) fn effect_call_insert_lines(call: &crate::data::EffectCall) -> Vec<String> {
+    if call.disabled {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for line in call.leading.iter() {
+        let line = line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    for line in emit_spawn_call(call, "").lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    if call.color.is_some() || call.control.is_some() {
+        for line in call.trailing.iter() {
+            let line = line.trim();
+            if !line.is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+        return lines;
+    }
+    if let Some(work) = &call.work_int {
+        lines.push(format!(
+            "visionary_last_effect_set_work_int(agent, {});",
+            const_expr(work)
+        ));
+    }
+    if let Some(offset) = call.camera_offset {
+        lines.push(format!(
+            "macros::LAST_EFFECT_SET_OFFSET_TO_CAMERA_FLAT(agent, {offset});"
+        ));
+    }
+    if let Some([r, g, b]) = call.tint {
+        lines.push(format!(
+            "macros::LAST_EFFECT_SET_COLOR(agent, {}, {}, {});",
+            num(r),
+            num(g),
+            num(b)
+        ));
+    }
+    if let Some([r, g, b]) = call.particle_tint {
+        lines.push(format!(
+            "macros::LAST_PARTICLE_SET_COLOR(agent, {}, {}, {});",
+            num(r),
+            num(g),
+            num(b)
+        ));
+    }
+    if let Some(alpha) = call.alpha {
+        lines.push(format!(
+            "macros::LAST_EFFECT_SET_ALPHA(agent, {});",
+            num(alpha)
+        ));
+    }
+    if let Some(values) = &call.scale_w {
+        lines.push(format!(
+            "visionary_last_effect_set_scale_w(agent, &[{}]);",
+            values
+                .iter()
+                .map(|value| num(*value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(rate) = call.rate {
+        lines.push(format!("macros::LAST_EFFECT_SET_RATE(agent, {rate});"));
+    }
+    for line in call.trailing.iter() {
+        let line = line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+/// Stop line for one added effect call, when its lifetime needs its own frame.
+///
+/// Returns `None` for one-shots and open-ended follows, which emit no stop.
+/// Otherwise the same `EFFECT_OFF_KIND` / `AFTER_IMAGE_OFF` line the export
+/// emits, without indentation.
+pub(crate) fn effect_call_stop_insert_line(call: &crate::data::EffectCall) -> Option<String> {
+    if call.disabled {
+        return None;
+    }
+    let needs_stop = if crate::data::is_color_command(&call.spawn_func) || call.control.is_some() {
+        false
+    } else if call.raw_line.is_some()
+        || call.trail_command.is_some()
+        || call.spawn_func == "AFTER_IMAGE_ON"
+    {
+        call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
+    } else {
+        call.follows_bone && call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
+    };
+    if !needs_stop {
+        return None;
+    }
+    let line = emit_spawn_stop(call, "");
+    let line = line.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
 /// Generate a smashline `effect_*` ACMD function that replays the (edited) effect-call
 /// list: calls grouped by spawn frame, disabled calls omitted. `tweaks` (keyed by effect
 /// hash) adds LAST_EFFECT_SET_COLOR / LAST_EFFECT_SET_RATE lines after matching spawns so
@@ -4664,7 +4967,7 @@ fn emit_effect_move_fn(
 /// `smash-script` declares the linked `LAST_EFFECT_SET_WORK_INT` primitive but has no Rust
 /// wrapper for it. Generated effect projects therefore use the same Lua-stack setup as the
 /// crate's wrappers, retaining the authored Work ID token at the call site.
-fn emit_last_effect_set_work_int_helper(indent: &str) -> Vec<String> {
+pub(crate) fn emit_last_effect_set_work_int_helper(indent: &str) -> Vec<String> {
     vec![
         format!("{indent}#[inline]"),
         format!("{indent}#[allow(dead_code)]"),
@@ -4685,7 +4988,7 @@ fn emit_last_effect_set_work_int_helper(indent: &str) -> Vec<String> {
 /// stack, but the vendored `smash-script` wrapper only exposes three typed arguments. Generated
 /// effect projects therefore push the authored number of values directly and call the linked
 /// primitive, preserving the dump's dynamic-arity semantics.
-fn emit_last_effect_set_scale_w_helper(indent: &str) -> Vec<String> {
+pub(crate) fn emit_last_effect_set_scale_w_helper(indent: &str) -> Vec<String> {
     vec![
         format!("{indent}#[inline]"),
         format!("{indent}#[allow(dead_code)]"),
@@ -5150,9 +5453,28 @@ pub fn install() {{
         let mut fn_entries: Vec<(String, String)> = Vec::new();
 
         for (move_name, script) in &sorted_moves {
-            let (fn_name, fn_src) = emit_move_fn(script, move_name);
+            // `attack_s3_s` installs as `game_attacks3` upstream (Ryu/Ken's real
+            // `game_attacks3s` excepted): resolve the motion to the script's
+            // spelling so the emitted function is the one the game calls.
+            let mut script_move = resolve_script_move_name(fighter, move_name);
+            if let Some((_, original)) =
+                slot_gates.get(&((*fighter).to_string(), (*move_name).to_string()))
+            {
+                // A costume gate carries the donor's own script as the else arm;
+                // its declared name is the spelling that fighter actually runs.
+                if let Some(declared) = declared_fn_name(original) {
+                    let moves = move_script_aliases(move_name);
+                    let scripts = acmd_script_candidates("game", move_name);
+                    if let Some(index) = scripts.iter().position(|name| name == &declared) {
+                        if let Some(matched) = moves.get(index) {
+                            script_move = matched.clone();
+                        }
+                    }
+                }
+            }
+            let (fn_name, fn_src) = emit_move_fn(script, &script_move);
             // The acmd script name used in agent.acmd() is "game_{movename_no_underscores}"
-            let acmd_name = script_function_name("game", move_name);
+            let acmd_name = script_function_name("game", &script_move);
             match slot_gates.get(&((*fighter).to_string(), (*move_name).to_string())) {
                 Some((slots, original)) => {
                     // The registered name stays `fn_name`; the authored body moves to a
@@ -5172,7 +5494,8 @@ pub fn install() {{
             let mut sorted_fx = fx_moves.clone();
             sorted_fx.sort_by_key(|(m, _, _)| *m);
             for (move_name, calls, residue) in &sorted_fx {
-                let (fn_name, fn_src) = emit_effect_move_fn(calls, move_name, &tweaks, residue);
+                let script_move = resolve_script_move_name(fighter, move_name);
+                let (fn_name, fn_src) = emit_effect_move_fn(calls, &script_move, &tweaks, residue);
                 acmd_src.push_str(&fn_src);
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
@@ -5184,7 +5507,8 @@ pub fn install() {{
             let mut sorted_sfx = sfx_moves.clone();
             sorted_sfx.sort_by_key(|(m, _)| *m);
             for (move_name, script) in &sorted_sfx {
-                let (fn_name, fn_src) = emit_sound_move_fn(script, move_name);
+                let script_move = resolve_script_move_name(fighter, move_name);
+                let (fn_name, fn_src) = emit_sound_move_fn(script, &script_move);
                 acmd_src.push_str(&fn_src);
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
@@ -5196,7 +5520,8 @@ pub fn install() {{
             let mut sorted_expression = expression_moves.clone();
             sorted_expression.sort_by_key(|(m, _)| *m);
             for (move_name, script) in &sorted_expression {
-                let (fn_name, fn_src) = emit_expression_move_fn(script, move_name);
+                let script_move = resolve_script_move_name(fighter, move_name);
+                let (fn_name, fn_src) = emit_expression_move_fn(script, &script_move);
                 acmd_src.push_str(&fn_src);
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
@@ -12161,5 +12486,113 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert!(emitted.contains("macros::ADD_SPEED_NO_LIMIT(agent, 0, 1, 2);"));
         assert!(emitted.contains("macros::CORRECT(agent);"));
         assert!(emitted.contains("macros::CORRECT(agent, 1, 2);"));
+    }
+
+    /// Issue 34: the motion list spells the mid forward tilt/smash
+    /// `attack_s3_s` / `attack_s4_s` while the scripts (and the archive) spell
+    /// them `attacks3` / `attacks4`. The motion's own spelling is tried first
+    /// so Ryu/Ken's real `AttackS3S.txt` still wins for them.
+    #[test]
+    fn ftilt_and_fsmash_motions_fall_back_to_their_script_spelling() {
+        assert_eq!(
+            move_script_aliases("attack_s3_s"),
+            vec!["attack_s3_s".to_string(), "attack_s3".to_string()]
+        );
+        assert_eq!(
+            move_script_aliases("attack_s4_s"),
+            vec!["attack_s4_s".to_string(), "attack_s4".to_string()]
+        );
+        assert_eq!(
+            move_script_aliases("attack_s3_s2"),
+            vec!["attack_s3_s2".to_string(), "attack_s3_2".to_string()]
+        );
+        assert_eq!(
+            move_script_aliases("attack_s3_s3"),
+            vec!["attack_s3_s3".to_string(), "attack_s3_3".to_string()]
+        );
+        assert_eq!(
+            move_script_aliases("attack_air_n"),
+            vec!["attack_air_n".to_string()]
+        );
+        assert_eq!(
+            acmd_script_candidates("game", "attack_s3_s"),
+            vec!["game_attacks3s".to_string(), "game_attacks3".to_string()]
+        );
+        assert_eq!(
+            acmd_script_candidates("game", "attack_s4_s"),
+            vec!["game_attacks4s".to_string(), "game_attacks4".to_string()]
+        );
+        assert_eq!(move_name_to_pascal("attack_s3"), "AttackS3".to_string());
+        assert_eq!(
+            acmd_script_name("game", "attack_s3"),
+            "game_attacks3".to_string()
+        );
+    }
+
+    #[test]
+    fn script_name_aliases_cover_both_spellings() {
+        assert_eq!(
+            script_name_aliases("game_attacks3s"),
+            vec!["game_attacks3s".to_string(), "game_attacks3".to_string()]
+        );
+        assert_eq!(
+            script_name_aliases("game_attacks3"),
+            vec!["game_attacks3".to_string(), "game_attacks3s".to_string()]
+        );
+        assert_eq!(
+            script_name_aliases("effect_attacks4s"),
+            vec![
+                "effect_attacks4s".to_string(),
+                "effect_attacks4".to_string()
+            ]
+        );
+        assert_eq!(
+            script_name_aliases("game_attacks32"),
+            vec!["game_attacks32".to_string(), "game_attacks3s2".to_string()]
+        );
+        assert_eq!(
+            script_name_aliases("game_attackairn"),
+            vec!["game_attackairn".to_string()]
+        );
+    }
+
+    #[test]
+    fn export_resolves_ftilt_to_the_script_the_game_calls() {
+        // A fighter name that can never have a populated script cache, so the
+        // static mapping decides without touching the network.
+        let nowhere = "visionary_test_no_such_fighter_34";
+        assert_eq!(
+            resolve_script_move_name(nowhere, "attack_s3_s"),
+            "attack_s3".to_string()
+        );
+        assert_eq!(
+            resolve_script_move_name(nowhere, "attack_s4_s"),
+            "attack_s4".to_string()
+        );
+        assert_eq!(
+            resolve_script_move_name(nowhere, "attack_s3_s2"),
+            "attack_s3_2".to_string()
+        );
+        assert_eq!(
+            resolve_script_move_name("ryu", "attack_s3_s"),
+            "attack_s3_s".to_string()
+        );
+        assert_eq!(
+            resolve_script_move_name("ken", "attack_s3_s"),
+            "attack_s3_s".to_string()
+        );
+        assert_eq!(
+            resolve_script_move_name("mario", "attack_air_n"),
+            "attack_air_n".to_string()
+        );
+        // The resolved spelling emits the function the game installs.
+        let script = parse_acmd_script(
+            "unsafe extern \"C\" fn game_attacks3(agent: &mut L2CAgentBase) {\n}\n",
+        );
+        let emitted = preview_game_fn(&script, &resolve_script_move_name(nowhere, "attack_s3_s"));
+        assert!(
+            emitted.contains("fn game_attacks3("),
+            "expected game_attacks3, got: {emitted}"
+        );
     }
 }

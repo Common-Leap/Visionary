@@ -320,6 +320,72 @@ pub fn workspace_romfs(workspace: &Path) -> PathBuf {
     workspace.join("romfs")
 }
 
+/// Copy selected dump files into their game-relative editing paths. Existing edits win.
+pub fn copy_base_files(
+    workspace: &Path,
+    data_root: &Path,
+    sources: &[PathBuf],
+) -> anyhow::Result<(usize, usize)> {
+    let root = data_root.canonicalize()?;
+    let mut files = Vec::new();
+    for source in sources {
+        let source = source.canonicalize()?;
+        let relative = source
+            .strip_prefix(&root)
+            .context("Choose files inside the base game folder")?
+            .to_path_buf();
+        anyhow::ensure!(source.is_file(), "Choose files, not folders");
+        files.push((source, relative));
+    }
+    let overlay = workspace_romfs(workspace);
+    std::fs::create_dir_all(&overlay)?;
+    anyhow::ensure!(
+        !std::fs::symlink_metadata(&overlay)?
+            .file_type()
+            .is_symlink(),
+        "The editing folder must not be a symbolic link"
+    );
+    let mut copied = 0;
+    let mut skipped = 0;
+    for (source, relative) in files {
+        let destination = overlay.join(&relative);
+        let mut parent = overlay.clone();
+        for component in relative.parent().unwrap_or(Path::new("")).components() {
+            parent.push(component);
+            if parent.exists() {
+                anyhow::ensure!(
+                    !std::fs::symlink_metadata(&parent)?.file_type().is_symlink(),
+                    "An editing folder is a symbolic link: {}",
+                    parent.display()
+                );
+            } else {
+                std::fs::create_dir(&parent)?;
+            }
+        }
+        let mut output = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                skipped += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let result = std::fs::File::open(&source)
+            .and_then(|mut input| std::io::copy(&mut input, &mut output));
+        if let Err(error) = result {
+            drop(output);
+            let _ = std::fs::remove_file(&destination);
+            return Err(error.into());
+        }
+        copied += 1;
+    }
+    Ok((copied, skipped))
+}
+
 /// Files that make up one fighter model folder. A model edit normally needs more than the
 /// `.numdlb`: material, skeleton, shader, helper, and texture files all travel together.
 pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
@@ -1473,27 +1539,18 @@ pub fn preserve_workspace_romfs(
 }
 
 const WORKSPACE_README: &str = "\
-# Visionary project workspace\n\
-\n\
-This folder holds every edit for the project.\n\
-\n\
-- `modproject.json` — every edit the tool supports (moves, params, roster,\n\
-  names, portraits, effect values/textures). Edited in Visionary, saved with\n\
-  Ctrl+S.\n\
-- `assets/` — portable images managed by Visionary. Keep beside the JSON.\n\
-- `reference/` — import reference copies (source text, notes). Never exported.\n\
-- `romfs/` — MANUAL overlay in arc layout. Drop files the tool does not model\n\
-  here and they ship verbatim on export:\n\
-  - models: `romfs/fighter/<fighter>/model/...` (*.numdlb, *.numshb, *.nusktb…)\n\
-  - animations: `romfs/fighter/<fighter>/motion/...` (*.nuanmb, *.nushdb…)\n\
-  - sound: `romfs/sound/...`\n\
-  - binary effect/message overrides: `romfs/effect/...`, `romfs/ui/message/...`\n\
-\n\
-Project Files can import models, animations, and swing.prc into this overlay.\n\
-Edit those imported copies, then use Reload asset preview to update the\n\
-experimental in-game carrier preview. Export keeps the original asset names.\n\
-\n\
-See Windows → Project Files in Visionary for the full map.\n";
+Visionary project\n\n\
+Open modproject.json in Visionary. Save with Ctrl+S.\n\n\
+romfs/       Game files to edit; included when you export the mod.\n\
+assets/      Images managed by Visionary. Keep these with the project.\n\
+reference/   Original imported files and notes; excluded from export.\n\
+modproject.json stores moves, effects, roster, and trait edits.\n\n\
+In Project Files, use Copy base game files to choose files from your game\n\
+dump, or Copy base model for a complete costume model and its textures.\n\
+Copies keep their game paths under romfs/. Existing files are preserved.\n\
+Edit these copies with your preferred tools. Open project folder takes\n\
+you to them. Reload asset preview updates supported models and animations\n\
+in game; Project > Export Mod Folder packages your edits.\n";
 
 /// Create a workspace folder: `modproject.json` (if missing), `assets/`,
 /// `reference/`, `romfs/` plus a README explaining the manual drop zones.
@@ -1588,109 +1645,6 @@ pub enum WorkspaceSupport {
     Reference,
     /// Not modelled: drop into `romfs/` overlay, ships verbatim on export.
     Manual,
-}
-
-/// One row of the workspace map.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceEntry {
-    pub kind: &'static str,
-    pub support: WorkspaceSupport,
-    /// Where it lives in the workspace (relative).
-    pub workspace_path: &'static str,
-    /// Example game path it ships as.
-    pub game_path: &'static str,
-    pub notes: &'static str,
-}
-
-/// Every edit class and where it goes — including the ones the tool does not
-/// support (models, animations, …). Single source for the Project Files panel.
-pub fn workspace_map() -> Vec<WorkspaceEntry> {
-    vec![
-        WorkspaceEntry {
-            kind: "Fighter moves (ACMD)",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "modproject.json",
-            game_path: "plugin.nro (built on export)",
-            notes: "Hitboxes, effects, sounds per move.",
-        },
-        WorkspaceEntry {
-            kind: "Fighter params",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "modproject.json",
-            game_path: "fighter/common/param/fighter_param.prc",
-            notes: "Weight, speeds, jumps — sparse diffs.",
-        },
-        WorkspaceEntry {
-            kind: "Roster order / visibility / row fields",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "modproject.json",
-            game_path: "ui/param/database/ui_chara_db.prc",
-            notes: "Rebuilt from base + overrides on export.",
-        },
-        WorkspaceEntry {
-            kind: "Display names",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "modproject.json",
-            game_path: "ui/message/msg_name.xmsbt",
-            notes: "Adopted from .xmsbt on import.",
-        },
-        WorkspaceEntry {
-            kind: "Portraits / stock icons",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "assets/roster_ui/...",
-            game_path: "ui/replace/chara/.../*.bntx",
-            notes: "PNGs managed by Visionary.",
-        },
-        WorkspaceEntry {
-            kind: "Effect textures",
-            support: WorkspaceSupport::Supported,
-            workspace_path: "assets/textures/...",
-            game_path: "effect pool BNTX",
-            notes: "Replacements + additions.",
-        },
-        WorkspaceEntry {
-            kind: "Source reference",
-            support: WorkspaceSupport::Reference,
-            workspace_path: "reference/...",
-            game_path: "—",
-            notes: "Copied on import for reading; never exported.",
-        },
-        WorkspaceEntry {
-            kind: "Models",
-            support: WorkspaceSupport::Manual,
-            workspace_path: "romfs/fighter/<fighter>/model/...",
-            game_path: "fighter/<fighter>/model/...",
-            notes: "Not modelled — drop .numdlb/.numshb/.nusktb here; ships verbatim.",
-        },
-        WorkspaceEntry {
-            kind: "Animations",
-            support: WorkspaceSupport::Manual,
-            workspace_path: "romfs/fighter/<fighter>/motion/...",
-            game_path: "fighter/<fighter>/motion/...",
-            notes: "Not modelled — drop .nuanmb/.nusmab here; ships verbatim.",
-        },
-        WorkspaceEntry {
-            kind: "Sound / streams",
-            support: WorkspaceSupport::Manual,
-            workspace_path: "romfs/sound/...",
-            game_path: "sound/...",
-            notes: "Not modelled — ships verbatim.",
-        },
-        WorkspaceEntry {
-            kind: "Binary effects / messages",
-            support: WorkspaceSupport::Manual,
-            workspace_path: "romfs/effect/... · romfs/ui/message/...",
-            game_path: "effect/... · ui/message/*.msbt",
-            notes: "Compiled .eff/.msbt are reference-only; manual overrides ship verbatim.",
-        },
-        WorkspaceEntry {
-            kind: "Compiled plugins",
-            support: WorkspaceSupport::Reference,
-            workspace_path: "reference/...",
-            game_path: "*.nro",
-            notes: "Reference-only by design; editor shows vanilla scripts.",
-        },
-    ]
 }
 
 #[cfg(test)]
@@ -1862,32 +1816,64 @@ mod tests {
     }
 
     #[test]
-    fn workspace_map_names_manual_drop_zones_for_unsupported_edits() {
-        let map = workspace_map();
-        let kinds: Vec<&str> = map.iter().map(|e| e.kind).collect();
-        for needed in [
-            "Models",
-            "Animations",
-            "Sound / streams",
-            "Binary effects / messages",
-        ] {
-            assert!(
-                kinds.contains(&needed),
-                "workspace map must show where {needed} go: {kinds:?}"
-            );
-        }
-        let models = map.iter().find(|e| e.kind == "Models").unwrap();
-        assert_eq!(models.support, WorkspaceSupport::Manual);
-        assert!(models.workspace_path.contains("romfs/fighter"));
-        assert!(models.notes.contains("ships verbatim"));
-        let anims = map.iter().find(|e| e.kind == "Animations").unwrap();
-        assert_eq!(anims.support, WorkspaceSupport::Manual);
-        assert!(anims.workspace_path.contains("motion"));
-        // Supported edits keep living in the JSON/assets.
-        assert!(map
-            .iter()
-            .any(|e| e.support == WorkspaceSupport::Supported
-                && e.workspace_path == "modproject.json"));
+    fn base_files_keep_game_paths_and_existing_edits_on_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let workspace = dir.path().join("project");
+        let relative = "fighter/mario/model/body/c00/model.numdlb";
+        let source = dump.join(relative);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, b"base model").unwrap();
+        assert_eq!(
+            copy_base_files(&workspace, &dump, std::slice::from_ref(&source)).unwrap(),
+            (1, 0)
+        );
+        let edited = workspace_romfs(&workspace).join(relative);
+        std::fs::write(&edited, b"edited model").unwrap();
+        assert_eq!(
+            copy_base_files(&workspace, &dump, &[source]).unwrap(),
+            (0, 1)
+        );
+        let export = dir.path().join("export");
+        assert_eq!(
+            merge_romfs_overlay(&workspace_romfs(&workspace), &export).unwrap(),
+            (1, vec![])
+        );
+        assert_eq!(
+            std::fs::read(export.join(relative)).unwrap(),
+            b"edited model"
+        );
+    }
+
+    #[test]
+    fn base_file_selection_is_validated_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        std::fs::create_dir(&dump).unwrap();
+        let inside = dump.join("valid.bin");
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&inside, b"inside").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let workspace = dir.path().join("project");
+        assert!(copy_base_files(&workspace, &dump, &[inside, outside]).is_err());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn base_copy_does_not_follow_workspace_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let workspace = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(dump.join("fighter")).unwrap();
+        std::fs::create_dir_all(workspace_romfs(&workspace)).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let source = dump.join("fighter/model.bin");
+        std::fs::write(&source, b"model").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace_romfs(&workspace).join("fighter")).unwrap();
+        assert!(copy_base_files(&workspace, &dump, &[source]).is_err());
+        assert!(!outside.join("model.bin").exists());
     }
 
     #[test]

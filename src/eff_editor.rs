@@ -382,6 +382,7 @@ pub struct EffTransplantRemoval {
 
 pub struct EffEditor {
     pub open: bool,
+    pub transplant_requested: bool,
     /// Eff path queued by the main editor (fighter selection) — loaded when the window is
     /// (or becomes) open, so closed-window fighter browsing stays cheap.
     pending_load: Option<PathBuf>,
@@ -528,6 +529,7 @@ impl Default for EffEditor {
     fn default() -> Self {
         Self {
             open: false,
+            transplant_requested: false,
             pending_load: None,
             pending_select: None,
             pending_edits: None,
@@ -2013,14 +2015,8 @@ impl EffEditor {
     }
 
     fn draw_header(&mut self, ui: &mut Ui, link: &GameLink) {
-        ui.horizontal(|ui| {
-            let (dot, label) = match link.status() {
-                LinkStatus::Connected => (egui::Color32::from_rgb(90, 220, 90), "game connected"),
-                LinkStatus::Connecting => (egui::Color32::YELLOW, "connecting…"),
-                LinkStatus::Disconnected => (egui::Color32::from_rgb(220, 90, 90), "game offline"),
-            };
-            ui.colored_label(dot, "●");
-            ui.label(label);
+        ui.horizontal_wrapped(|ui| {
+            crate::ui::game_connection(ui, link.status());
             ui.separator();
             // The ONLY send control, in the header so it is reachable from every panel. A
             // second copy used to sit in the game panel reporting none of the phases below it,
@@ -2207,7 +2203,7 @@ impl EffEditor {
         });
 
         // ── Base game files: reference source only. ──────────────────────────────────
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 egui::RichText::new("Base files (reference):")
                     .small()
@@ -2285,12 +2281,13 @@ impl EffEditor {
                 .on_hover_text("Entries with unsent emitter edits, highlighted in the list");
             }
         });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.entry_filter)
-                .hint_text("filter entries")
-                .desired_width(f32::INFINITY),
+        crate::ui::search_field(
+            ui,
+            "eff_entry_search",
+            &mut self.entry_filter,
+            "Search effects…",
         );
-        let filter = self.entry_filter.to_lowercase();
+        let filter = self.entry_filter.trim().to_lowercase();
         let transplant_entries: std::collections::HashMap<String, EffTransplant> = self
             .current_edit_source()
             .map(|source| {
@@ -2306,8 +2303,11 @@ impl EffEditor {
         egui::ScrollArea::vertical()
             .id_salt("eff_entries")
             .show(ui, |ui| {
+                if !self.entries.iter().any(|entry| entry.name.to_lowercase().contains(&filter)) {
+                    ui.weak(if self.entries.is_empty() { "Open an effect file to browse entries" } else { "No matching effects" });
+                }
                 for (i, entry) in self.entries.iter().enumerate() {
-                    if !filter.is_empty() && !entry.name.contains(&filter) {
+                    if !filter.is_empty() && !entry.name.to_lowercase().contains(&filter) {
                         continue;
                     }
                     ui.horizontal(|ui| {
@@ -3792,7 +3792,8 @@ impl EffEditor {
         self.draw_texture_panel(ui);
         ui.separator();
 
-        ui.heading("Game preview");
+        ui.label("Game preview")
+            .on_hover_text("Send edits, then trigger the move again to preview them.");
         let (frames_rx, edits_tx) = link.stats();
         ui.label(
             egui::RichText::new(format!(
@@ -3849,7 +3850,7 @@ impl EffEditor {
                 .color(egui::Color32::from_rgb(190, 140, 255)),
             );
             if ui
-                .button("Remove this transplanted effect from the game")
+                .button("Remove transplant")
                 .on_hover_text(
                     "Remove this entry from the project, rebuild the merged EFF, and unload \
                      its runtime carrier resources immediately",
@@ -3894,28 +3895,21 @@ impl EffEditor {
             })
             .unwrap_or_default();
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Authored edits → live eff").strong());
         if edited.is_empty() {
             ui.label(
-                egui::RichText::new("no authored edits yet — the game shows the original eff")
+                egui::RichText::new("No emitter edits")
                     .small()
                     .color(egui::Color32::DARK_GRAY),
             );
         } else {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} of {total} emitter(s) edited: {edited_names}",
-                    edited.len()
-                ))
-                .monospace(),
-            );
+                egui::RichText::new(format!("{} of {total} emitters edited", edited.len())).small(),
+            )
+            .on_hover_text(edited_names);
             ui.label(
-                egui::RichText::new(
-                    "Baked into the live carrier — only these emitters change. Send from the \
-                     header, then re-trigger the move to see it on a fresh spawn.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
+                egui::RichText::new("Send edits, then trigger the move again.")
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
         }
         // Texture replacements are file-wide, not per-entry, so they are listed here in full
@@ -3971,33 +3965,33 @@ impl EffEditor {
         };
 
         ui.separator();
-        ui.label(egui::RichText::new("Live values (from game)").strong());
-        let d = &kind.data;
-        ui.label(
-            egui::RichText::new(format!(
-                "scale {:.3} · speed {:.2} · visible {} · updates {}",
-                d.scale, d.speed, d.visible, kind.updates
-            ))
-            .small()
-            .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "pos [{:.2} {:.2} {:.2}] · rot X {:.2} · Y {:.2} · Z {:.2} · bone {}",
-                d.pos.x, d.pos.y, d.pos.z, d.rot.x, d.rot.y, d.rot.z, d.bone_name
-            ))
-            .small()
-            .monospace(),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "spawn baseline: scale {:.3} · pos [{:.2} {:.2} {:.2}]",
-                kind.first.scale, kind.first.pos.x, kind.first.pos.y, kind.first.pos.z
-            ))
-            .small()
-            .color(egui::Color32::GRAY),
-        );
-
+        ui.collapsing("Live values", |ui| {
+            let d = &kind.data;
+            ui.label(
+                egui::RichText::new(format!(
+                    "scale {:.3} · speed {:.2} · visible {} · updates {}",
+                    d.scale, d.speed, d.visible, kind.updates
+                ))
+                .small()
+                .monospace(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "pos [{:.2} {:.2} {:.2}] · rot X {:.2} · Y {:.2} · Z {:.2} · bone {}",
+                    d.pos.x, d.pos.y, d.pos.z, d.rot.x, d.rot.y, d.rot.z, d.bone_name
+                ))
+                .small()
+                .monospace(),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "spawn baseline: scale {:.3} · pos [{:.2} {:.2} {:.2}]",
+                    kind.first.scale, kind.first.pos.x, kind.first.pos.y, kind.first.pos.z
+                ))
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        });
         // The kind-level "color × / speed ×" multipliers used to sit here. They predate the
         // carrier: they were once the only way to change how an effect looked at runtime, and
         // they are whole-effect by construction — one multiplier tints every emitter of every
@@ -4014,16 +4008,15 @@ impl EffEditor {
     }
 
     fn draw_transplant_section(&mut self, ui: &mut Ui, entry_name: &str) {
-        // Transplanting moved to the Transplant Effects window (Windows menu in the main
-        // editor): it can pick a donor from ANY eff (pool-wide search) and redirect existing uses.
-        ui.label(
-            egui::RichText::new(format!(
-                "To transplant '{entry_name}' (or any other effect), open Windows → \
-                 Transplant Effects in the main window."
+        if ui
+            .button("Transplant effects…")
+            .on_hover_text(format!(
+                "Copy {entry_name} or another effect into a fighter"
             ))
-            .small()
-            .color(egui::Color32::GRAY),
-        );
+            .clicked()
+        {
+            self.transplant_requested = true;
+        }
     }
 }
 

@@ -530,16 +530,15 @@ impl CssView {
                     }
                     ui.separator();
 
-                    ui.label(RichText::new("⌕").small().weak());
-                    let filter_resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.grid_filter)
-                            .desired_width(110.0)
-                            .hint_text("Filter…"),
-                    );
-                    if filtering && ui.small_button(RichText::new("✕").small()).clicked() {
-                        self.grid_filter.clear();
-                        filter_resp.request_focus();
-                    }
+                    ui.scope(|ui| {
+                        ui.set_width(150.0);
+                        crate::ui::search_field(
+                            ui,
+                            "roster_search",
+                            &mut self.grid_filter,
+                            "Find character…",
+                        );
+                    });
 
                     ui.separator();
 

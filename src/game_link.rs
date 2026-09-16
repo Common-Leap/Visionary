@@ -1,13 +1,20 @@
-// Game link: TCP client to the slight_replica plugin (127.0.0.1:7878).
+// Game link: TCP client to the slight_replica plugin (127.0.0.1:7878 by default).
 // Speaks the plugin's `<TCP_MESSAGE>{json}</TCP_MESSAGE>` framing (formerly RPM's role):
 //  - inbound  `{"header":"Notify","body":"{\"Notify\":{id,name,value_in_json}}"}` = live
 //    effect-kind tabs (id = hash40 of the effect name, value = RpmEffectData JSON)
 //  - outbound `{"id":<hash>,"newValue":"<sparse JSON>"}` = an edit; only controls the
 //    user actually changed are sent and pinned.
+//
+// Connection robustness notes (see `link_thread` / `serve_connection`):
+//  - the outbound queue survives disconnects: edits made while offline are flushed on
+//    reconnect, with full-replace families coalesced to their latest state;
+//  - a periodic `ping` probes a silent connection so a half-open socket (emulator
+//    stalled, NAT timeout, missed FIN) is detected even when the user is idle;
+//  - the plugin answers `ping` with `Pong`; any inbound frame also proves liveness.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +22,103 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub const PLUGIN_ADDR: &str = "127.0.0.1:7878";
+const DEFAULT_PLUGIN_PORT: u16 = 7878;
+/// How long a `connect()` may take before the attempt is abandoned. The emulator's
+/// virtual network can stall under load; 1s was tight enough to fail connects that
+/// would have succeeded a moment later.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pause between reconnect attempts. Fixed 1s keeps recovery snappy without hammering.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// A stalled emulator can stop reading while still holding the socket open. Without a
+/// write timeout the link thread wedges inside `write_all` forever: status stays
+/// "Connected" while nothing moves. 2s is generous for localhost yet bounds the stall.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Idle probe period. Forces traffic on an otherwise silent connection so a dead peer
+/// is noticed via a send/recv error rather than lingering as a phantom "Connected".
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// No inbound frame (Notify / capture / CarrierStatus heartbeat / Pong) for this long
+/// means the connection is half-open: drop it and reconnect rather than showing stale
+/// "Connected". 20s comfortably covers menu idling (no spawns) while still recovering
+/// within a reasonable wait — the 5s ping guarantees traffic in the meantime.
+const STALE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound for queued outbound frames while offline. Full-replace families are coalesced
+/// to latest, so this is only reached by pathological churn; dropping oldest keeps
+/// memory bounded and preserves the newest (authoritative) state.
+const OUTBOX_CAP: usize = 8192;
+
+/// Address of the in-game plugin, honouring explicit overrides first.
+///
+/// 1. `VISIONARY_PLUGIN_ADDR` (full `ip:port`) when set and parseable.
+/// 2. `VISIONARY_PLUGIN_PORT` (port only) when set.
+/// 3. The port in `<emulator SD>/slight/user/gateway.txt`, which is the same file the
+///    plugin reads its listen port from — a custom port there must be matched here or
+///    the editor dials 7878 while the game listens elsewhere.
+/// 4. [`PLUGIN_ADDR`] as the fallback.
+pub fn plugin_addr() -> SocketAddr {
+    if let Ok(addr) = std::env::var("VISIONARY_PLUGIN_ADDR") {
+        let addr = addr.trim();
+        if !addr.is_empty() {
+            if let Ok(parsed) = addr.parse::<SocketAddr>() {
+                return parsed;
+            }
+        }
+    }
+    let mut port = DEFAULT_PLUGIN_PORT;
+    if let Ok(port_str) = std::env::var("VISIONARY_PLUGIN_PORT") {
+        if let Ok(parsed) = port_str.trim().parse::<u16>() {
+            if parsed != 0 {
+                port = parsed;
+            }
+        }
+    } else if let Some(gateway_port) = gateway_file_port() {
+        port = gateway_port;
+    }
+    format!("127.0.0.1:{port}")
+        .parse()
+        .unwrap_or_else(|_| PLUGIN_ADDR.parse().unwrap())
+}
+
+/// Port from the plugin's `gateway.txt` on the emulator SD, if present and parseable.
+///
+/// Mirrors the plugin's own `rpm_listen_port` parsing (dotted-quad with optional
+/// `:port`; port out of range falls back to 7878). Returns `None` when the SD root or
+/// file cannot be read, so callers fall back to the default.
+fn gateway_file_port() -> Option<u16> {
+    let sd = crate::scratch_dirs::emulator_sd_root()?;
+    let text = std::fs::read_to_string(sd.join("slight/user/gateway.txt")).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (addr, port_str) = match line.rsplit_once(':') {
+            Some((a, p)) => (a, Some(p)),
+            None => (line, None),
+        };
+        if !is_dotted_quad(addr) {
+            continue;
+        }
+        if let Some(port_str) = port_str {
+            match port_str.parse::<u32>() {
+                Ok(port) if port > 0 && port <= 65535 => return Some(port as u16),
+                _ => return Some(DEFAULT_PLUGIN_PORT),
+            }
+        }
+        return Some(DEFAULT_PLUGIN_PORT);
+    }
+    None
+}
+
+fn is_dotted_quad(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let valid = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), Some(d), None)
+            if valid(a) && valid(b) && valid(c) && valid(d)
+    )
+}
 
 // ── Wire structs (must match slight_replica effect_data.rs exactly) ──────────
 
@@ -1011,6 +1115,20 @@ impl LiveOverrides {
         sent
     }
 
+    /// Re-send every user-owned multiplier after a socket reconnect. A completed TCP write is
+    /// not an application acknowledgement: the plugin may restart before its game thread
+    /// applies the edit, so each handshake replays the editor's authoritative state.
+    pub fn resend_tweaks(&self, link: &GameLink) -> usize {
+        let mut sent = 0;
+        for (hash, entry) in &self.entries {
+            if entry.user_tweaked {
+                link.send_modifier_edit(*hash, &entry.form, false);
+                sent += 1;
+            }
+        }
+        sent
+    }
+
     /// True while a debounced send is pending (keep repainting so it fires).
     pub fn any_dirty(&self) -> bool {
         self.entries.values().any(|e| e.dirty_at.is_some())
@@ -1131,6 +1249,7 @@ pub struct LiveKind {
 struct Shared {
     status: LinkStatus,
     client_id: Option<u64>,
+    connection_epoch: u64,
     kinds: BTreeMap<u64, LiveKind>,
     /// Live ACMD capture log, keyed by motion hash (deduped; survives reconnects).
     captures: BTreeMap<u64, Vec<CaptureLine>>,
@@ -1181,35 +1300,84 @@ struct Shared {
     last_error: Option<String>,
     frames_rx: u64,
     edits_tx: u64,
+    /// When the last inbound frame arrived (any header, including `Pong`). Drives the
+    /// half-open detector in `serve_connection`: a connection that stops delivering
+    /// anything for `STALE_TIMEOUT` is dropped and redialled.
+    last_rx: Option<Instant>,
 }
 
-const SPAWN_RULES_MARKER: &str = "\"spawn_rules\":";
+/// Markers for every full-list-replace family on the wire. Each such message replaces
+/// the plugin's entire list for its family, so only the newest per marker matters;
+/// intermediate states replay stale edits and churn per-playback injection identity.
+const FULL_REPLACE_MARKERS: &[&str] = &[
+    "\"spawn_rules\":",
+    "\"hitbox_rules\":",
+    "\"effect_control_rules\":",
+    "\"effect_aliases\":",
+    "\"donor_effs\":",
+    "\"donor_bytes\":",
+    "\"asset_bundle\":",
+    "\"effect_names\":",
+];
 
-fn is_spawn_rules_message(message: &str) -> bool {
-    message.contains(SPAWN_RULES_MARKER)
-}
+const IDEMPOTENT_COMMAND_MARKERS: &[&str] = &[
+    r#""command":"reset_pins""#,
+    r#""command":"clear_acmd_captures""#,
+    r#""command":"live_eff_reload""#,
+    r#""command":"live_eff_probe""#,
+];
 
-/// Keep only the newest full spawn-rule replacement in an outbound batch. Spawn-rule messages
-/// replace the plugin's entire list, so sending intermediate drag states can only replay stale
-/// edits and churn the plugin's per-playback injection identity.
-fn retain_latest_spawn_rules(messages: &mut Vec<String>) {
-    let Some(latest) = messages
-        .iter()
-        .rposition(|message| is_spawn_rules_message(message))
-    else {
+fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
+    let Some(latest) = messages.iter().rposition(|m| m.contains(marker)) else {
         return;
     };
     let mut index = 0;
-    messages.retain(|message| {
-        let keep = !is_spawn_rules_message(message) || index == latest;
+    messages.retain(|m| {
+        let keep = !m.contains(marker) || index == latest;
         index += 1;
         keep
     });
 }
 
-fn queue_latest_spawn_rules(outbox: &mut Vec<String>, frame: String) {
+/// Keep only the newest message per full-replace family in a batch. Applied both when
+/// queueing (so offline drags cannot grow the outbox without bound) and when flushing
+/// (so a burst of queued states sends once).
+fn retain_latest_full_replace(messages: &mut Vec<String>) {
+    for marker in FULL_REPLACE_MARKERS {
+        retain_latest_for_marker(messages, marker);
+    }
+}
+
+fn retain_latest_idempotent_commands(messages: &mut Vec<String>) {
+    for marker in IDEMPOTENT_COMMAND_MARKERS {
+        retain_latest_for_marker(messages, marker);
+    }
+}
+
+fn trim_outbox(messages: &mut Vec<String>) {
+    while messages.len() > OUTBOX_CAP {
+        let removable = messages.iter().position(|message| {
+            !IDEMPOTENT_COMMAND_MARKERS
+                .iter()
+                .any(|marker| message.contains(marker))
+        });
+        messages.remove(removable.unwrap_or(0));
+    }
+}
+
+/// Push a full-replace frame, coalescing superseded states for the same family.
+fn queue_latest_full_replace(outbox: &mut Vec<String>, frame: String) {
     outbox.push(frame);
-    retain_latest_spawn_rules(outbox);
+    retain_latest_full_replace(outbox);
+    trim_outbox(outbox);
+}
+
+/// Push a command or sparse modifier edit while keeping the queue bounded. Repeated idempotent
+/// commands coalesce, and overflow discards the oldest modifier before a control command.
+fn push_outbox_capped(outbox: &mut Vec<String>, frame: String) {
+    outbox.push(frame);
+    retain_latest_idempotent_commands(outbox);
+    trim_outbox(outbox);
 }
 
 impl Default for Shared {
@@ -1217,6 +1385,7 @@ impl Default for Shared {
         Self {
             status: LinkStatus::Disconnected,
             client_id: None,
+            connection_epoch: 0,
             kinds: BTreeMap::new(),
             captures: BTreeMap::new(),
             capture_claimed_runs: BTreeMap::new(),
@@ -1244,6 +1413,7 @@ impl Default for Shared {
             last_error: None,
             frames_rx: 0,
             edits_tx: 0,
+            last_rx: None,
         }
     }
 }
@@ -1361,7 +1531,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            queue_latest_spawn_rules(&mut s.outbox, frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1378,7 +1548,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1395,7 +1565,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1411,7 +1581,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1428,7 +1598,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1448,7 +1618,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut shared) = self.shared.lock() {
-            shared.outbox.push(frame);
+            queue_latest_full_replace(&mut shared.outbox, frame);
             shared.edits_tx += 1;
         }
     }
@@ -1465,14 +1635,18 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
 
-    /// Client id assigned by the plugin for this connection (changes on reconnect).
-    pub fn client_id(&self) -> Option<u64> {
-        self.shared.lock().ok().and_then(|s| s.client_id)
+    /// Desktop-local session identity. Unlike the plugin's client id, this stays unique when a
+    /// restarted plugin resets its counter and assigns the same numeric id again.
+    pub fn connection_epoch(&self) -> Option<u64> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.client_id.is_some().then_some(s.connection_epoch))
     }
 
     /// Kinds the plugin reports active user pins for (fresh-session desync detection).
@@ -1497,7 +1671,7 @@ impl GameLink {
         }
         let frame = "<TCP_MESSAGE>{\"command\":\"reset_pins\"}</TCP_MESSAGE>".to_string();
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            push_outbox_capped(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1510,7 +1684,7 @@ impl GameLink {
         }
         let frame = "<TCP_MESSAGE>{\"command\":\"live_eff_reload\"}</TCP_MESSAGE>".to_string();
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            push_outbox_capped(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1522,7 +1696,7 @@ impl GameLink {
         }
         let frame = "<TCP_MESSAGE>{\"command\":\"live_eff_probe\"}</TCP_MESSAGE>".to_string();
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            push_outbox_capped(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1567,8 +1741,10 @@ impl GameLink {
             s.capture_ends.clear();
             s.capture_completed_runs.clear();
             s.captures_seq += 1;
-            s.outbox
-                .push("<TCP_MESSAGE>{\"command\":\"clear_acmd_captures\"}</TCP_MESSAGE>".into());
+            push_outbox_capped(
+                &mut s.outbox,
+                "<TCP_MESSAGE>{\"command\":\"clear_acmd_captures\"}</TCP_MESSAGE>".into(),
+            );
             s.edits_tx += 1;
         }
     }
@@ -1764,7 +1940,7 @@ impl GameLink {
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            queue_latest_full_replace(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1789,7 +1965,7 @@ impl GameLink {
         let payload = serde_json::json!({ "id": id, "newValue": value.to_string() });
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
         if let Ok(mut s) = self.shared.lock() {
-            s.outbox.push(frame);
+            push_outbox_capped(&mut s.outbox, frame);
             s.edits_tx += 1;
         }
     }
@@ -1797,52 +1973,119 @@ impl GameLink {
 
 // ── Connection thread ─────────────────────────────────────────────────────────
 
+fn connect_hint(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::ConnectionRefused => {
+            " — is the game running with the Visionary plugin? In Eden set \
+             Configure → System → Network → Network Interface to your active card, \
+             apply, then restart the game"
+        }
+        ErrorKind::TimedOut => {
+            " — timed out; the emulator's virtual network may be stalled or the \
+             Network Interface may be unset (Eden Configure → System → Network)"
+        }
+        _ => "",
+    }
+}
+
 fn link_thread(shared: Arc<Mutex<Shared>>) {
     loop {
         {
             let mut s = shared.lock().unwrap();
             s.status = LinkStatus::Connecting;
+            s.client_id = None;
+            s.last_rx = None;
         }
-        let addr: std::net::SocketAddr = PLUGIN_ADDR.parse().unwrap();
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+        let addr = plugin_addr();
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
             Ok(stream) => {
                 {
                     let mut s = shared.lock().unwrap();
                     s.status = LinkStatus::Connected;
                     s.last_error = None;
+                    // Fresh socket, fresh liveness baseline: the stale timer must not
+                    // inherit silence from the previous (dead) connection.
+                    s.last_rx = Some(Instant::now());
                 }
                 let reason = serve_connection(&shared, stream);
                 let mut s = shared.lock().unwrap();
                 s.status = LinkStatus::Disconnected;
                 s.last_error = reason;
+                s.client_id = None;
+                s.last_rx = None;
             }
             Err(e) => {
+                let hint = connect_hint(&e);
                 let mut s = shared.lock().unwrap();
                 s.status = LinkStatus::Disconnected;
-                s.last_error = Some(format!("connect: {e}"));
+                s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
+                s.client_id = None;
+                s.last_rx = None;
             }
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(RECONNECT_DELAY);
     }
 }
 
 fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Option<String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let _ = stream.set_nodelay(true);
     let mut buf = String::new();
     let mut chunk = [0u8; 8192];
+    let mut last_ping = Instant::now();
+    let mut ping_seq: u64 = 0;
+
+    // Requeue unsent frames at the FRONT, preserving order, so an interrupted flush
+    // loses nothing: edits made while offline are delivered on the next connection.
+    let requeue_front = |shared: &Arc<Mutex<Shared>>, unsent: Vec<String>| {
+        if unsent.is_empty() {
+            return;
+        }
+        if let Ok(mut s) = shared.lock() {
+            let mut combined = unsent;
+            combined.extend(std::mem::take(&mut s.outbox));
+            retain_latest_full_replace(&mut combined);
+            retain_latest_idempotent_commands(&mut combined);
+            trim_outbox(&mut combined);
+            s.outbox = combined;
+        }
+    };
 
     loop {
         // Outbound edits first — they're latency-sensitive.
-        let mut pending: Vec<String> = {
+        let pending: Vec<String> = {
             let mut s = shared.lock().unwrap();
             std::mem::take(&mut s.outbox)
         };
-        retain_latest_spawn_rules(&mut pending);
-        for msg in pending {
+        let mut pending = pending;
+        retain_latest_full_replace(&mut pending);
+        let mut failed_at: Option<(usize, String)> = None;
+        for (index, msg) in pending.iter().enumerate() {
             if let Err(e) = stream.write_all(msg.as_bytes()) {
-                return Some(format!("send: {e}"));
+                failed_at = Some((index, format!("send: {e}")));
+                break;
             }
+        }
+        if let Some((index, reason)) = failed_at {
+            // `index` failed; it and everything after it never hit the wire.
+            let unsent: Vec<String> = pending.into_iter().skip(index).collect();
+            requeue_front(shared, unsent);
+            return Some(reason);
+        }
+
+        // Idle probe: force traffic so a half-open socket surfaces as an error even
+        // when the user makes no edits. The plugin answers with `Pong` (older builds
+        // log `unknown command: ping` and stay connected — harmless).
+        if last_ping.elapsed() >= PING_INTERVAL {
+            ping_seq = ping_seq.wrapping_add(1);
+            let ping =
+                format!("<TCP_MESSAGE>{{\"command\":\"ping\",\"echo\":{ping_seq}}}</TCP_MESSAGE>");
+            if let Err(e) = stream.write_all(ping.as_bytes()) {
+                return Some(format!("send ping: {e}"));
+            }
+            last_ping = Instant::now();
         }
 
         match stream.read(&mut chunk) {
@@ -1857,6 +2100,22 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => return Some(format!("recv: {e}")),
+        }
+
+        // Half-open detector: pings guarantee regular traffic, and the plugin emits a
+        // CarrierStatus heartbeat (~2s) while in a match, so a long silence means the
+        // peer is gone even though the socket never closed.
+        let stale = shared
+            .lock()
+            .ok()
+            .and_then(|s| s.last_rx)
+            .is_some_and(|t| t.elapsed() > STALE_TIMEOUT);
+        if stale {
+            return Some(
+                "stale: no frames from the game for 20s (emulator stalled or connection \
+                 half-open; reconnecting)"
+                    .into(),
+            );
         }
     }
 }
@@ -1877,8 +2136,24 @@ fn extract_frames(buf: &mut String) -> Vec<String> {
             out.push(payload);
         }
     }
-    if buf.len() > 1 << 20 {
+    // Runaway guard that never drops an in-flight message. The old code cleared the
+    // whole buffer past 1 MiB, which discarded a fragmented frame mid-arrival. Only
+    // genuine garbage (no opening tag) is dropped. A prefix before a recent opening tag is
+    // trimmed, while one unterminated frame beyond the hard cap is rejected.
+    const GARBAGE_CAP: usize = 1 << 20;
+    const FRAME_CAP: usize = 16 << 20;
+    if buf.len() > GARBAGE_CAP && !buf.contains(OPEN) {
         buf.clear();
+    } else if buf.len() > FRAME_CAP {
+        if let Some(last) = buf.rfind(OPEN) {
+            if last > 0 && buf.len() - last <= FRAME_CAP {
+                *buf = buf[last..].to_string();
+            } else {
+                buf.clear();
+            }
+        } else {
+            buf.clear();
+        }
     }
     out
 }
@@ -1899,7 +2174,11 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 
     let mut s = shared.lock().unwrap();
     s.frames_rx += 1;
+    s.last_rx = Some(Instant::now());
     match header {
+        // Heartbeat answer from the plugin. Any frame proves liveness; `Pong` carries
+        // no state and needs no further handling.
+        "Pong" => {}
         "Notify" => {
             let Some(n) = body.get("Notify") else { return };
             let Some(id) = n.get("id").and_then(|i| i.as_u64()) else {
@@ -2138,10 +2417,14 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
         }
         "RemoveAll" => s.kinds.clear(),
         "GiveClientId" => {
-            s.client_id = body
+            let client_id = body
                 .get("GiveClientId")
                 .and_then(|g| g.get("client_id"))
                 .and_then(|c| c.as_u64());
+            if client_id.is_some() {
+                s.connection_epoch = s.connection_epoch.wrapping_add(1).max(1);
+            }
+            s.client_id = client_id;
         }
         _ => {}
     }
@@ -5295,7 +5578,7 @@ mod tests {
         let pending: Vec<&String> = shared
             .outbox
             .iter()
-            .filter(|message| is_spawn_rules_message(message))
+            .filter(|message| message.contains("\"spawn_rules\":"))
             .collect();
         assert_eq!(pending.len(), 1, "superseded drag states must not be sent");
         let frame = pending[0];
@@ -5544,5 +5827,311 @@ mod tests {
         assert!(cleared.target.is_empty());
         assert!(!cleared.ready);
         assert_eq!(cleared.reports, 2);
+    }
+
+    #[test]
+    fn frame_extraction_handles_fragmented_adjacent_frames_and_leaves_trailing_bytes() {
+        const OPEN: &str = "<TCP_MESSAGE>";
+        const CLOSE: &str = "</TCP_MESSAGE>";
+        let stream = format!("garbage{OPEN}{{\"id\":1}}{CLOSE}{OPEN}{{\"id\":2}}{CLOSE}trailing");
+        let mut buf = String::new();
+        let mut payloads = Vec::new();
+
+        // Three-byte reads split opening and closing tags as well as JSON payloads, like a
+        // socket read that happens to end in the middle of any protocol token.
+        for chunk in stream.as_bytes().chunks(3) {
+            buf.push_str(std::str::from_utf8(chunk).unwrap());
+            payloads.extend(extract_frames(&mut buf));
+        }
+
+        assert_eq!(
+            payloads,
+            vec![r#"{"id":1}"#.to_string(), r#"{"id":2}"#.to_string()]
+        );
+        assert_eq!(buf, "trailing");
+    }
+
+    #[test]
+    fn frame_extraction_discards_oversized_garbage_but_preserves_latest_partial_frame() {
+        const OPEN: &str = "<TCP_MESSAGE>";
+        const CLOSE: &str = "</TCP_MESSAGE>";
+
+        let mut garbage = "g".repeat((1 << 20) + 1);
+        assert!(extract_frames(&mut garbage).is_empty());
+        assert!(garbage.is_empty(), "unframed garbage must not grow forever");
+
+        // Put a valid opening tag after more than FRAME_CAP bytes of junk. The guard should trim
+        // only the junk and retain the in-flight frame so a later socket read can finish it.
+        let mut partial = "g".repeat((16 << 20) + 1);
+        partial.push_str(OPEN);
+        partial.push_str("partial");
+        assert!(extract_frames(&mut partial).is_empty());
+        assert_eq!(partial, format!("{OPEN}partial"));
+
+        partial.push_str(CLOSE);
+        assert_eq!(extract_frames(&mut partial), vec!["partial".to_string()]);
+        assert!(partial.is_empty());
+
+        let mut runaway_frame = format!("{OPEN}{}", "x".repeat(16 << 20));
+        assert!(extract_frames(&mut runaway_frame).is_empty());
+        assert!(
+            runaway_frame.is_empty(),
+            "one unterminated frame must be bounded"
+        );
+    }
+
+    #[test]
+    fn full_replace_outbox_coalesces_each_family_and_preserves_other_order() {
+        fn family(name: &str, value: u8) -> String {
+            format!("<TCP_MESSAGE>{{\"{name}\":{value}}}</TCP_MESSAGE>")
+        }
+        let command = |name: &str| format!("<TCP_MESSAGE>{{\"command\":\"{name}\"}}</TCP_MESSAGE>");
+        let mut outbox = Vec::new();
+        let spawn_old = family("spawn_rules", 1);
+        let spawn_new = family("spawn_rules", 2);
+        let hitbox_old = family("hitbox_rules", 3);
+        let hitbox_new = family("hitbox_rules", 4);
+        let alias_old = family("effect_aliases", 5);
+        let alias_new = family("effect_aliases", 6);
+        let before = command("before");
+        let between = command("between");
+        let after = command("after");
+
+        for frame in [
+            before.clone(),
+            spawn_old,
+            hitbox_old,
+            between.clone(),
+            spawn_new.clone(),
+            alias_old,
+            hitbox_new.clone(),
+            alias_new.clone(),
+            after.clone(),
+        ] {
+            queue_latest_full_replace(&mut outbox, frame);
+        }
+
+        assert_eq!(
+            outbox,
+            vec![before, between, spawn_new, hitbox_new, alias_new, after],
+            "only superseded full replacements should disappear; command order must stay stable"
+        );
+    }
+
+    #[test]
+    fn outbox_overflow_preserves_latest_critical_commands() {
+        let mut outbox = vec![
+            "<TCP_MESSAGE>{\"command\":\"reset_pins\"}</TCP_MESSAGE>".to_string(),
+            "<TCP_MESSAGE>{\"command\":\"clear_acmd_captures\"}</TCP_MESSAGE>".to_string(),
+        ];
+        for id in 0..=OUTBOX_CAP {
+            push_outbox_capped(
+                &mut outbox,
+                format!("<TCP_MESSAGE>{{\"id\":{id},\"newValue\":\"{{}}\"}}</TCP_MESSAGE>"),
+            );
+        }
+        assert_eq!(outbox.len(), OUTBOX_CAP);
+        assert!(outbox.iter().any(|message| message.contains("reset_pins")));
+        assert!(outbox
+            .iter()
+            .any(|message| message.contains("clear_acmd_captures")));
+
+        push_outbox_capped(
+            &mut outbox,
+            "<TCP_MESSAGE>{\"command\":\"reset_pins\"}</TCP_MESSAGE>".to_string(),
+        );
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|message| message.contains("reset_pins"))
+                .count(),
+            1,
+            "idempotent commands should coalesce instead of consuming the queue"
+        );
+    }
+
+    #[test]
+    fn reconnect_replays_authoritative_user_tweaks() {
+        let link = GameLink::default();
+        let mut overrides = LiveOverrides::default();
+        overrides.restore_tweak(
+            0x1234,
+            RpmEffectData {
+                effect_name: "sys_test".to_string(),
+                speed: 1.5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(overrides.flush_all(&link), 1);
+        link.shared.lock().unwrap().outbox.clear();
+
+        assert_eq!(overrides.resend_tweaks(&link), 1);
+        let outbox = &link.shared.lock().unwrap().outbox;
+        assert_eq!(outbox.len(), 1);
+        assert!(outbox[0].contains("\\\"speed\\\":1.5"));
+    }
+
+    #[test]
+    fn failed_flush_requeues_unsent_frames_in_original_order() {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let pending = vec![
+            "<TCP_MESSAGE>{\"command\":\"first\"}</TCP_MESSAGE>".to_string(),
+            "<TCP_MESSAGE>{\"command\":\"second\"}</TCP_MESSAGE>".to_string(),
+        ];
+        shared.lock().unwrap().outbox = pending.clone();
+
+        let reason = serve_connection(&shared, server);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|message| message.starts_with("send:")),
+            "a closed write half must report a send failure: {reason:?}"
+        );
+        assert_eq!(
+            shared.lock().unwrap().outbox,
+            pending,
+            "the failed frame and every later frame must be available for reconnect"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn successful_flush_writes_pending_frames_in_order() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let expected = [
+            "<TCP_MESSAGE>{\"command\":\"first\"}</TCP_MESSAGE>",
+            "<TCP_MESSAGE>{\"command\":\"second\"}</TCP_MESSAGE>",
+        ];
+        let wire = expected.concat();
+        shared.lock().unwrap().outbox = expected.iter().map(|s| (*s).to_string()).collect();
+
+        let thread_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || serve_connection(&thread_shared, server));
+        let mut received = vec![0u8; wire.len()];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(received, wire.as_bytes());
+        assert!(shared.lock().unwrap().outbox.is_empty());
+
+        drop(client);
+        assert_eq!(worker.join().unwrap(), Some("closed by plugin".into()));
+    }
+
+    #[test]
+    fn plugin_address_prefers_full_override_then_port_then_gateway_file() {
+        use std::ffi::OsString;
+        use std::sync::OnceLock;
+
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        struct EnvGuard {
+            values: Vec<(&'static str, Option<OsString>)>,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (name, value) in self.values.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _env = EnvGuard {
+            values: [
+                "VISIONARY_PLUGIN_ADDR",
+                "VISIONARY_PLUGIN_PORT",
+                "VISIONARY_SD_DIR",
+            ]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        };
+        let sd = tempfile::tempdir().unwrap();
+        let gateway = sd.path().join("slight/user/gateway.txt");
+        std::fs::create_dir_all(gateway.parent().unwrap()).unwrap();
+        std::env::set_var("VISIONARY_SD_DIR", sd.path());
+
+        std::env::set_var("VISIONARY_PLUGIN_ADDR", "[::1]:3210");
+        std::env::set_var("VISIONARY_PLUGIN_PORT", "4321");
+        assert_eq!(plugin_addr(), "[::1]:3210".parse().unwrap());
+
+        std::env::set_var("VISIONARY_PLUGIN_ADDR", "not-an-address");
+        assert_eq!(plugin_addr(), "127.0.0.1:4321".parse().unwrap());
+
+        std::env::remove_var("VISIONARY_PLUGIN_PORT");
+        std::fs::write(&gateway, "127.0.0.1:5432\n").unwrap();
+        assert_eq!(plugin_addr(), "127.0.0.1:5432".parse().unwrap());
+
+        std::fs::write(&gateway, "127.0.0.1:65536\n").unwrap();
+        assert_eq!(plugin_addr(), "127.0.0.1:7878".parse().unwrap());
+
+        std::fs::write(&gateway, "not-a-dotted-quad:5432\n").unwrap();
+        assert_eq!(plugin_addr(), "127.0.0.1:7878".parse().unwrap());
+    }
+
+    #[test]
+    fn pong_updates_liveness_and_silent_stale_connection_requests_reconnect() {
+        use std::net::{TcpListener, TcpStream};
+
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let stale = Instant::now() - STALE_TIMEOUT - Duration::from_secs(1);
+        shared.lock().unwrap().last_rx = Some(stale);
+        let mut pong = plugin_frame("Pong", &serde_json::json!({}));
+        for payload in extract_frames(&mut pong) {
+            handle_frame(&shared, &payload);
+        }
+        let refreshed = shared.lock().unwrap().last_rx.unwrap();
+        assert!(refreshed > stale);
+        assert_eq!(shared.lock().unwrap().frames_rx, 1);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        shared.lock().unwrap().last_rx = Some(stale);
+
+        let reason = serve_connection(&shared, server);
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "stale: no frames from the game for 20s (emulator stalled or connection half-open; reconnecting)"
+            )
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn repeated_plugin_ids_still_create_distinct_connection_epochs() {
+        let shared: Arc<Mutex<Shared>> = Arc::default();
+        let handshake = || {
+            plugin_frame(
+                "GiveClientId",
+                &serde_json::json!({ "GiveClientId": { "client_id": 1 } }),
+            )
+        };
+
+        for expected_epoch in [1, 2] {
+            let mut frame = handshake();
+            for payload in extract_frames(&mut frame) {
+                handle_frame(&shared, &payload);
+            }
+            let state = shared.lock().unwrap();
+            assert_eq!(state.client_id, Some(1));
+            assert_eq!(state.connection_epoch, expected_epoch);
+        }
     }
 }

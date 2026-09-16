@@ -14,6 +14,10 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static INBOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static RECV_BUF: Mutex<String> = Mutex::new(String::new());
+// `handshake` runs on the accept thread while `drain` runs on the sender thread.  Both write
+// to the same stream, so a reconnect with queued frames could otherwise interleave bytes from
+// the handshake and the first queued message and make the XML-like framing unrecoverable.
+static SEND_LOCK: Mutex<()> = Mutex::new(());
 static mut SOCKET_POOL: [u8; 0x40000] = [0; 0x40000];
 
 const AF_INET: i32 = 2;
@@ -21,10 +25,19 @@ const SOCK_STREAM: i32 = 1;
 const IPPROTO_TCP: i32 = 6;
 const SOL_SOCKET: i32 = 0xffff;
 const SO_REUSEADDR: i32 = 4;
+const OUTBOX_CAP: usize = 8192;
+const SEND_BATCH_CAP: usize = 256;
+const FRAME_OPEN: &str = "<TCP_MESSAGE>";
+const FRAME_CLOSE: &str = "</TCP_MESSAGE>";
+const PONG_INNER: &str = r#"{"header":"Pong","body":"{}"}"#;
 
 extern "C" {
     #[link_name = "\u{1}_ZN2nn6socket4RecvEiPvmi"]
     fn Recv(socket: i32, buffer: *mut u8, bufferLength: u64, flags: i32) -> i64;
+    #[link_name = "\u{1}_ZN2nn6socket8ShutdownEii"]
+    fn Shutdown(socket: i32, how: i32) -> i32;
+    #[link_name = "\u{1}_ZN2nn6socket5CloseEi"]
+    fn Close(socket: i32) -> i32;
 }
 
 pub fn start(port: u16) {
@@ -146,13 +159,23 @@ fn server_loop(port: u16) {
                 continue;
             }
             RECV_BUF.lock().clear();
-            CLIENT_FD.store(client, Ordering::SeqCst);
-            let cid = handshake(client);
+            // Keep the client unpublished while the two handshake frames are sent.  The sender
+            // thread keys off CLIENT_FD, so publishing it first would let queued application
+            // frames race ahead of RemoveAll/GiveClientId on a reconnect.
+            let Some(cid) = handshake(client) else {
+                crate::slight::diag::note(format!(
+                    "SRV handshake failed fd={client} — waiting for the next client"
+                ));
+                close_client(client);
+                continue;
+            };
+            CLIENT_FD.store(client, Ordering::Release);
             crate::rust_extender::debuggable_server::on_rpm_client_connected(cid);
             // Inbound only. Recv blocks until data/disconnect; outbound is the sender thread's job.
             while CLIENT_FD.load(Ordering::Acquire) == client {
                 recv_once(client);
             }
+            close_client(client);
         }
     }
 }
@@ -207,30 +230,63 @@ fn report_bind_failure(port: u16, rc: u32) {
     skyline::println!("[SLight] bind :{port} failed rc={rc} — second plugin copy? build={build}");
 }
 
-unsafe fn handshake(client: i32) -> u64 {
+unsafe fn handshake(client: i32) -> Option<u64> {
     let cid = CLIENT_ID.fetch_add(1, Ordering::SeqCst) + 1;
-    send_frame(client, r#"{"header":"RemoveAll","body":"{}"}"#);
-    send_frame(
+    // Keep both handshake frames together with respect to the dedicated sender.  This matters
+    // after a reconnect, when a failed send may have left frames waiting in OUTBOX.
+    let _send_guard = send_guard();
+    if send_frame_unlocked(client, r#"{"header":"RemoveAll","body":"{}"}"#) < 0 {
+        return None;
+    }
+    if send_frame_unlocked(
         client,
         &format!(
             r#"{{"header":"GiveClientId","body":"{{\"GiveClientId\":{{\"client_id\":{cid}}}}}"}}"#
         ),
-    );
-    cid
+    ) < 0
+    {
+        return None;
+    }
+    Some(cid)
 }
 
-unsafe fn send_frame(client: i32, inner: &str) -> i64 {
-    let msg = format!("<TCP_MESSAGE>{inner}</TCP_MESSAGE>");
-    nnsdk::nn::socket::Send(client, msg.as_ptr(), msg.len() as u64, 0) as i64
+/// Acquire the stream-write lock without parking a thread in the Skyline environment.
+fn send_guard() -> parking_lot::MutexGuard<'static, ()> {
+    loop {
+        if let Some(guard) = SEND_LOCK.try_lock() {
+            return guard;
+        }
+        sleep_ms(1);
+    }
+}
+
+/// Write one complete framed message.  TCP `Send` is allowed to return a short write; treating
+/// the first return value as the whole frame corrupts the next frame when a large donor payload
+/// or a congested emulator splits it.
+unsafe fn send_frame_unlocked(client: i32, inner: &str) -> i64 {
+    let msg = format!("{FRAME_OPEN}{inner}{FRAME_CLOSE}");
+    let bytes = msg.as_bytes();
+    let mut sent = 0usize;
+    while sent < bytes.len() {
+        let remaining = bytes.len() - sent;
+        let n =
+            nnsdk::nn::socket::Send(client, bytes.as_ptr().add(sent), remaining as u64, 0) as i64;
+        if n <= 0 || n as usize > remaining {
+            return -1;
+        }
+        sent += n as usize;
+    }
+    sent as i64
 }
 
 unsafe fn recv_once(client: i32) {
     let mut chunk = [0u8; 4096];
     let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, 0);
     if n <= 0 {
-        if n == 0 {
-            CLIENT_FD.store(-1, Ordering::SeqCst);
-        }
+        // A reset/error is just as terminal as EOF.  Leaving the fd live strands the accept
+        // loop in this dead client forever, so the editor's reconnect attempts all fail.
+        mark_client_disconnected(client);
+        crate::slight::diag::note(format!("SRV recv fd={client} rc={n} — client disconnected"));
         return;
     }
     let text = String::from_utf8_lossy(&chunk[..n as usize]);
@@ -240,16 +296,39 @@ unsafe fn recv_once(client: i32) {
 }
 
 fn extract_inbound(buf: &mut String) {
+    for payload in extract_payloads(buf) {
+        inbound_push(payload);
+    }
+}
+
+/// Extract framed or legacy newline-delimited payloads without touching plugin state.  Keeping
+/// this pure makes the stream recovery rules testable on the host and avoids hiding parser bugs
+/// behind the game-only inbound queue.
+fn extract_payloads(buf: &mut String) -> Vec<String> {
+    let mut payloads = Vec::new();
     loop {
-        let start = buf.find("<TCP_MESSAGE>");
-        let end = buf.find("</TCP_MESSAGE>");
+        let start = buf.find(FRAME_OPEN);
+        let end = buf.find(FRAME_CLOSE);
         if let (Some(s), Some(e)) = (start, end) {
             if e >= s {
-                let payload = buf[s + 13..e].trim().to_string();
-                *buf = buf[e + 14..].to_string();
+                let payload = buf[s + FRAME_OPEN.len()..e].trim().to_string();
+                *buf = buf[e + FRAME_CLOSE.len()..].to_string();
                 if !payload.is_empty() {
-                    inbound_push(payload);
+                    payloads.push(payload);
                 }
+                continue;
+            }
+            // A stale close tag before the next opening tag would otherwise remain forever and
+            // poison every subsequent frame on this connection.
+            *buf = buf[e + FRAME_CLOSE.len()..].to_string();
+            continue;
+        }
+
+        if start.is_none() {
+            // Drop an orphan closing tag even when there is no opening tag yet. This is the same
+            // recovery policy as the desktop parser and handles a torn previous frame.
+            if let Some(e) = end {
+                *buf = buf[e + FRAME_CLOSE.len()..].to_string();
                 continue;
             }
         }
@@ -258,7 +337,7 @@ fn extract_inbound(buf: &mut String) {
             let line = buf[..nl].trim().to_string();
             *buf = buf[nl + 1..].to_string();
             if !line.is_empty() {
-                inbound_push(line);
+                payloads.push(line);
             }
             continue;
         }
@@ -272,11 +351,18 @@ fn extract_inbound(buf: &mut String) {
         }
         break;
     }
+    payloads
 }
 
 /// Server thread → INBOUND. try_lock + SleepThread retry — never parks (parked waiters
 /// never wake in this environment).
 fn inbound_push(payload: String) {
+    // Heartbeats belong to the transport rather than the game-frame pump. Answer here so a
+    // paused or heavily loaded game still proves that its socket thread is alive.
+    if is_ping(&payload) {
+        queue_pong();
+        return;
+    }
     // Timing rules are pure shared state. Install them on receipt so the next ACMD coroutine
     // boundary can see a frame-0 edit; the general parser below remains responsible for all
     // commands and game-thread-only updates.
@@ -292,6 +378,14 @@ fn inbound_push(payload: String) {
     }
 }
 
+fn is_ping(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .is_some_and(|value| {
+            value.get("command").and_then(|command| command.as_str()) == Some("ping")
+        })
+}
+
 pub fn queue(inner: String) {
     // Push only — the sender thread does the (blocking) Send. Never send from here: this is
     // called on the game thread, and a blocking Send while RPM is slow would stall the frame.
@@ -300,7 +394,7 @@ pub fn queue(inner: String) {
     for _ in 0..1000 {
         if let Some(mut out) = OUTBOX.try_lock() {
             // Bound growth if RPM is stuck; drop newest.
-            if out.len() < 8192 {
+            if out.len() < OUTBOX_CAP {
                 out.push(inner);
             }
             return;
@@ -314,18 +408,78 @@ unsafe fn drain(client: i32) {
     // (game thread) never waits on the socket via the OUTBOX lock. Sender thread may sleep.
     let msgs: Vec<String> = loop {
         if let Some(mut out) = OUTBOX.try_lock() {
-            break out.drain(..).collect();
+            let count = out.len().min(SEND_BATCH_CAP);
+            break out.drain(..count).collect();
         }
         sleep_ms(1);
     };
     if !msgs.is_empty() {
         crate::slight::diag::note(format!("SND drain {} msgs", msgs.len()));
     }
-    for msg in msgs {
-        let rc = send_frame(client, &msg);
+    let _send_guard = send_guard();
+    for (index, msg) in msgs.iter().enumerate() {
+        let rc = send_frame_unlocked(client, msg);
         if rc < 0 {
             crate::slight::diag::note(format!("SND send failed rc={rc}"));
+            // The current frame may have been partially written, so it must be retried only on
+            // a fresh TCP connection. Requeue it and every later frame in their original order.
+            requeue_front(msgs.into_iter().skip(index).collect());
+            mark_client_disconnected(client);
+            return;
         }
+    }
+}
+
+fn requeue_front(unsent: Vec<String>) {
+    if unsent.is_empty() {
+        return;
+    }
+    loop {
+        if let Some(mut out) = OUTBOX.try_lock() {
+            let mut combined = unsent;
+            combined.extend(out.drain(..));
+            // Keep the same oldest-first/drop-newest policy as `queue` while preserving all
+            // frames that were already in flight ahead of newer edits.
+            combined.truncate(OUTBOX_CAP);
+            *out = combined;
+            return;
+        }
+        sleep_ms(1);
+    }
+}
+
+fn mark_client_disconnected(client: i32) {
+    if CLIENT_FD
+        .compare_exchange(client, -1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // Wake the accept thread if it is blocked in Recv while the sender discovered the
+        // failure. The accept thread closes the descriptor after its receive loop exits.
+        unsafe {
+            let _ = Shutdown(client, 2);
+        }
+    }
+}
+
+fn close_client(client: i32) {
+    // Do not recycle the descriptor while the sender still has a write in progress.
+    let _send_guard = send_guard();
+    unsafe {
+        let _ = Close(client);
+    }
+}
+
+/// Queue the heartbeat response expected by the desktop `GameLink` ping probe.
+fn queue_pong() {
+    loop {
+        if let Some(mut out) = OUTBOX.try_lock() {
+            if !out.iter().any(|message| message == PONG_INNER) {
+                out.insert(0, PONG_INNER.to_owned());
+                out.truncate(OUTBOX_CAP);
+            }
+            return;
+        }
+        sleep_ms(1);
     }
 }
 
@@ -343,5 +497,45 @@ pub fn take_inbound() -> Vec<String> {
     match INBOUND.try_lock() {
         Some(mut q) => q.drain(..).collect(),
         None => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pong_is_a_desktop_compatible_framed_envelope() {
+        let frame = format!("{FRAME_OPEN}{PONG_INNER}{FRAME_CLOSE}");
+        let payload = &frame[FRAME_OPEN.len()..frame.len() - FRAME_CLOSE.len()];
+        let value: serde_json::Value = serde_json::from_str(payload).expect("valid Pong JSON");
+        assert_eq!(value["header"], "Pong");
+        assert_eq!(value["body"], "{}");
+    }
+
+    #[test]
+    fn extractor_reassembles_torn_frames_and_recovers_from_orphan_close() {
+        let mut buf = format!("stale{FRAME_CLOSE}{FRAME_OPEN}{{\"command\":\"ping\"}}");
+        assert!(extract_payloads(&mut buf).is_empty());
+        buf.push_str(FRAME_CLOSE);
+        assert_eq!(
+            extract_payloads(&mut buf),
+            vec![r#"{"command":"ping"}"#.to_owned()]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn extractor_handles_multiple_frames_in_one_read() {
+        let mut buf = format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}");
+        assert_eq!(extract_payloads(&mut buf), vec!["one", "two"]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn ping_detection_is_exact() {
+        assert!(is_ping(r#"{"command":"ping","echo":4}"#));
+        assert!(!is_ping(r#"{"command":"live_eff_ping"}"#));
+        assert!(!is_ping("not json"));
     }
 }

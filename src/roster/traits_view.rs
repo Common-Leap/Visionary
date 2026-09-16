@@ -152,16 +152,10 @@ impl TraitsView {
                              them, including ones with no plain-language explanation.",
                         );
                     ui.separator();
-                    ui.label(RichText::new("⌕").small().weak());
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .desired_width(160.0)
-                            .hint_text("filter fields…"),
-                    );
-                    if !self.filter.is_empty() && ui.small_button(RichText::new("✕").small()).clicked() {
-                        self.filter.clear();
-                        resp.request_focus();
-                    }
+                    ui.scope(|ui| {
+                        ui.set_width(190.0);
+                        crate::ui::search_field(ui, "traits_search", &mut self.filter, "Search values…");
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
@@ -253,8 +247,6 @@ impl TraitsView {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.heading("◈  Traits");
-                    ui.add_space(4.0);
                     self.draw_picker(ui, index);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let total: usize = params.values().map(|p| p.field_count()).sum();
@@ -271,14 +263,6 @@ impl TraitsView {
                         );
                     });
                 });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Grouped by purpose — Movement, Jumps, Shield, Damage and more. Switch on \"Show every field\" for the full list.",
-                    )
-                    .small()
-                    .weak(),
-                );
             });
         ui.add_space(6.0);
     }

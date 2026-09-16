@@ -169,17 +169,9 @@ impl NewCharacterView {
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                ui.heading("＋ New character");
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("A costume on a donor fighter, with its own model, moves, and name.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(8.0);
-
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Based on").small().strong());
+                    ui.label("Based on")
+                        .on_hover_text("Shares this fighter's gameplay and traits, with its own costume, moves, and name.");
                     ui.add_space(8.0);
                     // Flex with the window instead of forcing a 220px box.
                     let combo_w = (ui.available_width() - 110.0).clamp(140.0, 220.0);
@@ -775,7 +767,7 @@ impl NewCharacterView {
                     );
                 } else if ready {
                     ui.label(
-                        RichText::new("Ready to ship ✓ — Mod → Export Mod Folder.")
+                        RichText::new("Ready to export — Project → Export Mod Folder.")
                             .small()
                             .strong()
                             .color(Color32::from_rgb(130, 225, 150)),
