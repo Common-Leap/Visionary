@@ -2210,6 +2210,149 @@ fn effect_call_set_signature(calls: &[crate::data::EffectCall]) -> Vec<String> {
     signatures
 }
 
+/// Whether every signature in `wanted` is present in `actual`, with duplicates counted.
+///
+/// A source rewrite may also carry a separately reported rename or removal that this path
+/// deliberately refuses. Added calls still need an independent read-back check in that case,
+/// so comparing the whole edited list would reject a valid addition because of the refused
+/// structural edit beside it.
+fn effect_signatures_contain(actual: &[String], wanted: &[String]) -> bool {
+    let mut remaining = actual.to_vec();
+    for signature in wanted {
+        let Some(position) = remaining
+            .iter()
+            .position(|candidate| candidate == signature)
+        else {
+            return false;
+        };
+        remaining.remove(position);
+    }
+    true
+}
+
+/// Whether two parsed hitboxes identify the same source call.
+///
+/// Values are intentionally absent. The caller is comparing the source it is about to edit
+/// with the editor's pristine snapshot, so a value difference is the work to perform. The
+/// frame, family, and family-specific identity are the anchors that make a positional source
+/// site safe to use when an id is reused later in the move.
+fn hitbox_source_identity(a: &crate::data::Hitbox, b: &crate::data::Hitbox) -> bool {
+    if a.category != b.category
+        || a.func != b.func
+        || a.id != b.id
+        || a.part != b.part
+        || a.active_start != b.active_start
+    {
+        return false;
+    }
+    match a.category {
+        crate::data::CAT_ABS => {
+            a.abs.as_ref().map(|value| value.kind.as_str())
+                == b.abs.as_ref().map(|value| value.kind.as_str())
+        }
+        2 => {
+            a.wind.as_ref().map(|value| value.command.as_str())
+                == b.wind.as_ref().map(|value| value.command.as_str())
+        }
+        _ => true,
+    }
+}
+
+/// Whether a scanned macro site has the identity the parser assigned to one hitbox.
+///
+/// This is the guard against a coincidental count match. If an unsupported or malformed macro
+/// disappears from the parser while a different collision family takes its place, zipping the
+/// two lists must fall back to the older unique-match path instead of retuning the neighbour.
+fn hitbox_site_matches(text: &str, site: &MacroSite, hitbox: &crate::data::Hitbox) -> bool {
+    let number = |slot: usize| {
+        site.arg(text, slot)
+            .and_then(|value| value.trim().parse().ok())
+    };
+    let hash = |slot: usize| {
+        site.arg(text, slot)
+            .map(|value| value.trim().trim_start_matches('*'))
+    };
+    match hitbox.category {
+        crate::data::CAT_ABS => {
+            site.name == "ATTACK_ABS"
+                && number(2) == Some(hitbox.id)
+                && hash(1) == hitbox.abs.as_ref().map(|value| value.kind.as_str())
+        }
+        crate::data::CAT_ATTACK_FP => {
+            site.name == "ATTACK_FP"
+                && number(1) == Some(hitbox.id)
+                && number(2) == Some(hitbox.part)
+        }
+        1 => site.name == "CATCH" && number(1) == Some(hitbox.id),
+        crate::data::CAT_SEARCH => {
+            site.name == "SEARCH" && number(1) == Some(hitbox.id) && number(2) == Some(hitbox.part)
+        }
+        2 => {
+            site.name
+                == hitbox
+                    .wind
+                    .as_ref()
+                    .map(|value| value.command.as_str())
+                    .unwrap_or_default()
+                && number(1) == Some(hitbox.id)
+        }
+        _ => {
+            crate::acmd::ATTACK_FUNCS.contains(&site.name.as_str())
+                && site.name == hitbox.func
+                && number(1) == Some(hitbox.id)
+                && number(2) == Some(hitbox.part)
+        }
+    }
+}
+
+/// Map parsed hitboxes to source sites when the source is a one-to-one collision list.
+///
+/// A loop intentionally produces more parsed hitboxes than source sites, and a malformed call
+/// can make the parser/source counts disagree. Those cases return no positional anchors and
+/// retain the existing unique-match refusal. A flat script with the same id/part reused at two
+/// frames does have a safe anchor: its parsed order and frame identity select the corresponding
+/// source call without guessing from id alone.
+fn positional_hitbox_sites<'a>(
+    text: &str,
+    sites: &'a [MacroSite],
+    pristine: &[crate::data::Hitbox],
+) -> Vec<Option<&'a MacroSite>> {
+    let mut mapped = vec![None; pristine.len()];
+    let parsed = crate::acmd::parse_acmd_script(text).to_hitboxes();
+    let collision_sites: Vec<&MacroSite> = sites
+        .iter()
+        .filter(|site| {
+            crate::acmd::ATTACK_FUNCS.contains(&site.name.as_str())
+                || site.name == "ATTACK_FP"
+                || site.name == "CATCH"
+                || site.name == "ATTACK_ABS"
+                || site.name == "SEARCH"
+                || crate::data::is_wind_command(&site.name)
+        })
+        .collect();
+    if parsed.len() != collision_sites.len() || parsed.len() != pristine.len() {
+        return mapped;
+    }
+    // Validate the complete correspondence before exposing any anchor. A single source change
+    // can otherwise leave an early pair coincidentally aligned while a later pair shifted; using
+    // only the coincidental entries would still let one edit reach the wrong call.
+    let valid =
+        parsed
+            .iter()
+            .zip(pristine)
+            .zip(&collision_sites)
+            .all(|((source, before), site)| {
+                hitbox_source_identity(source, before) && hitbox_site_matches(text, site, source)
+            });
+    if !valid {
+        return mapped;
+    }
+    for (position, site) in collision_sites.into_iter().enumerate() {
+        mapped[position] = Some(site);
+    }
+    mapped
+}
+
 fn source_compare_float(value: f32) -> f32 {
     if value.is_finite() {
         format!("{value:.4}").parse().unwrap_or(value)
@@ -2292,6 +2435,16 @@ pub fn rewrite_effect_calls(
             pristine.len(),
             ordinals.len()
         );
+    }
+    if edited.len() < pristine.len() {
+        report.skipped.push(format!(
+            "{label}: {} effect spawn(s) were removed — source syncing does not delete existing calls",
+            pristine.len() - edited.len()
+        ));
+        // The remaining list no longer has positional identity: after removing the first call,
+        // edited[0] describes the old second call. Applying value edits before a removal map is
+        // proven would retune the wrong authored spawn, so leave the complete source untouched.
+        return Ok((text.to_string(), report));
     }
 
     let (mut timing_moves, timing_skipped) =
@@ -2563,19 +2716,33 @@ pub fn rewrite_effect_calls(
     report.changed = value_count + moved_count;
     // Insert added spawns the script never had. Each is a brand-new frame-block
     // entry (or an append to its frame's execute block), so there is no existing
-    // line to retune — this is the path the old blanket refusal closed.
+    // line to retune — this is the path the old blanket refusal closed. A source
+    // conditional, loop, or opaque statement makes the insertion context ambiguous;
+    // leave it alone and explain why rather than placing a new spawn in the wrong arm.
     let mut updated = updated;
-    if edited.len() > pristine.len() {
+    let additions_allowed = effect_source_is_flat(&script.stmts);
+    if edited.len() > pristine.len() && !additions_allowed {
+        report.skipped.push(format!(
+            "{label}: added effect spawns are inside a source with a branch, loop, wait, or opaque statement — source syncing cannot choose their execution context"
+        ));
+    }
+    if edited.len() > pristine.len() && additions_allowed {
         let mut additions: Vec<&crate::data::EffectCall> =
             edited.iter().skip(pristine.len()).collect();
         additions.sort_by_key(|call| call.active_start);
         for call in additions {
             if call.disabled {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn is disabled — source syncing does not invent a disabled source call"
+                ));
                 continue;
             }
             ensure_effect_helpers(&mut updated, call);
             let lines = crate::acmd::effect_call_insert_lines(call);
             if lines.is_empty() {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn has no source representation — source syncing left it unchanged"
+                ));
                 continue;
             }
             insert_effect_lines(
@@ -2593,6 +2760,31 @@ pub fn rewrite_effect_calls(
                     None,
                 );
                 report.changed += 1;
+            }
+        }
+    }
+    if edited.len() > pristine.len() && additions_allowed {
+        let added: Vec<_> = edited
+            .iter()
+            .skip(pristine.len())
+            .filter(|call| !call.disabled)
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            let reparsed = crate::acmd::parse_effect_script(&updated).to_effect_calls();
+            let actual = effect_call_set_signature(&reparsed);
+            let wanted = effect_call_set_signature(&added);
+            // Count as well as compare signatures. A newly requested call can be byte-for-byte
+            // identical to an existing one; a containment-only check would then call the old
+            // call proof that the insertion happened, especially when another structural edit
+            // already populated `report.skipped` and disabled the full-list check below.
+            let expected_len = pristine.len() + added.len();
+            if reparsed.len() != expected_len || !effect_signatures_contain(&actual, &wanted) {
+                report.skipped.push(format!(
+                    "{label}: the added effect source did not reparse to the requested call; the addition was not applied"
+                ));
+                report.changed = value_count;
+                return Ok((valued, report));
             }
         }
     }
@@ -2636,10 +2828,17 @@ fn sync_script(
     script_name: &str,
     rewrite: impl FnOnce(&str) -> Result<(String, SyncReport)>,
 ) -> Result<SyncReport> {
-    if let Some(conflict) = index.conflict(fighter, script_name) {
+    // The index is a snapshot. A source generator, an editor, or an earlier sync pass may have
+    // inserted bytes before this function since the caller built it. `text.get(site.span)` alone
+    // is not enough validation: a stale span can still be in bounds and contain a different
+    // function, which would make a successful report edit the wrong script. Rebuild from the
+    // same root for every write so the site and its file text come from one snapshot.
+    let current = SourceIndex::build(&index.root)
+        .with_context(|| format!("indexing linked source at {}", index.root.display()))?;
+    if let Some(conflict) = current.conflict(fighter, script_name) {
         bail!("{}", conflict.description());
     }
-    let Some(site) = index.script(fighter, script_name) else {
+    let Some(site) = current.script(fighter, script_name) else {
         bail!("{fighter}: the project has no {script_name} to sync into");
     };
     let text = std::fs::read_to_string(&site.file)
@@ -3297,6 +3496,7 @@ pub fn rewrite_hitboxes(
         .iter()
         .filter(|s| crate::data::is_wind_command(&s.name))
         .collect();
+    let positional_sites = positional_hitbox_sites(text, &sites, pristine);
 
     let mut report = SyncReport::default();
     let mut edits = Vec::new();
@@ -3323,6 +3523,7 @@ pub fn rewrite_hitboxes(
                 &winds,
                 before,
                 hitbox,
+                positional_sites.get(position).and_then(|site| *site),
                 &mut report,
             ));
             continue;
@@ -3332,13 +3533,20 @@ pub fn rewrite_hitboxes(
         // only by kind. Matching on id here would be matching on a constant.
         if hitbox.category == crate::data::CAT_ABS || before.category == crate::data::CAT_ABS {
             let want = before.abs.as_ref().map(|a| a.kind.as_str()).unwrap_or("");
-            let matching: Vec<&MacroSite> = abs
-                .iter()
-                .copied()
-                .filter(|site| {
-                    site.arg(text, 1).map(|a| a.trim().trim_start_matches('*')) == Some(want)
-                })
-                .collect();
+            let matching: Vec<&MacroSite> = positional_sites
+                .get(position)
+                .and_then(|site| *site)
+                .filter(|site| site.name == "ATTACK_ABS")
+                .map(|site| vec![site])
+                .unwrap_or_else(|| {
+                    abs.iter()
+                        .copied()
+                        .filter(|site| {
+                            site.arg(text, 1).map(|a| a.trim().trim_start_matches('*'))
+                                == Some(want)
+                        })
+                        .collect()
+                });
             let [macro_site] = matching[..] else {
                 report.skipped.push(format!(
                     "{label}: the {want} throw damage matches {} `ATTACK_ABS` calls in the \
@@ -3379,16 +3587,23 @@ pub fn rewrite_hitboxes(
                 ));
                 continue;
             }
-            let matching: Vec<&MacroSite> = sites
-                .iter()
-                .filter(|site| {
-                    site.name == "ATTACK_FP"
-                        && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
-                            == Some(before.id)
-                        && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
-                            == Some(before.part)
-                })
-                .collect();
+            let matching: Vec<&MacroSite> = positional_sites
+                .get(position)
+                .and_then(|site| *site)
+                .filter(|site| site.name == "ATTACK_FP")
+                .map(|site| vec![site])
+                .unwrap_or_else(|| {
+                    sites
+                        .iter()
+                        .filter(|site| {
+                            site.name == "ATTACK_FP"
+                                && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
+                                    == Some(before.id)
+                                && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                                    == Some(before.part)
+                        })
+                        .collect()
+                });
             let [macro_site] = matching[..] else {
                 report.skipped.push(format!(
                     "{label}: ATTACK_FP hitbox {} matches {} calls in the source — cannot tell \
@@ -3442,7 +3657,13 @@ pub fn rewrite_hitboxes(
         // opens a `CATCH`, a `SEARCH` and an `ATTACK_ABS` all carrying id 0 in one block.
         let is_grab = hitbox.category == 1;
         let is_search = hitbox.category == crate::data::CAT_SEARCH;
-        let matching: Vec<&MacroSite> = if is_grab {
+        let matching: Vec<&MacroSite> = if let Some(site) = positional_sites
+            .get(position)
+            .and_then(|site| *site)
+            .filter(|site| hitbox_site_matches(text, site, before))
+        {
+            vec![site]
+        } else if is_grab {
             catches
                 .iter()
                 .copied()
@@ -4293,6 +4514,7 @@ fn wind_box_edits(
     winds: &[&MacroSite],
     before: &crate::data::Hitbox,
     after: &crate::data::Hitbox,
+    positional_site: Option<&MacroSite>,
     report: &mut SyncReport,
 ) -> Vec<Replacement> {
     let (Some(was), Some(now)) = (before.wind.as_ref(), after.wind.as_ref()) else {
@@ -4318,18 +4540,23 @@ fn wind_box_edits(
         ));
         return Vec::new();
     }
-    let matching: Vec<&MacroSite> = winds
-        .iter()
-        .copied()
-        .filter(|site| {
-            site.name == was.command
-                && site
-                    .arg(text, 1)
-                    .and_then(|a| a.trim().parse::<f32>().ok())
-                    .map(|id| id.max(0.0) as u32)
-                    == Some(was.id())
-        })
-        .collect();
+    let matching: Vec<&MacroSite> = positional_site
+        .filter(|site| site.name == was.command)
+        .map(|site| vec![site])
+        .unwrap_or_else(|| {
+            winds
+                .iter()
+                .copied()
+                .filter(|site| {
+                    site.name == was.command
+                        && site
+                            .arg(text, 1)
+                            .and_then(|a| a.trim().parse::<f32>().ok())
+                            .map(|id| id.max(0.0) as u32)
+                            == Some(was.id())
+                })
+                .collect()
+        });
     let [site] = matching[..] else {
         report.skipped.push(format!(
             "{label}: wind box {} matches {} `{}` calls in the source — cannot tell which one to \
@@ -10066,6 +10293,78 @@ visionary_set_speed(agent, 9, 10);
     }
 
     #[test]
+    fn repeated_hitbox_ids_use_their_source_ordinal_when_frames_differ() {
+        let text = r#"unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 10.0, 361, 100, 0, 40, 4.0, 0.0, 8.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    frame(agent.lua_state_agent, 15.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 12.0, 361, 100, 0, 40, 4.0, 0.0, 8.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_acmd_script(text).to_hitboxes();
+        assert_eq!(
+            pristine.len(),
+            2,
+            "both reuses must remain separate hitboxes"
+        );
+        assert_eq!(pristine[0].active_start, 5);
+        assert_eq!(pristine[1].active_start, 15);
+
+        let mut edited = pristine.clone();
+        edited[1].damage = 18.0;
+        let (after, report) = rewrite_hitboxes(text, "test", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 1, "only the second source call changed");
+        let reparsed = crate::acmd::parse_acmd_script(&after).to_hitboxes();
+        assert_eq!(reparsed[0].damage, 10.0, "the first reuse is untouched");
+        assert_eq!(
+            reparsed[1].damage, 18.0,
+            "the later reuse receives the edit"
+        );
+    }
+
+    #[test]
+    fn source_sync_relocates_a_script_after_external_bytes_shift_its_span() {
+        let (tmp, index) = mario_project();
+        let site = index.script("mario", "effect_attackairn").unwrap().clone();
+        let original = std::fs::read_to_string(&site.file).unwrap();
+        let original_body = &original[site.span.clone()];
+        let pristine = crate::acmd::parse_effect_script(original_body).to_effect_calls();
+        let mut edited = pristine.clone();
+        edited[0].scale = 7.25;
+
+        // This is the external/source-generation edit that leaves the caller's old snapshot
+        // with an in-bounds but stale span. The write must follow the function identity, not the
+        // old byte offset.
+        std::fs::write(&site.file, format!("// generated header\n{original}")).unwrap();
+        let report =
+            sync_effect_calls(&index, "mario", "attack_air_n", &pristine, &edited).unwrap();
+        assert_eq!(
+            report.changed, 1,
+            "the relocated effect still gets its edit"
+        );
+
+        let fresh = SourceIndex::build(tmp.path()).unwrap();
+        let current = fresh.script("mario", "effect_attackairn").unwrap();
+        let source = std::fs::read_to_string(&current.file).unwrap();
+        let body = &source[current.span.clone()];
+        let reparsed = crate::acmd::parse_effect_script(body).to_effect_calls();
+        assert_eq!(
+            reparsed[0].scale, 7.25,
+            "the current effect function was edited"
+        );
+        assert!(
+            source.contains("fn game_attackairn"),
+            "the sibling script survived"
+        );
+        assert!(source.starts_with("// generated header\n"));
+    }
+
+    #[test]
     fn syncing_refuses_to_invent_structure() {
         let (tmp, index) = mario_project();
         let before = std::fs::read_to_string(tmp.path().join("src/mario/acmd.rs")).unwrap();
@@ -10145,6 +10444,134 @@ visionary_set_speed(agent, 9, 10);
         let last = reparsed.last().unwrap();
         assert_eq!(last.effect_name, "sys_hit_elec");
         assert_eq!(last.active_start, 99);
+    }
+
+    #[test]
+    fn removing_an_effect_call_is_reported_instead_of_claiming_source_sync() {
+        let (_tmp, index) = mario_project();
+        let body = index.script_source("mario", "attack_air_n").unwrap().body;
+        let pristine = crate::acmd::parse_effect_script(&body).to_effect_calls();
+        let (updated, report) =
+            rewrite_effect_calls(&body, "mario/attack_air_n", &pristine, &[]).unwrap();
+        assert_eq!(
+            updated, body,
+            "source sync cannot delete the authored spawn"
+        );
+        assert_eq!(report.changed, 0, "a refused removal writes nothing");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|message| message.contains("removed")),
+            "the UI must explain why the source still has the call: {report:?}"
+        );
+    }
+
+    #[test]
+    fn removing_first_same_named_effect_never_retargets_the_next_spawn() {
+        let source = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_same"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, false);
+    }
+    frame(agent.lua_state_agent, 10.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_same"), Hash40::new("top"), 1, 2, 3, 0, 0, 0, 2, false);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        assert_ne!(pristine[0].offset, pristine[1].offset);
+        assert_ne!(pristine[0].scale, pristine[1].scale);
+
+        // Removing the first call shifts the second call into edited[0]. Without a proven
+        // removal map, that value would be mistaken for an edit to the first source macro.
+        let edited = vec![pristine[1].clone()];
+        let (updated, report) = rewrite_effect_calls(source, "test", &pristine, &edited).unwrap();
+        assert_eq!(
+            updated, source,
+            "a removal must not retune a surviving same-named spawn"
+        );
+        assert_eq!(report.changed, 0, "refused removal must not write values");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|message| message.contains("removed")),
+            "the refusal must be visible: {report:?}"
+        );
+    }
+
+    #[test]
+    fn adding_an_effect_inside_a_conditional_is_refused_without_guessing_its_arm() {
+        let text = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        if WorkModule::is_flag(agent.module_accessor, *FLAG) {
+            macros::EFFECT(agent, Hash40::new("sys_hit"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+        }
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_effect_script(text).to_effect_calls();
+        assert_eq!(pristine.len(), 1);
+        let mut added = pristine[0].clone();
+        added.effect_name = "sys_added".into();
+        added.active_start = 9;
+        added.normalize_timing();
+        let mut edited = pristine.clone();
+        edited.push(added);
+
+        let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
+        assert_eq!(
+            updated, text,
+            "an ambiguous conditional must remain untouched"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|message| message.contains("execution context")),
+            "the refusal must be visible: {report:?}"
+        );
+    }
+
+    #[test]
+    fn adding_an_effect_between_wait_points_is_refused_before_it_can_rewind_timeline() {
+        let text = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_effect_script(text).to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        assert_eq!(pristine[1].active_start, 7);
+        let mut added = pristine[0].clone();
+        added.effect_name = "sys_between".into();
+        added.active_start = 6;
+        added.normalize_timing();
+        let mut edited = pristine.clone();
+        edited.push(added);
+
+        let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
+        assert_eq!(
+            updated, text,
+            "a wait cannot safely be split by a new frame block"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|message| message.contains("wait")),
+            "the unsafe insertion must be explained: {report:?}"
+        );
     }
 
     #[test]

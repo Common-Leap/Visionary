@@ -742,15 +742,16 @@ installs looks exactly like one that does nothing.
 The **Project Hub** appears on launch — **Resume last / New / Open
 (`modproject.json`) / Import mod / Recent / Browse without project** — and
 reopens from **File → Project Hub** mid-session. One current project holds
-every edit: its path is remembered, **Save** (`Ctrl+S`) writes silently,
-**Save As** relocates, and Export/Load adopt the path they touched. Switching
-projects with unsaved edits warns first.
+every edit: its path is remembered, edits autosave to it about a second after
+they land, **Save As** relocates, and Export/Load adopt the path they touched.
+Switching projects only warns when there are edits autosave could not write
+yet (no project file, or a failed write).
 
 The **Mod** menu keeps hitbox, effect-spawn, authored effect, texture, and
 transplant edits together:
 
-- **Save / Save As** writes the current `modproject.json` silently (or asks once
-  when it has no file yet). If imported texture images are used, keep the
+- **Save As** relocates the current `modproject.json` (edits otherwise
+  autosave to its file). If imported texture images are used, keep the
   generated asset folder beside the JSON file.
 - **Export Project** writes a portable `modproject.json` and adopts its path.
   These editable files are exported separately from mod and developer files.
@@ -810,8 +811,7 @@ resource graph.
 The status distinguishes queued files, owner retirement, loading, and a ready
 preview. A successful file copy alone does not mean the game has reloaded its
 resources. This preview requires the matching Visionary plugin and the configured
-emulator SD directory. This preview is experimental; save your work before
-testing it in-game.
+emulator SD directory. Save your work before testing it in-game.
 
 Preview snapshots are immutable and old generations are reclaimed after the
 plugin acknowledges retirement. Staging stops if its SD cache reaches the safety

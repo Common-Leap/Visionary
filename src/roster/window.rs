@@ -573,26 +573,26 @@ impl RosterWindow {
         }
     }
 
-    /// Take a pending "save the project as part of deploying" request.
+    /// Take a pending "persist the project as part of deploying" request.
     ///
-    /// Deploy stages from in-memory state; without a save alongside it, the
+    /// Deploy stages from in-memory state; without a write alongside it, the
     /// staged files can run ahead of the project file on disk, and a crash
-    /// loses everything since the last save. `app.rs` polls this after the
-    /// window draws and saves silently when the project has a path.
+    /// loses everything since the last autosave. `app.rs` polls this after the
+    /// window draws and flushes the project when it has a path.
     pub fn take_save_request(&mut self) -> bool {
         std::mem::replace(&mut self.save_requested, false)
     }
 
-    /// Note the outcome of the save `app.rs` performed for a deploy, so the
+    /// Note the outcome of the write `app.rs` performed for a deploy, so the
     /// status line reads as one story: what was persisted, then staged.
     /// `false` covers both "no path yet" and a failed write — the latter is
     /// already reported in the main window's own status line.
     pub fn note_deploy_saved(&mut self, saved: bool) {
         if saved {
-            self.status = format!("Saved project. {}", self.status);
+            self.status = format!("Autosaved project. {}", self.status);
         } else {
             self.status = format!(
-                "{}. Project isn't saved — Save it to keep these edits.",
+                "{}. Project isn't saved — use File → Save As… to keep these edits.",
                 self.status
             );
         }
@@ -603,7 +603,7 @@ impl RosterWindow {
     /// emulator yourself afterwards — these files are read at boot.
     ///
     /// Synchronous: the staging is a few small files. Also raises
-    /// `save_requested` so `app.rs` persists the project (roster edits
+    /// `save_requested` so `app.rs` flushes the project (roster edits
     /// included) alongside the staged files.
     fn deploy_to_emulator(&mut self, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
         let summary = self.export_summary();

@@ -43,6 +43,371 @@ fn rebuild_linked_acmd_source_index(
     Ok(has_scripts)
 }
 
+/// Format the result of one explicit source-sync request.
+///
+/// A source category can be present while none of its edits are safe to write. Reporting that
+/// case as `Synced 0 ...` made a refused effect or hitbox change look successful, especially when
+/// a later source rescan replaced this message. Keep the wording tied to an actual file write so
+/// the status strip tells the user whether anything reached disk.
+fn source_sync_status(
+    fighter: &str,
+    move_name: &str,
+    ran: bool,
+    changed: usize,
+    files: usize,
+    notes: &[String],
+) -> String {
+    let mut status = if !ran {
+        format!("{fighter}/{move_name} is not in the linked project — nothing to sync")
+    } else if files == 0 {
+        if notes.is_empty() {
+            format!("No source changes to sync for {fighter}/{move_name}")
+        } else {
+            format!("No source changes written for {fighter}/{move_name}")
+        }
+    } else {
+        format!(
+            "Synced {changed} source change{} into {files} file{}",
+            if changed == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+        )
+    };
+    if !notes.is_empty() {
+        status.push_str(" — ");
+        status.push_str(&notes.join("; "));
+    }
+    status
+}
+
+/// Match one effect call from the source snapshot to the editor's call that owns it.
+///
+/// The editor keeps its vector in the order in which the move was first loaded. A source timing
+/// write can move one frame block across another call, so that order is no longer a safe source
+/// identity on the next sync. These fields are the structural parts of an effect call; transform,
+/// modifier, and timing values are deliberately left out so a pending edit still maps to the
+/// source call it came from.
+fn effect_source_identity_matches(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    let same_kind = match (&source.color, &candidate.color) {
+        (Some(left), Some(right)) => {
+            source.spawn_func == candidate.spawn_func
+                && left.transition.is_some() == right.transition.is_some()
+                && left.rgba.is_some() == right.rgba.is_some()
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let same_control = match (&source.control, &candidate.control) {
+        (Some(left), Some(right)) => left.command_name() == right.command_name(),
+        (None, None) => true,
+        _ => false,
+    };
+    same_kind
+        && same_control
+        && source
+            .effect_name
+            .eq_ignore_ascii_case(&candidate.effect_name)
+        && source.effect_name_alt == candidate.effect_name_alt
+        && source.spawn_func == candidate.spawn_func
+        && source.bone_name.eq_ignore_ascii_case(&candidate.bone_name)
+        && source.follows_bone == candidate.follows_bone
+        && source.trail_command == candidate.trail_command
+        && source.trail_bone2 == candidate.trail_bone2
+        && source.raw_line.is_some() == candidate.raw_line.is_some()
+}
+
+fn effect_source_values_match(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    let mut source = source.clone();
+    let mut candidate = candidate.clone();
+    // Removing a call is represented in the editor by a disabled entry. The authored source
+    // call remains present, so the disabled bit cannot be part of source identity.
+    source.disabled = false;
+    candidate.disabled = false;
+    source == candidate
+}
+
+fn effect_source_timing_matches(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    source.active_start == candidate.active_start
+        && (!source.follows_bone || source.active_end == candidate.active_end)
+}
+
+/// Reorder the editor's effect list into the order of the source currently on disk.
+///
+/// `pristine` remains the editor's native/live baseline. `source` is only the per-write source
+/// snapshot; it is never installed as a live baseline. A source call must have one best owner.
+/// Ambiguous or missing owners are refused so a repeated sync cannot retune a neighbouring
+/// repeated call by position.
+fn effect_calls_in_source_order(
+    source: &[crate::data::EffectCall],
+    pristine: &[crate::data::EffectCall],
+    edited: &[crate::data::EffectCall],
+) -> Result<Vec<crate::data::EffectCall>, String> {
+    let source: Vec<_> = source
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let pristine: Vec<_> = pristine
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let edited: Vec<_> = edited
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let mut used = vec![false; edited.len()];
+    let mut ordered = Vec::with_capacity(edited.len());
+
+    // The unchanged source order is authoritative on the first sync. This also handles repeated
+    // byte-identical calls: their ordinal is known because the source and pristine snapshots are
+    // still the same list.
+    if source.len() == pristine.len()
+        && source
+            .iter()
+            .zip(&pristine)
+            .all(|(source_call, before)| effect_source_values_match(source_call, before))
+    {
+        let mut ordered = edited.clone();
+        for call in &mut ordered {
+            call.normalize_timing();
+        }
+        return Ok(ordered);
+    }
+
+    for source_call in &source {
+        let mut exact = Vec::new();
+        let mut timing = Vec::new();
+        let mut structural = Vec::new();
+        for (index, candidate) in edited.iter().enumerate() {
+            if !effect_source_identity_matches(source_call, candidate) {
+                continue;
+            }
+            structural.push(index);
+            let source_matches_pristine = pristine
+                .get(index)
+                .is_some_and(|before| effect_source_values_match(source_call, before));
+            let source_matches_edited = effect_source_values_match(source_call, candidate);
+            let source_matches_pristine_timing = pristine
+                .get(index)
+                .is_some_and(|before| effect_source_timing_matches(source_call, before));
+            let source_matches_edited_timing = effect_source_timing_matches(source_call, candidate);
+            if source_matches_pristine || source_matches_edited {
+                exact.push(index);
+            } else if source_matches_pristine_timing || source_matches_edited_timing {
+                timing.push(index);
+            }
+        }
+        let mut verified = exact;
+        verified.extend(timing);
+        verified.sort_unstable();
+        verified.dedup();
+        let candidates = if verified.len() == 1 {
+            verified
+        } else if verified.is_empty() && structural.len() == 1 {
+            structural
+        } else {
+            Vec::new()
+        };
+        let Some(index) = candidates.first().copied() else {
+            return Err(format!(
+                "could not identify one source owner for effect at frame {}",
+                source_call.active_start
+            ));
+        };
+        if used[index] {
+            return Err(format!(
+                "multiple source calls claim editor effect #{}",
+                index + 1
+            ));
+        }
+        used[index] = true;
+        ordered.push(edited[index].clone());
+    }
+
+    // Calls beyond the pristine list are editor-authored additions. The source writer expects
+    // them after the existing source calls so it can use its conservative insertion path.
+    for (index, call) in edited.iter().enumerate() {
+        if !used[index] {
+            if index < pristine.len() {
+                return Err(format!(
+                    "editor effect #{} has no matching source call",
+                    index + 1
+                ));
+            }
+            ordered.push(call.clone());
+        }
+    }
+    Ok(ordered)
+}
+
+#[cfg(test)]
+mod source_sync_status_tests {
+    use super::{effect_calls_in_source_order, source_sync_status};
+
+    #[test]
+    fn source_sync_status_distinguishes_written_and_refused_edits() {
+        assert_eq!(
+            source_sync_status("mario", "attack_air_n", true, 0, 0, &[]),
+            "No source changes to sync for mario/attack_air_n"
+        );
+        assert_eq!(
+            source_sync_status(
+                "mario",
+                "attack_air_n",
+                true,
+                0,
+                0,
+                &["effect name is structural".into()]
+            ),
+            "No source changes written for mario/attack_air_n — effect name is structural"
+        );
+        assert_eq!(
+            source_sync_status("mario", "attack_air_n", true, 2, 1, &[]),
+            "Synced 2 source changes into 1 file"
+        );
+    }
+
+    #[test]
+    fn repeated_effect_sync_follows_a_crossing_retime_without_replacing_pristine() {
+        let source = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+    frame(agent.lua_state_agent, 15.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        let pristine_snapshot = pristine.clone();
+        let mut first_sync = pristine.clone();
+        first_sync[0].active_start = 25;
+        first_sync[1].active_start = 10;
+        let (after_first, report) = crate::acmd_src::rewrite_effect_calls(
+            source,
+            "test/effect_test",
+            &pristine,
+            &first_sync,
+        )
+        .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+
+        let source_after_first = crate::acmd::parse_effect_script(&after_first).to_effect_calls();
+        assert_eq!(source_after_first[0].effect_name, "second");
+        assert_eq!(source_after_first[1].effect_name, "first");
+        let ordered =
+            effect_calls_in_source_order(&source_after_first, &pristine, &first_sync).unwrap();
+        assert_eq!(ordered[0].effect_name, "second");
+        assert_eq!(ordered[1].effect_name, "first");
+
+        // A second panel edit targets the original first call after the source has reordered it.
+        // Passing the editor vector positionally would write this scale into `second`.
+        let mut second_sync = first_sync.clone();
+        second_sync[0].scale = 2.5;
+        let ordered_again =
+            effect_calls_in_source_order(&source_after_first, &pristine, &second_sync).unwrap();
+        let (after_second, report) = crate::acmd_src::rewrite_effect_calls(
+            &after_first,
+            "test/effect_test",
+            &source_after_first,
+            &ordered_again,
+        )
+        .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let final_calls = crate::acmd::parse_effect_script(&after_second).to_effect_calls();
+        assert_eq!(final_calls[0].effect_name, "second");
+        assert_eq!(final_calls[0].scale, 1.0);
+        assert_eq!(final_calls[1].effect_name, "first");
+        assert_eq!(final_calls[1].scale, 2.5);
+        assert_eq!(
+            pristine, pristine_snapshot,
+            "native/live pristine was changed"
+        );
+    }
+
+    #[test]
+    fn syncing_an_added_effect_twice_keeps_one_source_call_and_the_native_baseline() {
+        let source = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let native = crate::acmd::parse_effect_script(source).to_effect_calls();
+        let mut edited = native.clone();
+        let mut added = native[0].clone();
+        added.effect_name = "sys_hit_elec".into();
+        added.active_start = 9;
+        edited.push(added);
+        let (written, report) =
+            crate::acmd_src::rewrite_effect_calls(source, "test", &native, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let disk = crate::acmd::parse_effect_script(&written).to_effect_calls();
+        assert_eq!(disk.len(), 2);
+        edited[1].scale = 2.5;
+        let ordered = effect_calls_in_source_order(&disk, &native, &edited).unwrap();
+        let (rewritten, report) =
+            crate::acmd_src::rewrite_effect_calls(&written, "test", &disk, &ordered).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let final_calls = crate::acmd::parse_effect_script(&rewritten).to_effect_calls();
+        assert_eq!(
+            final_calls.len(),
+            2,
+            "a second sync must not duplicate the addition"
+        );
+        assert_eq!(final_calls[1].scale, 2.5);
+        assert_eq!(
+            native.len(),
+            1,
+            "the added call is still absent from the running game's baseline"
+        );
+        assert!(
+            super::VisionaryApp::build_effect_inject_from_captures(&edited[1], &[], None, 0)
+                .is_some(),
+            "the added call still has a donor-free live injection"
+        );
+    }
+
+    #[test]
+    fn repeated_effect_identity_refuses_ambiguous_duplicate_owners() {
+        let source = crate::acmd::parse_effect_script(
+            r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("same"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+        macros::EFFECT_FOLLOW(agent, Hash40::new("same"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#,
+        )
+        .to_effect_calls();
+        assert_eq!(source.len(), 2);
+        let mut edited = source.clone();
+        edited[0].scale = 3.0;
+        edited[1].scale = 4.0;
+        let mut previously_synced = source.clone();
+        for call in &mut previously_synced {
+            call.scale = 2.0;
+        }
+        let error = effect_calls_in_source_order(&previously_synced, &source, &edited).unwrap_err();
+        assert!(error.contains("one source owner"), "{error}");
+    }
+}
+
 #[cfg(test)]
 mod linked_acmd_index_tests {
     use super::rebuild_linked_acmd_source_index;
@@ -2765,12 +3130,20 @@ pub struct VisionaryApp {
     /// The open project's `modproject.json` path. `None` means in-memory only
     /// ("Browse without project"). Persisted so the hub can Resume last.
     project_path: Option<PathBuf>,
-    /// Last saved editable snapshot (move sources cleared), for the unsaved-edits
-    /// guard. `None` means "never saved this session" — dirty iff non-empty.
+    /// Last saved editable snapshot (move sources cleared), for the autosave
+    /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
+    /// Autosave debounce: when the project first read as dirty. `None` means clean
+    /// (or unsavable with no path). Set on the throttled dirty check, cleared on save.
+    project_autosave_pending_since: Option<std::time::Instant>,
+    /// Throttle for the dirty check itself — `build_project` + snapshot serializes
+    /// the whole edit model and must not run every frame.
+    project_autosave_last_check: std::time::Instant,
+    /// Last autosave failure, shown in the status strip until the next success.
+    project_autosave_error: Option<String>,
     /// Project Hub cold-start / mid-session window state.
     project_hub: crate::project_hub::HubState,
-    /// Hub action awaiting the unsaved-edits confirmation.
+    /// Hub action awaiting the not-yet-autosaved confirmation.
     hub_pending: Option<crate::project_hub::HubAction>,
     /// Last mod-import report, shown until dismissed.
     import_report: Option<crate::mod_import::ImportReport>,
@@ -3075,6 +3448,9 @@ impl VisionaryApp {
             project_name: "unnamed_mod".into(),
             project_path: None,
             last_saved_snapshot: None,
+            project_autosave_pending_since: None,
+            project_autosave_last_check: std::time::Instant::now(),
+            project_autosave_error: None,
             project_hub: crate::project_hub::HubState::cold_start(
                 &app_config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
             ),
@@ -3254,8 +3630,13 @@ impl VisionaryApp {
     fn reindex_fighters(&mut self) {
         // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
         // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
+        // `element` is the Pyra/Mythra swap manager, not a playable moveset — the same role
+        // `ptrainer` plays for the Pokémon trio. Its select-screen presence is the shared
+        // Aegis cell the roster already collapses; listing it here produced a third,
+        // unloadable entry next to the real Pyra (`eflame`) and Mythra (`elight`).
         let skip = [
             "common",
+            "element",
             "ptrainer",
             "ptrainer_low",
             "pfushigisou",
@@ -5346,19 +5727,81 @@ impl VisionaryApp {
         };
         let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
 
+        // Rebuild spans before reading the source snapshot. A source edit made outside Visionary
+        // can leave an old span in bounds while pointing at a different function.
+        if !self.refresh_linked_acmd_source_index() {
+            self.state.status =
+                format!("Could not refresh the linked source before syncing {fighter}/{move_name}");
+            return;
+        }
+
         let mut changed = 0usize;
         let mut files: Vec<PathBuf> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut ran = false;
+
+        // `move_source_cache` is the source snapshot established when this move was loaded or
+        // after the last successful write. A different disk body may be a perfectly valid edit,
+        // but it is no longer the baseline this editor state was authored against. Refuse it so
+        // source-only changes are never silently overwritten by a panel sync.
+        let source_snapshot_changed = self
+            .move_source_cache
+            .get(&Self::move_key(&fighter, &move_name))
+            .and_then(|saved| {
+                self.source_body_for_sync(&fighter, &move_name)
+                    .map(|(body, _)| (saved, body))
+            })
+            .is_some_and(|(saved, body)| saved.body != body);
+        if source_snapshot_changed {
+            notes.push(
+                "the linked source changed since this move was loaded or last synced — reload the move before syncing"
+                    .into(),
+            );
+            self.state.status = source_sync_status(&fighter, &move_name, true, 0, 0, &notes);
+            return;
+        }
 
         // A category the user has edited but the project does not define is created first, from
         // the mirror's own text, so the value passes below have somewhere of the user's own to
         // write into. Before D1b that could not happen; since D1d it is the ordinary case, because
         // a hitbox-only project still shows — and now edits — vanilla's sounds.
         ran |= self.create_missing_scripts(&fighter, &move_name, &mut files, &mut notes);
+        if ran && !self.note_synced_source_body(&fighter, &move_name) {
+            notes.push(
+                "a new source category was created, but the updated move could not be re-read"
+                    .into(),
+            );
+        }
 
         let Some(mut index) = self.acmd_src.as_ref().cloned() else {
             return;
+        };
+
+        // A previous sync may already have added an effect call or rewritten a hitbox in the
+        // user's file. Re-read those two source lists for matching, but keep the editor's pristine
+        // arrays as the original native identity for live rules. Re-indexing alone is not enough:
+        // on the next click the old pristine effect list would still have one fewer call than the
+        // source and the writer would refuse the whole move as out of date.
+        let (source_hitboxes_pristine, source_effects_pristine) =
+            match self.linked_source_sync_baselines(&fighter, &move_name) {
+                Ok(baselines) => baselines,
+                Err(error) => {
+                    notes.push(error);
+                    self.state.status =
+                        source_sync_status(&fighter, &move_name, ran, changed, 0, &notes);
+                    return;
+                }
+            };
+        let source_effects = match effect_calls_in_source_order(
+            &source_effects_pristine,
+            &self.state.effects_pristine,
+            &self.state.effects,
+        ) {
+            Ok(ordered) => Some(ordered),
+            Err(error) => {
+                notes.push(error);
+                None
+            }
         };
 
         if index
@@ -5369,19 +5812,21 @@ impl VisionaryApp {
             .is_some()
         {
             ran = true;
-            match crate::acmd_src::sync_effect_calls(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.effects_pristine,
-                &self.state.effects,
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
+            if let Some(edited_effects) = source_effects.as_deref() {
+                match crate::acmd_src::sync_effect_calls(
+                    &index,
+                    &fighter,
+                    &move_name,
+                    &source_effects_pristine,
+                    edited_effects,
+                ) {
+                    Ok(report) => {
+                        changed += report.changed;
+                        files.extend(report.files);
+                        notes.extend(report.skipped);
+                    }
+                    Err(e) => notes.push(e.to_string()),
                 }
-                Err(e) => notes.push(e.to_string()),
             }
             // An effect value can change the byte length of its function. Re-index before
             // the game passes, or a stale span truncates the game body when both live in
@@ -5399,7 +5844,7 @@ impl VisionaryApp {
                 &index,
                 &fighter,
                 &move_name,
-                &self.state.hitboxes_pristine,
+                &source_hitboxes_pristine,
                 &self.state.hitboxes,
             ) {
                 Ok(report) => {
@@ -5946,22 +6391,23 @@ impl VisionaryApp {
         }
         files.sort();
         files.dedup();
-        let mut status = format!(
-            "Synced {changed} source change{} into {} file{}",
-            if changed == 1 { "" } else { "s" },
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
-        );
-        if !notes.is_empty() {
-            status.push_str(" — ");
-            status.push_str(&notes.join("; "));
+        let wrote_source = !files.is_empty();
+        if wrote_source {
+            // Every pass above refreshed its local index after a write. Publish that final index
+            // without reloading the move: the editor's pristine arrays still identify the
+            // original calls that the running game needs suppressed/replayed, and replacing them
+            // here would make a successful source sync turn off its live preview.
+            self.acmd_src = Some(index);
+            if !self.note_synced_source_body(&fighter, &move_name) {
+                notes.push(
+                    "source changed, but the updated move could not be re-read; rescan the project"
+                        .into(),
+                );
+            }
+            self.refresh_source_buffer_after_sync(&fighter, &move_name, &mut notes);
         }
-        self.state.status = status;
-        if changed > 0 {
-            // The written values are now the pristine ones; re-reading also refreshes the
-            // spans the next sync will target.
-            self.rescan_acmd_source();
-        }
+        self.state.status =
+            source_sync_status(&fighter, &move_name, ran, changed, files.len(), &notes);
     }
 
     /// Which categories this move has been edited in, in the order a script file writes them.
@@ -14985,6 +15431,119 @@ impl VisionaryApp {
             .map(|body| (body, "GitHub"))
     }
 
+    /// Resolve a local linked body even when the mirror cache is cold. A project that owns only
+    /// one category still has a usable source function; `loaded_body` supplies the last merged
+    /// snapshot for categories the project does not cover.
+    fn source_body_for_sync(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Option<(String, &'static str)> {
+        self.warm_source_body(fighter, move_name).or_else(|| {
+            let project = self
+                .acmd_src
+                .as_ref()
+                .and_then(|index| index.script_source(fighter, move_name))?;
+            let body = if self.state.loaded_body.is_empty() {
+                project.body.clone()
+            } else {
+                crate::acmd::merge_project_over_mirror_blocked(
+                    &project.body,
+                    &project.covers,
+                    &project.blocked,
+                    &self.state.loaded_body,
+                )
+            };
+            Some((body, "Project source"))
+        })
+    }
+
+    /// Parse the source snapshot established by the last load or successful write.
+    ///
+    /// The source snapshot is a per-write baseline: it follows a prior source sync, while the
+    /// editor's pristine arrays continue to describe the original native calls used by live
+    /// suppression/replay. If the file changed outside this session, refuse the write until the
+    /// user explicitly reloads it instead of silently adopting those external values as a new
+    /// baseline.
+    fn linked_source_sync_baselines(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Result<(Vec<crate::data::Hitbox>, Vec<crate::data::EffectCall>), String> {
+        let Some((body, _)) = self.source_body_for_sync(fighter, move_name) else {
+            return Err(format!(
+                "could not read the linked source for {fighter}/{move_name}"
+            ));
+        };
+        let key = Self::move_key(fighter, move_name);
+        if self
+            .move_source_cache
+            .get(&key)
+            .is_some_and(|snapshot| snapshot.body != body)
+        {
+            return Err(format!(
+                "{fighter}/{move_name} changed on disk since it was loaded or last synced — reload the move before syncing"
+            ));
+        }
+        let mut hitboxes = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        self.normalize_hitbox_bones(&mut hitboxes);
+        let effects = crate::acmd::parse_effect_script(&body)
+            .to_effect_calls()
+            .into_iter()
+            .map(crate::data::EffectCall::normalized_timing)
+            .collect();
+        Ok((hitboxes, effects))
+    }
+
+    /// Keep source provenance in step with a successful write while leaving the live editor state
+    /// and its native pristine identities alone. The next move switch therefore sees the file as
+    /// the current source instead of opening a needless mismatch prompt, while current live rules
+    /// still suppress/replay the original calls until the game is rebuilt.
+    fn note_synced_source_body(&mut self, fighter: &str, move_name: &str) -> bool {
+        let Some((body, _)) = self.source_body_for_sync(fighter, move_name) else {
+            return false;
+        };
+        self.state.loaded_body = body.clone();
+        self.remember_move_source_body(fighter, move_name, body);
+        true
+    }
+
+    /// Reopen a clean source-editor checkout after a disk sync so its span and text follow the
+    /// newly indexed file. A buffer with unsaved typing is left in place and called out in the
+    /// sync report rather than silently discarding that text.
+    fn refresh_source_buffer_after_sync(
+        &mut self,
+        fighter: &str,
+        move_name: &str,
+        notes: &mut Vec<String>,
+    ) {
+        let Some(buffer) = self.acmd_src_buffer.as_ref() else {
+            return;
+        };
+        if buffer.fighter != fighter || buffer.move_name != move_name {
+            return;
+        }
+        if buffer.text != buffer.synced {
+            notes.push(
+                "the source editor has unsaved text; save or revert it before reopening that script"
+                    .into(),
+            );
+            return;
+        }
+        let Some(prefix) = ["game", "effect", "sound", "expression"]
+            .into_iter()
+            .find(|prefix| buffer.script.starts_with(&format!("{prefix}_")))
+        else {
+            self.acmd_src_buffer = None;
+            return;
+        };
+        self.acmd_src_buffer = None;
+        self.open_source_buffer(prefix);
+        if self.acmd_src_buffer.is_none() {
+            notes.push("the source editor could not reopen the synced script".into());
+        }
+    }
+
     fn capture_snapshot_body(
         move_name: &str,
         script: &crate::data::AcmdScript,
@@ -16231,7 +16790,7 @@ impl VisionaryApp {
                 let overlay_report = previous_project
                     .as_deref()
                     .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
-                // Export adopts the path: the next Save writes here silently.
+                // Export adopts the path: later edits autosave here.
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Project exported to {}", path.display());
                 match overlay_report {
@@ -16274,11 +16833,11 @@ impl VisionaryApp {
     // ── Project Hub: one current project ────────────────────────────────
     //
     // One current project holds every edit. Its path is persisted so the hub can
-    // Resume last; Save writes silently when it is known; Save As relocates;
-    // Export/Load adopt the path they touched. Hub switches with unsaved edits
-    // warn first.
+    // Resume last; edits autosave to it a beat after they land; Save As relocates;
+    // Export/Load adopt the path they touched. Hub switches only warn when there
+    // is no path to autosave to (or the last autosave failed).
 
-    /// Canonical snapshot for the unsaved-edits guard: the editable project
+    /// Canonical snapshot for the dirty check: the editable project
     /// with move-source provenance cleared. Browsing moves records provenance
     /// without editing anything, and must not read as dirty.
     fn snapshot_for_dirty(project: &crate::mod_project::ModProjectFile) -> serde_json::Value {
@@ -16289,7 +16848,7 @@ impl VisionaryApp {
         serde_json::to_value(&without_sources).unwrap_or(serde_json::Value::Null)
     }
 
-    /// True when in-memory edits differ from the last save/load.
+    /// True when in-memory edits differ from the last autosave/load.
     fn is_project_dirty(&mut self) -> bool {
         let project = self.build_project();
         if self.last_saved_snapshot.is_none() {
@@ -16308,6 +16867,8 @@ impl VisionaryApp {
     ) {
         self.project_path = Some(path.to_path_buf());
         self.last_saved_snapshot = Some(Self::snapshot_for_dirty(project));
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
         if let Some(config_dir) = app_config_dir() {
             crate::project_hub::push_recent(&config_dir, path);
             self.project_hub.last = Some(path.to_path_buf());
@@ -16320,19 +16881,15 @@ impl VisionaryApp {
     /// Save silently to the current path, or fall back to Save As.
     /// Returns whether the project ended up saved — the roster Deploy flow
     /// needs the answer without parsing the status line back out.
+    /// Manual saves are now rare (autosave covers every edit); this remains
+    /// for explicit flush points such as Deploy and the hub guard.
     fn save_project_silent(&mut self) -> bool {
         let Some(path) = self.project_path.clone() else {
             self.save_project_as();
             return self.project_path.is_some();
         };
         let project = self.build_project();
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(crate::mod_export::slugify)
-            .unwrap_or_else(|| "project".into());
-        let asset_dir = format!("{stem}_assets");
-        match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
+        match Self::persist_project_file(&project, &path) {
             Ok(()) => {
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Saved {}", path.display());
@@ -16410,6 +16967,116 @@ impl VisionaryApp {
         }
     }
 
+    /// Record a successful write to the already-adopted path without touching
+    /// recent/last or the status line. Autosave runs often; rewriting config
+    /// files and clobbering transient status on every pass would be noise.
+    fn note_autosaved(&mut self, project: &crate::mod_project::ModProjectFile) {
+        self.last_saved_snapshot = Some(Self::snapshot_for_dirty(project));
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
+    }
+
+    /// Write an already-built project to its file. Shared by the manual
+    /// save path and the autosave pass so both persist identical bytes.
+    fn persist_project_file(
+        project: &crate::mod_project::ModProjectFile,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(crate::mod_export::slugify)
+            .unwrap_or_else(|| "project".into());
+        let asset_dir = format!("{stem}_assets");
+        crate::mod_export::write_portable_project(project, path, &asset_dir)
+    }
+
+    /// Debounced autosave: persist dirty edits to the current path a beat after
+    /// they land. Throttled so `build_project` + snapshot serialization does not
+    /// run every frame; debounced so a slider drag writes once, not per tick.
+    fn poll_project_autosave(&mut self, ctx: &egui::Context) {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+
+        let Some(path) = self.project_path.clone() else {
+            // Nowhere to write yet — Save As gives the project a home, after
+            // which every later edit autosaves.
+            self.project_autosave_pending_since = None;
+            return;
+        };
+        if self.workspace_copy_rx.is_some() {
+            return;
+        }
+        if self.project_autosave_last_check.elapsed() < CHECK_INTERVAL {
+            // Still inside the debounce window: keep frames coming so the save
+            // lands without another edit.
+            if self.project_autosave_pending_since.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            return;
+        }
+        self.project_autosave_last_check = std::time::Instant::now();
+
+        let project = self.build_project();
+        let dirty = match &self.last_saved_snapshot {
+            None => !project.is_empty(),
+            Some(saved) => Some(&Self::snapshot_for_dirty(&project)) != Some(saved),
+        };
+        if !dirty {
+            self.project_autosave_pending_since = None;
+            self.project_autosave_error = None;
+            return;
+        }
+        let since = *self
+            .project_autosave_pending_since
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < DEBOUNCE {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+        match Self::persist_project_file(&project, &path) {
+            Ok(()) => self.note_autosaved(&project),
+            Err(e) => {
+                self.project_autosave_error = Some(format!("Autosave failed: {e:#}"));
+                // Retry on the next pass; keep the pending instant so failures
+                // do not spin the disk every check.
+                self.project_autosave_last_check = std::time::Instant::now();
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
+    /// Save now when dirty, bypassing the debounce. Used before hub switches
+    /// and deploys so they observe the file the autosave pass would write.
+    fn flush_project_autosave(&mut self) -> bool {
+        let Some(path) = self.project_path.clone() else {
+            return false;
+        };
+        if self.workspace_copy_rx.is_some() {
+            return false;
+        }
+        let project = self.build_project();
+        let dirty = match &self.last_saved_snapshot {
+            None => !project.is_empty(),
+            Some(saved) => Some(&Self::snapshot_for_dirty(&project)) != Some(saved),
+        };
+        if !dirty {
+            self.project_autosave_pending_since = None;
+            self.project_autosave_error = None;
+            return true;
+        }
+        match Self::persist_project_file(&project, &path) {
+            Ok(()) => {
+                self.note_autosaved(&project);
+                true
+            }
+            Err(e) => {
+                self.project_autosave_error = Some(format!("Autosave failed: {e:#}"));
+                false
+            }
+        }
+    }
+
     /// Start empty in a picked workspace folder: scaffold it so every edit has
     /// a home from the first save, then clear every edit store and the live game.
     fn new_project_in(&mut self, workspace: &std::path::Path) {
@@ -16447,7 +17114,7 @@ impl VisionaryApp {
         self.game_link.send_reset_pins();
         self.publish_live_rule_union();
         self.project_name = crate::mod_export::slugify(name);
-        // Adopt the scaffolded file immediately: Save writes silently from here.
+        // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
         self.adopt_project_path(&file, &project);
         self.import_report = None;
@@ -16455,9 +17122,10 @@ impl VisionaryApp {
         self.state.status = format!("New project at {}.", workspace.display());
     }
 
-    /// A hub choice was clicked: guard discarding actions with the unsaved-edits
-    /// modal, otherwise run immediately.
+    /// A hub choice was clicked: flush any pending autosave first, then guard
+    /// only what autosave could not persist (no path yet, or a failed write).
     fn request_hub_action(&mut self, action: crate::project_hub::HubAction) {
+        self.flush_project_autosave();
         if crate::project_hub::needs_hub_warning(self.is_project_dirty(), &action) {
             self.hub_pending = Some(action);
             return;
@@ -16482,7 +17150,7 @@ impl VisionaryApp {
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
                 self.state.status =
-                    "Browsing without a project — edits stay in memory until saved.".into();
+                    "Browsing without a project — edits stay in memory until File → Save As… gives them a home.".into();
             }
         }
     }
@@ -16535,7 +17203,7 @@ impl VisionaryApp {
                 }
             };
         project.name = stem.clone();
-        // Write the adopted project beside its assets so Save round-trips silently.
+        // Write the adopted project beside its assets so later edits autosave onto it.
         match crate::mod_export::write_portable_project(&project, &project_file, &asset_dir) {
             Ok(()) => {}
             Err(e) => {
@@ -16599,7 +17267,7 @@ impl VisionaryApp {
                 if ui
                     .button("New project…")
                     .on_hover_text(
-                        "Pick a workspace folder — every edit lives there from the first save",
+                        "Pick a workspace folder — every edit lives there and autosaves",
                     )
                     .clicked()
                 {
@@ -16662,10 +17330,17 @@ impl VisionaryApp {
                 }
                 if dirty {
                     ui.add_space(4.0);
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Unsaved edits — switching projects will warn first.",
-                    );
+                    if current_path.is_none() {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Edits are in memory — File → Save As… gives them a home before switching.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Edits are still saving — switching now keeps what autosave already wrote.",
+                        );
+                    }
                 }
                 if let Some(path) = &current_path {
                     ui.add_space(2.0);
@@ -16692,15 +17367,18 @@ impl VisionaryApp {
             return;
         };
         let mut decision: Option<&'static str> = None;
-        egui::Window::new("Unsaved edits")
+        egui::Window::new("Edits not yet autosaved")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("The current project has unsaved edits. Save them first?");
+                ui.label(
+                    "The current project has edits autosave could not write yet \
+                     (no project file, or the last write failed). Save them first?",
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if ui.button("Save…").clicked() {
                         decision = Some("save");
                     }
                     if ui.button("Discard").clicked() {
@@ -16714,8 +17392,8 @@ impl VisionaryApp {
         match decision {
             Some("save") => {
                 self.save_project_silent();
-                // A Save As cancel leaves the edits unsaved — stay put.
-                if self.is_project_dirty() && self.project_path.is_none() {
+                // A Save As cancel — or a failed write — leaves edits unsaved. Stay put.
+                if self.is_project_dirty() {
                     return;
                 }
                 self.hub_pending = None;
@@ -16970,7 +17648,7 @@ impl VisionaryApp {
                 Ok(result) => {
                     self.state.status = match result {
                         Ok((copied, skipped)) => format!(
-                            "Copied {copied} files into romfs/. Kept {skipped} existing files."
+                            "Copied {copied} files into romfs/. Kept {skipped} existing files. Open slot folder to edit them."
                         ),
                         Err(error) => format!("Could not copy base files: {error}"),
                     };
@@ -17016,6 +17694,7 @@ impl VisionaryApp {
         enum WorkspaceAction {
             CopyBaseFiles,
             CopyBaseModel,
+            CopyBaseCharacter,
             ImportModelFolder,
             ImportModelFiles,
             ImportAnimations,
@@ -17126,6 +17805,9 @@ impl VisionaryApp {
                             );
                         }
                         ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base character")).on_hover_text("Copy this costume's base model AND animations (all model/motion parts, motion_list.bin, swing.prc) into romfs/ for editing; keep existing edits").clicked() {
+                                action = Some(WorkspaceAction::CopyBaseCharacter);
+                            }
                             if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base model")).on_hover_text("Copy the complete base game model and textures for this costume; keep existing edits").clicked() {
                                 action = Some(WorkspaceAction::CopyBaseModel);
                             }
@@ -17163,7 +17845,7 @@ impl VisionaryApp {
                             {
                                 action = Some(WorkspaceAction::Send);
                             }
-                            if ui.button("Open slot folder").clicked() {
+                            if ui.button("Open slot folder").on_hover_text("Open this costume's project copies (romfs/fighter/… — the files you edit) in your file manager").clicked() {
                                 action = Some(WorkspaceAction::Reveal);
                             }
                             if ui.button("Stop preview").clicked() {
@@ -17231,13 +17913,29 @@ impl VisionaryApp {
 
         if matches!(
             action,
-            Some(WorkspaceAction::CopyBaseFiles | WorkspaceAction::CopyBaseModel)
+            Some(
+                WorkspaceAction::CopyBaseFiles
+                    | WorkspaceAction::CopyBaseModel
+                    | WorkspaceAction::CopyBaseCharacter
+            )
         ) {
             let (Some(workspace), Some(root)) = (&workspace, &self.state.data_root) else {
                 self.state.status = "Choose a base game folder from File first.".into();
                 return;
             };
-            let sources = if matches!(action, Some(WorkspaceAction::CopyBaseModel)) {
+            let sources = if matches!(action, Some(WorkspaceAction::CopyBaseCharacter)) {
+                let Some((fighter, _, _, _)) = &fighter else {
+                    return;
+                };
+                let slot = self.workspace_asset_slot;
+                match crate::project_hub::collect_base_character_files(root, fighter, slot) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        self.state.status = format!("Could not read base character: {error:#}");
+                        return;
+                    }
+                }
+            } else if matches!(action, Some(WorkspaceAction::CopyBaseModel)) {
                 let Some((fighter, _, _, _)) = &fighter else {
                     return;
                 };
@@ -17291,7 +17989,9 @@ impl VisionaryApp {
         };
         let slot = self.workspace_asset_slot;
         let result: anyhow::Result<Vec<std::path::PathBuf>> = match action {
-            WorkspaceAction::CopyBaseFiles | WorkspaceAction::CopyBaseModel => unreachable!(),
+            WorkspaceAction::CopyBaseFiles
+            | WorkspaceAction::CopyBaseModel
+            | WorkspaceAction::CopyBaseCharacter => unreachable!(),
             WorkspaceAction::ImportModelFolder => {
                 let Some(source) = rfd::FileDialog::new()
                     .set_title("Choose model folder")
@@ -17982,10 +18682,12 @@ impl VisionaryApp {
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
-        // Load adopts the path: the next Save writes here silently.
+        // Load adopts the path: later edits autosave here.
         let snapshot = Self::snapshot_for_dirty(&self.build_project());
         self.project_path = Some(path.to_path_buf());
         self.last_saved_snapshot = Some(snapshot);
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
         if let Some(config_dir) = app_config_dir() {
             crate::project_hub::push_recent(&config_dir, path);
             self.project_hub.last = Some(path.to_path_buf());
@@ -31506,13 +32208,7 @@ impl eframe::App for VisionaryApp {
             self.apply_history_action(HistoryAction::Redo);
             self.history_suppress_frame = true;
         }
-        // One current project holds every edit: Ctrl+S writes silently to its file.
-        if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::S)
-                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-        }) {
-            self.save_project_silent();
-        }
+        // One current project holds every edit: they autosave to its file.
         self.begin_history_frame();
 
         // Edit log window
@@ -31555,11 +32251,7 @@ impl eframe::App for VisionaryApp {
                         self.project_hub.show = true;
                         ui.close();
                     }
-                    if ui.button("Save  Ctrl+S").on_hover_text("Write the current project silently to its file (asks once when it has none)").clicked() {
-                        self.save_project_silent();
-                        ui.close();
-                    }
-                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json").clicked() {
+                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
                         self.save_project_as();
                         ui.close();
                     }
@@ -31567,7 +32259,7 @@ impl eframe::App for VisionaryApp {
                         self.load_project();
                         ui.close();
                     }
-                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there (warns first with unsaved edits)").clicked() {
+                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there and autosaves").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             self.request_hub_action(crate::project_hub::HubAction::New(folder));
                         }
@@ -31711,7 +32403,7 @@ impl eframe::App for VisionaryApp {
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new("file: in memory (Save will ask)")
+                            egui::RichText::new("file: in memory (use File → Save As… for autosave)")
                                 .small()
                                 .color(egui::Color32::GRAY),
                         );
@@ -31815,25 +32507,29 @@ impl eframe::App for VisionaryApp {
                                 .color(Color32::GRAY),
                         );
                     }
-                    if self.has_undo() {
-                        ui.separator();
-                        ui.label(
-                            RichText::new("Unsaved edits")
-                                .small()
-                                .color(Color32::YELLOW),
-                        );
-                    }
-                    // One current project holds every edit: always show where Save goes.
+                    // One current project holds every edit: always show where autosave goes.
                     ui.separator();
+                    if let Some(err) = &self.project_autosave_error {
+                        ui.label(RichText::new(err.clone()).small().color(Color32::YELLOW));
+                        ui.separator();
+                    } else if self.project_autosave_pending_since.is_some() {
+                        ui.label(RichText::new("saving…").small().color(Color32::YELLOW));
+                        ui.separator();
+                    }
                     if let Some(path) = &self.project_path {
+                        let suffix = if self.project_autosave_error.is_some() {
+                            ""
+                        } else {
+                            " · autosaved"
+                        };
                         ui.label(
-                            RichText::new(format!("Project: {}", path.display()))
+                            RichText::new(format!("Project: {}{suffix}", path.display()))
                                 .small()
                                 .color(Color32::GRAY),
                         );
                     } else {
                         ui.label(
-                            RichText::new("Project: in memory")
+                            RichText::new("Project: in memory (File → Save As… to autosave)")
                                 .small()
                                 .color(Color32::GRAY),
                         );
@@ -31984,12 +32680,12 @@ impl eframe::App for VisionaryApp {
             self.state.data_root.as_ref(),
             &self.state.labels,
         );
-        // Deploy stages from in-memory state, so persist the project alongside
+        // Deploy stages from in-memory state, so flush the project alongside
         // it — `build_project` carries the roster edits (order, names, new
         // characters, traits), keeping the file on disk level with the SD.
-        // Silent only when the project has a path: a Save As dialog popping
+        // Only when the project has a path: a Save As dialog popping
         // out of Deploy would hijack the flow, so a pathless project stages
-        // from memory and is told to save.
+        // from memory and is told to use Save As.
         if self.roster.take_save_request() {
             let saved = self.project_path.is_some() && self.save_project_silent();
             self.roster.note_deploy_saved(saved);
@@ -32196,6 +32892,9 @@ impl eframe::App for VisionaryApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
+
+        // Project autosave: every edit lands on disk without a keybind or button.
+        self.poll_project_autosave(&ctx);
 
         // Delayed serving-chain probe after a live-eff deploy.
         if let Some(due) = self.live_eff_probe_due {

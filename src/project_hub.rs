@@ -5,11 +5,11 @@
 //! that notion a shape that can be tested without a GUI:
 //!
 //! * [`CurrentProject`] tracks the open project's path (persisted) and whether it
-//!   holds unsaved edits. Save writes silently when a path is known; Save As
-//!   relocates; Export/Load adopt the path they touched.
+//!   holds edits autosave has not written yet. Edits autosave when a path is
+//!   known; Save As relocates; Export/Load adopt the path they touched.
 //! * [`HubState`] models the cold-start hub — Resume last / New / Open
 //!   (`modproject.json`) / Import mod / Recent / Browse without project — and the
-//!   mid-session reopen with its unsaved-edits guard.
+//!   mid-session reopen with its not-yet-autosaved guard.
 //! * Persistence helpers take an explicit config directory so tests run against a
 //!   tempdir instead of the user's real config.
 
@@ -37,9 +37,9 @@ pub const RECENT_PROJECTS_KEY: &str = "recent_projects";
 /// One current project holds every edit.
 #[derive(Debug, Clone, Default)]
 pub struct CurrentProject {
-    /// Where Save writes silently. `None` means "never saved yet".
+    /// Where edits autosave. `None` means "never saved yet".
     pub path: Option<PathBuf>,
-    /// True once any edit lands after the last save/load.
+    /// True once any edit lands after the last autosave/load.
     pub dirty: bool,
     /// Display name (`modproject.json`'s `name`), for the hub and title bar.
     pub name: String,
@@ -73,12 +73,12 @@ impl CurrentProject {
     }
 
     /// Any edit lands here. Called by every mutation path (or, failing that,
-    /// derived by comparing against the last saved snapshot).
+    /// derived by comparing against the last autosaved snapshot).
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// A successful save/load/export-adopt clears the flag and records the path.
+    /// A successful autosave/load/export-adopt clears the flag and records the path.
     pub fn mark_saved(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.dirty = false;
@@ -97,12 +97,12 @@ impl CurrentProject {
         self.dirty = false;
     }
 
-    /// Save needs a file dialog when there is no path yet.
+    /// Autosave needs Save As when there is no path yet.
     pub fn needs_save_as(&self) -> bool {
         self.path.is_none()
     }
 
-    /// Switching projects with unsaved edits must warn first.
+    /// Switching projects with edits autosave has not written must warn first.
     pub fn needs_warning(&self) -> bool {
         self.dirty
     }
@@ -114,7 +114,7 @@ pub enum HubAction {
     /// Reopen the last project path from config.
     ResumeLast(PathBuf),
     /// Start empty in a picked workspace folder. Carries the folder so every
-    /// edit has a home from the first save — nothing lives only in memory.
+    /// edit has a home from the first autosave — nothing lives only in memory.
     New(PathBuf),
     /// Open a `modproject.json` picked from disk.
     Open(PathBuf),
@@ -147,7 +147,7 @@ impl HubAction {
     }
 }
 
-/// True when choosing `action` with `dirty` unsaved edits must warn first.
+/// True when choosing `action` with `dirty` edits autosave has not written must warn first.
 pub fn needs_hub_warning(dirty: bool, action: &HubAction) -> bool {
     dirty && action.discards_edits()
 }
@@ -384,6 +384,56 @@ pub fn copy_base_files(
         copied += 1;
     }
     Ok((copied, skipped))
+}
+
+/// Every base-game file needed to edit one fighter costume in external tools:
+/// all model parts (`fighter/<f>/model/<part>/cNN/…`) plus all motion parts
+/// (`fighter/<f>/motion/<part>/cNN/…`, animations + `motion_list.bin` +
+/// `swing.prc`/companions). This is the one-click answer to "grab the files I
+/// need to edit this character" — no manual multi-select from the dump.
+///
+/// Only regular, non-symlink files are collected. Returns an error when the
+/// costume has no model or motion folder at all, so the caller can report
+/// which fighter/slot was missing instead of copying zero files silently.
+pub fn collect_base_character_files(
+    data_root: &Path,
+    fighter: &str,
+    slot: u8,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let fighter = fighter_component(fighter)?;
+    let slot = format!("c{slot:02}");
+    let fighter_dir = data_root.join("fighter").join(&fighter);
+    let mut files = Vec::new();
+    for group in ["model", "motion"] {
+        let group_dir = fighter_dir.join(group);
+        let Ok(parts) = std::fs::read_dir(&group_dir) else {
+            continue;
+        };
+        for part in parts.flatten() {
+            let slot_dir = part.path().join(&slot);
+            let Ok(entries) = std::fs::read_dir(&slot_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    anyhow::ensure!(
+        !files.is_empty(),
+        "No base model or motion files found for {fighter} {slot} under {}",
+        fighter_dir.display()
+    );
+    Ok(files)
 }
 
 /// Files that make up one fighter model folder. A model edit normally needs more than the
@@ -1540,13 +1590,14 @@ pub fn preserve_workspace_romfs(
 
 const WORKSPACE_README: &str = "\
 Visionary project\n\n\
-Open modproject.json in Visionary. Save with Ctrl+S.\n\n\
+Open modproject.json in Visionary. Edits autosave.\n\n\
 romfs/       Game files to edit; included when you export the mod.\n\
 assets/      Images managed by Visionary. Keep these with the project.\n\
 reference/   Original imported files and notes; excluded from export.\n\
 modproject.json stores moves, effects, roster, and trait edits.\n\n\
-In Project Files, use Copy base game files to choose files from your game\n\
-dump, or Copy base model for a complete costume model and its textures.\n\
+In Project Files, use Copy base character to grab one costume's model and\n\
+animations (all parts, motion_list.bin, swing.prc) for editing, Copy base\n\
+game files to pick files manually, or Copy base model for just the model.\n\
 Copies keep their game paths under romfs/. Existing files are preserved.\n\
 Edit these copies with your preferred tools. Open project folder takes\n\
 you to them. Reload asset preview updates supported models and animations\n\
@@ -1857,6 +1908,58 @@ mod tests {
         let workspace = dir.path().join("project");
         assert!(copy_base_files(&workspace, &dump, &[inside, outside]).is_err());
         assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn base_character_collects_one_costumes_model_and_motion_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        let wanted = [
+            "fighter/mario/model/body/c00/model.numdlb",
+            "fighter/mario/model/body/c00/model.nusktb",
+            "fighter/mario/model/sword/c00/model.numdlb",
+            "fighter/mario/motion/body/c00/attack11.nuanmb",
+            "fighter/mario/motion/body/c00/motion_list.bin",
+            "fighter/mario/motion/body/c00/swing.prc",
+        ];
+        for rel in wanted {
+            let path = dump.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"data").unwrap();
+        }
+        // Another costume must not leak into this costume's grab.
+        let other = dump.join("fighter/mario/model/body/c01/model.numdlb");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        let files = collect_base_character_files(&dump, "mario", 0).unwrap();
+        let rels: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&dump)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(rels, wanted);
+        // The collected set round-trips through the existing copy path.
+        let workspace = dir.path().join("project");
+        assert_eq!(
+            copy_base_files(&workspace, &dump, &files).unwrap(),
+            (wanted.len(), 0)
+        );
+        for rel in wanted {
+            assert!(workspace_romfs(&workspace).join(rel).is_file());
+        }
+    }
+
+    #[test]
+    fn base_character_reports_a_missing_costume() {
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("dump");
+        std::fs::create_dir_all(dump.join("fighter/mario/model/body/c00")).unwrap();
+        assert!(collect_base_character_files(&dump, "mario", 7).is_err());
     }
 
     #[test]
