@@ -16,6 +16,7 @@ mod eff_subsections;
 mod effect_pool;
 mod effects;
 mod emulator;
+mod frame_data;
 mod game_link;
 mod hash_macros;
 mod mod_export;

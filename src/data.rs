@@ -6905,6 +6905,9 @@ pub struct MoveEntry {
     pub hash: u64,
     pub frame_count: u32,
     pub anim_path: Option<PathBuf>,
+    /// The motion list's `cancel_frame` for this motion — its first actionable frame — or `0`
+    /// when the motion list sets none.
+    pub cancel_frame: u32,
 }
 
 impl Default for AppState {

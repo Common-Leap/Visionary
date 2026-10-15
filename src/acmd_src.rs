@@ -620,6 +620,8 @@ pub struct SourceIndex {
     pub consts: std::sync::Arc<crate::project_consts::ProjectConsts>,
     /// Helper functions that stand for one macro call. See [`crate::project_helpers`].
     pub helpers: std::sync::Arc<crate::project_helpers::ProjectHelpers>,
+    /// Params the moveset overrides in code (`landing_attack_air_frame_f: 8.0`), for frame data.
+    pub param_overrides: HashMap<String, f64>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -779,6 +781,9 @@ impl SourceIndex {
         index.helpers = std::sync::Arc::new(crate::project_helpers::ProjectHelpers::scan(
             sources.iter().map(|(_, text)| text.as_str()),
         ));
+        index.param_overrides = crate::frame_data::source_param_overrides(
+            sources.iter().map(|(_, text)| text.as_str()),
+        );
         index.files = files;
         Ok(index)
     }

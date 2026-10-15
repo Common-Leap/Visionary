@@ -2925,6 +2925,8 @@ pub struct VisionaryApp {
     /// Which editing surface is open in the right panel, visual effects included: they are a tab
     /// beside the others rather than a second panel competing for the same width.
     primary_tab: PrimaryEditorTab,
+    /// Params frame data needs for one `(fighter, move kind)`, read once rather than per frame.
+    frame_params_cache: Option<(String, String, crate::frame_data::FrameParams)>,
     timeline_filters: TimelineFilters,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
@@ -3354,6 +3356,7 @@ impl VisionaryApp {
             hurtbox_condition_edit_mode: "*DAMAGE_NO_REACTION_MODE_ALWAYS".into(),
             hurtbox_condition_edit_value: "0".into(),
             primary_tab: PrimaryEditorTab::Collisions,
+            frame_params_cache: None,
             timeline_filters: load_timeline_filters(),
             selected_command: None,
             show_effect_advanced: false,
@@ -4227,6 +4230,10 @@ impl VisionaryApp {
                         // ever shown for the move a user has actually opened.
                         frame_count: 0,
                         anim_path,
+                        cancel_frame: motion
+                            .extra
+                            .as_ref()
+                            .map_or(0, |extra| u32::from(extra.cancel_frame)),
                     }
                 })
                 .collect();
@@ -8730,6 +8737,122 @@ impl VisionaryApp {
             });
     }
 
+    /// The selected move's frame data, from the hitboxes as currently edited.
+    fn current_frame_data(&mut self) -> Option<crate::frame_data::FrameData> {
+        let move_entry = self.state.selected_move.as_ref()?;
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))?
+            .name
+            .clone();
+        let kind = crate::frame_data::MoveKind::of(&move_entry.name);
+        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
+        let overrides = self
+            .acmd_src
+            .as_ref()
+            .filter(|index| index.has_fighter(&fighter))
+            .map(|index| index.param_overrides.clone())
+            .unwrap_or_default();
+        // Everything the params depend on, so a new data root, a reordered mod or an edited
+        // `params.rs` re-reads them instead of showing stale numbers.
+        let mut sorted_overrides: Vec<_> = overrides.iter().collect();
+        sorted_overrides.sort_by(|a, b| a.0.cmp(b.0));
+        let kind_key = format!("{kind:?}|{roots:?}|{sorted_overrides:?}");
+        let cached = self
+            .frame_params_cache
+            .as_ref()
+            .is_some_and(|(f, k, _)| *f == fighter && *k == kind_key);
+        if !cached {
+            let params = crate::frame_data::load_params(&roots, &fighter, kind, &overrides);
+            self.frame_params_cache = Some((fighter, kind_key, params));
+        }
+        let params = &self.frame_params_cache.as_ref()?.2;
+        let move_entry = self.state.selected_move.as_ref()?;
+        Some(crate::frame_data::compute(&crate::frame_data::Inputs {
+            motion: &move_entry.name,
+            hitboxes: &self.state.hitboxes,
+            script: &self.state.script,
+            animation_frames: self.state.total_frames,
+            cancel_frame: Some(move_entry.cancel_frame),
+            params,
+        }))
+    }
+
+    /// One line of frame data above the collision list: what a moveset author checks after
+    /// every hitbox change. Each figure explains its own source on hover.
+    fn draw_frame_data_strip(&mut self, ui: &mut Ui) {
+        let Some(data) = self.current_frame_data() else {
+            return;
+        };
+        if data.startup.is_none() && data.faf.is_none() {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let rate_note = if self.state.script.rate_spans().is_empty() {
+                ""
+            } else {
+                " FT_MOTION_RATE is applied, so these are game frames, not script frames."
+            };
+            match data.startup {
+                Some(startup) => {
+                    ui.label(egui::RichText::new(format!("Startup {startup}")).strong())
+                        .on_hover_text(format!(
+                            "First game frame a damaging hitbox is out.{rate_note}"
+                        ));
+                }
+                None => {
+                    ui.label(egui::RichText::new("No hitbox").weak())
+                        .on_hover_text("No damaging hitbox in this move's game script.");
+                }
+            }
+            if !data.active.is_empty() {
+                let windows = data
+                    .active
+                    .iter()
+                    .map(|(start, end)| {
+                        if start == end {
+                            start.to_string()
+                        } else {
+                            format!("{start}-{end}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(format!("Active {windows}"))
+                    .on_hover_text("Game frames any damaging hitbox is out, inclusive.");
+            }
+            if let Some((faf, source)) = &data.faf {
+                ui.label(format!("FAF {faf}"))
+                    .on_hover_text(format!("First actionable frame, from {}.", source.describe()));
+            }
+            if let Some((lag, source)) = &data.landing_lag {
+                ui.label(format!("Landing lag {lag}"))
+                    .on_hover_text(format!("From {}.", source.describe()));
+            }
+            if let Some(stun) = data.shieldstun {
+                let advantage = data
+                    .shield_advantage
+                    .map(|adv| format!(", {adv:+} on shield"))
+                    .unwrap_or_default();
+                let explain = match data.kind {
+                    Some(crate::frame_data::MoveKind::Aerial(_)) => {
+                        "For an aerial, the advantage assumes it lands right after hitting \
+                         (shieldstun − landing lag)."
+                    }
+                    _ => "Advantage is shieldstun − (FAF − startup): hitting on the first active frame.",
+                };
+                ui.label(format!("Shieldstun {stun}{advantage}")).on_hover_text(format!(
+                    "Shieldstun of the strongest hitbox out on the startup frame: \
+                     floor(damage × 0.8 × multiplier + 2), with the smash-attack or aerial \
+                     multiplier from common.prc where it applies. {explain}"
+                ));
+            }
+        });
+        ui.separator();
+    }
+
     fn draw_right_panel(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             for tab in [
@@ -8995,6 +9118,7 @@ impl VisionaryApp {
         }
 
         if matches!(self.primary_tab, PrimaryEditorTab::Collisions) {
+            self.draw_frame_data_strip(ui);
             ui.vertical(|ui| {
                 let master_height =
                     hitbox_selector_height(self.state.hitboxes.len(), ui.available_height());
@@ -16090,6 +16214,7 @@ impl VisionaryApp {
                 hash: context.motion,
                 frame_count: 0,
                 anim_path: None,
+                cancel_frame: 0,
             });
             clear_move_state(&mut self.state);
             if context.source.body.is_empty() && context.captures.is_empty() {
@@ -44656,6 +44781,7 @@ mod live_motion_hash_tests {
             hash: motion_hash,
             frame_count: 0,
             anim_path: None,
+            cancel_frame: 0,
         };
 
         assert_eq!(VisionaryApp::live_motion_hash(&entry), motion_hash);
