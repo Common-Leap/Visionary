@@ -3013,6 +3013,9 @@ pub struct VisionaryApp {
     recent_effs: Vec<PathBuf>,
     /// Background cargo-skyline build of an exported mod's source (status polled in update).
     export_build: Option<std::sync::Arc<std::sync::Mutex<ExportBuildState>>>,
+    /// The linked moveset's own plugin build (`None` inside while it runs). See
+    /// [`crate::moveset_build`].
+    moveset_build: Option<std::sync::Arc<std::sync::Mutex<Option<crate::moveset_build::Outcome>>>>,
     /// Connection the pin-sync check last ran for (plugin client id).
     pin_sync_client: Option<u64>,
     /// Set on new connection; when the settle window elapses, untracked game pins prompt.
@@ -3399,6 +3402,7 @@ impl VisionaryApp {
             current_eff_path: None,
             recent_effs: load_recent_effs(),
             export_build: None,
+            moveset_build: None,
             pin_sync_client: None,
             pin_sync_wait: None,
             pin_sync_prompt: None,
@@ -7176,6 +7180,100 @@ impl VisionaryApp {
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
     /// that script in place, and push editor edits back into it.
+    /// Config key for the deploy destination chosen for the linked project.
+    fn moveset_deploy_key(&self) -> Option<String> {
+        let root = self.acmd_src.as_ref()?.root.to_string_lossy().to_lowercase();
+        Some(format!("moveset_deploy_{:010x}", hash40::hash40(&root).0))
+    }
+
+    /// Everything a build plan needs, read off `self` so the plan itself — which reads source
+    /// files and scans deployed plugins — can run on a worker thread.
+    fn moveset_build_inputs(&self) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
+        let index = self.acmd_src.as_ref()?;
+        let remembered = self.moveset_deploy_key().and_then(|key| load_config_path(&key));
+        Some((index.files.clone(), remembered))
+    }
+
+    fn moveset_build_plan(
+        files: &[PathBuf],
+        remembered: Option<&std::path::Path>,
+    ) -> anyhow::Result<crate::moveset_build::Plan> {
+        let sources: Vec<String> = files
+            .iter()
+            .filter_map(|file| std::fs::read_to_string(file).ok())
+            .collect();
+        crate::moveset_build::plan(
+            files,
+            &sources,
+            crate::scratch_dirs::emulator_sd_root().as_deref(),
+            remembered,
+        )
+    }
+
+    fn spawn_moveset_build(&mut self) {
+        let Some((files, remembered)) = self.moveset_build_inputs() else {
+            self.state.status = "Build & Deploy: no source project is linked".into();
+            return;
+        };
+        self.state.status = "Building the linked moveset…".into();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
+        self.moveset_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let outcome = match Self::moveset_build_plan(&files, remembered.as_deref()) {
+                Ok(plan) => crate::moveset_build::run(&plan),
+                Err(error) => crate::moveset_build::Outcome {
+                    ok: false,
+                    message: error.to_string(),
+                    log: None,
+                },
+            };
+            if let Ok(mut slot) = state.lock() {
+                *slot = Some(outcome);
+            }
+        });
+    }
+
+    /// Report a finished build once, on the status line.
+    fn poll_moveset_build(&mut self) {
+        let Some(state) = self.moveset_build.as_ref() else {
+            return;
+        };
+        let finished = state.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(outcome) = finished {
+            let log = outcome
+                .log
+                .as_ref()
+                .map(|log| format!(" (full output: {})", log.display()))
+                .unwrap_or_default();
+            self.state.status = format!("Build & Deploy: {}{log}", outcome.message);
+            self.moveset_build = None;
+        }
+    }
+
+    fn choose_moveset_deploy_target(&mut self) {
+        let plan = self
+            .moveset_build_inputs()
+            .and_then(|(files, remembered)| Self::moveset_build_plan(&files, remembered.as_deref()).ok());
+        let (Some(plan), Some(key)) = (plan, self.moveset_deploy_key()) else {
+            self.state.status = "Deploy to…: link the moveset's source project first".into();
+            return;
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Where should the built plugin go?")
+            .set_file_name(&plan.nro_name);
+        if let Some(sd) = crate::scratch_dirs::emulator_sd_root() {
+            dialog = dialog.set_directory(sd.join("ultimate").join("mods"));
+        }
+        if let Some(path) = dialog.save_file() {
+            save_config_path(&key, &path);
+            self.state.status = format!(
+                "Build & Deploy will also copy {} to {}",
+                plan.nro_name,
+                path.display()
+            );
+        }
+    }
+
     fn draw_acmd_source_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_acmd_src;
         let saved = self.window_geometry.get("acmd_source").copied();
@@ -7191,6 +7289,8 @@ impl VisionaryApp {
         // which the borrow of `self.acmd_src` for display rules out inside it.
         let mut link: Option<PathBuf> = None;
         let mut rescan = false;
+        let mut build_plugin = false;
+        let mut choose_deploy = false;
         let mut unlink = false;
         let mut checkout: Option<&'static str> = None;
         let mut save = false;
@@ -7255,6 +7355,38 @@ impl VisionaryApp {
                         .clicked()
                     {
                         rescan = true;
+                    }
+                    let building = self
+                        .moveset_build
+                        .as_ref()
+                        .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
+                    if ui
+                        .add_enabled(!building, egui::Button::new(if building {
+                            "Building…"
+                        } else {
+                            "Build & Deploy"
+                        }).small())
+                        .on_hover_text(
+                            "Run `cargo skyline build --release` on this project and replace \
+                             every deployed copy of its plugin on the emulator SD (and any \
+                             destination chosen with Deploy to…). If the plugin exports \
+                             `smashline_install`, it is also written as smashline's \
+                             development.nro: press L + R + D-pad Up in the game's menus to \
+                             reload it without restarting.",
+                        )
+                        .clicked()
+                    {
+                        build_plugin = true;
+                    }
+                    if ui
+                        .small_button("Deploy to…")
+                        .on_hover_text(
+                            "Choose where this project's built plugin should be copied, for a \
+                             mod folder Build & Deploy cannot find on its own",
+                        )
+                        .clicked()
+                    {
+                        choose_deploy = true;
                     }
                     if ui.small_button("Unlink").clicked() {
                         unlink = true;
@@ -7451,6 +7583,13 @@ impl VisionaryApp {
         if let Some(root) = link {
             self.link_acmd_source(root);
         }
+        if build_plugin {
+            self.spawn_moveset_build();
+        }
+        if choose_deploy {
+            self.choose_moveset_deploy_target();
+        }
+        self.poll_moveset_build();
         if rescan {
             self.rescan_acmd_source();
         }

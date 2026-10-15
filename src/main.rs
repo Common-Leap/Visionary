@@ -23,6 +23,7 @@ mod mod_export;
 mod mod_import;
 mod mod_project;
 mod motion_scripts;
+mod moveset_build;
 mod moveset_survey;
 mod move_kinds;
 mod param_labels;
