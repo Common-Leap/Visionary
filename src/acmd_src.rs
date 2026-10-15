@@ -55,6 +55,32 @@ impl MacroSite {
 /// both comment forms well enough not to be fooled by a macro name inside one, which is all
 /// the accuracy an argument-value rewrite needs.
 pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
+    let mut sites = scan_macro_sites_unscoped(text, range);
+    // A project helper standing for one macro call is presented as that call, exactly as the
+    // parser reads it (see `crate::project_helpers`). Arguments the helper fixes have no text
+    // of their own: they get an empty span at the call's `)`, which no edit is allowed to fill.
+    for site in &mut sites {
+        let Some(helper) = crate::project_helpers::in_scope(&site.name, site.args.len()) else {
+            continue;
+        };
+        let fixed = site.span.end.saturating_sub(1)..site.span.end.saturating_sub(1);
+        site.args = helper
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                crate::project_helpers::Slot::Param(index) => site.args[*index].clone(),
+                crate::project_helpers::Slot::Fixed(_) => fixed.clone(),
+                // The receiver is built from the agent argument; it is never edited.
+                crate::project_helpers::Slot::Accessor(index) => site.args[*index].clone(),
+            })
+            .collect();
+        site.name = helper.target;
+    }
+    sites
+}
+
+/// [`scan_macro_sites`] without the project-helper view: every call exactly as written.
+pub(crate) fn scan_macro_sites_unscoped(text: &str, range: Range<usize>) -> Vec<MacroSite> {
     const PREFIX: &str = "macros::";
     let bytes = text.as_bytes();
     let mut sites = Vec::new();
@@ -64,6 +90,20 @@ pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
         if let Some(next) = skip_trivia(text, i) {
             i = next;
             continue;
+        }
+        // `ATTACK(agent, …)` with no `macros::` in front: a project that glob-imports
+        // `smash_script::macros::*` writes every call this way, and across the corpus that is
+        // most of them. The name span stands in for the prefix so the site is the same shape.
+        if let Some(name) = bare_macro_name_at(text, i, range.end) {
+            if let Some((args, close)) = split_call_args(text, name.end + 1, range.end) {
+                sites.push(MacroSite {
+                    name: text[name.clone()].to_string(),
+                    span: i..close + 1,
+                    args,
+                });
+                i = close + 1;
+                continue;
+            }
         }
         if !text[i..range.end].starts_with(PREFIX) {
             // A trail written in the raw `effect(*MA_MSC_CMD_…, …)` form is a rewritable call
@@ -105,6 +145,101 @@ pub fn scan_macro_sites(text: &str, range: Range<usize>) -> Vec<MacroSite> {
         i = close + 1;
     }
     sites
+}
+
+/// The name of an ACMD macro called WITHOUT a path at `i` (`ATTACK(agent, …)`), if one starts
+/// there.
+///
+/// smash_script's ACMD macros are all upper case, and nothing else an ACMD body calls is: lua
+/// constants are dereferenced (`*FOO`), never called, and types are CamelCase. So an upper-case
+/// identifier of at least four characters, directly followed by `(`, that is not itself the end
+/// of a path (`sv_animcmd::EFFECT(`), a method (`.ATTACK(`), a macro invocation (`FOO!(`) or a
+/// function being declared (`fn PLAY_RANDOM_SE(`), is a bare macro call. The parsers and the
+/// write-back scanner both use this one test, so they always agree on which calls exist.
+pub(crate) fn bare_macro_name_at(text: &str, i: usize, limit: usize) -> Option<Range<usize>> {
+    let bytes = text.as_bytes();
+    if i >= limit || !bytes[i].is_ascii_uppercase() || !text.is_char_boundary(i) {
+        return None;
+    }
+    if text[..i]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.' | '$' | '#'))
+    {
+        return None;
+    }
+    let mut end = i;
+    while end < limit && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_') {
+        end += 1;
+    }
+    if end - i < 4 || bytes.get(end) != Some(&b'(') {
+        return None;
+    }
+    let before = text[..i].trim_end();
+    if before.ends_with("fn")
+        && !before[..before.len() - 2]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    Some(i..end)
+}
+
+/// `source` with every bare ACMD macro call given the `macros::` path the parsers look for.
+///
+/// Only the parsers' view changes: they match `macros::NAME(` throughout, and a project that
+/// writes `ATTACK(agent, …)` would otherwise read as nothing but raw lines. The file itself is
+/// never rewritten this way — write-back addresses calls through [`scan_macro_sites`], which
+/// recognises the bare spelling directly and edits only argument text.
+pub(crate) fn qualify_bare_macros(source: &str) -> std::borrow::Cow<'_, str> {
+    let mut inserts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+            continue;
+        }
+        if let Some(name) = bare_macro_name_at(source, i, source.len()) {
+            inserts.push(i);
+            i = name.end;
+            continue;
+        }
+        if !source.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if source[i..].starts_with("is_excute(")
+            && !source[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '.'))
+        {
+            inserts.push(i);
+            i += "is_excute(".len();
+            continue;
+        }
+        i += 1;
+    }
+    if inserts.is_empty() {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len() + inserts.len() * 8);
+    let mut last = 0;
+    for at in inserts {
+        out.push_str(&source[last..at]);
+        out.push_str("macros::");
+        last = at;
+    }
+    out.push_str(&source[last..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether `line` opens an `if …is_excute(…) {` block, however the project spells the path.
+pub(crate) fn opens_is_excute(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("if ") && trimmed.contains("is_excute(") && line.contains('{')
 }
 
 /// Every direct call to `name(...)` in `text[range]`, in document order.
@@ -400,6 +535,33 @@ impl ScriptConflict {
             .map(|site| format!("{}::{}", site.file.display(), site.function))
             .collect::<Vec<_>>()
             .join(", ");
+        // Two copies of one project (a `dist/` source drop beside the live crate) is the usual
+        // cause, and the fix is to link the crate actually built rather than edit either file.
+        let crates: Vec<PathBuf> = self
+            .sites
+            .iter()
+            .filter_map(|site| {
+                site.file
+                    .ancestors()
+                    .find(|dir| dir.join("Cargo.toml").is_file())
+                    .map(Path::to_path_buf)
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if crates.len() > 1 {
+            return format!(
+                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you                  build instead of the folder holding all of them",
+                self.fighter,
+                self.script,
+                crates.len(),
+                crates
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         format!(
             "{}: {} is ambiguous; found it in {} — resolve the duplicate before editing it",
             self.fighter, self.script, locations
@@ -452,6 +614,21 @@ pub struct SourceIndex {
     pub files: Vec<PathBuf>,
     /// Duplicate script identities that were found but deliberately not selected.
     pub conflicts: Vec<ScriptConflict>,
+    /// The project's own `Hash40` shorthand macros (`cmn!`, `se!`, …). See [`crate::hash_macros`].
+    pub hash_macros: crate::hash_macros::HashMacros,
+    /// Numeric `const`s used as ACMD values. See [`crate::project_consts`].
+    pub consts: std::sync::Arc<crate::project_consts::ProjectConsts>,
+    /// Helper functions that stand for one macro call. See [`crate::project_helpers`].
+    pub helpers: std::sync::Arc<crate::project_helpers::ProjectHelpers>,
+}
+
+/// Project-wide facts the per-file indexing pass needs.
+#[derive(Default)]
+struct ProjectFacts {
+    /// How many ACMD-shaped functions share each name across the project.
+    definitions: HashMap<String, usize>,
+    /// Every script name some registration call names explicitly.
+    registered: HashSet<String>,
 }
 
 /// A script registration found anywhere in the selected project. The owning fighter is retained
@@ -512,24 +689,39 @@ impl SourceIndex {
         // Two passes, because the conventional smashline layout splits the two halves of the
         // answer across files: `src/mario/mod.rs` says which fighter this is, and
         // `src/mario/acmd.rs` holds its scripts. Neither file can be indexed alone.
-        let sources: Vec<(PathBuf, String)> = files
+        let mut sources: Vec<(PathBuf, String)> = files
             .iter()
             .filter_map(|file| Some((file.clone(), std::fs::read_to_string(file).ok()?)))
             .collect();
+        let texts: HashMap<PathBuf, &str> = sources
+            .iter()
+            .map(|(file, text)| (file.clone(), text.as_str()))
+            .collect();
+        if let Some(compiled) = compiled_files(root, &texts) {
+            sources.retain(|(file, _)| compiled.contains(file));
+            files.retain(|file| compiled.contains(file));
+        }
         // A fighter declaration in `src/fighters/mario/mod.rs` owns every nested module below
         // it, not only Rust files immediately beside it. Keep declarations as directory scopes
         // and resolve a function against its nearest ancestor scope below.
         let mut fighter_scopes: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
+        let mut facts = ProjectFacts::default();
         for (file, text) in &sources {
+            for function in scan_acmd_functions(text) {
+                *facts.definitions.entry(function.name).or_default() += 1;
+            }
             let names = scan_fighter_names(text);
             for name in &names {
                 if !project_wide.contains(name) {
                     project_wide.push(name.clone());
                 }
             }
-            if let Some(dir) = file.parent() {
+            // Only a folder that declares something is a scope. An empty entry stopped
+            // `fighter_for_file`'s walk at the first folder holding any `.rs` file, so
+            // `pacman/acmd/tilts.rs` never reached the `pacman/` that owns it.
+            if let Some(dir) = file.parent().filter(|_| !names.is_empty()) {
                 let entry = fighter_scopes.entry(dir.to_path_buf()).or_default();
                 for name in &names {
                     if !entry.contains(name) {
@@ -537,8 +729,24 @@ impl SourceIndex {
                     }
                 }
             }
+            // `pacman::install(pacman)` where `pacman` is that file's `Agent::new("pacman")`
+            // hands the whole `pacman` module to that fighter, even though the installing file
+            // declares several agents (Shy Guy's installs `pacman` and three articles).
+            for (module, fighter) in scan_install_routes(file, text) {
+                let entry = fighter_scopes.entry(module).or_default();
+                if !entry.contains(&fighter) {
+                    entry.push(fighter);
+                }
+            }
             let registration_fighter = (names.len() == 1).then(|| names[0].clone());
-            for (script, function) in scan_acmd_registrations(text) {
+            let registrations = scan_acmd_registrations(text);
+            let last: HashMap<&str, &str> = registrations.iter().copied().collect();
+            for (script, function) in registrations {
+                facts.registered.insert(script.to_string());
+                // Replaced by a later registration of the same script in this file.
+                if last.get(script) != Some(&function) {
+                    continue;
+                }
                 let scripts = project_registrations
                     .entry(function.to_string())
                     .or_default();
@@ -560,9 +768,17 @@ impl SourceIndex {
                 &fighter_scopes,
                 &project_wide,
                 &project_registrations,
+                &facts,
             );
         }
         index.resolve_delegates(&sources);
+        index.hash_macros =
+            crate::hash_macros::HashMacros::scan(sources.iter().map(|(_, text)| text.as_str()));
+        crate::hash_macros::set_current(index.hash_macros.clone());
+        index.consts = std::sync::Arc::new(crate::project_consts::ProjectConsts::scan(&sources));
+        index.helpers = std::sync::Arc::new(crate::project_helpers::ProjectHelpers::scan(
+            sources.iter().map(|(_, text)| text.as_str()),
+        ));
         index.files = files;
         Ok(index)
     }
@@ -723,7 +939,10 @@ impl SourceIndex {
                 // A forwarding wrapper has no body of its own; show what it runs. The resolved
                 // text was built from the same snapshot as the span, at index time.
                 if let Some(delegate) = &site.delegate {
-                    body.push_str(&header_named(&delegate.body, &name));
+                    let text = self.hash_macros.expand_in(&delegate.body);
+                    let text = self.helpers.inline(&text);
+                    let text = self.consts.substitute(&text);
+                    body.push_str(&header_named(&text, &name));
                     body.push_str("\n\n");
                     covers.push(prefix);
                     notes.extend(
@@ -737,7 +956,14 @@ impl SourceIndex {
                 if let Ok(text) = std::fs::read_to_string(&site.file) {
                     // The span came from this file's text; a concurrent edit can shrink it.
                     if let Some(source) = text.get(site.span.clone()) {
-                        body.push_str(&header_named(source, &name));
+                        // `cmn!("swing_06")` reads as the name it hashes; the file keeps the
+                        // macro, and write-back puts edits back into it.
+                        let source = self.hash_macros.expand_in(source);
+                        // `RUMBLE_HIT(agent, kind)` reads as the vanilla call it makes.
+                        let source = self.helpers.inline(&source);
+                        // `WALK_LW_DAMAGE` reads as its value; an edit to it goes to the const.
+                        let source = self.consts.substitute(&source);
+                        body.push_str(&header_named(&source, &name));
                         body.push_str("\n\n");
                         covers.push(prefix);
                     }
@@ -926,6 +1152,7 @@ impl SourceIndex {
         fighter_scopes: &HashMap<PathBuf, Vec<String>>,
         project_wide: &[String],
         project_registrations: &HashMap<String, Vec<RegisteredScript>>,
+        facts: &ProjectFacts,
     ) {
         let functions = scan_acmd_functions(text);
         if functions.is_empty() {
@@ -934,8 +1161,22 @@ impl SourceIndex {
         // `agent.acmd("game_attackairn", game_attackairn, …)` names a script explicitly, as
         // does a `#[acmd_script(script = "…")]` attribute; a plain `fn game_attackairn` is
         // its own name by convention.
-        let mut named: HashMap<&str, Vec<&str>> = HashMap::new();
+        //
+        // A script registered twice in one file runs whichever function was registered LAST
+        // (smashline keeps one function per script name), so only that one is the script.
+        let mut winner: HashMap<&str, &str> = HashMap::new();
         for (script, function) in scan_acmd_registrations(text) {
+            winner.insert(script, function);
+        }
+        let mut named: HashMap<&str, Vec<&str>> = HashMap::new();
+        // Functions this file registers only to have the registration replaced: they run as
+        // nothing, and must not fall back to another file's registration or their own name.
+        let mut replaced: HashSet<&str> = HashSet::new();
+        for (script, function) in scan_acmd_registrations(text) {
+            if winner.get(script) != Some(&function) {
+                replaced.insert(function);
+                continue;
+            }
             let scripts = named.entry(function).or_default();
             if !scripts.contains(&script) {
                 scripts.push(script);
@@ -943,11 +1184,30 @@ impl SourceIndex {
         }
 
         for function in functions {
-            let registrations = project_registrations.get(function.name.as_str());
+            // A status function (`fn stub(fighter: &mut L2CFighterCommon)`) is never an ACMD
+            // script, however a same-named ACMD helper elsewhere is registered.
+            let header_end = text[function.span.clone()]
+                .find('{')
+                .map_or(function.span.end, |n| function.span.start + n);
+            let header = &text[function.span.start..header_end];
+            if !header.contains("L2CAgentBase")
+                && ["L2CFighterCommon", "L2CWeaponCommon", "L2CFighterBase"]
+                    .iter()
+                    .any(|status_type| header.contains(status_type))
+            {
+                continue;
+            }
+            // Another file's registration names this function only when nothing else in the
+            // project shares its name: `stub` defined in two modules is two functions.
+            let registrations = project_registrations
+                .get(function.name.as_str())
+                .filter(|_| facts.definitions.get(&function.name).copied().unwrap_or(0) <= 1);
             let script_names: Vec<String> = if let Some(script) = function.script.clone() {
                 vec![script]
             } else if let Some(scripts) = named.get(function.name.as_str()) {
                 scripts.iter().map(|script| (*script).to_string()).collect()
+            } else if replaced.contains(function.name.as_str()) {
+                continue;
             } else if let Some(scripts) = registrations {
                 scripts
                     .iter()
@@ -956,6 +1216,10 @@ impl SourceIndex {
             } else if ["game_", "effect_", "sound_", "expression_"]
                 .iter()
                 .any(|prefix| function.name.starts_with(prefix))
+                // Named like a script but never registered, while the project explicitly
+                // registers that script name to some other function: dead code, and the
+                // registered function is what the game runs.
+                && !facts.registered.contains(&function.name)
             {
                 vec![function.name.clone()]
             } else {
@@ -1050,6 +1314,12 @@ fn fighter_for_file(
     root: &Path,
     fighter_scopes: &HashMap<PathBuf, Vec<String>>,
 ) -> Option<String> {
+    // A module written as a single file (`pacman.rs`) is its own scope.
+    if let Some(names) = fighter_scopes.get(file) {
+        if !names.is_empty() {
+            return (names.len() == 1).then(|| names[0].clone());
+        }
+    }
     let mut directory = file.parent()?;
     loop {
         if let Some(names) = fighter_scopes.get(directory) {
@@ -1062,11 +1332,309 @@ fn fighter_for_file(
     }
 }
 
+/// Modules handed an agent: `(module path on disk, fighter)` for each `path::to::f(agent)` call
+/// in `text` whose argument is an `Agent::new("…")`, directly or through a `let` binding.
+///
+/// The module path is given both as a directory (`…/pacman`) and as a file (`…/pacman.rs`),
+/// since either layout declares the same module; [`fighter_for_file`] looks for both.
+fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
+    let text = &without_comments(text);
+    let mut bound: HashMap<String, String> = HashMap::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let rest = text[search..].trim_start();
+        let Some(name) = rest
+            .strip_prefix('"')
+            .and_then(|r| r.find('"').map(|end| r[..end].to_string()))
+        else {
+            continue;
+        };
+        // The statement this constructor sits in: `let [mut] VAR = [&mut] [path::]Agent::new(…`.
+        let stmt_start = text[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
+        let head = text[stmt_start..at].trim();
+        if let Some(binding) = head.strip_prefix("let ") {
+            let binding = binding.trim_start().strip_prefix("mut ").unwrap_or(binding).trim_start();
+            let end = ident_end(binding, 0);
+            if end > 0 && binding[end..].trim_start().starts_with('=') {
+                bound.insert(binding[..end].to_string(), normalize_fighter(&name));
+            }
+        }
+    }
+    let module_dir = match file.file_name().and_then(|n| n.to_str()) {
+        Some("mod.rs" | "lib.rs" | "main.rs") => file.parent().map(Path::to_path_buf),
+        _ => file
+            .parent()
+            .zip(file.file_stem())
+            .map(|(parent, stem)| parent.join(stem)),
+    };
+    let Some(module_dir) = module_dir else {
+        return Vec::new();
+    };
+    let crate_dir = file.ancestors().skip(1).find(|dir| {
+        dir.join("lib.rs").is_file() || dir.join("main.rs").is_file()
+    });
+    let mut routes = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) || !is_ident_byte(bytes[i]) || (i > 0 && is_ident_byte(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        // A path `a::b::f(`, read segment by segment.
+        let mut segments: Vec<&str> = Vec::new();
+        let mut at = i;
+        loop {
+            let end = ident_end(text, at);
+            if end == at {
+                break;
+            }
+            segments.push(&text[at..end]);
+            at = end;
+            if text[at..].starts_with("::") {
+                at += 2;
+                continue;
+            }
+            break;
+        }
+        if segments.len() < 2 || bytes.get(at) != Some(&b'(') {
+            i = at.max(i + 1);
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, at + 1, text.len()) else {
+            i = at + 1;
+            continue;
+        };
+        let fighter = args.iter().find_map(|span| {
+            let arg = text[span.clone()].trim();
+            let arg = arg.strip_prefix("&mut").unwrap_or(arg).trim_start();
+            let arg = arg.strip_prefix('&').unwrap_or(arg).trim_start();
+            if let Some(name) = bound.get(arg) {
+                return Some(name.clone());
+            }
+            let inner = arg.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+            Some(normalize_fighter(&inner[..inner.find('"')?]))
+        });
+        if let Some(fighter) = fighter {
+            let modules = &segments[..segments.len() - 1];
+            let mut dir = module_dir.clone();
+            let mut ok = true;
+            for (index, segment) in modules.iter().enumerate() {
+                match *segment {
+                    "self" if index == 0 => {}
+                    "super" => match dir.parent() {
+                        Some(parent) => dir = parent.to_path_buf(),
+                        None => ok = false,
+                    },
+                    "crate" if index == 0 => match crate_dir {
+                        Some(root) => dir = root.to_path_buf(),
+                        None => ok = false,
+                    },
+                    // A type or an external crate (`smashline::…`) is not a module of ours.
+                    s if s.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => ok = false,
+                    s => dir = dir.join(s),
+                }
+            }
+            if ok && dir != module_dir {
+                if dir.is_dir() || dir.with_extension("rs").is_file() {
+                    routes.push((dir.with_extension("rs"), fighter.clone()));
+                    routes.push((dir, fighter));
+                }
+            }
+        }
+        i = close + 1;
+    }
+    routes
+}
+
 /// Visionary names fighters after the dump folder (`mario`); ACMD attributes and
 /// `Agent::new` calls often spell the same character `fighter_mario`.
 fn normalize_fighter(name: &str) -> String {
     let name = name.trim().to_ascii_lowercase();
     name.strip_prefix("fighter_").unwrap_or(&name).to_string()
+}
+
+/// The files a crate under `root` actually compiles, or `None` when `root` holds no crate.
+///
+/// Moveset folders routinely carry source the build never sees: a `srcOLD/` kept as a backup, a
+/// `dist/` copy of a release's source, a `.zip` extracted beside the real tree, vanilla reference
+/// dumps. All of it defines the same script names as the live code, so indexing it turned every
+/// move into a "found in two places" conflict (Waluigi: all 96 scripts) or, worse, would let an
+/// edit land in a file that is never built. Rust says exactly which files are in a crate — the
+/// `mod` tree under `src/lib.rs` / `src/main.rs` — so that is what decides it.
+///
+/// A folder with no `Cargo.toml` anywhere (a loose set of ACMD files someone shared) keeps the
+/// old behaviour: every `.rs` file counts.
+fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet<PathBuf>> {
+    let mut crate_roots: Vec<PathBuf> = Vec::new();
+    // The linked folder may be a crate's `src/` or `plugin/`, with the manifest above it.
+    let mut manifests: Vec<PathBuf> = texts
+        .keys()
+        .filter_map(|file| {
+            let mut dir = file.parent();
+            while let Some(d) = dir {
+                if d.join("Cargo.toml").is_file() {
+                    return Some(d.to_path_buf());
+                }
+                if d == root {
+                    break;
+                }
+                dir = d.parent();
+            }
+            None
+        })
+        .collect();
+    let mut ancestor = Some(root);
+    for _ in 0..4 {
+        let Some(dir) = ancestor else { break };
+        if dir.join("Cargo.toml").is_file() {
+            manifests.push(dir.to_path_buf());
+            break;
+        }
+        ancestor = dir.parent();
+    }
+    manifests.sort();
+    manifests.dedup();
+    for manifest in &manifests {
+        let toml = std::fs::read_to_string(manifest.join("Cargo.toml")).unwrap_or_default();
+        // `[lib] path = "…"` relocates the crate root; take it when given.
+        let custom = toml
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("path"))
+            .filter_map(|line| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
+            .filter(|path| path.ends_with(".rs"))
+            .map(|path| manifest.join(path))
+            .collect::<Vec<_>>();
+        crate_roots.extend(custom);
+        for name in ["src/lib.rs", "src/main.rs"] {
+            crate_roots.push(manifest.join(name));
+        }
+    }
+    crate_roots.retain(|path| path.is_file());
+    if crate_roots.is_empty() {
+        return None;
+    }
+    let mut reached: HashSet<PathBuf> = HashSet::new();
+    let mut queue = crate_roots;
+    while let Some(file) = queue.pop() {
+        if !reached.insert(file.clone()) {
+            continue;
+        }
+        let owned;
+        let text = match texts.get(&file) {
+            Some(text) => *text,
+            None => {
+                owned = std::fs::read_to_string(&file).unwrap_or_default();
+                &owned
+            }
+        };
+        let stem_dir = match file.file_name().and_then(|n| n.to_str()) {
+            Some("mod.rs" | "lib.rs" | "main.rs") => file.parent().map(Path::to_path_buf),
+            _ => file
+                .parent()
+                .zip(file.file_stem())
+                .map(|(parent, stem)| parent.join(stem)),
+        };
+        let Some(stem_dir) = stem_dir else { continue };
+        for child in module_declarations(text) {
+            let base = child.inline_parents.iter().fold(stem_dir.clone(), |dir, m| dir.join(m));
+            let candidates = match &child.path_attr {
+                // `#[path]` is relative to the declaring file's directory (inline modules nest).
+                Some(path) => vec![file
+                    .parent()
+                    .map(|p| child.inline_parents.iter().fold(p.to_path_buf(), |d, m| d.join(m)))
+                    .unwrap_or_default()
+                    .join(path)],
+                None => vec![
+                    base.join(format!("{}.rs", child.name)),
+                    base.join(&child.name).join("mod.rs"),
+                ],
+            };
+            if let Some(found) = candidates.into_iter().find(|p| p.is_file()) {
+                queue.push(found);
+            }
+        }
+    }
+    Some(reached)
+}
+
+/// One `mod NAME;` found by [`module_declarations`].
+struct ModuleDeclaration {
+    name: String,
+    /// Inline `mod a { mod b { … } }` blocks enclosing the declaration, outermost first.
+    inline_parents: Vec<String>,
+    /// A `#[path = "…"]` attribute on the declaration.
+    path_attr: Option<String>,
+}
+
+/// Every out-of-line `mod NAME;` in `text`, ignoring comments and strings.
+fn module_declarations(text: &str) -> Vec<ModuleDeclaration> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    // (module name, brace depth its body opened at)
+    let mut inline: Vec<(String, usize)> = Vec::new();
+    let mut depth = 0usize;
+    let mut pending_path: Option<String> = None;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            b'}' => {
+                if inline.last().is_some_and(|(_, at)| *at == depth) {
+                    inline.pop();
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            b'#' if text[i..].starts_with("#[path") => {
+                let end = text[i..].find(']').map_or(text.len(), |n| i + n);
+                pending_path = attr_string_value(&text[i..end], "path");
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        if keyword_at(text, i, "mod") {
+            let name_start = i + 3 + (text[i + 3..].len() - text[i + 3..].trim_start().len());
+            let name_end = ident_end(text, name_start);
+            if name_end > name_start {
+                let name = text[name_start..name_end].to_string();
+                let after = text[name_end..].trim_start();
+                if after.starts_with(';') {
+                    out.push(ModuleDeclaration {
+                        name,
+                        inline_parents: inline.iter().map(|(n, _)| n.clone()).collect(),
+                        path_attr: pending_path.take(),
+                    });
+                } else if after.starts_with('{') {
+                    pending_path = None;
+                    inline.push((name, depth + 1));
+                }
+                i = name_end;
+                continue;
+            }
+        }
+        if !bytes[i].is_ascii_whitespace() && bytes[i] != b'#' && text.is_char_boundary(i) {
+            // Any other token between an attribute and its item ends the attribute's reach.
+            if bytes[i] == b';' {
+                pending_path = None;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
@@ -1252,6 +1820,9 @@ fn attr_value_span(line: &str, key: &str) -> Option<(Range<usize>, bool)> {
 
 /// Fighter names a file declares, via `Agent::new("…")` or an `agent = "…"` attribute.
 fn scan_fighter_names(text: &str) -> Vec<String> {
+    // A commented-out `// Agent::new("fighter")` template line is not a declaration; reading it
+    // gave Master Chief a fighter named `fighter` and split his scripts across two scopes.
+    let text = &without_comments(text);
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
         let name = normalize_fighter(&name);
@@ -1287,11 +1858,13 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
 /// `(script_name, function_name)` for every `agent.acmd("…", fn, …)`-style registration, and
 /// for `#[acmd_script(script = "…")]` attributes.
 fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(usize, &str, &str)> = Vec::new();
     for marker in [
         ".acmd(",
         ".game_acmd(",
         ".effect_acmd(",
+        ".sound_acmd(",
+        ".expression_acmd(",
         "install_acmd_script!(",
     ] {
         let mut search = 0;
@@ -1322,11 +1895,14 @@ fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
             let script = text[script.clone()].trim().trim_matches('"');
             let function = text[function.clone()].trim();
             if !script.is_empty() && is_identifier(function) {
-                out.push((script, function));
+                out.push((open, script, function));
             }
         }
     }
-    out
+    // Document order: when one agent registers a script twice, the later call replaces the
+    // earlier one, and callers rely on reading them in the order the game does.
+    out.sort_by_key(|(at, _, _)| *at);
+    out.into_iter().map(|(_, script, function)| (script, function)).collect()
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -2230,7 +2806,12 @@ pub fn create_script(
 
     // Highest offset first, so an earlier insertion cannot move a later one's index.
     let mut inserts: Vec<(usize, String)> = Vec::new();
-    let body = source.trim_end();
+    // The new function is copied from the reference script, which spells everything the
+    // canonical way; written into this file it takes the file's own spelling instead — a bare
+    // `ATTACK(` in a project that glob-imports the macros, its agent name, its indentation.
+    let style = crate::source_style::SourceStyle::detect(&text);
+    let styled = style.apply(source.trim_end(), "");
+    let body = styled.trim_end();
     let note = match &anchor.binding {
         Binding::Attribute(line) => {
             let attribute = rebuild_attribute(line, &anchor.script, script_name)?;
@@ -2273,6 +2854,13 @@ pub fn create_script(
         }
     };
 
+    // The surrounding text and the registration line come from this file already; only the
+    // line endings of what joins them need to match it.
+    if style.newline == "\r\n" {
+        for (_, insert) in &mut inserts {
+            *insert = insert.replace("\r\n", "\n").replace('\n', "\r\n");
+        }
+    }
     inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let mut updated = text;
     for (at, insert) in inserts {
@@ -2471,7 +3059,8 @@ pub struct SyncReport {
     pub changed: usize,
     /// Files whose contents actually differ afterwards.
     pub files: Vec<PathBuf>,
-    /// Edits that could not be expressed as a value change, each with the reason.
+    /// Edits that could not be expressed as a value change, each with the reason — and notes on
+    /// edits carried out somewhere other than the call, such as a const's definition.
     pub skipped: Vec<String>,
 }
 
@@ -2484,6 +3073,15 @@ struct Replacement {
 
 /// Rewrite `text` with every replacement applied. Spans must not overlap.
 fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
+    // An empty span is an argument a project helper fixes (see `scan_macro_sites`): the value
+    // lives in the helper's body, not at this call, so writing here would add an argument.
+    edits.retain(|edit| {
+        let phantom = edit.span.is_empty() && !edit.value.is_empty();
+        if phantom {
+            crate::project_helpers::refuse_fixed();
+        }
+        !phantom
+    });
     edits.sort_by_key(|e| e.span.start);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -2506,8 +3104,12 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
 fn float_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> {
     let current = text[span.clone()].trim();
     // A const or expression, not a literal — replacing it would discard the author's intent,
-    // which is exactly what this path promises not to do.
-    let old = current.parse::<f32>().ok()?;
+    // which is exactly what this path promises not to do. A project const is instead changed at
+    // its definition (see `crate::project_consts`).
+    let Ok(old) = current.parse::<f32>() else {
+        crate::project_consts::record_edit(current, f64::from(new));
+        return None;
+    };
     let replacement = format_float(new);
     // Two ways there is nothing to write, and both matter. The value being unchanged is the
     // obvious one. The second is that a written value only carries four decimals, so a float
@@ -2532,7 +3134,10 @@ fn float_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> 
 /// author already chose.
 fn to_f32_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement> {
     let current = text[span.clone()].trim();
-    let old = current.parse::<f32>().ok()?;
+    let Ok(old) = current.parse::<f32>() else {
+        crate::project_consts::record_edit(current, f64::from(new));
+        return None;
+    };
     let replacement = new.to_string();
     if old == new || replacement == current {
         return None;
@@ -2545,7 +3150,10 @@ fn to_f32_edit(text: &str, span: &Range<usize>, new: f32) -> Option<Replacement>
 
 fn int_edit(text: &str, span: &Range<usize>, new: i64) -> Option<Replacement> {
     let current = text[span.clone()].trim();
-    let old = current.parse::<i64>().ok()?;
+    let Ok(old) = current.parse::<i64>() else {
+        crate::project_consts::record_edit(current, new as f64);
+        return None;
+    };
     (old != new).then(|| Replacement {
         span: span.clone(),
         value: new.to_string(),
@@ -2627,7 +3235,7 @@ fn line_range_at(text: &str, offset: usize) -> Option<Range<usize>> {
 
 fn enclosing_effect_execute(text: &str, site_start: usize) -> Option<(usize, usize)> {
     let mut cursor = site_start;
-    while let Some(relative) = text[..cursor].rfind("macros::is_excute") {
+    while let Some(relative) = text[..cursor].rfind("is_excute(") {
         let at = relative;
         let line = line_range_at(text, at)?;
         let open = text[at..line.end].find('{').map(|offset| at + offset)?;
@@ -2779,8 +3387,11 @@ fn source_frame_blocks(text: &str) -> Vec<EffectSourceBlock> {
                 .map(|next| next.span.start)
                 .unwrap_or(text.len());
             let execute = text[site.span.end..limit]
-                .find("if macros::is_excute")
-                .map(|offset| site.span.end + offset)?;
+                .match_indices("is_excute(")
+                .map(|(offset, _)| site.span.end + offset)
+                .find(|at| {
+                    line_range_at(text, *at).is_some_and(|line| opens_is_excute(&text[line]))
+                })?;
             let execute_line = line_range_at(text, execute)?;
             if execute_line.start < line.end {
                 return None;
@@ -3309,11 +3920,19 @@ fn hitbox_source_identity(a: &crate::data::Hitbox, b: &crate::data::Hitbox) -> b
 /// This is the guard against a coincidental count match. If an unsupported or malformed macro
 /// disappears from the parser while a different collision family takes its place, zipping the
 /// two lists must fall back to the older unique-match path instead of retuning the neighbour.
+/// A numeric id/part argument of `site`: a literal, or a project const the parser resolved
+/// (`THROWB_STAB_HITBOX_ID as u64`).
+fn site_u32(text: &str, site: &MacroSite, slot: usize) -> Option<u32> {
+    let value = site.arg(text, slot)?.trim();
+    value.parse::<u32>().ok().or_else(|| {
+        crate::project_consts::resolve_in_scope(value)
+            .filter(|v| v.fract() == 0.0 && *v >= 0.0 && *v <= f64::from(u32::MAX))
+            .map(|v| v as u32)
+    })
+}
+
 fn hitbox_site_matches(text: &str, site: &MacroSite, hitbox: &crate::data::Hitbox) -> bool {
-    let number = |slot: usize| {
-        site.arg(text, slot)
-            .and_then(|value| value.trim().parse().ok())
-    };
+    let number = |slot: usize| site_u32(text, site, slot);
     let hash = |slot: usize| {
         site.arg(text, slot)
             .map(|value| value.trim().trim_start_matches('*'))
@@ -3906,7 +4525,32 @@ fn sync_script(
             file.display()
         );
     };
+    // A function whose agent is `fighter` has its `FT_MOTION_RATE(fighter, …)` read as the
+    // agent's own; the rewriters must count the same calls the parser typed.
+    let _agent = crate::acmd::agent_scope(body);
+    let _consts = crate::project_consts::scope(std::sync::Arc::clone(&current.consts));
+    let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&current.helpers));
     let (updated_body, mut report) = rewrite(body)?;
+    let refused = crate::project_helpers::take_refused();
+    if refused > 0 {
+        report.skipped.push(format!(
+            "{script_name}: {refused} edit(s) changed a value that one of the project's helper \
+             functions fixes (such as the hidden argument of a RUMBLE_HIT helper) — change it in \
+             the helper itself"
+        ));
+    }
+    // Values written as project consts change at the const's definition, wherever that is.
+    let pending = crate::project_consts::take_pending();
+    if !pending.is_empty() {
+        let (files, notes, changed) = crate::project_consts::apply_edits(&current.consts, &pending);
+        report.changed += changed;
+        report.skipped.extend(notes);
+        for written in files {
+            if !report.files.contains(&written) {
+                report.files.push(written);
+            }
+        }
+    }
     if updated_body == body {
         return Ok(report);
     }
@@ -4653,9 +5297,9 @@ pub fn rewrite_hitboxes(
                         .iter()
                         .filter(|site| {
                             site.name == "ATTACK_FP"
-                                && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
+                                && site_u32(text, site, 1)
                                     == Some(before.id)
-                                && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                                && site_u32(text, site, 2)
                                     == Some(before.part)
                         })
                         .collect()
@@ -4724,7 +5368,7 @@ pub fn rewrite_hitboxes(
                 .iter()
                 .copied()
                 .filter(|site| {
-                    site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok()) == Some(before.id)
+                    site_u32(text, site, 1) == Some(before.id)
                 })
                 .collect()
         } else if is_search {
@@ -4732,8 +5376,8 @@ pub fn rewrite_hitboxes(
                 .iter()
                 .copied()
                 .filter(|site| {
-                    site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok()) == Some(before.id)
-                        && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                    site_u32(text, site, 1) == Some(before.id)
+                        && site_u32(text, site, 2)
                             == Some(before.part)
                 })
                 .collect()
@@ -4745,9 +5389,9 @@ pub fn rewrite_hitboxes(
                     // Family members share the id space but are not the same call, so an
                     // `ATTACK` hitbox never retunes an `ATTACK_IGNORE_THROW` beside it.
                     site.name == before.func
-                        && site.arg(text, 1).and_then(|a| a.trim().parse::<u32>().ok())
+                        && site_u32(text, site, 1)
                             == Some(before.id)
-                        && site.arg(text, 2).and_then(|a| a.trim().parse::<u32>().ok())
+                        && site_u32(text, site, 2)
                             == Some(before.part)
                 })
                 .collect()
@@ -5709,9 +6353,25 @@ fn wind_box_edits(
 /// Replace a non-numeric argument — a const, a bool, a hash, a capsule endpoint — when the
 /// text the editor would write differs from what is already there.
 fn text_edit(text: &str, span: &Range<usize>, new: &str) -> Option<Replacement> {
-    (text[span.clone()].trim() != new).then(|| Replacement {
+    let current = text[span.clone()].trim();
+    // A hash the author wrote through one of the project's own macros (`rb!("attackm")`) keeps
+    // that spelling when the editor hands back a plain `Hash40::new("…")` for it.
+    let macros = crate::hash_macros::current();
+    let new = match new
+        .strip_prefix("Hash40::new(\"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+    {
+        Some(name) if macros.expand_call(current).is_some() => {
+            if macros.expand_call(current).as_deref() == Some(name) {
+                return None;
+            }
+            macros.spell(current, name, text)
+        }
+        _ => new.to_string(),
+    };
+    (current != new).then(|| Replacement {
         span: span.clone(),
-        value: new.to_string(),
+        value: new,
     })
 }
 
@@ -6807,7 +7467,7 @@ pub(crate) fn motion_module_set_rate_sites(text: &str) -> Vec<MacroSite> {
         site.args.len() == 2
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .and_then(|value| value.trim().parse::<f32>().ok())
@@ -6861,7 +7521,7 @@ pub fn rewrite_motion_module_set_rate(
             || site.args.len() != 2
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
         {
             report.skipped.push(format!(
                 "{label}: `MotionModule::set_rate` site {} no longer has its verified receiver/arity shape",
@@ -6912,7 +7572,7 @@ pub(crate) fn motion_module_set_helper_calculation_sites(text: &str) -> Vec<Macr
         site.args.len() == 2
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(|value| matches!(value.trim(), "false" | "true"))
@@ -6965,7 +7625,7 @@ pub fn rewrite_motion_module_set_helper_calculation(
             || site.args.len() != 2
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             || site
                 .arg(text, 1)
                 .is_none_or(|value| !matches!(value.trim(), "false" | "true"))
@@ -7028,7 +7688,7 @@ pub(crate) fn motion_module_set_rate_partial_sites(text: &str) -> Vec<MacroSite>
         site.args.len() == 3
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(valid_motion_module_part_kind_token)
@@ -7092,7 +7752,7 @@ pub fn rewrite_motion_module_set_rate_partial(
             || site.args.len() != 3
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             || site
                 .arg(text, 1)
                 .is_none_or(|value| value.trim() != before.call.part_kind.trim())
@@ -7175,7 +7835,7 @@ pub(crate) fn motion_module_set_frame_partial_sites(text: &str) -> Vec<MacroSite
         (site.args.len() == 3 || site.args.len() == 4)
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(valid_motion_module_part_kind_token)
@@ -7254,7 +7914,7 @@ pub fn rewrite_motion_module_set_frame_partial(
             || site.args.len() != usize::from(before.call.sync.is_some()) + 3
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             || site
                 .arg(text, 1)
                 .is_none_or(|value| value.trim() != before.call.part_kind.trim())
@@ -7430,7 +8090,7 @@ pub fn sync_clr_speed(
 /// The HDR dump binds `boma` to `agent.boma()` at the top of the function; generated source uses
 /// `agent.module_accessor`, so this receiver is normalized only for parsing and source syncing.
 fn is_change_kinetic_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 /// The verified direct `KineticModule::change_kinetic` calls in source order.
@@ -7538,7 +8198,7 @@ pub fn sync_change_kinetic(
 
 /// Whether a direct kinetic-energy receiver is one of the measured source forms.
 fn is_kinetic_energy_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 /// The verified direct kinetic-energy toggle calls in source order.
@@ -7713,7 +8373,7 @@ pub(crate) fn work_flag_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 2
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site.arg(text, 1).is_some_and(valid_work_flag_token)
         })
         .collect()
@@ -7771,7 +8431,7 @@ pub fn rewrite_work_flags(
             || site.args.len() != 2
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             || site
                 .arg(text, 1)
                 .is_none_or(|value| value.trim() != before.call.flag.trim())
@@ -7817,9 +8477,9 @@ pub fn sync_work_flags(
 fn valid_work_transition_term_receiver(function: &str, receiver: &str) -> bool {
     match function {
         "WorkModule::enable_transition_term_group"
-        | "WorkModule::unable_transition_term_group_ex" => receiver == "agent.module_accessor",
+        | "WorkModule::unable_transition_term_group_ex" => crate::acmd::is_agent_module_accessor(receiver),
         "WorkModule::enable_transition_term" | "WorkModule::unable_transition_term" => {
-            matches!(receiver, "agent.module_accessor" | "boma")
+            crate::acmd::is_module_accessor(receiver)
         }
         _ => false,
     }
@@ -7953,7 +8613,7 @@ pub(crate) fn work_module_inc_int_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 2
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site.arg(text, 1).is_some_and(valid_work_flag_token)
         })
         .collect()
@@ -8004,7 +8664,7 @@ pub fn rewrite_work_module_inc_int(
             || site.args.len() != 2
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
             || site
                 .arg(text, 1)
                 .is_none_or(|value| value.trim() != before.call.slot.trim())
@@ -8071,7 +8731,7 @@ pub(crate) fn work_module_set_sites(text: &str) -> Vec<MacroSite> {
             site.args.len() == 3
                 && site
                     .arg(text, 0)
-                    .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                    .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
                 && site
                     .arg(text, 1)
                     .is_some_and(|value| valid_work_module_set_value(value, kind))
@@ -8163,7 +8823,7 @@ pub fn rewrite_work_module_sets(
             ));
             continue;
         }
-        if !matches!(now.call.receiver.trim(), "agent.module_accessor" | "boma")
+        if !crate::acmd::is_module_accessor(now.call.receiver.trim())
             || !valid_work_module_set_value(&now.call.value, now.call.kind)
             || if now.call.kind.is_int64() {
                 !valid_work_module_slot_token(&now.call.slot)
@@ -8208,7 +8868,7 @@ pub fn sync_work_module_sets(
 
 /// Whether a direct `KineticModule::add_speed` receiver is one of the measured source forms.
 fn is_kinetic_add_speed_receiver(value: &str) -> bool {
-    matches!(value.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(value.trim())
 }
 
 fn parse_source_zero_z_vector(value: &str) -> Option<(f32, f32)> {
@@ -8368,7 +9028,7 @@ pub(crate) fn kinetic_set_consider_ground_friction_sites(text: &str) -> Vec<Macr
         site.args.len() == 3
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
             && site
                 .arg(text, 1)
                 .is_some_and(|value| matches!(value.trim(), "true" | "false"))
@@ -8440,7 +9100,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -8454,7 +9114,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -8464,7 +9124,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -8484,7 +9144,7 @@ fn insert_kinetic_set_consider_ground_friction_line(
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -8571,7 +9231,7 @@ pub fn rewrite_kinetic_set_consider_ground_friction(
             || site.args.len() != 3
             || site
                 .arg(text, 0)
-                .is_none_or(|value| !matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_none_or(|value| !crate::acmd::is_module_accessor(value.trim()))
         {
             report.skipped.push(format!(
                 "{label}: set_consider_ground_friction site {} no longer has its verified receiver/arity shape",
@@ -8688,7 +9348,7 @@ pub(crate) fn kinetic_clear_speed_all_sites(text: &str) -> Vec<MacroSite> {
         site.args.len() == 1
             && site
                 .arg(text, 0)
-                .is_some_and(|value| matches!(value.trim(), "agent.module_accessor" | "boma"))
+                .is_some_and(|value| crate::acmd::is_module_accessor(value.trim()))
     })
     .collect()
 }
@@ -8705,7 +9365,7 @@ fn remove_set_air_line(text: &str, site: &MacroSite) -> Replacement {
         };
     };
     let trimmed = text[line.clone()].trim();
-    if trimmed == "macros::SET_AIR(agent);" || trimmed == "visionary_set_air(agent);" {
+    if is_lone_agent_call(trimmed, "SET_AIR") || is_lone_agent_call(trimmed, "visionary_set_air") {
         Replacement {
             span: line.clone(),
             value: String::new(),
@@ -8737,7 +9397,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -8751,7 +9411,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(
+                    insert_styled(text,
                         close,
                         &format!("{body_indent}macros::SET_AIR(agent);{newline}"),
                     );
@@ -8764,7 +9424,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::SET_AIR(agent);{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -8784,7 +9444,7 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::SET_AIR(agent);{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -8841,7 +9501,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -8855,7 +9515,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -8865,7 +9525,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -8885,7 +9545,7 @@ fn insert_kinetic_clear_speed_all_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -9109,6 +9769,44 @@ pub(crate) fn reverse_lr_sites(text: &str) -> Vec<MacroSite> {
         .collect()
 }
 
+/// Insert canonical generated `block` at `at`, re-spelled in the style of `text` (the function
+/// being edited): its agent name, macro path, `frame` spelling, indentation and line endings.
+/// See [`crate::source_style`].
+fn insert_styled(text: &mut String, at: usize, block: &str) {
+    let style = crate::source_style::SourceStyle::detect(text);
+    let first = block.lines().next().unwrap_or("");
+    let base = &first[..first.len() - first.trim_start().len()];
+    let styled = style.apply(block, base);
+    // Callers aim at a block's closing `}`. Inserting there put the new line after the brace's
+    // own indentation — doubling it — and left the brace at column 0. A whole-line block goes
+    // in at the start of the brace's line instead.
+    let line_start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+    let at = if styled.ends_with('\n') && text[line_start..at].trim().is_empty() {
+        line_start
+    } else {
+        at
+    };
+    text.insert_str(at, &styled);
+}
+
+/// Whether `trimmed` is exactly one call of the macro `name` on the agent alone —
+/// `macros::SET_AIR(agent);`, `SET_AIR(fighter);` — however the file spells the path and agent.
+fn is_lone_agent_call(trimmed: &str, name: &str) -> bool {
+    let Some(at) = trimmed.find(&format!("{name}(")) else {
+        return false;
+    };
+    let path = &trimmed[..at];
+    if !(path.is_empty() || path.ends_with("::"))
+        || !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
+        return false;
+    }
+    let Some(arg) = trimmed[at + name.len() + 1..].strip_suffix(");") else {
+        return false;
+    };
+    is_identifier(arg.trim())
+}
+
 fn source_line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0;
@@ -9163,7 +9861,7 @@ fn remove_reverse_line(text: &str, site: &MacroSite) -> Replacement {
         };
     };
     let trimmed = text[line.clone()].trim();
-    if trimmed == "macros::REVERSE_LR(agent);" {
+    if is_lone_agent_call(trimmed, "REVERSE_LR") {
         Replacement {
             span: line.clone(),
             value: String::new(),
@@ -9197,7 +9895,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -9211,7 +9909,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(
+                    insert_styled(text,
                         close,
                         &format!("{body_indent}macros::REVERSE_LR(agent);{newline}"),
                     );
@@ -9226,7 +9924,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::REVERSE_LR(agent);{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -9248,7 +9946,7 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    macros::REVERSE_LR(agent);{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -9290,7 +9988,7 @@ fn insert_hurt_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -9304,7 +10002,7 @@ fn insert_hurt_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
@@ -9313,7 +10011,7 @@ fn insert_hurt_line(
         let block = format!(
             "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -9333,7 +10031,7 @@ fn insert_hurt_line(
     let block = format!(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -9382,7 +10080,7 @@ fn insert_damage_no_reaction_line(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -9396,13 +10094,13 @@ fn insert_damage_no_reaction_line(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &format!("{body_indent}{call}{newline}"));
+                    insert_styled(text, close, &format!("{body_indent}{call}{newline}"));
                     return true;
                 }
             }
         }
         let indent = line_indent(text, &frame_range);
-        text.insert_str(
+        insert_styled(text,
             frame_range.end,
             &format!(
                 "{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
@@ -9423,7 +10121,7 @@ fn insert_damage_no_reaction_line(
         .find(|range| frame_literal(&text[range.start..range.end]).is_some())
         .map(|range| line_indent(text, range).to_string())
         .unwrap_or_else(|| "    ".into());
-    text.insert_str(
+    insert_styled(text,
         insert_at,
         &format!(
             "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{indent}    {call}{newline}{indent}}}{newline}"
@@ -9512,7 +10210,7 @@ fn insert_effect_lines(
                 break;
             }
             let line = &text[range.clone()];
-            if line.contains("if macros::is_excute") && line.contains('{') {
+            if opens_is_excute(line) {
                 let open = range.start + line.find('{').unwrap();
                 if let Some(close) = matching_brace(text, open) {
                     let body_indent = ranges
@@ -9526,7 +10224,7 @@ fn insert_effect_lines(
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    text.insert_str(close, &render_into(&body_indent));
+                    insert_styled(text, close, &render_into(&body_indent));
                     return true;
                 }
             }
@@ -9537,7 +10235,7 @@ fn insert_effect_lines(
             "{indent}if macros::is_excute(agent) {{{newline}{}{indent}}}{newline}",
             render_into(&body_indent)
         );
-        text.insert_str(frame_range.end, &block);
+        insert_styled(text, frame_range.end, &block);
         return true;
     }
 
@@ -9559,7 +10257,7 @@ fn insert_effect_lines(
         "{indent}frame(agent.lua_state_agent, {frame}.0);{newline}{indent}if macros::is_excute(agent) {{{newline}{}{indent}}}{newline}",
         render_into(&body_indent)
     );
-    text.insert_str(insert_at, &block);
+    insert_styled(text, insert_at, &block);
     true
 }
 
@@ -9689,6 +10387,8 @@ pub(crate) fn expression_sites(text: &str) -> Vec<MacroSite> {
             CALLS
                 .iter()
                 .any(|(name, arity)| site.name == *name && site.args.len() == *arity)
+                // A project helper around `set_rumble` (see `crate::project_helpers`).
+                || (site.name == "ControlModule::set_rumble" && site.args.len() == 5)
         })
         .collect();
     sites.extend(
@@ -9829,12 +10529,30 @@ pub fn sync_expressions(
 ///
 /// `SOUND_FUNCS` carries `(name, hash args, has tail)`, and the total after `agent` is the sum
 /// of the last two.
+#[cfg(test)]
 pub(crate) fn sound_sites(text: &str) -> Vec<MacroSite> {
+    sound_sites_with(text, &crate::hash_macros::current())
+}
+
+/// [`sound_sites`] reading hash macros from `macros` — the linked project's own table.
+pub(crate) fn sound_sites_with(
+    text: &str,
+    macros: &crate::hash_macros::HashMacros,
+) -> Vec<MacroSite> {
     scan_macro_sites(text, 0..text.len())
         .into_iter()
         .filter(|site| {
             crate::acmd::SOUND_FUNCS.iter().any(|(name, hashes, tail)| {
-                site.name == *name && site.args.len() == hashes + usize::from(*tail) + 1
+                site.name == *name
+                    && site.args.len() == hashes + usize::from(*tail) + 1
+                    // The parser types a call only when every sound is a name it can read; a
+                    // `PLAY_SE(agent, sound)` with a variable stays raw. Counting it here anyway
+                    // numbered every later site one too high.
+                    && site.args[1..=*hashes].iter().all(|span| {
+                        let arg = text[span.clone()].trim();
+                        (arg.starts_with("Hash40::new(\"") && arg.ends_with("\")"))
+                            || macros.expand_call(arg).is_some()
+                    })
             })
         })
         .collect()
@@ -9853,7 +10571,19 @@ pub fn rewrite_sounds(
     pristine: &[crate::data::SoundEvent],
     edited: &[crate::data::SoundEvent],
 ) -> Result<(String, SyncReport)> {
-    let sites = sound_sites(text);
+    rewrite_sounds_with(text, label, pristine, edited, &crate::hash_macros::current())
+}
+
+/// [`rewrite_sounds`] with the project's hash macros given explicitly, so an edited name is
+/// written back in the author's own spelling (`se!("jump02")`, not `Hash40::new(…)`).
+pub fn rewrite_sounds_with(
+    text: &str,
+    label: &str,
+    pristine: &[crate::data::SoundEvent],
+    edited: &[crate::data::SoundEvent],
+    macros: &crate::hash_macros::HashMacros,
+) -> Result<(String, SyncReport)> {
+    let sites = sound_sites_with(text, macros);
     let mut report = SyncReport::default();
     let mut edits: Vec<Replacement> = Vec::new();
 
@@ -9924,7 +10654,9 @@ pub fn rewrite_sounds(
             let Some(span) = site.args.get(index + 1) else {
                 continue;
             };
-            let Some(edit) = text_edit(text, span, &format!("Hash40::new(\"{is}\")")) else {
+            // In the author's own spelling: `se!("jump02")` stays a `se!`.
+            let spelled = macros.spell(&text[span.clone()], is, text);
+            let Some(edit) = text_edit(text, span, &spelled) else {
                 continue;
             };
             // One looped `PLAY_SE` yields one event per iteration, all carrying the same site,
@@ -9957,7 +10689,13 @@ pub fn sync_sounds(
 ) -> Result<SyncReport> {
     let script_name = crate::acmd::acmd_script_name("sound", move_name);
     sync_script(index, fighter, &script_name, |body| {
-        rewrite_sounds(body, &format!("{fighter}/{move_name}"), pristine, edited)
+        rewrite_sounds_with(
+            body,
+            &format!("{fighter}/{move_name}"),
+            pristine,
+            edited,
+            &index.hash_macros,
+        )
     })
 }
 
@@ -15453,5 +16191,373 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text);
         assert!(report.skipped.iter().any(|note| note.contains("retimed")));
         assert_eq!(motion_module_set_helper_calculation_sites(text).len(), 1);
+    }
+}
+
+/// Layouts and spellings taken from real movesets (see `moveset_survey`), each of which the
+/// indexer or the write-back used to get wrong.
+#[cfg(test)]
+mod moveset_layout_tests {
+    use super::*;
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    const TILTS: &str = r#"use super::*;
+
+unsafe extern "C" fn game_attack_s3_kick(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("footl"), 8.0, 361, 100, 0, 40, 3.1, 1.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_KICK, *ATTACK_REGION_KICK);
+    }
+}
+
+unsafe extern "C" fn sound_attack_s3_kick(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, cmn!("punch_kick_swing_m"));
+        macros::PLAY_SE(agent, se!("special_n01"));
+    }
+}
+
+pub(super) fn install(agent: &mut Agent) {
+    agent
+        .game_acmd("game_attacks3hop", game_attack_s3_kick, Priority::Default)
+        .sound_acmd("sound_attacks3hop", sound_attack_s3_kick, Priority::Default);
+}
+"#;
+
+    /// Shy Guy's layout: one installer creates the fighter AND an article agent, hands each to a
+    /// submodule, keeps its sound macros in `common/`, and has an old copy of the source beside
+    /// the crate.
+    fn shy_guy_project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "plugin/Cargo.toml", "[package]\nname = \"shyguy\"\n");
+        put(root, "plugin/src/lib.rs", "mod common;\nmod shyguy;\n");
+        put(
+            root,
+            "plugin/src/common/mod.rs",
+            "pub mod util;\n// Agent::new(\"fighter\") is how a common agent would look\n",
+        );
+        put(
+            root,
+            "plugin/src/common/util.rs",
+            r#"#[macro_export]
+macro_rules! fighter_se {
+    ($fighter:literal, $tone:literal) => {
+        smash::phx::Hash40::new(concat!("se_", $fighter, "_", $tone))
+    };
+}
+#[macro_export]
+macro_rules! cmn {
+    ($tone:literal) => { smash::phx::Hash40::new(concat!("se_common_", $tone)) };
+}
+"#,
+        );
+        put(
+            root,
+            "plugin/src/shyguy/mod.rs",
+            r#"macro_rules! se {
+    ($tone:literal) => { $crate::fighter_se!("pacman", $tone) };
+}
+mod articles;
+mod pacman;
+
+pub(crate) fn install() {
+    let pacman = &mut Agent::new("pacman");
+    pacman::install(pacman);
+    pacman.install();
+
+    let trampoline = &mut Agent::new("pacman_trampoline");
+    articles::trampoline::install(trampoline);
+    trampoline.install();
+}
+"#,
+        );
+        put(
+            root,
+            "plugin/src/shyguy/pacman/mod.rs",
+            "mod acmd;\npub(super) fn install(agent: &mut Agent) { acmd::install(agent); }\n",
+        );
+        put(
+            root,
+            "plugin/src/shyguy/pacman/acmd/mod.rs",
+            "mod tilts;\npub(super) fn install(agent: &mut Agent) { tilts::install(agent); }\n",
+        );
+        put(root, "plugin/src/shyguy/pacman/acmd/tilts.rs", TILTS);
+        put(root, "plugin/src/shyguy/articles/mod.rs", "pub mod trampoline;\n");
+        put(
+            root,
+            "plugin/src/shyguy/articles/trampoline/mod.rs",
+            r#"unsafe extern "C" fn game_shoot(agent: &mut L2CAgentBase) {}
+pub fn install(agent: &mut Agent) { agent.game_acmd("game_shoot", game_shoot, Priority::Low); }
+"#,
+        );
+        // Never compiled: no `mod` reaches it.
+        put(root, "plugin/srcOLD/shyguy/pacman/acmd/tilts.rs", TILTS);
+        tmp
+    }
+
+    #[test]
+    fn a_multi_agent_installer_attributes_each_submodule_to_the_agent_it_is_handed() {
+        let tmp = shy_guy_project();
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
+        let mut fighters: Vec<_> = index.fighters.keys().cloned().collect();
+        fighters.sort();
+        assert_eq!(fighters, ["pacman", "pacman_trampoline"], "no `fighter` from a comment");
+        let game = index.script("pacman", "game_attacks3hop").expect("registered game script");
+        assert!(game.file.ends_with("plugin/src/shyguy/pacman/acmd/tilts.rs"), "{game:?}");
+        // `.sound_acmd(` registrations count, under the registered name.
+        assert!(index.script("pacman", "sound_attacks3hop").is_some());
+        assert!(index.script("pacman", "sound_attack_s3_kick").is_none());
+        assert!(index.script("pacman_trampoline", "game_shoot").is_some());
+        assert!(
+            !index.files.iter().any(|f| f.to_string_lossy().contains("srcOLD")),
+            "a backup copy outside the crate is not indexed"
+        );
+    }
+
+    #[test]
+    fn project_sound_macros_read_as_names_and_edits_keep_the_macro() {
+        let tmp = shy_guy_project();
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let project = index.script_source("pacman", "attacks3hop").unwrap();
+        assert!(
+            project.body.contains(r#"Hash40::new("se_common_punch_kick_swing_m")"#),
+            "{}",
+            project.body
+        );
+        let events = crate::acmd::parse_sound_script(&project.body).to_sound_events();
+        assert_eq!(events.len(), 2, "both macro-written sounds are typed");
+        assert_eq!(events[1].call.sounds, ["se_pacman_special_n01"]);
+
+        let mut edited = events.clone();
+        edited[1].call.sounds[0] = "se_pacman_special_n02".into();
+        edited[0].call.sounds[0] = "se_common_swing_01".into();
+        let file = tmp.path().join("plugin/src/shyguy/pacman/acmd/tilts.rs");
+        let site = index.script("pacman", "sound_attacks3hop").unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let body = &text[site.span.clone()];
+        let (after, report) =
+            rewrite_sounds_with(body, "t", &events, &edited, &index.hash_macros).unwrap();
+        assert_eq!(report.changed, 2, "{:?}", report.skipped);
+        assert!(after.contains(r#"macros::PLAY_SE(agent, se!("special_n02"));"#), "{after}");
+        assert!(after.contains(r#"macros::PLAY_SE(agent, cmn!("swing_01"));"#), "{after}");
+        assert!(!after.contains("Hash40::new(\"se_"), "no line was restyled: {after}");
+    }
+
+    /// A project that glob-imports smash_script's macros calls them bare. Reads see the calls,
+    /// and a value edit changes the value — the call stays bare.
+    #[test]
+    fn bare_macro_calls_are_read_and_edited_without_gaining_a_path() {
+        let source = r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+    if is_excute(agent) {
+        ATTACK(agent, 0, 0, Hash40::new("top"), 3.0, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_acmd_script(source).to_hitboxes();
+        assert_eq!(pristine.len(), 1, "the bare ATTACK is read");
+        assert_eq!(pristine[0].active_start, 3);
+        let mut edited = pristine.clone();
+        edited[0].damage = 4.5;
+        let (after, report) = rewrite_hitboxes(source, "t", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
+        assert!(
+            after.contains("        ATTACK(agent, 0, 0, Hash40::new(\"top\"), 4.5, 361"),
+            "{after}"
+        );
+        assert!(!after.contains("macros::"), "{after}");
+        assert_eq!(after.lines().count(), source.lines().count());
+    }
+
+    /// Bluster Kong registers `game_landingairhi` to `game_attackairhi` and leaves an unused
+    /// `fn game_landingairhi` behind; Sackboy registers `effect_fall` twice. Iron Man has an
+    /// ACMD `stub` and a status `stub` in different files.
+    #[test]
+    fn the_registered_function_is_the_script_not_a_namesake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "src/acmd.rs",
+            r#"unsafe extern "C" fn game_attackairhi(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn game_landingairhi(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn effect_fall(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn effect_burst(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn stub(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    let agent = &mut Agent::new("donkey");
+    agent.game_acmd("game_attackairhi", game_attackairhi, Priority::Default);
+    agent.game_acmd("game_landingairhi", game_attackairhi, Priority::Default);
+    agent.acmd("effect_fall", effect_fall, Priority::Default);
+    agent.acmd("effect_fall", effect_burst, Priority::Default);
+    agent.acmd("effect_appeallwr", stub, Priority::Default);
+}
+"#,
+        );
+        put(
+            root,
+            "src/status.rs",
+            "unsafe extern \"C\" fn stub(fighter: &mut L2CFighterCommon) -> L2CValue { 0.into() }\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
+        assert_eq!(
+            index.script("donkey", "game_landingairhi").unwrap().function,
+            "game_attackairhi"
+        );
+        assert_eq!(index.script("donkey", "effect_fall").unwrap().function, "effect_burst");
+        assert!(index.script("donkey", "effect_appeallwr").unwrap().file.ends_with("acmd.rs"));
+    }
+
+    /// An inserted line takes the file's own spelling. In a project that glob-imports the
+    /// macros, names its agent `fighter`, indents with tabs and checks out with CRLF, a
+    /// canonical `macros::REVERSE_LR(agent);` would not compile and would mix line endings.
+    #[test]
+    fn inserted_lines_match_the_file_they_land_in() {
+        let mut text = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\r\n\tframe(fighter.lua_state_agent, 3);\r\n\tif is_excute(fighter) {\r\n\t\tATTACK(fighter, 0);\r\n\t}\r\n}\r\n".to_string();
+        assert!(insert_reverse_line(&mut text, 3));
+        assert!(insert_reverse_line(&mut text, 7));
+        assert!(text.contains("\t\tATTACK(fighter, 0);\r\n\t\tREVERSE_LR(fighter);\r\n\t}"), "{text:?}");
+        assert!(
+            text.contains("\tframe(fighter.lua_state_agent, 7);\r\n\tif is_excute(fighter) {\r\n\t\tREVERSE_LR(fighter);\r\n\t}\r\n"),
+            "{text:?}"
+        );
+        assert!(!text.contains("macros::") && !text.contains("agent)"), "{text:?}");
+        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count(), "no bare LF");
+        // And the line it wrote is recognised as the one to take back out.
+        let line = text.lines().find(|l| l.contains("REVERSE_LR")).unwrap().trim();
+        assert!(is_lone_agent_call(line, "REVERSE_LR"));
+    }
+
+    /// Amy, Captain America and others name the agent `fighter`. Its calls are the agent's own
+    /// and are typed; a call on some other object stays raw, as it always did.
+    #[test]
+    fn a_fighter_named_agent_is_still_the_agent() {
+        let source = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\n    frame(fighter.lua_state_agent, 2.0);\n    macros::FT_MOTION_RATE(fighter, 0.5);\n    frame(fighter.lua_state_agent, 6.0);\n    if macros::is_excute(fighter) {\n        macros::SET_AIR(fighter);\n        macros::SET_AIR(other);\n    }\n}\n";
+        let script = crate::acmd::parse_acmd_script(source);
+        assert!(
+            script.stmts.iter().any(|s| matches!(s, crate::data::AcmdStmt::MotionRate(r) if *r == 0.5)),
+            "{:?}",
+            script.stmts
+        );
+        assert_eq!(script.to_set_air_events().len(), 1, "only the fighter's own SET_AIR");
+        // Outside any scope, the name means nothing special again.
+        assert!(!crate::acmd::is_agent_arg("fighter"));
+    }
+
+    /// A hitbox tuned through named constants — Shy Guy's walk kick keeps its numbers in
+    /// `const`s — reads as a hitbox, and an edit changes the constant where it is defined.
+    #[test]
+    fn a_value_written_as_a_const_is_edited_at_its_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\n");
+        put(
+            root,
+            "src/mario/mod.rs",
+            "mod acmd;\nmod params;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n",
+        );
+        put(root, "src/mario/params.rs", "pub const JAB_DAMAGE:   f32 = 3.0;\npub const JAB_ID: i32 = 0;\n");
+        let acmd = "use super::params::*;\nunsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK(agent, JAB_ID as u64, 0, Hash40::new(\"top\"), JAB_DAMAGE, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);\n    }\n}\npub fn install(agent: &mut Agent) { agent.game_acmd(\"game_attack11\", game_attack11, Priority::Default); }\n";
+        put(root, "src/mario/acmd.rs", acmd);
+        let index = SourceIndex::build(root).unwrap();
+        let body = index.script_source("mario", "attack11").unwrap().body;
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        assert_eq!(pristine.len(), 1, "{body}");
+        assert_eq!(pristine[0].damage, 3.0);
+        let mut edited = pristine.clone();
+        edited[0].damage = 4.5;
+        let report = sync_hitboxes(&index, "mario", "attack11", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/mario/params.rs")).unwrap(),
+            "pub const JAB_DAMAGE:   f32 = 4.5;\npub const JAB_ID: i32 = 0;\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(), acmd, "the call keeps its name");
+        assert!(report.skipped.iter().any(|note| note.contains("JAB_DAMAGE is a constant")), "{:?}", report.skipped);
+    }
+
+    /// Shy Guy's `RUMBLE_HIT(agent, kind)` helper stands for `RUMBLE_HIT(agent, kind, 0)`. The
+    /// helper call reads as that rumble, a vanilla-shaped call beside it keeps its own number,
+    /// an edited kind keeps the author's `rb!`, and the helper's fixed `0` is not writable here.
+    #[test]
+    fn a_project_helper_call_is_read_and_edited_through_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod common;\nmod mario;\n");
+        put(
+            root,
+            "src/common.rs",
+            "pub unsafe fn RUMBLE_HIT(agent: &mut L2CAgentBase, kind: Hash40) {\n    smash_script::macros::RUMBLE_HIT(agent, kind, 0);\n}\nmacro_rules! rb {\n    ($kind:literal) => { smash::phx::Hash40::new(concat!(\"rbkind_\", $kind)) };\n}\n",
+        );
+        put(root, "src/mario/mod.rs", "mod acmd;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n");
+        let acmd = "unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::RUMBLE_HIT(agent, rb!(\"attackm\"));\n        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attacks\"), 0);\n    }\n}\npub fn install(agent: &mut Agent) { agent.expression_acmd(\"expression_attack11\", expression_attack11, Priority::Default); }\n";
+        put(root, "src/mario/acmd.rs", acmd);
+        let index = SourceIndex::build(root).unwrap();
+        let body = index.script_source("mario", "attack11").unwrap().body;
+        let events = crate::acmd::parse_expression_script(&body).to_expression_events();
+        assert_eq!(events.len(), 2, "{body}");
+        assert_eq!(
+            events[0].call,
+            crate::data::ExpressionCall::RumbleHit {
+                kind: "Hash40::new(\"rbkind_attackm\")".into(),
+                unk: "0".into()
+            }
+        );
+
+        // Retune both kinds and the helper's hidden argument.
+        let mut edited = events.clone();
+        edited[0].call = crate::data::ExpressionCall::RumbleHit {
+            kind: "Hash40::new(\"rbkind_attackl\")".into(),
+            unk: "4".into(),
+        };
+        edited[1].call = crate::data::ExpressionCall::RumbleHit {
+            kind: "Hash40::new(\"rbkind_attackll\")".into(),
+            unk: "0".into(),
+        };
+        let report = sync_expressions(&index, "mario", "attack11", &events, &edited).unwrap();
+        let written = std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap();
+        assert!(written.contains("        macros::RUMBLE_HIT(agent, rb!(\"attackl\"));\n"), "{written}");
+        assert!(
+            written.contains("        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attackll\"), 0);\n"),
+            "the vanilla-shaped call is the second site, not the first: {written}"
+        );
+        assert!(
+            report.skipped.iter().any(|note| note.contains("helper")),
+            "the fixed argument is refused with a reason: {:?}",
+            report.skipped
+        );
+    }
+
+    #[test]
+    fn a_block_written_on_one_line_parses_instead_of_panicking() {
+        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 4.0);
+    if macros::is_excute(agent) { macros::ATTACK(agent, 0, 0, Hash40::new("top"), 3.0, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH); }
+    if foo(&Vector2f{x: 1.0, y: 0.0}) {
+        bar();
+    }
+    frame(agent.lua_state_agent, 9.0);
+}
+"#;
+        let script = crate::acmd::parse_acmd_script(source);
+        assert_eq!(script.to_hitboxes().len(), 1);
+        assert_eq!(script.to_hitboxes()[0].active_start, 4);
+        let effect = source.replace("game_x", "effect_x");
+        let _ = crate::acmd::parse_effect_script(&effect);
     }
 }

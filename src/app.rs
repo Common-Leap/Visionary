@@ -5262,6 +5262,18 @@ impl VisionaryApp {
             return;
         };
         let label = format!("{}/{}", buffer.fighter, buffer.move_name);
+        // Same agent-name rule the parser applied to this text (see `acmd::is_agent_arg`).
+        let _agent = crate::acmd::agent_scope(&buffer.text);
+        // Values written as project consts are recognised, but this buffer is one function:
+        // their definitions are changed by syncing to the project, not by mirroring here.
+        let _consts = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::project_consts::scope(std::sync::Arc::clone(&index.consts)));
+        let _helpers = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::project_helpers::scope(std::sync::Arc::clone(&index.helpers)));
         let outcome = if buffer.is_game_script() {
             match crate::acmd_src::rewrite_hitboxes(
                 &buffer.text,
@@ -5750,8 +5762,21 @@ impl VisionaryApp {
             return;
         };
         match outcome {
-            Ok((updated, report)) => {
+            Ok((updated, mut report)) => {
                 buffer.text = updated;
+                let refused = crate::project_helpers::take_refused();
+                if refused > 0 {
+                    report.skipped.push(format!(
+                        "{refused} edit(s) changed a value that one of the project's helper \
+                         functions fixes — change it in the helper itself"
+                    ));
+                }
+                for edit in crate::project_consts::take_pending() {
+                    report.skipped.push(format!(
+                        "{} is a constant — sync to the project to change its definition to {}",
+                        edit.name, edit.value
+                    ));
+                }
                 buffer.note = (!report.skipped.is_empty()).then(|| report.skipped.join("; "));
             }
             Err(e) => buffer.note = Some(e.to_string()),

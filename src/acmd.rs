@@ -370,7 +370,74 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
     Ok(String::new())
 }
 
+/// Whether `value` is an ACMD call's agent argument.
+///
+/// Every ACMD macro takes the agent first, and projects name it whatever they like: `agent`,
+/// `fighter` (2,200 calls across the moveset corpus), `weapon`, `_agent`. Matching only the
+/// literal `agent` left every call in those projects untyped — a `FT_MOTION_RATE(fighter, 0.7)`
+/// was ignored, so every frame after it was drawn at the wrong time. Shared by the parsers and
+/// the write-back scanners so both always accept the same calls.
+///
+/// Only the function's OWN agent counts: `SET_AIR(other)` acts on some other object, and typing
+/// it as this fighter's would let an edit change the wrong thing. The name is `agent` unless an
+/// [`AgentScope`] says the function being read or written calls it something else.
+pub(crate) fn is_agent_arg(value: impl AsRef<str>) -> bool {
+    let value = value.as_ref().trim();
+    value == "agent" || AGENT_NAME.with(|name| name.borrow().as_deref() == Some(value))
+}
+
+thread_local! {
+    static AGENT_NAME: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`is_agent_arg`] also accepts the agent parameter named in a function header.
+/// Restores the previous name on drop, so nested scopes are safe.
+pub(crate) struct AgentScope(Option<String>);
+
+impl Drop for AgentScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        AGENT_NAME.with(|name| *name.borrow_mut() = previous);
+    }
+}
+
+/// Scope [`is_agent_arg`] to the agent parameter of the first ACMD function in `text`.
+pub(crate) fn agent_scope(text: &str) -> AgentScope {
+    let detected = agent_param_name(text);
+    let previous = AGENT_NAME.with(|name| std::mem::replace(&mut *name.borrow_mut(), detected));
+    AgentScope(previous)
+}
+
+/// The name of the first `NAME: &mut L2CAgentBase` parameter in `text`.
+pub(crate) fn agent_param_name(text: &str) -> Option<String> {
+    let at = text.find("L2CAgentBase")?;
+    let before = text[..at].trim_end();
+    let before = before.strip_suffix("&mut").unwrap_or(before).trim_end();
+    let before = before.strip_suffix(':')?.trim_end();
+    let start = before
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |n| n + 1);
+    let name = &before[start..];
+    (!name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit())).then(|| name.to_string())
+}
+
+/// `agent.module_accessor`, with any agent name (see [`is_agent_arg`]).
+pub(crate) fn is_agent_module_accessor(value: impl AsRef<str>) -> bool {
+    value
+        .as_ref()
+        .trim()
+        .strip_suffix(".module_accessor")
+        .is_some_and(is_agent_arg)
+}
+
+/// A module-accessor receiver: `agent.module_accessor` under any agent name, or `boma`.
+pub(crate) fn is_module_accessor(value: impl AsRef<str>) -> bool {
+    let value = value.as_ref().trim();
+    value == "boma" || is_agent_module_accessor(value)
+}
+
 pub fn parse_acmd_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let game_fn = extract_function(source, "game_");
     // A body with no function header at all is a live capture or a paste, and is read whole —
     // that is the only reason this falls back. A source that *does* hold ACMD functions but no
@@ -382,6 +449,7 @@ pub fn parse_acmd_script(source: &str) -> AcmdScript {
         None if holds_acmd_function(source) => return AcmdScript::default(),
         None => source,
     };
+    let _agent = agent_scope(source);
     let lines: Vec<&str> = source.lines().collect();
     // Skip the function signature line and closing brace
     let body_lines = if lines.len() >= 2 {
@@ -412,8 +480,14 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
         if let Some(count) = parse_for_loop_header(line) {
             // Find the matching closing brace
             let body_start = pos + lines_consumed;
-            let (body_lines_end, _) = find_block_end(lines, pos);
-            let body_slice = &lines[body_start..body_lines_end];
+            let (body_lines_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            if let Some(inner) = inline_block_body(line, body_start, body_lines_end) {
+                let (body, _) = parse_stmts(&[inner.as_str()], 0);
+                stmts.push(AcmdStmt::Loop { count, body });
+                pos += lines_consumed;
+                continue;
+            }
+            let body_slice = block_slice(lines, body_start, body_lines_end);
             let (body, _) = parse_stmts(body_slice, 0);
             stmts.push(AcmdStmt::Loop { count, body });
             pos = body_lines_end + 1;
@@ -423,8 +497,13 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
         // if macros::is_excute(agent) { ... }
         if line.contains("is_excute") {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let excute_stmts = parse_excute_block(&lines[body_start..body_end]);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            if let Some(inner) = inline_block_body(line, body_start, body_end) {
+                stmts.push(AcmdStmt::Excute(parse_excute_block(&[inner.as_str()])));
+                pos += lines_consumed;
+                continue;
+            }
+            let excute_stmts = parse_excute_block(block_slice(lines, body_start, body_end));
             stmts.push(AcmdStmt::Excute(excute_stmts));
             pos = body_end + 1;
             continue;
@@ -481,7 +560,7 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
             || line.contains("fn visionary_set_air("))
             && line.ends_with('{')
         {
-            let (body_end, _) = find_block_end(lines, pos);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
             pos = body_end + 1;
             continue;
         }
@@ -491,14 +570,14 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
         // branch is still seen; the brace is kept, so the function still closes.
         if line.ends_with('{') {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let (body, _) = parse_stmts(&lines[body_start..body_end], 0);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            let (body, _) = parse_stmts(block_slice(lines, body_start, body_end), 0);
             stmts.push(AcmdStmt::RawBlock {
                 header: line.to_string(),
                 body,
             });
             // Dumped scripts often put the closing brace and the following branch opener on
-            // one physical line (`} else {`). `find_block_end` stops at the first closing brace,
+            // one physical line (`} else {`). `find_block_end_after` stops at the first closing brace,
             // so parse that sibling block here rather than feeding the combined line back into
             // the recursive walker (which would otherwise produce an inverted slice).
             if let Some(else_header) = combined_else_header(lines[body_end]) {
@@ -749,23 +828,53 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
 
 /// Find the line index of the closing `}` that matches the opening `{` on `lines[start]`.
 /// Returns (closing_line_index, depth_at_end).
-fn find_block_end(lines: &[&str], start: usize) -> (usize, i32) {
+/// The line holding the `}` that closes a block whose header is the `consumed` lines from
+/// `start` — a logical statement that may wrap. Braces the header itself balances
+/// (`Vector2f{x: 1.0}`) are not the block's: counting from the header's first character, as
+/// this used to, returned *that* brace as the end. Returns `start` when the header closes its
+/// own block (a one-line block).
+fn find_block_end_after(lines: &[&str], start: usize, consumed: usize) -> usize {
+    let header_end = (start + consumed).min(lines.len());
     let mut depth = 0i32;
-    for (i, line) in lines[start..].iter().enumerate() {
+    for line in &lines[start..header_end] {
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+    }
+    if depth <= 0 {
+        return start;
+    }
+    for (i, line) in lines[header_end..].iter().enumerate() {
         for ch in line.chars() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return (start + i, 0);
+                        return header_end + i;
                     }
                 }
                 _ => {}
             }
         }
     }
-    (lines.len().saturating_sub(1), depth)
+    lines.len().saturating_sub(1)
+}
+
+/// `lines[start..end]`, or nothing when a malformed block put its end first.
+fn block_slice<'a, 'b>(lines: &'b [&'a str], start: usize, end: usize) -> &'b [&'a str] {
+    lines.get(start..end).unwrap_or(&[])
+}
+
+/// The interior of a block that opens AND closes within the opening statement's own lines —
+/// `if is_excute(agent) { ATTACK(…); }` written on one line. [`find_block_end_after`] returns
+/// that same line as the block's end, which is before the body would start; slicing on it
+/// panicked and took the whole editor down with it. `None` when the block spans further lines.
+fn inline_block_body(logical: &str, body_start: usize, body_end: usize) -> Option<String> {
+    if body_end >= body_start {
+        return None;
+    }
+    let open = logical.find('{')?;
+    let close = logical.rfind('}')?;
+    (close > open).then(|| logical[open + 1..close].trim().to_string())
 }
 
 /// Return the branch opener after a closing brace on the same physical line.
@@ -1270,7 +1379,7 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
                 "visionary_last_effect_set_work_int("
             };
             if let Some(t) = try_extract(prefix) {
-                if t.len() == 2 && t[0].trim() == "agent" && !t[1].trim().is_empty() {
+                if t.len() == 2 && crate::acmd::is_agent_arg(&t[0]) && !t[1].trim().is_empty() {
                     macros.push(EffectMacro::LastEffectSetWorkInt {
                         work: strip_deref(&t[1]),
                     });
@@ -1354,7 +1463,7 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
         };
         if let Some(prefix) = scale_w_prefix {
             if let Some(t) = try_extract(prefix) {
-                if (2..=4).contains(&t.len()) && t[0].trim() == "agent" {
+                if (2..=4).contains(&t.len()) && crate::acmd::is_agent_arg(&t[0]) {
                     let values = t[1..]
                         .iter()
                         .enumerate()
@@ -1458,8 +1567,8 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
 
         if let Some(count) = parse_for_loop_header(line) {
             let body_start = pos + lines_consumed;
-            let (body_lines_end, _) = find_block_end(lines, pos);
-            let body_slice = &lines[body_start..body_lines_end];
+            let (body_lines_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            let body_slice = block_slice(lines, body_start, body_lines_end);
             let (body, _) = parse_effect_stmts(body_slice, 0);
             stmts.push(EffectStmt::Loop { count, body });
             pos = body_lines_end + 1;
@@ -1473,15 +1582,20 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
             || line.contains("fn visionary_last_effect_set_scale_w("))
             && line.ends_with('{')
         {
-            let (body_end, _) = find_block_end(lines, pos);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
             pos = body_end + 1;
             continue;
         }
 
         if line.contains("is_excute") {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let effect_macros = parse_excute_block_effects(&lines[body_start..body_end]);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            if let Some(inner) = inline_block_body(line, body_start, body_end) {
+                stmts.push(EffectStmt::Excute(parse_excute_block_effects(&[inner.as_str()])));
+                pos += lines_consumed;
+                continue;
+            }
+            let effect_macros = parse_excute_block_effects(block_slice(lines, body_start, body_end));
             stmts.push(EffectStmt::Excute(effect_macros));
             pos = body_end + 1;
             continue;
@@ -1495,8 +1609,8 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
         // dropped line and — worse — parsed the body as siblings of the conditional. Both arms
         // of an `if`/`else` then resolved as unconditional spawns at the same frame.
         if opens_block(line) {
-            let (body_end, _) = find_block_end(lines, pos);
-            let (body, _) = parse_effect_stmts(&lines[pos + lines_consumed..body_end], 0);
+            let (body_end, _) = (find_block_end_after(lines, pos, lines_consumed), 0);
+            let (body, _) = parse_effect_stmts(block_slice(lines, pos + lines_consumed, body_end), 0);
             stmts.push(EffectStmt::Cond {
                 header: line.to_string(),
                 body,
@@ -1866,11 +1980,13 @@ fn effect_spawn_macro_layout(line: &str) -> Option<(&'static str, bool, bool)> {
 
 /// Parse an effect_ script source into an `EffectScript` IR.
 pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let effect_fn = extract_function(source, "effect_");
     let effect_fn = match effect_fn {
         Some(ref s) => s.as_str(),
         None => return EffectScript::default(),
     };
+    let _agent = agent_scope(effect_fn);
     let lines: Vec<&str> = effect_fn.lines().collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
@@ -1898,9 +2014,11 @@ pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
 /// until sound editing has its own complete surface contract.
 #[allow(dead_code)]
 pub fn parse_sound_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let Some(sound_fn) = extract_function(source, "sound_") else {
         return AcmdScript::default();
     };
+    let _agent = agent_scope(&sound_fn);
     let lines: Vec<&str> = sound_fn.lines().collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
@@ -1913,9 +2031,11 @@ pub fn parse_sound_script(source: &str) -> AcmdScript {
 
 /// Parse the `expression_` function's measured camera/rumble calls.
 pub fn parse_expression_script(source: &str) -> AcmdScript {
+    let source = &*crate::acmd_src::qualify_bare_macros(source);
     let Some(expression_fn) = extract_function(source, "expression_") else {
         return AcmdScript::default();
     };
+    let _agent = agent_scope(&expression_fn);
     let lines: Vec<&str> = expression_fn.lines().collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
@@ -1997,7 +2117,7 @@ fn parse_motion_rate_call(line: &str) -> Option<f32> {
     let (agent, rate) = inner.split_once(',')?;
     // The first argument is the agent in every corpus call. Anything else is a shape this has
     // not seen, and guessing at it is how a wrong value reaches the export.
-    (agent.trim() == "agent").then(|| rate.trim().parse::<f32>().ok())?
+    (crate::acmd::is_agent_arg(agent)).then(|| rate.trim().parse::<f32>().ok())?
 }
 
 fn parse_wait_call(line: &str) -> Option<f32> {
@@ -2411,7 +2531,7 @@ fn parse_damage_no_reaction_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, command, mode, value] = args.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent"
+    if !crate::acmd::is_agent_arg(agent)
         || command.trim().trim_start_matches('*') != "MA_MSC_DAMAGE_DAMAGE_NO_REACTION"
     {
         return None;
@@ -2583,7 +2703,7 @@ fn parse_direct_expression_call(line: &str) -> Option<ExcuteStmt> {
     let [receiver, kind, duration, looped, target] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(receiver.trim(), "agent.module_accessor" | "boma")
+    if !crate::acmd::is_module_accessor(receiver.trim())
         || kind.trim().is_empty()
         || duration.trim().parse::<i32>().is_err()
         || !matches!(looped.trim(), "true" | "false")
@@ -2661,7 +2781,7 @@ fn parse_reverse_lr_call(line: &str) -> Option<ExcuteStmt> {
     let start = line.find(needle)? + needle.len();
     let end = line[start..].rfind(')')? + start;
     let tokens = tokenize_args(&line[start..end]);
-    (tokens.as_slice() == ["agent"]).then_some(ExcuteStmt::ReverseLr)
+    (tokens.len() == 1 && crate::acmd::is_agent_arg(&tokens[0])).then_some(ExcuteStmt::ReverseLr)
 }
 
 /// Parse the buildable `SET_SPEED_EX(agent, x, y, kinetic_kind)` shape.
@@ -2677,7 +2797,7 @@ fn parse_set_speed_ex_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y, kinetic_kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::SetSpeedEx(crate::data::SetSpeedExCall {
@@ -2703,7 +2823,7 @@ fn parse_set_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::SetSpeed(crate::data::SetSpeedCall {
@@ -2721,7 +2841,7 @@ fn parse_add_speed_no_limit_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, speed_x, speed_y] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::AddSpeedNoLimit(
@@ -2741,7 +2861,7 @@ fn parse_correct_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" || kind.trim().is_empty() {
+    if !crate::acmd::is_agent_arg(agent) || kind.trim().is_empty() {
         return None;
     }
     Some(ExcuteStmt::Correct(crate::data::CorrectCall {
@@ -2761,7 +2881,7 @@ fn parse_ft_catch_stop_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, arg1, arg2] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::FtCatchStop(crate::data::FtCatchStopCall {
@@ -2782,7 +2902,7 @@ fn parse_ft_start_adjust_motion_frame_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, value] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" {
+    if !crate::acmd::is_agent_arg(agent) {
         return None;
     }
     Some(ExcuteStmt::FtStartAdjustMotionFrame(
@@ -2805,7 +2925,7 @@ fn parse_motion_module_set_rate_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, rate] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let rate = rate.trim().parse::<f32>().ok()?;
@@ -2826,7 +2946,7 @@ fn parse_motion_module_set_helper_calculation_call(line: &str) -> Option<ExcuteS
     let [module_accessor, enabled] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let enabled = match enabled.trim() {
@@ -2866,7 +2986,7 @@ fn parse_motion_module_set_rate_partial_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, part_kind, rate] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let part_kind = parse_motion_module_part_kind(part_kind)?;
@@ -2898,7 +3018,7 @@ fn parse_motion_module_set_frame_partial_call(line: &str) -> Option<ExcuteStmt> 
         },
         _ => return None,
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let part_kind = parse_motion_module_part_kind(part_kind)?;
@@ -2929,7 +3049,7 @@ fn parse_clr_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [agent, kinetic_kind] = tokens.as_slice() else {
         return None;
     };
-    if agent.trim() != "agent" || kinetic_kind.trim().is_empty() {
+    if !crate::acmd::is_agent_arg(agent) || kinetic_kind.trim().is_empty() {
         return None;
     }
     Some(ExcuteStmt::ClrSpeed(crate::data::ClrSpeedCall {
@@ -2949,7 +3069,7 @@ fn parse_set_air_call(line: &str) -> Option<ExcuteStmt> {
     let start = line.find(needle)? + needle.len();
     let end = line[start..].rfind(')')? + start;
     let tokens = tokenize_args(&line[start..end]);
-    (tokens.as_slice() == ["agent"]).then_some(ExcuteStmt::SetAir)
+    (tokens.len() == 1 && crate::acmd::is_agent_arg(&tokens[0])).then_some(ExcuteStmt::SetAir)
 }
 
 /// Parse the measured direct `KineticModule::clear_speed_all` shapes:
@@ -2964,7 +3084,7 @@ fn parse_kinetic_clear_speed_all_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor] = tokens.as_slice() else {
         return None;
     };
-    matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+    crate::acmd::is_module_accessor(module_accessor.trim())
         .then_some(ExcuteStmt::KineticClearSpeedAll)
 }
 
@@ -2981,7 +3101,7 @@ fn parse_kinetic_set_consider_ground_friction_call(line: &str) -> Option<ExcuteS
     else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let consider_ground_friction = match consider_ground_friction.trim() {
@@ -3014,7 +3134,7 @@ fn parse_change_kinetic_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, kinetic_type] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+    if !crate::acmd::is_module_accessor(module_accessor.trim())
         || kinetic_type.trim().is_empty()
     {
         return None;
@@ -3056,7 +3176,7 @@ fn parse_kinetic_energy_call(line: &str) -> Option<ExcuteStmt> {
         let [module_accessor, kinetic_energy_id] = tokens.as_slice() else {
             continue;
         };
-        if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma")
+        if !crate::acmd::is_module_accessor(module_accessor.trim())
             || kinetic_energy_id.trim().is_empty()
         {
             continue;
@@ -3081,7 +3201,7 @@ fn parse_kinetic_add_speed_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, vector] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) {
         return None;
     }
     let (speed_x, speed_y) = parse_zero_z_vector(vector)?;
@@ -3108,7 +3228,7 @@ fn parse_work_flag_call(line: &str) -> Option<ExcuteStmt> {
         let [module_accessor, flag] = tokens.as_slice() else {
             continue;
         };
-        if !matches!(module_accessor.trim(), "agent.module_accessor" | "boma") {
+        if !crate::acmd::is_module_accessor(module_accessor.trim()) {
             continue;
         }
         let flag = flag.trim();
@@ -3166,11 +3286,11 @@ fn parse_work_transition_term_call(line: &str) -> Option<ExcuteStmt> {
         let receiver_is_measured = match action {
             crate::data::WorkTransitionTermAction::Enable
             | crate::data::WorkTransitionTermAction::Unable => {
-                matches!(receiver, "agent.module_accessor" | "boma")
+                crate::acmd::is_module_accessor(receiver)
             }
             crate::data::WorkTransitionTermAction::EnableGroup
             | crate::data::WorkTransitionTermAction::UnableGroupEx => {
-                receiver == "agent.module_accessor"
+                crate::acmd::is_agent_module_accessor(receiver)
             }
         };
         if !receiver_is_measured {
@@ -3206,7 +3326,7 @@ fn parse_work_module_inc_int_call(line: &str) -> Option<ExcuteStmt> {
     let [receiver, slot] = tokens.as_slice() else {
         return None;
     };
-    if !matches!(receiver.trim(), "agent.module_accessor" | "boma") {
+    if !crate::acmd::is_module_accessor(receiver.trim()) {
         return None;
     }
     let slot = slot.trim();
@@ -3280,7 +3400,7 @@ fn parse_work_module_set_call(line: &str) -> Option<ExcuteStmt> {
             continue;
         };
         let receiver = module_accessor.trim();
-        if !matches!(receiver, "agent.module_accessor" | "boma") {
+        if !crate::acmd::is_module_accessor(receiver) {
             continue;
         }
         let value = value.trim();
