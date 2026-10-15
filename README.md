@@ -17,7 +17,9 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 ## Prerequisites
 
 - A recent Rust toolchain
-- The `cargo-skyline` toolchain for building the in-game plugin
+- The `cargo-skyline` toolchain for building the in-game plugin, and for
+  **Build & Deploy** of a linked moveset (see [Building and deploying your
+  plugin](#building-and-deploying-your-plugin))
 
 Cargo downloads the pinned `ssbh_wgpu` revision, `effect_library`, and the other
 Rust dependencies automatically during the build.
@@ -152,9 +154,10 @@ selected export root for future sessions.
 The main window keeps editing tasks in one focused inspector. Select a move in
 the Fighters list, then use the tabs beside the viewport:
 
-- **Collisions** contains attacks, grabs, wind, throw-damage, and active-hitbox
-  data. Common values are shown first; **Hit behavior**, **Valid targets**, **Hit
-  feedback**, and other less-used fields stay in clearly named collapsible sections.
+- **Collisions** opens with the move's frame data (below), then lists attacks,
+  grabs, wind, throw-damage, and active-hitbox data. Common values are shown
+  first; **Hit behavior**, **Valid targets**, **Hit feedback**, and other
+  less-used fields stay in clearly named collapsible sections.
 - **Hurtboxes** contains parameter-defined capsules, `HIT_NODE`/`HIT_NO`/
   `WHOLE_HIT` state changes, invincibility and intangibility ranges, and
   damage-reaction armor settings.
@@ -167,6 +170,25 @@ the Fighters list, then use the tabs beside the viewport:
   effect that ends at a finite frame also shows the two **End flags** its
   `EFFECT_OFF_KIND` was written with; the vanilla scripts do not agree on them,
   so they are carried per call rather than defaulted.
+
+The frame data line recalculates as you edit and shows:
+
+- **Startup** — the first game frame a damaging hitbox is out.
+- **Active** — every window in which one is out, inclusive (`5-7, 9-10`).
+- **FAF** — the first actionable frame: the motion list's `cancel_frame`, or the
+  frame after the animation ends when the motion list sets none.
+- **Landing lag** — for aerials, from `landing_attack_air_frame_*`. A value your
+  linked source sets (for example a `param_config` override in `params.rs`)
+  wins over the `.prc` files, and a mod's `fighter_param.prc` wins over the
+  vanilla one.
+- **Shieldstun** and advantage — `floor(damage × 0.8 × multiplier + 2)` for the
+  strongest hitbox out on the startup frame, using the smash-attack or aerial
+  multiplier from `common.prc`. Grounded advantage assumes the hit lands on the
+  first active frame; aerial advantage assumes the aerial lands right after
+  hitting (shieldstun − landing lag).
+
+Every figure is in game frames, so `FT_MOTION_RATE` windows are applied. Hover
+any figure to see where its number came from.
 
 Section names use plain language first and show the native macro name where it
 matters. Hover any section name to see what it controls, including engine terms
@@ -253,49 +275,60 @@ macros you actually called. Both the smashline layout (`Agent::new("mario")`
 beside the scripts) and the older `#[acmd_script(agent = "…", script = "…")]`
 attributes are recognised.
 
-Real movesets are written in many styles, and Visionary reads them as written:
-
-- **Only compiled code counts.** Files are followed through the crate's `mod`
-  tree from `src/lib.rs`, so a `srcOLD/` backup, an extracted release copy or a
-  vanilla reference dump beside the crate is never mistaken for the live script.
-- **Multi-agent installers.** `pacman::install(pacman)` with
-  `let pacman = &mut Agent::new("pacman")` gives that module to `pacman`, even
-  when the same installer also sets up article agents. `.game_acmd`,
-  `.effect_acmd`, `.sound_acmd`, `.expression_acmd` and `.acmd` registrations are
-  all read, and the last registration of a script name wins, as it does in game.
-- **Bare macros and any agent name.** `ATTACK(agent, …)` from a
-  `use smash_script::macros::*;` import reads the same as `macros::ATTACK`, and
-  a function whose agent is called `fighter` or `weapon` is understood too.
-- **Your own shorthand.** Hash macros such as `cmn!("swing_06")` or
-  `se!("jump01")` show the sound they name, numeric `const`s show their value,
-  and one-line helpers such as `RUMBLE_HIT(agent, kind)` read as the macro they
-  call.
-
-Edits keep your style. A value changes in place; a `se!("jump01")` stays a
-`se!` macro; a hitbox whose damage is `WALK_LW_DAMAGE` changes the const where it
-is defined, and says how many other places share it; a value a helper fixes is
-refused with a note instead of rewritten. Lines Visionary has to add use the
-file's own macro path, agent name, indentation and line endings.
-
-**Build & Deploy** in the same window runs `cargo skyline build --release` on
-the linked crate and replaces the deployed plugin. It finds the plugin on the
-most recently used emulator SD by name, or by fingerprint when a mod ships it
-renamed to `plugin.nro`, and **Deploy to…** picks a destination it could not
-find. If the plugin exports smashline's `smashline_install`, it is also written
-as smashline's `development.nro`; press L + R + D-pad Up in the game's menus to
-hot-reload it. The full cargo output is kept in `visionary-build.log`.
-
-The **Collisions** tab opens with the move's frame data: startup, active frames,
-first actionable frame, landing lag and shield advantage, in game frames
-(`FT_MOTION_RATE` applied). Hover any figure for where it came from. Landing lag
-set in your source (for example through `param_config`) takes precedence over the
-`.prc` files.
-
 A project rarely overrides everything, and it does not have to. Each category is
 resolved on its own: your `game_attackairn` is used for the hitboxes, and the
 move's stock effects and sounds still come from the vanilla scripts, so a mod
 that only retimes a hitbox does not make the move look silent and effectless.
 Anything your project does define always wins over the vanilla copy.
+
+### How your project is read
+
+Real movesets are written in many styles, and Visionary reads them as written.
+The link header shows how many scripts and fighters it found.
+
+- **Only compiled code counts.** Files are followed through the crate's `mod`
+  tree from `src/lib.rs` or `src/main.rs`, so a `srcOLD/` backup, an extracted
+  release copy, or a vanilla reference dump beside the crate is never mistaken
+  for the live script.
+- **Multi-agent installers.** `pacman::install(pacman)` after
+  `let pacman = &mut Agent::new("pacman")` gives that whole module to `pacman`,
+  even when the same installer also sets up article agents. A commented-out
+  `Agent::new("…")` is not a fighter.
+- **Every registration form.** `.acmd`, `.game_acmd`, `.effect_acmd`,
+  `.sound_acmd`, `.expression_acmd` and `install_acmd_script!` are read, under
+  the script name they register rather than the function's name. When one agent
+  registers a script twice, the later registration wins, as it does in game; a
+  `game_…` function that is never registered while another function is
+  registered under its name is treated as dead code. Status functions
+  (`L2CFighterCommon`) are never mistaken for ACMD, even when they share a name
+  with an ACMD helper elsewhere.
+- **Bare macros and any agent name.** `ATTACK(agent, …)` from a
+  `use smash_script::macros::*;` import reads the same as `macros::ATTACK`, and
+  a function whose agent is called `fighter`, `weapon`, or anything else is
+  understood. Calls on some *other* object (`SET_AIR(other)`) stay untyped.
+- **One-line blocks.** `if is_excute(agent) { ATTACK(…); }` written on one line
+  parses like the multi-line form.
+
+The project's own shorthand is read too:
+
+- **Hash macros.** Single-arm `macro_rules!` that build a `Hash40` from string
+  literals — `cmn!("swing_06")`, `se!("jump01")`, `vc!("ottotto")`, including
+  ones defined through another macro such as `fighter_se!` — show the name they
+  hash, so those sounds and rumbles appear in the panels.
+- **Numeric consts.** `const WALK_LW_DAMAGE: f32 = 4.0;` shows its value where
+  it is used. Float consts always do; integer consts do when cast
+  (`LIFTOFF_FRAME as f32`) or named like a quantity. An integer named like an
+  identifier — a hitbox id, a work flag, a status — keeps its name.
+- **One-call helpers.** A function whose body is a single macro call built from
+  its own parameters, such as `RUMBLE_HIT(agent, kind)` wrapping
+  `RUMBLE_HIT(agent, kind, 0)`, or a `RUMBLE` helper around
+  `ControlModule::set_rumble`, reads as the call it makes. A helper with logic of
+  its own stays a raw line, which is always safe.
+
+A name defined twice with different values or bodies is left alone, since which
+one a call sees depends on module scoping.
+
+### Editing your source
 
 The same window edits a script in place: pick **Hitboxes** or **Effects** to
 open that function in a small text editor. Saving needs the function to exist in
@@ -312,10 +345,30 @@ The editor and the rest of the app stay in sync both ways while you work:
 
 Nothing touches the file on disk until you press **Save**, which rewrites only
 that one function in the source file that owns it and leaves the rest of the
-project alone. If the same fighter and script name appears in more than one
-function, Visionary reports the conflicting files and functions instead of
-guessing which one to edit; resolve the duplicate and press **Rescan**.
-**Revert** restores the script as loaded, panels included.
+project alone. If the same fighter and script name is still defined by more than
+one function after the rules above, Visionary reports the conflicting files and
+functions instead of guessing which one to edit; resolve the duplicate and press
+**Rescan**. When the duplicates come from separate crates — a folder holding
+several copies of one moveset — the report says so: link the folder of the crate
+you actually build instead. **Revert** restores the script as loaded, panels
+included.
+
+Edits keep your style:
+
+- A value changes in place, and nothing else on the line is rewritten.
+- A hash written through one of your macros stays in it: `se!("jump01")`
+  becomes `se!("jump02")`, or `cmn!("swing_01")` when the new name is a common
+  sound. A plain `Hash40::new("…")` stays plain.
+- A value written as a const changes the **definition**, in whichever file it
+  lives, and the report says how many other places use that const. The call keeps
+  the const's name. Dragging a const-backed value in the panels while the
+  source pane is open notes that the definition changes when you sync to the
+  project.
+- A value a helper fixes inside its own body (the hidden `0` of a `RUMBLE_HIT`
+  helper) is refused with a note rather than written at the call.
+- Lines Visionary has to add — a new `frame` block, an added effect, a new
+  script — use the file's own macro path (`macros::`, `smash_script::macros::`
+  or none), agent name, frame number style, indentation and line endings.
 
 **Show** switches between your source, the code Visionary *would* write into
 `acmd_source/` if you exported the move right now, and both side by side. The
@@ -326,6 +379,34 @@ cannot be exported under the macro your script used, it says which one and why.
 The generated pane does not need a linked project, and works for any move the
 editor has loaded — including one captured live from the game, which has no
 script file anywhere. That case is the reason it is worth having.
+
+### Building and deploying your plugin
+
+**Build & Deploy** in the link header runs `cargo skyline build --release` on
+the crate the linked source belongs to and copies the resulting
+`lib<name>.nro` over every deployed copy it finds on the emulator SD the game
+wrote to most recently:
+
+- copies with the same file name under `ultimate/mods/`, the Skyline plugins
+  folder, or the emulator's LayeredFS `load/` folder;
+- a mod that ships the plugin renamed to `plugin.nro`, recognised by the
+  crate's own source paths compiled into it. A plugin built from a shared
+  template only counts when it clearly matches this crate better than any
+  other;
+- any destination chosen with **Deploy to…**, remembered per linked project.
+
+If the plugin exports smashline's `smashline_install` entry point, it is also
+written as smashline's `development.nro`; press **L + R + D-pad Up** in the
+game's menus to reload it without restarting. Otherwise, restart the game to
+load the new build.
+
+The build runs in the background and reports on the status line, including the
+first compiler error and its location when it fails. The full cargo output is
+kept in `visionary-build.log` in the crate folder.
+
+This builds *your moveset's* plugin. Visionary's own in-game plugin is built
+separately (see [In-game plugin](#in-game-plugin)), and edits to Visionary do
+not require rebuilding it unless the plugin's sources changed.
 
 ### Checking the generated code
 
@@ -856,6 +937,20 @@ plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
 limit; stop the game before manually clearing that cache.
 
 ## Additional tools
+
+`src/moveset_survey.rs` is an ignored test that runs the source indexer and
+parsers over a folder of moveset projects and reports, per project, the
+fighters and scripts found, conflicts, and the most common lines left untyped.
+Use it to check a change against real projects:
+
+```bash
+VISIONARY_MOVESETS="/path/to/Movesets" cargo test --bin visionary moveset_survey -- --ignored --nocapture
+```
+
+`VISIONARY_SURVEY_ONLY=<folder name>` limits it to one project, and
+`VISIONARY_SURVEY_PLAN=1` also prints the Build & Deploy plan each project would
+use (without building or copying anything).
+
 
 Reusable game-analysis utilities are available in `research/decomp/ssbu-re/`.
 Each tool reads its inputs from the external directory selected through
