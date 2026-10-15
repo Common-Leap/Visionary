@@ -63,9 +63,44 @@ pub fn emulator_sd_root() -> Option<PathBuf> {
         return path.is_dir().then_some(path);
     }
 
-    sd_root_candidates()
-        .into_iter()
-        .find(|path| is_emulator_sd_root(path.as_path()))
+    // Several emulators may be installed, each with a real SD holding `ultimate/`. Taking the
+    // first in probe order wrote payloads to an idle eden SD while the game ran in sudachi, so
+    // the plugin reported "could not read the payload". Pick the SD the game touched most
+    // recently instead; probe order only breaks ties (or decides when nothing has been written).
+    most_active_sd_root(sd_root_candidates())
+}
+
+/// The valid SD root among `candidates` with the newest game activity; the earliest wins a tie.
+fn most_active_sd_root(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut best: Option<(Option<std::time::SystemTime>, PathBuf)> = None;
+    for path in candidates {
+        if !is_emulator_sd_root(&path) {
+            continue;
+        }
+        let activity = last_activity(&path);
+        let newer = match &best {
+            None => true,
+            Some((best_activity, _)) => activity > *best_activity,
+        };
+        if newer {
+            best = Some((activity, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// When the game last wrote to this SD: the emulator's own FS access log, plus the files the
+/// plugin rewrites while a match runs. `None` when none of them exist.
+fn last_activity(sd: &Path) -> Option<std::time::SystemTime> {
+    [
+        "FsAccessLog.txt",
+        "effect_viewer_probe.txt",
+        "effect_viewer_capture.txt",
+        "effect_viewer_marks.txt",
+    ]
+    .iter()
+    .filter_map(|name| std::fs::metadata(sd.join(name)).ok()?.modified().ok())
+    .max()
 }
 
 /// The standard SD locations to probe, most likely first. Split out so the path spelling can
@@ -76,6 +111,11 @@ fn sd_root_candidates() -> Vec<PathBuf> {
     [
         data.as_ref().map(|d| d.join("eden").join("sdmc")),
         data.as_ref().map(|d| d.join("yuzu").join("sdmc")),
+        // yuzu forks keep the same layout under their own name.
+        data.as_ref().map(|d| d.join("sudachi").join("sdmc")),
+        data.as_ref().map(|d| d.join("suyu").join("sdmc")),
+        data.as_ref().map(|d| d.join("citron").join("sdmc")),
+        data.as_ref().map(|d| d.join("torzu").join("sdmc")),
         config.as_ref().map(|c| c.join("Ryujinx").join("sdcard")),
         data.as_ref().map(|d| d.join("Ryujinx").join("sdcard")),
     ]
@@ -156,6 +196,39 @@ mod tests {
         assert!(has("eden/sdmc"), "{candidates:?}");
         assert!(has("yuzu/sdmc"), "{candidates:?}");
         assert!(has("Ryujinx/sdcard"), "{candidates:?}");
+        assert!(has("sudachi/sdmc"), "{candidates:?}");
+    }
+
+    /// Two emulators both with a real SD: the one the game is running in must win, not the one
+    /// probed first. Payloads written to the idle SD are invisible to the plugin.
+    #[test]
+    fn the_sd_the_game_wrote_to_last_wins() {
+        let idle = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        for sd in [idle.path(), live.path()] {
+            std::fs::create_dir(sd.join("ultimate")).unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let probe = idle.path().join("effect_viewer_probe.txt");
+        std::fs::write(&probe, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&probe)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::write(live.path().join("effect_viewer_probe.txt"), b"x").unwrap();
+
+        let picked =
+            most_active_sd_root(vec![idle.path().to_path_buf(), live.path().to_path_buf()]);
+        assert_eq!(picked.as_deref(), Some(live.path()));
+        // With no activity anywhere, probe order decides.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::create_dir(a.path().join("ultimate")).unwrap();
+        std::fs::create_dir(b.path().join("ultimate")).unwrap();
+        let picked = most_active_sd_root(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        assert_eq!(picked.as_deref(), Some(a.path()));
     }
 
     /// A bare directory must NOT qualify. Testers who ran the broken build have an empty
