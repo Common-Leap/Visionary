@@ -4409,6 +4409,11 @@ impl VisionaryApp {
             .and_then(|index| index.script_source(&fighter_name, &move_name));
 
         if let Some(project) = project {
+            // A forwarding script whose shared body depends on values the index could not
+            // resolve still shows, but its frames may be wrong; say which, rather than guess.
+            if !project.notes.is_empty() {
+                self.state.status = project.notes.join("; ");
+            }
             // A complete override needs nothing else, and a warm disk cache is a local file
             // read — either way this resolves inline instead of paying for a thread and a
             // repaint.
@@ -42804,6 +42809,7 @@ mod live_effect_capture_tests {
             body: PROJECT_GAME.to_string(),
             covers: vec!["game_"],
             blocked: Vec::new(),
+            notes: Vec::new(),
         };
 
         let (body, label) = merge_fetched_body(Some(project.clone()), Err("offline".into()));

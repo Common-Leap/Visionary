@@ -15,7 +15,7 @@
 //! reported, not guessed at. For "throw the original away and emit a fresh project",
 //! `mod_export` already exists.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -327,6 +327,57 @@ pub struct ScriptSite {
     pub function: String,
     /// The `unsafe extern "C" fn …` item, from `fn` through its closing brace.
     pub span: Range<usize>,
+    /// Set when the registered function only forwards to another function in the project,
+    /// such as `game_attacks4reverse(agent) { game_attacks4_impl(agent, Facing::Reverse) }`.
+    pub delegate: Option<Delegate>,
+}
+
+/// The shared implementation a forwarding script calls, as this caller sees it.
+///
+/// The wrapper itself has no body worth showing, so reads use the callee's body with this
+/// caller's arguments substituted wherever that is statically certain. Writes are a different
+/// matter: a body shared by several scripts, or one shown with substituted values, does not
+/// correspond to any single span of source, so [`Delegate::write_refusal`] refuses it rather
+/// than letting one variant's edit silently change the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delegate {
+    pub file: PathBuf,
+    /// The called function's name.
+    pub function: String,
+    /// The callee's whole item, from its line start through its closing brace.
+    pub span: Range<usize>,
+    /// How many indexed scripts run this same body: forwarding wrappers, plus the callee
+    /// itself when it is registered as a script too.
+    pub callers: usize,
+    /// The wrapper's header over the callee's body, with this caller's arguments resolved.
+    pub body: String,
+    /// Whether `body` differs from the callee's source because values were substituted.
+    pub substituted: bool,
+    /// Values that depend on this caller's arguments but could not be resolved statically.
+    pub unresolved: Vec<String>,
+}
+
+impl Delegate {
+    /// Why an edit to the script `script` (registered as `wrapper`) cannot be written back
+    /// into this callee, if it cannot.
+    pub fn write_refusal(&self, script: &str, wrapper: &str) -> Option<String> {
+        let location = format!("{} in {}", self.function, self.file.display());
+        if self.callers > 1 {
+            return Some(format!(
+                "{script}: {wrapper} forwards to {location}, which {} scripts share; an edit \
+                 here would change all of them, so edit the shared function directly",
+                self.callers
+            ));
+        }
+        if self.substituted || !self.unresolved.is_empty() {
+            return Some(format!(
+                "{script}: {wrapper} forwards to {location} with arguments the editor resolved \
+                 for display; writing back would replace the parameterized source, so edit the \
+                 shared function directly"
+            ));
+        }
+        None
+    }
 }
 
 /// One script identity found in more than one source function.
@@ -373,6 +424,9 @@ pub struct ProjectScript {
     /// Categories the linked project defines more than once and therefore cannot be selected
     /// safely. These are deliberately not filled from the mirror.
     pub blocked: Vec<&'static str>,
+    /// Values in `body` that forward to a shared implementation and depend on arguments the
+    /// index could not resolve statically, one sentence each, for the status line.
+    pub notes: Vec<String>,
 }
 
 impl ProjectScript {
@@ -508,6 +562,7 @@ impl SourceIndex {
                 &project_registrations,
             );
         }
+        index.resolve_delegates(&sources);
         index.files = files;
         Ok(index)
     }
@@ -640,6 +695,7 @@ impl SourceIndex {
         let mut body = String::new();
         let mut covers: Vec<&'static str> = Vec::new();
         let mut blocked: Vec<&'static str> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
         for prefix in crate::acmd::SCRIPT_PREFIXES {
             let trimmed = prefix.trim_end_matches('_');
             // `attack_s3_s` is `game_attacks3` upstream (except Ryu/Ken's real
@@ -664,6 +720,20 @@ impl SourceIndex {
                 continue;
             }
             if let Some((name, site)) = resolved {
+                // A forwarding wrapper has no body of its own; show what it runs. The resolved
+                // text was built from the same snapshot as the span, at index time.
+                if let Some(delegate) = &site.delegate {
+                    body.push_str(&header_named(&delegate.body, &name));
+                    body.push_str("\n\n");
+                    covers.push(prefix);
+                    notes.extend(
+                        delegate
+                            .unresolved
+                            .iter()
+                            .map(|reason| format!("{name}: {reason}")),
+                    );
+                    continue;
+                }
                 if let Ok(text) = std::fs::read_to_string(&site.file) {
                     // The span came from this file's text; a concurrent edit can shrink it.
                     if let Some(source) = text.get(site.span.clone()) {
@@ -678,7 +748,175 @@ impl SourceIndex {
             body,
             covers,
             blocked,
+            notes,
         })
+    }
+
+    /// Point every script whose function only forwards to another project function at that
+    /// function's body. See [`Delegate`].
+    fn resolve_delegates(&mut self, sources: &[(PathBuf, String)]) {
+        let mut functions: HashMap<String, Vec<(usize, PlainFunction)>> = HashMap::new();
+        let mut methods: MethodTable = HashMap::new();
+        for (file_at, (_, text)) in sources.iter().enumerate() {
+            let impls = scan_impl_blocks(text);
+            for function in scan_plain_functions(text) {
+                let owner = impls.iter().find(|(_, block)| {
+                    block.start < function.span.start && function.span.end <= block.end
+                });
+                if let Some((ty, _)) = owner {
+                    let Some(ty) = ty else {
+                        continue;
+                    };
+                    let takes_self = function
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.first())
+                        .is_some_and(|(name, _)| name == "self");
+                    if takes_self {
+                        let arms = parse_self_match(&text[function.body.clone()]);
+                        // Two impls defining the same method leave nothing certain to read.
+                        methods
+                            .entry((ty.clone(), function.name.clone()))
+                            .and_modify(|known| *known = None)
+                            .or_insert(arms);
+                    }
+                    continue;
+                }
+                functions
+                    .entry(function.name.clone())
+                    .or_default()
+                    .push((file_at, function));
+            }
+        }
+        let file_at: HashMap<&Path, usize> = sources
+            .iter()
+            .enumerate()
+            .map(|(at, (file, _))| (file.as_path(), at))
+            .collect();
+        let registered: HashSet<(PathBuf, String)> = self
+            .fighters
+            .values()
+            .flat_map(|table| table.scripts.values())
+            .map(|site| (site.file.clone(), site.function.clone()))
+            .collect();
+
+        struct Pending<'a> {
+            fighter: String,
+            script: String,
+            wrapper: ScriptSite,
+            forward: Forward,
+            callee: Result<(usize, &'a PlainFunction), String>,
+        }
+        let mut pending: Vec<Pending> = Vec::new();
+        for (fighter, table) in &self.fighters {
+            for (script, site) in &table.scripts {
+                let Some(&at) = file_at.get(site.file.as_path()) else {
+                    continue;
+                };
+                let Some(item) = sources[at].1.get(site.span.clone()) else {
+                    continue;
+                };
+                let Some(forward) = forwarding_call(item) else {
+                    continue;
+                };
+                // A call to something the project does not define is an ordinary one-line
+                // script (or a crate helper), not a wrapper the index can see through.
+                let callee = match functions.get(&forward.callee).map(Vec::as_slice) {
+                    None | Some([]) => continue,
+                    Some([(callee_at, callee)]) => {
+                        if *callee_at == at && callee.span.start == site.span.start {
+                            continue;
+                        }
+                        Ok((*callee_at, callee))
+                    }
+                    Some(many) => Err(format!(
+                        "forwards to {}, which the project defines {} times; the shared body \
+                         cannot be chosen safely",
+                        forward.callee,
+                        many.len()
+                    )),
+                };
+                pending.push(Pending {
+                    fighter: fighter.clone(),
+                    script: script.clone(),
+                    wrapper: site.clone(),
+                    forward,
+                    callee,
+                });
+            }
+        }
+
+        let mut callers: HashMap<(usize, usize), HashSet<(PathBuf, String)>> = HashMap::new();
+        for entry in &pending {
+            if let Ok((at, callee)) = entry.callee {
+                callers
+                    .entry((at, callee.span.start))
+                    .or_default()
+                    .insert((entry.wrapper.file.clone(), entry.wrapper.function.clone()));
+            }
+        }
+
+        let mut resolved = Vec::new();
+        for entry in pending {
+            let item = &sources[file_at[entry.wrapper.file.as_path()]].1[entry.wrapper.span.clone()];
+            let delegate = match entry.callee {
+                Err(reason) => Delegate {
+                    file: entry.wrapper.file.clone(),
+                    function: entry.forward.callee.clone(),
+                    span: entry.wrapper.span.clone(),
+                    callers: 0,
+                    body: item.to_string(),
+                    substituted: false,
+                    unresolved: vec![reason],
+                },
+                Ok((at, callee)) => {
+                    let (file, text) = &sources[at];
+                    let callee_body = &text[callee.body.clone()];
+                    let resolution = match &callee.params {
+                        Some(params) => resolve_shared_body(
+                            callee_body,
+                            params,
+                            &entry.forward.args,
+                            &entry.forward.params,
+                            &methods,
+                        ),
+                        None => Resolution {
+                            body: callee_body.to_string(),
+                            substituted: false,
+                            unresolved: vec![format!(
+                                "the parameter list of {} could not be read",
+                                callee.name
+                            )],
+                        },
+                    };
+                    let mut count = callers
+                        .get(&(at, callee.span.start))
+                        .map_or(0, HashSet::len);
+                    if registered.contains(&(file.clone(), callee.name.clone())) {
+                        count += 1;
+                    }
+                    Delegate {
+                        file: file.clone(),
+                        function: callee.name.clone(),
+                        span: callee.span.clone(),
+                        callers: count,
+                        body: format!("{}{}", &item[..entry.forward.open], resolution.body),
+                        substituted: resolution.substituted,
+                        unresolved: resolution.unresolved,
+                    }
+                }
+            };
+            resolved.push((entry.fighter, entry.script, delegate));
+        }
+        for (fighter, script, delegate) in resolved {
+            if let Some(site) = self
+                .fighters
+                .get_mut(&fighter)
+                .and_then(|table| table.scripts.get_mut(&script))
+            {
+                site.delegate = Some(delegate);
+            }
+        }
     }
 
     fn index_file(
@@ -760,6 +998,7 @@ impl SourceIndex {
                         file: file.to_path_buf(),
                         function: function.name.clone(),
                         span: function.span.clone(),
+                        delegate: None,
                     },
                 );
             }
@@ -1094,6 +1333,813 @@ fn is_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !value.starts_with(|c: char| c.is_ascii_digit())
+}
+
+// ── Scripts that forward to a shared implementation ───────────────────────────
+
+/// Any free function or method with a body, found by [`scan_plain_functions`].
+#[derive(Debug, Clone)]
+struct PlainFunction {
+    name: String,
+    /// `(name, type)` per parameter, `self` included as `("self", "Self")`. `None` when the
+    /// list holds something this reader cannot split, such as a pattern or a generic type
+    /// with a comma, because a misnumbered parameter would substitute the wrong argument.
+    params: Option<Vec<(String, String)>>,
+    /// From the declaration's line start through its closing brace.
+    span: Range<usize>,
+    /// The body, `{` through `}` inclusive.
+    body: Range<usize>,
+}
+
+/// `Type::method` → that method's `match self` arms, or `None` when the method is not a
+/// trivial match (or is defined twice).
+type MethodTable = HashMap<(String, String), Option<Vec<MatchArm>>>;
+
+/// One `A | B => value` arm: the last path segment of each pattern, and the value text.
+type MatchArm = (Vec<String>, String);
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// The end of the identifier starting at `at`.
+fn ident_end(text: &str, at: usize) -> usize {
+    at + text[at..]
+        .bytes()
+        .position(|b| !is_ident_byte(b))
+        .unwrap_or(text.len() - at)
+}
+
+/// Whether `text[at..]` begins the keyword `word` as a whole token.
+fn keyword_at(text: &str, at: usize, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.is_char_boundary(at)
+        && text[at..].starts_with(word)
+        && (at == 0 || !is_ident_byte(bytes[at - 1]))
+        && bytes.get(at + word.len()).is_some_and(|b| !is_ident_byte(*b))
+}
+
+/// Every `fn NAME(…) … { … }` in `text` with a body, nested ones included.
+fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(text, i, "fn") {
+            i += 1;
+            continue;
+        }
+        let fn_kw = i;
+        let name_start = i + 2 + text[i + 2..].len() - text[i + 2..].trim_start().len();
+        let name_end = ident_end(text, name_start);
+        i = name_end.max(fn_kw + 2);
+        if name_end == name_start {
+            continue;
+        }
+        let Some(paren) = text[name_end..].find('(').map(|n| name_end + n) else {
+            continue;
+        };
+        // Only generics may sit between the name and its parameter list.
+        let between = text[name_end..paren].trim();
+        if !(between.is_empty() || between.starts_with('<')) {
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, paren + 1, text.len()) else {
+            continue;
+        };
+        // The body, unless this is a bodiless declaration (`fn x();` in a trait).
+        let mut j = close + 1;
+        let mut open = None;
+        while j < text.len() {
+            if let Some(next) = skip_trivia(text, j) {
+                j = next;
+                continue;
+            }
+            match bytes[j] {
+                b'{' => {
+                    open = Some(j);
+                    break;
+                }
+                b';' => break,
+                _ => j += 1,
+            }
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let Some(close_brace) = match_brace(text, open) else {
+            continue;
+        };
+        let params = args
+            .iter()
+            .map(|span| {
+                let param = text[span.clone()].trim();
+                if param.trim_start_matches('&').trim_start_matches("mut ").trim() == "self"
+                    || param.ends_with("self") && !param.contains(':')
+                {
+                    return Some(("self".to_string(), "Self".to_string()));
+                }
+                let (name, ty) = param.split_once(':')?;
+                let name = name.trim().trim_start_matches("mut ").trim();
+                is_identifier(name).then(|| (name.to_string(), ty.trim().to_string()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let line_start = text[..fn_kw].rfind('\n').map_or(0, |n| n + 1);
+        found.push(PlainFunction {
+            name: text[name_start..name_end].to_string(),
+            params,
+            span: line_start..close_brace + 1,
+            body: open..close_brace + 1,
+        });
+    }
+    found
+}
+
+/// Every `impl … { … }` block's braces, with the type's last path segment for an inherent
+/// impl. A trait impl carries `None`: its methods are neither free functions nor what this
+/// reader resolves a `param.method()` through.
+fn scan_impl_blocks(text: &str) -> Vec<(Option<String>, Range<usize>)> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(text, i, "impl") {
+            i += 1;
+            continue;
+        }
+        i += 4;
+        let Some(open) = text[i..].find(['{', ';']).map(|n| i + n) else {
+            break;
+        };
+        if text.as_bytes()[open] != b'{' {
+            continue;
+        }
+        let header = text[i..open].trim();
+        // `impl<T> Type<T>` leads with its own generics.
+        let header = if header.starts_with('<') {
+            header.find('>').map_or("", |n| header[n + 1..].trim())
+        } else {
+            header
+        };
+        let inherent = !(header.contains(" for ") || header.contains(" where "));
+        let ty = type_name(header.split('<').next().unwrap_or(""));
+        if let Some(close) = match_brace(text, open) {
+            found.push(((inherent && !ty.is_empty()).then_some(ty), open..close + 1));
+        }
+    }
+    found
+}
+
+/// The bare type name out of a parameter's type: `&mut crate::Facing` → `Facing`.
+fn type_name(ty: &str) -> String {
+    let ty = ty.trim().trim_start_matches('&').trim();
+    let ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
+    let ty = ty.split('<').next().unwrap_or("");
+    ty.rsplit("::").next().unwrap_or("").trim().to_string()
+}
+
+/// `text` with every comment blanked out, strings and everything else kept.
+fn without_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with("//") || text[i..].starts_with("/*") {
+            i = skip_trivia(text, i).unwrap_or(text.len());
+            out.push(' ');
+            continue;
+        }
+        if let Some(next) = skip_trivia(text, i) {
+            out.push_str(&text[i..next]);
+            i = next;
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Split `text` at every top-level `separator`, ignoring nested brackets, strings and
+/// comments. Pieces are trimmed; empty ones (a trailing comma) are dropped.
+fn split_top_level(text: &str, separator: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut pieces = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b if b == separator && depth == 0 => {
+                pieces.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    pieces.push(text[start..].trim());
+    pieces.retain(|piece| !piece.is_empty());
+    pieces
+}
+
+/// A numeric literal as ACMD source spells one: `3`, `-28.4`, `1.`. No suffixes.
+fn is_number(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A value safe to paste in place of a name: a number, a bool, or a (dereferenced) constant
+/// path such as `*ATTACK_LR_CHECK_F`. Anything with an operator or a call is left alone.
+fn is_simple_value(text: &str) -> bool {
+    let text = text.trim();
+    if is_number(text) || text == "true" || text == "false" {
+        return true;
+    }
+    let path = text.strip_prefix('*').unwrap_or(text);
+    !path.is_empty() && path.split("::").all(is_identifier)
+}
+
+/// The arms of a `match` block's interior.
+fn parse_arms(text: &str) -> Option<Vec<MatchArm>> {
+    split_top_level(text, b',')
+        .into_iter()
+        .map(|arm| {
+            let (pattern, value) = arm.split_once("=>")?;
+            if pattern.contains(" if ") {
+                return None; // a guard decides at run time
+            }
+            let patterns = pattern
+                .split('|')
+                .map(|alternative| {
+                    let alternative = alternative.trim();
+                    alternative.rsplit("::").next().unwrap_or(alternative).trim().to_string()
+                })
+                .collect();
+            Some((patterns, value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// The arms of a method whose whole body is `match self { … }`, optionally inside
+/// `unsafe { … }`. Every arm's value must be a [simple value](is_simple_value).
+fn parse_self_match(body: &str) -> Option<Vec<MatchArm>> {
+    let body = without_comments(body);
+    let mut inner = body.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    while let Some(rest) = inner.strip_prefix("unsafe") {
+        inner = rest.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    }
+    let rest = inner.strip_prefix("match")?.trim_start();
+    let rest = rest.strip_prefix("self")?.trim_start();
+    if !rest.starts_with('{') {
+        return None;
+    }
+    let close = match_brace(rest, 0)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return None;
+    }
+    let arms = parse_arms(&rest[1..close])?;
+    arms.iter()
+        .all(|(_, value)| is_simple_value(value))
+        .then_some(arms)
+}
+
+/// The value of the arm matching `key`, falling back to a `_` arm.
+fn arm_for<'a>(arms: &'a [MatchArm], key: &str) -> Option<&'a str> {
+    arms.iter()
+        .find(|(patterns, _)| patterns.iter().any(|p| p == key))
+        .or_else(|| arms.iter().find(|(patterns, _)| patterns.iter().any(|p| p == "_")))
+        .map(|(_, value)| value.as_str())
+}
+
+/// A registered function whose body is one call to another function.
+#[derive(Debug, Clone)]
+struct Forward {
+    /// The called function's name, its last path segment.
+    callee: String,
+    /// Offset of the wrapper's body `{` within its item.
+    open: usize,
+    /// The call's arguments, verbatim.
+    args: Vec<String>,
+    /// The wrapper's own parameter names, to recognise pass-through arguments.
+    params: Vec<String>,
+}
+
+/// `fn game_x(agent) { shared_impl(agent, Facing::Reverse) }` → the call it forwards to.
+fn forwarding_call(item: &str) -> Option<Forward> {
+    let function = scan_plain_functions(item).into_iter().next()?;
+    let inner = without_comments(&item[function.body.start + 1..function.body.end - 1]);
+    let inner = inner.trim();
+    let inner = inner.strip_suffix(';').unwrap_or(inner).trim_end();
+    let path_end = inner
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(inner.len());
+    let callee = inner[..path_end].rsplit("::").next()?;
+    if !is_identifier(callee) || !inner[path_end..].starts_with('(') {
+        return None;
+    }
+    let (args, close) = split_call_args(inner, path_end + 1, inner.len())?;
+    if close + 1 != inner.len() {
+        return None;
+    }
+    Some(Forward {
+        callee: callee.to_string(),
+        open: function.body.start,
+        args: args.iter().map(|span| inner[span.clone()].to_string()).collect(),
+        params: function
+            .params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+    })
+}
+
+/// A shared body as one caller sees it.
+struct Resolution {
+    body: String,
+    substituted: bool,
+    unresolved: Vec<String>,
+}
+
+/// What one callee parameter is for this caller.
+enum ParamValue {
+    /// An enum variant (`Facing::Reverse` → `Reverse`) of the parameter's type.
+    Variant { variant: String, ty: String },
+    /// A literal, pasted wherever the parameter is read.
+    Literal(String),
+    /// Anything else: an expression the index cannot evaluate.
+    Dynamic,
+}
+
+/// Substitute a caller's arguments into a shared body, `{` through `}`.
+///
+/// Three shapes resolve, all of them statically certain:
+/// - `let (a, b) = match param { Variant => (x, y), … };`, which binds `a`/`b` for the rest of
+///   the body and is itself removed;
+/// - `param.method()`, where `method` is a [trivial `match self`](parse_self_match);
+/// - a literal argument, read directly.
+///
+/// Constant products the substitution exposes (`28.4 * -1.0`) are then folded, since the
+/// readers downstream expect a number in those slots. Every other read of a parameter is left
+/// as written and reported, never guessed.
+fn resolve_shared_body(
+    body: &str,
+    params: &[(String, String)],
+    args: &[String],
+    wrapper_params: &[String],
+    methods: &MethodTable,
+) -> Resolution {
+    let mut unresolved = Vec::new();
+    let callee_params: Vec<&(String, String)> =
+        params.iter().filter(|(name, _)| name != "self").collect();
+    if callee_params.len() != args.len() {
+        unresolved.push(format!(
+            "passes {} argument(s) to a function taking {}",
+            args.len(),
+            callee_params.len()
+        ));
+        return Resolution {
+            body: body.to_string(),
+            substituted: false,
+            unresolved,
+        };
+    }
+    let mut values: HashMap<&str, ParamValue> = HashMap::new();
+    for ((name, ty), arg) in callee_params.into_iter().zip(args) {
+        let arg = arg.trim();
+        if is_identifier(arg) && wrapper_params.iter().any(|param| param == arg) {
+            continue; // the agent, passed straight through
+        }
+        let value = if is_number(arg) || arg == "true" || arg == "false" {
+            ParamValue::Literal(arg.to_string())
+        } else if arg.contains("::") && arg.split("::").all(is_identifier) {
+            ParamValue::Variant {
+                variant: arg.rsplit("::").next().unwrap_or(arg).to_string(),
+                ty: type_name(ty),
+            }
+        } else {
+            ParamValue::Dynamic
+        };
+        values.insert(name.as_str(), value);
+    }
+
+    let mut edits: Vec<Replacement> = Vec::new();
+    let mut removed: Vec<Range<usize>> = Vec::new();
+    let mut bindings: HashMap<String, String> = HashMap::new();
+    let mut unbound: Vec<String> = Vec::new();
+
+    // `let PATTERN = match PARAM { … };`
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < body.len() {
+        if let Some(next) = skip_trivia(body, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(body, i, "let") {
+            i += 1;
+            continue;
+        }
+        let let_at = i;
+        i += 3;
+        let Some(semi) = statement_end(body, let_at) else {
+            continue;
+        };
+        let Some(binding) = parse_let_match(&body[let_at..semi]) else {
+            continue;
+        };
+        let Some(value) = values.get(binding.scrutinee.as_str()) else {
+            continue;
+        };
+        let key = match value {
+            ParamValue::Variant { variant, .. } => variant.clone(),
+            ParamValue::Literal(literal) => literal.clone(),
+            ParamValue::Dynamic => {
+                unbound.extend(binding.names);
+                continue;
+            }
+        };
+        let chosen = binding
+            .arms
+            .as_deref()
+            .and_then(|arms| arm_for(arms, &key))
+            .map(|value| {
+                if binding.names.len() == 1 {
+                    Some(vec![value.to_string()])
+                } else {
+                    let inner = value.trim().strip_prefix('(')?.strip_suffix(')')?;
+                    let parts = split_top_level(inner, b',');
+                    (parts.len() == binding.names.len())
+                        .then(|| parts.into_iter().map(str::to_string).collect())
+                }
+            });
+        let Some(Some(parts)) = chosen else {
+            unresolved.push(format!(
+                "`let {} = match {} {{ … }}` has no arm this reader can pick for {key}",
+                binding.pattern, binding.scrutinee
+            ));
+            unbound.extend(binding.names);
+            continue;
+        };
+        for (name, part) in binding.names.iter().zip(parts) {
+            if is_simple_value(&part) {
+                bindings.insert(name.clone(), part);
+            } else {
+                unresolved.push(format!("{name} = `{part}` is not a literal"));
+                unbound.push(name.clone());
+            }
+        }
+        // Drop the whole line when the statement owns it, so no blank husk is left behind.
+        let line_start = body[..let_at].rfind('\n').map_or(0, |n| n + 1);
+        let start = if body[line_start..let_at].trim().is_empty() {
+            line_start
+        } else {
+            let_at
+        };
+        let mut end = semi + 1;
+        let rest = &body[end..];
+        let trailing = rest.len() - rest.trim_start_matches([' ', '\t', '\r']).len();
+        if rest[trailing..].starts_with('\n') {
+            end += trailing + 1;
+        }
+        removed.push(start..end);
+        edits.push(Replacement {
+            span: start..end,
+            value: String::new(),
+        });
+        i = end;
+    }
+
+    // Reads of a parameter or of a binding made above.
+    let mut i = 0;
+    while i < body.len() {
+        if let Some(next) = skip_trivia(body, i) {
+            i = next;
+            continue;
+        }
+        if !body.is_char_boundary(i)
+            || !is_ident_byte(bytes[i])
+            || bytes[i].is_ascii_digit()
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+        {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let end = ident_end(body, start);
+        i = end;
+        if removed.iter().any(|range| range.contains(&start)) {
+            continue;
+        }
+        let word = &body[start..end];
+        let before = body[..start].trim_end();
+        if before.ends_with('.') || before.ends_with("::") {
+            continue; // a field, a method or a path segment of the same name
+        }
+        let after = body[end..].trim_start();
+        let is_read = !(after.starts_with('(')
+            || after.starts_with('!')
+            || after.starts_with("::")
+            || (after.starts_with(':') && before.ends_with(['{', ','])));
+        if let Some(ParamValue::Variant { variant, ty }) = values.get(word) {
+            // `param.method()`
+            let Some(call) = method_call(body, end) else {
+                continue; // any other read is reported below
+            };
+            let found = methods
+                .get(&(ty.clone(), call.method.clone()))
+                .map(|arms| arms.as_deref().and_then(|arms| arm_for(arms, variant)));
+            match found {
+                Some(Some(value)) => {
+                    edits.push(Replacement {
+                        span: start..call.end,
+                        value: value.to_string(),
+                    });
+                    i = call.end;
+                }
+                Some(None) => unresolved.push(format!(
+                    "{word}.{}() is not a plain `match self` of literals",
+                    call.method
+                )),
+                None => unresolved.push(format!(
+                    "{word}.{}() is not a method of {ty} in the project",
+                    call.method
+                )),
+            }
+            continue;
+        }
+        if !is_read {
+            continue;
+        }
+        let value = match values.get(word) {
+            Some(ParamValue::Literal(literal)) => Some(literal.clone()),
+            _ => bindings.get(word).cloned(),
+        };
+        if let Some(value) = value {
+            edits.push(Replacement {
+                span: start..end,
+                value,
+            });
+        }
+    }
+
+    let substituted = !edits.is_empty();
+    let mut resolved = apply(body, edits);
+    if substituted {
+        resolved = fold_constant_products(&resolved);
+    }
+
+    // Whatever still reads a parameter, or a binding that could not be made, is reported.
+    let mut leftover: Vec<&str> = values
+        .iter()
+        .filter(|(_, value)| !matches!(value, ParamValue::Literal(_)))
+        .map(|(name, _)| *name)
+        .collect();
+    leftover.extend(unbound.iter().map(String::as_str));
+    let mut reported_lines: Vec<String> = Vec::new();
+    let out = resolved.as_bytes();
+    let mut i = 0;
+    while i < resolved.len() {
+        if let Some(next) = skip_trivia(&resolved, i) {
+            i = next;
+            continue;
+        }
+        if !is_ident_byte(out[i]) || (i > 0 && is_ident_byte(out[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let end = ident_end(&resolved, i);
+        let word = &resolved[i..end];
+        let field = resolved[..i].trim_end().ends_with('.');
+        if !field && leftover.contains(&word) {
+            let line_start = resolved[..i].rfind('\n').map_or(0, |n| n + 1);
+            let line_end = resolved[i..].find('\n').map_or(resolved.len(), |n| i + n);
+            let line = resolved[line_start..line_end].trim().to_string();
+            if !reported_lines.contains(&line) {
+                unresolved.push(format!("`{line}` depends on {word}, which is not resolved"));
+                reported_lines.push(line);
+            }
+        }
+        i = end;
+    }
+
+    Resolution {
+        body: resolved,
+        substituted,
+        unresolved,
+    }
+}
+
+/// The offset of the `;` ending the statement that starts at `start`, at bracket depth 0.
+fn statement_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => {
+                if depth == 0 {
+                    return None; // the block ended first
+                }
+                depth -= 1;
+            }
+            b';' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `let (a, b) = match scrutinee { … }`, without its `;`.
+struct LetMatch {
+    pattern: String,
+    names: Vec<String>,
+    scrutinee: String,
+    /// `None` when the arms could not be read.
+    arms: Option<Vec<MatchArm>>,
+}
+
+fn parse_let_match(statement: &str) -> Option<LetMatch> {
+    let statement = without_comments(statement);
+    let rest = statement.trim().strip_prefix("let")?;
+    let (pattern, rhs) = rest.split_once('=')?;
+    if rhs.starts_with(['=', '>']) {
+        return None;
+    }
+    let pattern = pattern.trim();
+    // A type ascription (`let x: f32 = …`) is fine; only the names matter.
+    let names_part = match pattern.strip_prefix('(') {
+        Some(tuple) => tuple.strip_suffix(')')?,
+        None => pattern.split(':').next()?,
+    };
+    let names = split_top_level(names_part, b',')
+        .into_iter()
+        .map(|name| {
+            let name = name.strip_prefix("mut ").unwrap_or(name).trim();
+            is_identifier(name).then(|| name.to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let rhs = rhs.trim().strip_prefix("match")?;
+    if !rhs.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rhs = rhs.trim_start();
+    let scrutinee_end = ident_end(rhs, 0);
+    let scrutinee = &rhs[..scrutinee_end];
+    let block = rhs[scrutinee_end..].trim_start();
+    if scrutinee.is_empty() || !block.starts_with('{') {
+        return None;
+    }
+    let close = match_brace(block, 0)?;
+    if !block[close + 1..].trim().is_empty() {
+        return None;
+    }
+    Some(LetMatch {
+        pattern: pattern.to_string(),
+        names,
+        scrutinee: scrutinee.to_string(),
+        arms: parse_arms(&block[1..close]),
+    })
+}
+
+/// `.method()` right after a receiver ending at `at`.
+struct MethodCall {
+    method: String,
+    /// Just past the call's `)`.
+    end: usize,
+}
+
+fn method_call(text: &str, at: usize) -> Option<MethodCall> {
+    let rest = text[at..].strip_prefix('.')?;
+    let name_end = ident_end(rest, 0);
+    let method = &rest[..name_end];
+    let call = rest[name_end..].strip_prefix('(')?;
+    let close = call.len() - call.trim_start().len();
+    if !call[close..].starts_with(')') || method.is_empty() {
+        return None;
+    }
+    Some(MethodCall {
+        method: method.to_string(),
+        end: at + 1 + name_end + 1 + close + 1,
+    })
+}
+
+/// Fold every `NUMBER * NUMBER` into its product: `28.4 * -1.0` → `-28.4`.
+///
+/// Only products whose surroundings cannot bind tighter are folded: an operand after `/`,
+/// `*`, `%` or `.` belongs to that operation first, and a number followed by `.` is a method
+/// receiver. A leading `-` counts as the operand's sign only where it cannot be subtraction.
+fn fold_constant_products(text: &str) -> String {
+    let mut text = text.to_string();
+    let mut search = 0;
+    'scan: while search < text.len() {
+        let mut i = search;
+        while i < text.len() {
+            if let Some(next) = skip_trivia(&text, i) {
+                i = next;
+                continue;
+            }
+            if text.as_bytes()[i] == b'*' {
+                if let Some((range, product)) = constant_product(&text, i) {
+                    text.replace_range(range.clone(), &product);
+                    search = range.start;
+                    continue 'scan;
+                }
+            }
+            i += 1;
+        }
+        break;
+    }
+    text
+}
+
+/// The span and folded value of a `NUMBER * NUMBER` whose `*` is at `star`.
+fn constant_product(text: &str, star: usize) -> Option<(Range<usize>, String)> {
+    let bytes = text.as_bytes();
+    // Left operand, read backwards.
+    let left_end = text[..star].trim_end().len();
+    let mut left_start = left_end;
+    while left_start > 0 && (bytes[left_start - 1].is_ascii_digit() || bytes[left_start - 1] == b'.')
+    {
+        left_start -= 1;
+    }
+    if left_start == left_end || !bytes[left_start].is_ascii_digit() {
+        return None;
+    }
+    if left_start > 0 && is_ident_byte(bytes[left_start - 1]) {
+        return None;
+    }
+    let before_sign = text[..left_start].trim_end();
+    if before_sign.ends_with('-') {
+        let ahead = text[..before_sign.len() - 1].trim_end();
+        if ahead.is_empty() || ahead.ends_with(['(', ',', '=', '[', '{']) {
+            left_start = before_sign.len() - 1;
+        }
+    }
+    let ahead = text[..left_start].trim_end();
+    if ahead.ends_with(['/', '*', '%', '.']) {
+        return None;
+    }
+    // Right operand.
+    let right_start = star + 1 + (text[star + 1..].len() - text[star + 1..].trim_start().len());
+    let mut right_end = right_start;
+    if bytes.get(right_end) == Some(&b'-') {
+        right_end += 1;
+    }
+    while right_end < text.len() && (bytes[right_end].is_ascii_digit() || bytes[right_end] == b'.')
+    {
+        right_end += 1;
+    }
+    let left = &text[left_start..left_end];
+    let right = &text[right_start..right_end];
+    if !is_number(left) || !is_number(right) {
+        return None;
+    }
+    let after = text[right_end..].trim_start();
+    if right.ends_with('.')
+        || after.starts_with('.')
+        || bytes.get(right_end).is_some_and(|b| is_ident_byte(*b))
+    {
+        return None;
+    }
+    let product = if left.contains('.') || right.contains('.') {
+        let value = left.parse::<f32>().ok()? * right.parse::<f32>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        let mut formatted = format!("{value}");
+        if !formatted.contains('.') {
+            formatted.push_str(".0");
+        }
+        formatted
+    } else {
+        left.parse::<i64>().ok()?.checked_mul(right.parse::<i64>().ok()?)?.to_string()
+    };
+    Some((left_start..right_end, product))
 }
 
 // ── Creating a script the project does not have ───────────────────────────────
@@ -2841,12 +3887,23 @@ fn sync_script(
     let Some(site) = current.script(fighter, script_name) else {
         bail!("{fighter}: the project has no {script_name} to sync into");
     };
-    let text = std::fs::read_to_string(&site.file)
-        .with_context(|| format!("reading {}", site.file.display()))?;
-    let Some(body) = text.get(site.span.clone()) else {
+    // A forwarding wrapper's own span holds only the call. Its edits belong in the callee, and
+    // only when that callee is this script's alone and was shown verbatim.
+    let (file, span) = match &site.delegate {
+        None => (&site.file, site.span.clone()),
+        Some(delegate) => {
+            if let Some(reason) = delegate.write_refusal(script_name, &site.function) {
+                bail!("{reason}");
+            }
+            (&delegate.file, delegate.span.clone())
+        }
+    };
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let Some(body) = text.get(span.clone()) else {
         bail!(
             "{} changed on disk since it was indexed — rescan and try again",
-            site.file.display()
+            file.display()
         );
     };
     let (updated_body, mut report) = rewrite(body)?;
@@ -2854,12 +3911,11 @@ fn sync_script(
         return Ok(report);
     }
     let mut updated = String::with_capacity(text.len());
-    updated.push_str(&text[..site.span.start]);
+    updated.push_str(&text[..span.start]);
     updated.push_str(&updated_body);
-    updated.push_str(&text[site.span.end..]);
-    std::fs::write(&site.file, &updated)
-        .with_context(|| format!("writing {}", site.file.display()))?;
-    report.files.push(site.file.clone());
+    updated.push_str(&text[span.end..]);
+    std::fs::write(file, &updated).with_context(|| format!("writing {}", file.display()))?;
+    report.files.push(file.clone());
     Ok(report)
 }
 
@@ -9248,6 +10304,220 @@ pub fn install(agent: &mut smashline::Agent) {
     agent.acmd("effect_attackairn", effect_attackairn, smashline::Priority::Default);
 }
 "#;
+
+    /// Shy Guy's forward smash: both directions forward to one `_impl` with a facing argument.
+    const SHARED_SMASH: &str = r#"
+use super::*;
+
+#[derive(Clone, Copy)]
+enum SmashFacing { Forward, Reverse }
+
+impl SmashFacing {
+    fn z(self) -> f32 { match self { Self::Forward => 1.0, Self::Reverse => -1.0 } }
+    #[inline]
+    fn lr_check(self) -> i32 {
+        unsafe { match self { Self::Forward => *ATTACK_LR_CHECK_F, Self::Reverse => *ATTACK_LR_CHECK_B } }
+    }
+}
+
+unsafe fn game_attacks4_impl(agent: &mut L2CAgentBase, facing: SmashFacing) {
+    // The reverse sweetspot doing 21.5 instead of 21.0 is on purpose
+    let (hit_frame, clear_frame, sweet_damage) = match facing {
+        SmashFacing::Forward => (21.0, 25.0, 21.0),
+        SmashFacing::Reverse => (24.0, 28.0, 21.5),
+    };
+    frame(agent.lua_state_agent, 3.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD);
+    }
+    frame(agent.lua_state_agent, hit_frame);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), sweet_damage, 42, 80, 0, 35, 6.0, 0.0, 11.6, 28.4 * facing.z(), None, None, None, 1.2, 1.0, *ATTACK_SETOFF_KIND_ON, facing.lr_check(), false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_HEAVY, *ATTACK_REGION_OBJECT);
+        macros::ATTACK(agent, 1, 0, Hash40::new("top"), 14.5, 42, 90, 0, 35, 2.4, 0.0, 10.7, 21.6 * facing.z(), Some(0.0), Some(10.0), Some(12.0 * facing.z()), 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, facing.lr_check(), false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_HEAVY, *ATTACK_REGION_OBJECT);
+    }
+    frame(agent.lua_state_agent, clear_frame);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+}
+
+unsafe fn effect_attacks4_impl(agent: &mut L2CAgentBase, facing: SmashFacing) {
+    let (smoke_frame, impact_frame) = match facing {
+        SmashFacing::Forward => (20.0, 21.0),
+        SmashFacing::Reverse => (23.0, 24.0),
+    };
+    frame(agent.lua_state_agent, smoke_frame);
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_h_smoke_b"), Hash40::new("top"), 0, 0, -7.0 * facing.z(), 0, 0, 0, 0.7, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, impact_frame);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 11.6, 28.4 * facing.z(), 90, 0, 0, 1.95, 0, 0, 0, 0, 0, 0, true);
+    }
+}
+
+unsafe extern "C" fn game_attacks4(agent: &mut L2CAgentBase) { game_attacks4_impl(agent, SmashFacing::Forward) }
+unsafe extern "C" fn game_attacks4reverse(agent: &mut L2CAgentBase) { game_attacks4_impl(agent, SmashFacing::Reverse) }
+unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) { effect_attacks4_impl(agent, SmashFacing::Forward) }
+unsafe extern "C" fn effect_attacks4reverse(agent: &mut L2CAgentBase) { effect_attacks4_impl(agent, SmashFacing::Reverse) }
+
+pub(super) fn install(agent: &mut Agent) {
+    agent
+        .game_acmd("game_attacks4", game_attacks4, Priority::Default)
+        .effect_acmd("effect_attacks4", effect_attacks4, Priority::Default)
+        .game_acmd("game_attacks4reverse", game_attacks4reverse, Priority::Default)
+        .effect_acmd("effect_attacks4reverse", effect_attacks4reverse, Priority::Default)
+        ;
+}
+"#;
+
+    fn shared_smash_project(acmd: &str) -> (tempfile::TempDir, SourceIndex) {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "src/pacman/acmd/smashes.rs", acmd);
+        write(
+            tmp.path(),
+            "src/pacman/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"pacman\"); }",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        (tmp, index)
+    }
+
+    #[test]
+    fn forwarding_scripts_read_the_shared_body_resolved_for_each_caller() {
+        let (_tmp, index) = shared_smash_project(SHARED_SMASH);
+        let reverse = index.script_source("pacman", "attacks4reverse").unwrap();
+        assert!(reverse.notes.is_empty(), "{:?}", reverse.notes);
+        assert_eq!(reverse.covers, vec!["game_", "effect_"]);
+        let body = &reverse.body;
+        assert!(body.contains("fn game_attacks4reverse("), "{body}");
+        assert!(!body.contains("facing"), "every facing read resolves: {body}");
+        assert!(!body.contains("let ("), "the resolved binding is dropped: {body}");
+        assert!(body.contains("frame(agent.lua_state_agent, 24.0);"), "{body}");
+        assert!(body.contains("frame(agent.lua_state_agent, 28.0);"), "{body}");
+        assert!(body.contains("Some(-12.0)"), "{body}");
+        assert!(body.contains("*ATTACK_LR_CHECK_B"), "{body}");
+        // `-7.0 * -1.0`: the leading minus is the operand's sign.
+        assert!(body.contains("0, 0, 7.0, 0"), "{body}");
+
+        let hitboxes = crate::acmd::parse_acmd_script(body).to_hitboxes();
+        assert_eq!(hitboxes.len(), 2, "{body}");
+        assert_eq!(hitboxes[0].damage, 21.5);
+        assert_eq!(hitboxes[0].offset_z, -28.4);
+        assert_eq!(hitboxes[0].active_start, 24);
+        assert_eq!(hitboxes[1].offset_z, -21.6);
+        assert_eq!(hitboxes[1].capsule_end.map(|end| end[2]), Some(-12.0));
+
+        let forward = index.script_source("pacman", "attacks4").unwrap();
+        let hitboxes = crate::acmd::parse_acmd_script(&forward.body).to_hitboxes();
+        assert_eq!(hitboxes.len(), 2, "{}", forward.body);
+        assert_eq!(hitboxes[0].damage, 21.0);
+        assert_eq!(hitboxes[0].offset_z, 28.4);
+        assert_eq!(hitboxes[0].active_start, 21);
+        assert!(forward.body.contains("*ATTACK_LR_CHECK_F"), "{}", forward.body);
+    }
+
+    #[test]
+    fn a_shared_body_refuses_write_back_instead_of_changing_every_variant() {
+        let (tmp, index) = shared_smash_project(SHARED_SMASH);
+        let site = index.script("pacman", "game_attacks4reverse").unwrap();
+        let delegate = site.delegate.as_ref().expect("the wrapper forwards");
+        assert_eq!(delegate.function, "game_attacks4_impl");
+        assert_eq!(delegate.callers, 2);
+        assert_eq!(site.function, "game_attacks4reverse", "the wrapper keeps its own site");
+
+        let body = index.script_source("pacman", "attacks4reverse").unwrap().body;
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].damage = 30.0;
+        let error = sync_hitboxes(&index, "pacman", "attacks4reverse", &pristine, &edited)
+            .expect_err("one variant's edit must not reach the shared body");
+        assert!(error.to_string().contains("2 scripts share"), "{error}");
+        let on_disk =
+            std::fs::read_to_string(tmp.path().join("src/pacman/acmd/smashes.rs")).unwrap();
+        assert_eq!(on_disk, SHARED_SMASH);
+    }
+
+    #[test]
+    fn values_that_cannot_be_resolved_are_reported_not_guessed() {
+        let acmd = SHARED_SMASH
+            .replace(
+                "frame(agent.lua_state_agent, 3.0);",
+                "frame(agent.lua_state_agent, facing.charge_frame());",
+            )
+            .replace(
+                "game_attacks4_impl(agent, SmashFacing::Reverse)",
+                "game_attacks4_impl(agent, pick_facing(agent))",
+            );
+        let (_tmp, index) = shared_smash_project(&acmd);
+
+        let forward = index.script_source("pacman", "attacks4").unwrap();
+        assert!(
+            forward
+                .notes
+                .iter()
+                .any(|note| note.starts_with("game_attacks4:") && note.contains("charge_frame")),
+            "{:?}",
+            forward.notes
+        );
+        // What could be resolved still is.
+        assert!(
+            forward.body.contains("frame(agent.lua_state_agent, 21.0);"),
+            "{}",
+            forward.body
+        );
+
+        let reverse = index.script_source("pacman", "attacks4reverse").unwrap();
+        assert!(
+            reverse
+                .notes
+                .iter()
+                .any(|note| note.contains("frame(agent.lua_state_agent, hit_frame);")),
+            "{:?}",
+            reverse.notes
+        );
+        assert!(reverse.body.contains("hit_frame"), "nothing is guessed: {}", reverse.body);
+    }
+
+    #[test]
+    fn a_private_pass_through_body_is_written_where_it_lives() {
+        let acmd = MARIO.replace(
+            "unsafe extern \"C\" fn game_attackairn(agent: &mut L2CAgentBase) {",
+            "unsafe extern \"C\" fn game_attackairn(agent: &mut L2CAgentBase) {\n    \
+             nair_impl(agent);\n}\n\nunsafe fn nair_impl(agent: &mut L2CAgentBase) {",
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write(tmp.path(), "src/mario/acmd.rs", &acmd);
+        write(
+            tmp.path(),
+            "src/mario/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"mario\"); }",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let body = index.script_source("mario", "attack_air_n").unwrap().body;
+        assert!(body.contains("fn game_attackairn("), "{body}");
+        assert!(body.contains("macros::ATTACK("), "{body}");
+
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].damage = 9.5;
+        let report = sync_hitboxes(&index, "mario", "attack_air_n", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1);
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk.contains("    nair_impl(agent);\n"), "the wrapper is untouched");
+        assert!(on_disk.contains("Hash40::new(\"top\"), 9.5, 361"), "{on_disk}");
+    }
+
+    #[test]
+    fn constant_products_fold_only_where_nothing_binds_tighter() {
+        assert_eq!(
+            fold_constant_products("f(0, 28.4 * -1.0, Some(12.0 * -1.0), -7.0 * -1.0, 2 * 3)"),
+            "f(0, -28.4, Some(-12.0), 7.0, 6)"
+        );
+        assert_eq!(fold_constant_products("x / 2.0 * 3.0"), "x / 2.0 * 3.0");
+        assert_eq!(fold_constant_products("x - 2.0 * 3.0"), "x - 6.0");
+        assert_eq!(fold_constant_products("a, *CONST, 1.0"), "a, *CONST, 1.0");
+    }
 
     fn mario_project() -> (tempfile::TempDir, SourceIndex) {
         let tmp = tempfile::tempdir().unwrap();
