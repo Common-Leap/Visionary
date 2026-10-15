@@ -99,6 +99,9 @@ pub struct CarrierAuthored {
 /// mesh-backed sources (see `preserve_raw_primitives`). The caller is expected to show these —
 /// silently shipping a carrier that is missing an edit, or whose geometry is known-wrong, is
 /// what made several of these faults take multiple test runs to pin down.
+// The app resolves each donor on its own (`…_resolving`); this single-root form remains for the
+// tests that pin its behaviour.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // The public pipeline boundary keeps each input explicit.
 pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
     carrier_bytes: &[u8],
