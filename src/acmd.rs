@@ -31,6 +31,20 @@ pub fn move_name_to_pascal(name: &str) -> String {
 /// are `attacks32` / `attacks33` (`AttackS32.txt`), while Link's `attack_s4_s2`
 /// keeps its `s` (`AttackS4S2.txt`) and is listed for completeness.
 pub fn move_script_aliases(move_name: &str) -> Vec<String> {
+    let mut out = move_script_aliases_guess(move_name);
+    // What the motion list says this motion runs comes FIRST: it is the game's own answer, and
+    // the name-based spellings below are only guesses at it. Registered only for motions the
+    // guess cannot reach (see `motion_scripts`), so vanilla lookups are unchanged.
+    if let Some(suffix) = crate::motion_scripts::registered_suffix(move_name) {
+        out.retain(|alias| *alias != suffix);
+        out.insert(0, suffix);
+    }
+    out
+}
+
+/// The name-based spellings alone, without the motion list's answer. `motion_scripts` uses
+/// this to decide whether a motion's real script is reachable by guessing at all.
+pub fn move_script_aliases_guess(move_name: &str) -> Vec<String> {
     let mut out = vec![move_name.to_string()];
     let lower = move_name.to_ascii_lowercase();
     let alias: Option<&str> = match lower.as_str() {
@@ -111,6 +125,10 @@ pub fn script_name_aliases(script_name: &str) -> Vec<String> {
 /// `attack_s3_s2`/`s3` map to `attack_s3_2`/`_3` (`AttackS32/33.txt`); Link's
 /// `attack_s4_s2` keeps its `s` and needs no resolution.
 pub fn resolve_script_move_name(fighter: &str, move_name: &str) -> String {
+    // The motion list named this motion's script outright; nothing to guess.
+    if let Some(suffix) = crate::motion_scripts::registered_suffix(move_name) {
+        return suffix;
+    }
     let aliases = move_script_aliases(move_name);
     if aliases.len() <= 1 {
         return move_name.to_string();

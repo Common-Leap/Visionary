@@ -4122,6 +4122,14 @@ impl VisionaryApp {
         let labels = self.state.labels.clone();
         let fighter_dir = fighter.fighter_dir.clone();
         let base_slot = fighter.base_slot();
+        // Where a moveset spells out the motion and script names it adds: its linked source and
+        // the compiled plugins under the data/mod roots. Read on the worker thread.
+        let source_files: Vec<PathBuf> = self
+            .acmd_src
+            .as_ref()
+            .map(|index| index.files.clone())
+            .unwrap_or_default();
+        let name_roots = self.all_roots();
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
         self.state.status = "Loading moves...".to_string();
@@ -4131,6 +4139,17 @@ impl VisionaryApp {
             let Ok(mlist) = motion_lib::open(&motion_list_path) else {
                 return;
             };
+            // ParamLabels only knows vanilla names. A custom motion (Shy Guy's
+            // `attack_s4_s_reverse`) is named only by the moveset itself, so fill the gaps from
+            // there; ParamLabels still wins wherever it has an answer.
+            let mut names = crate::motion_scripts::moveset_names(&source_files, &name_roots);
+            names.extend(labels.iter().map(|(hash, name)| (*hash, name.clone())));
+            // A yamlist `motion_list.yml` beside the binary is the author's own text of this
+            // list — every motion, script and animation by name — so it outranks all of the
+            // above. Released mods usually ship only the `.bin`, which is what the rest is for.
+            if let Ok(yml) = std::fs::read_to_string(motion_dir.join("motion_list.yml")) {
+                names.extend(crate::motion_scripts::names_from_motion_list_yml(&yml));
+            }
 
             let anim_index = index_nuanmb(&motion_dir);
             // Kirby's body motion list points at copy-ability animations stored in sibling
@@ -4139,6 +4158,15 @@ impl VisionaryApp {
             // Other fighters use the same layout for weapon and helper parts, so this is a
             // fighter-data rule rather than a Kirby special case.
             let animation_files = index_fighter_nuanmb(&fighter_dir, base_slot);
+            // Animation file names name motions too (`a04walkfallr.nuanmb` → `walk_fall_r`), for
+            // the motions neither ParamLabels nor the moveset spells out.
+            for (hash, path) in &animation_files {
+                if let Some(file) = path.file_name() {
+                    names
+                        .entry(*hash)
+                        .or_insert_with(|| file.to_string_lossy().to_ascii_lowercase());
+                }
+            }
             let mut moves: Vec<MoveEntry> = mlist
                 .list
                 .iter()
@@ -4146,10 +4174,26 @@ impl VisionaryApp {
                 // change — every motion in the list reaches the panel now.
                 .map(|(hash_key, motion)| {
                     let hash_val = hash_key.0;
-                    let name = labels
-                        .get(&hash_val)
-                        .cloned()
-                        .unwrap_or_else(|| format!("{:#018x}", hash_val));
+                    // The scripts this motion runs, as the motion list states them. Every
+                    // script lookup goes through `move_script_aliases`, which now puts this
+                    // first whenever the name-based guess would have missed it.
+                    let script_hashes: Vec<u64> = std::iter::once(motion.game_script.0)
+                        .chain(motion.scripts.iter().map(|script| script.0))
+                        .collect();
+                    let animation_name_hashes: Vec<u64> =
+                        motion.animations.iter().map(|a| a.name.0).collect();
+                    let name = crate::motion_scripts::motion_name(
+                        hash_val,
+                        &script_hashes,
+                        &animation_name_hashes,
+                        &names,
+                    )
+                    .unwrap_or_else(|| format!("{:#018x}", hash_val));
+                    if let Some(suffix) =
+                        crate::motion_scripts::script_suffix(&name, &script_hashes, &names)
+                    {
+                        crate::motion_scripts::register_if_unguessable(&name, &suffix);
+                    }
 
                     // **No family filter.** This used to keep only six substrings — attack,
                     // special, throw, catch, cliff, final — which hid 65% of the corpus's sound

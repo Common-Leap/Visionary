@@ -20,6 +20,7 @@ mod game_link;
 mod mod_export;
 mod mod_import;
 mod mod_project;
+mod motion_scripts;
 mod move_kinds;
 mod param_labels;
 mod plugin_deploy;
