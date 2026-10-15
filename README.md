@@ -253,6 +253,44 @@ macros you actually called. Both the smashline layout (`Agent::new("mario")`
 beside the scripts) and the older `#[acmd_script(agent = "…", script = "…")]`
 attributes are recognised.
 
+Real movesets are written in many styles, and Visionary reads them as written:
+
+- **Only compiled code counts.** Files are followed through the crate's `mod`
+  tree from `src/lib.rs`, so a `srcOLD/` backup, an extracted release copy or a
+  vanilla reference dump beside the crate is never mistaken for the live script.
+- **Multi-agent installers.** `pacman::install(pacman)` with
+  `let pacman = &mut Agent::new("pacman")` gives that module to `pacman`, even
+  when the same installer also sets up article agents. `.game_acmd`,
+  `.effect_acmd`, `.sound_acmd`, `.expression_acmd` and `.acmd` registrations are
+  all read, and the last registration of a script name wins, as it does in game.
+- **Bare macros and any agent name.** `ATTACK(agent, …)` from a
+  `use smash_script::macros::*;` import reads the same as `macros::ATTACK`, and
+  a function whose agent is called `fighter` or `weapon` is understood too.
+- **Your own shorthand.** Hash macros such as `cmn!("swing_06")` or
+  `se!("jump01")` show the sound they name, numeric `const`s show their value,
+  and one-line helpers such as `RUMBLE_HIT(agent, kind)` read as the macro they
+  call.
+
+Edits keep your style. A value changes in place; a `se!("jump01")` stays a
+`se!` macro; a hitbox whose damage is `WALK_LW_DAMAGE` changes the const where it
+is defined, and says how many other places share it; a value a helper fixes is
+refused with a note instead of rewritten. Lines Visionary has to add use the
+file's own macro path, agent name, indentation and line endings.
+
+**Build & Deploy** in the same window runs `cargo skyline build --release` on
+the linked crate and replaces the deployed plugin. It finds the plugin on the
+most recently used emulator SD by name, or by fingerprint when a mod ships it
+renamed to `plugin.nro`, and **Deploy to…** picks a destination it could not
+find. If the plugin exports smashline's `smashline_install`, it is also written
+as smashline's `development.nro`; press L + R + D-pad Up in the game's menus to
+hot-reload it. The full cargo output is kept in `visionary-build.log`.
+
+The **Collisions** tab opens with the move's frame data: startup, active frames,
+first actionable frame, landing lag and shield advantage, in game frames
+(`FT_MOTION_RATE` applied). Hover any figure for where it came from. Landing lag
+set in your source (for example through `param_config`) takes precedence over the
+`.prc` files.
+
 A project rarely overrides everything, and it does not have to. Each category is
 resolved on its own: your `game_attackairn` is used for the hitboxes, and the
 move's stock effects and sounds still come from the vanilla scripts, so a mod
