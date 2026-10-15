@@ -27632,7 +27632,7 @@ impl VisionaryApp {
         // NOTE: aliases are SENT further down, after the authored-edit clones have added
         // theirs. Sending here would ship a list missing every authored redirect (the plugin
         // does a full-list replace, so a partial list silently disables them).
-        const LIVE_CARRIER_REL: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        const LIVE_CARRIER_REL: &str = crate::eff_editor::CARRIER_BASE_REL;
         // EVERY transplant of the carrier fighter rides the carrier, including one sourced from
         // that fighter's own eff.
         //
@@ -27736,6 +27736,13 @@ impl VisionaryApp {
             roots.push(d.clone());
         }
         roots.extend(self.extra_roots.iter().cloned());
+        // The vanilla dump goes LAST: it is where the carrier base comes from, and a fighter eff
+        // a mod also ships must still resolve to the mod's copy, which is what the user edits.
+        if let Some(vanilla) = &self.eff_editor.vanilla_root {
+            if !roots.contains(vanilla) {
+                roots.push(vanilla.clone());
+            }
+        }
         let mut carrier_authored: Vec<crate::eff_export::CarrierAuthored> = Vec::new();
         let mut authored_aliases: Vec<(String, String)> = Vec::new();
         let mut carrier_name_conflicts: Vec<String> = Vec::new();
@@ -28089,12 +28096,15 @@ impl VisionaryApp {
         // Textures the build would not delete because something still samples them.
         let mut carrier_textures_in_use: Vec<String> = Vec::new();
         if carrier_needed {
-            // Sources may legitimately live under DIFFERENT roots: the carrier is an assist
-            // eff from the vanilla dump, while a modded fighter's own eff is under a mod
-            // root. Requiring one root that holds everything silently skipped the carrier in
-            // that case (logged only as CARRIER ROOT MISS). Resolve per file instead, and
-            // only fall back to the all-in-one-root requirement for the builder's `donor_root`
-            // argument, which still takes a single base.
+            // Sources legitimately live under DIFFERENT roots: the carrier is an assist eff from
+            // the vanilla dump, while a modded fighter's own eff (a `c40` costume eff, say) exists
+            // only under the mod's romfs. Every file — the carrier and each donor — is resolved
+            // on its own, and the builder is handed the same resolver.
+            //
+            // The builder used to take ONE donor root, chosen as "the root holding the carrier".
+            // For a modded fighter that root never holds the fighter's eff, so every authored
+            // edit failed as "donor unreadable": no carrier bytes, no spec, and the plugin sat at
+            // state 0 while the editor waited for a swap that was never requested.
             let resolve = |rel: &str| -> Option<std::path::PathBuf> {
                 let rel = rel.to_lowercase();
                 roots.iter().map(|r| r.join(&rel)).find(|p| p.is_file())
@@ -28105,31 +28115,19 @@ impl VisionaryApp {
                 .filter(|op| resolve(&op.src_file_rel).is_none())
                 .map(|op| op.src_file_rel.clone())
                 .collect();
-            // The builder resolves donors relative to ONE root, so prefer a root that holds
-            // every source; otherwise fall back to the root holding the carrier itself and
-            // let the builder report precisely what it could not read.
-            let shared_root = roots
-                .iter()
-                .find(|root| {
-                    root.join(live_carrier_rel).is_file()
-                        && carrier_ops
-                            .iter()
-                            .all(|op| root.join(op.src_file_rel.to_lowercase()).is_file())
-                })
-                .or_else(|| {
-                    missing
-                        .is_empty()
-                        .then(|| roots.iter().find(|r| r.join(live_carrier_rel).is_file()))
-                        .flatten()
-                });
-            if shared_root.is_none() && carrier_path.is_some() && !missing.is_empty() {
+            if carrier_path.is_none() {
+                carrier_error = Some(format!(
+                    "the carrier base {live_carrier_rel} was not found — set \"Vanilla dump\" in \
+                     the Eff Editor to your vanilla ArcExplorer export"
+                ));
+            } else if !missing.is_empty() {
                 carrier_error = Some(format!(
                     "carrier sources not found under any effect root: {}",
                     missing.join(", ")
                 ));
             }
-            if let Some(root) = shared_root {
-                match std::fs::read(root.join(live_carrier_rel)) {
+            if let Some(carrier_file) = carrier_path.as_ref().filter(|_| missing.is_empty()) {
+                match std::fs::read(carrier_file) {
                     Ok(carrier_base) => {
                         // Names the carrier must hold VERBATIM: an authored clone is a copy
                         // of the fighter's OWN entry, so storing it under the donor name would
@@ -28161,11 +28159,11 @@ impl VisionaryApp {
                                 .collect();
                         let mut warnings: Vec<String> = Vec::new();
                         let carrier_bytes =
-                            crate::eff_export::rebuild_runtime_carrier_eff_bytes_with_edits(
+                            crate::eff_export::rebuild_runtime_carrier_eff_bytes_resolving(
                                 &carrier_base,
                                 live_carrier_rel,
                                 &carrier_transplants,
-                                root,
+                                &resolve,
                                 &carrier_authored,
                                 &carrier_textures,
                                 &carrier_new_textures,
@@ -28243,18 +28241,18 @@ impl VisionaryApp {
                             }
                         }
                     }
-                    Err(e) => dbg.push_str(&format!(
-                        "CARRIER BASE READ FAILED {live_carrier_rel}: {e}\n"
-                    )),
+                    Err(e) => {
+                        dbg.push_str(&format!(
+                            "CARRIER BASE READ FAILED {live_carrier_rel}: {e}\n"
+                        ));
+                        carrier_error = Some(format!("could not read {live_carrier_rel}: {e}"));
+                    }
                 }
             } else {
-                let needed = carrier_ops
-                    .iter()
-                    .map(|op| op.src_file_rel.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 dbg.push_str(&format!(
-                    "CARRIER ROOT MISS: need {live_carrier_rel} and [{needed}] under one effect root\n"
+                    "CARRIER ROOT MISS: carrier={} missing=[{}] roots={roots:?}\n",
+                    if carrier_path.is_some() { "found" } else { "missing" },
+                    missing.join(", ")
                 ));
             }
         }
@@ -28406,6 +28404,15 @@ impl VisionaryApp {
             if let Some(e) = &carrier_error {
                 self.state.status = format!("Live transplant carrier not built — {e}");
             }
+            // Tell the editor's send indicator directly. Without this it waited on a game that
+            // was never sent a carrier, then reported "never staged the carrier" after 25s.
+            self.eff_editor.carrier_build_error = Some(carrier_error.clone().unwrap_or_else(|| {
+                if carrier_target.is_none() {
+                    "no fighter is selected to hold the carrier".to_string()
+                } else {
+                    "the carrier was not built (see donor_send_debug.txt)".to_string()
+                }
+            }));
         }
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
         // receives the new spec and creates its object. Empty is meaningful and clears old data.
@@ -32719,6 +32726,9 @@ impl eframe::App for VisionaryApp {
             // Discard any rejection left over from an earlier send, so it cannot immediately
             // abort this one.
             let _ = self.game_link.take_carrier_error();
+            // Likewise a build failure from an earlier snapshot: this send's own build runs in
+            // `flush_effect_aliases` at the end of this frame and sets it afresh if it fails.
+            self.eff_editor.carrier_build_error = None;
             // Start the stall clock fresh. Between sends the carrier sits in its live state for
             // as long as the user is editing, so a timer left running from the PREVIOUS send is
             // already past the threshold — and `live` is false on the first frame of a new send
@@ -32797,7 +32807,21 @@ impl eframe::App for VisionaryApp {
             // Nothing is coming, so stop waiting now instead of sitting out the silence
             // timeout and blaming the match for it.
             let rejected = self.game_link.take_carrier_error();
-            if live || silent || stalled || rejected.is_some() {
+            // The app never built the carrier, so the game was never asked for one. Stop now
+            // and say why, instead of timing out on state 0 and blaming the plugin or the .nro.
+            let build_failed = if self.eff_editor.carrier_expected {
+                self.eff_editor.carrier_build_error.take()
+            } else {
+                None
+            };
+            if let Some(reason) = build_failed {
+                self.eff_editor.awaiting_game = None;
+                self.eff_editor.carrier_ok = false;
+                self.eff_editor.last_carrier_result =
+                    Some(format!("carrier: not built — {reason}"));
+                self.eff_editor
+                    .set_sent_note(format!("NOT sent — the carrier could not be built: {reason}"));
+            } else if live || silent || stalled || rejected.is_some() {
                 self.eff_editor.awaiting_game = None;
                 // Keep the final reading visible. The indicator vanished too fast to read,
                 // which made the one signal that could settle this undiagnosable.
@@ -36225,6 +36249,12 @@ fn legacy_config_path(key: &str) -> Option<std::path::PathBuf> {
 /// folder the app happened to be launched from.
 pub(crate) const EFF_ROOT_CONFIG_KEY: &str = "eff_root";
 
+/// Config key for the VANILLA effect dump (an ArcExplorer export holding `effect/assist/…`).
+/// Kept apart from [`EFF_ROOT_CONFIG_KEY`] because the live carrier is built on a vanilla
+/// assist eff that a mod's romfs never contains: pointing the eff root at the mod you are
+/// editing used to make every send fail with "carrier base not found".
+pub(crate) const VANILLA_ROOT_CONFIG_KEY: &str = "vanilla_root";
+
 /// Config key for the emulator's SD root — the folder holding `ultimate/`, which is where live
 /// edits are staged for the plugin to read. Left unset, `scratch_dirs::emulator_sd_root` probes
 /// the standard Eden / yuzu / Ryujinx locations for the host platform; set it when the emulator
@@ -36427,7 +36457,7 @@ fn save_forgotten_fighters(fighters: &BTreeSet<String>) {
     }
 }
 
-fn load_config_path(key: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn load_config_path(key: &str) -> Option<std::path::PathBuf> {
     let dest = config_path(key)?;
     let dest = if dest.exists() {
         dest

@@ -518,6 +518,12 @@ pub struct EffEditor {
     /// Whether that final reading was a success — colours the persisted readout so a failed
     /// send is not a grey line that reads like a status message.
     pub carrier_ok: bool,
+    /// Set by the app when it could not BUILD the carrier for a send that needed one. Nothing
+    /// was sent to the game, so waiting for it would only time out and blame the plugin.
+    pub carrier_build_error: Option<String>,
+    /// The vanilla effect dump, always searched when building the live carrier. Independent of
+    /// `export_root`, which is usually the mod being edited and never holds the carrier base.
+    pub vanilla_root: Option<PathBuf>,
     /// The carrier rebuild is synchronous on the UI thread, so servicing the request in the
     /// same frame as the click would block before the spinner ever painted. Hold the request
     /// for one frame so the "sending" state is visible.
@@ -581,6 +587,8 @@ impl Default for EffEditor {
             carrier_gen_now: 0,
             last_carrier_result: None,
             carrier_ok: false,
+            carrier_build_error: None,
+            vanilla_root: crate::app::load_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY),
             deploy_defer: false,
             last_sent_note: None,
         }
@@ -744,6 +752,9 @@ fn unique_emitter_name(base: &str, existing: &[EmitterDef]) -> String {
 
 /// The attributes the emitter panel puts above the group tree, in this order. These are the ones
 /// an effect edit almost always starts from; every one of them is also in its own group below.
+/// The vanilla assist eff the live carrier is built on. Only a vanilla dump holds it.
+pub const CARRIER_BASE_REL: &str = "effect/assist/bomberman/ef_bomberman.eff";
+
 const BASIC_ATTRS: &[&str] = &[
     "emitter_static.color_scale",
     "emission.rate",
@@ -1103,10 +1114,25 @@ impl EffEditor {
     }
 
     pub fn set_export_root(&mut self, root: PathBuf) {
+        // A folder that holds the carrier base IS a vanilla dump: remember it as such, so that
+        // later pointing the eff root at a mod's romfs does not lose the carrier base with it.
+        self.remember_vanilla_root(&root);
         if self.export_root != root {
             self.export_root = root;
             self.rescan();
         }
+    }
+
+    /// Record `dir` as the vanilla dump if it holds the carrier base. Returns whether it did.
+    pub fn remember_vanilla_root(&mut self, dir: &Path) -> bool {
+        if !dir.join(CARRIER_BASE_REL).is_file() {
+            return false;
+        }
+        if self.vanilla_root.as_deref() != Some(dir) {
+            self.vanilla_root = Some(dir.to_path_buf());
+            crate::app::save_config_path(crate::app::VANILLA_ROOT_CONFIG_KEY, dir);
+        }
+        true
     }
 
     /// Queue authored edits to apply after the next queued eff loads (project load path).
@@ -2139,6 +2165,32 @@ impl EffEditor {
             }
             if ui.small_button("Rescan").clicked() {
                 self.rescan();
+            }
+            let vanilla_label = match &self.vanilla_root {
+                Some(dir) => format!("Vanilla dump: {}", dir.display()),
+                None => "Vanilla dump: not set".to_string(),
+            };
+            let vanilla_button = ui
+                .small_button(vanilla_label)
+                .on_hover_text(
+                    "The vanilla ArcExplorer export. Live edits ride a carrier built on a vanilla \
+                     assist eff, which a mod's romfs does not contain, so this stays set even \
+                     when the folder above points at your mod.",
+                );
+            if vanilla_button.clicked() {
+                let mut dialog =
+                    rfd::FileDialog::new().set_title("Select the vanilla ArcExplorer export");
+                if let Some(dir) = self.vanilla_root.as_ref().filter(|d| d.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(dir) = dialog.pick_folder() {
+                    if !self.remember_vanilla_root(&dir) {
+                        self.set_sent_note(format!(
+                            "{} has no {CARRIER_BASE_REL} — pick the folder that contains effect/",
+                            dir.display()
+                        ));
+                    }
+                }
             }
         });
 

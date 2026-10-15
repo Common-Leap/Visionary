@@ -111,6 +111,38 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
     removed_textures: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<u8>> {
+    rebuild_runtime_carrier_eff_bytes_resolving(
+        carrier_bytes,
+        carrier_rel,
+        ops,
+        &|rel| Some(donor_root.join(rel)),
+        authored,
+        textures,
+        added_textures,
+        removed_textures,
+        warnings,
+    )
+}
+
+/// [`rebuild_runtime_carrier_eff_bytes_with_edits`] with each donor located by `resolve_donor`
+/// instead of under one shared root.
+///
+/// The carrier base and its donors routinely live under DIFFERENT roots: the carrier is an
+/// assist eff from the vanilla dump, while a modded fighter's own eff (e.g. a `c40` costume eff
+/// that exists only in the mod's romfs) is never in that dump. Forcing one root made every
+/// authored edit on such a fighter fail as "donor unreadable", so no carrier was ever sent.
+#[allow(clippy::too_many_arguments)]
+pub fn rebuild_runtime_carrier_eff_bytes_resolving(
+    carrier_bytes: &[u8],
+    carrier_rel: &str,
+    ops: &[TransplantOp],
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+    authored: &[CarrierAuthored],
+    textures: &[TextureImport],
+    added_textures: &[crate::mod_project::TextureAddition],
+    removed_textures: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<Vec<u8>> {
     // A carrier-native selection needs no transplant. The runtime remap already turns an `_os`
     // request into the carrier's existing real entry, so parsing, pruning, and repacking these
     // resource pools only introduces risk. Preserve the game's known-good payload byte-for-byte.
@@ -152,10 +184,12 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
         let index = match donors.iter().position(|(existing, _)| *existing == key) {
             Some(index) => index,
             None => {
-                let bytes =
-                    std::fs::read(donor_root.join(&op.src_file_rel)).with_context(|| {
-                        format!("transplant donor '{}' is unreadable", op.src_file_rel)
-                    })?;
+                let path = resolve_donor(&op.src_file_rel).ok_or_else(|| {
+                    anyhow!("transplant donor '{}' was not found", op.src_file_rel)
+                })?;
+                let bytes = std::fs::read(&path).with_context(|| {
+                    format!("transplant donor '{}' is unreadable", op.src_file_rel)
+                })?;
                 let donor = effect_library::NamcoEffectFile::load(&bytes)
                     .context("effect_library failed to parse a transplant donor .eff")?;
                 donors.push((key, donor));
@@ -3213,6 +3247,77 @@ mod tests {
     /// the donor's value, so silencing — which used to read only that field — kept some unrelated
     /// carrier set and cleared every one of the transplant's real ones. The effect arrived as a
     /// named, resolvable, completely silent entry.
+    /// A modded fighter's own eff (here a costume eff that exists only in the mod's romfs) is
+    /// never under the vanilla dump that holds the carrier. With a single donor root the build
+    /// failed as "donor unreadable", so an authored edit never produced a carrier at all.
+    #[test]
+    fn a_donor_outside_the_carrier_root_still_builds() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        const CARRIER: &str = "effect/assist/bomberman/ef_bomberman.eff";
+        const DONOR: &str = "effect/fighter/pacman/ef_pacman_c40.eff";
+        let carrier_base = std::fs::read(root.join(CARRIER)).expect("carrier eff");
+        let vanilla = std::fs::read(root.join("effect/fighter/pacman/ef_pacman.eff"))
+            .expect("pacman eff");
+        let entry = effect_library::NamcoEffectFile::load(&vanilla)
+            .expect("pacman parses")
+            .entry_names
+            .iter()
+            .find(|n| !n.is_empty())
+            .cloned()
+            .expect("an entry");
+        // The mod root: holds the costume eff and nothing else.
+        let mod_root = tempfile::tempdir().expect("tempdir");
+        let donor_path = mod_root.path().join(DONOR);
+        std::fs::create_dir_all(donor_path.parent().unwrap()).unwrap();
+        std::fs::write(&donor_path, &vanilla).unwrap();
+        assert!(!root.join(DONOR).is_file(), "test needs the donor absent from the dump");
+
+        let ops = [crate::mod_project::TransplantOp {
+            new_entry_name: format!("vsnedit_{}", entry.to_lowercase()),
+            src_file_rel: DONOR.into(),
+            src_set_name: entry.to_lowercase(),
+            src_set_idx: 0,
+            one_slot_slots: Vec::new(),
+            replace_entry: None,
+        }];
+        let single_root = super::rebuild_runtime_carrier_eff_bytes_with_edits(
+            &carrier_base,
+            CARRIER,
+            &ops,
+            &root,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut Vec::new(),
+        );
+        assert!(single_root.is_err(), "one root cannot see the mod's donor");
+
+        let roots = [root.clone(), mod_root.path().to_path_buf()];
+        let resolve = |rel: &str| roots.iter().map(|r| r.join(rel)).find(|p| p.is_file());
+        let built = super::rebuild_runtime_carrier_eff_bytes_resolving(
+            &carrier_base,
+            CARRIER,
+            &ops,
+            &resolve,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut Vec::new(),
+        )
+        .expect("carrier builds with the donor resolved from the mod root");
+        let out = effect_library::NamcoEffectFile::load(&built).expect("carrier re-reads");
+        assert!(out
+            .entry_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&ops[0].new_entry_name)));
+    }
+
     #[test]
     fn a_multi_part_transplant_keeps_every_variant_set() {
         let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
