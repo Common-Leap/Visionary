@@ -19,8 +19,9 @@ glam = "0.28.0"
 
 # SSBU file formats
 # Character rendering; effect rendering is performed live in game by slight_replica.
-# Pin a known-compatible commit from the canonical upstream main branch.
-ssbh_wgpu = { git = "https://github.com/ScanMountGoat/ssbh_wgpu.git", rev = "f7bfb4b3bb3affcd361f80b1f63f6789ee2cc9e5" }
+# joobert's fork: upstream f7bfb4b plus ModelFolder::load_files (costumes that share files
+# through config.json) and apply_anims_with_skel_edit (a thrown fighter held by the throw bone).
+ssbh_wgpu = { git = "https://github.com/joobert/ssbh_wgpu.git", rev = "592d0d17c6945373c9ebe917c2e4e9701c57bcae" }
 ssbh_data = { version = "0.19.0", features = ["serde"] }
 prc = { package = "prc-rs", version = "1.6" }
 motion_lib = { package = "motion_list_rs", version = "1.5" }

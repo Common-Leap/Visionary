@@ -4,6 +4,7 @@ mod acmd_src;
 mod acmd_verify;
 mod app;
 mod app_icon;
+mod costume_files;
 mod asset_snapshots;
 mod carrier_motion;
 mod carrier_support;

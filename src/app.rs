@@ -3110,6 +3110,9 @@ pub struct VisionaryApp {
     /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
     /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
     viewport_toolbar_rect: Option<egui::Rect>,
+    /// Where the shown model's and motion's borrowed files come from, for the viewport toolbar.
+    /// Empty when both folders hold all their own files.
+    viewport_file_sources: Vec<ViewportFileSource>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
@@ -3527,6 +3530,7 @@ impl VisionaryApp {
             show_hurtboxes: load_hurtbox_visibility(),
             helper_bones: load_helper_bones(),
             viewport_toolbar_rect: None,
+            viewport_file_sources: Vec::new(),
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
@@ -4196,6 +4200,20 @@ impl VisionaryApp {
         self.workspace_asset_slot = fighter.base_slot();
         let model_dir = fighter.model_dir.clone();
         let motion_dir = fighter.motion_dir.clone();
+        // What ARCropolis would load from each folder: its own files, its config.json shares,
+        // and the game's files for a vanilla slot.
+        let model_files = crate::costume_files::CostumeFolder::resolve(&model_dir);
+        let motion_files = crate::costume_files::CostumeFolder::resolve(&motion_dir);
+        self.viewport_file_sources = [("Model", &model_files), ("Motion", &motion_files)]
+            .into_iter()
+            .filter_map(|(label, folder)| {
+                Some(ViewportFileSource {
+                    label,
+                    summary: folder.summary()?,
+                    detail: folder.detail(),
+                })
+            })
+            .collect();
         self.current_default_eyelid_path = find_default_eyelid_nuanmb(&motion_dir);
         // A mod may not ship c00 at all, so weapon lookups follow the fighter's own base
         // slot rather than assuming slot 0 exists.
@@ -4203,37 +4221,31 @@ impl VisionaryApp {
         let model_root = fighter.fighter_dir.join("model");
 
         // Set skel path and eagerly load bone names for the dropdown
-        let skel = model_dir.join("model.nusktb");
-        self.current_skel_path = if skel.exists() {
-            Some(skel.clone())
-        } else {
-            None
-        };
-        let mut loaded_bone_names: Vec<String> = skel
-            .exists()
-            .then(|| ssbh_data::skel_data::SkelData::from_file(&skel).ok())
-            .flatten()
+        self.current_skel_path = model_files.get("model.nusktb").map(Path::to_path_buf);
+        let mut loaded_bone_names: Vec<String> = self
+            .current_skel_path
+            .as_ref()
+            .and_then(|skel| ssbh_data::skel_data::SkelData::from_file(skel).ok())
             .map(|s| s.bones.into_iter().map(|b| b.name).collect())
             .unwrap_or_default();
 
         // Also collect weapon bone names from sibling model dirs (sword, hammer, etc.)
         // model_root = fighter/{name}/model, each part holding cNN subdirs.
-        if let Ok(entries) = std::fs::read_dir(&model_root) {
-            for entry in entries.flatten() {
-                let dir_name = entry.file_name();
-                if dir_name.to_string_lossy() == "body" {
-                    continue;
-                }
-                // The weapon's slot set can differ from the body's, so fall back to any slot
-                // it does have rather than giving up when the base slot is missing.
-                let part_dir = entry.path();
-                let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
-                else {
-                    continue;
-                };
-                if let Ok(wskel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel_path) {
-                    loaded_bone_names.extend(wskel.bones.into_iter().map(|bone| bone.name));
-                }
+        for part_dir in crate::costume_files::sibling_dirs(&model_root) {
+            if part_dir
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("body"))
+            {
+                continue;
+            }
+            // The weapon's slot set can differ from the body's, so fall back to any slot
+            // it does have rather than giving up when the base slot is missing.
+            let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
+            else {
+                continue;
+            };
+            if let Ok(wskel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel_path) {
+                loaded_bone_names.extend(wskel.bones.into_iter().map(|bone| bone.name));
             }
         }
         // Keep the text-edit fallback when no skeleton could be loaded. Once there is a
@@ -4303,11 +4315,15 @@ impl VisionaryApp {
             // A yamlist `motion_list.yml` beside the binary is the author's own text of this
             // list — every motion, script and animation by name — so it outranks all of the
             // above. Released mods usually ship only the `.bin`, which is what the rest is for.
-            if let Ok(yml) = std::fs::read_to_string(motion_dir.join("motion_list.yml")) {
+            let motion_files = crate::costume_files::CostumeFolder::resolve(&motion_dir);
+            if let Some(yml) = motion_files
+                .get("motion_list.yml")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
                 names.extend(crate::motion_scripts::names_from_motion_list_yml(&yml));
             }
 
-            let anim_index = index_nuanmb(&motion_dir);
+            let anim_index = index_nuanmb(&motion_files);
             // Kirby's body motion list points at copy-ability animations stored in sibling
             // motion parts (`cloudbody`, `shulkbody`, ...). Index every part once so the
             // animation named by the motion list wins over the old body-only suffix guess.
@@ -4369,7 +4385,6 @@ impl VisionaryApp {
                     let anim_path = find_motion_nuanmb(
                         &animation_hashes,
                         &animation_files,
-                        &motion_dir,
                         &anim_index,
                         &name,
                         hash_val,
@@ -13681,6 +13696,20 @@ impl VisionaryApp {
                     "This model has no model.nuhlpb. The saved preference is kept for models \
                      that do."
                 });
+                for source in &self.viewport_file_sources {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("{}: {}", source.label, source.summary))
+                            .small()
+                            .weak(),
+                    )
+                    .on_hover_text(format!(
+                        "Files this costume's {} folder doesn't hold itself, loaded from where \
+                         ARCropolis would load them:\n\n{}",
+                        source.label.to_lowercase(),
+                        source.detail
+                    ));
+                }
             });
         self.viewport_toolbar_rect = Some(inner.response.rect);
     }
@@ -34909,17 +34938,13 @@ mod hurtbox_viewport_tests {
 /// 398 animations against ~460 moves, so the old shape was heading for ~180,000 directory
 /// entries walked on the load thread. Indexing once makes it linear, and the widened list now
 /// loads faster than the filtered one did.
-fn index_nuanmb(motion_dir: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = std::fs::read_dir(motion_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("nuanmb"))
-        .filter_map(|p| {
-            let stem = p.file_stem()?.to_str()?.to_lowercase();
-            Some((stem, p))
+/// `(lowercase stem, path)` of every animation the game loads from one motion folder.
+fn index_nuanmb(motion_files: &crate::costume_files::CostumeFolder) -> Vec<(String, PathBuf)> {
+    motion_files
+        .with_extension("nuanmb")
+        .filter_map(|(name, path)| {
+            let stem = Path::new(name).file_stem()?.to_str()?.to_lowercase();
+            Some((stem, path.to_path_buf()))
         })
         .collect()
 }
@@ -34931,15 +34956,9 @@ fn index_nuanmb(motion_dir: &Path) -> Vec<(String, PathBuf)> {
 /// Linux, and inspect only this one directory so a missing cNN asset never falls back to a
 /// different costume.
 fn find_default_eyelid_nuanmb(motion_dir: &Path) -> Option<PathBuf> {
-    const DEFAULT_EYELID: &str = "a00defaulteyelid.nuanmb";
-    let entries = std::fs::read_dir(motion_dir).ok()?;
-    entries.flatten().map(|entry| entry.path()).find(|path| {
-        path.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(DEFAULT_EYELID))
-    })
+    crate::costume_files::CostumeFolder::resolve(motion_dir)
+        .get("a00defaulteyelid.nuanmb")
+        .map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -34981,15 +35000,7 @@ mod default_eyelid_tests {
 fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
     let motion_root = fighter_dir.join("motion");
     let slot_name = format!("c{slot:02}");
-    let Ok(entries) = std::fs::read_dir(&motion_root) else {
-        return HashMap::new();
-    };
-
-    let mut parts: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
+    let mut parts = crate::costume_files::sibling_dirs(&motion_root);
     parts.sort_by_key(|path| {
         (
             path.file_name().and_then(|name| name.to_str()) != Some("body"),
@@ -34999,20 +35010,10 @@ fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
 
     let mut files = HashMap::new();
     for part in parts {
-        let slot_dir = part.join(&slot_name);
-        let Ok(entries) = std::fs::read_dir(slot_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("nuanmb") {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
+        let slot_files = crate::costume_files::CostumeFolder::resolve(&part.join(&slot_name));
+        for (name, path) in slot_files.with_extension("nuanmb") {
             let hash = hash40::hash40(&name.to_lowercase()).0;
-            files.entry(hash).or_insert(path);
+            files.entry(hash).or_insert_with(|| path.to_path_buf());
         }
     }
     files
@@ -35022,7 +35023,6 @@ fn index_fighter_nuanmb(fighter_dir: &Path, slot: u8) -> HashMap<u64, PathBuf> {
 fn find_motion_nuanmb(
     animation_hashes: &[u64],
     animation_files: &HashMap<u64, PathBuf>,
-    motion_dir: &Path,
     index: &[(String, PathBuf)],
     label: &str,
     hash: u64,
@@ -35030,18 +35030,19 @@ fn find_motion_nuanmb(
     animation_hashes
         .iter()
         .find_map(|hash| animation_files.get(hash).cloned())
-        .or_else(|| find_nuanmb(motion_dir, index, label, hash))
+        .or_else(|| find_nuanmb(index, label, hash))
 }
 
-fn find_nuanmb(
-    motion_dir: &Path,
-    index: &[(String, PathBuf)],
-    label: &str,
-    hash: u64,
-) -> Option<PathBuf> {
-    let p = motion_dir.join(format!("{}.nuanmb", label));
-    if p.exists() {
-        return Some(p);
+/// `index` is [`index_nuanmb`] of the motion folder, so every lookup sees shared files too.
+fn find_nuanmb(index: &[(String, PathBuf)], label: &str, hash: u64) -> Option<PathBuf> {
+    let by_stem = |stem: &str| {
+        index
+            .iter()
+            .find(|(indexed, _)| *indexed == stem)
+            .map(|(_, path)| path.clone())
+    };
+    if let Some(path) = by_stem(&label.to_lowercase()) {
+        return Some(path);
     }
 
     // Same rule as before: animation files carry a slot prefix (`a00wait1.nuanmb`), so the match
@@ -35051,11 +35052,7 @@ fn find_nuanmb(
         return Some(path.clone());
     }
 
-    let p = motion_dir.join(format!("{:#018x}.nuanmb", hash));
-    if p.exists() {
-        return Some(p);
-    }
-    None
+    by_stem(&format!("{:#018x}", hash))
 }
 
 /// Rebuild an ACMD script from the complete edited collision list while retaining every
@@ -36964,6 +36961,16 @@ fn load_hurtbox_visibility() -> bool {
         .is_some_and(|body| parse_viewport_flag(&body))
 }
 
+/// One viewport folder whose files are not all its own, as the toolbar reports it.
+struct ViewportFileSource {
+    /// `Model` or `Motion`.
+    label: &'static str,
+    /// [`crate::costume_files::CostumeFolder::summary`].
+    summary: String,
+    /// [`crate::costume_files::CostumeFolder::detail`], for the hover.
+    detail: String,
+}
+
 /// Helper bone constraints default on, matching the game, so only a saved "off" disables them.
 fn save_helper_bones(enabled: bool) {
     let Some(dest) = config_path("editor_viewport_helper_bones") else {
@@ -37343,9 +37350,8 @@ mod carrier_send_state_tests {
 
 #[cfg(test)]
 mod motion_animation_tests {
-    use super::{find_motion_nuanmb, index_fighter_nuanmb};
+    use super::{find_motion_nuanmb, index_fighter_nuanmb, index_nuanmb};
     use std::fs::File;
-    use std::path::Path;
 
     #[test]
     fn motion_part_index_hashes_the_complete_animation_filename() {
@@ -37386,7 +37392,6 @@ mod motion_animation_tests {
         let selected = find_motion_nuanmb(
             &[hash40::hash40("cloudd00specialn.nuanmb").0],
             &files,
-            Path::new(&root.path().join("motion/body/c00")),
             &[],
             "cloud_special_n",
             hash40::hash40("cloud_special_n").0,
@@ -37402,11 +37407,13 @@ mod motion_animation_tests {
         File::create(&body).unwrap();
 
         let files = index_fighter_nuanmb(root.path(), 0);
+        let index = index_nuanmb(&crate::costume_files::CostumeFolder::resolve(
+            &root.path().join("motion/body/c00"),
+        ));
         let selected = find_motion_nuanmb(
             &[],
             &files,
-            Path::new(&root.path().join("motion/body/c00")),
-            &[],
+            &index,
             "attack11",
             hash40::hash40("attack11").0,
         );

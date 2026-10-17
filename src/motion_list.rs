@@ -65,13 +65,14 @@ pub fn editable_in(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The motion list the game would see in `dir`: whichever of the binary and the YAML was
-/// written last, so an edit to the YAML shows before the next build converts it.
+/// written last, so an edit to the YAML shows before the next build converts it. A list the
+/// folder only gets through a `config.json` share, or from the game, counts too.
 pub fn load_current_in(dir: &Path) -> Option<MList> {
     let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let files = crate::costume_files::CostumeFolder::resolve(dir);
     let mut candidates: Vec<PathBuf> = ["motion_list.bin", "motion_list.yml", "motion_list.yaml"]
         .iter()
-        .map(|name| dir.join(name))
-        .filter(|path| path.is_file())
+        .filter_map(|name| files.get(name).map(Path::to_path_buf))
         .collect();
     candidates.sort_by_key(|path| std::cmp::Reverse(modified(path)));
     candidates.iter().find_map(|path| load(path).ok())

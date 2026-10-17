@@ -181,11 +181,14 @@ impl HitboxRenderState {
     pub fn load_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model_dir: &Path) {
         self.render_models.clear();
         self.weapon_skels.clear();
-        if !model_dir.exists() {
-            eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
+        // The files ARCropolis would load here: the folder's own, its config.json shares, and
+        // the game's files for a vanilla slot.
+        let costume = crate::costume_files::CostumeFolder::resolve(model_dir);
+        if costume.is_empty() {
+            eprintln!("[MODEL] no model files for {:?}", model_dir);
             return;
         }
-        let folder = ModelFolder::load_folder(model_dir);
+        let folder = ModelFolder::load_files(costume.model_files());
         let render_model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
         eprintln!("[MODEL] loaded from {:?}", model_dir);
         self.model_hlpb = folder.find_hlpb().cloned();
@@ -203,23 +206,21 @@ impl HitboxRenderState {
             .and_then(crate::data::parse_costume_dir)
             .unwrap_or(0);
         if let Some(model_root) = model_dir.parent().and_then(|p| p.parent()) {
-            if let Ok(entries) = std::fs::read_dir(model_root) {
-                for entry in entries.flatten() {
-                    let dir_name = entry.file_name();
-                    let dir_name = dir_name.to_string_lossy();
-                    if dir_name == "body" {
-                        continue;
-                    }
-                    let Some(weapon_skel) = crate::data::find_part_skel(&entry.path(), body_slot)
-                    else {
-                        continue;
-                    };
-                    if let Ok(skel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel) {
-                        // Determine the attach bone: prefer "haver" (right hand), then "havel" (left hand)
-                        // This is the character body bone the weapon root is parented to at runtime.
-                        let attach = weapon_attach_bone(&dir_name);
-                        self.weapon_skels.push((dir_name.to_string(), skel, attach));
-                    }
+            for part_dir in crate::costume_files::sibling_dirs(model_root) {
+                let Some(dir_name) = part_dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if dir_name.eq_ignore_ascii_case("body") {
+                    continue;
+                }
+                let Some(weapon_skel) = crate::data::find_part_skel(&part_dir, body_slot) else {
+                    continue;
+                };
+                if let Ok(skel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel) {
+                    // Determine the attach bone: prefer "haver" (right hand), then "havel" (left hand)
+                    // This is the character body bone the weapon root is parented to at runtime.
+                    let attach = weapon_attach_bone(dir_name);
+                    self.weapon_skels.push((dir_name.to_string(), skel, attach));
                 }
             }
         }

@@ -7078,17 +7078,20 @@ pub fn part_costume_slots(part_dir: &std::path::Path) -> Vec<u8> {
 ///
 /// Weapon parts routinely carry a different slot set from the body, and a modded fighter may
 /// ship no `c00` at all — hardcoding `c00` silently dropped that fighter's weapons.
+///
+/// Each slot is resolved the way ARCropolis loads it, so a skeleton shared through
+/// `config.json` or left to the game's own file still counts.
 pub fn find_part_skel(part_dir: &std::path::Path, preferred_slot: u8) -> Option<PathBuf> {
-    let preferred = part_dir
-        .join(format!("c{preferred_slot:02}"))
-        .join("model.nusktb");
-    if preferred.exists() {
-        return Some(preferred);
-    }
-    part_costume_slots(part_dir)
-        .iter()
-        .map(|s| part_dir.join(format!("c{s:02}")).join("model.nusktb"))
-        .find(|p| p.exists())
+    let skel_in = |slot: u8| {
+        crate::costume_files::CostumeFolder::resolve(&part_dir.join(format!("c{slot:02}")))
+            .get("model.nusktb")
+            .map(std::path::Path::to_path_buf)
+    };
+    skel_in(preferred_slot).or_else(|| {
+        part_costume_slots(part_dir)
+            .into_iter()
+            .find_map(skel_in)
+    })
 }
 
 /// Slot index encoded in an eff file name, e.g. `("ef_mario_c08", "mario") → 8`.

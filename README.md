@@ -215,6 +215,12 @@ The toolbar in the viewport's top-left corner holds the display options:
   bones (`H_` elbow, knee and similar helpers) then move the mesh and any
   hitbox, hurtbox or effect placed on them. It is on by default. A move's
   material animations (glows, colour changes, eye swaps) always play.
+- **Model** and **Motion** notes appear when the shown costume borrows files.
+  Visionary loads each costume the way ARCropolis does: the folder's own file
+  first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
+  then the game's file at that path from the vanilla dump. Hover a note to see
+  each borrowed file and its source. The move list's animations and motion list
+  are read the same way.
 
 To hide a fighter from the sidebar, right-click its name and choose **Forget
 fighter**. Visionary removes that fighter's cached scripts, saved edits, and
