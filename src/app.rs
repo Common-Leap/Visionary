@@ -18021,6 +18021,7 @@ impl VisionaryApp {
             name: self.project_name.clone(),
             fighters: HashMap::new(),
             roster: self.roster.project.clone(),
+            ..Default::default()
         };
         // Trait edits are authored in the Roster window and have no edit-log entry, so a
         // fighter whose only change is a value edit would otherwise be absent from the project

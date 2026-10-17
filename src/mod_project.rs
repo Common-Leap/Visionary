@@ -9,14 +9,14 @@
 //     (c00, c07, c12, c50 …; NOT limited to 0–7). That's a modifier, expressed as
 //     `TransplantOp::one_slot_slots`, and it can ride on top of a transplant.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 4;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
 /// an older project loads with the new sections empty — which is exactly what was true when
@@ -48,6 +48,42 @@ pub struct ModProjectFile {
     /// project created. Added in v3.
     #[serde(default, skip_serializing_if = "RosterMod::is_empty")]
     pub roster: RosterMod,
+    /// The fighters this project works on: the left fighter list shows exactly these. Added in
+    /// v4. Older projects load with it empty and get it seeded from what they already edit.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub project_fighters: BTreeSet<ProjectFighter>,
+    /// The moveset folder this project is linked to, as an absolute path in memory. Added in v4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moveset_source: Option<String>,
+}
+
+/// One row of the project's fighter list: a vanilla fighter, or a character this project
+/// added on a fighter's costume slot.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProjectFighter {
+    pub name: String,
+    /// The slot character's display name (`FighterEntry::custom_name`). `None` is the
+    /// fighter's own row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character: Option<String>,
+}
+
+impl ProjectFighter {
+    /// The fighter's own row.
+    pub fn fighter(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            character: None,
+        }
+    }
+
+    /// A character this project added on `name`'s costume slot.
+    pub fn character(name: &str, character: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            character: Some(character.to_string()),
+        }
+    }
 }
 
 /// Which ACMD portion of a saved project should be sent through the source exporter.
@@ -84,6 +120,9 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         // source export cannot carry a character select screen. They ship through the mod
         // folder path instead.
         roster: RosterMod::default(),
+        // Neither is ACMD, so neither belongs in a Smashline source export.
+        project_fighters: BTreeSet::new(),
+        moveset_source: None,
     };
 
     // A whole-project export may have a tweak stored under one fighter while the corresponding
@@ -184,34 +223,38 @@ impl Default for ModProjectFile {
             name: "unnamed_mod".into(),
             fighters: HashMap::new(),
             roster: RosterMod::default(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: None,
         }
     }
 }
 
 impl ModProjectFile {
-    /// Deliberately does not consult `effect_dropped_lines`. It is a note about what an export
-    /// would lose, not an edit, so a project holding only that has nothing to build and must
-    /// still count as empty — otherwise "No edits to export yet" turns into an export that
-    /// produces no files.
+    /// Deliberately ignores `project_fighters` and `moveset_source`: a project that only names
+    /// fighters has nothing to export. Likewise does not consult `effect_dropped_lines` (see
+    /// [`FighterMod::has_edits`]).
     pub fn is_empty(&self) -> bool {
-        self.fighters.values().all(|f| {
-            f.acmd.is_empty()
-                && f.effect_calls.values().all(|v| v.is_empty())
-                && f.effect_calls_full.values().all(|v| v.is_empty())
-                // An empty category script is an explicit replacement: it means the user
-                // removed every call and wants the generated plugin to silence the stock
-                // category. The map's presence, not the statement count, carries that intent.
-                && f.sound_scripts.is_empty()
-                && f.expression_scripts.is_empty()
-                && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
-                && f.live_tweaks.is_empty()
-                && f.params.is_empty()
-        }) && self.roster.is_empty()
+        self.fighters.values().all(|f| !f.has_edits()) && self.roster.is_empty()
+    }
+
+    /// Add the fighters this project already edits to `project_fighters`: every fighter with
+    /// edits, and every character it authored. Additive and idempotent, so it is safe to run
+    /// on a v1–v3 project that has no list yet and again on one that does.
+    pub fn seed_project_fighters(&mut self) {
+        for (name, fighter) in &self.fighters {
+            if fighter.has_edits() {
+                self.project_fighters.insert(ProjectFighter::fighter(name));
+            }
+        }
+        for entry in &self.roster.authored {
+            self.project_fighters
+                .insert(ProjectFighter::character(&entry.donor, &entry.display_name));
+        }
     }
 
     /// Bring a just-loaded project up to the current version.
     ///
-    /// Every v1→v3 field addition is additive and defaulted, so there is no data to move;
+    /// Every v1→v4 field addition is additive and defaulted, so there is no data to move;
     /// what this does is stamp the current version so a re-export is honestly labelled, and
     /// refuse a file from a *newer* build rather than silently dropping sections it does not
     /// understand. Silently dropping is the dangerous direction: the project would reopen
@@ -497,6 +540,28 @@ pub struct FighterMod {
     /// the rest of the fighter-wide values. Added in v3.
     #[serde(default, skip_serializing_if = "ParamMod::is_empty")]
     pub params: ParamMod,
+}
+
+impl FighterMod {
+    /// Whether this fighter holds anything an export would build.
+    ///
+    /// Deliberately does not consult `effect_dropped_lines`. It is a note about what an export
+    /// would lose, not an edit, so a fighter holding only that has nothing to build and must
+    /// still count as empty — otherwise "No edits to export yet" turns into an export that
+    /// produces no files.
+    pub fn has_edits(&self) -> bool {
+        !(self.acmd.is_empty()
+            && self.effect_calls.values().all(|v| v.is_empty())
+            && self.effect_calls_full.values().all(|v| v.is_empty())
+            // An empty category script is an explicit replacement: it means the user
+            // removed every call and wants the generated plugin to silence the stock
+            // category. The map's presence, not the statement count, carries that intent.
+            && self.sound_scripts.is_empty()
+            && self.expression_scripts.is_empty()
+            && self.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
+            && self.live_tweaks.is_empty()
+            && self.params.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1520,5 +1585,71 @@ mod version_three_tests {
             .hidden
             .insert(crate::roster::RosterKey::fighter("ridley"));
         assert!(!project.is_empty());
+    }
+
+    #[test]
+    fn v3_project_loads_with_empty_scope() {
+        let mut project: ModProjectFile =
+            serde_json::from_str(r#"{"version":3,"name":"x"}"#).expect("v3 must still load");
+        project.migrate().expect("v3 is supported");
+        assert_eq!(project.version, 4);
+        assert!(project.project_fighters.is_empty());
+        assert!(project.moveset_source.is_none());
+    }
+
+    #[test]
+    fn project_fighters_round_trip() {
+        let mut project = ModProjectFile::default();
+        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project
+            .project_fighters
+            .insert(ProjectFighter::character("pacman", "Shy Guy"));
+
+        let json = serde_json::to_string(&ProjectFighter::fighter("mario")).unwrap();
+        assert!(!json.contains("character"), "a fighter's own row has no character key: {json}");
+
+        let reloaded: ModProjectFile =
+            serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        assert_eq!(reloaded.project_fighters, project.project_fighters);
+    }
+
+    #[test]
+    fn seed_adds_edited_and_authored() {
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
+            "attack_s3_s".into(),
+            crate::data::AcmdScript::default(),
+        );
+        project.fighters.insert("falco".into(), FighterMod::default());
+        project.roster.authored.push(AuthoredEntry {
+            key: crate::roster::RosterKey::slot("pacman", 8),
+            donor: "pacman".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Shy Guy".into(),
+            name_id: "shy_guy".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+
+        project.seed_project_fighters();
+        let expected: std::collections::BTreeSet<ProjectFighter> = [
+            ProjectFighter::fighter("fox"),
+            ProjectFighter::character("pacman", "Shy Guy"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(project.project_fighters, expected);
+
+        project.seed_project_fighters();
+        assert_eq!(project.project_fighters, expected);
+    }
+
+    #[test]
+    fn scope_only_project_is_empty() {
+        let mut project = ModProjectFile::default();
+        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project.moveset_source = Some("C:/mods/my_moveset".into());
+        assert!(project.is_empty());
     }
 }
