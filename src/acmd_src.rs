@@ -728,13 +728,54 @@ impl SourceIndex {
             .iter()
             .map(|(file, text)| (file.clone(), text.as_str()))
             .collect();
+        // Compiled files above the linked folder. A folder linked inside a crate
+        // (`src/emperte/`) is often told which fighter it is only by the crate root
+        // (`src/lib.rs` handing it `Agent::new("falco")`), so those files are read for who owns
+        // what, though their own scripts are not indexed.
+        let mut context: Vec<(PathBuf, String)> = Vec::new();
+        // Where a walk up from a script file stops looking for the module that names it.
+        let mut scope_root = root.to_path_buf();
         if let Some(compiled) = compiled_files(root, &texts) {
             // Cargo spells paths its own way (drive-letter case, separators); compare by key.
-            let compiled: HashSet<String> =
+            let keys: HashSet<String> =
                 compiled.iter().map(|file| crate::cargo_project::path_key(file)).collect();
-            let built = |file: &PathBuf| compiled.contains(&crate::cargo_project::path_key(file));
+            let built = |file: &PathBuf| keys.contains(&crate::cargo_project::path_key(file));
             sources.retain(|(file, _)| built(file));
             files.retain(built);
+            let linked: HashSet<String> =
+                files.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let mut outside: Vec<&PathBuf> = compiled
+                .iter()
+                .filter(|file| !linked.contains(&crate::cargo_project::path_key(file)))
+                .collect();
+            outside.sort();
+            for file in outside {
+                // Respell under the linked folder's own ancestors, so the scopes these files
+                // declare are the same paths the walk from a linked file meets.
+                let key = crate::cargo_project::path_key(file);
+                let Some((ancestor, depth)) = root.ancestors().skip(1).find_map(|ancestor| {
+                    let prefix = crate::cargo_project::path_key(ancestor);
+                    let prefix = prefix.trim_end_matches(['\\', '/']);
+                    let rest = key.strip_prefix(prefix)?;
+                    rest.starts_with(['\\', '/']).then(|| {
+                        (ancestor, rest.split(['\\', '/']).filter(|s| !s.is_empty()).count())
+                    })
+                }) else {
+                    continue;
+                };
+                let parts: Vec<_> = file.components().collect();
+                let Some(tail) = parts.len().checked_sub(depth).map(|start| &parts[start..]) else {
+                    continue;
+                };
+                let respelled = tail.iter().fold(ancestor.to_path_buf(), |dir, part| dir.join(part));
+                let Ok(text) = std::fs::read_to_string(&respelled) else {
+                    continue;
+                };
+                if scope_root.starts_with(ancestor) {
+                    scope_root = ancestor.to_path_buf();
+                }
+                context.push((respelled, text));
+            }
         }
         // A fighter declaration in `src/fighters/mario/mod.rs` owns every nested module below
         // it, not only Rust files immediately beside it. Keep declarations as directory scopes
@@ -743,7 +784,7 @@ impl SourceIndex {
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
         let mut facts = ProjectFacts::default();
-        for (file, text) in &sources {
+        for (file, text) in sources.iter().chain(&context) {
             for function in scan_acmd_functions(text) {
                 *facts.definitions.entry(function.name).or_default() += 1;
             }
@@ -810,6 +851,7 @@ impl SourceIndex {
                 &project_wide,
                 &project_registrations,
                 &facts,
+                &scope_root,
             );
         }
         index.resolve_delegates(&sources);
@@ -825,7 +867,7 @@ impl SourceIndex {
         );
         index.scales = crate::fighter_scale::scan(
             &sources,
-            |file| fighter_for_file(file, root, &fighter_scopes),
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
             &index.consts,
         );
         index.param_scale = crate::fighter_scale::param_config_scale(
@@ -1229,6 +1271,7 @@ impl SourceIndex {
         project_wide: &[String],
         project_registrations: &HashMap<String, Vec<RegisteredScript>>,
         facts: &ProjectFacts,
+        scope_root: &Path,
     ) {
         let functions = scan_acmd_functions(text);
         if functions.is_empty() {
@@ -1325,7 +1368,7 @@ impl SourceIndex {
             let fallback = function
                 .fighter
                 .clone()
-                .or_else(|| fighter_for_file(file, &self.root, fighter_scopes))
+                .or_else(|| fighter_for_file(file, scope_root, fighter_scopes))
                 .or(registration_fighter)
                 .or_else(|| sole(project_wide))
                 // A folder of ACMD modules is often shared without the plugin's install
@@ -1597,7 +1640,15 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
         let mut ancestor = Some(root);
         for _ in 0..4 {
             let Some(dir) = ancestor else { break };
-            if dir.join("Cargo.toml").is_file() {
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                // A plain package builds only itself: a crate nested inside it (a
+                // `plugin(old)/` backup with its own manifest) is not a workspace member, and
+                // cargo never compiles it.
+                let toml = std::fs::read_to_string(&manifest).unwrap_or_default();
+                if toml.contains("[package]") && !toml.contains("[workspace]") {
+                    manifests.clear();
+                }
                 manifests.push(dir.to_path_buf());
                 break;
             }
@@ -11676,12 +11727,44 @@ pub fn install(agent: &mut Agent) {
 "#,
         );
 
-        let index = SourceIndex::build(tmp.path()).unwrap();
-        assert_eq!(index.script("falco", "game_attackairb").unwrap().file, aerials);
-        assert!(index.script("falco", "game_specialnstart").is_some());
-        assert!(index.script("falco_cannon", "game_fly").is_some());
-        assert!(index.script("falco_cannon", "game_attackairb").is_none());
-        assert!(!index.has_fighter("common"));
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        // A backup crate kept beside the live one; cargo never builds it.
+        write(tmp.path(), "plugin(old)/Cargo.toml", "[package]
+name = \"empoleon\"
+");
+        write(tmp.path(), "plugin(old)/src/lib.rs", "mod aerials;
+");
+        write(
+            tmp.path(),
+            "plugin(old)/src/aerials.rs",
+            "unsafe extern \"C\" fn game_attackairb(agent: &mut L2CAgentBase) {}
+",
+        );
+
+        // Linked at the moveset, its crate's `src/`, or the mod's own folder: the folder
+        // linked inside the crate is told it is Falco's only by `src/lib.rs` above it.
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert_eq!(
+                index.script("falco", "game_attackairb").unwrap().file,
+                aerials,
+                "linked at {linked:?}"
+            );
+            assert!(index.script("falco", "game_specialnstart").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_fly").is_some(), "linked at {linked:?}");
+            assert!(index.script("falco_cannon", "game_attackairb").is_none(), "linked at {linked:?}");
+            assert!(!index.has_fighter("common"), "linked at {linked:?}");
+            assert!(index.conflicts.is_empty(), "linked at {linked:?}");
+        }
     }
 
     /// A project whose functions are named for the mod, not the script, has to read the same
@@ -16686,7 +16769,7 @@ pub fn install() {
         let Some(root) = std::env::var_os("VISIONARY_PROBE_SOURCE") else {
             return;
         };
-        crate::cargo_project::tests::enable();
+        //NOCARGO
         let index = SourceIndex::build(Path::new(&root)).unwrap();
         let mut fighters: Vec<_> = index.fighters.iter().map(|(name, f)| (name.clone(), f.scripts.len())).collect();
         fighters.sort();
