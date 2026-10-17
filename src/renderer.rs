@@ -37,12 +37,28 @@ impl Default for Camera {
 }
 
 impl Camera {
-    /// Pan in the camera plane (left/right and up/down) while keeping rotation fixed.
-    /// Moves in world X (left/right) and world Y (up/down) regardless of camera rotation.
-    pub fn pan(&mut self, delta_x: f32, delta_y: f32) {
-        let speed = self.translation.z.abs() * 0.001;
-        self.translation.x -= delta_x * speed;
-        self.translation.y += delta_y * speed;
+    /// Orbit the model, as SSBH Editor's left drag does: horizontal drags turn about the
+    /// vertical axis, vertical drags tilt.
+    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
+        self.rotation.x += delta_y * 0.01;
+        self.rotation.y += delta_x * 0.01;
+    }
+
+    /// Pan in the view plane so the model follows the pointer, as SSBH Editor's right drag
+    /// does. The viewport height and vertical field of view convert pixels to world units at
+    /// the model's distance.
+    pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
+        let factor = self.fov_y.sin() * self.translation.z.abs() / viewport_height.max(1.0);
+        self.translation.x += delta_x * factor;
+        self.translation.y -= delta_y * factor;
+    }
+
+    /// Whether the camera has moved away from the default side view.
+    pub fn is_default(&self) -> bool {
+        let default = Self::default();
+        self.translation.abs_diff_eq(default.translation, 1e-4)
+            && self.rotation.abs_diff_eq(default.rotation, 1e-4)
+            && (self.fov_y - default.fov_y).abs() < 1e-4
     }
 
     /// Zoom: move along Z axis.

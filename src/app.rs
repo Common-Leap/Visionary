@@ -2481,6 +2481,20 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
     changed
 }
 
+/// Put the viewport camera back on the default side view.
+fn reset_viewport_camera(frame: &eframe::Frame) {
+    if let Some(wgpu_state) = frame.wgpu_render_state() {
+        if let Some(rs) = wgpu_state
+            .renderer
+            .write()
+            .callback_resources
+            .get_mut::<HitboxRenderState>()
+        {
+            rs.camera = crate::renderer::Camera::default();
+        }
+    }
+}
+
 /// Costume slots as runs: `c40–c47`, or `c08, c10–c12` when they have gaps.
 fn format_slot_list(slots: &[u8]) -> String {
     let mut runs: Vec<String> = Vec::new();
@@ -14257,6 +14271,69 @@ impl VisionaryApp {
                      that do."
                 });
 
+                ui.separator();
+                ui.label(RichText::new("Camera").strong());
+                ui.label(
+                    RichText::new("Left drag orbits · right or middle drag pans · scroll zooms")
+                        .small()
+                        .weak(),
+                );
+                if let Some(wgpu_state) = frame.wgpu_render_state() {
+                    let mut renderer = wgpu_state.renderer.write();
+                    if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                        let camera = &mut rs.camera;
+                        egui::Grid::new("settings_camera").num_columns(4).show(ui, |ui| {
+                            ui.label("Translation");
+                            for value in [
+                                &mut camera.translation.x,
+                                &mut camera.translation.y,
+                                &mut camera.translation.z,
+                            ] {
+                                ui.add(egui::DragValue::new(value).speed(0.1).fixed_decimals(2));
+                            }
+                            ui.end_row();
+                            ui.label("Rotation (°)");
+                            for value in [
+                                &mut camera.rotation.x,
+                                &mut camera.rotation.y,
+                                &mut camera.rotation.z,
+                            ] {
+                                let mut degrees = value.to_degrees();
+                                if ui
+                                    .add(egui::DragValue::new(&mut degrees).speed(0.5).fixed_decimals(1))
+                                    .changed()
+                                {
+                                    *value = degrees.to_radians();
+                                }
+                            }
+                            ui.end_row();
+                            ui.label("Field of view (°)");
+                            let mut degrees = camera.fov_y.to_degrees();
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut degrees)
+                                        .range(1.0..=120.0)
+                                        .speed(0.25)
+                                        .fixed_decimals(1),
+                                )
+                                .changed()
+                            {
+                                camera.fov_y = degrees.to_radians();
+                            }
+                            ui.end_row();
+                        });
+                        camera.translation.z = camera.translation.z.min(-1.0);
+                        if ui
+                            .add_enabled(!camera.is_default(), egui::Button::new("⟲ Reset view"))
+                            .on_hover_text("Back to the side view")
+                            .clicked()
+                        {
+                            *camera = crate::renderer::Camera::default();
+                        }
+                    } else {
+                        ui.weak("Load a fighter to adjust the camera.");
+                    }
+                }
             });
         self.settings_open = open;
         if self.preferences != before {
@@ -14266,7 +14343,7 @@ impl VisionaryApp {
     }
 
     /// Viewport display options, drawn over the model's top-left corner.
-    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, _frame: &eframe::Frame) {
+    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
         let area = egui::Rect::from_min_size(
             viewport.left_top() + egui::vec2(8.0, 8.0),
             egui::vec2(
@@ -14292,6 +14369,27 @@ impl VisionaryApp {
                         .clicked()
                     {
                         self.settings_open = !self.settings_open;
+                    }
+                    let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
+                        wgpu_state
+                            .renderer
+                            .read()
+                            .callback_resources
+                            .get::<HitboxRenderState>()
+                            .is_some_and(|rs| !rs.camera.is_default())
+                    });
+                    if ui
+                        .add_enabled(camera_moved, egui::Button::new("⟲"))
+                        .on_hover_text(
+                            "Reset view: back to the side view. Left drag orbits, right or                              middle drag pans, scroll zooms.",
+                        )
+                        .on_disabled_hover_text(
+                            "Left drag orbits, right or middle drag pans, scroll zooms. This                              button returns to the side view.",
+                        )
+                        .clicked()
+                    {
+                        reset_viewport_camera(frame);
+                        ui.ctx().request_repaint();
                     }
                     let scales = self.viewport_scales();
                     if [&scales.model, &scales.attack, &scales.grab]
@@ -34816,13 +34914,20 @@ impl eframe::App for VisionaryApp {
                         rs.set_model_scale(viewport_scales.model.value);
                         rs.set_victim(&wgpu_state.device, &wgpu_state.queue, victim);
                         rs.apply_preferences(&wgpu_state.queue, &self.preferences);
-                        // Left drag: pan in camera plane (left/right + up/down)
+                        // SSBH Editor's controls: left drag orbits, right (or middle) drag
+                        // pans, scroll zooms.
                         if response.dragged_by(egui::PointerButton::Primary) {
                             let delta = response.drag_delta();
-                            rs.camera.pan(delta.x, delta.y);
+                            rs.camera.rotate(delta.x, delta.y);
                             ctx.request_repaint();
                         }
-                        // Middle drag or right drag: pan (disabled for now)
+                        if response.dragged_by(egui::PointerButton::Secondary)
+                            || response.dragged_by(egui::PointerButton::Middle)
+                        {
+                            let delta = response.drag_delta();
+                            rs.camera.pan(delta.x, delta.y, h);
+                            ctx.request_repaint();
+                        }
                         // Scroll: zoom
                         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                         if scroll != 0.0 && response.hovered() {
