@@ -22,6 +22,8 @@ mod hash_macros;
 mod mod_export;
 mod mod_import;
 mod mod_project;
+mod motion_list;
+mod motion_list_editor;
 mod motion_scripts;
 mod moveset_build;
 mod moveset_survey;
