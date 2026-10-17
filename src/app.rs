@@ -3338,6 +3338,18 @@ pub struct VisionaryApp {
     /// The open project's `modproject.json` path. `None` means in-memory only
     /// ("Browse without project"). Persisted so the hub can Resume last.
     project_path: Option<PathBuf>,
+    /// The fighter rows the open project works on, by row key. Edited fighters are added by
+    /// `build_project` and stay after the edit is undone. Saved in `modproject.json`.
+    project_fighters: BTreeSet<crate::mod_project::ProjectFighter>,
+    /// The open project's moveset crate (absolute). `None` means not linked. Kept even when the
+    /// crate could not be re-opened, so a missing folder is reported rather than forgotten.
+    project_moveset: Option<PathBuf>,
+    /// Costume slots the open project's `romfs/` has files for, by lowercased fighter name.
+    /// Recomputed in `reindex_fighters`.
+    project_romfs_slots: BTreeMap<String, BTreeSet<u8>>,
+    /// The fighters `acmd_src` has scripts for, cached for `row_membership`, which runs per
+    /// row per frame. Refreshed wherever `acmd_src` is replaced.
+    acmd_src_fighters: BTreeSet<String>,
     /// Last saved editable snapshot (move sources cleared), for the autosave
     /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
@@ -3676,6 +3688,10 @@ impl VisionaryApp {
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
+            project_fighters: BTreeSet::new(),
+            project_moveset: None,
+            project_romfs_slots: BTreeMap::new(),
+            acmd_src_fighters: BTreeSet::new(),
             last_saved_snapshot: None,
             project_autosave_pending_since: None,
             project_autosave_last_check: std::time::Instant::now(),
@@ -3726,19 +3742,9 @@ impl VisionaryApp {
             app.eff_editor.set_export_root(root);
         }
 
-        // Re-link the user's own ACMD source, quietly: a project that has moved or been
-        // deleted since last session should not open with an error over an unrelated task.
-        // An index with no scripts is kept: dropping it made every move read as vanilla with
-        // nothing on screen saying the link had gone, and the header now explains it instead.
-        if let Some(root) = load_config_path(ACMD_SRC_CONFIG_KEY) {
-            match crate::acmd_src::SourceIndex::build(&root) {
-                Ok(index) => app.acmd_src = Some(index),
-                Err(error) => {
-                    app.acmd_src_problem =
-                        Some(format!("could not re-open {}: {error}", root.display()));
-                }
-            }
-        }
+        // Re-link the user's own ACMD source. Resuming a project later replaces this with the
+        // project's own link.
+        app.relink_global_acmd_source();
 
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
         // measures the loaded-model path (3D viewport, bone overlays) instead of the empty
@@ -3783,14 +3789,105 @@ impl VisionaryApp {
     }
 
     /// Every root fighters and their costume slots are discovered from: the game-data root
-    /// first (so vanilla files win on path lookups), then user-added mod roots.
+    /// first (so vanilla files win on path lookups), then user-added mod roots, then the open
+    /// project's `romfs/`. The romfs comes last so it only adds fighters and slots; where it
+    /// has a file for an indexed fighter, `reindex_fighters` points the entry at it.
     fn all_roots(&self) -> Vec<PathBuf> {
+        let mut roots = self.shared_roots();
+        if let Some(romfs) = self.project_romfs().filter(|romfs| romfs.is_dir()) {
+            roots.push(romfs);
+        }
+        roots
+    }
+
+    /// [`Self::all_roots`] without the open project's `romfs/`: the dump and the Mod Library,
+    /// which every project shares.
+    fn shared_roots(&self) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
         if let Some(root) = &self.state.data_root {
             roots.push(root.clone());
         }
         roots.extend(self.extra_roots.iter().cloned());
         roots
+    }
+
+    /// The open project's workspace folder: the one holding its `modproject.json`.
+    fn project_workspace(&self) -> Option<PathBuf> {
+        self.project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+    }
+
+    fn project_romfs(&self) -> Option<PathBuf> {
+        self.project_workspace().map(|workspace| workspace.join("romfs"))
+    }
+
+    /// Why fighter row `idx` belongs to the open project; empty when it does not, and always
+    /// empty with no project open.
+    fn row_membership(&self, idx: usize) -> Vec<crate::project_scope::MembershipReason> {
+        if self.project_path.is_none() {
+            return Vec::new();
+        }
+        let Some(entry) = self.state.fighters.get(idx) else {
+            return Vec::new();
+        };
+        let inputs = crate::project_scope::MembershipInputs {
+            added: &self.project_fighters,
+            romfs_slots: &self.project_romfs_slots,
+            moveset_fighters: &self.acmd_src_fighters,
+        };
+        crate::project_scope::membership(entry, &self.state.fighters, &inputs)
+    }
+
+    fn project_fighter_key(&self, idx: usize) -> Option<crate::mod_project::ProjectFighter> {
+        self.state
+            .fighters
+            .get(idx)
+            .map(|entry| crate::mod_project::ProjectFighter {
+                name: entry.name.clone(),
+                character: entry.custom_name.clone(),
+            })
+    }
+
+    /// Add fighter row `idx` to the project. Autosave picks it up: `build_project` writes
+    /// `project_fighters`, so the dirty check sees the change.
+    fn add_to_project(&mut self, idx: usize) {
+        if let Some(key) = self.project_fighter_key(idx) {
+            self.project_fighters.insert(key);
+        }
+    }
+
+    /// Take fighter row `idx` out of the project's added list. A row that is in for another
+    /// reason (romfs files, moveset scripts) stays listed.
+    fn remove_from_project(&mut self, idx: usize) {
+        if let Some(key) = self.project_fighter_key(idx) {
+            self.project_fighters.remove(&key);
+        }
+    }
+
+    /// Re-derive [`Self::acmd_src_fighters`] after `acmd_src` was replaced.
+    fn refresh_acmd_src_fighters(&mut self) {
+        self.acmd_src_fighters = self
+            .acmd_src
+            .as_ref()
+            .map(crate::project_scope::moveset_fighters)
+            .unwrap_or_default();
+    }
+
+    /// Link the moveset remembered in the app config, quietly, as startup does: a source that
+    /// has moved or been deleted should not open with an error over an unrelated task. An
+    /// index with no scripts is kept: dropping it made every move read as vanilla with nothing
+    /// on screen saying the link had gone, and the header now explains it instead.
+    fn relink_global_acmd_source(&mut self) {
+        let (_, index, problem) = crate::project_scope::moveset_on_load(
+            load_config_path(ACMD_SRC_CONFIG_KEY),
+            crate::acmd_src::SourceIndex::build,
+        );
+        self.acmd_src = index;
+        self.acmd_src_problem = problem;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
     }
 
     fn set_data_root(&mut self, path: PathBuf) {
@@ -3888,6 +3985,11 @@ impl VisionaryApp {
         ];
 
         let roots = self.all_roots();
+        // The list is rebuilt and re-sorted, so the selection is re-found by row, not index.
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|idx| self.project_fighter_key(idx));
         self.state.fighters.clear();
 
         // Fighter name → the root that owns it. A mod root may either ADD a new fighter or
@@ -4033,6 +4135,28 @@ impl VisionaryApp {
         self.state
             .fighters
             .sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+        // A file in the project's romfs wins over the dump and the mods for every row.
+        self.project_romfs_slots = match self.project_romfs() {
+            Some(romfs) => {
+                for entry in &mut self.state.fighters {
+                    crate::project_scope::apply_romfs_overlay(entry, &romfs);
+                }
+                crate::project_scope::romfs_fighter_slots(&romfs)
+            }
+            None => BTreeMap::new(),
+        };
+
+        if let Some(selected) = selected {
+            let found = self.state.fighters.iter().position(|entry| {
+                entry.name == selected.name && entry.custom_name == selected.character
+            });
+            if found.is_none() {
+                self.state.selected_move = None;
+                clear_move_state(&mut self.state);
+            }
+            self.state.selected_fighter = found;
+        }
 
         let extra_slots: usize = self
             .state
@@ -4904,7 +5028,15 @@ impl VisionaryApp {
                 );
                 self.acmd_src = Some(index);
                 self.acmd_src_problem = None;
-                save_config_path(ACMD_SRC_CONFIG_KEY, &root);
+                self.refresh_acmd_src_fighters();
+                // An open project records its own link; the global one is for browsing
+                // without a project and is left alone.
+                match crate::project_scope::link_target(self.project_path.is_some()) {
+                    crate::project_scope::LinkTarget::Project => self.project_moveset = Some(root),
+                    crate::project_scope::LinkTarget::Global => {
+                        save_config_path(ACMD_SRC_CONFIG_KEY, &root)
+                    }
+                }
                 // The open move was loaded from the mirror; re-read it from source now.
                 self.reload_move_scripts();
             }
@@ -4953,7 +5085,9 @@ impl VisionaryApp {
         let Some(root) = self.acmd_src.as_ref().map(|index| index.root.clone()) else {
             return false;
         };
-        match rebuild_linked_acmd_source_index(&root, &mut self.acmd_src) {
+        let rebuilt = rebuild_linked_acmd_source_index(&root, &mut self.acmd_src);
+        self.refresh_acmd_src_fighters();
+        match rebuilt {
             Ok(has_scripts) => {
                 if !has_scripts {
                     self.state.status = format!(
@@ -4977,7 +5111,11 @@ impl VisionaryApp {
         self.acmd_src = None;
         self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
-        clear_config_path(ACMD_SRC_CONFIG_KEY);
+        self.refresh_acmd_src_fighters();
+        match crate::project_scope::link_target(self.project_path.is_some()) {
+            crate::project_scope::LinkTarget::Project => self.project_moveset = None,
+            crate::project_scope::LinkTarget::Global => clear_config_path(ACMD_SRC_CONFIG_KEY),
+        }
         self.state.status = "Unlinked the ACMD source project — scripts come from the \
                              online archive again"
             .into();
@@ -6788,6 +6926,7 @@ impl VisionaryApp {
             // original calls that the running game needs suppressed/replayed, and replacing them
             // here would make a successful source sync turn off its live preview.
             self.acmd_src = Some(index);
+            self.refresh_acmd_src_fighters();
             if !self.note_synced_source_body(&fighter, &move_name) {
                 notes.push(
                     "source changed, but the updated move could not be re-read; rescan the project"
@@ -6924,6 +7063,7 @@ impl VisionaryApp {
         };
         if let Ok(index) = crate::acmd_src::SourceIndex::build(&root) {
             self.acmd_src = Some(index);
+            self.refresh_acmd_src_fighters();
         }
     }
 
@@ -18021,7 +18161,11 @@ impl VisionaryApp {
             name: self.project_name.clone(),
             fighters: HashMap::new(),
             roster: self.roster.project.clone(),
-            ..Default::default()
+            project_fighters: BTreeSet::new(),
+            moveset_source: self
+                .project_moveset
+                .as_ref()
+                .map(|path| path.display().to_string()),
         };
         // Trait edits are authored in the Roster window and have no edit-log entry, so a
         // fighter whose only change is a value edit would otherwise be absent from the project
@@ -18180,6 +18324,10 @@ impl VisionaryApp {
                 .capture_branch_warnings
                 .insert(move_name.to_string(), warning.clone());
         }
+        // An edited fighter joins the project and stays after the edit is undone: recorded on
+        // `self`, which outlives this build, then copied into the file.
+        crate::project_scope::absorb_edited_fighters(&mut self.project_fighters, &project);
+        project.project_fighters = self.project_fighters.clone();
         project
     }
 
@@ -18552,6 +18700,12 @@ impl VisionaryApp {
         self.roster.project = crate::mod_project::RosterMod::default();
         self.roster.params.clear();
         self.edit_history.clear();
+        self.project_fighters.clear();
+        self.project_moveset = None;
+        self.acmd_src = None;
+        self.acmd_src_problem = None;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
         self.game_link.end_project_batch();
         self.game_link.send_reset_pins();
         self.publish_live_rule_union();
@@ -18559,6 +18713,9 @@ impl VisionaryApp {
         // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
         self.adopt_project_path(&file, &project);
+        // The workspace's romfs is an index root now.
+        self.reindex_fighters();
+        self.reload_move_scripts();
         self.import_report = None;
         self.project_hub.show = false;
         self.state.status = format!("New project at {}.", workspace.display());
@@ -18591,6 +18748,17 @@ impl VisionaryApp {
             }
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
+                // Leaving an open project (autosave flushed it above): its romfs stops being an
+                // index root and the global moveset link applies again. In-memory edits stay.
+                if self.project_path.take().is_some() {
+                    self.last_saved_snapshot = None;
+                    self.project_autosave_pending_since = None;
+                    self.project_autosave_error = None;
+                    self.project_moveset = None;
+                    self.relink_global_acmd_source();
+                    self.reindex_fighters();
+                    self.reload_move_scripts();
+                }
                 self.state.status =
                     "Browsing without a project — edits stay in memory until File → Save As… gives them a home.".into();
             }
@@ -18629,7 +18797,9 @@ impl VisionaryApp {
         // Param labels: the downloaded CSV first, then whatever the dump carries.
         let mut labels = self.downloaded_labels.clone();
         labels.extend(self.state.labels.clone());
-        let base_roots = self.all_roots();
+        // What the import overrides is the dump and the Mod Library, not whichever project
+        // happens to be open.
+        let base_roots = self.shared_roots();
         let options = crate::mod_import::ImportOptions {
             known_fighters: &known_fighters,
             labels: &labels,
@@ -18645,6 +18815,13 @@ impl VisionaryApp {
                 }
             };
         project.name = stem.clone();
+        // Everything the mod touches is what the project is about, edits or not.
+        let touched: Vec<String> = project.fighters.keys().cloned().collect();
+        for name in touched {
+            project
+                .project_fighters
+                .insert(crate::mod_project::ProjectFighter::fighter(&name));
+        }
         // Write the adopted project beside its assets so later edits autosave onto it.
         match crate::mod_export::write_portable_project(&project, &project_file, &asset_dir) {
             Ok(()) => {}
@@ -20081,6 +20258,23 @@ impl VisionaryApp {
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
+        // The project's fighters and moveset link. Adopted before the edits below, which read
+        // the linked source and the indexed fighters; v1-v3 files are seeded from their edits.
+        project.seed_project_fighters();
+        self.project_fighters = std::mem::take(&mut project.project_fighters);
+        let (moveset, index, problem) = crate::project_scope::moveset_on_load(
+            project.moveset_source.take().map(PathBuf::from),
+            crate::acmd_src::SourceIndex::build,
+        );
+        self.project_moveset = moveset;
+        self.acmd_src = index;
+        self.acmd_src_problem = problem;
+        self.acmd_src_buffer = None;
+        self.refresh_acmd_src_fighters();
+        // The path is adopted in full at the end; the fighter list needs this project's romfs
+        // now, before the editor selection below is restored against it.
+        self.project_path = Some(path.to_path_buf());
+        self.reindex_fighters();
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
             if base.is_file() {

@@ -9,7 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::data::FighterEntry;
-use crate::mod_project::ProjectFighter;
+use crate::acmd_src::SourceIndex;
+use crate::mod_project::{ModProjectFile, ProjectFighter};
 
 /// How a project records its linked moveset crate: relative to the project folder (with `/`
 /// separators) when the crate lives inside it, so the pair can move together; otherwise the
@@ -177,7 +178,8 @@ pub fn membership(
     if inputs.added.contains(&key) {
         reasons.push(MembershipReason::Added);
     }
-    if let Some(slots) = inputs.romfs_slots.get(&entry.name) {
+    // The romfs scan lowercases names; the indexed row keeps its folder's spelling.
+    if let Some(slots) = inputs.romfs_slots.get(&entry.name.to_lowercase()) {
         let owned = slots.iter().any(|s| entry.slots.contains(s));
         let unowned = own_row
             && slots.iter().any(|s| {
@@ -210,6 +212,53 @@ pub fn reason_label(reason: MembershipReason) -> &'static str {
         MembershipReason::Added => "added to project",
         MembershipReason::RomfsFiles => "has files in romfs/",
         MembershipReason::MovesetScripts => "moveset has scripts",
+    }
+}
+
+/// Where linking or unlinking a moveset is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkTarget {
+    /// In the open project's `modproject.json`; the global link is left alone.
+    Project,
+    /// In the app config, as before projects carried their own link ("Browse without project").
+    Global,
+}
+
+pub fn link_target(project_open: bool) -> LinkTarget {
+    if project_open {
+        LinkTarget::Project
+    } else {
+        LinkTarget::Global
+    }
+}
+
+/// Add every fighter `project` edits to `set`. Never removes: a fighter stays in the project
+/// after its last edit is undone, so editing never makes a row vanish.
+pub fn absorb_edited_fighters(set: &mut BTreeSet<ProjectFighter>, project: &ModProjectFile) {
+    for (name, fighter) in &project.fighters {
+        if fighter.has_edits() {
+            set.insert(ProjectFighter::fighter(name));
+        }
+    }
+}
+
+/// Re-open a loaded project's moveset link with `build`. Returns the path to keep, the index
+/// when it built, and the problem to show when it did not. The stored path is always kept: a
+/// crate that is missing today (an unplugged drive, a renamed folder) must not be unlinked by
+/// the next autosave.
+pub fn moveset_on_load(
+    stored: Option<PathBuf>,
+    build: impl FnOnce(&Path) -> anyhow::Result<SourceIndex>,
+) -> (Option<PathBuf>, Option<SourceIndex>, Option<String>) {
+    let Some(path) = stored else {
+        return (None, None, None);
+    };
+    match build(&path) {
+        Ok(index) => (Some(path), Some(index), None),
+        Err(error) => {
+            let problem = format!("could not re-open {}: {error}", path.display());
+            (Some(path), None, Some(problem))
+        }
     }
 }
 
@@ -400,5 +449,95 @@ mod tests {
         assert!(moveset_fighters(&index).is_empty());
         index.fighters.insert("mario".into(), Default::default());
         assert_eq!(moveset_fighters(&index), BTreeSet::from(["mario".to_string()]));
+    }
+
+    #[test]
+    fn membership_matches_romfs_case_insensitively() {
+        let added = BTreeSet::new();
+        let romfs_slots = BTreeMap::from([("mario".to_string(), BTreeSet::from([0u8]))]);
+        let moveset_fighters = BTreeSet::new();
+        let inputs = MembershipInputs {
+            added: &added,
+            romfs_slots: &romfs_slots,
+            moveset_fighters: &moveset_fighters,
+        };
+        let rows = vec![entry("Mario", None, 0..8)];
+        assert_eq!(
+            membership(&rows[0], &rows, &inputs),
+            vec![MembershipReason::RomfsFiles]
+        );
+    }
+
+    fn edited(project: &mut crate::mod_project::ModProjectFile, name: &str) {
+        project
+            .fighters
+            .entry(name.to_string())
+            .or_default()
+            .sound_scripts
+            .insert("attack11".into(), Default::default());
+    }
+
+    #[test]
+    fn editing_adds_fighter_and_survives_undo() {
+        let mut set = BTreeSet::new();
+        let mut project = crate::mod_project::ModProjectFile::default();
+        edited(&mut project, "fox");
+        // Built but unedited: not a member.
+        project.fighters.entry("mario".into()).or_default();
+        absorb_edited_fighters(&mut set, &project);
+        assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
+        // The edit is undone; the next build still keeps fox.
+        project.fighters.clear();
+        absorb_edited_fighters(&mut set, &project);
+        assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
+    }
+
+    #[test]
+    fn project_fighters_round_trip_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = crate::mod_project::ModProjectFile {
+            project_fighters: BTreeSet::from([ProjectFighter::fighter("ghost")]),
+            ..Default::default()
+        };
+        let path = dir.path().join("modproject.json");
+        let portable =
+            crate::mod_export::make_portable_project(&project, dir.path(), "assets").unwrap();
+        let json = serde_json::to_string_pretty(&portable).unwrap();
+        let mut loaded: crate::mod_project::ModProjectFile = serde_json::from_str(&json).unwrap();
+        crate::mod_export::resolve_project_assets(&mut loaded, &path).unwrap();
+        loaded.seed_project_fighters();
+        assert_eq!(
+            loaded.project_fighters,
+            BTreeSet::from([ProjectFighter::fighter("ghost")])
+        );
+    }
+
+    #[test]
+    fn stale_moveset_path_is_kept() {
+        let gone = PathBuf::from("Z:/no/such/moveset");
+        let (kept, index, problem) = moveset_on_load(Some(gone.clone()), |_| {
+            Err(anyhow::anyhow!("not found"))
+        });
+        assert_eq!(kept, Some(gone.clone()));
+        assert!(index.is_none());
+        assert_eq!(
+            problem.as_deref(),
+            Some(format!("could not re-open {}: not found", gone.display()).as_str())
+        );
+
+        let (kept, index, problem) =
+            moveset_on_load(Some(gone.clone()), |_| Ok(crate::acmd_src::SourceIndex::default()));
+        assert_eq!(kept, Some(gone));
+        assert!(index.is_some());
+        assert!(problem.is_none());
+
+        let (kept, index, problem) = moveset_on_load(None, |_| unreachable!());
+        assert!(kept.is_none() && index.is_none() && problem.is_none());
+    }
+
+    #[test]
+    fn linking_in_project_mode_leaves_global_alone() {
+        assert_eq!(link_target(true), LinkTarget::Project);
+        assert_eq!(link_target(false), LinkTarget::Global);
     }
 }
