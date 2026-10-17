@@ -3105,6 +3105,11 @@ pub struct VisionaryApp {
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
     show_hurtboxes: bool,
+    /// Persistent viewport preference: apply `model.nuhlpb` to the mesh and the overlay.
+    helper_bones: bool,
+    /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
+    /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
+    viewport_toolbar_rect: Option<egui::Rect>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
@@ -3520,6 +3525,8 @@ impl VisionaryApp {
             hurtbox_volumes: Vec::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
+            helper_bones: load_helper_bones(),
+            viewport_toolbar_rect: None,
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
@@ -13636,6 +13643,47 @@ impl VisionaryApp {
     /// Edits go straight into `state.script`. Hurtbox statements are carried through the script
     /// rather than rebuilt from a list the way collisions are, so the script is the model here
     /// and there is no second copy to keep in step.
+    /// Viewport display options, drawn over the model's top-left corner.
+    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+        let has_helper_bones = frame.wgpu_render_state().is_some_and(|wgpu_state| {
+            wgpu_state
+                .renderer
+                .read()
+                .callback_resources
+                .get::<HitboxRenderState>()
+                .is_some_and(HitboxRenderState::has_helper_bones)
+        });
+        let area = egui::Rect::from_min_size(
+            viewport.left_top() + egui::vec2(8.0, 8.0),
+            egui::vec2((viewport.width() - 16.0).max(0.0), 28.0),
+        );
+        let mut toolbar = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(area)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let inner = egui::Frame::popup(toolbar.style())
+            .inner_margin(egui::Margin::symmetric(6, 2))
+            .show(&mut toolbar, |ui| {
+                let response = ui.add_enabled(
+                    has_helper_bones,
+                    egui::Checkbox::new(&mut self.helper_bones, "Helper bones"),
+                );
+                if response.changed() {
+                    save_helper_bones(self.helper_bones);
+                    ui.ctx().request_repaint();
+                }
+                response.on_hover_text(if has_helper_bones {
+                    "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
+                     They move H_ bones such as elbow and knee helpers, which changes the mesh \
+                     and any hitbox, hurtbox or effect placed on those bones."
+                } else {
+                    "This model has no model.nuhlpb. The saved preference is kept for models \
+                     that do."
+                });
+            });
+        self.viewport_toolbar_rect = Some(inner.response.rect);
+    }
     fn draw_hurtbox_toggle(&mut self, ui: &mut Ui) {
         let available = self
             .hurtbox_volumes
@@ -33907,6 +33955,8 @@ impl eframe::App for VisionaryApp {
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                        // Before the overlay reads bone matrices below, so both see one setting.
+                        rs.set_helper_bones(self.helper_bones);
                         // Left drag: pan in camera plane (left/right + up/down)
                         if response.dragged_by(egui::PointerButton::Primary) {
                             let delta = response.drag_delta();
@@ -34297,10 +34347,13 @@ impl eframe::App for VisionaryApp {
                         // timeline click.  The draw loop above deliberately stays paint-only;
                         // this small second pass uses the same bone convention to hit-test the
                         // visible center of each active collision without changing export data.
+                        let toolbar_rect = self.viewport_toolbar_rect;
                         let click_pos = ui.input(|i| {
-                            i.pointer
-                                .interact_pos()
-                                .filter(|p| i.pointer.primary_clicked() && rect.contains(*p))
+                            i.pointer.interact_pos().filter(|p| {
+                                i.pointer.primary_clicked()
+                                    && rect.contains(*p)
+                                    && !toolbar_rect.is_some_and(|r| r.contains(*p))
+                            })
                         });
                         let mut best_hitbox_pick: Option<(usize, f32)> = None;
                         if let Some(cp) = click_pos {
@@ -34520,7 +34573,9 @@ impl eframe::App for VisionaryApp {
                         }
                     }
                 }
+                self.draw_viewport_toolbar(ui, rect, frame);
             } else {
+                self.viewport_toolbar_rect = None;
                 ui.painter()
                     .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
                 ui.centered_and_justified(|ui| {
@@ -34836,13 +34891,13 @@ mod hurtbox_viewport_tests {
 
     #[test]
     fn hurtbox_visibility_config_is_versioned_and_defaults_off_safely() {
-        assert_eq!(encode_hurtbox_visibility(false), "v1,0");
-        assert_eq!(encode_hurtbox_visibility(true), "v1,1");
-        assert!(!parse_hurtbox_visibility(""));
-        assert!(!parse_hurtbox_visibility("v2,1"));
-        assert!(!parse_hurtbox_visibility("v1,yes"));
-        assert!(!parse_hurtbox_visibility("v1,1,extra"));
-        assert!(parse_hurtbox_visibility("v1,1\n"));
+        assert_eq!(encode_viewport_flag(false), "v1,0");
+        assert_eq!(encode_viewport_flag(true), "v1,1");
+        assert!(!parse_viewport_flag(""));
+        assert!(!parse_viewport_flag("v2,1"));
+        assert!(!parse_viewport_flag("v1,yes"));
+        assert!(!parse_viewport_flag("v1,1,extra"));
+        assert!(parse_viewport_flag("v1,1\n"));
     }
 }
 
@@ -36897,7 +36952,7 @@ fn save_hurtbox_visibility(visible: bool) {
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(dest, encode_hurtbox_visibility(visible));
+    let _ = std::fs::write(dest, encode_viewport_flag(visible));
 }
 
 fn load_hurtbox_visibility() -> bool {
@@ -36906,14 +36961,31 @@ fn load_hurtbox_visibility() -> bool {
     };
     std::fs::read_to_string(dest)
         .ok()
-        .is_some_and(|body| parse_hurtbox_visibility(&body))
+        .is_some_and(|body| parse_viewport_flag(&body))
 }
 
-fn encode_hurtbox_visibility(visible: bool) -> String {
+/// Helper bone constraints default on, matching the game, so only a saved "off" disables them.
+fn save_helper_bones(enabled: bool) {
+    let Some(dest) = config_path("editor_viewport_helper_bones") else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(dest, encode_viewport_flag(enabled));
+}
+
+fn load_helper_bones() -> bool {
+    config_path("editor_viewport_helper_bones")
+        .and_then(|dest| std::fs::read_to_string(dest).ok())
+        .map_or(true, |body| parse_viewport_flag(&body))
+}
+
+fn encode_viewport_flag(visible: bool) -> String {
     format!("v1,{}", u8::from(visible))
 }
 
-fn parse_hurtbox_visibility(body: &str) -> bool {
+fn parse_viewport_flag(body: &str) -> bool {
     let mut fields = body.trim().split(',');
     if fields.next() != Some("v1") {
         return false;

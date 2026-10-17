@@ -207,6 +207,15 @@ remain available when you switch moves during the session. **Restore move**
 discards the current move's staged collision, motion, effect, sound, and
 expression edits and reloads the loaded source or capture baseline.
 
+### Viewport
+
+The toolbar in the viewport's top-left corner holds the display options:
+
+- **Helper bones** applies the model's `model.nuhlpb`, as the game does. Helper
+  bones (`H_` elbow, knee and similar helpers) then move the mesh and any
+  hitbox, hurtbox or effect placed on them. It is on by default. A move's
+  material animations (glows, colour changes, eye swaps) always play.
+
 To hide a fighter from the sidebar, right-click its name and choose **Forget
 fighter**. Visionary removes that fighter's cached scripts, saved edits, and
 live effect previews while leaving the dumped and mod files unchanged. Use the
