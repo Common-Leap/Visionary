@@ -18,6 +18,9 @@ const CANCEL_HELP: &str = "The frame where the motion can be interrupted by othe
                            actionable frame). 0 uses the end of the animation.";
 const BLEND_HELP: &str = "Number of frames used to blend from the previous motion into this one.";
 const NO_STOP_INTP_HELP: &str = "Keep interpolating while hitstop pauses the motion.";
+/// Width of the label column, shared by every labelled grid so their fields line up.
+const LABEL_WIDTH: f32 = 96.0;
+const SECTION_SPACING: f32 = 8.0;
 const ERROR_COLOR: Color32 = Color32::from_rgb(230, 110, 100);
 
 /// The open motion list and the window's own state.
@@ -327,39 +330,49 @@ impl MotionListEditor {
         };
         let mut changed = false;
 
-        let mut new_key = key;
-        Grid::new("motion_list_header").num_columns(2).show(ui, |ui| {
-            ui.label("Motion Kind")
-                .on_hover_text("The motion name used by scripts like MotionModule::change_motion.");
-            if hash_edit(ui, Id::new("motion_key"), &mut new_key, 260.0) {
-                match rename_motion(&mut self.file.mlist, key, new_key) {
-                    Ok(()) => {
-                        self.selected = Some(new_key);
-                        self.message = None;
-                        changed = true;
+        // One grid for every labelled field so the labels share a column and the fields share a
+        // left edge. Fields sit in the last column, which is the only one egui lets grow.
+        Grid::new("motion_list_fields")
+            .num_columns(2)
+            .min_col_width(LABEL_WIDTH)
+            .show(ui, |ui| {
+                ui.label("Motion Kind").on_hover_text(
+                    "The motion name used by scripts like MotionModule::change_motion.",
+                );
+                let mut new_key = key;
+                if hash_edit(ui, Id::new("motion_key"), &mut new_key, f32::INFINITY) {
+                    match rename_motion(&mut self.file.mlist, key, new_key) {
+                        Ok(()) => {
+                            self.selected = Some(new_key);
+                            self.message = None;
+                            changed = true;
+                        }
+                        Err(e) => self.message = Some(e),
                     }
-                    Err(e) => self.message = Some(e),
                 }
-            }
-            ui.end_row();
-        });
+                ui.end_row();
+
+                let key = self.selected.unwrap_or(key);
+                let Some(motion) = self.file.mlist.list.get_mut(&key) else {
+                    return;
+                };
+
+                ui.label("Game Script").on_hover_text("The ACMD game script for this motion.");
+                changed |=
+                    hash_edit(ui, Id::new("game_script"), &mut motion.game_script, f32::INFINITY);
+                ui.end_row();
+
+                ui.label("Blend Frames").on_hover_text(BLEND_HELP);
+                changed |= ui.add(DragValue::new(&mut motion.blend_frames).range(0..=255)).changed();
+                ui.end_row();
+            });
 
         let key = self.selected.unwrap_or(key);
         let Some(motion) = self.file.mlist.list.get_mut(&key) else {
             return changed;
         };
 
-        Grid::new("motion_list_fields").num_columns(2).show(ui, |ui| {
-            ui.label("Game Script").on_hover_text("The ACMD game script for this motion.");
-            changed |= hash_edit(ui, Id::new("game_script"), &mut motion.game_script, 260.0);
-            ui.end_row();
-
-            ui.label("Blend Frames").on_hover_text(BLEND_HELP);
-            changed |= ui.add(DragValue::new(&mut motion.blend_frames).range(0..=255)).changed();
-            ui.end_row();
-        });
-
-        ui.add_space(4.0);
+        ui.add_space(SECTION_SPACING);
         ui.heading("Flags");
         Grid::new("motion_list_flags").num_columns(3).show(ui, |ui| {
             for i in 0..6 {
@@ -382,23 +395,25 @@ impl MotionListEditor {
                 });
             });
 
-        ui.add_space(4.0);
+        ui.add_space(SECTION_SPACING);
         ui.heading("Animations").on_hover_text(format!(
             "Animation files played by this motion. The game reads at most {MAX_ANIMATIONS}."
         ));
         let mut anim_to_remove = None;
-        Grid::new("motion_list_anims").num_columns(4).show(ui, |ui| {
-            for (i, anim) in motion.animations.iter_mut().enumerate() {
-                changed |= hash_edit(ui, Id::new(("motion_anim", i)), &mut anim.name, 220.0);
-                changed |= anim_name_menu(ui, &mut anim.name, anim_names);
-                ui.label("Unk");
-                changed |= ui.add(DragValue::new(&mut anim.unk).range(0..=255)).changed();
+        for (i, anim) in motion.animations.iter_mut().enumerate() {
+            trailing_row(ui, |ui| {
                 if ui.button("Remove").clicked() {
                     anim_to_remove = Some(i);
                 }
-                ui.end_row();
-            }
-        });
+                changed |= ui
+                    .add(DragValue::new(&mut anim.unk).range(0..=255))
+                    .on_hover_text("Unknown per-animation value.")
+                    .changed();
+                ui.label("Unk");
+                changed |= anim_name_menu(ui, &mut anim.name, anim_names);
+                changed |= hash_edit(ui, Id::new(("motion_anim", i)), &mut anim.name, f32::INFINITY);
+            });
+        }
         if let Some(i) = anim_to_remove {
             motion.animations.remove(i);
             changed = true;
@@ -411,18 +426,17 @@ impl MotionListEditor {
             changed = true;
         }
 
-        ui.add_space(4.0);
+        ui.add_space(SECTION_SPACING);
         ui.heading("Scripts").on_hover_text("Effect, sound and expression scripts for this motion.");
         let mut script_to_remove = None;
-        Grid::new("motion_list_scripts").num_columns(2).show(ui, |ui| {
-            for (i, script) in motion.scripts.iter_mut().enumerate() {
-                changed |= hash_edit(ui, Id::new(("motion_script", i)), script, 260.0);
+        for (i, script) in motion.scripts.iter_mut().enumerate() {
+            trailing_row(ui, |ui| {
                 if ui.button("Remove").clicked() {
                     script_to_remove = Some(i);
                 }
-                ui.end_row();
-            }
-        });
+                changed |= hash_edit(ui, Id::new(("motion_script", i)), script, f32::INFINITY);
+            });
+        }
         if let Some(i) = script_to_remove {
             motion.scripts.remove(i);
             changed = true;
@@ -443,7 +457,7 @@ impl MotionListEditor {
             }
         });
 
-        ui.add_space(4.0);
+        ui.add_space(SECTION_SPACING);
         ui.heading("Extra");
         let mut has_extra = motion.extra.is_some();
         if ui
@@ -540,24 +554,35 @@ fn anim_name_menu(ui: &mut Ui, name: &mut Hash40, anim_names: &[String]) -> bool
 /// Editable cancel, intangibility and interpolation fields.
 fn extra_fields(ui: &mut Ui, extra: &mut Extra) -> bool {
     let mut changed = false;
-    Grid::new(ui.id().with("motion_extra")).num_columns(2).show(ui, |ui| {
-        ui.label("Cancel Frame").on_hover_text(CANCEL_HELP);
-        changed |= ui.add(DragValue::new(&mut extra.cancel_frame).range(0..=255)).changed();
-        ui.end_row();
-
-        ui.label("XLU Start").on_hover_text(XLU_HELP);
-        changed |= ui.add(DragValue::new(&mut extra.xlu_start).range(0..=255)).changed();
-        ui.end_row();
-
-        ui.label("XLU End").on_hover_text(XLU_HELP);
-        changed |= ui.add(DragValue::new(&mut extra.xlu_end).range(0..=255)).changed();
-        ui.end_row();
-
-        ui.label("No Stop Intp").on_hover_text(NO_STOP_INTP_HELP);
-        changed |= ui.checkbox(&mut extra.no_stop_intp, "").changed();
-        ui.end_row();
-    });
+    Grid::new(ui.id().with("motion_extra"))
+        .num_columns(2)
+        .min_col_width(LABEL_WIDTH)
+        .show(ui, |ui| {
+            ui.label("Cancel Frame").on_hover_text(CANCEL_HELP);
+            changed |= ui.add(DragValue::new(&mut extra.cancel_frame).range(0..=255)).changed();
+            ui.end_row();
+    
+            ui.label("XLU Start").on_hover_text(XLU_HELP);
+            changed |= ui.add(DragValue::new(&mut extra.xlu_start).range(0..=255)).changed();
+            ui.end_row();
+    
+            ui.label("XLU End").on_hover_text(XLU_HELP);
+            changed |= ui.add(DragValue::new(&mut extra.xlu_end).range(0..=255)).changed();
+            ui.end_row();
+    
+            ui.label("No Stop Intp").on_hover_text(NO_STOP_INTP_HELP);
+            changed |= ui.checkbox(&mut extra.no_stop_intp, "").changed();
+            ui.end_row();
+        });
     changed
+}
+
+/// A list row whose controls are added right to left: trailing buttons first, then a field
+/// that fills what is left. Keeps every row's buttons flush with the right edge.
+fn trailing_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_contents);
+    });
 }
 
 /// Single line editor for a hash that accepts labels or hex values like "0x0123456789".
