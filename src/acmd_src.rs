@@ -1406,7 +1406,26 @@ fn fighter_for_file(
     let mut directory = file.parent()?;
     loop {
         if let Some(names) = fighter_scopes.get(directory) {
-            return (names.len() == 1).then(|| names[0].clone());
+            if names.len() == 1 {
+                return Some(names[0].clone());
+            }
+            // Fighter kinds never contain `_`; `falco_arwing` is an article. A folder whose
+            // files declare a fighter's articles beside it (`specials.rs` registers the
+            // `falco_cannon` shots, `misc.rs` the `falco_arwing` entry) still holds that
+            // fighter's own scripts, and one declaring only articles doesn't own its other
+            // files at all: keep walking to the module that names the fighter. A folder
+            // named for the mod (`emperte/`) rather than the fighter is then still Falco's.
+            let fighters: Vec<&String> = names.iter().filter(|name| !name.contains('_')).collect();
+            match fighters.as_slice() {
+                [] => {}
+                [fighter] if names
+                    .iter()
+                    .all(|name| *name == **fighter || name.starts_with(&format!("{fighter}_"))) =>
+                {
+                    return Some((*fighter).clone());
+                }
+                _ => return None,
+            }
         }
         if directory == root {
             return None;
@@ -1916,7 +1935,9 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut push = |name: String| {
         let name = normalize_fighter(&name);
-        if !name.is_empty() && !names.contains(&name) {
+        // `Agent::new("common")` hooks every fighter at once (opff, status lines). It is no
+        // one's character, and counting it made a mod's own folder name two fighters.
+        if !name.is_empty() && name != "common" && !names.contains(&name) {
             names.push(name);
         }
     };
@@ -11593,6 +11614,74 @@ pub(super) fn install(agent: &mut Agent) {
         assert!(std::fs::read_to_string(script_file)
             .unwrap()
             .contains("6.0"));
+    }
+
+    /// Empoleon's layout: the module is named for the mod (`emperte/`), not the fighter it
+    /// plays on; the ACMD folder also declares Falco's articles; the mod's folder hooks the
+    /// `common` agent. None of that may take Falco's own scripts away from him.
+    #[test]
+    fn a_module_named_for_the_mod_still_belongs_to_its_base_fighter() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    let agent = &mut Agent::new("falco");
+    emperte::install(agent);
+    agent.install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            "mod acmd;\nmod vars;\npub fn install(agent: &mut Agent) { acmd::install(agent); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/vars.rs",
+            "pub fn install() { Agent::new(\"common\").on_line(Main, hook).install(); }\n",
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/mod.rs",
+            "mod aerials;\nmod specials;\npub fn install(agent: &mut Agent) { aerials::install(agent); specials::install(agent); }\n",
+        );
+        let aerials = write(
+            tmp.path(),
+            "src/emperte/acmd/aerials.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/acmd/specials.rs",
+            r#"unsafe extern "C" fn game_specialnstart(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 3.0);
+}
+unsafe extern "C" fn game_fly(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_specialnstart", game_specialnstart, Priority::Low);
+    Agent::new("falco_cannon").acmd("game_fly", game_fly, Priority::Low).install();
+    Agent::new("falco_arwing").install();
+}
+"#,
+        );
+
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert_eq!(index.script("falco", "game_attackairb").unwrap().file, aerials);
+        assert!(index.script("falco", "game_specialnstart").is_some());
+        assert!(index.script("falco_cannon", "game_fly").is_some());
+        assert!(index.script("falco_cannon", "game_attackairb").is_none());
+        assert!(!index.has_fighter("common"));
     }
 
     /// A project whose functions are named for the mod, not the script, has to read the same
