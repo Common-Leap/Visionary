@@ -3113,6 +3113,8 @@ pub struct VisionaryApp {
     /// Where the shown model's and motion's borrowed files come from, for the viewport toolbar.
     /// Empty when both folders hold all their own files.
     viewport_file_sources: Vec<ViewportFileSource>,
+    /// The last model check of a Project Files costume, shown in that window.
+    model_report: Option<CostumeModelReport>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
@@ -3531,6 +3533,7 @@ impl VisionaryApp {
             helper_bones: load_helper_bones(),
             viewport_toolbar_rect: None,
             viewport_file_sources: Vec::new(),
+            model_report: None,
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
@@ -18209,6 +18212,55 @@ impl VisionaryApp {
     /// Stage the selected workspace model/motion files on the emulator SD and publish one full
     /// carrier snapshot. The plugin reports callback reads separately; queuing this snapshot is
     /// not presented as proof that a parsed game resource has already changed.
+    /// The selected data's model folder for `fighter`'s costume `slot`: the base a preview's
+    /// workspace files go over.
+    fn costume_model_dir(&self, fighter: &str, slot: u8) -> Option<std::path::PathBuf> {
+        self.state
+            .fighters
+            .iter()
+            .find(|entry| entry.name == fighter)
+            .map(|entry| {
+                entry
+                    .fighter_dir
+                    .join("model")
+                    .join("body")
+                    .join(format!("c{slot:02}"))
+            })
+    }
+
+    /// Check the model a preview of this costume would load, keep the report for Project
+    /// Files, and return it. Issues the costume's base model already has are left out.
+    fn check_workspace_model(
+        &mut self,
+        workspace: &std::path::Path,
+        fighter: &str,
+        slot: u8,
+    ) -> Option<&crate::model_checks::ModelReport> {
+        let base = self.costume_model_dir(fighter, slot);
+        let sources =
+            crate::project_hub::carrier_model_sources(workspace, fighter, slot, base.as_deref())
+                .ok()?;
+        // Compare against the game's own model, never the data root's: when the data root is
+        // this project's romfs, that is the model being checked and would hide every issue.
+        // An added slot has no vanilla model, so it is compared with the fighter's c00.
+        let vanilla_body = load_config_path(VANILLA_ROOT_CONFIG_KEY)
+            .map(|root| root.join("fighter").join(fighter).join("model").join("body"));
+        let baseline = vanilla_body.and_then(|body| {
+            [slot, 0]
+                .into_iter()
+                .map(|s| body.join(format!("c{s:02}")))
+                .find(|dir| dir.is_dir())
+                .map(|dir| crate::costume_files::list_files(&dir))
+        });
+        let report = crate::model_checks::check_files_against(sources, baseline);
+        self.model_report = Some(CostumeModelReport {
+            fighter: fighter.to_string(),
+            slot,
+            report,
+        });
+        self.model_report.as_ref().map(|entry| &entry.report)
+    }
+
     fn send_workspace_asset_bundle(
         &mut self,
         workspace: &std::path::Path,
@@ -18219,6 +18271,17 @@ impl VisionaryApp {
         if self.game_link.status() != crate::game_link::LinkStatus::Connected {
             self.state.status = "Connect to the game before reloading the asset preview.".into();
             return;
+        }
+        // Refuse a model that would reach the game broken: invisible meshes, unknown shaders,
+        // files that can't be read. Warnings are listed in Project Files and don't stop it.
+        if let Some(report) = self.check_workspace_model(workspace, fighter, slot) {
+            if report.has_blocking() {
+                self.state.status = format!(
+                    "Reload stopped: {} in c{slot:02}. See Project Files for what to fix.",
+                    report.summary().unwrap_or_default()
+                );
+                return;
+            }
         }
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
             self.state.status = "Emulator SD card not found. Set it in Visionary before sending model or animation files."
@@ -18403,6 +18466,7 @@ impl VisionaryApp {
             ImportModelFiles,
             ImportAnimations,
             ImportSwing,
+            CheckModel,
             Send,
             Stop,
             Reveal,
@@ -18492,6 +18556,78 @@ impl VisionaryApp {
                             .small()
                             .color(egui::Color32::GRAY),
                         );
+                        if !inventory.model_files.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .small_button("Check model")
+                                    .on_hover_text("Check the model this costume's preview and export would use, for the mistakes that make it render wrong in game. Also runs on model import and before every reload.")
+                                    .clicked()
+                                {
+                                    action = Some(WorkspaceAction::CheckModel);
+                                }
+                                if let Some(entry) = self.model_report.as_ref().filter(|entry| {
+                                    entry.fighter == *fighter && entry.slot == self.workspace_asset_slot
+                                }) {
+                                    match entry.report.summary() {
+                                        Some(summary) => {
+                                            let color = if entry.report.has_blocking() {
+                                                egui::Color32::from_rgb(235, 110, 100)
+                                            } else {
+                                                egui::Color32::from_rgb(225, 185, 90)
+                                            };
+                                            ui.label(egui::RichText::new(summary).small().color(color));
+                                        }
+                                        None => {
+                                            ui.label(
+                                                egui::RichText::new("Model check: no problems")
+                                                    .small()
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            if let Some(entry) = self.model_report.as_ref().filter(|entry| {
+                                entry.fighter == *fighter
+                                    && entry.slot == self.workspace_asset_slot
+                                    && !entry.report.is_empty()
+                            }) {
+                                egui::CollapsingHeader::new("Model check")
+                                    .id_salt(("model_check", fighter, entry.slot))
+                                    .default_open(entry.report.has_blocking())
+                                    .show(ui, |ui| {
+                                        if entry.report.has_blocking() {
+                                            ui.label(
+                                                egui::RichText::new("Reload asset preview stays off until these are fixed:")
+                                                    .small()
+                                                    .strong(),
+                                            );
+                                        }
+                                        egui::ScrollArea::vertical()
+                                            .max_height(180.0)
+                                            .show(ui, |ui| {
+                                                for issue in &entry.report.issues {
+                                                    let (mark, color) = match issue.severity {
+                                                        crate::model_checks::Severity::Blocking => {
+                                                            ("✖", egui::Color32::from_rgb(235, 110, 100))
+                                                        }
+                                                        crate::model_checks::Severity::Warning => {
+                                                            ("⚠", egui::Color32::from_rgb(225, 185, 90))
+                                                        }
+                                                    };
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        ui.label(egui::RichText::new(mark).color(color));
+                                                        ui.label(
+                                                            egui::RichText::new(format!("{}: {}", issue.file, issue.message))
+                                                                .small(),
+                                                        );
+                                                    });
+                                                }
+                                            });
+                                        ui.weak("Issues the game's own model for this costume already has are not listed.");
+                                    });
+                            }
+                        }
                         let asset_status = self.game_link.asset_bundle_status();
                         if asset_status.target == fighter.to_ascii_lowercase()
                             && asset_status.generation == self.workspace_asset_generation
@@ -18739,6 +18875,17 @@ impl VisionaryApp {
                 crate::project_hub::import_swing_prc(&workspace, &fighter, slot, &source)
                     .map(|path| vec![path])
             }
+            WorkspaceAction::CheckModel => {
+                self.state.status = match self
+                    .check_workspace_model(&workspace, &fighter, slot)
+                    .map(crate::model_checks::ModelReport::summary)
+                {
+                    Some(Some(summary)) => format!("Model check for c{slot:02}: {summary}."),
+                    Some(None) => format!("Model check for c{slot:02}: no problems."),
+                    None => format!("Could not read the model files for c{slot:02}."),
+                };
+                return;
+            }
             WorkspaceAction::Send => {
                 self.send_workspace_asset_bundle(&workspace, &fighter, slot);
                 return;
@@ -18781,11 +18928,27 @@ impl VisionaryApp {
         };
         match result {
             Ok(files) => {
-                self.state.status = format!(
+                let mut status = format!(
                     "Imported {} file{} for {fighter} c{slot:02}; ready to send or export.",
                     files.len(),
                     if files.len() == 1 { "" } else { "s" }
                 );
+                if matches!(
+                    action,
+                    WorkspaceAction::ImportModelFolder | WorkspaceAction::ImportModelFiles
+                ) {
+                    if let Some(summary) = self
+                        .check_workspace_model(&workspace, &fighter, slot)
+                        .and_then(crate::model_checks::ModelReport::summary)
+                    {
+                        status = format!(
+                            "Imported {} file{} for {fighter} c{slot:02}. Model check: {summary}; see Project Files.",
+                            files.len(),
+                            if files.len() == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                self.state.status = status;
             }
             Err(error) => self.state.status = format!("Asset import failed: {error:#}"),
         }
@@ -18997,6 +19160,17 @@ impl VisionaryApp {
                                 "Workspace overlay — {copied} manual file{} (models/animations/…) from romfs/",
                                 if copied == 1 { "" } else { "s" }
                             ));
+                        }
+                        // Report, never refuse: an export is the user's to ship as it is.
+                        for (fighter, slot) in workspace_model_costumes(&overlay) {
+                            if let Some(summary) = self
+                                .check_workspace_model(&workspace, &fighter, slot)
+                                .and_then(crate::model_checks::ModelReport::summary)
+                            {
+                                report.push(format!(
+                                    "Model check {fighter} c{slot:02}: {summary} (see Project Files)"
+                                ));
+                            }
                         }
                         for conflict in skipped {
                             errors.push(format!(
@@ -36959,6 +37133,36 @@ fn load_hurtbox_visibility() -> bool {
     std::fs::read_to_string(dest)
         .ok()
         .is_some_and(|body| parse_viewport_flag(&body))
+}
+
+/// Every `(fighter, slot)` whose body model the workspace overlay (`romfs/`) holds files for.
+fn workspace_model_costumes(overlay: &Path) -> Vec<(String, u8)> {
+    let subdirs = |dir: &Path| -> Vec<(String, std::path::PathBuf)> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| Some((entry.file_name().to_str()?.to_string(), entry.path())))
+            .collect()
+    };
+    let mut costumes = Vec::new();
+    for (fighter, fighter_dir) in subdirs(&overlay.join("fighter")) {
+        for (slot_name, _) in subdirs(&fighter_dir.join("model").join("body")) {
+            if let Some(slot) = crate::data::parse_costume_dir(&slot_name) {
+                costumes.push((fighter.clone(), slot));
+            }
+        }
+    }
+    costumes.sort();
+    costumes
+}
+
+/// [`crate::model_checks`] of one Project Files costume.
+struct CostumeModelReport {
+    fighter: String,
+    slot: u8,
+    report: crate::model_checks::ModelReport,
 }
 
 /// One viewport folder whose files are not all its own, as the toolbar reports it.

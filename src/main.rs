@@ -23,6 +23,7 @@ mod hash_macros;
 mod mod_export;
 mod mod_import;
 mod mod_project;
+mod model_checks;
 mod motion_list;
 mod motion_list_editor;
 mod motion_scripts;

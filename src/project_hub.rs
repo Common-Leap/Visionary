@@ -834,6 +834,25 @@ fn rename_carrier_texture(path: &Path, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The model files a preview of this costume loads, by name: the costume's vanilla model with
+/// the workspace's own files over it. [`prepare_carrier_assets`] stages from this, and the model
+/// checks read the same set so they judge exactly what reaches the game.
+pub fn carrier_model_sources(
+    workspace: &Path,
+    fighter: &str,
+    slot: u8,
+    vanilla_model_dir: Option<&Path>,
+) -> anyhow::Result<BTreeMap<String, PathBuf>> {
+    let fighter = fighter_component(fighter)?;
+    let (model_dir, _) = workspace_fighter_slot_dirs(workspace, &fighter, slot)?;
+    let mut model_files = BTreeMap::new();
+    if let Some(vanilla) = vanilla_model_dir {
+        model_files.extend(optional_asset_files(vanilla, "model")?);
+    }
+    model_files.extend(optional_asset_files(&model_dir, "model")?);
+    Ok(model_files)
+}
+
 /// What `prepare_carrier_assets` staged, plus where the motion side came from. Anything
 /// listed in `vanilla_motion_used` was filled in from the vanilla dump because the workspace
 /// motion folder did not provide it; `omitted_swing` means neither side had a `swing.prc`
@@ -889,11 +908,7 @@ pub fn prepare_carrier_assets(
 ) -> anyhow::Result<CarrierBundle> {
     let fighter = fighter_component(fighter)?;
     let (model_dir, motion_dir) = workspace_fighter_slot_dirs(workspace, &fighter, slot)?;
-    let mut model_files = BTreeMap::new();
-    if let Some(vanilla) = vanilla_model_dir {
-        model_files.extend(optional_asset_files(vanilla, "model")?);
-    }
-    model_files.extend(optional_asset_files(&model_dir, "model")?);
+    let model_files = carrier_model_sources(workspace, &fighter, slot, vanilla_model_dir)?;
     let workspace_motion = optional_asset_files(&motion_dir, "motion")?;
     let mut motion_files = BTreeMap::new();
     if let Some(vanilla) = vanilla_motion_dir {

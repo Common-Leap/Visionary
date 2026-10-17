@@ -942,6 +942,23 @@ after loading and remains usable during the preview. Do not
 spawn a normal Alucard assist while previewing, since it shares the carrier's
 resource graph.
 
+Visionary checks the model before every reload, after a model import, on export,
+and when you click **Check model** in Project Files. The checks are ported from
+SSBH Editor. Some problems stop **Reload asset preview** because they break the
+model in game:
+- a file that can't be read
+- a `model.numdlb` entry naming a mesh or material that doesn't exist, which
+  leaves that mesh invisible
+- a shader label the game doesn't have
+- a cube map in a 2D texture slot, or the reverse
+
+Everything else is a warning: missing vertex attributes (a yellow
+checkerboard), RENORMAL meshes without `model.adjb` entries, sRGB mismatches,
+clamped tiling, skin weights that don't sum to 1, duplicate names, missing
+textures. Issues the game's own model for that costume already has are left
+out, because SSBH Editor's rules also flag some vanilla models. Exports list
+the findings but are never blocked.
+
 The status distinguishes queued files, owner retirement, loading, and a ready
 preview. A successful file copy alone does not mean the game has reloaded its
 resources. This preview requires the matching Visionary plugin and the configured
