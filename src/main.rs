@@ -41,6 +41,7 @@ mod preferences;
 mod project_consts;
 mod project_helpers;
 mod project_hub;
+mod project_scope;
 mod renderer;
 mod roster;
 mod scratch_dirs;
