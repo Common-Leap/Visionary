@@ -3115,6 +3115,14 @@ pub struct VisionaryApp {
     viewport_file_sources: Vec<ViewportFileSource>,
     /// The last model check of a Project Files costume, shown in that window.
     model_report: Option<CostumeModelReport>,
+    /// Persistent viewport preference: show a fighter held by the `throw` bone on throws.
+    thrown_victim: ThrownVictimPref,
+    /// The victim costume's resolved model and thrown motions, read once per costume.
+    victim_cache: Option<VictimCache>,
+    /// Session choice of the victim's thrown motion; `None` picks one for the throw.
+    victim_motion_override: Option<String>,
+    /// [`Self::victim_fighters`], keyed by the indexed fighter count it was built from.
+    victim_fighters: Option<(usize, Vec<VictimFighter>)>,
     show_debug: bool,
     show_capture_debug: bool,
     capture_debug_kind: Option<i32>,
@@ -3534,6 +3542,10 @@ impl VisionaryApp {
             viewport_toolbar_rect: None,
             viewport_file_sources: Vec::new(),
             model_report: None,
+            thrown_victim: load_thrown_victim(),
+            victim_cache: None,
+            victim_motion_override: None,
+            victim_fighters: None,
             show_debug: false,
             show_capture_debug: false,
             capture_debug_kind: None,
@@ -13661,6 +13673,234 @@ impl VisionaryApp {
     /// Edits go straight into `state.script`. Hurtbox statements are carried through the script
     /// rather than rebuilt from a list the way collisions are, so the script is the model here
     /// and there is no second copy to keep in step.
+    /// Whether the selected move throws: a `throw_*` motion (or a special that throws) on a
+    /// fighter whose skeleton has the `throw` bone a thrown fighter is carried by.
+    fn selected_move_is_throw(&self) -> bool {
+        let Some(name) = self.state.selected_move.as_ref().map(|m| m.name.as_str()) else {
+            return false;
+        };
+        name.contains("throw")
+            && !name.contains("thrown")
+            // Throwing an item is not throwing a fighter.
+            && !name.starts_with("item_")
+            && self.bone_names.iter().any(|bone| bone == "throw")
+    }
+
+    /// Fighters that can be shown being thrown: the indexed ones, plus every fighter in the
+    /// vanilla dump, since a mod's data root often holds only the fighter it changes.
+    fn victim_fighters(&mut self) -> &[VictimFighter] {
+        let key = self.state.fighters.len();
+        if self.victim_fighters.as_ref().map(|(k, _)| *k) != Some(key) {
+            let mut fighters: Vec<VictimFighter> = self
+                .state
+                .fighters
+                .iter()
+                .map(|entry| VictimFighter {
+                    name: entry.name.clone(),
+                    display: entry.display_name.clone(),
+                    fighter_dir: entry.fighter_dir.clone(),
+                    slots: entry.slots.clone(),
+                })
+                .collect();
+            if let Some(vanilla) = load_config_path(VANILLA_ROOT_CONFIG_KEY) {
+                for dir in crate::costume_files::sibling_dirs(&vanilla.join("fighter")) {
+                    let Some(name) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if fighters.iter().any(|f| f.name == name) {
+                        continue;
+                    }
+                    let slots: Vec<u8> = crate::data::part_costume_slots(&dir.join("model").join("body"))
+                        .into_iter()
+                        .filter(|slot| dir.join("model").join("body").join(format!("c{slot:02}")).is_dir())
+                        .collect();
+                    if slots.is_empty() {
+                        continue;
+                    }
+                    fighters.push(VictimFighter {
+                        display: crate::data::fighter_display_name(&name),
+                        name,
+                        fighter_dir: dir,
+                        slots,
+                    });
+                }
+            }
+            fighters.sort_by(|a, b| a.display.cmp(&b.display));
+            self.victim_fighters = Some((key, fighters));
+        }
+        self.victim_fighters.as_ref().map_or(&[], |(_, list)| list.as_slice())
+    }
+
+    fn victim_fighter(&mut self) -> Option<VictimFighter> {
+        let wanted = self.thrown_victim.fighter.clone();
+        self.victim_fighters()
+            .iter()
+            .find(|fighter| fighter.name == wanted)
+            .cloned()
+    }
+
+    /// The victim costume's model and thrown motions, read again only when the costume changes.
+    fn victim_cache(&mut self) -> Option<&VictimCache> {
+        let key = (self.thrown_victim.fighter.clone(), self.thrown_victim.slot);
+        if self.victim_cache.as_ref().map(|cache| &cache.key) != Some(&key) {
+            let fighter_dir = self.victim_fighter()?.fighter_dir;
+            let slot = key.1;
+            let costume = format!("c{slot:02}");
+            let model = crate::costume_files::CostumeFolder::resolve(
+                &fighter_dir.join("model").join("body").join(&costume),
+            );
+            let motion_dir = fighter_dir.join("motion").join("body").join(&costume);
+            let animation_files = index_fighter_nuanmb(&fighter_dir, slot);
+            let mut motions: Vec<(String, PathBuf)> = crate::motion_list::load_current_in(&motion_dir)
+                .map(|mlist| {
+                    mlist
+                        .list
+                        .iter()
+                        .filter_map(|(hash, motion)| {
+                            let name = self.state.labels.get(&hash.0)?;
+                            if !name.contains("thrown") {
+                                return None;
+                            }
+                            let animation = motion.animations.first()?;
+                            let path = animation_files.get(&animation.name.0)?;
+                            Some((name.clone(), path.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            motions.sort();
+            self.victim_cache = Some(VictimCache {
+                key,
+                model_files: model.model_files(),
+                motions,
+            });
+        }
+        self.victim_cache.as_ref()
+    }
+
+    /// The victim to draw this frame, or `None` when the move doesn't throw or it's off.
+    fn current_victim_spec(&mut self) -> Option<crate::renderer::VictimSpec> {
+        if !self.thrown_victim.enabled || !self.selected_move_is_throw() {
+            return None;
+        }
+        let attacker = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| entry.name.clone())?;
+        let move_name = self.state.selected_move.as_ref()?.name.clone();
+        let wanted = self.victim_motion_override.clone();
+        let cache = self.victim_cache()?;
+        if cache.model_files.is_empty() {
+            return None;
+        }
+        let anim_path = match wanted {
+            Some(name) => cache
+                .motions
+                .iter()
+                .find(|(motion, _)| *motion == name)
+                .map(|(_, path)| path.clone()),
+            None => auto_thrown_motion(&attacker, &move_name, &cache.motions)
+                .map(|index| cache.motions[index].1.clone()),
+        };
+        Some(crate::renderer::VictimSpec {
+            model_files: cache.model_files.clone(),
+            anim_path,
+        })
+    }
+
+    fn draw_thrown_victim_controls(&mut self, ui: &mut Ui) {
+        let mut changed = ui
+            .checkbox(&mut self.thrown_victim.enabled, "Thrown fighter")
+            .on_hover_text(
+                "Show a second fighter carried by this one's throw bone, playing its own thrown \
+                 animation, the way the game positions a thrown opponent.",
+            )
+            .changed();
+        if self.thrown_victim.enabled {
+            let fighters: Vec<(String, String)> = self
+                .victim_fighters()
+                .iter()
+                .map(|fighter| (fighter.name.clone(), fighter.display.clone()))
+                .collect();
+            let selected = fighters
+                .iter()
+                .find(|(name, _)| *name == self.thrown_victim.fighter)
+                .map(|(_, display)| display.clone())
+                .unwrap_or_else(|| self.thrown_victim.fighter.clone());
+            egui::ComboBox::from_id_salt("thrown_victim_fighter")
+                .selected_text(selected)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (name, display) in &fighters {
+                        changed |= ui
+                            .selectable_value(&mut self.thrown_victim.fighter, name.clone(), display)
+                            .changed();
+                    }
+                });
+            let slots = self
+                .victim_fighter()
+                .map(|fighter| fighter.slots)
+                .unwrap_or_default();
+            if !slots.is_empty() && !slots.contains(&self.thrown_victim.slot) {
+                self.thrown_victim.slot = slots[0];
+                changed = true;
+            }
+            egui::ComboBox::from_id_salt("thrown_victim_slot")
+                .selected_text(format!("c{:02}", self.thrown_victim.slot))
+                .width(52.0)
+                .show_ui(ui, |ui| {
+                    for slot in &slots {
+                        changed |= ui
+                            .selectable_value(&mut self.thrown_victim.slot, *slot, format!("c{slot:02}"))
+                            .changed();
+                    }
+                });
+
+            let attacker = self
+                .state
+                .selected_fighter
+                .and_then(|index| self.state.fighters.get(index))
+                .map(|entry| entry.name.clone())
+                .unwrap_or_default();
+            let move_name = self
+                .state
+                .selected_move
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+            let motions = self
+                .victim_cache()
+                .map(|cache| cache.motions.clone())
+                .unwrap_or_default();
+            let auto = auto_thrown_motion(&attacker, &move_name, &motions)
+                .map(|index| motions[index].0.clone());
+            let auto_label = format!("Auto ({})", auto.as_deref().unwrap_or("none found"));
+            let selected = self.victim_motion_override.clone().unwrap_or(auto_label.clone());
+            egui::ComboBox::from_id_salt("thrown_victim_motion")
+                .selected_text(selected)
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.victim_motion_override, None, auto_label);
+                    for (name, _) in &motions {
+                        ui.selectable_value(&mut self.victim_motion_override, Some(name.clone()), name);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "The victim's own thrown animation. Auto matches the throw's direction \
+                     (throw_f → thrown_f) or this fighter's own thrown set when the victim has \
+                     one. The game also picks a _dx, _big or _girl variant depending on the \
+                     thrower, which Visionary doesn't detect yet; choose it here.",
+                );
+        }
+        if changed {
+            save_thrown_victim(&self.thrown_victim);
+            ui.ctx().request_repaint();
+        }
+    }
+
     /// Viewport display options, drawn over the model's top-left corner.
     fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
         let has_helper_bones = frame.wgpu_render_state().is_some_and(|wgpu_state| {
@@ -13673,49 +13913,59 @@ impl VisionaryApp {
         });
         let area = egui::Rect::from_min_size(
             viewport.left_top() + egui::vec2(8.0, 8.0),
-            egui::vec2((viewport.width() - 16.0).max(0.0), 28.0),
+            egui::vec2(
+                (viewport.width() - 16.0).max(0.0),
+                (viewport.height() - 16.0).max(0.0),
+            ),
         );
         let mut toolbar = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(area)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                .layout(egui::Layout::left_to_right(egui::Align::TOP)),
         );
         let inner = egui::Frame::popup(toolbar.style())
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
-                let response = ui.add_enabled(
-                    has_helper_bones,
-                    egui::Checkbox::new(&mut self.helper_bones, "Helper bones"),
-                );
-                if response.changed() {
-                    save_helper_bones(self.helper_bones);
-                    ui.ctx().request_repaint();
-                }
-                response.on_hover_text(if has_helper_bones {
-                    "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
-                     They move H_ bones such as elbow and knee helpers, which changes the mesh \
-                     and any hitbox, hurtbox or effect placed on those bones."
-                } else {
-                    "This model has no model.nuhlpb. The saved preference is kept for models \
-                     that do."
+                ui.horizontal_wrapped(|ui| {
+                    let response = ui.add_enabled(
+                        has_helper_bones,
+                        egui::Checkbox::new(&mut self.helper_bones, "Helper bones"),
+                    );
+                    if response.changed() {
+                        save_helper_bones(self.helper_bones);
+                        ui.ctx().request_repaint();
+                    }
+                    response.on_hover_text(if has_helper_bones {
+                        "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
+                         They move H_ bones such as elbow and knee helpers, which changes the mesh \
+                         and any hitbox, hurtbox or effect placed on those bones."
+                    } else {
+                        "This model has no model.nuhlpb. The saved preference is kept for models \
+                         that do."
+                    });
+                    if self.selected_move_is_throw() {
+                        ui.separator();
+                        self.draw_thrown_victim_controls(ui);
+                    }
+                    for source in &self.viewport_file_sources {
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("{}: {}", source.label, source.summary))
+                                .small()
+                                .weak(),
+                        )
+                        .on_hover_text(format!(
+                            "Files this costume's {} folder doesn't hold itself, loaded from where \
+                             ARCropolis would load them:\n\n{}",
+                            source.label.to_lowercase(),
+                            source.detail
+                        ));
+                    }
                 });
-                for source in &self.viewport_file_sources {
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("{}: {}", source.label, source.summary))
-                            .small()
-                            .weak(),
-                    )
-                    .on_hover_text(format!(
-                        "Files this costume's {} folder doesn't hold itself, loaded from where \
-                         ARCropolis would load them:\n\n{}",
-                        source.label.to_lowercase(),
-                        source.detail
-                    ));
-                }
             });
         self.viewport_toolbar_rect = Some(inner.response.rect);
     }
+
     fn draw_hurtbox_toggle(&mut self, ui: &mut Ui) {
         let available = self
             .hurtbox_volumes
@@ -34155,11 +34405,13 @@ impl eframe::App for VisionaryApp {
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
                 // Camera controls — apply to render state
+                let victim = self.current_victim_spec();
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
                         // Before the overlay reads bone matrices below, so both see one setting.
                         rs.set_helper_bones(self.helper_bones);
+                        rs.set_victim(&wgpu_state.device, &wgpu_state.queue, victim);
                         // Left drag: pan in camera plane (left/right + up/down)
                         if response.dragged_by(egui::PointerButton::Primary) {
                             let delta = response.drag_delta();
@@ -37133,6 +37385,107 @@ fn load_hurtbox_visibility() -> bool {
     std::fs::read_to_string(dest)
         .ok()
         .is_some_and(|body| parse_viewport_flag(&body))
+}
+
+/// Which fighter the viewport shows being thrown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThrownVictimPref {
+    enabled: bool,
+    fighter: String,
+    slot: u8,
+}
+
+impl Default for ThrownVictimPref {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fighter: "mario".to_string(),
+            slot: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VictimFighter {
+    name: String,
+    display: String,
+    fighter_dir: PathBuf,
+    slots: Vec<u8>,
+}
+
+struct VictimCache {
+    key: (String, u8),
+    model_files: Vec<(String, PathBuf)>,
+    /// `(motion name, animation)` of every thrown motion in the victim's motion list, by name.
+    motions: Vec<(String, PathBuf)>,
+}
+
+fn encode_thrown_victim(pref: &ThrownVictimPref) -> String {
+    format!("v1,{},{},{}", u8::from(pref.enabled), pref.fighter, pref.slot)
+}
+
+fn parse_thrown_victim(body: &str) -> Option<ThrownVictimPref> {
+    let mut fields = body.trim().split(',');
+    if fields.next() != Some("v1") {
+        return None;
+    }
+    let enabled = match fields.next()? {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let fighter = fields.next().filter(|name| !name.is_empty())?.to_string();
+    let slot = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some(ThrownVictimPref {
+        enabled,
+        fighter,
+        slot,
+    })
+}
+
+fn save_thrown_victim(pref: &ThrownVictimPref) {
+    let Some(dest) = config_path("editor_thrown_victim") else {
+        return;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(dest, encode_thrown_victim(pref));
+}
+
+fn load_thrown_victim() -> ThrownVictimPref {
+    config_path("editor_thrown_victim")
+        .and_then(|dest| std::fs::read_to_string(dest).ok())
+        .and_then(|body| parse_thrown_victim(&body))
+        .unwrap_or_default()
+}
+
+/// The victim motion a throw plays, from `motions` (sorted names): the attacker's own thrown
+/// set when the victim has one (`shizue_special_s_thrown_f` for Isabelle's side special),
+/// otherwise the generic one for the throw's direction (`throw_f` → `thrown_f`). Only the
+/// plain variant: the `_dx`, `_big` and `_girl` sets depend on the thrower in ways not read
+/// here.
+fn auto_thrown_motion(attacker: &str, move_name: &str, motions: &[(String, PathBuf)]) -> Option<usize> {
+    let is_variant = |name: &str| {
+        ["_dx", "_big", "_girl"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    };
+    let position = |wanted: &str| motions.iter().position(|(name, _)| name == wanted);
+    if let Some(direction) = move_name.strip_prefix("throw_") {
+        return position(&format!("thrown_{direction}"));
+    }
+    // A special that throws: the victim's `<attacker>_<move>_thrown*`, else any of the
+    // attacker's own thrown motions.
+    let own = format!("{attacker}_{move_name}");
+    motions
+        .iter()
+        .position(|(name, _)| name.starts_with(&own) && !is_variant(name))
+        .or_else(|| {
+            motions.iter().position(|(name, _)| {
+                name.starts_with(&format!("{attacker}_")) && !is_variant(name)
+            })
+        })
 }
 
 /// Every `(fighter, slot)` whose body model the workspace overlay (`romfs/`) holds files for.
@@ -45740,5 +46093,59 @@ mod saved_effect_tests {
         resolve_raw_effect_names(&mut calls, &names);
         assert_eq!(calls[0].effect_name, "sys_smash_flash");
         assert_eq!(calls[1].effect_name, "0xdeadbeef", "an unknown hash stays a hash");
+    }
+}
+
+#[cfg(test)]
+mod thrown_victim_tests {
+    use super::{auto_thrown_motion, encode_thrown_victim, parse_thrown_victim, ThrownVictimPref};
+    use std::path::PathBuf;
+
+    fn motions(names: &[&str]) -> Vec<(String, PathBuf)> {
+        let mut list: Vec<_> = names
+            .iter()
+            .map(|name| (name.to_string(), PathBuf::from(format!("{name}.nuanmb"))))
+            .collect();
+        list.sort();
+        list
+    }
+
+    fn pick<'a>(list: &'a [(String, PathBuf)], attacker: &str, move_name: &str) -> Option<&'a str> {
+        auto_thrown_motion(attacker, move_name, list).map(|i| list[i].0.as_str())
+    }
+
+    #[test]
+    fn a_throw_picks_the_victims_motion_for_its_direction() {
+        let list = motions(&["thrown_b", "thrown_f", "thrown_f_dx", "thrown_hi", "thrown_lw"]);
+        assert_eq!(pick(&list, "mario", "throw_f"), Some("thrown_f"));
+        assert_eq!(pick(&list, "mario", "throw_lw"), Some("thrown_lw"));
+        assert_eq!(pick(&motions(&["thrown_f_dx"]), "mario", "throw_f"), None);
+    }
+
+    #[test]
+    fn a_throwing_special_picks_the_attackers_own_set_without_variants() {
+        let list = motions(&[
+            "shizue_special_s_thrown_f",
+            "shizue_special_s_thrown_f_big",
+            "gaogaen_thrown_01_dx",
+            "gaogaen_thrown_01",
+            "thrown_f",
+        ]);
+        assert_eq!(pick(&list, "shizue", "special_s_throw"), Some("shizue_special_s_thrown_f"));
+        assert_eq!(pick(&list, "gaogaen", "special_lw_throw"), Some("gaogaen_thrown_01"));
+        assert_eq!(pick(&list, "mario", "special_s_throw"), None);
+    }
+
+    #[test]
+    fn the_victim_preference_is_versioned() {
+        let pref = ThrownVictimPref {
+            enabled: true,
+            fighter: "pikachu".to_string(),
+            slot: 3,
+        };
+        assert_eq!(parse_thrown_victim(&encode_thrown_victim(&pref)), Some(pref));
+        assert_eq!(parse_thrown_victim("v2,1,mario,0"), None);
+        assert_eq!(parse_thrown_victim("v1,1,,0"), None);
+        assert_eq!(parse_thrown_victim("v1,1,mario,0,extra"), None);
     }
 }

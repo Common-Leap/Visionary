@@ -104,6 +104,8 @@ pub struct HitboxRenderState {
     /// Viewport preference: evaluate helper bone constraints. Set through
     /// [`Self::set_helper_bones`] so a change re-skins the model.
     helper_bones: bool,
+    /// A second fighter held by this one's `throw` bone, drawn as `render_models[1]`.
+    victim: Option<ThrownVictim>,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
     weapon_skels: Vec<(String, ssbh_data::skel_data::SkelData, String)>,
@@ -156,6 +158,7 @@ impl HitboxRenderState {
             model_hlpb: None,
             model_matl: None,
             helper_bones: true,
+            victim: None,
             weapon_skels: Vec::new(),
             last_frame: -1.0,
             last_anim_path: None,
@@ -194,6 +197,16 @@ impl HitboxRenderState {
         self.model_hlpb = folder.find_hlpb().cloned();
         self.model_matl = folder.find_matl().cloned();
         self.render_models.push(render_model);
+        // `clear()` above dropped the victim's render model with the body's.
+        if let Some(victim) = &self.victim {
+            let folder = ModelFolder::load_files(victim.files.clone());
+            self.render_models.push(RenderModel::from_folder(
+                device,
+                queue,
+                &folder,
+                &self.shared_data,
+            ));
+        }
 
         // Scan sibling directories for weapon skeletons.
         // model_dir is e.g. fighter/link/model/body/c00
@@ -303,7 +316,7 @@ impl HitboxRenderState {
         let hlpb = self.model_hlpb.as_ref().filter(|_| self.helper_bones);
         let matl = self.model_matl.as_ref();
 
-        for render_model in &mut self.render_models {
+        if let Some(render_model) = self.render_models.first_mut() {
             // RenderModel applies animations in iterator order. Put the default eyelid layer
             // first so a selected move's visibility tracks take precedence over the baseline.
             let animations = animation_layers(
@@ -322,12 +335,92 @@ impl HitboxRenderState {
                 frame,
             );
         }
+        self.pose_victim(queue, frame);
     }
 
-    /// Every mesh name of every loaded model.
+    /// Show `victim` held by this fighter's `throw` bone, or stop showing one.
+    pub fn set_victim(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        victim: Option<VictimSpec>,
+    ) {
+        let Some(spec) = victim else {
+            if self.victim.take().is_some() {
+                self.render_models.truncate(1);
+                self.last_frame = -1.0;
+            }
+            return;
+        };
+        let same_model = self
+            .victim
+            .as_ref()
+            .is_some_and(|current| current.files == spec.model_files);
+        if !same_model {
+            let folder = ModelFolder::load_files(spec.model_files.clone());
+            let render_model =
+                RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+            self.render_models.truncate(1);
+            self.render_models.push(render_model);
+            self.victim = Some(ThrownVictim {
+                files: spec.model_files,
+                skel: folder.find_skel().cloned(),
+                hlpb: folder.find_hlpb().cloned(),
+                matl: folder.find_matl().cloned(),
+                anim: None,
+            });
+            self.last_frame = -1.0;
+        }
+        let victim = self.victim.as_mut().expect("set above");
+        if victim.anim.as_ref().map(|(path, _)| path) != spec.anim_path.as_ref() {
+            victim.anim = spec.anim_path.and_then(|path| {
+                let anim = ssbh_data::anim_data::AnimData::from_file(&path).ok()?;
+                Some((path, anim))
+            });
+            self.last_frame = -1.0;
+        }
+    }
+
+    /// Pose the victim for `frame`: its own thrown animation, with its `rot` bone placed on
+    /// this fighter's `throw` bone, which is how the game carries a thrown fighter.
+    fn pose_victim(&mut self, queue: &wgpu::Queue, frame: f32) {
+        let target = self
+            .victim
+            .as_ref()
+            .and_then(|_| self.bone_world_matrices_at(frame).get("throw").copied());
+        let (Some(victim), Some(render_model)) = (&self.victim, self.render_models.get_mut(1))
+        else {
+            return;
+        };
+        let Some(skel) = victim.skel.as_ref() else {
+            return;
+        };
+        let rot = skel
+            .bones
+            .iter()
+            .position(|bone| bone.name.eq_ignore_ascii_case("rot"));
+        let hlpb = victim.hlpb.as_ref().filter(|_| self.helper_bones);
+        render_model.apply_anims_with_skel_edit(
+            queue,
+            victim.anim.iter().map(|(_, anim)| anim),
+            Some(skel),
+            victim.matl.as_ref(),
+            hlpb,
+            &self.shared_data,
+            frame,
+            |bones| {
+                if let (Some(rot), Some(target)) = (rot, target) {
+                    constrain_bone_to_world(bones, skel, rot, target);
+                }
+            },
+        );
+    }
+
+    /// Every mesh name of the fighter's own model. The victim's visibility tracks are its own.
     fn mesh_names(&self) -> Vec<String> {
         self.render_models
             .iter()
+            .take(1)
             .flat_map(|model| model.meshes.iter().map(|mesh| mesh.name.clone()))
             .collect()
     }
@@ -425,6 +518,43 @@ impl HitboxRenderState {
         };
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame)
+    }
+}
+
+/// What [`HitboxRenderState::set_victim`] shows.
+pub struct VictimSpec {
+    /// The victim costume's model, as [`crate::costume_files::CostumeFolder::model_files`].
+    pub model_files: Vec<(String, std::path::PathBuf)>,
+    /// The victim's thrown animation; `None` holds it in its rest pose.
+    pub anim_path: Option<std::path::PathBuf>,
+}
+
+struct ThrownVictim {
+    files: Vec<(String, std::path::PathBuf)>,
+    skel: Option<ssbh_data::skel_data::SkelData>,
+    hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
+    matl: Option<ssbh_data::matl_data::MatlData>,
+    anim: Option<(std::path::PathBuf, ssbh_data::anim_data::AnimData)>,
+}
+
+/// Set bone `index`'s local transform so its world transform is `target`, given the rest of
+/// the sampled pose. Ported from SSBH Editor's thrown-character link.
+fn constrain_bone_to_world(
+    bones: &mut [(usize, ssbh_wgpu::animation::AnimatedBone)],
+    skel: &ssbh_data::skel_data::SkelData,
+    index: usize,
+    target: glam::Mat4,
+) {
+    use ssbh_wgpu::animation::{animate_skel_inner, AnimationTransforms};
+    let mut sampled = Box::new(AnimationTransforms::from_skel(skel));
+    animate_skel_inner(&mut sampled, bones, &skel.bones, None);
+    let parent = skel.bones[index]
+        .parent_index
+        .map(|parent| sampled.world_transforms[parent])
+        .unwrap_or(glam::Mat4::IDENTITY);
+    let (scale, rotation, translation) = (parent.inverse() * target).to_scale_rotation_translation();
+    if let Some((_, bone)) = bones.iter_mut().find(|(i, _)| *i == index) {
+        bone.set_current_trs(translation, rotation, scale);
     }
 }
 
@@ -706,6 +836,51 @@ mod tests {
                 ),
             }],
         }
+    }
+
+    /// The thrown fighter's `rot` bone lands exactly on the target, whatever its animation
+    /// does to its parents.
+    #[test]
+    fn a_constrained_bone_reaches_its_world_target() {
+        use glam::{Mat4, Quat, Vec3};
+        let skel = ssbh_data::skel_data::SkelData {
+            major_version: 1,
+            minor_version: 0,
+            bones: vec![
+                bone("Trans", None, Vec3::ZERO),
+                bone("Rot", Some(0), Vec3::new(0.0, 1.0, 0.0)),
+                bone("Hip", Some(1), Vec3::new(0.0, 5.0, 0.0)),
+            ],
+        };
+        let anim = ssbh_data::anim_data::AnimData {
+            major_version: 2,
+            minor_version: 0,
+            final_frame_index: 0.0,
+            groups: vec![ssbh_data::anim_data::GroupData {
+                group_type: ssbh_data::anim_data::GroupType::Transform,
+                nodes: vec![transform_track(
+                    "Trans",
+                    vec![(Vec3::new(3.0, 0.0, 2.0), Quat::from_rotation_y(0.7))],
+                )],
+            }],
+        };
+        let target = Mat4::from_rotation_translation(
+            Quat::from_rotation_z(1.1),
+            Vec3::new(10.0, 12.0, -4.0),
+        );
+        let mut transforms = Box::new(ssbh_wgpu::animation::AnimationTransforms::identity());
+        ssbh_wgpu::animation::animate_skel_with_edit(
+            &mut transforms,
+            &skel,
+            std::iter::once(&anim),
+            None,
+            0.0,
+            |bones| super::constrain_bone_to_world(bones, &skel, 1, target),
+        );
+        assert!(transforms.world_transforms[1].abs_diff_eq(target, 1e-4));
+        // Its children follow it.
+        let hip = transforms.world_transforms[2].col(3).truncate();
+        assert!(hip.abs_diff_eq(target.transform_point3(Vec3::new(0.0, 5.0, 0.0)), 1e-4));
     }
 
     /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists

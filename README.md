@@ -215,6 +215,14 @@ The toolbar in the viewport's top-left corner holds the display options:
   bones (`H_` elbow, knee and similar helpers) then move the mesh and any
   hitbox, hurtbox or effect placed on them. It is on by default. A move's
   material animations (glows, colour changes, eye swaps) always play.
+- **Thrown fighter** appears on throws. It shows a second fighter (Mario by
+  default; any indexed fighter or any fighter in the vanilla dump) whose `rot`
+  bone sits on the thrower's `throw` bone, playing its own thrown animation.
+  **Auto** matches the throw's direction (`throw_f` → `thrown_f`), or the
+  thrower's own set when the victim has one (`shizue_special_s_thrown_f`). The
+  game also picks a `_dx`, `_big` or `_girl` variant depending on the thrower.
+  Visionary doesn't detect that yet, so choose it from the list. The victim
+  copies the throw bone's full transform, scale included.
 - **Model** and **Motion** notes appear when the shown costume borrows files.
   Visionary loads each costume the way ARCropolis does: the folder's own file
   first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
