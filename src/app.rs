@@ -2480,6 +2480,27 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
     changed
 }
 
+/// Costume slots as runs: `c40–c47`, or `c08, c10–c12` when they have gaps.
+fn format_slot_list(slots: &[u8]) -> String {
+    let mut runs: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < slots.len() {
+        let start = slots[index];
+        let mut end = start;
+        while index + 1 < slots.len() && slots[index + 1] == end + 1 {
+            index += 1;
+            end = slots[index];
+        }
+        runs.push(if start == end {
+            format!("c{start:02}")
+        } else {
+            format!("c{start:02}–c{end:02}")
+        });
+        index += 1;
+    }
+    runs.join(", ")
+}
+
 fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
     if let Some(control) = &call.control {
         return match control {
@@ -3919,16 +3940,26 @@ impl VisionaryApp {
                     .find(|d| d.is_dir());
 
                 // A mod that plays its own character on this fighter's extra slots gets its
-                // own row, named for the character and the slots it borrows; the fighter's row
-                // keeps the rest. Only a vanilla fighter from the data root is split this way.
+                // own row, named for the character; the fighter's row keeps the rest. Only a
+                // vanilla fighter from the data root is split this way. The data root itself
+                // is searched too: a moveset project's romfs is often opened as the data root,
+                // and then it is the only root that names the character.
                 let characters = match source {
                     crate::data::FighterSource::DataRoot => {
-                        crate::data::slot_characters(&roots[1..], &name)
+                        let mut distinct: Vec<PathBuf> = Vec::new();
+                        for root in &roots {
+                            if !distinct.contains(root) {
+                                distinct.push(root.clone());
+                            }
+                        }
+                        crate::data::slot_characters(&distinct, &name)
                     }
                     crate::data::FighterSource::ModRoot => Vec::new(),
                 };
                 let mut slots = slots;
                 slots.retain(|slot| !characters.iter().any(|c| c.slots.contains(slot)));
+                // Every slot belongs to a character: there is no fighter left to list.
+                let keep_fighter = !slots.is_empty() || characters.is_empty();
                 let custom_entries: Vec<crate::data::FighterEntry> = characters
                     .into_iter()
                     .map(|character| {
@@ -3939,10 +3970,7 @@ impl VisionaryApp {
                         };
                         crate::data::FighterEntry {
                             name: name.clone(),
-                            display_name: format!(
-                                "{} ({display_name} [{costume}])",
-                                character.name
-                            ),
+                            display_name: character.name.clone(),
                             param_path: param_path.clone(),
                             motion_dir: or_base(own.join("motion").join("body").join(&costume), &motion_dir),
                             model_dir: or_base(own.join("model").join("body").join(&costume), &model_dir),
@@ -3969,10 +3997,12 @@ impl VisionaryApp {
                     source,
                     custom_name: None,
                 };
-                if entry.is_modded() {
-                    modded_added += 1;
+                if keep_fighter {
+                    if entry.is_modded() {
+                        modded_added += 1;
+                    }
+                    self.state.fighters.push(entry);
                 }
-                self.state.fighters.push(entry);
                 modded_added += custom_entries.len();
                 self.state.fighters.extend(custom_entries);
             }
@@ -9082,6 +9112,10 @@ impl VisionaryApp {
                         fighter_query.is_empty()
                             || f.display_name.to_lowercase().contains(&fighter_query)
                             || f.name.to_lowercase().contains(&fighter_query)
+                            || (f.custom_name.is_some()
+                                && fighter_display_name(&f.name)
+                                    .to_lowercase()
+                                    .contains(&fighter_query))
                     })
                     .map(|(i, f)| {
                         (
@@ -9109,10 +9143,13 @@ impl VisionaryApp {
                     }
                     let mut hover = format!("{slot_count} costume slot(s), base c{base:02}");
                     if custom {
-                        hover.push_str(&format!(
-                            "\nA mod character played on {fighter_name}'s slots: it shares \
-                             {fighter_name}'s scripts, with its own models and motions"
-                        ));
+                        let base_name = fighter_display_name(&fighter_name);
+                        hover = format!(
+                            "Base fighter: {base_name} ({fighter_name})\nSlots: {}\n\nA mod \
+                             character played on {base_name}'s slots: it shares {base_name}'s \
+                             scripts, with its own models and motions",
+                            format_slot_list(&self.state.fighters[i].slots)
+                        );
                     } else if modded {
                         hover.push_str("\nModded character (not in the vanilla roster)");
                     }
