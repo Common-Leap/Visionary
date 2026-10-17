@@ -661,6 +661,9 @@ struct ProjectFacts {
 struct RegisteredScript {
     script: String,
     fighter: Option<String>,
+    /// The fighter is the agent the registration call is made on, not a guess from the
+    /// registering file's declarations.
+    exact: bool,
 }
 
 /// The same function text with its header renamed to `script`, when the project calls it
@@ -721,8 +724,12 @@ impl SourceIndex {
             .map(|(file, text)| (file.clone(), text.as_str()))
             .collect();
         if let Some(compiled) = compiled_files(root, &texts) {
-            sources.retain(|(file, _)| compiled.contains(file));
-            files.retain(|file| compiled.contains(file));
+            // Cargo spells paths its own way (drive-letter case, separators); compare by key.
+            let compiled: HashSet<String> =
+                compiled.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let built = |file: &PathBuf| compiled.contains(&crate::cargo_project::path_key(file));
+            sources.retain(|(file, _)| built(file));
+            files.retain(built);
         }
         // A fighter declaration in `src/fighters/mario/mod.rs` owns every nested module below
         // it, not only Rust files immediately beside it. Keep declarations as directory scopes
@@ -761,25 +768,31 @@ impl SourceIndex {
                     entry.push(fighter);
                 }
             }
-            let registration_fighter = (names.len() == 1).then(|| names[0].clone());
-            let registrations = scan_acmd_registrations(text);
-            let last: HashMap<&str, &str> = registrations.iter().copied().collect();
-            for (script, function) in registrations {
-                facts.registered.insert(script.to_string());
-                // Replaced by a later registration of the same script in this file.
-                if last.get(script) != Some(&function) {
+            let sole_name = (names.len() == 1).then(|| names[0].clone());
+            let registrations = scan_registrations(text);
+            let last = last_registrations(&registrations);
+            for registration in &registrations {
+                facts.registered.insert(registration.script.to_string());
+                // Replaced by a later registration of the same agent and script in this file.
+                if last.get(&(registration.agent.clone(), registration.script))
+                    != Some(&registration.function)
+                {
                     continue;
                 }
+                // The agent the call is made on beats the file's own declarations: a file that
+                // registers `falco` and `falco_cannon` scripts still knows which is which.
+                let fighter = registration.agent.clone().or_else(|| sole_name.clone());
                 let scripts = project_registrations
-                    .entry(function.to_string())
+                    .entry(registration.function.to_string())
                     .or_default();
                 if !scripts
                     .iter()
-                    .any(|known| known.script == script && known.fighter == registration_fighter)
+                    .any(|known| known.script == registration.script && known.fighter == fighter)
                 {
                     scripts.push(RegisteredScript {
-                        script: script.to_string(),
-                        fighter: registration_fighter.clone(),
+                        script: registration.script.to_string(),
+                        fighter,
+                        exact: registration.agent.is_some(),
                     });
                 }
             }
@@ -923,6 +936,30 @@ impl SourceIndex {
                     })
                     .flatten()
             })
+    }
+
+    /// Why [`Self::script_source`] has nothing for this move, in a phrase for the status line —
+    /// the difference between "this project is not for that fighter" and "this move is not
+    /// modded" is the whole diagnosis when a modded move shows vanilla.
+    pub fn why_no_script(&self, fighter: &str, move_name: &str) -> String {
+        let wanted = normalize_fighter(fighter);
+        if self.script_count() == 0 && self.conflict_count() == 0 {
+            return "the linked source has no ACMD scripts".into();
+        }
+        if !self.has_fighter(fighter) {
+            let mut agents: Vec<&str> = self
+                .fighters
+                .keys()
+                .map(String::as_str)
+                .filter(|name| !name.is_empty())
+                .collect();
+            agents.sort_unstable();
+            let shown = agents.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+            let more = agents.len().saturating_sub(6);
+            let more = if more > 0 { format!(" +{more}") } else { String::new() };
+            return format!("the linked source has no `{wanted}` scripts (it defines {shown}{more})");
+        }
+        format!("the linked source does not define {wanted}/{move_name}")
     }
 
     /// The functions this project defines for a move, concatenated into one body the existing
@@ -1190,22 +1227,24 @@ impl SourceIndex {
         //
         // A script registered twice in one file runs whichever function was registered LAST
         // (smashline keeps one function per script name), so only that one is the script.
-        let mut winner: HashMap<&str, &str> = HashMap::new();
-        for (script, function) in scan_acmd_registrations(text) {
-            winner.insert(script, function);
-        }
-        let mut named: HashMap<&str, Vec<&str>> = HashMap::new();
+        let registrations = scan_registrations(text);
+        let winner = last_registrations(&registrations);
+        // Function → the (agent, script) pairs this file registers it as. The agent is `None`
+        // when the call is made on a parameter, and is then resolved from the file's scope.
+        let mut named: HashMap<&str, Vec<(Option<String>, String)>> = HashMap::new();
         // Functions this file registers only to have the registration replaced: they run as
         // nothing, and must not fall back to another file's registration or their own name.
         let mut replaced: HashSet<&str> = HashSet::new();
-        for (script, function) in scan_acmd_registrations(text) {
-            if winner.get(script) != Some(&function) {
-                replaced.insert(function);
+        for registration in &registrations {
+            let key = (registration.agent.clone(), registration.script);
+            if winner.get(&key) != Some(&registration.function) {
+                replaced.insert(registration.function);
                 continue;
             }
-            let scripts = named.entry(function).or_default();
-            if !scripts.contains(&script) {
-                scripts.push(script);
+            let target = (registration.agent.clone(), registration.script.to_string());
+            let targets = named.entry(registration.function).or_default();
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
 
@@ -1228,16 +1267,21 @@ impl SourceIndex {
             let registrations = project_registrations
                 .get(function.name.as_str())
                 .filter(|_| facts.definitions.get(&function.name).copied().unwrap_or(0) <= 1);
-            let script_names: Vec<String> = if let Some(script) = function.script.clone() {
-                vec![script]
-            } else if let Some(scripts) = named.get(function.name.as_str()) {
-                scripts.iter().map(|script| (*script).to_string()).collect()
+            // `(agent, script)` per script this function is. A known agent is the call's own
+            // receiver; `None` falls back to the scopes below.
+            let targets: Vec<(Option<String>, String)> = if let Some(script) = function.script.clone() {
+                vec![(None, script)]
+            } else if let Some(targets) = named.get(function.name.as_str()) {
+                targets.clone()
             } else if replaced.contains(function.name.as_str()) {
                 continue;
             } else if let Some(scripts) = registrations {
                 scripts
                     .iter()
-                    .map(|registered| registered.script.clone())
+                    .map(|registered| {
+                        let agent = registered.exact.then(|| registered.fighter.clone()).flatten();
+                        (agent, registered.script.clone())
+                    })
                     .collect()
             } else if ["game_", "effect_", "sound_", "expression_"]
                 .iter()
@@ -1247,7 +1291,7 @@ impl SourceIndex {
                 // registered function is what the game runs.
                 && !facts.registered.contains(&function.name)
             {
-                vec![function.name.clone()]
+                vec![(None, function.name.clone())]
             } else {
                 continue;
             };
@@ -1265,7 +1309,7 @@ impl SourceIndex {
                 fighters.dedup();
                 (fighters.len() == 1).then(|| fighters[0].clone())
             });
-            let Some(fighter) = function
+            let fallback = function
                 .fighter
                 .clone()
                 .or_else(|| fighter_for_file(file, &self.root, fighter_scopes))
@@ -1276,11 +1320,11 @@ impl SourceIndex {
                 // source set has no labels at all it is still one safely editable set. Store
                 // it under the empty sentinel; `script` exposes it only while it remains the
                 // sole set, so it can never silently bleed into a named multi-fighter project.
-                .or_else(|| project_wide.is_empty().then(String::new))
-            else {
-                continue;
-            };
-            for script_name in script_names {
+                .or_else(|| project_wide.is_empty().then(String::new));
+            for (agent, script_name) in targets {
+                let Some(fighter) = agent.or_else(|| fallback.clone()) else {
+                    continue;
+                };
                 self.record_script(
                     &fighter,
                     script_name,
@@ -1495,48 +1539,55 @@ fn normalize_fighter(name: &str) -> String {
 /// old behaviour: every `.rs` file counts.
 fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet<PathBuf>> {
     let mut crate_roots: Vec<PathBuf> = Vec::new();
-    // The linked folder may be a crate's `src/` or `plugin/`, with the manifest above it.
-    let mut manifests: Vec<PathBuf> = texts
-        .keys()
-        .filter_map(|file| {
-            let mut dir = file.parent();
-            while let Some(d) = dir {
-                if d.join("Cargo.toml").is_file() {
-                    return Some(d.to_path_buf());
-                }
-                if d == root {
-                    break;
-                }
-                dir = d.parent();
-            }
-            None
-        })
-        .collect();
-    let mut ancestor = Some(root);
-    for _ in 0..4 {
-        let Some(dir) = ancestor else { break };
-        if dir.join("Cargo.toml").is_file() {
-            manifests.push(dir.to_path_buf());
-            break;
-        }
-        ancestor = dir.parent();
+    // Cargo knows exactly which crates the workspace builds, wherever their roots are. The
+    // folder walk below is for when it cannot be asked: no cargo, or a loose folder of files.
+    if let Some(project) = crate::cargo_project::CargoProject::discover(root) {
+        crate_roots.extend(project.crate_roots().cloned());
     }
-    manifests.sort();
-    manifests.dedup();
-    for manifest in &manifests {
-        let toml = std::fs::read_to_string(manifest.join("Cargo.toml")).unwrap_or_default();
-        // `[lib] path = "…"` relocates the crate root; take it when given.
-        let custom = toml
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("path"))
-            .filter_map(|line| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
-            .filter(|path| path.ends_with(".rs"))
-            .map(|path| manifest.join(path))
-            .collect::<Vec<_>>();
-        crate_roots.extend(custom);
-        for name in ["src/lib.rs", "src/main.rs"] {
-            crate_roots.push(manifest.join(name));
+    if crate_roots.is_empty() {
+        // The linked folder may be a crate's `src/` or `plugin/`, with the manifest above it.
+        let mut manifests: Vec<PathBuf> = texts
+            .keys()
+            .filter_map(|file| {
+                let mut dir = file.parent();
+                while let Some(d) = dir {
+                    if d.join("Cargo.toml").is_file() {
+                        return Some(d.to_path_buf());
+                    }
+                    if d == root {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+                None
+            })
+            .collect();
+        let mut ancestor = Some(root);
+        for _ in 0..4 {
+            let Some(dir) = ancestor else { break };
+            if dir.join("Cargo.toml").is_file() {
+                manifests.push(dir.to_path_buf());
+                break;
+            }
+            ancestor = dir.parent();
+        }
+        manifests.sort();
+        manifests.dedup();
+        for manifest in &manifests {
+            let toml = std::fs::read_to_string(manifest.join("Cargo.toml")).unwrap_or_default();
+            // `[lib] path = "…"` relocates the crate root; take it when given.
+            let custom = toml
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("path"))
+                .filter_map(|line| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
+                .filter(|path| path.ends_with(".rs"))
+                .map(|path| manifest.join(path))
+                .collect::<Vec<_>>();
+            crate_roots.extend(custom);
+            for name in ["src/lib.rs", "src/main.rs"] {
+                crate_roots.push(manifest.join(name));
+            }
         }
     }
     crate_roots.retain(|path| path.is_file());
@@ -1881,10 +1932,34 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
     names
 }
 
-/// `(script_name, function_name)` for every `agent.acmd("…", fn, …)`-style registration, and
-/// for `#[acmd_script(script = "…")]` attributes.
-fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
-    let mut out: Vec<(usize, &str, &str)> = Vec::new();
+/// One `agent.acmd("…", fn, …)`-style registration.
+#[derive(Debug, Clone, PartialEq)]
+struct Registration<'a> {
+    script: &'a str,
+    function: &'a str,
+    /// The agent the call is made on, when the call itself says: a chain headed by
+    /// `Agent::new("…")`, or a `let` binding of one. `None` for a parameter (`agent.acmd(…)`
+    /// inside `fn install(agent: &mut Agent)`), whose agent only the caller knows.
+    agent: Option<String>,
+}
+
+/// The function that wins each `(agent, script)` pair: smashline keeps one function per agent
+/// and script, so a later registration replaces an earlier one — but only for the same agent.
+fn last_registrations<'a>(
+    registrations: &[Registration<'a>],
+) -> HashMap<(Option<String>, &'a str), &'a str> {
+    registrations
+        .iter()
+        .map(|registration| ((registration.agent.clone(), registration.script), registration.function))
+        .collect()
+}
+
+/// Every `agent.acmd("…", fn, …)`-style registration in `text`, in document order, with the
+/// agent each is made on.
+fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
+    let mut out: Vec<(usize, &str, &str, Option<String>)> = Vec::new();
+    let boundaries = statement_boundaries(text);
+    let bindings = agent_bindings(text, &boundaries);
     for marker in [
         ".acmd(",
         ".game_acmd(",
@@ -1913,22 +1988,95 @@ fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
                 continue;
             };
             // (script, function) for `.acmd(…)`; the bang form leads with the agent.
-            let (script, function) = match (marker, args.len()) {
-                ("install_acmd_script!(", 3..) => (&args[1], &args[2]),
-                (_, 2..) => (&args[0], &args[1]),
+            let (script, function, receiver) = match (marker, args.len()) {
+                ("install_acmd_script!(", 3..) => (&args[1], &args[2], &text[args[0].clone()]),
+                (_, 2..) => {
+                    // The method chain this call hangs off, from its statement's start.
+                    let dot = open + 1 - marker.len();
+                    let start = statement_start(&boundaries, dot);
+                    (&args[0], &args[1], &text[start..dot])
+                }
                 _ => continue,
             };
             let script = text[script.clone()].trim().trim_matches('"');
             let function = text[function.clone()].trim();
             if !script.is_empty() && is_identifier(function) {
-                out.push((open, script, function));
+                out.push((open, script, function, receiver_agent(receiver, &bindings)));
             }
         }
     }
     // Document order: when one agent registers a script twice, the later call replaces the
     // earlier one, and callers rely on reading them in the order the game does.
-    out.sort_by_key(|(at, _, _)| *at);
-    out.into_iter().map(|(_, script, function)| (script, function)).collect()
+    out.sort_by_key(|(at, _, _, _)| *at);
+    out.into_iter()
+        .map(|(_, script, function, agent)| Registration { script, function, agent })
+        .collect()
+}
+
+/// Offsets of every `;`, `{` and `}` outside strings and comments, ascending.
+fn statement_boundaries(text: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if matches!(text.as_bytes()[i], b';' | b'{' | b'}') {
+            found.push(i);
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Where the statement containing `at` starts: just past the last boundary before it.
+fn statement_start(boundaries: &[usize], at: usize) -> usize {
+    let before = boundaries.partition_point(|&b| b < at);
+    before.checked_sub(1).map_or(0, |i| boundaries[i] + 1)
+}
+
+/// The fighter named by the first `Agent::new("…")` in `text`, normalized.
+fn agent_literal(text: &str) -> Option<String> {
+    let rest = text.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+    Some(normalize_fighter(&rest[..rest.find('"')?]))
+}
+
+/// `let [mut] NAME = [&mut] [path::]Agent::new("…")` bindings in `text`: name → fighter.
+fn agent_bindings(text: &str, boundaries: &[usize]) -> HashMap<String, String> {
+    let mut bound = HashMap::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let head = text[statement_start(boundaries, at)..at].trim();
+        let Some(binding) = head.strip_prefix("let ") else {
+            continue;
+        };
+        let binding = binding.trim_start();
+        let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim_start();
+        let end = ident_end(binding, 0);
+        if end > 0 && binding[end..].trim_start().starts_with('=') {
+            if let Some(fighter) = agent_literal(&text[at..]) {
+                bound.insert(binding[..end].to_string(), fighter);
+            }
+        }
+    }
+    bound
+}
+
+/// The agent a registration's receiver names: an `Agent::new("…")` at the head of the chain, or
+/// a variable bound to one. A parameter or anything else is `None`.
+fn receiver_agent(receiver: &str, bindings: &HashMap<String, String>) -> Option<String> {
+    let receiver = receiver.trim_start();
+    if receiver.contains("Agent::new(") {
+        return agent_literal(receiver);
+    }
+    let receiver = receiver.strip_prefix("&mut").unwrap_or(receiver).trim_start();
+    let receiver = receiver.strip_prefix('&').unwrap_or(receiver).trim_start();
+    let receiver = receiver.strip_prefix('*').unwrap_or(receiver).trim_start();
+    let end = ident_end(receiver, 0);
+    bindings.get(&receiver[..end]).cloned()
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -16343,6 +16491,110 @@ mod moveset_layout_tests {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// Empoleon (over Falco): one folder registers the fighter and two of its articles, each on
+    /// its own `Agent::new` chain. The folder naming several agents used to drop every script
+    /// in it, so the whole moveset read as vanilla Falco from the mirror.
+    #[test]
+    fn chained_registrations_attribute_each_script_to_its_own_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        put(root, "src/lib.rs", "mod emperte;\n");
+        put(root, "src/emperte/mod.rs", "mod acmd;\npub fn install() { acmd::install(); }\n");
+        put(root, "src/emperte/acmd/mod.rs", "mod normals;\nmod specials;\npub fn install() { normals::install(); specials::install(); }\n");
+        put(
+            root,
+            "src/emperte/acmd/normals.rs",
+            r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco")
+    .set_costume(costume.to_vec())
+    .acmd("game_attack11", game_attack11, Priority::Default)
+    .install();
+}
+"#,
+        );
+        put(
+            root,
+            "src/emperte/acmd/specials.rs",
+            r#"unsafe extern "C" fn game_specialsstart(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn game_fly(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn ava_game_regular(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco")
+    .acmd("game_specialsstart", game_specialsstart, Priority::Default)
+    .acmd("game_specialairsstart", game_specialsstart, Priority::Default)
+    .install();
+
+    Agent::new("falco_cannon")
+    .acmd("game_fly", game_fly, Priority::Default)
+    .install();
+
+    let ava = &mut Agent::new("FALCO_ava");
+    ava.game_acmd("game_regular", ava_game_regular, Priority::Default);
+    ava.install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        for script in ["game_attack11", "game_specialsstart", "game_specialairsstart"] {
+            assert!(index.script("falco", script).is_some(), "falco/{script}: {:?}", index.fighters.keys());
+        }
+        assert!(index.script("falco_cannon", "game_fly").is_some());
+        assert!(index.script("falco", "game_fly").is_none(), "an article script is not the fighter's");
+        assert!(index.script("falco_ava", "game_regular").is_some());
+        assert_eq!(index.conflict_count(), 0, "{:?}", index.conflicts);
+
+        // A move it leaves vanilla, and a fighter it is not for, say which.
+        let other = index.why_no_script("mario", "attack_11");
+        assert!(other.contains("no `mario` scripts") && other.contains("falco"), "{other}");
+        let unmodded = index.why_no_script("falco", "attack_lw4");
+        assert!(unmodded.contains("does not define falco/attack_lw4"), "{unmodded}");
+    }
+
+    /// Two agents registering the same script name in one file are two scripts, not a
+    /// replacement: smashline keys registrations by agent.
+    #[test]
+    fn same_script_on_two_agents_in_one_file_is_not_a_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "acmd.rs",
+            r#"unsafe extern "C" fn fly_a(agent: &mut L2CAgentBase) {}
+unsafe extern "C" fn fly_b(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco_blaster_bullet").acmd("game_fly", fly_a, Priority::Low).install();
+    Agent::new("falco_cannon").acmd("game_fly", fly_b, Priority::Low).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert_eq!(index.script("falco_blaster_bullet", "game_fly").map(|s| s.function.as_str()), Some("fly_a"));
+        assert_eq!(index.script("falco_cannon", "game_fly").map(|s| s.function.as_str()), Some("fly_b"));
+    }
+
+    /// Point `VISIONARY_PROBE_SOURCE` at a real project to see how it indexes:
+    /// `cargo test probe_linked_source -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn probe_linked_source() {
+        let Some(root) = std::env::var_os("VISIONARY_PROBE_SOURCE") else {
+            return;
+        };
+        crate::cargo_project::tests::enable();
+        let index = SourceIndex::build(Path::new(&root)).unwrap();
+        let mut fighters: Vec<_> = index.fighters.iter().map(|(name, f)| (name.clone(), f.scripts.len())).collect();
+        fighters.sort();
+        println!("{} scripts, {} conflicts", index.script_count(), index.conflict_count());
+        for (name, count) in fighters {
+            println!("  {name:?}: {count}");
+        }
+        for conflict in &index.conflicts {
+            println!("  conflict {}/{}", conflict.fighter, conflict.script);
+        }
     }
 
     const TILTS: &str = r#"use super::*;

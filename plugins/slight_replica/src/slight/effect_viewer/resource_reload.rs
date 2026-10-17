@@ -705,18 +705,3 @@ pub fn debug_line() -> String {
     )
 }
 
-/// Register a no-op disk callback for the UI roster DB path so we get a logged trace
-/// when the game attempts to load the file via Arcropolis. The callback returns `false`
-/// so the normal arcrop path proceeds; this is purely diagnostic.
-pub fn register_ui_db_probe() -> bool {
-    const UI_CHARA_DB: &str = "ui/param/database/ui_chara_db.prc";
-    let hash = smash::hash40(UI_CHARA_DB);
-
-    extern "C" fn disk_cb(_hash: u64, _out: *mut u8, _max: usize, _out_len: &mut usize) -> bool {
-        crate::slight::diag::note("arcrop: ui_chara_db requested (probe)");
-        // Returning false — do not claim the data — so the game's normal loader continues.
-        false
-    }
-
-    crate::slight::effect_viewer::arcrop::register_disk(hash, 0, disk_cb)
-}

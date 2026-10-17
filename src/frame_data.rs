@@ -411,6 +411,45 @@ mod tests {
         assert_eq!(data.faf.map(|(f, _)| f), Some(10));
     }
 
+    /// Startup and FAF for a 10-frame hitbox and a cancel at 20 under `body`.
+    fn startup_and_faf(body: &str) -> (Option<u32>, Option<u32>) {
+        let script = crate::acmd::parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n{body}\n    frame(agent.lua_state_agent, 10.0);\n}}\n"
+        ));
+        let hitboxes = [hitbox(10, 12, 5.0)];
+        let data = compute(&Inputs {
+            motion: "attack_11",
+            hitboxes: &hitboxes,
+            script: &script,
+            animation_frames: 0,
+            cancel_frame: Some(20),
+            params: &FrameParams::default(),
+        });
+        (data.startup, data.faf.map(|(f, _)| f))
+    }
+
+    #[test]
+    fn every_rate_form_moves_frame_data() {
+        // smash_script's helpers: both call FT_MOTION_RATE with game_frames / motion_frames.
+        assert_eq!(startup_and_faf("    FT_MOTION_RATE_RANGE(agent, 0.0, 10.0, 5.0);"), (Some(5), Some(10)));
+        assert_eq!(startup_and_faf("    macros::FT_DESIRED_RATE(agent, 10.0, 20.0);"), (Some(20), Some(40)));
+        // set_rate is playback speed: 2.0 plays twice as fast, so half the game frames.
+        assert_eq!(
+            startup_and_faf("    if macros::is_excute(agent) {\n        MotionModule::set_rate(agent.module_accessor, 2.0);\n    }"),
+            (Some(5), Some(10))
+        );
+    }
+
+    #[test]
+    fn waits_inside_a_loop_still_move_a_later_rate_change() {
+        // Four waits of 2 put the cursor at 8; the rate set there halves only what follows.
+        let (startup, faf) = startup_and_faf(
+            "    for _ in 0..4 {\n        wait(agent.lua_state_agent, 2.0);\n    }\n    macros::FT_MOTION_RATE(agent, 0.5);",
+        );
+        assert_eq!(startup, Some(9), "8 + 2 × 0.5");
+        assert_eq!(faf, Some(14), "8 + 12 × 0.5");
+    }
+
     #[test]
     fn an_aerial_uses_landing_lag_and_the_air_multiplier() {
         let script = crate::data::AcmdScript::default();

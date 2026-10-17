@@ -51,6 +51,12 @@ fn hash40(s: &str) -> u64 {
     (!hash) as u64 | (s.len() as u64) << 32
 }
 
+/// The scan below writes into game memory wherever a byte merely looks like a `disp_order`
+/// (any value 0–127 within 0x400 bytes of a name hit) and flips any nearby 0/1 byte as
+/// `can_select`. Without the measured struct layout that rewrites unrelated character select
+/// data, so it stays off until `DumpUiCharaDb` gives real offsets.
+const HEAP_PATCH_ENABLED: bool = false;
+
 pub fn patch_raw_prc(_order: &BTreeMap<String, i8>, _hidden: &BTreeSet<String>) -> usize {
     0
 }
@@ -553,8 +559,15 @@ fn load_rebuild_addr() -> Option<usize> {
     usize::from_str_radix(s, 16).ok()
 }
 
-/// Heap-only patch entry point.
+/// Heap-only patch entry point. Disabled: see [`HEAP_PATCH_ENABLED`].
 pub fn patch_instant(order: &BTreeMap<String, i8>, hidden: &BTreeSet<String>) -> bool {
+    if !HEAP_PATCH_ENABLED {
+        crate::slight::diag::note(
+            "heap_patch: disabled — ui_chara_db's in-memory layout is unmeasured; the CSS \
+             order applies on the next menu load",
+        );
+        return false;
+    }
     let heap_patched = patch_parsed_heap(order, hidden);
     if heap_patched > 0 {
         let rebuilt = trigger_rebuild();

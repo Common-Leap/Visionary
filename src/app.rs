@@ -1035,7 +1035,7 @@ fn timeline_content_height(
 fn merge_fetched_body(
     project: Option<crate::acmd_src::ProjectScript>,
     body: Result<String, String>,
-) -> (Result<String, String>, &'static str) {
+) -> (Result<String, String>, crate::data::ScriptOrigin) {
     match project {
         Some(project) => {
             let mirror = body.unwrap_or_default();
@@ -1045,9 +1045,9 @@ fn merge_fetched_body(
                 &project.blocked,
                 &mirror,
             );
-            (Ok(merged), "Project source")
+            (Ok(merged), crate::data::ScriptOrigin::MovesetSource)
         }
-        None => (body, "GitHub"),
+        None => (body, crate::data::ScriptOrigin::Vanilla),
     }
 }
 
@@ -2686,6 +2686,8 @@ struct PendingMoveSourceMismatch {
     move_entry: MoveEntry,
     saved: crate::mod_project::MoveSourceSnapshot,
     current: crate::mod_project::MoveSourceSnapshot,
+    /// Where `current` was read from.
+    current_origin: crate::data::ScriptOrigin,
 }
 
 #[derive(Default)]
@@ -3255,6 +3257,11 @@ pub struct VisionaryApp {
     /// The user's own smashline project, when linked. Scripts are read from here in
     /// preference to the dumped-script mirror — see `acmd_src`.
     acmd_src: Option<crate::acmd_src::SourceIndex>,
+    /// Why the remembered moveset source could not be re-linked at startup, until the user
+    /// relinks or unlinks it. Without this a moved project silently turned every move vanilla.
+    acmd_src_problem: Option<String>,
+    /// Why the open move shows vanilla even though a moveset source is linked.
+    acmd_source_note: Option<String>,
     show_acmd_src: bool,
     /// The Motion List window, and the open list when it has been opened.
     show_motion_list: bool,
@@ -3607,6 +3614,8 @@ impl VisionaryApp {
             move_search_opened: BTreeSet::new(),
             move_search_touched: BTreeSet::new(),
             acmd_src: None,
+            acmd_src_problem: None,
+            acmd_source_note: None,
             show_acmd_src: false,
             show_motion_list: false,
             motion_list_editor: None,
@@ -3673,10 +3682,16 @@ impl VisionaryApp {
 
         // Re-link the user's own ACMD source, quietly: a project that has moved or been
         // deleted since last session should not open with an error over an unrelated task.
+        // An index with no scripts is kept: dropping it made every move read as vanilla with
+        // nothing on screen saying the link had gone, and the header now explains it instead.
         if let Some(root) = load_config_path(ACMD_SRC_CONFIG_KEY) {
-            app.acmd_src = crate::acmd_src::SourceIndex::build(&root)
-                .ok()
-                .filter(|index| index.has_scripts());
+            match crate::acmd_src::SourceIndex::build(&root) {
+                Ok(index) => app.acmd_src = Some(index),
+                Err(error) => {
+                    app.acmd_src_problem =
+                        Some(format!("could not re-open {}: {error}", root.display()));
+                }
+            }
         }
 
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
@@ -3900,6 +3915,45 @@ impl VisionaryApp {
                     .map(|r| r.join("effect").join("fighter").join(&name))
                     .find(|d| d.is_dir());
 
+                // A mod that plays its own character on this fighter's extra slots gets its
+                // own row, named for the character and the slots it borrows; the fighter's row
+                // keeps the rest. Only a vanilla fighter from the data root is split this way.
+                let characters = match source {
+                    crate::data::FighterSource::DataRoot => {
+                        crate::data::slot_characters(&roots[1..], &name)
+                    }
+                    crate::data::FighterSource::ModRoot => Vec::new(),
+                };
+                let mut slots = slots;
+                slots.retain(|slot| !characters.iter().any(|c| c.slots.contains(slot)));
+                let custom_entries: Vec<crate::data::FighterEntry> = characters
+                    .into_iter()
+                    .map(|character| {
+                        let costume = format!("c{:02}", character.slots[0]);
+                        let own = character.root.join("fighter").join(&name);
+                        let or_base = |dir: PathBuf, base: &PathBuf| {
+                            if dir.is_dir() { dir } else { base.clone() }
+                        };
+                        crate::data::FighterEntry {
+                            name: name.clone(),
+                            display_name: format!(
+                                "{} ({display_name} [{costume}])",
+                                character.name
+                            ),
+                            param_path: param_path.clone(),
+                            motion_dir: or_base(own.join("motion").join("body").join(&costume), &motion_dir),
+                            model_dir: or_base(own.join("model").join("body").join(&costume), &model_dir),
+                            effect_dir: Some(character.root.join("effect").join("fighter").join(&name))
+                                .filter(|dir| dir.is_dir())
+                                .or_else(|| effect_dir.clone()),
+                            slots: character.slots,
+                            fighter_dir: own,
+                            source: crate::data::FighterSource::ModRoot,
+                            custom_name: Some(character.name),
+                        }
+                    })
+                    .collect();
+
                 let entry = crate::data::FighterEntry {
                     name,
                     display_name,
@@ -3910,11 +3964,14 @@ impl VisionaryApp {
                     slots,
                     fighter_dir: fighter_path,
                     source,
+                    custom_name: None,
                 };
                 if entry.is_modded() {
                     modded_added += 1;
                 }
                 self.state.fighters.push(entry);
+                modded_added += custom_entries.len();
+                self.state.fighters.extend(custom_entries);
             }
         }
 
@@ -4470,7 +4527,7 @@ impl VisionaryApp {
             self.refresh_linked_acmd_source_index();
             let key = Self::move_key(&fighter_name, &move_entry.name);
             if let Some(saved) = self.move_source_cache.get(&key).cloned() {
-                if let Some((body, _)) = self.warm_source_body(&fighter_name, &move_entry.name) {
+                if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name) {
                     if body != saved.body {
                         let captures = self.captures_for_move(&fighter_name, move_entry.hash);
                         let captures = if captures.is_empty() {
@@ -4489,15 +4546,16 @@ impl VisionaryApp {
                             move_entry,
                             saved,
                             current,
+                            current_origin: origin,
                         });
                         return;
                     }
                 }
-                self.activate_move(move_entry, Some(saved), "Saved project source");
+                self.activate_move(move_entry, Some(saved), crate::data::ScriptOrigin::Saved);
                 return;
             }
         }
-        self.activate_move(move_entry, None, "");
+        self.activate_move(move_entry, None, crate::data::ScriptOrigin::None);
     }
 
     /// Finish a move selection after source resolution has made its choice. The old selection
@@ -4507,13 +4565,14 @@ impl VisionaryApp {
         &mut self,
         mut move_entry: MoveEntry,
         snapshot: Option<crate::mod_project::MoveSourceSnapshot>,
-        snapshot_label: &str,
+        snapshot_origin: crate::data::ScriptOrigin,
     ) {
         // Dropping the receiver is cancellation: each worker owns only the sender for its own
         // channel, so a result from the previous selection has nowhere to land. Clear the
         // project half of that request at the same boundary.
         self.acmd_receiver = None;
         self.pending_project_script = None;
+        self.acmd_source_note = None;
         self.fetching_acmd = false;
         self.state.current_frame = FIRST_GAME_FRAME;
         self.selected_hitbox = None;
@@ -4574,13 +4633,13 @@ impl VisionaryApp {
                     &fighter,
                     &move_name,
                     Ok(snapshot.body),
-                    if snapshot_label.is_empty() {
-                        "Saved source"
+                    if snapshot_origin.is_none() {
+                        crate::data::ScriptOrigin::Saved
                     } else {
-                        snapshot_label
+                        snapshot_origin.clone()
                     },
                 );
-                if snapshot_label == "Current source" {
+                if matches!(snapshot_origin, crate::data::ScriptOrigin::Refreshed { .. }) {
                     self.rebase_current_edit_record();
                 }
                 self.refresh_current_live_rules();
@@ -4631,6 +4690,7 @@ impl VisionaryApp {
 
         self.acmd_error = None;
         self.pending_project_script = None;
+        self.acmd_source_note = None;
 
         // A linked project is the authoritative script for anyone who has already modded the
         // move — but only for the categories it actually defines. The mirror still supplies
@@ -4641,6 +4701,14 @@ impl VisionaryApp {
             .acmd_src
             .as_ref()
             .and_then(|index| index.script_source(&fighter_name, &move_name));
+        // A linked source that has nothing for this move is why vanilla shows; say so, or a
+        // modded fighter reading as vanilla looks like the link silently failed.
+        if project.is_none() {
+            self.acmd_source_note = self
+                .acmd_src
+                .as_ref()
+                .map(|index| index.why_no_script(&fighter_name, &move_name));
+        }
 
         if let Some(project) = project {
             // A forwarding script whose shared body depends on values the index could not
@@ -4671,7 +4739,7 @@ impl VisionaryApp {
                     &fighter_name,
                     &move_name,
                     body,
-                    "Project source",
+                    crate::data::ScriptOrigin::MovesetSource,
                 );
                 return;
             }
@@ -4703,7 +4771,7 @@ impl VisionaryApp {
         fighter: &str,
         move_name: &str,
         body: String,
-        source_label: &str,
+        origin: crate::data::ScriptOrigin,
     ) {
         let key = Self::move_key(fighter, move_name);
         if let Some(saved) = self.move_source_cache.get(&key).cloned() {
@@ -4733,11 +4801,12 @@ impl VisionaryApp {
                     move_entry,
                     saved,
                     current: crate::mod_project::MoveSourceSnapshot { body, captures },
+                    current_origin: origin,
                 });
                 return;
             }
         }
-        self.apply_acmd_body(fighter, move_name, Ok(body), source_label);
+        self.apply_acmd_body(fighter, move_name, Ok(body), origin);
     }
 
     // ── Linked ACMD source project ────────────────────────────────────────────
@@ -4779,6 +4848,7 @@ impl VisionaryApp {
                     }
                 );
                 self.acmd_src = Some(index);
+                self.acmd_src_problem = None;
                 save_config_path(ACMD_SRC_CONFIG_KEY, &root);
                 // The open move was loaded from the mirror; re-read it from source now.
                 self.reload_move_scripts();
@@ -4850,6 +4920,7 @@ impl VisionaryApp {
 
     fn unlink_acmd_source(&mut self) {
         self.acmd_src = None;
+        self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
         clear_config_path(ACMD_SRC_CONFIG_KEY);
         self.state.status = "Unlinked the ACMD source project — scripts come from the \
@@ -6955,7 +7026,7 @@ impl VisionaryApp {
         fighter_name: &str,
         move_name: &str,
         body: Result<String, String>,
-        source_label: &str,
+        origin: crate::data::ScriptOrigin,
     ) {
         match body {
             Ok(body) => {
@@ -6967,7 +7038,7 @@ impl VisionaryApp {
                 // branch warning from that snapshot is no longer applicable. Project-source
                 // loads deliberately retain a saved note, allowing an exported project to
                 // preserve the provenance it was created from.
-                if matches!(source_label, "GitHub" | "Current source") {
+                if origin.is_fresh_read() {
                     self.state
                         .capture_branch_warnings
                         .remove(&format!("{fighter_name}/{move_name}"));
@@ -7028,7 +7099,7 @@ impl VisionaryApp {
                     }
                     self.normalize_hitbox_bones(&mut hitboxes);
                     self.state.hitboxes_pristine = hitboxes.clone();
-                    self.state.acmd_source = source_label.into();
+                    self.state.acmd_source = origin;
                     self.state.hitboxes = hitboxes;
                     self.state.set_script(script);
 
@@ -7595,89 +7666,126 @@ impl VisionaryApp {
             // nothing was linked, when the fighter was not in the project, or when no script
             // was open — which meant a live-captured move, the one case with no source file
             // anywhere, showed an empty window instead of the code it would export.
-            ui.horizontal_wrapped(|ui| match self.acmd_src.as_ref() {
-                None => {
-                    ui.label(
-                        egui::RichText::new("No source project linked")
+            //
+            // Two layers feed a move, and they are named apart here because they are easy to
+            // confuse: the base game (the dump vanilla fighters are read from) and the moveset
+            // source (the Rust project whose scripts replace vanilla's).
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Base game").small().strong()).on_hover_text(
+                    "The extracted game folder vanilla fighters, models and motions are read \
+                     from (File → Choose base game folder…). Vanilla ACMD itself comes from the \
+                     dumped-script mirror on GitHub.",
+                );
+                match &self.state.data_root {
+                    Some(root) => ui.label(
+                        egui::RichText::new(root.display().to_string()).small().monospace(),
+                    ),
+                    None => ui.label(
+                        egui::RichText::new("not set").small().color(egui::Color32::GRAY),
+                    ),
+                };
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Moveset source").small().strong()).on_hover_text(
+                    "Your Rust moveset project. Every script it defines replaces vanilla's; \
+                     vanilla fills in the rest.",
+                );
+                match self.acmd_src.as_ref() {
+                    None => {
+                        let (text, color) = match &self.acmd_src_problem {
+                            Some(problem) => (problem.clone(), egui::Color32::from_rgb(220, 180, 90)),
+                            None => ("not linked — moves show vanilla".to_string(), egui::Color32::GRAY),
+                        };
+                        ui.label(egui::RichText::new(text).small().color(color));
+                        if ui
+                            .small_button("Link…")
+                            .on_hover_text(
+                                "Pick any folder of the Rust project that builds your plugin: its \
+                                 root, plugin/, or src/. Cargo works out which crates it builds.",
+                            )
+                            .clicked()
+                        {
+                            link = rfd::FileDialog::new()
+                                .set_title("Link moveset source")
+                                .pick_folder();
+                        }
+                    }
+                    Some(index) => {
+                        ui.label(
+                            egui::RichText::new(index.root.display().to_string())
+                                .small()
+                                .monospace(),
+                        );
+                        let conflict_summary = if index.conflict_count() == 0 {
+                            String::new()
+                        } else {
+                            format!(" · {} ambiguous", index.conflict_count())
+                        };
+                        let mut agents: Vec<&str> = index
+                            .fighters
+                            .keys()
+                            .map(String::as_str)
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        agents.sort_unstable();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "· {} usable scripts · {} agents{conflict_summary}",
+                                index.script_count(),
+                                index.fighters.len()
+                            ))
                             .small()
                             .color(egui::Color32::GRAY),
-                    );
-                    if ui
-                        .small_button("Link Source Project…")
-                        .on_hover_text(
-                            "Point at the root of the Rust project that builds your ACMD \
-                                 plugin — the folder holding Cargo.toml",
                         )
-                        .clicked()
-                    {
-                        link = rfd::FileDialog::new()
-                            .set_title("Link ACMD source project")
-                            .pick_folder();
-                    }
-                }
-                Some(index) => {
-                    ui.label(
-                        egui::RichText::new(index.root.display().to_string())
-                            .small()
-                            .monospace(),
-                    );
-                    let conflict_summary = if index.conflict_count() == 0 {
-                        String::new()
-                    } else {
-                        format!(" · {} ambiguous", index.conflict_count())
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "· {} usable scripts · {} fighters{conflict_summary}",
-                            index.script_count(),
-                            index.fighters.len()
-                        ))
-                        .small()
-                        .color(egui::Color32::GRAY),
-                    );
-                    if ui
-                        .small_button("Rescan")
-                        .on_hover_text(
-                            "Re-read the project from disk, picking up edits made elsewhere",
-                        )
-                        .clicked()
-                    {
-                        rescan = true;
-                    }
-                    let building = self
-                        .moveset_build
-                        .as_ref()
-                        .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
-                    if ui
-                        .add_enabled(!building, egui::Button::new(if building {
-                            "Building…"
+                        .on_hover_text(if agents.is_empty() {
+                            "No script is attributed to a named agent.".to_string()
                         } else {
-                            "Build & Deploy"
-                        }).small())
-                        .on_hover_text(
-                            "Run `cargo skyline build --release` on this project and replace \
-                             every deployed copy of its plugin on the emulator SD (and any \
-                             destination chosen with Deploy to…). If the plugin exports \
-                             `smashline_install`, it is also written as smashline's \
-                             development.nro: press L + R + D-pad Up in the game's menus to \
-                             reload it without restarting.",
-                        )
-                        .clicked()
-                    {
-                        build_plugin = true;
-                    }
-                    if ui
-                        .small_button("Deploy to…")
-                        .on_hover_text(
-                            "Choose where this project's built plugin should be copied, for a \
-                             mod folder Build & Deploy cannot find on its own",
-                        )
-                        .clicked()
-                    {
-                        choose_deploy = true;
-                    }
-                    if ui.small_button("Unlink").clicked() {
-                        unlink = true;
+                            format!("Scripts for: {}", agents.join(", "))
+                        });
+                        if ui
+                            .small_button("Rescan")
+                            .on_hover_text(
+                                "Re-read the project from disk, picking up edits made elsewhere",
+                            )
+                            .clicked()
+                        {
+                            rescan = true;
+                        }
+                        let building = self
+                            .moveset_build
+                            .as_ref()
+                            .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
+                        if ui
+                            .add_enabled(!building, egui::Button::new(if building {
+                                "Building…"
+                            } else {
+                                "Build & Deploy"
+                            }).small())
+                            .on_hover_text(
+                                "Run `cargo skyline build --release` on this project and replace \
+                                 every deployed copy of its plugin on the emulator SD (and any \
+                                 destination chosen with Deploy to…). If the plugin exports \
+                                 `smashline_install`, it is also written as smashline's \
+                                 development.nro: press L + R + D-pad Up in the game's menus to \
+                                 reload it without restarting.",
+                            )
+                            .clicked()
+                        {
+                            build_plugin = true;
+                        }
+                        if ui
+                            .small_button("Deploy to…")
+                            .on_hover_text(
+                                "Choose where this project's built plugin should be copied, for a \
+                                 mod folder Build & Deploy cannot find on its own",
+                            )
+                            .clicked()
+                        {
+                            choose_deploy = true;
+                        }
+                        if ui.small_button("Unlink").clicked() {
+                            unlink = true;
+                        }
                     }
                 }
             });
@@ -7699,11 +7807,18 @@ impl VisionaryApp {
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
-                if !self.state.acmd_source.is_empty() {
+                if !self.state.acmd_source.is_none() {
                     ui.label(
-                        egui::RichText::new(format!("from {}", self.state.acmd_source))
+                        egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
                             .small()
                             .color(egui::Color32::GRAY),
+                    );
+                }
+                if let Some(note) = &self.acmd_source_note {
+                    ui.label(
+                        egui::RichText::new(format!("— {note}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 180, 90)),
                     );
                 }
             });
@@ -8953,7 +9068,8 @@ impl VisionaryApp {
             .show(ui, |ui| {
                 // (index, internal name, label, modded, slot count, base slot) — modded fighters and
                 // non-vanilla skin counts are called out so an added-character mod is
-                // visibly picked up rather than silently indistinguishable from vanilla.
+                // visibly picked up rather than silently indistinguishable from vanilla. A slot
+                // character's label already names it and its fighter, so it skips the tag.
                 let fighters: Vec<(usize, String, String, bool, usize, u8)> = self
                     .state
                     .fighters
@@ -8969,7 +9085,7 @@ impl VisionaryApp {
                             i,
                             f.name.clone(),
                             f.display_name.clone(),
-                            f.is_modded(),
+                            f.is_modded() && f.custom_name.is_none(),
                             f.slots.len(),
                             f.base_slot(),
                         )
@@ -8984,11 +9100,17 @@ impl VisionaryApp {
                     if modded {
                         label.push_str("  [mod]");
                     }
-                    if slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
+                    let custom = self.state.fighters[i].custom_name.is_some();
+                    if !custom && slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
                         label.push_str(&format!("  ({slot_count} skins)"));
                     }
                     let mut hover = format!("{slot_count} costume slot(s), base c{base:02}");
-                    if modded {
+                    if custom {
+                        hover.push_str(&format!(
+                            "\nA mod character played on {fighter_name}'s slots: it shares \
+                             {fighter_name}'s scripts, with its own models and motions"
+                        ));
+                    } else if modded {
                         hover.push_str("\nModded character (not in the vanilla roster)");
                     }
                     let response = ui.selectable_label(selected, &label).on_hover_text(hover);
@@ -9305,7 +9427,7 @@ impl VisionaryApp {
                 ui.menu_button("Move…", |ui| {
                     let btn_text = if self.fetching_acmd {
                         "Loading…"
-                    } else if self.state.acmd_source.is_empty() {
+                    } else if self.state.acmd_source.is_none() {
                         "Retry source"
                     } else {
                         "Reload source"
@@ -9561,7 +9683,7 @@ impl VisionaryApp {
                         // the first person to open one concluded the editor could not edit its sounds,
                         // because nothing on screen said where they were. Say it.
                         if self.state.hitboxes.is_empty() && self.state.selected_move.is_some() {
-                            let fetched = !self.state.acmd_source.is_empty();
+                            let fetched = !self.state.acmd_source.is_none();
                             if !fetched {
                                 ui.weak("Nothing loaded yet — press Fetch ACMD.");
                             } else {
@@ -13695,6 +13817,7 @@ impl VisionaryApp {
                 .state
                 .fighters
                 .iter()
+                .filter(|entry| entry.custom_name.is_none())
                 .map(|entry| VictimFighter {
                     name: entry.name.clone(),
                     display: entry.display_name.clone(),
@@ -14309,7 +14432,7 @@ impl VisionaryApp {
         let conditions = self.state.script.to_hurtbox_conditions();
 
         if states.is_empty() && conditions.is_empty() && pris.is_empty() {
-            if self.state.acmd_source.is_empty() {
+            if self.state.acmd_source.is_none() {
                 ui.weak("No hurtbox commands loaded yet — press Fetch ACMD above.");
             } else {
                 ui.weak(
@@ -16323,7 +16446,11 @@ impl VisionaryApp {
     /// Return the merged source body when every required input is already local. This is used
     /// for mismatch detection; normal move navigation never performs a network request merely to
     /// compare a saved project snapshot.
-    fn warm_source_body(&self, fighter: &str, move_name: &str) -> Option<(String, &'static str)> {
+    fn warm_source_body(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Option<(String, crate::data::ScriptOrigin)> {
         if let Some(project) = self
             .acmd_src
             .as_ref()
@@ -16341,12 +16468,12 @@ impl VisionaryApp {
                     &project.blocked,
                     &mirror,
                 ),
-                "Project source",
+                crate::data::ScriptOrigin::MovesetSource,
             ));
         }
         crate::acmd::cached_script_body(fighter, move_name)
             .filter(|body| !body.is_empty())
-            .map(|body| (body, "GitHub"))
+            .map(|body| (body, crate::data::ScriptOrigin::Vanilla))
     }
 
     /// Resolve a local linked body even when the mirror cache is cold. A project that owns only
@@ -16356,7 +16483,7 @@ impl VisionaryApp {
         &self,
         fighter: &str,
         move_name: &str,
-    ) -> Option<(String, &'static str)> {
+    ) -> Option<(String, crate::data::ScriptOrigin)> {
         self.warm_source_body(fighter, move_name).or_else(|| {
             let project = self
                 .acmd_src
@@ -16372,7 +16499,7 @@ impl VisionaryApp {
                     &self.state.loaded_body,
                 )
             };
-            Some((body, "Project source"))
+            Some((body, crate::data::ScriptOrigin::MovesetSource))
         })
     }
 
@@ -16795,7 +16922,7 @@ impl VisionaryApp {
             &context.fighter,
             &context.move_name,
             Ok(context.source.body.clone()),
-            "Saved project source",
+            crate::data::ScriptOrigin::Saved,
         );
         // `apply_acmd_body` has already established these same values, but using the context
         // here makes the project-wide path independent of whichever move happened to be open
@@ -19982,11 +20109,13 @@ impl VisionaryApp {
             "saved" => self.activate_move(
                 prompt.move_entry,
                 Some(prompt.saved),
-                "Saved project source",
+                crate::data::ScriptOrigin::Saved,
             ),
-            "current" => {
-                self.activate_move(prompt.move_entry, Some(prompt.current), "Current source")
-            }
+            "current" => self.activate_move(
+                prompt.move_entry,
+                Some(prompt.current),
+                prompt.current_origin.refreshed(),
+            ),
             _ => {}
         }
     }
@@ -20362,7 +20491,7 @@ impl VisionaryApp {
         let Some(key) = self.current_move_key() else {
             return;
         };
-        if self.state.acmd_source == "Live capture" {
+        if self.state.acmd_source == crate::data::ScriptOrigin::LiveCapture {
             self.move_source_cache.remove(&key);
         } else if let Some(snapshot) = self.move_source_cache.get_mut(&key) {
             snapshot.captures.clear();
@@ -20546,10 +20675,10 @@ impl VisionaryApp {
             None => {
                 // Arm on an EMPTY move (nothing to lose) or on its UNEDITED live snapshot. A
                 // GitHub fetch, or a live capture the user has since edited, is never clobbered.
-                let empty = self.state.acmd_source.is_empty()
+                let empty = self.state.acmd_source.is_none()
                     && self.state.hitboxes.is_empty()
                     && self.state.effects.is_empty();
-                let live_unedited = self.state.acmd_source == "Live capture"
+                let live_unedited = self.state.acmd_source == crate::data::ScriptOrigin::LiveCapture
                     && self.state.hitboxes == self.state.hitboxes_pristine
                     // Effect timing edits are live state too. The old check only compared
                     // hitboxes, so playing a move after changing an effect could auto-adopt a
@@ -20589,7 +20718,10 @@ impl VisionaryApp {
         // run to completion means the click still works and then self-corrects to the full
         // script instead of leaving the truncated one in place.
         if self.current_motion_hash() != Some(motion)
-            || (!self.state.acmd_source.is_empty() && self.state.acmd_source != "Live capture")
+            || !matches!(
+                self.state.acmd_source,
+                crate::data::ScriptOrigin::None | crate::data::ScriptOrigin::LiveCapture
+            )
         {
             self.pending_capture = None;
             return;
@@ -20862,7 +20994,7 @@ impl VisionaryApp {
             }
         }
         if can_adopt_live_script {
-            self.state.acmd_source = "Live capture".into();
+            self.state.acmd_source = crate::data::ScriptOrigin::LiveCapture;
         }
         self.acmd_error = None;
         if self.apply_saved_hitbox_edits_to_current() {
@@ -21050,7 +21182,7 @@ impl VisionaryApp {
     /// those direct observations before this gate is consulted.
     fn live_capture_can_replace_script(
         script_kept: bool,
-        _source_label: &str,
+        _origin: &crate::data::ScriptOrigin,
         loaded_body: &str,
     ) -> bool {
         !script_kept && loaded_body.trim().is_empty()
@@ -27616,11 +27748,17 @@ impl VisionaryApp {
         // The target's ACTUAL costume slots, however many and however numbered. Indexed
         // fighters carry a scanned list; anything else (an eff opened standalone) is scanned
         // on the spot, and only a total miss falls back to the vanilla 0..=7.
-        let avail_slots: Vec<u8> = match target
+        let rows: Vec<&crate::data::FighterEntry> = target
             .as_ref()
-            .and_then(|name| self.state.fighters.iter().find(|f| f.name == *name))
-        {
-            Some(f) => f.slots.clone(),
+            .map(|name| self.state.fighters.iter().filter(|f| f.name == *name).collect())
+            .unwrap_or_default();
+        let avail_slots: Vec<u8> = match rows.first() {
+            Some(_) => {
+                let mut slots: Vec<u8> = rows.iter().flat_map(|f| f.slots.iter().copied()).collect();
+                slots.sort_unstable();
+                slots.dedup();
+                slots
+            }
             None => match target.as_ref() {
                 Some(name) => crate::data::costume_slots_or_default(&self.all_roots(), name),
                 None => crate::data::default_slots(),
@@ -33701,13 +33839,16 @@ impl eframe::App for VisionaryApp {
                             .small()
                             .color(Color32::LIGHT_GRAY),
                     );
-                    if !self.state.acmd_source.is_empty() {
+                    if !self.state.acmd_source.is_none() {
                         ui.separator();
-                        ui.label(
-                            RichText::new(format!("Source: {}", self.state.acmd_source))
+                        let source = ui.label(
+                            RichText::new(format!("ACMD from {}", self.state.acmd_source.label()))
                                 .small()
                                 .color(Color32::GRAY),
                         );
+                        if let Some(note) = &self.acmd_source_note {
+                            source.on_hover_text(note.as_str());
+                        }
                     }
                     // One current project holds every edit: always show where autosave goes.
                     ui.separator();
@@ -36117,7 +36258,7 @@ fn clear_move_state(state: &mut crate::data::AppState) {
     state
         .expression_motion_module_set_frame_partial_pristine
         .clear();
-    state.acmd_source = String::new();
+    state.acmd_source = crate::data::ScriptOrigin::None;
     state.loaded_body.clear();
 }
 
@@ -39490,7 +39631,7 @@ mod live_effect_capture_tests {
             sound_script: script.clone(),
             sounds: script.to_sound_events(),
             sounds_pristine: script.to_sound_events(),
-            acmd_source: "Live capture".into(),
+            acmd_source: crate::data::ScriptOrigin::LiveCapture,
             loaded_body: "previous move source".into(),
             ..Default::default()
         };
@@ -39544,7 +39685,7 @@ mod live_effect_capture_tests {
             state.ft_start_adjust_motion_frame_pristine.is_empty(),
             "ft_start_adjust_motion_frame_pristine"
         );
-        assert!(state.acmd_source.is_empty(), "acmd_source");
+        assert!(state.acmd_source.is_none(), "acmd_source");
         assert!(state.loaded_body.is_empty(), "loaded_body");
 
         // The fighter's own data is untouched — this is not `AppState::default()`.
@@ -41546,20 +41687,21 @@ mod live_effect_capture_tests {
     }
 }
         "#;
+        use crate::data::ScriptOrigin;
         assert!(!VisionaryApp::live_capture_can_replace_script(
             false,
-            "GitHub",
+            &ScriptOrigin::Vanilla,
             effect_only
         ));
-        assert!(VisionaryApp::live_capture_can_replace_script(false, "", ""));
+        assert!(VisionaryApp::live_capture_can_replace_script(false, &ScriptOrigin::None, ""));
         assert!(!VisionaryApp::live_capture_can_replace_script(
             false,
-            "Live capture",
+            &ScriptOrigin::LiveCapture,
             effect_only
         ));
         assert!(!VisionaryApp::live_capture_can_replace_script(
             true,
-            "GitHub",
+            &ScriptOrigin::Vanilla,
             effect_only
         ));
     }
@@ -41593,7 +41735,11 @@ mod live_effect_capture_tests {
         assert_eq!(typed.to_hurtboxes().0.len(), 1);
         assert_eq!(typed.to_work_flag_events().len(), 0);
         assert!(
-            !VisionaryApp::live_capture_can_replace_script(false, "GitHub", "effect body"),
+            !VisionaryApp::live_capture_can_replace_script(
+                false,
+                &crate::data::ScriptOrigin::Vanilla,
+                "effect body"
+            ),
             "the unscoped direct-module policy remains in force"
         );
 
@@ -44140,7 +44286,7 @@ mod live_effect_capture_tests {
         let (body, label) = merge_fetched_body(Some(project.clone()), Err("offline".into()));
         let body = body.expect("a failed fetch must not surface as an error over a project");
         assert!(body.contains("fn game_x"), "{body}");
-        assert_eq!(label, "Project source");
+        assert_eq!(label, crate::data::ScriptOrigin::MovesetSource);
 
         // With the mirror in hand, the category the project left out arrives — and the one it
         // did not leave out is still the project's.
@@ -44159,7 +44305,7 @@ mod live_effect_capture_tests {
         // With no project, the fetch's own error is the answer.
         let (body, label) = merge_fetched_body(None, Err("offline".into()));
         assert!(body.is_err());
-        assert_eq!(label, "GitHub");
+        assert_eq!(label, crate::data::ScriptOrigin::Vanilla);
     }
 
     /// Dragging a hitbox rebuilds the whole script, and a runtime branch has to come through

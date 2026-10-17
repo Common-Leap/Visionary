@@ -2806,43 +2806,93 @@ impl AcmdScript {
     /// in force: the engine advances the motion by `1/r` motion frames per game frame, so a span
     /// of `n` motion frames takes `n * r` game frames.
     ///
-    /// Rate calls sit at the function's top level in all 17 corpus calls, so only the top level
-    /// is walked. A rate set inside a runtime branch would apply for real, but whether the
-    /// branch is taken is not knowable here, and pretending otherwise would put a confident
-    /// wrong number on the timeline; those scripts keep a `Raw` block and are left alone.
+    /// Every way a moveset sets the rate counts, because frame data built from only one of them
+    /// is wrong for the rest: `FT_MOTION_RATE`, smash_script's `FT_MOTION_RATE_RANGE(start, end,
+    /// game_frames)` and `FT_DESIRED_RATE(motion_frames, game_frames)` (both of which call it
+    /// with `game_frames / motion_frames`), and `MotionModule::set_rate(r)`, the playback speed,
+    /// whose game-frames-per-motion-frame is `1/r`. `is_excute` blocks always run for the agent
+    /// whose script this is, so they are walked, and a loop's body is walked once per iteration.
+    ///
+    /// A rate set inside a runtime branch would apply for real, but whether the branch is taken
+    /// is not knowable here, and pretending otherwise would put a confident wrong number on the
+    /// timeline; those blocks are left alone.
     pub fn rate_spans(&self) -> Vec<RateSpan> {
-        let mut spans: Vec<RateSpan> = Vec::new();
-        let (mut motion, mut game, mut rate) = (0.0f32, 0.0f32, 1.0f32);
-        for stmt in &self.stmts {
-            match stmt {
-                // `frame()` waits *until* a frame and returns immediately if it has already
-                // passed, so a target behind the cursor advances nothing rather than rewinding.
-                AcmdStmt::Frame(f) => {
-                    let advance = (*f - motion).max(0.0);
-                    motion += advance;
-                    game += advance * rate;
+        /// Iterations walked per loop at most: a `loop {}` read as a huge count must not hang.
+        const MAX_LOOP: usize = 1000;
+        struct Walk {
+            spans: Vec<RateSpan>,
+            motion: f32,
+            game: f32,
+            rate: f32,
+        }
+        impl Walk {
+            fn advance(&mut self, by: f32) {
+                let by = by.max(0.0);
+                self.motion += by;
+                self.game += by * self.rate;
+            }
+            fn set_rate(&mut self, rate: f32) {
+                if !(rate > 0.0 && rate.is_finite()) {
+                    return;
                 }
-                AcmdStmt::Wait(w) => {
-                    let advance = w.max(0.0);
-                    motion += advance;
-                    game += advance * rate;
+                if let Some(last) = self.spans.last_mut() {
+                    last.to_motion = self.motion;
                 }
-                AcmdStmt::MotionRate(r) if *r > 0.0 => {
-                    if let Some(last) = spans.last_mut() {
-                        last.to_motion = motion;
+                self.spans.push(RateSpan {
+                    from_motion: self.motion,
+                    to_motion: f32::INFINITY,
+                    from_game: self.game,
+                    rate,
+                });
+                self.rate = rate;
+            }
+            fn stmts(&mut self, stmts: &[AcmdStmt]) {
+                for stmt in stmts {
+                    match stmt {
+                        // `frame()` waits *until* a frame and returns immediately if it has
+                        // already passed, so a target behind the cursor advances nothing rather
+                        // than rewinding.
+                        AcmdStmt::Frame(f) => self.advance(*f - self.motion),
+                        AcmdStmt::Wait(w) => self.advance(*w),
+                        AcmdStmt::MotionRate(r) => self.set_rate(*r),
+                        AcmdStmt::Raw(line) => {
+                            if let Some(rate) = raw_rate_call(line) {
+                                self.set_rate(rate);
+                            }
+                        }
+                        AcmdStmt::Excute(body) => body.iter().for_each(|s| self.excute(s)),
+                        AcmdStmt::Bare(s) => self.excute(s),
+                        AcmdStmt::Loop { count, body } => {
+                            for _ in 0..(*count).min(MAX_LOOP) {
+                                self.stmts(body);
+                            }
+                        }
+                        AcmdStmt::WaitLoopClear | AcmdStmt::RawBlock { .. } => {}
                     }
-                    spans.push(RateSpan {
-                        from_motion: motion,
-                        to_motion: f32::INFINITY,
-                        from_game: game,
-                        rate: *r,
-                    });
-                    rate = *r;
                 }
-                _ => {}
+            }
+            fn excute(&mut self, stmt: &ExcuteStmt) {
+                match stmt {
+                    ExcuteStmt::MotionModuleSetRate(call) if call.rate > 0.0 => {
+                        self.set_rate(1.0 / call.rate)
+                    }
+                    ExcuteStmt::Raw(line) => {
+                        if let Some(rate) = raw_rate_call(line) {
+                            self.set_rate(rate);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        spans
+        let mut walk = Walk {
+            spans: Vec::new(),
+            motion: 0.0,
+            game: 0.0,
+            rate: 1.0,
+        };
+        walk.stmts(&self.stmts);
+        walk.spans
     }
 
     /// The game frame a motion frame lands on, given this script's rate windows.
@@ -6389,6 +6439,40 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
     }
 }
 
+/// The `FT_MOTION_RATE` argument a rate call the parser keeps as text amounts to:
+/// `FT_MOTION_RATE_RANGE(agent, start, end, game_frames)` → `game_frames / (end - start)`,
+/// `FT_DESIRED_RATE(agent, motion_frames, game_frames)` → `game_frames / motion_frames`, and a
+/// plain `FT_MOTION_RATE(agent, r)` written somewhere the parser does not type it. Arguments that
+/// are not number literals (a const, an expression) give `None` rather than a guess.
+fn raw_rate_call(line: &str) -> Option<f32> {
+    let args = |name: &str| -> Option<Vec<f32>> {
+        let (_, rest) = line.split_once(name)?;
+        let inner = &rest[..rest.find(')')?];
+        inner
+            .split(',')
+            .skip(1)
+            .map(|arg| {
+                let arg = arg.trim();
+                let arg = arg.strip_suffix("as f32").unwrap_or(arg).trim();
+                let arg = arg.strip_suffix("f32").unwrap_or(arg).trim_end_matches('_');
+                arg.parse::<f32>().ok()
+            })
+            .collect()
+    };
+    if let Some(args) = args("FT_MOTION_RATE_RANGE(") {
+        let [start, end, game] = args[..] else { return None };
+        return (end > start).then(|| game / (end - start));
+    }
+    if let Some(args) = args("FT_DESIRED_RATE(") {
+        let [motion, game] = args[..] else { return None };
+        return (motion > 0.0).then(|| game / motion);
+    }
+    match args("FT_MOTION_RATE(")?[..] {
+        [rate] => Some(rate),
+        _ => None,
+    }
+}
+
 fn eval_stmts(
     stmts: &[AcmdStmt],
     start_frame: f32,
@@ -6698,6 +6782,60 @@ impl EditLog {
     }
 }
 
+/// Where the open move's ACMD came from.
+///
+/// Three places can supply a move, and the editor has to say which one it is showing: the
+/// vanilla scripts (dumped from the game, read from the GitHub mirror), the user's moveset
+/// source (the linked Rust project, merged over vanilla for categories it leaves out), or this
+/// Visionary project's own saved copy. A modded Falco showing vanilla Falco is only diagnosable
+/// when the label says "vanilla" rather than a host name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScriptOrigin {
+    /// Nothing loaded yet.
+    #[default]
+    None,
+    /// The vanilla script from the dumped-script mirror.
+    Vanilla,
+    /// The linked moveset source, with vanilla filling any category it does not define.
+    MovesetSource,
+    /// The baseline this Visionary project saved when the move was first opened.
+    Saved,
+    /// A fresh read the user chose over the saved baseline: of the moveset source, or of
+    /// vanilla when the source does not define the move.
+    Refreshed { moveset: bool },
+    /// Rebuilt from a live game capture.
+    LiveCapture,
+}
+
+impl ScriptOrigin {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    /// The same body read again, chosen over the saved baseline.
+    pub fn refreshed(&self) -> Self {
+        Self::Refreshed { moveset: *self == Self::MovesetSource }
+    }
+
+    /// A freshly read source, which replaces anything a live snapshot said about the move.
+    pub fn is_fresh_read(&self) -> bool {
+        matches!(self, Self::Vanilla | Self::Refreshed { .. })
+    }
+
+    /// Short label for status lines: "from {label}".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Vanilla => "vanilla (GitHub mirror)",
+            Self::MovesetSource => "your moveset source",
+            Self::Saved => "this project's saved copy",
+            Self::Refreshed { moveset: true } => "your moveset source (re-read)",
+            Self::Refreshed { moveset: false } => "vanilla (re-read)",
+            Self::LiveCapture => "live capture",
+        }
+    }
+}
+
 /// Where a fighter was indexed from. Modded fighters (added-character mods) come from a
 /// user-added mod root and may be missing pieces a vanilla dump always has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6724,6 +6862,10 @@ pub struct FighterEntry {
     /// rescans and modded-fighter lookups don't have to re-derive it from the data root.
     pub fighter_dir: PathBuf,
     pub source: FighterSource,
+    /// The character a mod plays on this fighter's slots (`Shy Guy` on Pac-Man c40–c47), when
+    /// this entry is that character rather than the fighter itself. It shares the fighter's
+    /// agent and scripts; only its slots, files, and name are its own.
+    pub custom_name: Option<String>,
 }
 
 impl FighterEntry {
@@ -6849,8 +6991,8 @@ pub struct AppState {
     /// Direct WorkModule value-set point events as loaded, for sparse live rules and source
     /// syncing.
     pub work_module_set_pristine: Vec<WorkModuleSetEvent>,
-    /// Provenance of the current move's ACMD data ("", "GitHub", "Live capture").
-    pub acmd_source: String,
+    /// Provenance of the current move's ACMD data.
+    pub acmd_source: ScriptOrigin,
     /// "fighter/move" → the warning captured when a live performance observed only one arm of
     /// a branched source script. Kept separately from `acmd_source` so a later project export can
     /// carry the warning even after the move is no longer open.
@@ -6964,7 +7106,7 @@ impl Default for AppState {
             work_transition_term_pristine: Vec::new(),
             work_module_inc_int_pristine: Vec::new(),
             work_module_set_pristine: Vec::new(),
-            acmd_source: String::new(),
+            acmd_source: ScriptOrigin::None,
             capture_branch_warnings: HashMap::new(),
             loaded_body: String::new(),
             effect_call_edits: HashMap::new(),
@@ -7164,6 +7306,99 @@ pub fn discover_costume_slots(roots: &[PathBuf], fighter: &str) -> Vec<u8> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// A character a mod adds on a vanilla fighter's costume slots: Shy Guy on Pac-Man c40–c47.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotCharacter {
+    pub name: String,
+    /// Its slots, ascending; all past the vanilla eight.
+    pub slots: Vec<u8>,
+    /// The mod root its files live in.
+    pub root: PathBuf,
+}
+
+/// The slot characters `roots` add to `fighter`.
+///
+/// A mod root counts when it ships `fighter` slots past c07 *and* names a character of its own
+/// in `ui/message/msg_name.xmsbt`. Slots with no name are a skin pack and stay with the fighter.
+pub fn slot_characters(roots: &[PathBuf], fighter: &str) -> Vec<SlotCharacter> {
+    roots
+        .iter()
+        .filter_map(|root| {
+            let slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(root), fighter)
+                .into_iter()
+                .filter(|slot| *slot >= VANILLA_SLOT_COUNT)
+                .collect();
+            if slots.is_empty() {
+                return None;
+            }
+            let text = std::fs::read(root.join("ui/message/msg_name.xmsbt")).ok()?;
+            let name = xmsbt_character_name(&decode_xmsbt(&text), fighter)?;
+            Some(SlotCharacter {
+                name,
+                slots,
+                root: root.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `.xmsbt` is UTF-16 (either byte order, BOM or not) in practice, and UTF-8 now and then.
+fn decode_xmsbt(bytes: &[u8]) -> String {
+    let utf16 = |big: bool, body: &[u8]| {
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| if big { u16::from_be_bytes([pair[0], pair[1]]) } else { u16::from_le_bytes([pair[0], pair[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xFF, 0xFE, body @ ..] => utf16(false, body),
+        [0xFE, 0xFF, body @ ..] => utf16(true, body),
+        [b'<', 0, ..] => utf16(false, bytes),
+        [0, b'<', ..] => utf16(true, bytes),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The character name an `.xmsbt` gives: the text of a `nam_chr1_NN_<id>` entry (`chr0` when
+/// there is no `chr1`), preferring an id other than `fighter`'s own, which is a rename of the
+/// vanilla character rather than a new one.
+fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
+    let mut found: Vec<(u8, bool, String)> = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("label=\"nam_chr") {
+        rest = &rest[at + "label=\"nam_chr".len()..];
+        let Some(close) = rest.find('"') else { break };
+        let label = &rest[..close];
+        // `1_00_shyguy` → variant 1, id `shyguy`.
+        let mut parts = label.splitn(3, '_');
+        let (Some(variant), Some(_slot), Some(id)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let rank = match variant {
+            "1" => 0,
+            "0" => 1,
+            _ => continue,
+        };
+        let body = &rest[close..];
+        let entry_end = body.find("</entry>").unwrap_or(body.len());
+        let Some(start) = body[..entry_end].find("<text>") else { continue };
+        let Some(len) = body[start + 6..entry_end].find("</text>") else { continue };
+        let name = body[start + 6..start + 6 + len]
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'");
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !name.is_empty() {
+            found.push((rank, id.eq_ignore_ascii_case(fighter), name));
+        }
+    }
+    found.sort_by_key(|(rank, own, _)| (*own, *rank));
+    found.into_iter().next().map(|(_, _, name)| name)
 }
 
 /// [`discover_costume_slots`] with the vanilla 0..=7 fallback applied — what the UI and the
@@ -8669,6 +8904,41 @@ impl EffectScript {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mod_naming_its_own_character_on_extra_slots_is_a_slot_character() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shyguy = tmp.path().join("shyguy");
+        for slot in [40, 41] {
+            std::fs::create_dir_all(shyguy.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(shyguy.join("ui/message")).unwrap();
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<xmsbt>\n  <entry label=\"nam_chr2_00_shyguy\">\n    <text>SHY GUY</text>\n  </entry>\n  <entry label=\"nam_chr1_00_shyguy\">\n    <text>Shy Guy</text>\n  </entry>\n</xmsbt>\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(shyguy.join("ui/message/msg_name.xmsbt"), bytes).unwrap();
+        // A skin pack: extra slots, no name of its own.
+        let skins = tmp.path().join("skins");
+        std::fs::create_dir_all(skins.join("fighter/pacman/model/body/c08")).unwrap();
+
+        let found = super::slot_characters(&[shyguy.clone(), skins], "pacman");
+        assert_eq!(
+            found,
+            [super::SlotCharacter { name: "Shy Guy".into(), slots: vec![40, 41], root: shyguy }]
+        );
+    }
+
+    #[test]
+    fn a_rename_of_the_fighter_itself_is_the_last_resort_name() {
+        let text = r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>
+<entry label="nam_chr0_00_ghost"><text>Inky &amp; Co</text></entry>"#;
+        assert_eq!(super::xmsbt_character_name(text, "pacman").as_deref(), Some("Inky & Co"));
+        assert_eq!(
+            super::xmsbt_character_name(r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>"#, "pacman")
+                .as_deref(),
+            Some("Pac")
+        );
+    }
+
     use super::*;
 
     /// kirby's down smash, which is the clearest case in the corpus: it sets `0.25`, crosses

@@ -529,6 +529,7 @@ mod tests {
             slots: vec![0],
             fighter_dir: PathBuf::new(),
             source: FighterSource::DataRoot,
+            custom_name: None,
         }
     }
 

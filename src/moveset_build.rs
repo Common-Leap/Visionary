@@ -4,8 +4,10 @@
 //! --release`, find the `.nro` under `target/aarch64-skyline-switch/release/`, copy it over the
 //! one the emulator loads, restart. This does the middle three in one step:
 //!
-//! - the crate is the one the linked source belongs to (the `Cargo.toml` most indexed files sit
-//!   under), and its plugin is `lib<name>.nro` per `[lib] name` or `[package] name`;
+//! - the crate is the linked source's `cdylib` package as `cargo metadata` reports it (the one
+//!   most indexed files belong to, when a workspace has several), and its plugin is
+//!   `lib<name>.nro` in cargo's own target directory. Without cargo, the `Cargo.toml` most
+//!   indexed files sit under stands in, per `[lib] name` or `[package] name`;
 //! - every copy of that file already deployed — in an emulator SD's `ultimate/mods`, its Skyline
 //!   plugins folder, or a LayeredFS `load/` mod — is replaced, plus any destination the user
 //!   chose before. ARCropolis mods usually ship the plugin renamed to `plugin.nro`, which a name
@@ -57,23 +59,40 @@ pub fn plan(
     sd_root: Option<&Path>,
     remembered: Option<&Path>,
 ) -> Result<Plan> {
-    let crate_dir = owning_crate(files).context("the linked source is not inside a Cargo crate")?;
-    let toml = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
-        .with_context(|| format!("reading {}", crate_dir.join("Cargo.toml").display()))?;
-    let Some(lib) = library_name(&toml) else {
-        bail!("{} names no package", crate_dir.join("Cargo.toml").display());
+    let cargo = files
+        .iter()
+        .find_map(|file| file.parent())
+        .and_then(crate::cargo_project::CargoProject::discover);
+    let resolved = cargo.as_ref().and_then(|project| {
+        let package = project.plugin_for(files)?;
+        let built = project.built_plugin(package, "release")?;
+        let name = built.file_name()?.to_string_lossy().into_owned();
+        Some((package.dir().to_path_buf(), name, vec![built]))
+    });
+    let (crate_dir, nro_name, built) = match resolved {
+        Some(resolved) => resolved,
+        None => {
+            let crate_dir =
+                owning_crate(files).context("the linked source is not inside a Cargo crate")?;
+            let toml = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
+                .with_context(|| format!("reading {}", crate_dir.join("Cargo.toml").display()))?;
+            let Some(lib) = library_name(&toml) else {
+                bail!("{} names no package", crate_dir.join("Cargo.toml").display());
+            };
+            let nro_name = format!("lib{}.nro", lib.replace('-', "_"));
+            let built = crate_dir
+                .ancestors()
+                .take(4)
+                .map(|dir| {
+                    dir.join("target")
+                        .join("aarch64-skyline-switch")
+                        .join("release")
+                        .join(&nro_name)
+                })
+                .collect();
+            (crate_dir, nro_name, built)
+        }
     };
-    let nro_name = format!("lib{}.nro", lib.replace('-', "_"));
-    let built = crate_dir
-        .ancestors()
-        .take(4)
-        .map(|dir| {
-            dir.join("target")
-                .join("aarch64-skyline-switch")
-                .join("release")
-                .join(&nro_name)
-        })
-        .collect();
     let mut targets = sd_root.map(|sd| deployed_copies(sd, &nro_name)).unwrap_or_default();
     if let Some(sd) = sd_root {
         if let Some(renamed) = fingerprinted_plugin(sd, &crate_dir, files) {
