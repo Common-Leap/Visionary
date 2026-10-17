@@ -643,6 +643,11 @@ pub struct SourceIndex {
     pub helpers: std::sync::Arc<crate::project_helpers::ProjectHelpers>,
     /// Params the moveset overrides in code (`landing_attack_air_frame_f: 8.0`), for frame data.
     pub param_overrides: HashMap<String, f64>,
+    /// Scales each fighter's frame callback sets (`ModelModule::set_scale` and its siblings),
+    /// by fighter. See [`crate::fighter_scale`].
+    pub scales: HashMap<String, crate::fighter_scale::SourceScales>,
+    /// A `fighter_param` `scale` the moveset overrides through `param_config`.
+    pub param_scale: Option<f32>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -816,6 +821,14 @@ impl SourceIndex {
             sources.iter().map(|(_, text)| text.as_str()),
         ));
         index.param_overrides = crate::frame_data::source_param_overrides(
+            sources.iter().map(|(_, text)| text.as_str()),
+        );
+        index.scales = crate::fighter_scale::scan(
+            &sources,
+            |file| fighter_for_file(file, root, &fighter_scopes),
+            &index.consts,
+        );
+        index.param_scale = crate::fighter_scale::param_config_scale(
             sources.iter().map(|(_, text)| text.as_str()),
         );
         index.files = files;

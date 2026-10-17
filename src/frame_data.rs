@@ -253,6 +253,15 @@ pub fn load_params(
     params
 }
 
+/// `fighter`'s `scale` in `fighter_param.prc`, from the last of `fighter_roots` that has the file
+/// (see [`load_params`]).
+pub fn fighter_param_scale(fighter_roots: &[std::path::PathBuf], fighter: &str) -> Option<f32> {
+    let root = fighter_roots.iter().rev().find_map(|root| {
+        read_prc(&root.join("common").join("param").join("fighter_param.prc"))
+    })?;
+    field_number(fighter_row(&root, fighter)?, "scale").filter(|scale| *scale > 0.0)
+}
+
 fn read_prc(path: &Path) -> Option<prc::ParamStruct> {
     prc::open(path).ok()
 }

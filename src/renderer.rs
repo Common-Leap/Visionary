@@ -104,6 +104,10 @@ pub struct HitboxRenderState {
     /// Viewport preference: evaluate helper bone constraints. Set through
     /// [`Self::set_helper_bones`] so a change re-skins the model.
     helper_bones: bool,
+    /// The fighter's model scale (`ModelModule::scale`): its `fighter_param` `scale`, or what
+    /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
+    /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
+    model_scale: f32,
     /// A second fighter held by this one's `throw` bone, drawn as `render_models[1]`.
     victim: Option<ThrownVictim>,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
@@ -158,6 +162,7 @@ impl HitboxRenderState {
             model_hlpb: None,
             model_matl: None,
             helper_bones: true,
+            model_scale: 1.0,
             victim: None,
             weapon_skels: Vec::new(),
             last_frame: -1.0,
@@ -325,7 +330,8 @@ impl HitboxRenderState {
                     .and_then(|(_, a)| a.as_ref()),
                 anim,
             );
-            render_model.apply_anims(
+            let model_scale = self.model_scale;
+            render_model.apply_anims_with_skel_edit(
                 queue,
                 animations.iter().copied(),
                 skel,
@@ -333,6 +339,11 @@ impl HitboxRenderState {
                 hlpb,
                 &self.shared_data,
                 frame,
+                |bones| {
+                    if let Some(skel) = skel {
+                        scale_root_bones(bones, skel, model_scale);
+                    }
+                },
             );
         }
         self.pose_victim(queue, frame);
@@ -364,6 +375,7 @@ impl HitboxRenderState {
             self.render_models.push(render_model);
             self.victim = Some(ThrownVictim {
                 files: spec.model_files,
+                scale: spec.scale,
                 skel: folder.find_skel().cloned(),
                 hlpb: folder.find_hlpb().cloned(),
                 matl: folder.find_matl().cloned(),
@@ -372,6 +384,10 @@ impl HitboxRenderState {
             self.last_frame = -1.0;
         }
         let victim = self.victim.as_mut().expect("set above");
+        if victim.scale != spec.scale {
+            victim.scale = spec.scale;
+            self.last_frame = -1.0;
+        }
         if victim.anim.as_ref().map(|(path, _)| path) != spec.anim_path.as_ref() {
             victim.anim = spec.anim_path.and_then(|path| {
                 let anim = ssbh_data::anim_data::AnimData::from_file(&path).ok()?;
@@ -384,10 +400,11 @@ impl HitboxRenderState {
     /// Pose the victim for `frame`: its own thrown animation, with its `rot` bone placed on
     /// this fighter's `throw` bone, which is how the game carries a thrown fighter.
     fn pose_victim(&mut self, queue: &wgpu::Queue, frame: f32) {
-        let target = self
-            .victim
-            .as_ref()
-            .and_then(|_| self.bone_world_matrices_at(frame).get("throw").copied());
+        // The throw bone carries this fighter's model scale; the victim keeps its own.
+        let target = self.victim.as_ref().and_then(|victim| {
+            let throw = self.bone_world_matrices_at(frame).get("throw").copied()?;
+            Some(throw * glam::Mat4::from_scale(glam::Vec3::splat(victim.scale / self.model_scale)))
+        });
         let (Some(victim), Some(render_model)) = (&self.victim, self.render_models.get_mut(1))
         else {
             return;
@@ -481,6 +498,15 @@ impl HitboxRenderState {
         }
     }
 
+    /// Resize the fighter, mesh and overlay alike. See [`Self::model_scale`].
+    pub fn set_model_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+        if self.model_scale != scale {
+            self.model_scale = scale;
+            self.last_frame = -1.0;
+        }
+    }
+
     fn active_hlpb(&self) -> Option<&ssbh_data::hlpb_data::HlpbData> {
         self.model_hlpb.as_ref().filter(|_| self.helper_bones)
     }
@@ -517,7 +543,21 @@ impl HitboxRenderState {
             }
         };
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
-        compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame)
+        let mut matrices =
+            compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame);
+        if self.model_scale != 1.0 {
+            // The same as scaling the root bone, which is what the mesh gets.
+            let scale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale));
+            for matrix in matrices.values_mut() {
+                *matrix = scale * *matrix;
+            }
+        }
+        matrices
+    }
+
+    /// The model scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
+    pub fn model_scale(&self) -> f32 {
+        self.model_scale
     }
 }
 
@@ -527,10 +567,13 @@ pub struct VictimSpec {
     pub model_files: Vec<(String, std::path::PathBuf)>,
     /// The victim's thrown animation; `None` holds it in its rest pose.
     pub anim_path: Option<std::path::PathBuf>,
+    /// The victim's own model scale, its `fighter_param` `scale`.
+    pub scale: f32,
 }
 
 struct ThrownVictim {
     files: Vec<(String, std::path::PathBuf)>,
+    scale: f32,
     skel: Option<ssbh_data::skel_data::SkelData>,
     hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
     matl: Option<ssbh_data::matl_data::MatlData>,
@@ -555,6 +598,29 @@ fn constrain_bone_to_world(
     let (scale, rotation, translation) = (parent.inverse() * target).to_scale_rotation_translation();
     if let Some((_, bone)) = bones.iter_mut().find(|(i, _)| *i == index) {
         bone.set_current_trs(translation, rotation, scale);
+    }
+}
+
+/// Scale the skeleton's root bones by `scale`, which scales the whole fighter about its origin:
+/// what `ModelModule::set_scale` does to a fighter in game.
+fn scale_root_bones(
+    bones: &mut [(usize, ssbh_wgpu::animation::AnimatedBone)],
+    skel: &ssbh_data::skel_data::SkelData,
+    scale: f32,
+) {
+    use ssbh_wgpu::animation::{animate_skel_inner, AnimationTransforms};
+    if scale == 1.0 {
+        return;
+    }
+    // A root's world transform is its animated local one.
+    let mut sampled = Box::new(AnimationTransforms::from_skel(skel));
+    animate_skel_inner(&mut sampled, bones, &skel.bones, None);
+    for (index, bone) in bones.iter_mut() {
+        if bone.parent_index().is_none() {
+            let (bone_scale, rotation, translation) =
+                sampled.world_transforms[*index].to_scale_rotation_translation();
+            bone.set_current_trs(translation * scale, rotation, bone_scale * scale);
+        }
     }
 }
 

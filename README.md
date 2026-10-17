@@ -211,10 +211,21 @@ expression edits and reloads the loaded source or capture baseline.
 
 The toolbar in the viewport's top-left corner holds the display options:
 
-- **Helper bones** applies the model's `model.nuhlpb`, as the game does. Helper
-  bones (`H_` elbow, knee and similar helpers) then move the mesh and any
-  hitbox, hurtbox or effect placed on them. It is on by default. A move's
-  material animations (glows, colour changes, eye swaps) always play.
+- **⚙ Render settings** holds **Enable helper bones**, which applies the
+  model's `model.nuhlpb`, as the game does (SSBH Editor keeps the same option
+  in its Render Settings window). Helper bones (`H_` elbow, knee and similar
+  helpers) then move the mesh and any hitbox, hurtbox or effect placed on them.
+  It is on by default. A move's material animations (glows, colour changes, eye
+  swaps) always play.
+- **Scale** appears when the fighter isn't drawn at 1.0. The fighter starts at
+  its `fighter_param` `scale` (or the moveset's `param_config` override of it).
+  A linked moveset's frame callback (`on_line`) wins over that:
+  `ModelModule::set_scale` resizes the model and skeleton,
+  `AttackModule::set_attack_scale` the hitboxes, and `GrabModule::set_size_mul`
+  the grab boxes. Each call is read on its own, through any helper the moveset
+  wraps them in, so a helper that leaves one out leaves that scale alone.
+  Branches that only run on the results screen or on entry are skipped. Hover
+  the label to see each value and the line it came from.
 - **Thrown fighter** appears on throws. It shows a second fighter (Mario by
   default; any indexed fighter or any fighter in the vanilla dump) whose `rot`
   bone sits on the thrower's `throw` bone, playing its own thrown animation.

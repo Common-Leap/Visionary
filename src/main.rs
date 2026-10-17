@@ -17,6 +17,7 @@ mod eff_export;
 mod eff_subsections;
 mod effect_pool;
 mod effects;
+mod fighter_scale;
 mod emulator;
 mod frame_data;
 mod game_link;

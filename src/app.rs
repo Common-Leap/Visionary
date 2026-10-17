@@ -3057,6 +3057,8 @@ pub struct VisionaryApp {
     primary_tab: PrimaryEditorTab,
     /// Params frame data needs for one `(fighter, move kind)`, read once rather than per frame.
     frame_params_cache: Option<(String, String, crate::frame_data::FrameParams)>,
+    /// [`Self::viewport_scales`], keyed by everything it reads.
+    viewport_scales_cache: Option<(String, ViewportScales)>,
     timeline_filters: TimelineFilters,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
@@ -3522,6 +3524,7 @@ impl VisionaryApp {
             hurtbox_condition_edit_value: "0".into(),
             primary_tab: PrimaryEditorTab::Collisions,
             frame_params_cache: None,
+            viewport_scales_cache: None,
             timeline_filters: load_timeline_filters(),
             selected_command: None,
             show_effect_advanced: false,
@@ -9328,6 +9331,77 @@ impl VisionaryApp {
         }))
     }
 
+    /// The scales the viewport draws the selected fighter at: what its frame callback sets, over
+    /// its `fighter_param` `scale` (or the moveset's `param_config` override of it).
+    fn viewport_scales(&mut self) -> ViewportScales {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| entry.name.clone())
+        else {
+            return ViewportScales::default();
+        };
+        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
+        let index = self.acmd_src.as_ref().filter(|index| index.has_fighter(&fighter));
+        let source = index.and_then(|index| {
+            let scales = index
+                .scales
+                .get(&fighter)
+                // A project that never names its fighter keeps its scripts under "".
+                .or_else(|| (index.scales.len() == 1).then(|| index.scales.values().next()).flatten())?;
+            Some((index.root.clone(), scales.clone()))
+        });
+        let override_scale = index.and_then(|index| index.param_scale);
+        let key = format!("{fighter}|{roots:?}|{source:?}|{override_scale:?}");
+        if let Some((cached, scales)) = &self.viewport_scales_cache {
+            if *cached == key {
+                return scales.clone();
+            }
+        }
+        let base = match override_scale {
+            Some(value) => ScaleValue {
+                value,
+                source: "the moveset's param_config override of fighter_param scale".to_string(),
+            },
+            None => match crate::frame_data::fighter_param_scale(&roots, &fighter) {
+                Some(value) => ScaleValue {
+                    value,
+                    source: "fighter_param.prc scale".to_string(),
+                },
+                None => ScaleValue {
+                    value: 1.0,
+                    source: "default (no fighter_param scale found)".to_string(),
+                },
+            },
+        };
+        let from_call = |call: Option<&crate::fighter_scale::ScaleCall>, root: &Path| {
+            call.map(|call| ScaleValue {
+                value: call.value,
+                source: format!(
+                    "{}:{}",
+                    call.file.strip_prefix(root).unwrap_or(&call.file).display(),
+                    call.line
+                ),
+            })
+        };
+        let (model, attack, grab) = match &source {
+            Some((root, scales)) => (
+                from_call(scales.model.as_ref(), root),
+                from_call(scales.attack.as_ref(), root),
+                from_call(scales.grab.as_ref(), root),
+            ),
+            None => (None, None, None),
+        };
+        let scales = ViewportScales {
+            model: model.unwrap_or_else(|| base.clone()),
+            attack: attack.unwrap_or_else(|| base.clone()),
+            grab: grab.unwrap_or(base),
+        };
+        self.viewport_scales_cache = Some((key, scales.clone()));
+        scales
+    }
+
     /// One line of frame data above the collision list: what a moveset author checks after
     /// every hitbox change. Each figure explains its own source on hover.
     fn draw_frame_data_strip(&mut self, ui: &mut Ui) {
@@ -13893,10 +13967,14 @@ impl VisionaryApp {
                 })
                 .unwrap_or_default();
             motions.sort();
+            let roots: Vec<PathBuf> =
+                self.all_roots().iter().map(|root| root.join("fighter")).collect();
+            let scale = crate::frame_data::fighter_param_scale(&roots, &key.0).unwrap_or(1.0);
             self.victim_cache = Some(VictimCache {
                 key,
                 model_files: model.model_files(),
                 motions,
+                scale,
             });
         }
         self.victim_cache.as_ref()
@@ -13930,6 +14008,7 @@ impl VisionaryApp {
         Some(crate::renderer::VictimSpec {
             model_files: cache.model_files.clone(),
             anim_path,
+            scale: cache.scale,
         })
     }
 
@@ -14050,22 +14129,66 @@ impl VisionaryApp {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let response = ui.add_enabled(
-                        has_helper_bones,
-                        egui::Checkbox::new(&mut self.helper_bones, "Helper bones"),
-                    );
-                    if response.changed() {
-                        save_helper_bones(self.helper_bones);
-                        ui.ctx().request_repaint();
+                    // Render settings live behind a button, as SSBH Editor keeps them in their
+                    // own window: they are rarely changed and shouldn't crowd the move controls.
+                    let (gear, _) = egui::containers::menu::MenuButton::new("⚙")
+                        .config(
+                            egui::containers::menu::MenuConfig::new()
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                        )
+                        .ui(ui, |ui| {
+                            ui.label(RichText::new("Animation").strong());
+                            let response = ui.add_enabled(
+                                has_helper_bones,
+                                egui::Checkbox::new(&mut self.helper_bones, "Enable helper bones"),
+                            );
+                            if response.changed() {
+                                save_helper_bones(self.helper_bones);
+                                ui.ctx().request_repaint();
+                            }
+                            response.on_hover_text(if has_helper_bones {
+                                "Apply the model's helper bone constraints (model.nuhlpb), as the \
+                                 game does. They move H_ bones such as elbow and knee helpers, \
+                                 which changes the mesh and any hitbox, hurtbox or effect placed \
+                                 on those bones."
+                            } else {
+                                "This model has no model.nuhlpb. The saved preference is kept for \
+                                 models that do."
+                            });
+                        });
+                    gear.on_hover_text("Render settings");
+                    let scales = self.viewport_scales();
+                    if [&scales.model, &scales.attack, &scales.grab]
+                        .iter()
+                        .any(|scale| (scale.value - 1.0).abs() > 1e-4)
+                    {
+                        ui.separator();
+                        let uniform = scales.attack.value == scales.model.value
+                            && scales.grab.value == scales.model.value;
+                        let text = if uniform {
+                            format!("Scale {:.2}", scales.model.value)
+                        } else {
+                            format!(
+                                "Scale {:.2} · hit {:.2} · grab {:.2}",
+                                scales.model.value, scales.attack.value, scales.grab.value
+                            )
+                        };
+                        ui.label(RichText::new(text).small().weak()).on_hover_text(format!(
+                            "The fighter is drawn at the scales the game would give it:\n\n\
+                             Model (ModelModule::set_scale): {:.3}, from {}\n\
+                             Hitboxes (AttackModule::set_attack_scale): {:.3}, from {}\n\
+                             Grab boxes (GrabModule::set_size_mul): {:.3}, from {}\n\n\
+                             A call in the fighter's frame callback (on_line) wins over the \
+                             fighter_param scale. Branches that only run on the results screen \
+                             or on entry are skipped.",
+                            scales.model.value,
+                            scales.model.source,
+                            scales.attack.value,
+                            scales.attack.source,
+                            scales.grab.value,
+                            scales.grab.source,
+                        ));
                     }
-                    response.on_hover_text(if has_helper_bones {
-                        "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
-                         They move H_ bones such as elbow and knee helpers, which changes the mesh \
-                         and any hitbox, hurtbox or effect placed on those bones."
-                    } else {
-                        "This model has no model.nuhlpb. The saved preference is kept for models \
-                         that do."
-                    });
                     if self.selected_move_is_throw() {
                         ui.separator();
                         self.draw_thrown_victim_controls(ui);
@@ -34547,11 +34670,13 @@ impl eframe::App for VisionaryApp {
 
                 // Camera controls — apply to render state
                 let victim = self.current_victim_spec();
+                let viewport_scales = self.viewport_scales();
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
                         // Before the overlay reads bone matrices below, so both see one setting.
                         rs.set_helper_bones(self.helper_bones);
+                        rs.set_model_scale(viewport_scales.model.value);
                         rs.set_victim(&wgpu_state.device, &wgpu_state.queue, victim);
                         // Left drag: pan in camera plane (left/right + up/down)
                         if response.dragged_by(egui::PointerButton::Primary) {
@@ -34879,21 +35004,13 @@ impl eframe::App for VisionaryApp {
                                 .or_else(|| bone_matrices.get(&hb.bone_name.to_lowercase()))
                                 .copied()
                                 .unwrap_or(glam::Mat4::IDENTITY);
-
-                            let bone_mat = if is_system_bone(&hb.bone_name) {
-                                // Keep only the translation — offsets are world-space
-                                glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                            } else {
-                                bone_mat
-                            };
-
-                            // Transform offset from bone local space to world space
-                            let offset = glam::Vec3::new(hb.offset_x, hb.offset_y, hb.offset_z);
-                            let world_pos = bone_mat.transform_point3(offset);
-
-                            let capsule_world_end = hb.capsule_end.map(|[ex, ey, ez]| {
-                                bone_mat.transform_point3(glam::Vec3::new(ex, ey, ez))
-                            });
+                            let (world_pos, capsule_world_end, world_radius) =
+                                collision_world_placement(
+                                    bone_mat,
+                                    hb,
+                                    rs.model_scale(),
+                                    viewport_scales.collision(hb.category),
+                                );
                             let launch_center = capsule_world_end
                                 .map(|world_end| (world_pos + world_end) * 0.5)
                                 .unwrap_or(world_pos);
@@ -34905,15 +35022,15 @@ impl eframe::App for VisionaryApp {
                                 ProjectedCapsule {
                                     world_start: world_pos,
                                     world_end: capsule_world_end,
-                                    world_radius: hb.size,
+                                    world_radius,
                                     stroke,
                                     fill,
                                 },
                             );
                             if let Some(label_pos) = label_pos {
                                 let label_radius = rs
-                                    .world_radius_to_screen(world_pos, hb.size, rect)
-                                    .unwrap_or(hb.size * 4.0)
+                                    .world_radius_to_screen(world_pos, world_radius, rect)
+                                    .unwrap_or(world_radius * 4.0)
                                     .max(4.0);
                                 ui.painter().text(
                                     label_pos + egui::vec2(label_radius + 2.0, 0.0),
@@ -34926,7 +35043,7 @@ impl eframe::App for VisionaryApp {
 
                             if hb.category == 0 {
                                 let (direction, _) = hitbox_launch_direction(hb.angle);
-                                let launch_end = launch_center + direction * hb.size;
+                                let launch_end = launch_center + direction * world_radius;
                                 if let (Some(screen_center), Some(screen_end)) = (
                                     rs.world_to_screen(launch_center, rect),
                                     rs.world_to_screen(launch_end, rect),
@@ -34992,26 +35109,14 @@ impl eframe::App for VisionaryApp {
                                     else {
                                         continue;
                                     };
-                                    let bone_mat = if is_system_bone(&hb.bone_name) {
-                                        glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                                    } else {
-                                        bone_mat
-                                    };
-                                    let start = bone_mat.transform_point3(glam::Vec3::new(
-                                        hb.offset_x,
-                                        hb.offset_y,
-                                        hb.offset_z,
-                                    ));
-                                    let center = hb
-                                        .capsule_end
-                                        .map(|[x, y, z]| {
-                                            (start
-                                                + bone_mat
-                                                    .transform_point3(glam::Vec3::new(x, y, z)))
-                                                * 0.5
-                                        })
-                                        .unwrap_or(start);
-                                    (center, hb.size.max(0.5))
+                                    let (start, end, radius) = collision_world_placement(
+                                        bone_mat,
+                                        hb,
+                                        rs.model_scale(),
+                                        viewport_scales.collision(hb.category),
+                                    );
+                                    let center = end.map(|end| (start + end) * 0.5).unwrap_or(start);
+                                    (center, radius.max(0.5))
                                 };
                                 let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
                                     continue;
@@ -35279,6 +35384,34 @@ fn hurtbox_render_descriptors(
             (status != crate::data::HurtboxStatus::Off).then_some((index, status))
         })
         .collect()
+}
+
+/// Where a bone-placed collision box sits: `(start, capsule end, radius)` in world space.
+///
+/// `bone_mat` already carries the fighter's `model_scale`, so it moves the box's bone. The box's
+/// own offset and radius take `collision_scale` instead (`AttackModule::set_attack_scale` or
+/// `GrabModule::set_size_mul`); with all scales equal, the box scales with the model. A system
+/// bone (`top`, `trans`, ...) gives only its position, as its offsets are in world axes.
+fn collision_world_placement(
+    bone_mat: glam::Mat4,
+    hb: &crate::data::Hitbox,
+    model_scale: f32,
+    collision_scale: f32,
+) -> (glam::Vec3, Option<glam::Vec3>, f32) {
+    let bone_mat = if is_system_bone(&hb.bone_name) {
+        glam::Mat4::from_translation(bone_mat.col(3).truncate())
+            * glam::Mat4::from_scale(glam::Vec3::splat(model_scale))
+    } else {
+        bone_mat
+    };
+    let offset_scale = collision_scale / model_scale;
+    let place =
+        |[x, y, z]: [f32; 3]| bone_mat.transform_point3(glam::Vec3::new(x, y, z) * offset_scale);
+    (
+        place([hb.offset_x, hb.offset_y, hb.offset_z]),
+        hb.capsule_end.map(place),
+        hb.size * collision_scale,
+    )
 }
 
 fn hurtbox_world_endpoints(
@@ -37554,11 +37687,53 @@ struct VictimFighter {
     slots: Vec<u8>,
 }
 
+/// One of [`ViewportScales`], with where it came from for the toolbar's tooltip.
+#[derive(Debug, Clone, PartialEq)]
+struct ScaleValue {
+    value: f32,
+    source: String,
+}
+
+impl Default for ScaleValue {
+    fn default() -> Self {
+        Self {
+            value: 1.0,
+            source: "default".to_string(),
+        }
+    }
+}
+
+/// The scales the viewport draws a fighter at. Each is set by its own call in game, so a moveset
+/// can change one and not the others.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ViewportScales {
+    /// `ModelModule::set_scale`: the mesh and skeleton, so every bone-placed box moves with it.
+    model: ScaleValue,
+    /// `AttackModule::set_attack_scale`: hitbox radius and offset.
+    attack: ScaleValue,
+    /// `GrabModule::set_size_mul`: grab box radius and offset.
+    grab: ScaleValue,
+}
+
+impl ViewportScales {
+    /// The radius and offset multiplier for a box of `category` (see [`crate::data::Hitbox`]).
+    /// Wind areas and search boxes aren't attacks or grabs and keep their size.
+    fn collision(&self, category: u8) -> f32 {
+        match category {
+            0 => self.attack.value,
+            1 => self.grab.value,
+            _ => 1.0,
+        }
+    }
+}
+
 struct VictimCache {
     key: (String, u8),
     model_files: Vec<(String, PathBuf)>,
     /// `(motion name, animation)` of every thrown motion in the victim's motion list, by name.
     motions: Vec<(String, PathBuf)>,
+    /// The victim's `fighter_param` `scale`.
+    scale: f32,
 }
 
 fn encode_thrown_victim(pref: &ThrownVictimPref) -> String {
