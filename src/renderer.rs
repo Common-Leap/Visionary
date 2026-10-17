@@ -87,6 +87,9 @@ pub struct HitboxRenderState {
     pub current_height: u32,
     /// Cached selected-move animation data — reloaded only when the path changes.
     cached_anim: Option<(std::path::PathBuf, ssbh_data::anim_data::AnimData)>,
+    /// The mesh names both cached animations' visibility tracks were matched against (see
+    /// [`exact_visibility_tracks`]); a different set of loaded meshes re-reads them.
+    cached_vis_meshes: u64,
     /// Cached default eyelid animation data. This is kept separately from the selected move
     /// animation because the eyelid asset is a visibility baseline, not a second source of bone
     /// or material animation.
@@ -139,6 +142,7 @@ impl HitboxRenderState {
             current_width: 0,
             current_height: 0,
             cached_anim: None,
+            cached_vis_meshes: 0,
             cached_default_anim: None,
             cached_skel: None,
             weapon_skels: Vec::new(),
@@ -228,7 +232,20 @@ impl HitboxRenderState {
         skel_path: Option<&Path>,
         frame: f32,
     ) {
-        self.update_default_animation(default_anim_path);
+        let meshes = self.mesh_names();
+        let meshes_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            meshes.hash(&mut hasher);
+            hasher.finish()
+        };
+        if meshes_key != self.cached_vis_meshes {
+            // Both animations' track names were fitted to the previous meshes.
+            self.cached_anim = None;
+            self.cached_default_anim = None;
+            self.cached_vis_meshes = meshes_key;
+        }
+        self.update_default_animation(default_anim_path, &meshes);
 
         // Reload anim only when path changes
         if let Some(path) = anim_path {
@@ -240,7 +257,10 @@ impl HitboxRenderState {
             if needs_load {
                 self.cached_anim = ssbh_data::anim_data::AnimData::from_file(path)
                     .ok()
-                    .map(|a| (path.to_path_buf(), a));
+                    .map(|mut a| {
+                        exact_visibility_tracks(&mut a, &meshes);
+                        (path.to_path_buf(), a)
+                    });
             }
         } else {
             self.cached_anim = None;
@@ -286,7 +306,15 @@ impl HitboxRenderState {
         }
     }
 
-    fn update_default_animation(&mut self, path: Option<&Path>) {
+    /// Every mesh name of every loaded model.
+    fn mesh_names(&self) -> Vec<String> {
+        self.render_models
+            .iter()
+            .flat_map(|model| model.meshes.iter().map(|mesh| mesh.name.clone()))
+            .collect()
+    }
+
+    fn update_default_animation(&mut self, path: Option<&Path>, meshes: &[String]) {
         if let Some(path) = path {
             let needs_load = self
                 .cached_default_anim
@@ -298,7 +326,11 @@ impl HitboxRenderState {
                     path.to_path_buf(),
                     ssbh_data::anim_data::AnimData::from_file(path)
                         .ok()
-                        .map(|anim| visibility_only_animation(&anim)),
+                        .map(|anim| {
+                            let mut anim = visibility_only_animation(&anim);
+                            exact_visibility_tracks(&mut anim, meshes);
+                            anim
+                        }),
                 ));
             }
         } else {
@@ -380,6 +412,38 @@ fn visibility_only_animation(
             .filter(|group| group.group_type == GroupType::Visibility)
             .cloned()
             .collect(),
+    }
+}
+
+/// Narrow each visibility track to the meshes the game gives it.
+///
+/// A visibility track names a mesh without its `_VIS_O_OBJShape` suffix, and ssbh_wgpu applies
+/// it to every mesh whose name merely *starts with* the track's name. That reaches too far
+/// whenever one mesh's name extends another's: Shy Guy's `mace_spike` track (on) also switched
+/// on `mace_spikeFLIP_VIS_O_OBJShape`, the left-hand mace its `mace_spikeFLIP` track keeps off.
+/// Which won depended on the order the tracks are stored in, so the forward smash showed one
+/// mace and its reverse showed both.
+///
+/// A track that has an exact match — a mesh named `<track>_VIS…` — is renamed to
+/// `<track>_VIS`, which the prefix rule can only match exactly. A track with no exact match is
+/// left alone, so any model that does rely on prefix matching renders as before.
+fn exact_visibility_tracks(anim: &mut ssbh_data::anim_data::AnimData, meshes: &[String]) {
+    use ssbh_data::anim_data::GroupType;
+    for group in &mut anim.groups {
+        if group.group_type != GroupType::Visibility {
+            continue;
+        }
+        for node in &mut group.nodes {
+            let exact = format!("{}_VIS", node.name);
+            let has_exact = meshes.iter().any(|mesh| mesh.starts_with(&exact));
+            let overreaches = meshes
+                .iter()
+                .any(|mesh| mesh.starts_with(&node.name) && !mesh.starts_with(&exact) && *mesh != node.name);
+            let named_bare = meshes.iter().any(|mesh| *mesh == node.name);
+            if has_exact && overreaches && !named_bare {
+                node.name = exact;
+            }
+        }
     }
 }
 
@@ -679,6 +743,53 @@ mod tests {
         assert_eq!(filtered.final_frame_index, animation.final_frame_index);
         assert_eq!(filtered.groups.len(), 1);
         assert_eq!(filtered.groups[0].group_type, GroupType::Visibility);
+    }
+
+    #[test]
+    fn a_visibility_track_reaches_only_its_own_mesh() {
+        use ssbh_data::anim_data::{AnimData, GroupData, GroupType, NodeData, TrackData, TrackValues};
+
+        let track = |name: &str, on: bool| NodeData {
+            name: name.into(),
+            tracks: vec![TrackData {
+                name: "Visibility".into(),
+                compensate_scale: false,
+                transform_flags: Default::default(),
+                values: TrackValues::Boolean(vec![on]),
+            }],
+        };
+        // The reverse forward smash stores the FLIP track first, so the plain one won last.
+        let mut anim = AnimData {
+            major_version: 2,
+            minor_version: 1,
+            final_frame_index: 0.0,
+            groups: vec![GroupData {
+                group_type: GroupType::Visibility,
+                nodes: vec![track("mace_spikeFLIP", false), track("mace_spike", true), track("Eye", true)],
+            }],
+        };
+        let meshes: Vec<String> = [
+            "mace_spike_VIS_O_OBJShape",
+            "mace_spikeFLIP_VIS_O_OBJShape",
+            "EyeL_VIS_O_OBJShape",
+            "EyeR_VIS_O_OBJShape",
+        ]
+        .map(String::from)
+        .to_vec();
+        super::exact_visibility_tracks(&mut anim, &meshes);
+
+        let mut visible: Vec<(String, bool)> = meshes.iter().map(|m| (m.clone(), true)).collect();
+        ssbh_wgpu::animation::animate_visibility(&anim, 0.0, &mut visible);
+        assert_eq!(
+            visible,
+            [
+                ("mace_spike_VIS_O_OBJShape".to_string(), true),
+                ("mace_spikeFLIP_VIS_O_OBJShape".to_string(), false),
+                // No exact `Eye_VIS` mesh: the prefix rule is left to work as it did.
+                ("EyeL_VIS_O_OBJShape".to_string(), true),
+                ("EyeR_VIS_O_OBJShape".to_string(), true),
+            ]
+        );
     }
 
     #[test]

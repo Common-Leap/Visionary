@@ -2823,6 +2823,134 @@ fn materialize_effect_calls(
     effects
 }
 
+/// The parts of a spawn that say which call in the script it is: the graphic (compared by hash,
+/// so a `0x…` spelling matches its name), the spawn function, the bone and the frame.
+fn effect_call_identity(call: &crate::data::EffectCall) -> (u64, String, String, u32) {
+    (
+        effect_name_hash(&call.effect_name),
+        call.spawn_func.to_ascii_lowercase(),
+        call.bone_name.to_ascii_lowercase(),
+        call.active_start,
+    )
+}
+
+/// What [`reconcile_saved_effects`] had to discard.
+#[derive(Debug, Default, PartialEq)]
+struct SavedEffectsReconcile {
+    /// The saved full call list was made against a different version of the script.
+    stale_full: bool,
+    /// Edits whose target call no longer exists in the script.
+    dropped_edits: usize,
+    /// Edits whose target call moved to another position and were re-anchored to it.
+    reanchored_edits: usize,
+}
+
+/// A move's saved effect edits, checked against the script as it is now.
+///
+/// `effect_call_full` is the edited call list as it stood when it was saved, and it is only
+/// meaningful against the script it was made from. A moveset's script changes under it — Shy
+/// Guy's forward smash was saved while Visionary still showed the vanilla Pac-Man script — and
+/// applying the old list afterwards replaced the move's real seven effects with one stale call.
+///
+/// Every writer keeps the list and the edit log in step: removed script calls stay in the list
+/// (disabled), added calls are `Add` edits, and every other change is a `Modify` edit. So a list
+/// is current exactly when it is as long as the script plus its adds, and every script call no
+/// edit touches is still in its place. Otherwise the edits are reapplied on their own, each
+/// re-anchored to its call by identity when the script has moved it, and dropped when the call
+/// it was made for is gone.
+fn reconcile_saved_effects(
+    pristine: &[crate::data::EffectCall],
+    full: Option<&Vec<crate::data::EffectCall>>,
+    edits: Option<&[crate::data::EffectCallEdit]>,
+) -> (
+    Vec<crate::data::EffectCall>,
+    Vec<crate::data::EffectCallEdit>,
+    SavedEffectsReconcile,
+) {
+    let mut report = SavedEffectsReconcile::default();
+    let mut kept: Vec<crate::data::EffectCallEdit> = Vec::new();
+    for edit in edits.unwrap_or_default() {
+        let targets_script = !matches!(edit.op, crate::data::EffectCallOp::Add(_));
+        let Some(was) = edit.pristine.as_ref().filter(|_| targets_script) else {
+            kept.push(edit.clone());
+            continue;
+        };
+        let identity = effect_call_identity(was);
+        if pristine
+            .get(edit.index)
+            .is_some_and(|call| effect_call_identity(call) == identity)
+        {
+            kept.push(edit.clone());
+            continue;
+        }
+        let mut matches = pristine
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| effect_call_identity(call) == identity)
+            .map(|(index, _)| index);
+        match (matches.next(), matches.next()) {
+            (Some(index), None) if !kept.iter().any(|e| e.index == index) => {
+                let mut edit = edit.clone();
+                edit.index = index;
+                kept.push(edit);
+                report.reanchored_edits += 1;
+            }
+            _ => report.dropped_edits += 1,
+        }
+    }
+    let adds = kept
+        .iter()
+        .filter(|edit| matches!(edit.op, crate::data::EffectCallOp::Add(_)))
+        .count();
+    if let Some(full) = full {
+        let current = report.dropped_edits == 0
+            && report.reanchored_edits == 0
+            && full.len() == pristine.len() + adds
+            && pristine.iter().enumerate().all(|(index, call)| {
+                kept.iter().any(|edit| {
+                    edit.index == index && !matches!(edit.op, crate::data::EffectCallOp::Add(_))
+                }) || effect_call_identity(&full[index]) == effect_call_identity(call)
+            });
+        if current {
+            let calls = full
+                .iter()
+                .cloned()
+                .map(crate::data::EffectCall::normalized_timing)
+                .collect();
+            return (calls, kept, report);
+        }
+        report.stale_full = true;
+    }
+    let calls = materialize_effect_calls(pristine, Some(&kept));
+    (calls, kept, report)
+}
+
+/// Spell out effect names stored as raw `0x…` hashes wherever `names` knows them.
+///
+/// A capture taken before a name was known (ParamLabels still loading, or an effect that lives
+/// only in a costume's own `.eff`) is saved as its hash, and nothing ever revisited it, so the
+/// panel kept showing `0xfcb698218` for what is `sys_smash_flash`. The hash is the same either
+/// way, so exports and live rules are unaffected.
+fn resolve_raw_effect_names(calls: &mut [crate::data::EffectCall], names: &HashMap<u64, String>) {
+    let resolve = |name: &mut String| {
+        if let Some(hex) = name.strip_prefix("0x") {
+            if let Some(known) = u64::from_str_radix(hex, 16)
+                .ok()
+                .and_then(|hash| names.get(&hash))
+                .filter(|known| !known.starts_with("0x"))
+            {
+                *name = known.clone();
+            }
+        }
+    };
+    for call in calls {
+        resolve(&mut call.effect_name);
+        if let Some(alt) = call.effect_name_alt.as_mut() {
+            resolve(alt);
+        }
+    }
+}
+
 /// Why the source pane has no script to edit. Each state gets its own answer, because
 /// "nothing here" is exactly the unhelpful thing this window used to say.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3122,6 +3250,10 @@ pub struct VisionaryApp {
     live_overrides: crate::game_link::LiveOverrides,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
+    /// Entry names read from each `.eff` file, keyed by path and checked against its modified
+    /// time. See [`VisionaryApp::fighter_effect_names`].
+    eff_name_cache:
+        std::cell::RefCell<HashMap<PathBuf, (Option<std::time::SystemTime>, Vec<String>)>>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3451,6 +3583,7 @@ impl VisionaryApp {
             game_link: crate::game_link::GameLink::default(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
+            eff_name_cache: Default::default(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -16152,23 +16285,13 @@ impl VisionaryApp {
             self.state.expression_script_edits.get(&key).cloned(),
         )
         .0;
-        let effects = self
-            .state
-            .effect_call_full
-            .get(&key)
-            .cloned()
-            .map(|calls| {
-                calls
-                    .into_iter()
-                    .map(crate::data::EffectCall::normalized_timing)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                materialize_effect_calls(
-                    &effect_pristine,
-                    self.state.effect_call_edits.get(&key).map(Vec::as_slice),
-                )
-            });
+        // Same check the open move gets: a saved list made against an older script is not
+        // replayed over the current one.
+        let (effects, _, _) = reconcile_saved_effects(
+            &effect_pristine,
+            self.state.effect_call_full.get(&key),
+            self.state.effect_call_edits.get(&key).map(Vec::as_slice),
+        );
         let record = self
             .state
             .edit_log
@@ -16741,18 +16864,66 @@ impl VisionaryApp {
         let Some(mv) = self.current_move_key() else {
             return;
         };
-        if let Some(full) = self.state.effect_call_full.get(&mv) {
-            self.state.effects = full
-                .iter()
-                .cloned()
-                .map(crate::data::EffectCall::normalized_timing)
-                .collect();
-            return;
+        let names = self.effect_reverse_map();
+        resolve_raw_effect_names(&mut self.state.effects_pristine, &names);
+        let (mut effects, kept, report) = reconcile_saved_effects(
+            &self.state.effects_pristine,
+            self.state.effect_call_full.get(&mv),
+            self.state.effect_call_edits.get(&mv).map(Vec::as_slice),
+        );
+        resolve_raw_effect_names(&mut effects, &names);
+        self.state.effects = effects;
+        if report != SavedEffectsReconcile::default() {
+            // Store what is shown, so the next save writes the reconciled record rather than the
+            // stale one, and the move does not have to be reconciled again.
+            if kept.is_empty() {
+                self.state.effect_call_edits.remove(&mv);
+            } else {
+                self.state.effect_call_edits.insert(mv.clone(), kept);
+            }
+            if report.stale_full {
+                if self.state.effect_call_edits.contains_key(&mv) {
+                    self.state
+                        .effect_call_full
+                        .insert(mv.clone(), self.state.effects.clone());
+                } else {
+                    self.state.effect_call_full.remove(&mv);
+                }
+            }
+            let mut parts = Vec::new();
+            if report.stale_full {
+                parts.push(
+                    "the saved effect list for this move was made against an older version of \
+                     its script, so the script's effects are shown with your edits reapplied"
+                        .to_string(),
+                );
+            }
+            if report.reanchored_edits > 0 {
+                parts.push(format!(
+                    "{} effect edit(s) followed their call to its new place in the script",
+                    report.reanchored_edits
+                ));
+            }
+            if report.dropped_edits > 0 {
+                parts.push(format!(
+                    "{} effect edit(s) were dropped because the call they changed is no longer \
+                     in the script",
+                    report.dropped_edits
+                ));
+            }
+            self.state.status = format!("{mv}: {}.", parts.join("; "));
+        } else if let Some(edits) = self.state.effect_call_edits.get_mut(&mv) {
+            for edit in edits.iter_mut() {
+                if let crate::data::EffectCallOp::Modify(call) | crate::data::EffectCallOp::Add(call) =
+                    &mut edit.op
+                {
+                    resolve_raw_effect_names(std::slice::from_mut(call), &names);
+                }
+            }
         }
-        let Some(edits) = self.state.effect_call_edits.get(&mv) else {
-            return;
-        };
-        self.state.effects = materialize_effect_calls(&self.state.effects_pristine, Some(edits));
+        if let Some(full) = self.state.effect_call_full.get_mut(&mv) {
+            resolve_raw_effect_names(full, &names);
+        }
     }
 
     /// Repair legacy one-shot ranges in every persisted effect snapshot before it is saved or
@@ -19629,6 +19800,57 @@ impl VisionaryApp {
             .collect()
     }
 
+    /// Lowercase entry names from every `.eff` the selected fighter has under any data or mod
+    /// root: the base file and each costume's, vanilla and modded alike. Files are parsed once
+    /// and re-read only when they change on disk.
+    fn fighter_effect_names(&self) -> Vec<String> {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+        else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = fighter.effect_dir.iter().cloned().collect();
+        for root in self.all_roots() {
+            dirs.push(root.join("effect").join("fighter").join(&fighter.name));
+        }
+        let mut files: Vec<PathBuf> = Vec::new();
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("eff"))
+                    && !files.contains(&path)
+                {
+                    files.push(path);
+                }
+            }
+        }
+        let mut cache = self.eff_name_cache.borrow_mut();
+        let mut names = Vec::new();
+        for path in files {
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let fresh = cache
+                .get(&path)
+                .is_some_and(|(stamp, _)| *stamp == modified);
+            if !fresh {
+                let read = crate::effects::entry_names(&path).unwrap_or_default();
+                cache.insert(path.clone(), (modified, read));
+            }
+            if let Some((_, read)) = cache.get(&path) {
+                names.extend(read.iter().map(|name| name.to_lowercase()));
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn effect_reverse_map(&self) -> HashMap<u64, String> {
         // Resolved names are LOWERCASE everywhere (matches live-kind names and the case
         // the hashes are computed on) — the file's original case leaked UPPERCASE names
@@ -19646,6 +19868,12 @@ impl VisionaryApp {
                 (!label.is_empty()).then(|| (*hash, label.to_lowercase()))
             })
             .collect();
+        // Every effect file this fighter has, not just the one the effect editor opened: a
+        // moveset's custom effects usually live in its costume files (`ef_pacman_c40.eff`), and
+        // reading only `ef_pacman.eff` left every one of them showing as a hash.
+        for name in self.fighter_effect_names() {
+            m.insert(hash40::hash40(&name).0, name);
+        }
         if let Some(idx) = self
             .current_eff_path
             .as_deref()
@@ -45003,5 +45231,103 @@ mod donor_capture_tests {
             chosen.is_empty(),
             "replay must not borrow another move's live run"
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_effect_tests {
+    use super::*;
+    use crate::data::{EffectCall, EffectCallEdit, EffectCallOp};
+
+    fn call(name: &str, frame: u32) -> EffectCall {
+        let mut call = crate::acmd::parse_effect_script(&format!(
+            "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, {frame}.0);\n    if macros::is_excute(agent) {{\n        macros::EFFECT(agent, Hash40::new(\"{name}\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);\n    }}\n}}\n"
+        ))
+        .to_effect_calls()
+        .remove(0);
+        call.normalize_timing();
+        call
+    }
+
+    /// Shy Guy's forward smash as the saved project held it: a one-call list from the vanilla
+    /// script it was first opened against (a raw-hash `sys_smash_flash` on frame 43), and an
+    /// edit removing the flash that both scripts open with.
+    #[test]
+    fn a_full_list_saved_against_another_script_is_not_shown_over_this_one() {
+        let pristine = vec![
+            call("sys_smash_flash", 1),
+            call("shyguy_mace_arc_wind", 17),
+            call("sys_attack_impact", 21),
+        ];
+        let stale = vec![{
+            let mut c = call("sys_smash_flash", 43);
+            c.effect_name = format!("{:#x}", hash40::hash40("sys_smash_flash").0);
+            c
+        }];
+        let edits = vec![EffectCallEdit {
+            index: 0,
+            op: EffectCallOp::Remove,
+            pristine: Some(call("sys_smash_flash", 1)),
+        }];
+        let (calls, kept, report) = reconcile_saved_effects(&pristine, Some(&stale), Some(&edits));
+        assert!(report.stale_full);
+        assert_eq!(calls.len(), 3, "the script's effects come back");
+        assert!(calls[0].disabled, "the removal still applies to the call it was made for");
+        assert_eq!(calls[1].effect_name, "shyguy_mace_arc_wind");
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn a_current_full_list_is_used_as_saved() {
+        let pristine = vec![call("a", 1), call("b", 5)];
+        let mut moved = call("b", 5);
+        moved.offset = [1.0, 2.0, 3.0];
+        let full = vec![
+            // Same call spelled as its hash: still the same call.
+            {
+                let mut c = call("a", 1);
+                c.effect_name = format!("{:#x}", hash40::hash40("a").0);
+                c
+            },
+            moved.clone(),
+            call("added", 9),
+        ];
+        let edits = vec![
+            EffectCallEdit { index: 1, op: EffectCallOp::Modify(moved), pristine: Some(call("b", 5)) },
+            EffectCallEdit { index: 2, op: EffectCallOp::Add(call("added", 9)), pristine: None },
+        ];
+        let (calls, _, report) = reconcile_saved_effects(&pristine, Some(&full), Some(&edits));
+        assert_eq!(report, SavedEffectsReconcile::default());
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].offset, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn an_edit_follows_its_call_when_the_script_moves_it_and_is_dropped_when_it_is_gone() {
+        let pristine = vec![call("new", 1), call("a", 3)];
+        let mut tuned = call("a", 3);
+        tuned.scale = 2.0;
+        let edits = vec![
+            EffectCallEdit { index: 0, op: EffectCallOp::Modify(tuned), pristine: Some(call("a", 3)) },
+            EffectCallEdit { index: 1, op: EffectCallOp::Remove, pristine: Some(call("gone", 8)) },
+        ];
+        let (calls, kept, report) = reconcile_saved_effects(&pristine, None, Some(&edits));
+        assert_eq!((report.reanchored_edits, report.dropped_edits), (1, 1));
+        assert_eq!(calls[0].effect_name, "new");
+        assert_eq!(calls[1].scale, 2.0);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].index, 1);
+    }
+
+    #[test]
+    fn raw_hash_names_are_spelled_out_when_known() {
+        let mut calls = vec![call("x", 1), call("y", 1)];
+        calls[0].effect_name = format!("{:#x}", hash40::hash40("sys_smash_flash").0);
+        calls[1].effect_name = "0xdeadbeef".into();
+        let names: HashMap<u64, String> =
+            [(hash40::hash40("sys_smash_flash").0, "sys_smash_flash".to_string())].into();
+        resolve_raw_effect_names(&mut calls, &names);
+        assert_eq!(calls[0].effect_name, "sys_smash_flash");
+        assert_eq!(calls[1].effect_name, "0xdeadbeef", "an unknown hash stays a hash");
     }
 }

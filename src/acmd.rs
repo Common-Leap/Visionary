@@ -450,7 +450,8 @@ pub fn parse_acmd_script(source: &str) -> AcmdScript {
         None => source,
     };
     let _agent = agent_scope(source);
-    let lines: Vec<&str> = source.lines().collect();
+    let lines = source_lines(source);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     // Skip the function signature line and closing brace
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
@@ -473,6 +474,13 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
         // Skip empty lines and closing braces handled by caller
         if line.is_empty() || line == "}" {
             pos += 1;
+            continue;
+        }
+
+        // A commented-out call is text, not a command: kept verbatim, never read as one.
+        if is_comment_only(line) {
+            stmts.push(AcmdStmt::Raw(line.to_string()));
+            pos += lines_consumed;
             continue;
         }
 
@@ -640,6 +648,10 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_comment_only(line) {
+            stmts.push(ExcuteStmt::Raw(line.to_string()));
             continue;
         }
         // `ATTACK_FP` starts with `ATTACK` but has a different fixed 41-slot layout. Keep its
@@ -837,13 +849,14 @@ fn find_block_end_after(lines: &[&str], start: usize, consumed: usize) -> usize 
     let header_end = (start + consumed).min(lines.len());
     let mut depth = 0i32;
     for line in &lines[start..header_end] {
+        let line = crate::acmd_src::without_comments(line);
         depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
     }
     if depth <= 0 {
         return start;
     }
     for (i, line) in lines[header_end..].iter().enumerate() {
-        for ch in line.chars() {
+        for ch in crate::acmd_src::without_comments(line).chars() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -891,7 +904,7 @@ fn combined_else_header(line: &str) -> Option<String> {
 fn find_else_block_end(lines: &[&str], combined_line: usize) -> (usize, i32) {
     let mut depth = 1i32;
     for (i, line) in lines.iter().enumerate().skip(combined_line + 1) {
-        for ch in line.chars() {
+        for ch in crate::acmd_src::without_comments(line).chars() {
             match ch {
                 '{' => depth += 1,
                 '}' => {
@@ -905,6 +918,38 @@ fn find_else_block_end(lines: &[&str], combined_line: usize) -> (usize, i32) {
         }
     }
     (lines.len().saturating_sub(1), depth)
+}
+
+/// Whether `line` holds comments and nothing else: `// macros::EFFECT(…);`, or a whole
+/// `/* … */` that [`source_lines`] kept on one line.
+///
+/// Every parser checks this before it looks for a call, because each of them dispatches on
+/// `line.contains("macros::NAME(")`, which a commented-out call satisfies just as well. The
+/// write-back scanners in `acmd_src` already skip comments, so a commented call the parser
+/// counted also shifted the numbering every later edit was matched by.
+fn is_comment_only(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && crate::acmd_src::without_comments(line).trim().is_empty()
+}
+
+/// `source`'s lines, with a `/* … */` comment that spans several lines kept as one.
+///
+/// The parsers walk one line at a time and could not otherwise tell a line in the middle of a
+/// block comment from code. The joined line goes back out verbatim like any other `Raw` line.
+fn source_lines(source: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut open = false;
+    for line in source.lines() {
+        match lines.last_mut() {
+            Some(last) if open => {
+                last.push('\n');
+                last.push_str(line);
+            }
+            _ => lines.push(line.to_string()),
+        }
+        open = crate::acmd_src::ends_in_block_comment(lines.last().expect("just pushed"));
+    }
+    lines
 }
 
 /// Return the source line at `start`, joined with following lines while its parentheses are
@@ -1090,14 +1135,15 @@ pub(crate) fn extract_function(source: &str, prefix: &str) -> Option<String> {
     let mut found = false;
 
     for line in source.lines() {
-        if !in_fn && is_function_header(line.trim(), prefix) {
+        let code = crate::acmd_src::without_comments(line);
+        if !in_fn && is_function_header(code.trim(), prefix) {
             in_fn = true;
             found = true;
         }
         if in_fn {
             result.push_str(line);
             result.push('\n');
-            for ch in line.chars() {
+            for ch in code.chars() {
                 match ch {
                     '{' => depth += 1,
                     '}' => {
@@ -1125,6 +1171,10 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if is_comment_only(line) {
+            macros.push(EffectMacro::Raw(line.to_string()));
             continue;
         }
 
@@ -1542,6 +1592,7 @@ fn color_macro_layout(line: &str) -> Option<(&'static str, bool, bool)> {
 /// closing paren in between. No effect line puts a brace inside a string literal, so counting
 /// characters is safe here.
 fn opens_block(line: &str) -> bool {
+    let line = crate::acmd_src::without_comments(line);
     line.chars().filter(|c| *c == '{').count() > line.chars().filter(|c| *c == '}').count()
 }
 
@@ -1562,6 +1613,14 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
 
         if line.is_empty() || line == "}" {
             pos += 1;
+            continue;
+        }
+
+        // Shy Guy's forward smash keeps a retired `EFFECT_FOLLOW` and a whole trail block as
+        // `//` lines; reading them as calls drew both on top of the live effects.
+        if is_comment_only(line) {
+            stmts.push(EffectStmt::Raw(line.to_string()));
+            pos += lines_consumed;
             continue;
         }
 
@@ -1987,7 +2046,8 @@ pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
         None => return EffectScript::default(),
     };
     let _agent = agent_scope(effect_fn);
-    let lines: Vec<&str> = effect_fn.lines().collect();
+    let lines = source_lines(effect_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -2019,7 +2079,8 @@ pub fn parse_sound_script(source: &str) -> AcmdScript {
         return AcmdScript::default();
     };
     let _agent = agent_scope(&sound_fn);
-    let lines: Vec<&str> = sound_fn.lines().collect();
+    let lines = source_lines(&sound_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -2036,7 +2097,8 @@ pub fn parse_expression_script(source: &str) -> AcmdScript {
         return AcmdScript::default();
     };
     let _agent = agent_scope(&expression_fn);
-    let lines: Vec<&str> = expression_fn.lines().collect();
+    let lines = source_lines(&expression_fn);
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     let body_lines = if lines.len() >= 2 {
         &lines[1..lines.len() - 1]
     } else {
@@ -5885,6 +5947,78 @@ pub fn export_acmd_source(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn commented_out_game_lines_stay_comments() {
+        let source = r#"unsafe extern "C" fn game_attacks4(agent: &mut L2CAgentBase) {
+    // frame(agent.lua_state_agent, 5.0);
+    frame(agent.lua_state_agent, 10.0);
+    // if macros::is_excute(agent) {
+    //     macros::ATTACK(agent, 0, 0, Hash40::new("top"), 9.0, 361, 100, 0, 30, 4.0, 0.0, 8.0, 8.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    // }
+    if macros::is_excute(agent) {
+        // macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_m"));
+        /* macros::QUAKE(agent, *CAMERA_QUAKE_KIND_S); */
+        macros::PLAY_SE(agent, Hash40::new("se_common_swing_05"));
+    }
+}
+"#;
+        let script = parse_acmd_script(source);
+        let frames: Vec<f32> = script
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Frame(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![10.0]);
+        assert!(script.to_hitboxes().is_empty());
+        let excutes: Vec<&Vec<ExcuteStmt>> = script
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Excute(body) => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(excutes.len(), 1, "{:#?}", script.stmts);
+        let raw: Vec<&str> = excutes[0]
+            .iter()
+            .filter_map(|stmt| match stmt {
+                ExcuteStmt::Raw(line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raw.len(), 2, "{:#?}", excutes[0]);
+        assert_eq!(excutes[0].len(), 3, "{:#?}", excutes[0]);
+        // Commented lines go back out verbatim.
+        let emitted = emit_stmts(&script.stmts, "    ").join("\n");
+        assert!(emitted.contains("// frame(agent.lua_state_agent, 5.0);"), "{emitted}");
+        assert!(emitted.contains("// if macros::is_excute(agent) {"), "{emitted}");
+
+        // The sound and expression parsers share the block walker: only the live call is typed.
+        let typed = |stmts: &[AcmdStmt]| {
+            let mut counts = (0, 0);
+            for stmt in stmts {
+                if let AcmdStmt::Excute(body) = stmt {
+                    for inner in body {
+                        match inner {
+                            ExcuteStmt::Sound(_) => counts.0 += 1,
+                            ExcuteStmt::Expression(_) => counts.1 += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            counts
+        };
+        assert_eq!(typed(&parse_sound_script(&source.replace("game_", "sound_")).stmts), (1, 0));
+        assert_eq!(
+            typed(&parse_expression_script(&source.replace("game_", "expression_")).stmts),
+            (1, 0)
+        );
+    }
 
     /// The test with teeth for a newly modelled macro: **the typed thing comes out at all.**
     ///

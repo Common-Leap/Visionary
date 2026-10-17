@@ -52,8 +52,35 @@ pub struct HashMacros {
 static CURRENT: LazyLock<RwLock<Arc<HashMacros>>> =
     LazyLock::new(|| RwLock::new(Arc::new(HashMacros::default())));
 
-/// The macros of the project most recently indexed, for write-back paths that only see text.
+thread_local! {
+    static SCOPED: std::cell::RefCell<Option<Arc<HashMacros>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, [`current`] on this thread answers with one project's macros.
+///
+/// A sync writes into one project, and must spell edits with *that* project's macros whatever
+/// was indexed last process-wide — another project linked meanwhile, or, in the test suite,
+/// another test's index built on a parallel thread.
+pub struct MacroScope(Option<Arc<HashMacros>>);
+
+impl Drop for MacroScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SCOPED.with(|scoped| *scoped.borrow_mut() = previous);
+    }
+}
+
+pub fn scope(macros: Arc<HashMacros>) -> MacroScope {
+    let previous = SCOPED.with(|scoped| scoped.borrow_mut().replace(macros));
+    MacroScope(previous)
+}
+
+/// The macros of the project being written in this thread's [`scope`], else of the project
+/// most recently indexed, for write-back paths that only see text.
 pub fn current() -> Arc<HashMacros> {
+    if let Some(scoped) = SCOPED.with(|scoped| scoped.borrow().clone()) {
+        return scoped;
+    }
     CURRENT
         .read()
         .map(|guard| Arc::clone(&guard))

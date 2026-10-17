@@ -379,6 +379,27 @@ fn skip_trivia(text: &str, i: usize) -> Option<usize> {
     None
 }
 
+/// Whether `text` ends inside a `/* … */` comment it opened and never closed.
+///
+/// The line-oriented parsers in `acmd` use this to keep a block comment that spans several lines
+/// together as one line, so the call it comments out is never read as code.
+pub(crate) fn ends_in_block_comment(text: &str) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(body) = text[i..].strip_prefix("/*") {
+            if !body.contains("*/") {
+                return true;
+            }
+        }
+        i = skip_trivia(text, i).unwrap_or(i + 1);
+    }
+    false
+}
+
 fn string_literal_len(rest: &str) -> usize {
     let bytes = rest.as_bytes();
     let mut j = 1;
@@ -2087,7 +2108,7 @@ fn type_name(ty: &str) -> String {
 }
 
 /// `text` with every comment blanked out, strings and everything else kept.
-fn without_comments(text: &str) -> String {
+pub(crate) fn without_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
@@ -3242,13 +3263,17 @@ fn enclosing_effect_execute(text: &str, site_start: usize) -> Option<(usize, usi
     let mut cursor = site_start;
     while let Some(relative) = text[..cursor].rfind("is_excute(") {
         let at = relative;
+        cursor = at;
         let line = line_range_at(text, at)?;
+        // A commented-out block is not the one the site runs in.
+        if !without_comments(&text[line.start..at + "is_excute(".len()]).ends_with("is_excute(") {
+            continue;
+        }
         let open = text[at..line.end].find('{').map(|offset| at + offset)?;
         let close = matching_brace(text, open)?;
         if open < site_start && site_start <= close {
             return Some((open, close));
         }
-        cursor = at;
     }
     None
 }
@@ -4534,6 +4559,7 @@ fn sync_script(
     // agent's own; the rewriters must count the same calls the parser typed.
     let _agent = crate::acmd::agent_scope(body);
     let _consts = crate::project_consts::scope(std::sync::Arc::clone(&current.consts));
+    let _macros = crate::hash_macros::scope(std::sync::Arc::new(current.hash_macros.clone()));
     let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&current.helpers));
     let (updated_body, mut report) = rewrite(body)?;
     let refused = crate::project_helpers::take_refused();
@@ -9838,18 +9864,27 @@ fn frame_literal(line: &str) -> Option<f32> {
 }
 
 fn matching_brace(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
     let mut depth = 0usize;
-    for (offset, byte) in text.as_bytes()[open..].iter().enumerate() {
-        match byte {
+    let mut i = open;
+    while i < bytes.len() {
+        // A brace inside a comment or a string is not structure: `// if is_excute(agent) {`
+        // left in a body used to swallow the real block that closes after it.
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
             b'{' => depth += 1,
             b'}' => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    return Some(open + offset);
+                    return Some(i);
                 }
             }
             _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -11985,6 +12020,105 @@ unsafe extern "C" fn my_custom_name(agent: &mut L2CAgentBase) {
         assert_eq!(sites.len(), 1, "found {sites:?}");
         assert_eq!(sites[0].name, "EFFECT");
         assert_eq!(sites[0].arg(text, 1), Some("4"));
+    }
+
+    /// Shy Guy's forward smash, shape for shape: a retired `EFFECT_FOLLOW` and a whole trail
+    /// block left as `//` lines between live calls. The parser used to read both as calls, so
+    /// the editor drew seven effects and every edit after the comments matched the wrong site.
+    const COMMENTED_EFFECT_SOURCE: &str = r#"unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_smash_flash"), Hash40::new("top"), 12, 10, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+    }
+    frame(agent.lua_state_agent, 17.0);
+    if macros::is_excute(agent) {
+        // Dedede's hammer arc.
+        macros::EFFECT(agent, Hash40::new("shyguy_mace_arc_wind"), Hash40::new("top"), 2, 4, 10, 0, -60, -115, 0.85, 0, 0, 0, 0, 0, 0, true);
+        // macros::EFFECT_FOLLOW(agent, Hash40::new("shyguy_mace_arc_wind"), Hash40::new("haver"), 2, 4, 10, 0, -60, -115, 0.85, true);
+    }
+    // frame(agent.lua_state_agent, 15.0);
+    // if macros::is_excute(agent) {
+    //     let (ball, z) = if is_facing_left(agent.module_accessor) {
+    //         (Hash40::new("center_boner"), 3.0)
+    //     } else {
+    //         (Hash40::new("center_bonel"), -3.0)
+    //     };
+    //     macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex_shyguy_hammer"), Hash40::new("tex_shyguy_cutlass2"), 10, ball, 0, 3.0, -z, ball, 0, -3.0, z, true, Hash40::new("null"), ball, 0, 0, 0, 0, 0, 0, 1, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_ALPHA, 101, *TRAIL_CULL_NONE, 1.4, 0.2);
+    // }
+    frame(agent.lua_state_agent, 20.0);
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_h_smoke_b"), Hash40::new("top"), 0, 0, -7.0, 0, 0, 0, 0.7, 0, 0, 0, 0, 0, 0, true);
+        // // Stop adding to it before the spin flips it
+        // macros::AFTER_IMAGE_OFF(agent, 10);
+        /* macros::EFFECT(agent, Hash40::new("sys_block_comment"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true); */
+        /*
+        macros::EFFECT(agent, Hash40::new("sys_spanning_comment"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+        if x {
+        */
+    }
+    frame(agent.lua_state_agent, 21.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 11.6, 28.4, 90, 0, 0, 1.95, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, 24.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_DETACH_KIND(agent, Hash40::new("shyguy_mace_arc_wind"), -1);
+    }
+}
+"#;
+
+    #[test]
+    fn commented_out_effect_calls_are_not_read_as_calls() {
+        let calls = crate::acmd::parse_effect_script(COMMENTED_EFFECT_SOURCE).to_effect_calls();
+        let names: Vec<&str> = calls.iter().map(|call| call.effect_name.as_str()).collect();
+        assert_eq!(calls.len(), 5, "{names:?}");
+        assert!(!names.contains(&"tex_shyguy_hammer"), "{names:?}");
+        assert!(!names.contains(&"sys_block_comment"), "{names:?}");
+        assert!(!names.contains(&"sys_spanning_comment"), "{names:?}");
+        let arcs: Vec<_> = calls
+            .iter()
+            .filter(|call| call.effect_name == "shyguy_mace_arc_wind" && call.active_start == 17)
+            .collect();
+        assert_eq!(arcs.len(), 1, "{calls:#?}");
+        assert!(!arcs[0].follows_bone, "the live arc is the plain EFFECT, not the comment");
+        // The structure still closes: the impact lands at its own frame.
+        let impact = calls
+            .iter()
+            .find(|call| call.effect_name == "sys_attack_impact")
+            .expect("impact parsed");
+        assert_eq!(impact.active_start, 21);
+    }
+
+    #[test]
+    fn an_edit_after_commented_calls_lands_on_its_own_line() {
+        let source = COMMENTED_EFFECT_SOURCE;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        let mut edited = pristine.clone();
+        let impact = edited
+            .iter()
+            .position(|call| call.effect_name == "sys_attack_impact")
+            .expect("impact parsed");
+        edited[impact].offset[1] = 12.5;
+
+        let (after, report) =
+            rewrite_effect_calls(source, "pacman/attack_s4_s", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert!(
+            after.contains(r#"Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 12.5, 28.4,"#),
+            "{after}"
+        );
+        // Everything else, comments included, is untouched.
+        let changed: Vec<_> = source
+            .lines()
+            .zip(after.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:#?}");
+        let reparsed = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert_eq!(
+            effect_call_set_signature(&reparsed),
+            effect_call_set_signature(&edited)
+        );
     }
 
     #[test]
