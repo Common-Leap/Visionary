@@ -158,7 +158,7 @@ into the global Mod Library as a reference mod. The imported fighters are seeded
 - **Membership is per list row, not per internal name.** A mod character on extra slots
   (same internal `name`, own `custom_name`) is its own row and is added/removed on its
   own. `project_fighters` entries therefore carry the row identity (internal name plus,
-  for slot characters, its slot set). Rule 2 matches a row when its slots have files
+  for slot characters, the character's name — stable when slots are added or moved). Rule 2 matches a row when its slots have files
   under `romfs/`; a romfs folder for a slot no row owns matches the base fighter row.
 - **The second group is "Everything else", not "Base game".** Whole new characters from
   reference mods sit there with their existing `[mod]` tag.
