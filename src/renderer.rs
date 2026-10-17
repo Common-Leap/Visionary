@@ -79,7 +79,6 @@ pub struct HitboxRenderState {
     pub renderer: SsbhRenderer,
     pub shared_data: SharedRenderData,
     pub render_models: Vec<RenderModel>,
-    #[allow(dead_code)]
     pub render_settings: RenderSettings,
     pub model_render_options: ModelRenderOptions,
     pub camera: Camera,
@@ -171,6 +170,22 @@ impl HitboxRenderState {
             last_skel_path: None,
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
+        }
+    }
+
+    /// Viewport preferences from the Settings window: background, floor grid, and bloom.
+    pub fn apply_preferences(
+        &mut self,
+        queue: &wgpu::Queue,
+        preferences: &crate::preferences::Preferences,
+    ) {
+        self.renderer
+            .set_clear_color(preferences.viewport_clear_color());
+        self.model_render_options.draw_floor_grid = preferences.floor_grid;
+        if self.render_settings.render_bloom != preferences.bloom {
+            self.render_settings.render_bloom = preferences.bloom;
+            self.renderer
+                .update_render_settings(queue, &self.render_settings);
         }
     }
 

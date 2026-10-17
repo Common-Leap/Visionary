@@ -10,6 +10,7 @@
 //! Everything here is a refinement. When cargo is missing or the folder is not inside a
 //! workspace, [`CargoProject::discover`] returns `None` and callers keep their folder heuristics.
 
+use crate::console::NoConsoleWindow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -62,6 +63,7 @@ impl CargoProject {
             }
         }
         let output = std::process::Command::new("cargo")
+            .no_console_window()
             .args(["metadata", "--no-deps", "--format-version", "1"])
             .current_dir(dir)
             .output()

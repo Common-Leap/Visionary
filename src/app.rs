@@ -1,3 +1,4 @@
+use crate::console::NoConsoleWindow;
 use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
@@ -3132,6 +3133,9 @@ pub struct VisionaryApp {
     show_hurtboxes: bool,
     /// Persistent viewport preference: apply `model.nuhlpb` to the mesh and the overlay.
     helper_bones: bool,
+    /// Application preferences edited in the Settings window.
+    preferences: crate::preferences::Preferences,
+    settings_open: bool,
     /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
     /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
     viewport_toolbar_rect: Option<egui::Rect>,
@@ -3472,6 +3476,8 @@ impl VisionaryApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         // Set dark theme with visible text
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let preferences = crate::preferences::Preferences::load();
+        cc.egui_ctx.set_zoom_factor(preferences.ui_scale);
         // Install image loaders — this also ensures font atlas is properly initialized
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
@@ -3570,6 +3576,8 @@ impl VisionaryApp {
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
             helper_bones: load_helper_bones(),
+            preferences,
+            settings_open: false,
             viewport_toolbar_rect: None,
             viewport_file_sources: Vec::new(),
             model_report: None,
@@ -14140,8 +14148,18 @@ impl VisionaryApp {
         }
     }
 
-    /// Viewport display options, drawn over the model's top-left corner.
-    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+    /// The Settings window the viewport toolbar's gear opens: application preferences, the
+    /// viewport's look, and the camera.
+    fn draw_settings_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        // Ctrl +/- zooms the interface too; keep the saved scale in step with it.
+        let zoom = ctx.zoom_factor();
+        if (zoom - self.preferences.ui_scale).abs() > 1e-3 {
+            self.preferences.ui_scale = zoom;
+            self.preferences.save();
+        }
+        if !self.settings_open {
+            return;
+        }
         let has_helper_bones = frame.wgpu_render_state().is_some_and(|wgpu_state| {
             wgpu_state
                 .renderer
@@ -14150,6 +14168,105 @@ impl VisionaryApp {
                 .get::<HitboxRenderState>()
                 .is_some_and(HitboxRenderState::has_helper_bones)
         });
+        let before = self.preferences.clone();
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                let defaults = crate::preferences::Preferences::default();
+
+                ui.label(RichText::new("General").strong());
+                let console = ui.add_enabled(
+                    crate::console::SUPPORTED && !crate::console::from_terminal(),
+                    egui::Checkbox::new(
+                        &mut self.preferences.show_console,
+                        "Show console window",
+                    ),
+                );
+                if console.changed() {
+                    crate::console::set_visible(self.preferences.show_console);
+                }
+                console.on_hover_text(
+                    "A console window with Visionary's log output: model loading, plugin \
+                     deploys, builds and the game link. Turn it off here rather than closing \
+                     the console, which would close Visionary with it.",
+                )
+                .on_disabled_hover_text(if crate::console::SUPPORTED {
+                    "Visionary was started from a terminal, which already shows its log output."
+                } else {
+                    "Log output goes to the terminal that started Visionary."
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Interface scale");
+                    let mut scale = self.preferences.ui_scale;
+                    let response = ui.add(
+                        egui::Slider::new(&mut scale, crate::preferences::Preferences::UI_SCALE_RANGE)
+                            .step_by(0.05)
+                            .fixed_decimals(2),
+                    );
+                    if response.changed() {
+                        self.preferences.ui_scale = scale;
+                        ctx.set_zoom_factor(scale);
+                    }
+                    if ui
+                        .add_enabled(scale != defaults.ui_scale, egui::Button::new("Reset").small())
+                        .clicked()
+                    {
+                        self.preferences.ui_scale = defaults.ui_scale;
+                        ctx.set_zoom_factor(defaults.ui_scale);
+                    }
+                })
+                .response
+                .on_hover_text("Size of all text and controls. Ctrl + and Ctrl - also change it.");
+
+                ui.separator();
+                ui.label(RichText::new("Viewport").strong());
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut self.preferences.viewport_color);
+                    ui.label("Background");
+                    if ui
+                        .add_enabled(
+                            self.preferences.viewport_color != defaults.viewport_color,
+                            egui::Button::new("Reset").small(),
+                        )
+                        .on_hover_text("SSBH Editor's dark grey")
+                        .clicked()
+                    {
+                        self.preferences.viewport_color = defaults.viewport_color;
+                    }
+                });
+                ui.checkbox(&mut self.preferences.floor_grid, "Floor grid")
+                    .on_hover_text("A grid on the ground plane (y = 0) under the fighter.");
+                ui.checkbox(&mut self.preferences.bloom, "Bloom")
+                    .on_hover_text("The game's glow around bright and emissive materials.");
+                let response = ui.add_enabled(
+                    has_helper_bones,
+                    egui::Checkbox::new(&mut self.helper_bones, "Enable helper bones"),
+                );
+                if response.changed() {
+                    save_helper_bones(self.helper_bones);
+                }
+                response.on_hover_text(if has_helper_bones {
+                    "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
+                     They move H_ bones such as elbow and knee helpers, which changes the mesh \
+                     and any hitbox, hurtbox or effect placed on those bones."
+                } else {
+                    "This model has no model.nuhlpb. The saved preference is kept for models \
+                     that do."
+                });
+
+            });
+        self.settings_open = open;
+        if self.preferences != before {
+            self.preferences.save();
+            ctx.request_repaint();
+        }
+    }
+
+    /// Viewport display options, drawn over the model's top-left corner.
+    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, _frame: &eframe::Frame) {
         let area = egui::Rect::from_min_size(
             viewport.left_top() + egui::vec2(8.0, 8.0),
             egui::vec2(
@@ -14166,34 +14283,16 @@ impl VisionaryApp {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    // Render settings live behind a button, as SSBH Editor keeps them in their
-                    // own window: they are rarely changed and shouldn't crowd the move controls.
-                    let (gear, _) = egui::containers::menu::MenuButton::new("⚙")
-                        .config(
-                            egui::containers::menu::MenuConfig::new()
-                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
-                        )
-                        .ui(ui, |ui| {
-                            ui.label(RichText::new("Animation").strong());
-                            let response = ui.add_enabled(
-                                has_helper_bones,
-                                egui::Checkbox::new(&mut self.helper_bones, "Enable helper bones"),
-                            );
-                            if response.changed() {
-                                save_helper_bones(self.helper_bones);
-                                ui.ctx().request_repaint();
-                            }
-                            response.on_hover_text(if has_helper_bones {
-                                "Apply the model's helper bone constraints (model.nuhlpb), as the \
-                                 game does. They move H_ bones such as elbow and knee helpers, \
-                                 which changes the mesh and any hitbox, hurtbox or effect placed \
-                                 on those bones."
-                            } else {
-                                "This model has no model.nuhlpb. The saved preference is kept for \
-                                 models that do."
-                            });
-                        });
-                    gear.on_hover_text("Render settings");
+                    // Settings live in their own window, as SSBH Editor keeps its preferences
+                    // and render settings: they are rarely changed and shouldn't crowd the
+                    // move controls.
+                    if ui
+                        .selectable_label(self.settings_open, "⚙")
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
+                        self.settings_open = !self.settings_open;
+                    }
                     let scales = self.viewport_scales();
                     if [&scales.model, &scales.attack, &scales.grab]
                         .iter()
@@ -19790,6 +19889,7 @@ impl VisionaryApp {
         self.export_build = Some(state.clone());
         std::thread::spawn(move || {
             let out = std::process::Command::new("cargo")
+                .no_console_window()
                 .args(["skyline", "build", "--release"])
                 .current_dir(&src_root)
                 .output();
@@ -34715,6 +34815,7 @@ impl eframe::App for VisionaryApp {
                         rs.set_helper_bones(self.helper_bones);
                         rs.set_model_scale(viewport_scales.model.value);
                         rs.set_victim(&wgpu_state.device, &wgpu_state.queue, victim);
+                        rs.apply_preferences(&wgpu_state.queue, &self.preferences);
                         // Left drag: pan in camera plane (left/right + up/down)
                         if response.dragged_by(egui::PointerButton::Primary) {
                             let delta = response.drag_delta();
@@ -35314,8 +35415,9 @@ impl eframe::App for VisionaryApp {
                 self.draw_viewport_toolbar(ui, rect, frame);
             } else {
                 self.viewport_toolbar_rect = None;
+                let [r, g, b] = self.preferences.viewport_color;
                 ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
+                    .rect_filled(rect, 0.0, Color32::from_rgb(r, g, b));
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         RichText::new("Open a data root directory to begin").color(Color32::GRAY),
@@ -35324,6 +35426,7 @@ impl eframe::App for VisionaryApp {
             }
         });
         self.perf.end("central_viewport", t_central);
+        self.draw_settings_window(&ctx, frame);
         if self.perf.enabled {
             // Profiling wants a continuous frame stream to average over; normal runs stay
             // reactive (this is exactly the "repaint on a timer" cost we do NOT want by default).

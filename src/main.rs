@@ -1,4 +1,6 @@
 // Visionary: character/circle preview, authored effect editing, and live in-game rendering.
+// A window application: the console is opened on request, see `console`.
+#![windows_subsystem = "windows"]
 mod acmd;
 mod acmd_src;
 mod acmd_verify;
@@ -9,6 +11,7 @@ mod costume_files;
 mod asset_snapshots;
 mod carrier_motion;
 mod carrier_support;
+mod console;
 mod credits;
 mod data;
 mod eff_attrs;
@@ -34,6 +37,7 @@ mod moveset_survey;
 mod move_kinds;
 mod param_labels;
 mod plugin_deploy;
+mod preferences;
 mod project_consts;
 mod project_helpers;
 mod project_hub;
@@ -47,6 +51,8 @@ mod ui;
 mod wayland_icon;
 
 fn main() -> anyhow::Result<()> {
+    // First, so everything below logs to the launching terminal or the console the user asked for.
+    console::init(preferences::Preferences::load().show_console);
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() == Some(std::ffi::OsStr::new("--install-carrier-support")) {
         let sd = args

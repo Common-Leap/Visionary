@@ -18,6 +18,7 @@
 //!   also written as smashline's `development.nro`, which smashline reloads in place when
 //!   L + R + D-pad Up is pressed in the menus, so a change needs no restart at all.
 
+use crate::console::NoConsoleWindow;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -128,6 +129,7 @@ pub fn plan(
 pub fn run(plan: &Plan) -> Outcome {
     let log_path = plan.crate_dir.join("visionary-build.log");
     let output = std::process::Command::new("cargo")
+        .no_console_window()
         .args(["skyline", "build", "--release"])
         .current_dir(&plan.crate_dir)
         .output();
