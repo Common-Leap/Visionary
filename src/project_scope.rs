@@ -6,10 +6,35 @@
 //! naming the reasons a row belongs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::data::FighterEntry;
 use crate::mod_project::ProjectFighter;
+
+/// How a project records its linked moveset crate: relative to the project folder (with `/`
+/// separators) when the crate lives inside it, so the pair can move together; otherwise the
+/// absolute path as given.
+pub fn store_moveset_path(crate_root: &Path, project_dir: &Path) -> String {
+    match crate_root.strip_prefix(project_dir) {
+        Ok(rel) => rel
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => crate_root.display().to_string(),
+    }
+}
+
+/// The inverse of [`store_moveset_path`]: an absolute stored path is used as is, a relative
+/// one is joined onto the project folder.
+pub fn resolve_moveset_path(stored: &str, project_dir: &Path) -> PathBuf {
+    let path = Path::new(stored);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
+    }
+}
 
 /// `cNN` to `NN`: `c` and two or more ASCII digits that fit a `u8` (`c07`, `c120`; not `c7`).
 fn parse_slot(folder: &str) -> Option<u8> {
@@ -193,6 +218,34 @@ mod tests {
     use super::*;
     use crate::data::FighterSource;
     use std::path::PathBuf;
+
+    #[test]
+    fn inside_crate_is_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let crate_root = dir.path().join("moveset");
+        assert_eq!(store_moveset_path(&crate_root, dir.path()), "moveset");
+    }
+
+    #[test]
+    fn outside_crate_is_absolute() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let crate_root = other.path().join("moveset");
+        assert_eq!(
+            store_moveset_path(&crate_root, proj.path()),
+            crate_root.display().to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_round_trips() {
+        let proj = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        for crate_root in [proj.path().join("a").join("moveset"), other.path().join("moveset")] {
+            let stored = store_moveset_path(&crate_root, proj.path());
+            assert_eq!(resolve_moveset_path(&stored, proj.path()), crate_root);
+        }
+    }
 
     fn touch(root: &Path, rel: &str) {
         let path = root.join(rel);

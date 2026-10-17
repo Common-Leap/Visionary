@@ -314,6 +314,11 @@ fn valid_relative(path: &Path) -> bool {
 
 /// Copy every external texture beside the project and rewrite its path to be relative. The
 /// returned project is the one that should be serialized.
+///
+/// A linked `moveset_source` is stored relative to the project when the crate lives inside it,
+/// else as the absolute path. An absolute `moveset_source` must never end up in a
+/// `modproject.json` meant for distribution; no current writer does that (`export_mod` writes
+/// none).
 pub fn make_portable_project(
     project: &ModProjectFile,
     project_dir: &Path,
@@ -415,6 +420,12 @@ pub fn make_portable_project(
             ov.png_path = relative.to_string_lossy().replace('\\', "/");
         }
     }
+    if let Some(source) = &portable.moveset_source {
+        portable.moveset_source = Some(crate::project_scope::store_moveset_path(
+            Path::new(source),
+            project_dir,
+        ));
+    }
     Ok(portable)
 }
 
@@ -457,6 +468,13 @@ pub fn resolve_project_assets(project: &mut ModProjectFile, project_path: &Path)
                 *path = parent.join(candidate).to_string_lossy().to_string();
             }
         }
+    }
+    if let Some(stored) = &project.moveset_source {
+        project.moveset_source = Some(
+            crate::project_scope::resolve_moveset_path(stored, parent)
+                .display()
+                .to_string(),
+        );
     }
     for kinds in project.roster.ui_images.values_mut() {
         for ov in kinds.values_mut() {
@@ -528,6 +546,25 @@ mod tests {
             raw: false,
         });
         assert!(base_eff_has_content(&eff));
+    }
+
+    #[test]
+    fn portable_project_relativises_moveset() {
+        let temp = tempfile::tempdir().unwrap();
+        let abs = temp.path().join("moveset");
+        let project = ModProjectFile {
+            version: PROJECT_VERSION,
+            name: "p".into(),
+            moveset_source: Some(abs.display().to_string()),
+            ..Default::default()
+        };
+        let mut portable = make_portable_project(&project, temp.path(), "assets").unwrap();
+        assert_eq!(portable.moveset_source.as_deref(), Some("moveset"));
+        resolve_project_assets(&mut portable, &temp.path().join("modproject.json")).unwrap();
+        assert_eq!(
+            PathBuf::from(portable.moveset_source.unwrap()),
+            abs
+        );
     }
 
     #[test]
