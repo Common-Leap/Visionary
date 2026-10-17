@@ -2,12 +2,17 @@
 
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
+This is joobert's fork of Visionary. See [CHANGELOG.md](CHANGELOG.md) for everything it adds on top of upstream `v0.1.2`.
+
 ## Components
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
-- The upstream `ssbh_wgpu` crate provides character model, animation, skeleton,
-  and weapon rendering.
+- The `ssbh_wgpu` crate provides character model, animation, skeleton, and
+  weapon rendering. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu),
+  which adds loading a model from files in different folders (costumes that
+  share files through `config.json`) and the skeleton edit used to place a
+  thrown fighter.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on
   crates.io provides `.eff` parsing, editing, and export.
 - The effect editor exposes the documented emitter, particle, animation,
@@ -209,14 +214,27 @@ expression edits and reloads the loaded source or capture baseline.
 
 ### Viewport
 
+The camera works like SSBH Editor's: left drag orbits the model, right or middle
+drag pans so the model follows the pointer, and scroll zooms.
+
 The toolbar in the viewport's top-left corner holds the display options:
 
-- **⚙ Render settings** holds **Enable helper bones**, which applies the
-  model's `model.nuhlpb`, as the game does (SSBH Editor keeps the same option
-  in its Render Settings window). Helper bones (`H_` elbow, knee and similar
-  helpers) then move the mesh and any hitbox, hurtbox or effect placed on them.
-  It is on by default. A move's material animations (glows, colour changes, eye
-  swaps) always play.
+- **⚙** opens the **Settings** window, saved to `preferences.json` in the
+  user config directory (`%APPDATA%\visionary\` on Windows):
+  - **Show console window** (Windows). Visionary is a GUI program: started from
+    a terminal it logs there; otherwise a console opens only while this is on.
+    Its close button is removed, since closing it would end Visionary.
+  - **Interface scale**, kept in step with **Ctrl +/-**.
+  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**
+    and **Bloom**.
+  - **Enable helper bones**, which applies the model's `model.nuhlpb`, as the
+    game does. Helper bones (`H_` elbow, knee and similar helpers) then move
+    the mesh and any hitbox, hurtbox or effect placed on them. It is on by
+    default. A move's material animations (glows, colour changes, eye swaps)
+    always play.
+  - **Camera**: translation, rotation and field of view, with **⟲ Reset view**.
+- **⟲** beside the gear returns the camera to the default side view. It is
+  disabled while the camera is already there.
 - **Scale** appears when the fighter isn't drawn at 1.0. The fighter starts at
   its `fighter_param` `scale` (or the moveset's `param_config` override of it).
   A linked moveset's frame callback (`on_line`) wins over that:
@@ -240,6 +258,24 @@ The toolbar in the viewport's top-left corner holds the display options:
   then the game's file at that path from the vanilla dump. Hover a note to see
   each borrowed file and its source. The move list's animations and motion list
   are read the same way.
+
+### Motion List
+
+**Windows → Motion List** (ported from SSBH Editor) edits every field of the
+selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
+and other scripts, up to three animations picked from the folder's `.nuanmb`
+files, flags, blend frames, cancel frames and intangibility frames. Motions can
+be added, duplicated, deleted and renamed, and the list saved in either format.
+A list with unsaved edits stays open until you save or discard it. When a
+folder has both files, the move list reads whichever was written last.
+
+### Fighter list
+
+A mod that plays its own character on a vanilla fighter's extra slots (Shy Guy
+on Pac-Man's c40–c47) is listed as its own fighter under its own name. Hover it
+to see the base fighter and the slots it takes; searching the base fighter's
+name still finds it. When the character takes every slot, the empty base
+fighter row is dropped.
 
 To hide a fighter from the sidebar, right-click its name and choose **Forget
 fighter**. Visionary removes that fighter's cached scripts, saved edits, and
@@ -288,11 +324,19 @@ The resulting `lib_effect_viewer.nro` is written beneath
 [plugin guide](plugins/slight_replica/README.md) for deployment, runtime
 dependencies, and live-edit setup.
 
-Visionary finds standard Eden, yuzu, and Ryujinx SD-card locations through the
-host operating system's application-data directories. For a portable or custom
+Visionary finds standard Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu
+SD-card locations through the host operating system's application-data
+directories. When more than one exists, it uses the one the game wrote to most
+recently. For a portable or custom
 emulator installation, set `VISIONARY_SD_DIR` to the emulator SD root before
 starting Visionary. `VISIONARY_CACHE_DIR` can similarly move Visionary's cache
 and temporary workspace to another location.
+
+Live effect previews load through a carrier built from vanilla effect files. If
+the root you opened is a mod rather than a full ArcExplorer export, set
+**Vanilla dump** in the Eff Editor to your vanilla export; the carrier base and
+each donor file are then found across both roots. When the carrier can't be
+built, the send indicator stops at once and says which file is missing.
 
 ## Your own ACMD source
 
@@ -320,6 +364,10 @@ Anything your project does define always wins over the vanilla copy.
 Real movesets are written in many styles, and Visionary reads them as written.
 The link header shows how many scripts and fighters it found.
 
+- **Cargo decides the crates.** `cargo metadata` says which crates the linked
+  workspace builds, where each crate's root is and where its plugin is built
+  to. When cargo can't be asked, Visionary falls back to looking for crate
+  folders itself.
 - **Only compiled code counts.** Files are followed through the crate's `mod`
   tree from `src/lib.rs` or `src/main.rs`, so a `srcOLD/` backup, an extracted
   release copy, or a vanilla reference dump beside the crate is never mistaken
@@ -342,6 +390,20 @@ The link header shows how many scripts and fighters it found.
   understood. Calls on some *other* object (`SET_AIR(other)`) stay untyped.
 - **One-line blocks.** `if is_excute(agent) { ATTACK(…); }` written on one line
   parses like the multi-line form.
+- **Shared implementations.** A script that only forwards to a shared function
+  shows that function's body, with the caller's arguments substituted where
+  they are certain (literals, match-bound lets). Values it can't settle are
+  named on the status line, and Save is refused, since the body belongs to
+  every caller.
+- **Custom motions.** Scripts named in `motion_list.bin` only by hash are named
+  from ParamLabels, your source, compiled plugins, `motion_list.yml` and the
+  animation file names, so a custom motion such as `attack_s4_s_reverse` reaches
+  its real scripts.
+
+The status line says where the open move's script came from — your source,
+vanilla, this project's saved copy or a live capture — and, when a linked
+project still shows vanilla, why, including a project that could not be
+re-linked at startup.
 
 The project's own shorthand is read too:
 
