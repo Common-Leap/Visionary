@@ -85,7 +85,7 @@ Ported from SSBH Editor. Runs on model import, before every **Reload asset previ
 
 With a project open, the left panel splits the fighter list into **In this project** (expanded) and **Everything else** (collapsed); search filters both and opens a group that matches. With no project open the list is the flat list as before.
 
-- A fighter is in the project when it was **added** to it, has **files in the project's `romfs/fighter/<name>/`**, has **scripts in the linked moveset crate**, or has **saved edits**. Editing a fighter adds it to the project for good, even if the edit is undone
+- A fighter is in the project when it was **added** to it, has **files in the project's `romfs/fighter/<name>/`**, has **scripts in the linked moveset crate**, or has **saved edits**. A fighter's first edit adds it to the project, and it stays after the edit is undone. Removing an edited fighter sticks: it stays listed under "has edits" only until its edits are gone
 - Right-click **Add to project** / **Remove from project**, or use **Add fighter…** under the group. Remove only clears the explicit entry; the menu says why a fighter stays ("has files in romfs/", "moveset has scripts", "has edits")
 - Membership is per list row, so a slot character is added and removed on its own
 - A crate that does not label its fighters counts for nothing here; the Sources row says so

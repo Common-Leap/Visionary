@@ -3388,6 +3388,10 @@ pub struct VisionaryApp {
     /// The fighters `acmd_src` has scripts for, cached for `row_membership`, which runs per
     /// row per frame. Refreshed wherever `acmd_src` is replaced.
     acmd_src_fighters: BTreeSet<String>,
+    /// The fighters the last `build_project` found edits for. A fighter joins
+    /// `project_fighters` only when it first appears here, so removing an edited fighter
+    /// sticks; `row_membership` reports these as "has edits".
+    edited_fighters: BTreeSet<String>,
     /// Last saved editable snapshot (move sources cleared), for the autosave
     /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
@@ -3739,6 +3743,7 @@ impl VisionaryApp {
             project_moveset: None,
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
+            edited_fighters: BTreeSet::new(),
             last_saved_snapshot: None,
             project_autosave_pending_since: None,
             project_autosave_last_check: std::time::Instant::now(),
@@ -3883,6 +3888,7 @@ impl VisionaryApp {
             added: &self.project_fighters,
             romfs_slots: &self.project_romfs_slots,
             moveset_fighters: &self.acmd_src_fighters,
+            has_edits: &self.edited_fighters,
         };
         crate::project_scope::membership(entry, &self.state.fighters, &inputs)
     }
@@ -9438,7 +9444,7 @@ impl VisionaryApp {
             ui.add_space(6.0);
             ui.strong("Step 1 — your game dump");
             ui.label(
-                "Choose the folder ArcExplorer exported from data.arc.
+                "Choose the folder ArcExplorer exported from data.arc.\n\
                  It holds fighter/ and effect/.",
             );
             ui.add_space(4.0);
@@ -18574,9 +18580,13 @@ impl VisionaryApp {
                 .capture_branch_warnings
                 .insert(move_name.to_string(), warning.clone());
         }
-        // An edited fighter joins the project and stays after the edit is undone: recorded on
-        // `self`, which outlives this build, then copied into the file.
-        crate::project_scope::absorb_edited_fighters(&mut self.project_fighters, &project);
+        // A fighter's first edit adds it to the project, and it stays after the edit is undone:
+        // recorded on `self`, which outlives this build, then copied into the file.
+        self.edited_fighters = crate::project_scope::absorb_edited_fighters(
+            &mut self.project_fighters,
+            &self.edited_fighters,
+            &project,
+        );
         project.project_fighters = self.project_fighters.clone();
         project
     }
@@ -18972,6 +18982,7 @@ impl VisionaryApp {
         self.roster.params.clear();
         self.edit_history.clear();
         self.project_fighters.clear();
+        self.edited_fighters.clear();
         self.project_moveset = None;
         self.acmd_src = None;
         self.acmd_src_problem = None;
@@ -19032,6 +19043,7 @@ impl VisionaryApp {
                     self.project_moveset = None;
                     // No project, no membership; a later Save As re-absorbs edited fighters.
                     self.project_fighters.clear();
+                    self.edited_fighters.clear();
                     self.relink_global_acmd_source();
                     self.reindex_fighters();
                     self.reload_move_scripts();
@@ -20938,6 +20950,8 @@ impl VisionaryApp {
         // the linked source and the indexed fighters; v1-v3 files are seeded from their edits.
         project.seed_project_fighters();
         self.project_fighters = std::mem::take(&mut project.project_fighters);
+        // Already edited when saved: seeding covered them, so the next build adds nothing.
+        self.edited_fighters = crate::project_scope::edited_fighters(&project);
         let (moveset, index, problem) = crate::project_scope::moveset_on_load(
             project.moveset_source.take().map(PathBuf::from),
             crate::acmd_src::SourceIndex::build,

@@ -147,12 +147,14 @@ pub fn apply_romfs_overlay(entry: &mut FighterEntry, romfs: &Path) {
 }
 
 /// Why a fighter row is in the project's list, in the order the list shows them.
-/// "Has edits" isn't a reason here: an edited fighter is recorded as `Added`.
+/// A first edit also records the fighter as `Added`; `HasEdits` keeps it listed after the user
+/// removes that entry, until the edits are gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipReason {
     Added,
     RomfsFiles,
     MovesetScripts,
+    HasEdits,
 }
 
 /// What the project knows, for [`membership`].
@@ -160,6 +162,9 @@ pub struct MembershipInputs<'a> {
     pub added: &'a BTreeSet<ProjectFighter>,
     pub romfs_slots: &'a BTreeMap<String, BTreeSet<u8>>,
     pub moveset_fighters: &'a BTreeSet<String>,
+    /// Fighters with edits right now, by name (any case). Edits are kept per fighter and
+    /// shared by its slot characters, so they count for the fighter's own row only.
+    pub has_edits: &'a BTreeSet<String>,
 }
 
 /// The reasons `entry` belongs in the project's list, in [`MembershipReason`] order; empty
@@ -194,6 +199,14 @@ pub fn membership(
     if own_row && inputs.moveset_fighters.contains(&entry.name) {
         reasons.push(MembershipReason::MovesetScripts);
     }
+    if own_row
+        && inputs
+            .has_edits
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&entry.name))
+    {
+        reasons.push(MembershipReason::HasEdits);
+    }
     reasons
 }
 
@@ -212,6 +225,7 @@ pub fn reason_label(reason: MembershipReason) -> &'static str {
         MembershipReason::Added => "added to project",
         MembershipReason::RomfsFiles => "has files in romfs/",
         MembershipReason::MovesetScripts => "moveset has scripts",
+        MembershipReason::HasEdits => "has edits",
     }
 }
 
@@ -232,14 +246,32 @@ pub fn link_target(project_open: bool) -> LinkTarget {
     }
 }
 
-/// Add every fighter `project` edits to `set`. Never removes: a fighter stays in the project
-/// after its last edit is undone, so editing never makes a row vanish.
-pub fn absorb_edited_fighters(set: &mut BTreeSet<ProjectFighter>, project: &ModProjectFile) {
-    for (name, fighter) in &project.fighters {
-        if fighter.has_edits() {
-            set.insert(ProjectFighter::fighter(name));
-        }
+/// Add each fighter that `project` edits now but did not in `previously_edited` to `set`, and
+/// return the fighters it edits now (pass them back in on the next build).
+///
+/// Only the first edit adds: a fighter the user removed from the project while it still has
+/// edits stays removed (it stays listed through [`MembershipReason::HasEdits`]). Never removes
+/// either, so undoing the last edit leaves the fighter in the project.
+pub fn absorb_edited_fighters(
+    set: &mut BTreeSet<ProjectFighter>,
+    previously_edited: &BTreeSet<String>,
+    project: &ModProjectFile,
+) -> BTreeSet<String> {
+    let edited = edited_fighters(project);
+    for name in edited.difference(previously_edited) {
+        set.insert(ProjectFighter::fighter(name));
     }
+    edited
+}
+
+/// The fighters `project` holds edits for.
+pub fn edited_fighters(project: &ModProjectFile) -> BTreeSet<String> {
+    project
+        .fighters
+        .iter()
+        .filter(|(_, fighter)| fighter.has_edits())
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Re-open a loaded project's moveset link with `build`. Returns the path to keep, the index
@@ -382,16 +414,27 @@ mod tests {
         romfs: &[(&str, &[u8])],
         moveset: &[&str],
     ) -> Vec<Vec<MembershipReason>> {
+        run_with_edits(added, romfs, moveset, &[])
+    }
+
+    fn run_with_edits(
+        added: &[ProjectFighter],
+        romfs: &[(&str, &[u8])],
+        moveset: &[&str],
+        edits: &[&str],
+    ) -> Vec<Vec<MembershipReason>> {
         let added: BTreeSet<_> = added.iter().cloned().collect();
         let romfs_slots: BTreeMap<_, _> = romfs
             .iter()
             .map(|(n, s)| (n.to_string(), s.iter().copied().collect()))
             .collect();
         let moveset_fighters: BTreeSet<_> = moveset.iter().map(|s| s.to_string()).collect();
+        let has_edits: BTreeSet<_> = edits.iter().map(|s| s.to_string()).collect();
         let inputs = MembershipInputs {
             added: &added,
             romfs_slots: &romfs_slots,
             moveset_fighters: &moveset_fighters,
+            has_edits: &has_edits,
         };
         let rows = rows();
         rows.iter().map(|r| membership(r, &rows, &inputs)).collect()
@@ -431,15 +474,31 @@ mod tests {
 
     #[test]
     fn reasons_come_in_enum_order() {
-        let got = run(&[ProjectFighter::fighter("mario")], &[("mario", &[2])], &["mario"]);
+        let got = run_with_edits(
+            &[ProjectFighter::fighter("mario")],
+            &[("mario", &[2])],
+            &["mario"],
+            &["mario"],
+        );
         assert_eq!(
             got[0],
             vec![
                 MembershipReason::Added,
                 MembershipReason::RomfsFiles,
-                MembershipReason::MovesetScripts
+                MembershipReason::MovesetScripts,
+                MembershipReason::HasEdits,
             ]
         );
+    }
+
+    #[test]
+    fn has_edits_reason_on_own_row_only() {
+        // Edits are kept per fighter, shared by its slot characters: only the own row shows it,
+        // and the name matches whatever its case.
+        let got = run_with_edits(&[], &[], &[], &["PacMan"]);
+        assert_eq!(got[1], vec![MembershipReason::HasEdits]);
+        assert!(got[2].is_empty());
+        assert!(got[0].is_empty());
     }
 
     #[test]
@@ -456,10 +515,12 @@ mod tests {
         let added = BTreeSet::new();
         let romfs_slots = BTreeMap::from([("mario".to_string(), BTreeSet::from([0u8]))]);
         let moveset_fighters = BTreeSet::new();
+        let has_edits = BTreeSet::new();
         let inputs = MembershipInputs {
             added: &added,
             romfs_slots: &romfs_slots,
             moveset_fighters: &moveset_fighters,
+            has_edits: &has_edits,
         };
         let rows = vec![entry("Mario", None, 0..8)];
         assert_eq!(
@@ -484,11 +545,32 @@ mod tests {
         edited(&mut project, "fox");
         // Built but unedited: not a member.
         project.fighters.entry("mario".into()).or_default();
-        absorb_edited_fighters(&mut set, &project);
+        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
+        assert_eq!(edited_now, BTreeSet::from(["fox".to_string()]));
         // The edit is undone; the next build still keeps fox.
         project.fighters.clear();
-        absorb_edited_fighters(&mut set, &project);
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
+        assert!(edited_now.is_empty());
+    }
+
+    #[test]
+    fn removed_edited_fighter_stays_removed() {
+        let mut set = BTreeSet::new();
+        let mut project = crate::mod_project::ModProjectFile::default();
+        edited(&mut project, "fox");
+        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project);
+        // "Remove from project" while fox still has edits.
+        set.remove(&ProjectFighter::fighter("fox"));
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        assert!(set.is_empty());
+        assert_eq!(edited_now, BTreeSet::from(["fox".to_string()]));
+        // Undone and edited again: that is a new edit, so fox joins again.
+        project.fighters.clear();
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        edited(&mut project, "fox");
+        absorb_edited_fighters(&mut set, &edited_now, &project);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
     }
 

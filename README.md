@@ -76,9 +76,10 @@ With a project open, the fighter list has two groups: **In this project** (expan
 **Everything else** (collapsed, for effect donors and comparisons); search filters both.
 A fighter is in the project when it was added to it, has files in the project's
 `romfs/fighter/<name>/`, has scripts in the linked moveset crate, or has saved edits (an
-edited fighter is never hidden). Right-click a fighter to **Add to project** or **Remove
-from project**; the menu says why a fighter that is in by rule cannot be removed. Without a
-project the list is the flat list it always was.
+edited fighter is never hidden). Editing a fighter adds it to the project, and it stays
+after the edit is undone. Right-click a fighter to **Add to project** or **Remove from
+project**; the menu says why a fighter stays listed after removal (for example, it still has
+edits). Without a project the list is the flat list it always was.
 
 The `ui` folder is optional and only the Roster window needs it. Dump it if you
 want to edit the character select screen: it provides

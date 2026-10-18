@@ -113,11 +113,13 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   expands a matching group). No project: the flat list, unchanged. Membership: explicit
   `project_fighters` entry, files in `romfs/fighter/<name>/`, scripts for the fighter in the
   linked crate (`SourceIndex::fighters`, unlabelled scripts under `""` ignored), or a non-empty
-  `FighterMod`. Editing adds the explicit entry, so it survives undo. Membership is per row
+  `FighterMod` (`has_edits()`, on the fighter's own row). A fighter's first edit adds the
+  explicit entry, so it survives undo; removing it sticks while the edits keep the row listed
+  as "has edits". Membership is per row
   (internal name plus the character name for slot characters). Right-click Add to / Remove
   from project (with the reason when a rule keeps it in), an **Add fighter…** picker, and a
   fighter picker in New Project. Import Mod as Project seeds the imported fighters.
-- **`modproject.json` v4.** `project_fighters: Vec<String>` and `moveset_source: Option<String>`,
+- **`modproject.json` v4.** `project_fighters: BTreeSet<ProjectFighter>` (`name` plus optional `character`) and `moveset_source: Option<String>`,
   both `#[serde(default)]`; v1-v3 still load. Old projects seed `project_fighters` from edited
   fighters and authored `RosterMod` entries. `moveset_source` is relative to the workspace when
   the crate is inside it, absolute otherwise; Save As re-expresses it for the new location.
