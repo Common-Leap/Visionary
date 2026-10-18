@@ -14798,16 +14798,6 @@ impl VisionaryApp {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    // Settings live in their own window, as SSBH Editor keeps its preferences
-                    // and render settings: they are rarely changed and shouldn't crowd the
-                    // move controls.
-                    if ui
-                        .selectable_label(self.settings_open, "⚙")
-                        .on_hover_text("Settings")
-                        .clicked()
-                    {
-                        self.settings_open = !self.settings_open;
-                    }
                     let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
                         wgpu_state
                             .renderer
@@ -35118,6 +35108,18 @@ impl eframe::App for VisionaryApp {
                 // Game-link status — same widget language as the Eff Editor header.
                 crate::ui::game_connection(ui, self.game_link.status());
                 ui.separator();
+                // Settings live in their own window, as SSBH Editor keeps its preferences and
+                // render settings: they are rarely changed, so the button sits at the far end
+                // of the menu bar rather than among the move controls.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(self.settings_open, "⚙")
+                        .on_hover_text("Settings")
+                        .clicked()
+                    {
+                        self.settings_open = !self.settings_open;
+                    }
+                });
             });
         });
         self.perf.end("menu_bar", t_menu);
