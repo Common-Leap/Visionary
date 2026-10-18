@@ -44,7 +44,7 @@ ArcExplorer export/
 ```
 
 On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
-else, then shows the Project Hub. It checks the folder: one without `fighter/` and `effect/`
+else, then shows the Project Hub (the hub waits until a dump is set). It checks the folder: one without `fighter/` and `effect/`
 is refused with the reason, one that looks like a mod (an `info.toml`, a `.nro`, a `romfs/`
 wrapper or only a handful of fighters) is warned about, and a folder that holds a valid dump
 one level down offers that folder instead. The `fighter` folder provides character models,
@@ -62,8 +62,10 @@ with what each is for and whether it is OK, missing or has a problem:
 4. **Moveset code.** The Rust crate linked to the open project.
 
 The precedence rule: a file in the project's `romfs/` wins over everything else, in the
-fighter list and in previews, so a copied and edited model previews from `romfs/` and not
-from the dump. Between the dump and the reference mods nothing changes: the dump stays
+fighter list and in previews (models, motions, params and icons), so a copied and edited
+model previews from `romfs/` and not from the dump. Effects are the exception: they still
+come from the dump and the reference mods, so exporting an edited effect can never write
+over a file in `romfs/`. Between the dump and the reference mods nothing changes: the dump stays
 authoritative for a fighter's model, motion and parameter paths, and mods add fighters and
 slots. The dump and the Mod Library belong to the machine; the project's files and moveset
 link belong to the project. The moveset link is saved per project in `modproject.json`
@@ -988,7 +990,7 @@ installs looks exactly like one that does nothing.
 
 ## Projects and mod exports
 
-The **Project Hub** appears on launch — **Resume last / New / Open
+The **Project Hub** appears on launch once a game dump is set — **Resume last / New / Open
 (`modproject.json`) / Import mod / Recent / Browse without project** — and
 reopens from **File → Project Hub** mid-session. One current project holds
 every edit: its path is remembered, edits autosave to it about a second after

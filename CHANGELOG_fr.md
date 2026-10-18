@@ -126,7 +126,11 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   the crate is inside it, absolute otherwise; Save As re-expresses it for the new location.
   Distribution copies never carry an absolute `moveset_source`.
 - **Project `romfs/` as an index root.** It overrides the dump and reference mods for any file
-  it provides, in the fighter list and in previews (models, motions, params, icons). Between
+  it provides, in the fighter list and in previews (models, motions, params, icons). Effects
+  are not overlaid (`apply_romfs_overlay` leaves `effect_dir` alone and `reindex_fighters`
+  looks for effect folders in the shared roots only): the eff editor's saved `source_rel`
+  falls back to an absolute path outside the dump, and export would write it back over the
+  romfs file. Between
   the dump and reference mods the first-root-wins rule is unchanged.
 - **Per-project moveset link.** Opening a project re-links its crate. Linking with a project
   open writes the project only; the global `acmd_source` changes only in Browse without
@@ -138,8 +142,9 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   `info.toml`, a `.nro`, a `romfs/` wrapper or few fighters; offers a valid dump one level down.
   A failing folder is held as `pending_dump` and resolved in the Sources window.
 - **First run.** With no dump, the left panel shows "Step 1 — your game dump" and **Choose game
-  dump…** (`pick_game_dump`, shared with the Sources row). Applying a dump when none was set,
-  no project is open and there are no recent projects opens the Project Hub (`apply_game_dump`),
+  dump…** (`pick_game_dump`, shared with the Sources row). `VisionaryApp::new` keeps the hub
+  hidden while no dump is set; applying a dump when none was set and no project is open opens
+  the Project Hub (`apply_game_dump`, no longer gated on recent projects),
   on both the immediate path and the confirmed-from-Sources path.
 
 ## Emulator and live preview

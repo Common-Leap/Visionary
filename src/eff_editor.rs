@@ -2151,7 +2151,7 @@ impl EffEditor {
                      opened in the main window until you pick one here.",
                 );
             if ui.small_button("Change…").clicked() {
-                let mut dialog = rfd::FileDialog::new().set_title("Select ArcExplorer export root");
+                let mut dialog = rfd::FileDialog::new().set_title("Select your ArcExplorer game dump");
                 // Start where we already are, not in the launch folder.
                 if self.export_root.is_dir() {
                     dialog = dialog.set_directory(&self.export_root);

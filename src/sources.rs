@@ -146,14 +146,16 @@ pub fn hint_text(hint: &ModHint) -> String {
         ModHint::InfoToml => "has an info.toml, which mods ship and dumps don't".into(),
         ModHint::Plugin => "contains a plugin (.nro file), which a game dump never does".into(),
         ModHint::RomfsWrapper => {
-            "is, or sits inside, a romfs folder — pick the folder that contains fighter/ and effect/"
+            "is, or contains, a romfs folder — pick the folder that contains fighter/ and effect/"
                 .into()
         }
         ModHint::FewFighters(n) => {
             format!("holds only {n} fighters — a full dump has about 90")
         }
         ModHint::NotVanilla => {
-            format!("is missing {CARRIER_BASE_REL}, a file every full dump has")
+            format!(
+                "is missing {CARRIER_BASE_REL}, a file every full dump has, so it won't be                  used to fill in files a partial romfs copy leaves out"
+            )
         }
     }
 }

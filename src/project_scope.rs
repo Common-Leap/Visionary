@@ -121,6 +121,11 @@ pub fn romfs_fighter_slots(romfs: &Path) -> BTreeMap<String, BTreeSet<u8>> {
 /// Point `entry`'s paths at the project's `romfs/` wherever it has the file, so a file in the
 /// project wins over the dump. A part the romfs lacks keeps its dump path. `fighter_dir`,
 /// `slots`, `source` and the name fields are never touched.
+///
+/// `effect_dir` is left alone too. The effect editor saves the path of the eff it loaded into
+/// the project relative to the dump, falling back to an absolute path; an eff loaded from
+/// `romfs/` would then be exported straight back over that romfs file. Effects keep resolving
+/// from the dump and reference mods (`fighter_effect_names` already scans every root).
 pub fn apply_romfs_overlay(entry: &mut FighterEntry, romfs: &Path) {
     let fighter = romfs.join("fighter").join(&entry.name);
     let slot = format!("c{:02}", entry.base_slot());
@@ -139,10 +144,6 @@ pub fn apply_romfs_overlay(entry: &mut FighterEntry, romfs: &Path) {
         .find(|p| p.exists())
     {
         entry.param_path = path;
-    }
-    let effect = romfs.join("effect").join("fighter").join(&entry.name);
-    if effect.is_dir() {
-        entry.effect_dir = Some(effect);
     }
 }
 
@@ -220,12 +221,23 @@ pub fn moveset_fighters(index: &crate::acmd_src::SourceIndex) -> BTreeSet<String
         .collect()
 }
 
+/// A reason as a verb phrase, to follow "because it" in the list's hover text.
 pub fn reason_label(reason: MembershipReason) -> &'static str {
     match reason {
-        MembershipReason::Added => "added to project",
+        MembershipReason::Added => "was added to the project",
         MembershipReason::RomfsFiles => "has files in romfs/",
-        MembershipReason::MovesetScripts => "moveset has scripts",
+        MembershipReason::MovesetScripts => "has scripts in the moveset",
         MembershipReason::HasEdits => "has edits",
+    }
+}
+
+/// `reasons` as one phrase for "... because it {phrase}": "a", "a and b", "a, b and c".
+pub fn join_reasons(reasons: &[MembershipReason]) -> String {
+    let labels: Vec<&str> = reasons.iter().map(|r| reason_label(*r)).collect();
+    match labels.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -401,6 +413,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         touch(t.path(), "fighter/mario/model/body/c00/x");
         touch(t.path(), "fighter/mario/param/vl.prc");
+        // A romfs effect folder never redirects: effects stay on the dump.
+        touch(t.path(), "effect/fighter/mario/ef_mario.eff");
         let mut e = entry("mario", None, 0..8);
         let before = e.clone();
         apply_romfs_overlay(&mut e, t.path());
@@ -523,6 +537,21 @@ mod tests {
         assert_eq!(got[1], vec![MembershipReason::HasEdits]);
         assert!(got[2].is_empty());
         assert!(got[0].is_empty());
+    }
+
+    #[test]
+    fn reasons_join_into_one_phrase() {
+        use MembershipReason::*;
+        assert_eq!(join_reasons(&[]), "");
+        assert_eq!(join_reasons(&[MovesetScripts]), "has scripts in the moveset");
+        assert_eq!(
+            join_reasons(&[RomfsFiles, HasEdits]),
+            "has files in romfs/ and has edits"
+        );
+        assert_eq!(
+            join_reasons(&[Added, RomfsFiles, MovesetScripts]),
+            "was added to the project, has files in romfs/ and has scripts in the moveset"
+        );
     }
 
     #[test]

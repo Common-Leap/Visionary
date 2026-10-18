@@ -48,7 +48,8 @@
   projects ask which fighters they are for.
 - **One Sources window.** File → Sources… shows the game dump, your reference mods, your
   project's files and your moveset code in one place, with what each is for and whether it is
-  working. Your project's own files win over the game dump when previewing.
+  working. Your project's own models, motions and params win over the game dump when
+  previewing; effects still come from the dump.
 - **Your moveset link is saved with the project.** Opening a project links its moveset again.
 - **First-run setup.** Visionary asks for your ArcExplorer dump first, warns you if the folder
   looks like a mod, then shows the Project Hub.

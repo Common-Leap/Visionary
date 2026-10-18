@@ -3802,6 +3802,13 @@ impl VisionaryApp {
         // project's own link.
         app.relink_global_acmd_source();
 
+        // First run: the dump comes before the Project Hub. Left showing, the hub covered the
+        // left panel's "Step 1 — your game dump" and let New Project start with no dump;
+        // `apply_game_dump` brings it up once a dump is set.
+        if app.state.data_root.is_none() {
+            app.project_hub.show = false;
+        }
+
         // Profiling helper: preselect a fighter by internal name so a `VISIONARY_PROFILE` run
         // measures the loaded-model path (3D viewport, bone overlays) instead of the empty
         // "open a data root" viewport, which exercises almost none of the per-frame work.
@@ -3828,12 +3835,15 @@ impl VisionaryApp {
     ///
     /// Falls back to the export-root path when nothing exists, preserving the previous
     /// behaviour (and the previous error message) for genuinely missing files.
+    ///
+    /// The open project's `romfs/` is not searched: effects resolve from the dump and the mods
+    /// only, so an export never reads its base from (and writes back over) the project's file.
     fn resolve_eff_source(&self, source_rel: &str) -> PathBuf {
         let primary = self.eff_editor.export_root().join(source_rel);
         if primary.exists() {
             return primary;
         }
-        let mut roots = self.all_roots();
+        let mut roots = self.shared_roots();
         if let Some(d) = &self.export_dir {
             roots.push(d.clone());
         }
@@ -3949,7 +3959,9 @@ impl VisionaryApp {
 
     fn set_data_root(&mut self, path: PathBuf) {
         save_config_path("data_root", &path);
-        self.state.fighters.clear();
+        // The fighter list is left in place for `reindex_fighters`, which re-finds the selected
+        // row by name in the new dump (and reloads it there); clearing it here first made the
+        // selection a stale index into the new list.
         self.state.labels.clear();
         self.state.status = format!("Loading from {}...", path.display());
 
@@ -3999,6 +4011,8 @@ impl VisionaryApp {
         // Index fighters
         let fighter_dir = path.join("fighter");
         if !fighter_dir.is_dir() {
+            self.clear_fighter_selection();
+            self.state.fighters.clear();
             self.state.status = "No fighter/ directory found.".to_string();
             return;
         }
@@ -4042,11 +4056,16 @@ impl VisionaryApp {
         ];
 
         let roots = self.all_roots();
+        let shared_roots = self.shared_roots();
         // The list is rebuilt and re-sorted, so the selection is re-found by row, not index.
         let selected = self.state.selected_fighter.and_then(|idx| {
             let entry = self.state.fighters.get(idx)?;
-            let dirs = (entry.model_dir.clone(), entry.motion_dir.clone());
-            Some((self.project_fighter_key(idx)?, dirs))
+            let files = (
+                entry.model_dir.clone(),
+                entry.motion_dir.clone(),
+                entry.param_path.clone(),
+            );
+            Some((self.project_fighter_key(idx)?, files))
         });
         self.state.fighters.clear();
 
@@ -4115,8 +4134,10 @@ impl VisionaryApp {
                     crate::data::FighterSource::ModRoot
                 };
 
-                // Prefer the effect folder from whichever root actually has one.
-                let effect_dir = roots
+                // Prefer the effect folder from whichever root actually has one. The project's
+                // romfs is not asked: effects resolve from the dump and the mods only (see
+                // `project_scope::apply_romfs_overlay`).
+                let effect_dir = shared_roots
                     .iter()
                     .map(|r| r.join("effect").join("fighter").join(&name))
                     .find(|d| d.is_dir());
@@ -4157,7 +4178,7 @@ impl VisionaryApp {
                             motion_dir: or_base(own.join("motion").join("body").join(&costume), &motion_dir),
                             model_dir: or_base(own.join("model").join("body").join(&costume), &model_dir),
                             effect_dir: Some(character.root.join("effect").join("fighter").join(&name))
-                                .filter(|dir| dir.is_dir())
+                                .filter(|dir| shared_roots.contains(&character.root) && dir.is_dir())
                                 .or_else(|| effect_dir.clone()),
                             slots: character.slots,
                             fighter_dir: own,
@@ -4205,7 +4226,7 @@ impl VisionaryApp {
             None => BTreeMap::new(),
         };
 
-        if let Some((selected, dirs)) = selected {
+        if let Some((selected, files)) = selected {
             let found = self.state.fighters.iter().position(|entry| {
                 entry.name == selected.name && entry.custom_name == selected.character
             });
@@ -4214,7 +4235,11 @@ impl VisionaryApp {
                 // or the viewport keeps showing the old ones.
                 Some(idx) => {
                     let entry = &self.state.fighters[idx];
-                    let changed = (entry.model_dir.clone(), entry.motion_dir.clone()) != dirs;
+                    let changed = (
+                        entry.model_dir.clone(),
+                        entry.motion_dir.clone(),
+                        entry.param_path.clone(),
+                    ) != files;
                     // Re-pointed first: `select_fighter` commits the open move through this
                     // index, and may return early with it left as is.
                     self.state.selected_fighter = Some(idx);
@@ -9330,12 +9355,10 @@ impl VisionaryApp {
             hover.push_str("\nModded character (not in the vanilla roster)");
         }
         if in_project {
-            let reasons: Vec<&str> = row
-                .reasons
-                .iter()
-                .map(|r| crate::project_scope::reason_label(*r))
-                .collect();
-            hover.push_str(&format!("\nIn project: {}", reasons.join(", ")));
+            hover.push_str(&format!(
+                "\nIn the project because it {}",
+                crate::project_scope::join_reasons(&row.reasons)
+            ));
         }
         let response = ui.selectable_label(selected, &label).on_hover_text(hover);
         if response.clicked() {
@@ -9346,18 +9369,21 @@ impl VisionaryApp {
                 if in_project {
                     use crate::project_scope::MembershipReason;
                     let has_added = row.reasons.contains(&MembershipReason::Added);
-                    let others: Vec<&str> = row
+                    let others: Vec<MembershipReason> = row
                         .reasons
                         .iter()
-                        .filter(|r| **r != MembershipReason::Added)
-                        .map(|r| crate::project_scope::reason_label(*r))
+                        .copied()
+                        .filter(|r| *r != MembershipReason::Added)
                         .collect();
                     let remove =
                         ui.add_enabled(has_added, egui::Button::new("Remove from project"));
                     let remove = if others.is_empty() {
                         remove
                     } else {
-                        let why = format!("Still in the project because it {}", others.join(", "));
+                        let why = format!(
+                            "Still in the project because it {}",
+                            crate::project_scope::join_reasons(&others)
+                        );
                         remove.on_hover_text(why.clone()).on_disabled_hover_text(why)
                     };
                     if remove.clicked() {
@@ -9389,10 +9415,22 @@ impl VisionaryApp {
         });
     }
 
+    /// Close the "Add fighter…" popup and forget its search. It belongs to one project, so
+    /// leaving or switching the project closes it.
+    fn close_add_fighter_popup(&mut self) {
+        self.add_fighter_popup = None;
+        self.add_fighter_search.clear();
+    }
+
     /// The "Add fighter…" popup: a search field over the fighters not yet in the project.
     /// Clicking one adds it and the list keeps going, so several can be added in a row; closing
     /// the window skips the rest. New Project opens it with a title that asks the question.
     fn draw_add_fighter_popup(&mut self, ctx: &egui::Context) {
+        // It adds to the open project; with none open there is nothing to add to.
+        if self.project_path.is_none() {
+            self.close_add_fighter_popup();
+            return;
+        }
         let Some(title) = self.add_fighter_popup.clone() else {
             return;
         };
@@ -18972,6 +19010,7 @@ impl VisionaryApp {
                 return;
             }
         };
+        self.close_add_fighter_popup();
         self.game_link.begin_project_batch();
         self.clear_all_game_edits();
         self.eff_editor.reset_project_state();
@@ -19044,6 +19083,7 @@ impl VisionaryApp {
             }
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
+                self.close_add_fighter_popup();
                 // Leaving an open project (autosave flushed it above): its romfs stops being an
                 // index root and the global moveset link applies again. In-memory edits stay.
                 if self.project_path.take().is_some() {
@@ -19161,14 +19201,14 @@ impl VisionaryApp {
         self.dump_status = None;
     }
 
-    /// Apply a dump the user has accepted. On first run (no dump yet, no project open, no
-    /// recent projects) this is step 1 of setup, so step 2 follows: the Project Hub.
+    /// Apply a dump the user has accepted. On first run (no dump yet, no project open) this is
+    /// step 1 of setup, so step 2 follows: the Project Hub.
     fn apply_game_dump(&mut self, path: PathBuf) {
-        let first_run = self.state.data_root.is_none()
-            && self.project_path.is_none()
-            && self.project_hub.recent.is_empty();
+        // No recent-projects condition: a returning user whose dump setting was lost had the
+        // hub held back at startup too, and gets it here.
+        let first_run = self.state.data_root.is_none() && self.project_path.is_none();
         self.set_data_root(path);
-        if first_run {
+        if first_run && self.state.data_root.is_some() {
             self.project_hub.show = true;
         }
     }
@@ -20929,6 +20969,9 @@ impl VisionaryApp {
             self.state.status = format!("Project load failed: {error}");
             return;
         }
+
+        // An "Add fighter…" popup left open adds to whichever project is open: close it.
+        self.close_add_fighter_popup();
 
         // Loading is replacement, not an undocumented merge. Clear the previous project's
         // runtime rules/carrier first, then replace every local edit store so saving immediately
@@ -39051,8 +39094,6 @@ pub(crate) const VANILLA_ROOT_CONFIG_KEY: &str = "vanilla_root";
 /// is a portable install that lives somewhere else entirely.
 pub(crate) const SD_ROOT_CONFIG_KEY: &str = "sd_root";
 
-/// Config key for the user's own ACMD source project — the smashline crate that builds their
-/// plugin. When set, its scripts are read in preference to the dumped-script mirror.
 /// A row of the Sources window, so other panels can send the user to the one they need.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRow {
@@ -39062,6 +39103,8 @@ pub(crate) enum SourceRow {
     MovesetCode,
 }
 
+/// Config key for the user's own ACMD source project — the smashline crate that builds their
+/// plugin. When set, its scripts are read in preference to the dumped-script mirror.
 pub(crate) const ACMD_SRC_CONFIG_KEY: &str = "acmd_src_root";
 
 pub(crate) fn save_config_path(key: &str, path: &std::path::Path) {

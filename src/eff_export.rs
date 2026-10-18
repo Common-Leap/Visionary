@@ -1332,7 +1332,7 @@ fn rebuild_eff_bytes_filtered(
         } else {
             let root = donor_root.ok_or_else(|| {
                 anyhow!(
-                    "transplant '{}': cross-file donor '{}' needs the export root",
+                    "transplant '{}': cross-file donor '{}' needs the game dump",
                     op.new_entry_name,
                     op.src_file_rel
                 )
