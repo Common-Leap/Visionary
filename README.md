@@ -43,9 +43,42 @@ ArcExplorer export/
 └── ui/        (optional — needed for the Roster window)
 ```
 
-Open this export root in Visionary when prompted. The `fighter` folder provides
-character models, motion data, and parameters; the `effect` folder provides the
-`.eff` files used by the effect editor.
+On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
+else, then shows the Project Hub. It checks the folder: one without `fighter/` and `effect/`
+is refused with the reason, one that looks like a mod (an `info.toml`, a `.nro`, a `romfs/`
+wrapper or only a handful of fighters) is warned about, and a folder that holds a valid dump
+one level down offers that folder instead. The `fighter` folder provides character models,
+motion data, and parameters; the `effect` folder provides the `.eff` files used by the
+effect editor.
+
+### Sources window
+
+**File → Sources…** is the one place that shows every input, top to bottom in load order,
+with what each is for and whether it is OK, missing or has a problem:
+
+1. **Base game — ArcExplorer dump.** Global: the same game for every project.
+2. **Reference mods.** Global: the enabled Mod Library entries, opened from this row.
+3. **This project's files.** The open project's `romfs/`.
+4. **Moveset code.** The Rust crate linked to the open project.
+
+The precedence rule: a file in the project's `romfs/` wins over everything else, in the
+fighter list and in previews, so a copied and edited model previews from `romfs/` and not
+from the dump. Between the dump and the reference mods nothing changes: the dump stays
+authoritative for a fighter's model, motion and parameter paths, and mods add fighters and
+slots. The dump and the Mod Library belong to the machine; the project's files and moveset
+link belong to the project. The moveset link is saved per project in `modproject.json`
+(relative to the project folder when the crate is inside it), so opening a project re-links
+its crate. Without a project open, the link is the global one, as before.
+
+### Project fighters
+
+With a project open, the fighter list has two groups: **In this project** (expanded) and
+**Everything else** (collapsed, for effect donors and comparisons); search filters both.
+A fighter is in the project when it was added to it, has files in the project's
+`romfs/fighter/<name>/`, has scripts in the linked moveset crate, or has saved edits (an
+edited fighter is never hidden). Right-click a fighter to **Add to project** or **Remove
+from project**; the menu says why a fighter that is in by rule cannot be removed. Without a
+project the list is the flat list it always was.
 
 The `ui` folder is optional and only the Roster window needs it. Dump it if you
 want to edit the character select screen: it provides

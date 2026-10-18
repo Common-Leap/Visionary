@@ -9435,12 +9435,19 @@ impl VisionaryApp {
 
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
+            ui.add_space(6.0);
+            ui.strong("Step 1 — your game dump");
+            ui.label(
+                "Choose the folder ArcExplorer exported from data.arc.
+                 It holds fighter/ and effect/.",
+            );
+            ui.add_space(4.0);
             if ui
-                .button("Set game dump…")
+                .button("Choose game dump…")
                 .on_hover_text("Choose the folder containing extracted fighter files")
                 .clicked()
             {
-                self.open_sources(SourceRow::Dump);
+                self.pick_game_dump();
             }
             return;
         }
@@ -19131,6 +19138,18 @@ impl VisionaryApp {
         self.dump_status = None;
     }
 
+    /// Apply a dump the user has accepted. On first run (no dump yet, no project open, no
+    /// recent projects) this is step 1 of setup, so step 2 follows: the Project Hub.
+    fn apply_game_dump(&mut self, path: PathBuf) {
+        let first_run = self.state.data_root.is_none()
+            && self.project_path.is_none()
+            && self.project_hub.recent.is_empty();
+        self.set_data_root(path);
+        if first_run {
+            self.project_hub.show = true;
+        }
+    }
+
     /// Pick a folder as the ArcExplorer dump. A folder that passes `check_dump` is applied
     /// straight away; anything else is held in `pending_dump` for the Sources window to ask
     /// about, since the answer arrives on a later frame. Shared by the Sources window and
@@ -19145,7 +19164,7 @@ impl VisionaryApp {
         match crate::sources::check_dump(&path) {
             crate::sources::DumpCheck::Ok => {
                 self.pending_dump = None;
-                self.set_data_root(path);
+                self.apply_game_dump(path);
             }
             other => {
                 self.pending_dump = Some((path, other));
@@ -19476,7 +19495,7 @@ impl VisionaryApp {
         }
         if let Some(path) = use_pending {
             self.pending_dump = None;
-            self.set_data_root(path);
+            self.apply_game_dump(path);
         }
         if change_dump {
             self.pending_dump = None;

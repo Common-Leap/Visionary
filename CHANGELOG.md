@@ -39,6 +39,20 @@
 - **Settings window.** Click the ⚙ gear to change the interface size, background colour, floor
   grid, bloom, helper bones and camera. Your choices are remembered.
 
+## Projects and setup
+
+- **The fighter list follows your project.** With a project open, the fighters it is about sit
+  at the top under "In this project", and everything else is tucked into a collapsed
+  "Everything else" group. A fighter you have edited, or that has files in your project, is
+  always listed. Right-click any fighter to add it to or remove it from the project, and new
+  projects ask which fighters they are for.
+- **One Sources window.** File → Sources… shows the game dump, your reference mods, your
+  project's files and your moveset code in one place, with what each is for and whether it is
+  working. Your project's own files win over the game dump when previewing.
+- **Your moveset link is saved with the project.** Opening a project links its moveset again.
+- **First-run setup.** Visionary asks for your ArcExplorer dump first, warns you if the folder
+  looks like a mod, then shows the Project Hub.
+
 ## Characters and mods
 
 - Characters added on extra costume slots now get their own entry in the fighter list, under

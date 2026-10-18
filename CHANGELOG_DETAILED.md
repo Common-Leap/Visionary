@@ -81,6 +81,30 @@ Ported from SSBH Editor. Runs on model import, before every **Reload asset previ
 - Hover shows the base fighter and slot runs; searching the base fighter's name still finds it
 - The data root is searched too, and an empty base-fighter row is dropped when the character takes every slot
 
+### Project fighters
+
+With a project open, the left panel splits the fighter list into **In this project** (expanded) and **Everything else** (collapsed); search filters both and opens a group that matches. With no project open the list is the flat list as before.
+
+- A fighter is in the project when it was **added** to it, has **files in the project's `romfs/fighter/<name>/`**, has **scripts in the linked moveset crate**, or has **saved edits**. Editing a fighter adds it to the project for good, even if the edit is undone
+- Right-click **Add to project** / **Remove from project**, or use **Add fighter…** under the group. Remove only clears the explicit entry; the menu says why a fighter stays ("has files in romfs/", "moveset has scripts", "has edits")
+- Membership is per list row, so a slot character is added and removed on its own
+- A crate that does not label its fighters counts for nothing here; the Sources row says so
+- New Project asks which fighters it is for (optional). Import Mod as Project adds the imported fighters. Older projects start with the fighters they already edit or give roster entries to
+
+### Sources window
+
+**File → Sources…** lists every input in load order with its purpose and status (OK, missing, or the problem in words), plus Change and Open folder actions. Every older picker (left panel, File menu, ACMD **Link…**) opens it on the relevant row.
+
+- **Base game — ArcExplorer dump** (global), **Reference mods** (global, opens the Mod Library), **This project's files** (the workspace `romfs/`) and **Moveset code** (per project)
+- **Precedence** — a file in the project's `romfs/` wins over the dump and mods, in the fighter list and in previews. Between the dump and mods the first root to define a fighter still owns its model, motion and parameter paths
+- **Moveset link per project** — stored in `modproject.json`, relative to the project folder when the crate is inside it. Linking with a project open changes only the project; the global link changes only without one. A project with no link offers "Use" for the global crate
+- **Dump check** — a folder must hold `fighter/` and `effect/`. A folder that looks like a mod (`info.toml`, a `.nro`, a `romfs/` wrapper, or few fighters) gets a warning you can override, and a folder with a valid dump one level down offers that folder
+- User-facing text says "ArcExplorer dump" instead of "data root", "export root" or "base game folder"
+
+### First run
+
+With no dump set, the left panel shows "Step 1 — your game dump" and **Choose game dump…**, running the same check as the Sources window. Once a dump is accepted on a first run (no project open, no recent projects), the Project Hub opens as step 2.
+
 ### Emulator support
 
 - SD detection adds sudachi, suyu, citron and torzu alongside Eden, yuzu and Ryujinx

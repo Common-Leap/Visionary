@@ -106,6 +106,39 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   for these too, and an empty base-fighter row is dropped when the character takes every slot.
   The thrown-fighter list skips slot-character rows.
 
+## Project fighters and Sources
+
+- **Project-scoped fighter list.** With a project open, the `reindex_fighters` output is split
+  into "In this project" (expanded) and "Everything else" (collapsed; search filters both and
+  expands a matching group). No project: the flat list, unchanged. Membership: explicit
+  `project_fighters` entry, files in `romfs/fighter/<name>/`, scripts for the fighter in the
+  linked crate (`SourceIndex::fighters`, unlabelled scripts under `""` ignored), or a non-empty
+  `FighterMod`. Editing adds the explicit entry, so it survives undo. Membership is per row
+  (internal name plus the character name for slot characters). Right-click Add to / Remove
+  from project (with the reason when a rule keeps it in), an **Add fighter…** picker, and a
+  fighter picker in New Project. Import Mod as Project seeds the imported fighters.
+- **`modproject.json` v4.** `project_fighters: Vec<String>` and `moveset_source: Option<String>`,
+  both `#[serde(default)]`; v1-v3 still load. Old projects seed `project_fighters` from edited
+  fighters and authored `RosterMod` entries. `moveset_source` is relative to the workspace when
+  the crate is inside it, absolute otherwise; Save As re-expresses it for the new location.
+  Distribution copies never carry an absolute `moveset_source`.
+- **Project `romfs/` as an index root.** It overrides the dump and reference mods for any file
+  it provides, in the fighter list and in previews (models, motions, params, icons). Between
+  the dump and reference mods the first-root-wins rule is unchanged.
+- **Per-project moveset link.** Opening a project re-links its crate. Linking with a project
+  open writes the project only; the global `acmd_source` changes only in Browse without
+  project. A project with no link shows "not linked" with a one-click "Use <global crate>".
+- **Sources window.** File → Sources… lists the dump, reference mods, project files and moveset
+  code in load order with purpose, status and Change / Open folder. The left panel, File menu
+  and ACMD **Link…** now open it on the matching row. UI text says "ArcExplorer dump".
+- **Dump check (`sources::check_dump`).** Requires `fighter/` and `effect/`; warns on
+  `info.toml`, a `.nro`, a `romfs/` wrapper or few fighters; offers a valid dump one level down.
+  A failing folder is held as `pending_dump` and resolved in the Sources window.
+- **First run.** With no dump, the left panel shows "Step 1 — your game dump" and **Choose game
+  dump…** (`pick_game_dump`, shared with the Sources row). Applying a dump when none was set,
+  no project is open and there are no recent projects opens the Project Hub (`apply_game_dump`),
+  on both the immediate path and the confirmed-from-Sources path.
+
 ## Emulator and live preview
 
 - SD detection also probes sudachi, suyu, citron and torzu, and picks the SD root the game wrote
