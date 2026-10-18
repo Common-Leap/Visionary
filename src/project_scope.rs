@@ -264,6 +264,30 @@ pub fn absorb_edited_fighters(
     edited
 }
 
+/// The slot characters `roster` authors, as project rows.
+pub fn authored_characters(roster: &crate::mod_project::RosterMod) -> BTreeSet<ProjectFighter> {
+    roster
+        .authored
+        .iter()
+        .map(|entry| ProjectFighter::character(&entry.donor, &entry.display_name))
+        .collect()
+}
+
+/// Add each character `roster` authors now but did not in `previously_authored` to `set`, and
+/// return the characters it authors now. Like [`absorb_edited_fighters`]: a character made in
+/// the Roster window joins the project once, and removing it from the project sticks.
+pub fn absorb_authored_characters(
+    set: &mut BTreeSet<ProjectFighter>,
+    previously_authored: &BTreeSet<ProjectFighter>,
+    roster: &crate::mod_project::RosterMod,
+) -> BTreeSet<ProjectFighter> {
+    let authored = authored_characters(roster);
+    for row in authored.difference(previously_authored) {
+        set.insert(row.clone());
+    }
+    authored
+}
+
 /// The fighters `project` holds edits for.
 pub fn edited_fighters(project: &ModProjectFile) -> BTreeSet<String> {
     project
@@ -553,6 +577,28 @@ mod tests {
         let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
         assert!(edited_now.is_empty());
+    }
+
+    #[test]
+    fn authored_character_joins_once() {
+        let mut set = BTreeSet::new();
+        let mut project = crate::mod_project::ModProjectFile::default();
+        project.roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("pacman", 8),
+            donor: "pacman".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Shy Guy".into(),
+            name_id: "shy_guy".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let shy_guy = ProjectFighter::character("pacman", "Shy Guy");
+        let authored = absorb_authored_characters(&mut set, &BTreeSet::new(), &project.roster);
+        assert_eq!(set, BTreeSet::from([shy_guy.clone()]));
+        set.remove(&shy_guy);
+        absorb_authored_characters(&mut set, &authored, &project.roster);
+        assert!(set.is_empty());
     }
 
     #[test]

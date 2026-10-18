@@ -120,8 +120,9 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   from project (with the reason when a rule keeps it in), an **Add fighter…** picker, and a
   fighter picker in New Project. Import Mod as Project seeds the imported fighters.
 - **`modproject.json` v4.** `project_fighters: BTreeSet<ProjectFighter>` (`name` plus optional `character`) and `moveset_source: Option<String>`,
-  both `#[serde(default)]`; v1-v3 still load. Old projects seed `project_fighters` from edited
-  fighters and authored `RosterMod` entries. `moveset_source` is relative to the workspace when
+  both `#[serde(default)]`; v1-v3 still load. `migrate()` seeds a v1-v3 project's
+  `project_fighters` from edited fighters and authored `RosterMod` entries; a v4 file's list is
+  kept as saved. `moveset_source` is relative to the workspace when
   the crate is inside it, absolute otherwise; Save As re-expresses it for the new location.
   Distribution copies never carry an absolute `moveset_source`.
 - **Project `romfs/` as an index root.** It overrides the dump and reference mods for any file

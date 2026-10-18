@@ -238,8 +238,8 @@ impl ModProjectFile {
     }
 
     /// Add the fighters this project already edits to `project_fighters`: every fighter with
-    /// edits, and every character it authored. Additive and idempotent, so it is safe to run
-    /// on a v1–v3 project that has no list yet and again on one that does.
+    /// edits, and every character it authored. Additive and idempotent. [`Self::migrate`] runs
+    /// it for v1–v3 files only: a v4 file's list is what the user left it as.
     pub fn seed_project_fighters(&mut self) {
         for (name, fighter) in &self.fighters {
             if fighter.has_edits() {
@@ -270,6 +270,11 @@ impl ModProjectFile {
         }
         if self.version < OLDEST_SUPPORTED_VERSION {
             anyhow::bail!("unsupported project version {}", self.version);
+        }
+        // v4 added `project_fighters`. An older file gets it from what it already edits; a v4
+        // file's list is the user's own and is left alone, so a removal survives a reopen.
+        if self.version < 4 {
+            self.seed_project_fighters();
         }
         self.version = PROJECT_VERSION;
         Ok(())
@@ -1643,6 +1648,33 @@ mod version_three_tests {
 
         project.seed_project_fighters();
         assert_eq!(project.project_fighters, expected);
+    }
+
+    fn with_edited_fox(version: u32) -> ModProjectFile {
+        let mut project = ModProjectFile {
+            version,
+            ..Default::default()
+        };
+        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
+            "attack_s3_s".into(),
+            crate::data::AcmdScript::default(),
+        );
+        project
+    }
+
+    #[test]
+    fn v3_project_is_seeded_on_migrate() {
+        let mut project = with_edited_fox(3);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.contains(&ProjectFighter::fighter("fox")));
+    }
+
+    #[test]
+    fn v4_project_is_not_reseeded() {
+        // A v4 file's list is the user's own: fox was removed while it still had edits.
+        let mut project = with_edited_fox(4);
+        project.migrate().unwrap();
+        assert!(project.project_fighters.is_empty());
     }
 
     #[test]

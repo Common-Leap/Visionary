@@ -3392,6 +3392,9 @@ pub struct VisionaryApp {
     /// `project_fighters` only when it first appears here, so removing an edited fighter
     /// sticks; `row_membership` reports these as "has edits".
     edited_fighters: BTreeSet<String>,
+    /// The slot characters the last `build_project` found authored in the Roster window; a
+    /// character joins `project_fighters` when it first appears here, as edits do.
+    authored_characters: BTreeSet<crate::mod_project::ProjectFighter>,
     /// Last saved editable snapshot (move sources cleared), for the autosave
     /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
@@ -3744,6 +3747,7 @@ impl VisionaryApp {
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
             edited_fighters: BTreeSet::new(),
+            authored_characters: BTreeSet::new(),
             last_saved_snapshot: None,
             project_autosave_pending_since: None,
             project_autosave_last_check: std::time::Instant::now(),
@@ -18587,6 +18591,11 @@ impl VisionaryApp {
             &self.edited_fighters,
             &project,
         );
+        self.authored_characters = crate::project_scope::absorb_authored_characters(
+            &mut self.project_fighters,
+            &self.authored_characters,
+            &project.roster,
+        );
         project.project_fighters = self.project_fighters.clone();
         project
     }
@@ -18983,6 +18992,7 @@ impl VisionaryApp {
         self.edit_history.clear();
         self.project_fighters.clear();
         self.edited_fighters.clear();
+        self.authored_characters.clear();
         self.project_moveset = None;
         self.acmd_src = None;
         self.acmd_src_problem = None;
@@ -19044,6 +19054,7 @@ impl VisionaryApp {
                     // No project, no membership; a later Save As re-absorbs edited fighters.
                     self.project_fighters.clear();
                     self.edited_fighters.clear();
+                    self.authored_characters.clear();
                     self.relink_global_acmd_source();
                     self.reindex_fighters();
                     self.reload_move_scripts();
@@ -20947,11 +20958,12 @@ impl VisionaryApp {
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.state.hitboxes = self.state.hitboxes_pristine.clone();
         // The project's fighters and moveset link. Adopted before the edits below, which read
-        // the linked source and the indexed fighters; v1-v3 files are seeded from their edits.
-        project.seed_project_fighters();
+        // the linked source and the indexed fighters; `migrate` seeded a v1-v3 file's list.
         self.project_fighters = std::mem::take(&mut project.project_fighters);
-        // Already edited when saved: seeding covered them, so the next build adds nothing.
+        // Already edited when saved: these are not first edits, so the next build adds nothing
+        // (a fighter the user removed while it had edits stays removed).
         self.edited_fighters = crate::project_scope::edited_fighters(&project);
+        self.authored_characters = crate::project_scope::authored_characters(&project.roster);
         let (moveset, index, problem) = crate::project_scope::moveset_on_load(
             project.moveset_source.take().map(PathBuf::from),
             crate::acmd_src::SourceIndex::build,
