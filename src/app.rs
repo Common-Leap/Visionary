@@ -4157,10 +4157,12 @@ impl VisionaryApp {
                 // or the viewport keeps showing the old ones.
                 Some(idx) => {
                     let entry = &self.state.fighters[idx];
-                    if (entry.model_dir.clone(), entry.motion_dir.clone()) != dirs {
+                    let changed = (entry.model_dir.clone(), entry.motion_dir.clone()) != dirs;
+                    // Re-pointed first: `select_fighter` commits the open move through this
+                    // index, and may return early with it left as is.
+                    self.state.selected_fighter = Some(idx);
+                    if changed {
                         self.select_fighter(idx);
-                    } else {
-                        self.state.selected_fighter = Some(idx);
                     }
                 }
                 None => self.clear_fighter_selection(),
@@ -18351,7 +18353,14 @@ impl VisionaryApp {
                 "Wait for the base game files to finish copying before exporting.".into();
             return;
         }
+        // From Browse without project, the exported file records the crate in use now, for this
+        // build only; it is taken on once the write succeeds, as in Save As.
+        let previous_moveset = self.project_moveset.clone();
+        if self.project_path.is_none() {
+            self.project_moveset = self.acmd_src.as_ref().map(|index| index.root.clone());
+        }
         let project = self.build_project();
+        let saved_moveset = std::mem::replace(&mut self.project_moveset, previous_moveset);
         // A project may intentionally contain only the binary `romfs/` overlay (for example a
         // model/animation iteration with no ACMD or EFF edits). Keep that useful project
         // exportable instead of treating the serialized edit model as the whole project.
@@ -18395,6 +18404,7 @@ impl VisionaryApp {
                     .as_deref()
                     .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
                 // Export adopts the path: later edits autosave here.
+                self.project_moveset = saved_moveset;
                 self.adopt_project_path(&path, &project);
                 // The new workspace's romfs is the index root now.
                 self.reindex_fighters();
