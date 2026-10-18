@@ -3986,10 +3986,11 @@ impl VisionaryApp {
 
         let roots = self.all_roots();
         // The list is rebuilt and re-sorted, so the selection is re-found by row, not index.
-        let selected = self
-            .state
-            .selected_fighter
-            .and_then(|idx| self.project_fighter_key(idx));
+        let selected = self.state.selected_fighter.and_then(|idx| {
+            let entry = self.state.fighters.get(idx)?;
+            let dirs = (entry.model_dir.clone(), entry.motion_dir.clone());
+            Some((self.project_fighter_key(idx)?, dirs))
+        });
         self.state.fighters.clear();
 
         // Fighter name → the root that owns it. A mod root may either ADD a new fighter or
@@ -4147,15 +4148,23 @@ impl VisionaryApp {
             None => BTreeMap::new(),
         };
 
-        if let Some(selected) = selected {
+        if let Some((selected, dirs)) = selected {
             let found = self.state.fighters.iter().position(|entry| {
                 entry.name == selected.name && entry.custom_name == selected.character
             });
-            if found.is_none() {
-                self.state.selected_move = None;
-                clear_move_state(&mut self.state);
+            match found {
+                // The row now reads other files (a romfs overlay came or went): load them,
+                // or the viewport keeps showing the old ones.
+                Some(idx) => {
+                    let entry = &self.state.fighters[idx];
+                    if (entry.model_dir.clone(), entry.motion_dir.clone()) != dirs {
+                        self.select_fighter(idx);
+                    } else {
+                        self.state.selected_fighter = Some(idx);
+                    }
+                }
+                None => self.clear_fighter_selection(),
             }
-            self.state.selected_fighter = found;
         }
 
         let extra_slots: usize = self
@@ -4327,35 +4336,7 @@ impl VisionaryApp {
 
         self.state.fighters.remove(index);
         if was_selected {
-            self.state.selected_fighter = None;
-            self.state.selected_move = None;
-            clear_move_state(&mut self.state);
-            self.state.current_frame = FIRST_GAME_FRAME;
-            self.state.total_frames = 0;
-            self.state.playing = false;
-            self.move_list.clear();
-            self.move_list_receiver = None;
-            self.acmd_receiver = None;
-            self.pending_project_script = None;
-            self.pending_capture = None;
-            self.current_model_dir = None;
-            self.current_anim_path = None;
-            self.current_default_eyelid_path = None;
-            self.current_skel_path = None;
-            self.pending_model_load = None;
-            self.current_eff_path = None;
-            self.bone_names.clear();
-            self.hurtbox_volumes.clear();
-            self.hurtbox_warnings.clear();
-            self.selected_hitbox = None;
-            self.selected_hurtbox = None;
-            self.hurtbox_editor_selection = None;
-            self.hurtbox_condition_edit_start = FIRST_GAME_FRAME;
-            self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
-            self.hitbox_watch = None;
-            self.hitbox_dirty_at = None;
-            self.acmd_error = None;
-            self.acmd_src_buffer = None;
+            self.clear_fighter_selection();
         } else if let Some(selected) = self.state.selected_fighter {
             if selected > index {
                 self.state.selected_fighter = Some(selected - 1);
@@ -4410,6 +4391,39 @@ impl VisionaryApp {
                 fighter.slots = found;
             }
         }
+    }
+
+    /// Select no fighter and empty the viewport, move list and every per-fighter view.
+    fn clear_fighter_selection(&mut self) {
+        self.state.selected_fighter = None;
+        self.state.selected_move = None;
+        clear_move_state(&mut self.state);
+        self.state.current_frame = FIRST_GAME_FRAME;
+        self.state.total_frames = 0;
+        self.state.playing = false;
+        self.move_list.clear();
+        self.move_list_receiver = None;
+        self.acmd_receiver = None;
+        self.pending_project_script = None;
+        self.pending_capture = None;
+        self.current_model_dir = None;
+        self.current_anim_path = None;
+        self.current_default_eyelid_path = None;
+        self.current_skel_path = None;
+        self.pending_model_load = None;
+        self.current_eff_path = None;
+        self.bone_names.clear();
+        self.hurtbox_volumes.clear();
+        self.hurtbox_warnings.clear();
+        self.selected_hitbox = None;
+        self.selected_hurtbox = None;
+        self.hurtbox_editor_selection = None;
+        self.hurtbox_condition_edit_start = FIRST_GAME_FRAME;
+        self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
+        self.hitbox_watch = None;
+        self.hitbox_dirty_at = None;
+        self.acmd_error = None;
+        self.acmd_src_buffer = None;
     }
 
     fn select_fighter(&mut self, idx: usize) {
@@ -18382,6 +18396,8 @@ impl VisionaryApp {
                     .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
                 // Export adopts the path: later edits autosave here.
                 self.adopt_project_path(&path, &project);
+                // The new workspace's romfs is the index root now.
+                self.reindex_fighters();
                 self.state.status = format!("Project exported to {}", path.display());
                 match overlay_report {
                     Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
@@ -18499,7 +18515,15 @@ impl VisionaryApp {
                 "Wait for the base game files to finish copying before Save As.".into();
             return;
         }
+        // From Browse without project, the new file records the crate in use now. Only for
+        // this build: the field is taken on below once the file is written, so a cancelled or
+        // failed Save As leaves Browse mode without a project link.
+        let previous_moveset = self.project_moveset.clone();
+        if self.project_path.is_none() {
+            self.project_moveset = self.acmd_src.as_ref().map(|index| index.root.clone());
+        }
         let project = self.build_project();
+        let saved_moveset = std::mem::replace(&mut self.project_moveset, previous_moveset);
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save project as…")
             .set_file_name(crate::mod_project::PROJECT_FILE_NAME)
@@ -18528,7 +18552,10 @@ impl VisionaryApp {
                 let overlay_report = previous_project
                     .as_deref()
                     .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
+                self.project_moveset = saved_moveset;
                 self.adopt_project_path(&path, &project);
+                // The new workspace's romfs is the index root now.
+                self.reindex_fighters();
                 self.state.status = format!("Saved {}", path.display());
                 match overlay_report {
                     Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
@@ -18713,9 +18740,10 @@ impl VisionaryApp {
         // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
         self.adopt_project_path(&file, &project);
-        // The workspace's romfs is an index root now.
+        // The workspace's romfs is an index root now. Nothing stays selected: re-selecting
+        // would commit the previous project's open move into this one.
+        self.clear_fighter_selection();
         self.reindex_fighters();
-        self.reload_move_scripts();
         self.import_report = None;
         self.project_hub.show = false;
         self.state.status = format!("New project at {}.", workspace.display());
@@ -18755,6 +18783,8 @@ impl VisionaryApp {
                     self.project_autosave_pending_since = None;
                     self.project_autosave_error = None;
                     self.project_moveset = None;
+                    // No project, no membership; a later Save As re-absorbs edited fighters.
+                    self.project_fighters.clear();
                     self.relink_global_acmd_source();
                     self.reindex_fighters();
                     self.reload_move_scripts();
@@ -20274,6 +20304,9 @@ impl VisionaryApp {
         // The path is adopted in full at the end; the fighter list needs this project's romfs
         // now, before the editor selection below is restored against it.
         self.project_path = Some(path.to_path_buf());
+        // Deselect first: a reload from the reindex would commit the previous project's open
+        // move into this one. The selection is restored below.
+        self.clear_fighter_selection();
         self.reindex_fighters();
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
