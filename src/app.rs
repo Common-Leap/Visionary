@@ -1600,6 +1600,26 @@ fn effect_source_label(source_dir: &str) -> String {
         .unwrap_or_else(|| source_dir.to_string())
 }
 
+/// A fighter row prepared for the sidebar list: copied out of the fighter index so the rows can
+/// be drawn (and split into project groups) without holding a borrow of it.
+struct FighterRow {
+    idx: usize,
+    name: String,
+    label: String,
+    modded: bool,
+    slot_count: usize,
+    base: u8,
+    reasons: Vec<crate::project_scope::MembershipReason>,
+}
+
+/// What a click in the fighter list asked for, applied after the list is drawn.
+enum FighterRowAction {
+    Select(usize),
+    Forget(String),
+    Add(usize),
+    Remove(usize),
+}
+
 /// Read the persisted open state of a collapsing header using the same parent-aware ID that the
 /// `CollapsingHeader` widget will use when it is rendered.
 fn persistent_collapsing_open(ui: &Ui, salt: impl Hash, default_open: bool) -> bool {
@@ -3288,6 +3308,14 @@ pub struct VisionaryApp {
     /// the donor (GitHub scripts, disk-cached) — not just moves already played/opened.
     use_scan: Option<UseScan>,
     fighter_search: String,
+    /// Open state of the "In this project" and "Everything else" groups captured just before
+    /// fighter search began, so clearing the search puts them back.
+    fighter_group_before_search: Option<[bool; 2]>,
+    /// Groups the user toggled by hand during this search; search stops forcing them open.
+    fighter_group_touched: [bool; 2],
+    /// Title of the open "Add fighter" popup, if any.
+    add_fighter_popup: Option<String>,
+    add_fighter_search: String,
     move_search: String,
     /// Open/closed move categories captured immediately before move search mode began.
     move_expansion_before_search: Option<BTreeMap<crate::move_kinds::MoveGroup, bool>>,
@@ -3667,6 +3695,10 @@ impl VisionaryApp {
             downloaded_labels: HashMap::new(),
             use_scan: None,
             fighter_search: String::new(),
+            fighter_group_before_search: None,
+            fighter_group_touched: [false; 2],
+            add_fighter_popup: None,
+            add_fighter_search: String::new(),
             move_search: String::new(),
             move_expansion_before_search: None,
             move_search_opened: BTreeSet::new(),
@@ -9229,6 +9261,165 @@ impl VisionaryApp {
         }
     }
 
+    /// Whether a fighter passes the sidebar search: internal name, shown name, or (for a slot
+    /// character) its base fighter's name.
+    fn fighter_matches_query(f: &crate::data::FighterEntry, query: &str) -> bool {
+        query.is_empty()
+            || f.display_name.to_lowercase().contains(query)
+            || f.name.to_lowercase().contains(query)
+            || (f.custom_name.is_some()
+                && fighter_display_name(&f.name).to_lowercase().contains(query))
+    }
+
+    /// One fighter row, shared by both project groups and the project-less list. Modded
+    /// fighters and non-vanilla skin counts are called out so an added-character mod is visibly
+    /// picked up rather than silently indistinguishable from vanilla; a slot character's label
+    /// already names it and its fighter, so it skips the tag. Clicks are pushed onto `actions`
+    /// for the caller to apply once the list's borrows end.
+    fn draw_fighter_row(
+        &self,
+        ui: &mut Ui,
+        row: &FighterRow,
+        in_project: bool,
+        actions: &mut Vec<FighterRowAction>,
+    ) {
+        let i = row.idx;
+        let selected = self.state.selected_fighter == Some(i);
+        let mut label = row.label.clone();
+        if row.modded {
+            label.push_str("  [mod]");
+        }
+        let custom = self.state.fighters[i].custom_name.is_some();
+        if !custom && row.slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
+            label.push_str(&format!("  ({} skins)", row.slot_count));
+        }
+        let mut hover = format!("{} costume slot(s), base c{:02}", row.slot_count, row.base);
+        if custom {
+            let base_name = fighter_display_name(&row.name);
+            hover = format!(
+                "Base fighter: {base_name} ({})\nSlots: {}\n\nA mod \
+                 character played on {base_name}'s slots: it shares {base_name}'s \
+                 scripts, with its own models and motions",
+                row.name,
+                format_slot_list(&self.state.fighters[i].slots)
+            );
+        } else if row.modded {
+            hover.push_str("\nModded character (not in the vanilla roster)");
+        }
+        if in_project {
+            let reasons: Vec<&str> = row
+                .reasons
+                .iter()
+                .map(|r| crate::project_scope::reason_label(*r))
+                .collect();
+            hover.push_str(&format!("\nIn project: {}", reasons.join(", ")));
+        }
+        let response = ui.selectable_label(selected, &label).on_hover_text(hover);
+        if response.clicked() {
+            actions.push(FighterRowAction::Select(i));
+        }
+        response.context_menu(|ui| {
+            if self.project_path.is_some() {
+                if in_project {
+                    use crate::project_scope::MembershipReason;
+                    let has_added = row.reasons.contains(&MembershipReason::Added);
+                    let others: Vec<&str> = row
+                        .reasons
+                        .iter()
+                        .filter(|r| **r != MembershipReason::Added)
+                        .map(|r| crate::project_scope::reason_label(*r))
+                        .collect();
+                    let remove =
+                        ui.add_enabled(has_added, egui::Button::new("Remove from project"));
+                    let remove = if others.is_empty() {
+                        remove
+                    } else {
+                        let why = format!("Still in the project because it {}", others.join(", "));
+                        remove.on_hover_text(why.clone()).on_disabled_hover_text(why)
+                    };
+                    if remove.clicked() {
+                        actions.push(FighterRowAction::Remove(i));
+                        ui.close();
+                    }
+                } else if ui.button("Add to project").clicked() {
+                    actions.push(FighterRowAction::Add(i));
+                    ui.close();
+                }
+                ui.separator();
+            }
+            editor_subsection_heading(
+                ui,
+                "Cached fighter data",
+                "Scripts, edits, and live-preview data Visionary has remembered for this fighter during editing.",
+            );
+            ui.label(
+                egui::RichText::new(concat!(
+                    "Clears cached scripts, edits, and live effect previews. ",
+                    "Source files stay on disk."
+                ))
+                .small(),
+            );
+            if ui.button("Forget fighter").clicked() {
+                actions.push(FighterRowAction::Forget(row.name.clone()));
+                ui.close();
+            }
+        });
+    }
+
+    /// The "Add fighter…" popup: a search field over the fighters not yet in the project.
+    /// Clicking one adds it and the list keeps going, so several can be added in a row; closing
+    /// the window skips the rest. New Project opens it with a title that asks the question.
+    fn draw_add_fighter_popup(&mut self, ctx: &egui::Context) {
+        let Some(title) = self.add_fighter_popup.clone() else {
+            return;
+        };
+        let query = self.add_fighter_search.trim().to_lowercase();
+        let candidates: Vec<(usize, String)> = self
+            .state
+            .fighters
+            .iter()
+            .enumerate()
+            .filter(|(i, f)| {
+                self.row_membership(*i).is_empty() && Self::fighter_matches_query(f, &query)
+            })
+            .map(|(i, f)| (i, f.display_name.clone()))
+            .collect();
+        let mut open = true;
+        let mut add: Option<usize> = None;
+        egui::Window::new(title)
+            .id(egui::Id::new("add_fighter_popup"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                crate::ui::search_field(
+                    ui,
+                    "add_fighter_search",
+                    &mut self.add_fighter_search,
+                    "Search fighters…",
+                );
+                ScrollArea::vertical()
+                    .id_salt("add_fighter_list")
+                    .max_height(320.0)
+                    .show(ui, |ui| {
+                        if candidates.is_empty() {
+                            ui.weak("No matching fighters");
+                        }
+                        for (i, name) in &candidates {
+                            if ui.selectable_label(false, name).clicked() {
+                                add = Some(*i);
+                            }
+                        }
+                    });
+            });
+        if let Some(i) = add {
+            self.add_to_project(i);
+        }
+        if !open {
+            self.add_fighter_popup = None;
+        }
+    }
+
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
             if ui
@@ -9272,95 +9463,120 @@ impl VisionaryApp {
             "Search fighters…",
         );
         let fighter_query = self.fighter_search.trim().to_lowercase();
+        let fighter_searching = !fighter_query.is_empty();
+        let has_project = self.project_path.is_some();
+        let mut row_actions: Vec<FighterRowAction> = Vec::new();
+        let mut open_add_fighter = false;
         ScrollArea::both()
             .id_salt("fighters")
             .max_height(half)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // (index, internal name, label, modded, slot count, base slot) — modded fighters and
-                // non-vanilla skin counts are called out so an added-character mod is
-                // visibly picked up rather than silently indistinguishable from vanilla. A slot
-                // character's label already names it and its fighter, so it skips the tag.
-                let fighters: Vec<(usize, String, String, bool, usize, u8)> = self
+                let rows: Vec<FighterRow> = self
                     .state
                     .fighters
                     .iter()
                     .enumerate()
-                    .filter(|(_, f)| {
-                        fighter_query.is_empty()
-                            || f.display_name.to_lowercase().contains(&fighter_query)
-                            || f.name.to_lowercase().contains(&fighter_query)
-                            || (f.custom_name.is_some()
-                                && fighter_display_name(&f.name)
-                                    .to_lowercase()
-                                    .contains(&fighter_query))
-                    })
-                    .map(|(i, f)| {
-                        (
-                            i,
-                            f.name.clone(),
-                            f.display_name.clone(),
-                            f.is_modded() && f.custom_name.is_none(),
-                            f.slots.len(),
-                            f.base_slot(),
-                        )
+                    .filter(|(_, f)| Self::fighter_matches_query(f, &fighter_query))
+                    .map(|(i, f)| FighterRow {
+                        idx: i,
+                        name: f.name.clone(),
+                        label: f.display_name.clone(),
+                        modded: f.is_modded() && f.custom_name.is_none(),
+                        slot_count: f.slots.len(),
+                        base: f.base_slot(),
+                        reasons: self.row_membership(i),
                     })
                     .collect();
-                if fighters.is_empty() {
-                    ui.weak("No matching fighters");
+                if !has_project {
+                    if rows.is_empty() {
+                        ui.weak("No matching fighters");
+                    }
+                    for row in &rows {
+                        self.draw_fighter_row(ui, row, false, &mut row_actions);
+                    }
+                    return;
                 }
-                for (i, fighter_name, name, modded, slot_count, base) in fighters {
-                    let selected = self.state.selected_fighter == Some(i);
-                    let mut label = name.clone();
-                    if modded {
-                        label.push_str("  [mod]");
+                let (project_rows, other_rows): (Vec<&FighterRow>, Vec<&FighterRow>) =
+                    rows.iter().partition(|row| !row.reasons.is_empty());
+
+                // Searching force-opens any group with matches (as the move list does for its
+                // categories) and puts the groups back as the user had them afterwards.
+                const GROUPS: [(&str, bool); 2] = [("project", true), ("rest", false)];
+                let has_matches = [!project_rows.is_empty(), !other_rows.is_empty()];
+                if fighter_searching {
+                    if self.fighter_group_before_search.is_none() {
+                        self.fighter_group_touched = [false; 2];
+                        self.fighter_group_before_search = Some(GROUPS.map(|(key, default)| {
+                            persistent_collapsing_open(ui, ("fighter_group", key), default)
+                        }));
                     }
-                    let custom = self.state.fighters[i].custom_name.is_some();
-                    if !custom && slot_count != crate::data::VANILLA_SLOT_COUNT as usize {
-                        label.push_str(&format!("  ({slot_count} skins)"));
+                } else if let Some(before) = self.fighter_group_before_search.take() {
+                    for (n, (key, _)) in GROUPS.iter().enumerate() {
+                        set_persistent_collapsing_open(ui, ("fighter_group", *key), before[n]);
                     }
-                    let mut hover = format!("{slot_count} costume slot(s), base c{base:02}");
-                    if custom {
-                        let base_name = fighter_display_name(&fighter_name);
-                        hover = format!(
-                            "Base fighter: {base_name} ({fighter_name})\nSlots: {}\n\nA mod \
-                             character played on {base_name}'s slots: it shares {base_name}'s \
-                             scripts, with its own models and motions",
-                            format_slot_list(&self.state.fighters[i].slots)
-                        );
-                    } else if modded {
-                        hover.push_str("\nModded character (not in the vanilla roster)");
+                    self.fighter_group_touched = [false; 2];
+                }
+
+                for (n, (key, default_open)) in GROUPS.iter().enumerate() {
+                    let group = if n == 0 { &project_rows } else { &other_rows };
+                    if fighter_searching && has_matches[n] && !self.fighter_group_touched[n] {
+                        set_persistent_collapsing_open(ui, ("fighter_group", *key), true);
                     }
-                    let response = ui.selectable_label(selected, &label).on_hover_text(hover);
-                    let clicked = response.clicked();
-                    response.context_menu(|ui| {
-                        editor_subsection_heading(
-                            ui,
-                            "Cached fighter data",
-                            "Scripts, edits, and live-preview data Visionary has remembered for this fighter during editing.",
-                        );
-                        ui.label(
-                            egui::RichText::new(concat!(
-                                "Clears cached scripts, edits, and live effect previews. ",
-                                "Source files stay on disk."
-                            ))
-                            .small(),
-                        );
-                        if ui.button("Forget fighter").clicked() {
-                            forget_fighter = Some(fighter_name.clone());
-                            ui.close();
-                        }
-                    });
-                    if clicked && !selected {
-                        self.select_fighter(i);
+                    let title = if n == 0 {
+                        format!("In this project ({})", group.len())
+                    } else {
+                        format!("Everything else ({})", group.len())
+                    };
+                    let response = egui::CollapsingHeader::new(title)
+                        .id_salt(("fighter_group", *key))
+                        .default_open(*default_open)
+                        .show(ui, |ui| {
+                            for row in group {
+                                self.draw_fighter_row(ui, row, n == 0, &mut row_actions);
+                            }
+                            if n == 0 {
+                                if group.is_empty() && !fighter_searching {
+                                    ui.weak(
+                                        "No fighters yet — use Add fighter… or right-click one below.",
+                                    );
+                                }
+                                if ui
+                                    .small_button("Add fighter…")
+                                    .on_hover_text("Pick fighters that belong to this project")
+                                    .clicked()
+                                {
+                                    open_add_fighter = true;
+                                }
+                            }
+                        });
+                    if fighter_searching && response.header_response.clicked() {
+                        self.fighter_group_touched[n] = true;
                     }
                 }
             });
+        if open_add_fighter {
+            self.add_fighter_popup = Some("Add fighters to this project".to_string());
+            self.add_fighter_search.clear();
+        }
+        for action in row_actions {
+            match action {
+                FighterRowAction::Select(i) => {
+                    if self.state.selected_fighter != Some(i) {
+                        self.select_fighter(i);
+                    }
+                }
+                FighterRowAction::Forget(name) => forget_fighter = Some(name),
+                FighterRowAction::Add(i) => self.add_to_project(i),
+                FighterRowAction::Remove(i) => self.remove_from_project(i),
+            }
+        }
         if let Some(fighter) = forget_fighter {
             self.forget_fighter(&fighter);
         } else if restore_forgotten {
             self.restore_forgotten_fighters();
         }
+        self.draw_add_fighter_popup(ui.ctx());
 
         ui.separator();
         sidebar_section_heading(
@@ -18757,6 +18973,9 @@ impl VisionaryApp {
         self.import_report = None;
         self.project_hub.show = false;
         self.state.status = format!("New project at {}.", workspace.display());
+        // Ask which fighters it is for; closing the popup skips it.
+        self.add_fighter_popup = Some("Which fighters is this project for?".to_string());
+        self.add_fighter_search.clear();
     }
 
     /// A hub choice was clicked: flush any pending autosave first, then guard
