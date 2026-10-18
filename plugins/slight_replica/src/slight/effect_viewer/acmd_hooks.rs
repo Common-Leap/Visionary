@@ -3575,10 +3575,115 @@ unsafe fn hook_acmd_wait(lua_state: u64, target: f32) {
     inject_before_acmd_wait(lua_state, CoroutineBoundary::Wait);
 }
 
+// These four live in `lua2cpp_common`, not the main executable. At plugin load that module is
+// not mapped yet, so their imports are unresolved: Skyline silently skipped the hook and ozone
+// aborts on it. Each one is installed once its symbol resolves, at boot or when a lua2cpp module
+// loads.
+const CALL_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase14call_coroutineEiN3phx6Hash40E ";
+const START_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase15start_coroutineEiN3phx6Hash40ERi ";
+const RESUME_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase16resume_coroutineEiRi ";
+const EFFECT_COMMON_CTOR: &[u8] = b"_ZN7lua2cpp29L2CFighterAnimcmdEffectCommonC1EPN3app12BattleObjectEPNS1_26BattleObjectModuleAccessorEP9lua_State ";
+
+fn module_target(import: *const (), mangled: &[u8]) -> *const u8 {
+    crate::slight::loader::target(import, mangled)
+}
+
+// Address each hook below installs on; written just before its install call. skyline's hook
+// macro only accepts a path for `replace`, and casts it inside its own `unsafe` block.
+static mut CALL_COROUTINE_TARGET: usize = 0;
+static mut START_COROUTINE_TARGET: usize = 0;
+static mut RESUME_COROUTINE_TARGET: usize = 0;
+static mut EFFECT_COMMON_CTOR_TARGET: usize = 0;
+
+struct ModuleHook {
+    name: &'static str,
+    symbol: fn() -> *const u8,
+    install: unsafe fn(usize),
+    installed: std::sync::atomic::AtomicBool,
+}
+
+static MODULE_HOOKS: [ModuleHook; 4] = [
+    ModuleHook {
+        name: "call_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_call_coroutine as *const (), CALL_COROUTINE),
+        install: |target| unsafe {
+            CALL_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_call_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "start_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_start_coroutine as *const (), START_COROUTINE),
+        install: |target| unsafe {
+            START_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_start_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "resume_coroutine",
+        symbol: || module_target(smash::lua2cpp::L2CAgentBase_resume_coroutine as *const (), RESUME_COROUTINE),
+        install: |target| unsafe {
+            RESUME_COROUTINE_TARGET = target;
+            skyline::install_hook!(hook_resume_coroutine);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+    ModuleHook {
+        name: "L2CFighterAnimcmdEffectCommon ctor",
+        symbol: || {
+            module_target(
+                smash::lua2cpp::L2CFighterAnimcmdEffectCommon_L2CFighterAnimcmdEffectCommon as *const (),
+                EFFECT_COMMON_CTOR,
+            )
+        },
+        install: |target| unsafe {
+            EFFECT_COMMON_CTOR_TARGET = target;
+            skyline::install_hook!(hook_common_effect_agent_ctor);
+        },
+        installed: std::sync::atomic::AtomicBool::new(false),
+    },
+];
+
+fn install_module_hooks() {
+    use std::sync::atomic::Ordering;
+    let loader = crate::slight::loader::current().name();
+    for hook in &MODULE_HOOKS {
+        if hook.installed.load(Ordering::Acquire) {
+            continue;
+        }
+        let target = (hook.symbol)();
+        if target.is_null() {
+            crate::slight::diag::note(format!("{} hook deferred (unresolved, {loader})", hook.name));
+            continue;
+        }
+        if hook.installed.swap(true, Ordering::AcqRel) {
+            continue;
+        }
+        unsafe { (hook.install)(target as usize) };
+        skyline::println!("[SLight] {} hook installed @ {:p} ({loader})", hook.name, target);
+        crate::slight::diag::note(format!("{} hook installed ({loader})", hook.name));
+    }
+}
+
+extern "Rust" fn retry_module_hooks(info: &skyline::nro::NroInfo) {
+    if info.name.contains("lua2cpp_") {
+        install_module_hooks();
+    }
+}
+
+fn install_module_hook_retry() {
+    if skyline::nro::add_hook(retry_module_hooks).is_err() {
+        skyline::println!("[SLight] nro hook unavailable; lua2cpp_common hooks stay inactive");
+        crate::slight::diag::note("lua2cpp module hooks=unavailable (no nro hook)");
+    }
+}
+
 /// `call_coroutine` is retained as a lifecycle hook for the pinned runtime, but it is not a live
 /// dispatch point: its callback runs before the ACMD has necessarily reached a valid command
 /// context, and `inject_for_lua_state` intentionally returns for this boundary.
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_call_coroutine)]
+#[skyline::hook(replace = CALL_COROUTINE_TARGET)]
 unsafe fn hook_call_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3598,7 +3703,7 @@ unsafe fn hook_call_coroutine(
     result
 }
 
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_start_coroutine)]
+#[skyline::hook(replace = START_COROUTINE_TARGET)]
 unsafe fn hook_start_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3618,7 +3723,7 @@ unsafe fn hook_start_coroutine(
     result
 }
 
-#[skyline::hook(replace = smash::lua2cpp::L2CAgentBase_resume_coroutine)]
+#[skyline::hook(replace = RESUME_COROUTINE_TARGET)]
 unsafe fn hook_resume_coroutine(
     agent: *mut smash::lua2cpp::L2CAgentBase,
     coroutine_index: i32,
@@ -3633,7 +3738,7 @@ unsafe fn hook_resume_coroutine(
 
 /// Mark the persistent Lua state used by the game's common effect script bank. Fighter-specific
 /// effect agents are distinct objects and intentionally do not enter this set.
-#[skyline::hook(replace = smash::lua2cpp::L2CFighterAnimcmdEffectCommon_L2CFighterAnimcmdEffectCommon)]
+#[skyline::hook(replace = EFFECT_COMMON_CTOR_TARGET)]
 unsafe fn hook_common_effect_agent_ctor(
     this: *mut smash::lua2cpp::L2CFighterAnimcmdEffectCommon,
     battle_object: *mut smash::app::BattleObject,
@@ -3648,6 +3753,8 @@ unsafe fn hook_common_effect_agent_ctor(
 
 pub fn install() {
     install_effect_detach_kind_import_hook();
+    install_module_hooks();
+    install_module_hook_retry();
     skyline::install_hooks!(
         hook_motion_change,
         hook_motion_change_inherit_frame,
@@ -3657,10 +3764,6 @@ pub fn install() {
         hook_acmd_is_excute,
         hook_acmd_frame,
         hook_acmd_wait,
-        hook_call_coroutine,
-        hook_start_coroutine,
-        hook_resume_coroutine,
-        hook_common_effect_agent_ctor,
         hook_eff,
         hook_eff_alpha,
         hook_eff_attr,
