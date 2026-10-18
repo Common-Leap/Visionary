@@ -3766,7 +3766,14 @@ impl VisionaryApp {
     ///
     /// Falls back to the export-root path when nothing exists, preserving the previous
     /// behaviour (and the previous error message) for genuinely missing files.
+    ///
+    /// The file the eff editor has open wins over all of them: an eff opened from a download
+    /// or a mod records only its game path, and its edits were made against that file, not
+    /// against the dump's copy at the same path.
     fn resolve_eff_source(&self, source_rel: &str) -> PathBuf {
+        if let Some(open) = self.eff_editor.loaded_path_for(source_rel) {
+            return open.to_path_buf();
+        }
         let primary = self.eff_editor.export_root().join(source_rel);
         if primary.exists() {
             return primary;
@@ -37656,6 +37663,18 @@ fn run_export(
         .any(|fighter| fighter.eff.as_ref().is_some_and(|eff| !eff.is_empty()));
     for (fighter, fm) in &project.fighters {
         match &fm.eff {
+            Some(eff)
+                if !eff.is_empty() && !crate::mod_project::is_mod_relative(&eff.source_rel) =>
+            {
+                // `mod_dir.join` of an absolute path IS that path: this once rebuilt the eff
+                // straight over the user's own source file. Write nothing outside the mod.
+                errors.push(format!(
+                    "{fighter} eff: not exported — its source \"{}\" is not a game path \
+                     (effect/fighter/{fighter}/ef_{fighter}.eff). Reopen the eff from the dump \
+                     or from a mod's effect/ folder and export again.",
+                    eff.source_rel
+                ));
+            }
             Some(eff) if !eff.is_empty() => {
                 let src_path = eff_sources
                     .get(fighter)
@@ -46280,6 +46299,88 @@ mod blocked_export_writes_nothing_tests {
             outcome.built_source_root.is_some(),
             "generated source was not written, so this control proves nothing about \
              the refusal tests"
+        );
+    }
+
+    /// An eff source with no game path must not be written anywhere: `mod_dir.join` of an
+    /// absolute path is that path, and this once rebuilt the eff over the user's own file.
+    #[test]
+    fn an_absolute_eff_source_is_refused_and_left_untouched() {
+        let dest = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let src_eff = outside.path().join("custom.eff");
+        std::fs::write(&src_eff, b"the user's own eff").unwrap();
+
+        let mut project = project(AcmdScript::default());
+        project.fighters.get_mut("mario").unwrap().eff = Some(EffMod {
+            source_rel: src_eff.to_string_lossy().into_owned(),
+            textures_removed: vec!["_visionary_no_such_texture".into()],
+            ..Default::default()
+        });
+        let mut inputs = inputs(dest.path(), source.path());
+        inputs.eff_sources.insert("mario".into(), src_eff.clone());
+
+        let outcome = run_export(&project, &inputs).expect("the rest of the project exports");
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("mario eff") && e.contains("not a game path")),
+            "the refusal has to say which eff and why: {:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            std::fs::read(&src_eff).unwrap(),
+            b"the user's own eff",
+            "export wrote over the eff it was given as a source"
+        );
+        assert!(
+            !dest.path().join("effect").exists(),
+            "a refused eff still wrote effect files: {:?}",
+            entries(dest.path())
+        );
+    }
+
+    /// The fix end to end: an eff opened from outside the dump records its game path, exports
+    /// into the mod folder at that path, and the file it was opened from is not touched.
+    #[test]
+    fn an_externally_opened_eff_exports_into_the_mod_folder() {
+        let Some(root) = corpus_root() else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let vanilla = std::fs::read(root.join("effect/fighter/mario/ef_mario.eff"))
+            .expect("mario's eff is missing from the corpus");
+        let outside = tempfile::tempdir().unwrap();
+        let src_eff = outside
+            .path()
+            .join("some_mod/effect/fighter/mario/ef_mario.eff");
+        std::fs::create_dir_all(src_eff.parent().unwrap()).unwrap();
+        std::fs::write(&src_eff, &vanilla).unwrap();
+
+        let source_rel = crate::mod_project::eff_game_rel(&src_eff, Some(&root));
+        assert_eq!(source_rel, "effect/fighter/mario/ef_mario.eff");
+
+        let dest = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let mut project = project(AcmdScript::default());
+        project.fighters.get_mut("mario").unwrap().eff = Some(EffMod {
+            source_rel: source_rel.clone(),
+            textures_removed: vec!["_visionary_no_such_texture".into()],
+            ..Default::default()
+        });
+        let mut inputs = inputs(dest.path(), source.path());
+        inputs.eff_sources.insert("mario".into(), src_eff.clone());
+        inputs.eff_export_root = root.clone();
+
+        let outcome = run_export(&project, &inputs).expect("nothing here should refuse");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(dest.path().join(&source_rel).exists());
+        assert_eq!(
+            std::fs::read(&src_eff).unwrap(),
+            vanilla,
+            "export wrote over the eff it was opened from"
         );
     }
 }

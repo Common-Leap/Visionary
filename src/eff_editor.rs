@@ -1102,11 +1102,21 @@ impl EffEditor {
 
     // ── Project integration ───────────────────────────────────────────────────
 
-    /// Loaded eff path relative to the export root (project `source_rel`).
+    /// The loaded eff's game path (project `source_rel`), wherever the file was opened from.
+    /// See [`crate::mod_project::eff_game_rel`].
     pub fn loaded_rel(&self) -> Option<String> {
         let path = self.loaded_path.as_ref()?;
-        let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        Some(crate::mod_project::eff_game_rel(
+            path,
+            Some(&self.export_root),
+        ))
+    }
+
+    /// The file on disk the editor has open, when it is the eff recorded as `source_rel`.
+    pub fn loaded_path_for(&self, source_rel: &str) -> Option<&Path> {
+        self.loaded_rel()
+            .filter(|rel| rel.eq_ignore_ascii_case(source_rel))
+            .and(self.loaded_path.as_deref())
     }
 
     pub fn export_root(&self) -> &Path {
@@ -4639,5 +4649,23 @@ mod tests {
         }]);
         assert!(editor.pending_edits.is_some());
         assert!(editor.pending_edits_push_live);
+    }
+    /// File → Open Effect File… on a mod's eff: the project records the game path, and the
+    /// open file (not the dump's copy) is what that path resolves to while it is open.
+    #[test]
+    fn an_eff_opened_outside_the_root_records_its_game_path() {
+        let opened = PathBuf::from("C:/Users/me/mods/x/effect/fighter/mario/ef_mario.eff");
+        let editor = EffEditor {
+            export_root: PathBuf::from("C:/dump"),
+            loaded_path: Some(opened.clone()),
+            ..Default::default()
+        };
+        let rel = editor.loaded_rel().unwrap();
+        assert_eq!(rel, "effect/fighter/mario/ef_mario.eff");
+        assert_eq!(editor.loaded_path_for(&rel), Some(opened.as_path()));
+        assert_eq!(
+            editor.loaded_path_for("effect/fighter/link/ef_link.eff"),
+            None
+        );
     }
 }
