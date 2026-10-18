@@ -2147,7 +2147,7 @@ impl EffEditor {
 
             ui.label(egui::RichText::new(self.export_root.display().to_string()).small())
                 .on_hover_text(
-                    "Where this window reads base .eff files from. Follows the data root you \
+                    "Where this window reads base .eff files from. Follows the game dump you \
                      opened in the main window until you pick one here.",
                 );
             if ui.small_button("Change…").clicked() {

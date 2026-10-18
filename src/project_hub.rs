@@ -332,7 +332,7 @@ pub fn copy_base_files(
         let source = source.canonicalize()?;
         let relative = source
             .strip_prefix(&root)
-            .context("Choose files inside the base game folder")?
+            .context("Choose files inside the game dump")?
             .to_path_buf();
         anyhow::ensure!(source.is_file(), "Choose files, not folders");
         files.push((source, relative));

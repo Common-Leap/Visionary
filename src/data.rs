@@ -7067,7 +7067,7 @@ impl Default for AppState {
             current_frame: 1,
             total_frames: 0,
             playing: false,
-            status: "Select a data root directory to begin.".to_string(),
+            status: "Set your game dump to begin.".to_string(),
             edit_log: EditLog::default(),
             effect_script: EffectScript::default(),
             effects: Vec::new(),
