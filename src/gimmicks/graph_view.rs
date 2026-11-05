@@ -95,7 +95,7 @@ impl GraphView {
             FieldRef::Graph => {
                 let mut initial = graph.initial.clone();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Start in");
+                    ui.label("Starts in");
                     state_picker(ui, "field_initial", graph, &mut initial);
                 });
                 if initial != graph.initial {
@@ -293,14 +293,14 @@ impl GraphView {
                         !super::field_values::is_managed_timer_transition(graph, *index),
                         |ui| {
                             ui.horizontal_wrapped(|ui| {
-                                ui.label("From");
+                                ui.label("While in");
                                 state_picker(
                                     ui,
                                     "field_transition_from",
                                     graph,
                                     &mut transition.from,
                                 );
-                                ui.label("To");
+                                ui.label("Then go to");
                                 state_picker(ui, "field_transition_to", graph, &mut transition.to);
                             })
                         },
@@ -332,7 +332,7 @@ impl GraphView {
                             self.apply(graph, result);
                         }
                     });
-                    if ui.small_button("Remove event").clicked() {
+                    if ui.small_button("Remove").clicked() {
                         let result = graph_edit::delete_transition(graph, fighter, *index);
                         self.apply(graph, result);
                     }
@@ -1329,10 +1329,10 @@ pub(crate) fn hook_label(hook: HookName) -> &'static str {
         HookName::OnSwitch => "Switches form",
         HookName::OnStockStart => "Stock starts",
         HookName::OnKo => "Stock lost",
-        HookName::OnArticleSpawn => "Owned article appears",
-        HookName::OnArticleRemoved => "Owned article disappears",
-        HookName::OnStatusEnter => "Entered status",
-        HookName::OnStatusExit => "Exited status",
+        HookName::OnArticleSpawn => "Its object appears",
+        HookName::OnArticleRemoved => "Its object goes away",
+        HookName::OnStatusEnter => "An action starts",
+        HookName::OnStatusExit => "An action ends",
         HookName::OnDealDamage => "Deals damage",
         HookName::OnTakeDamage => "Takes damage",
         HookName::OnIncomingHit => "About to be hit",
@@ -1616,7 +1616,7 @@ fn guard_control(
         "Advanced condition",
     ];
     ui.horizontal_wrapped(|ui| {
-        ui.label("When");
+        ui.label("Only if");
         egui::ComboBox::from_id_salt("graph_guard_kind")
             .selected_text(labels[kind])
             .height(400.0)

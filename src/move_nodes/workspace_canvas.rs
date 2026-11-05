@@ -374,24 +374,27 @@ impl CanvasState {
                     let world = (center - self.pan) / self.zoom.max(0.85);
                     [world.x, (world.y - top - LANE_HEADER).max(0.0)]
                 });
-            let mut added = 0;
+            // A new card takes the first free spot below where it would land.
+            let mut taken: Vec<[f32; 2]> = chart.layout.positions.values().copied().collect();
             for (index, reference) in keys.iter().enumerate() {
-                chart
-                    .layout
-                    .positions
-                    .entry(reference.clone())
-                    .or_insert_with(|| {
-                        if had_positions {
-                            let position = [anchor[0], anchor[1] + added as f32 * 110.0];
-                            added += 1;
-                            position
-                        } else {
-                            [
-                                placement[index].0 as f32 * 240.0,
-                                placement[index].1 as f32 * 110.0,
-                            ]
-                        }
-                    });
+                if chart.layout.positions.contains_key(reference) {
+                    continue;
+                }
+                let mut position = if had_positions {
+                    anchor
+                } else {
+                    [
+                        placement[index].0 as f32 * 240.0,
+                        placement[index].1 as f32 * 110.0,
+                    ]
+                };
+                while taken.iter().any(|other| {
+                    (other[0] - position[0]).abs() < 230.0 && (other[1] - position[1]).abs() < 100.0
+                }) {
+                    position[1] += 110.0;
+                }
+                taken.push(position);
+                chart.layout.positions.insert(reference.clone(), position);
             }
 
             for (index, node) in projection.nodes.iter().enumerate() {
@@ -437,9 +440,9 @@ impl CanvasState {
             self.lanes.push(Lane {
                 track: None,
                 label: if chart_id == "main" {
-                    "Character".into()
+                    "Gimmicks".into()
                 } else {
-                    format!("Character · {chart_id}")
+                    format!("Gimmick · {chart_id}")
                 },
                 top,
                 bottom,

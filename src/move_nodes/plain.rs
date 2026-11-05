@@ -61,6 +61,7 @@ pub fn block_name(internal: &str) -> &str {
         "Controller" => "Gimmick",
         "Event source" => "When",
         "Entry state" => "First state",
+        "Attack mod" => "Change hitbox power",
         "Counter" => "Number",
         "Gauge" => "Meter",
         other => other,

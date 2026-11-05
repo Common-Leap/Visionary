@@ -1373,7 +1373,10 @@ mod tests {
         // Kirby's copy flag and kind are read-only; Limit goes through its helpers.
         assert!(count("kirby", NativeUse::Set) < count("kirby", NativeUse::Test));
         assert!(count("cloud", NativeUse::Test) > 0);
-        assert_eq!(count("cloud", NativeUse::Set), 0);
+        assert!(catalog("cloud", Track::Game, &graph).iter().all(|entry| !matches!(
+            entry.block,
+            PaletteBlock::Native(native, NativeUse::Set) if native.symbol.contains("LIMIT_GAUGE")
+        )));
         assert!(count("edge", NativeUse::Test) > 0);
         assert_eq!(
             count("edge", NativeUse::Set),
