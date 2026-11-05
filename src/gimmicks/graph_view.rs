@@ -1079,7 +1079,7 @@ impl GraphView {
         match result {
             Ok(updated) => {
                 *graph = updated;
-                self.status = "Edited; Apply nodes to use it.".into();
+                self.status.clear();
                 true
             }
             Err(error) => {
@@ -1412,7 +1412,7 @@ pub(crate) fn motion_text(action: &Action) -> (&'static str, String) {
         ),
         Action::CancelIncomingHit => ("Cancel incoming hit", String::new()),
         Action::Resource(command) => (
-            "Change resource",
+            "Change a meter",
             format!("{} {}", command.label(), value_text(&command.amount)),
         ),
         Action::ChooseHeroMenuSpell { slot } => ("Choose Hero menu spell", format!("slot {slot}")),

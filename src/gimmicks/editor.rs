@@ -1131,6 +1131,7 @@ pub(crate) fn article_label(symbol: &str) -> String {
     }
     match symbol.split("_GENERATE_ARTICLE_").nth(1) {
         Some("FIREBALL") => return "Fireball".into(),
+        Some("TICO") => return "Luma".into(),
         Some("FUSIONSWORD") => return "Fusion sword (model)".into(),
         Some("WATERPUMP") => return "FLUDD".into(),
         Some("MANTLE") => return "Cape".into(),

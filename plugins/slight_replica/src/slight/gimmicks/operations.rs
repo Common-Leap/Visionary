@@ -226,6 +226,10 @@ fn newest_article_action(
                 status.value as i32,
                 app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST),
             );
+            crate::slight::diag::note(format!(
+                "object {} of {count} asked for status {}",
+                article.symbol, status.symbol
+            ));
         } else {
             ArticleModule::remove_exist(
                 accessor,
