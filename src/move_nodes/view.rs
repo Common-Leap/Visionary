@@ -5913,7 +5913,13 @@ pub(super) fn node_edit_error(ui: &mut Ui, error: &str) {
     }
     ui.horizontal_wrapped(|ui| {
         // A short message is shown as it is; only a long one folds away.
-        let first = error.lines().next().unwrap_or(error);
+        let first: String = error
+            .lines()
+            .next()
+            .unwrap_or(error)
+            .chars()
+            .take(70)
+            .collect();
         ui.colored_label(egui::Color32::LIGHT_RED, first)
             .on_hover_text(error);
         ui.menu_button("Details", |ui| {
