@@ -29,6 +29,15 @@ pub enum Writer {
     PickelMaterial(&'static str),
     /// `DamageModule::add_damage` on this fighter's partner (Nana, Luma). A missing partner is a no-op.
     PartnerDamage,
+    /// Sends this fighter's partner to one action. It has no amount.
+    PartnerAction(&'static str),
+}
+
+impl Writer {
+    /// Partner rows live on the partner, so they have no Work field of this fighter behind them.
+    pub fn is_partner(self) -> bool {
+        matches!(self, Self::PartnerDamage | Self::PartnerAction(_))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,6 +84,11 @@ resources! {
     ("littleMacKoGauge", "littlemac", "KO meter", "FIGHTER_LITTLEMAC_INSTANCE_WORK_ID_FLOAT_KO_GAGE", Float, 100.0, Writer::Work),
     ("banjoFeathers", "buddy", "Wonderwing feathers", "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_SPECIAL_S_REMAIN", Int, 5.0, Writer::Work),
     ("nanaDamage", "popo", "Nana's damage", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 999.0, Writer::PartnerDamage),
+    ("nanaWait", "popo", "Nana: stand still", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 1.0, Writer::PartnerAction("FIGHTER_STATUS_KIND_WAIT")),
+    ("nanaJump", "popo", "Nana: jump", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 1.0, Writer::PartnerAction("FIGHTER_STATUS_KIND_JUMP_SQUAT")),
+    ("nanaAttack", "popo", "Nana: attack", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 1.0, Writer::PartnerAction("FIGHTER_STATUS_KIND_ATTACK")),
+    ("nanaSpecial", "popo", "Nana: neutral special", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 1.0, Writer::PartnerAction("FIGHTER_STATUS_KIND_SPECIAL_N")),
+    ("nanaShield", "popo", "Nana: shield", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 1.0, Writer::PartnerAction("FIGHTER_STATUS_KIND_GUARD_ON")),
     ("lumaDamage", "rosetta", "Luma's damage", "FIGHTER_ROSETTA_INSTANCE_WORK_ID_INT_EXTEND_BUFFER", Float, 999.0, Writer::PartnerDamage),
     ("steveDirt", "pickel", "Dirt", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_GRADE_1", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_GRADE_1")),
     ("steveWood", "pickel", "Wood", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_WOOD", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_WOOD")),
@@ -160,6 +174,9 @@ impl<E> Command<E> {
         })
     }
     pub fn label(&self) -> String {
+        if matches!(self.resource.entry().writer, Writer::PartnerAction(_)) {
+            return self.resource.label().to_owned();
+        }
         match self.op {
             Op::Add => format!("Add {}", self.resource.label()),
             Op::Set => format!("Set {}", self.resource.label()),

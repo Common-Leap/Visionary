@@ -1765,6 +1765,12 @@ pub(super) fn action_picker(
                         ui.selectable_value(&mut command.resource, resource, resource.label());
                     }
                 });
+                // A partner action is a command: it has no amount to choose.
+                if matches!(command.resource.entry().writer, super::resource_commands::Writer::PartnerAction(_)) {
+                    command.op = Op::Add;
+                    command.amount = Expr::Const(ConstValue::Float(1.0));
+                    return;
+                }
                 egui::ComboBox::from_id_salt("native_resource_op").selected_text(format!("{:?}", command.op)).show_ui(ui, |ui| {
                     for op in [Op::Add, Op::Set] {
                         ui.selectable_value(&mut command.op, op, format!("{op:?}"));
@@ -2183,7 +2189,7 @@ fn action_label(action: super::controller::ControllerActionKind) -> &'static str
         SetObjectSpeed => "Set object speed",
         RemoveObject => "Remove object",
         RequestArticleStatus => "Object state",
-        Resource => "Change a meter",
+        Resource => "Fighter special",
         ChooseHeroMenuSpell => "Choose Hero menu spell",
         AddHeldOpponentDamage => "Damage the held opponent",
         ThrowHeldOpponent => "Throw the held opponent",

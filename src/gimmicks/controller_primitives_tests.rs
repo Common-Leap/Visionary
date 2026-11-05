@@ -2150,10 +2150,7 @@ fn item_hooks_and_kind_guard_round_trip_and_share_static_live_dispatch() {
 fn resource_rows_keep_owner_bounds_reads_and_bundle_live_parity() {
     use super::resource_commands::{Command, Op, Writer, FEATURE, RESOURCES};
     let float = |v: f32| Expr::Const(ConstValue::Float(v));
-    for entry in RESOURCES
-        .iter()
-        .filter(|entry| entry.writer != Writer::PartnerDamage)
-    {
+    for entry in RESOURCES.iter().filter(|entry| !entry.writer.is_partner()) {
         let fighter = entry.fighter;
         let resource = super::resource_commands::Resource::named(entry.key).unwrap();
         let command = Command {

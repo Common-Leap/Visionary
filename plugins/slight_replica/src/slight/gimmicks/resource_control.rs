@@ -42,6 +42,9 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
     command.validate(entry.fighter)?;
     current(boid, expected, command)?;
     // A partner's damage lives on the partner, not in a Work field of this fighter.
+    if matches!(entry.writer, Writer::PartnerAction(_)) {
+        return Ok((0.0, 0.0, 0));
+    }
     if entry.writer == Writer::PartnerDamage {
         let value = super::partner_control::damage(boid, entry.fighter, expected);
         return Ok((
@@ -173,6 +176,14 @@ pub(crate) fn execute(boid: u32, expected: Identity, command: Command) -> Result
                     expected,
                     delta,
                 );
+            }
+            Writer::PartnerAction(status) => {
+                super::partner_control::request_status(
+                    boid,
+                    command.resource.fighter(),
+                    expected,
+                    status,
+                )?;
             }
             Writer::PickelMaterial(kind) => {
                 let kind = material(kind)?;

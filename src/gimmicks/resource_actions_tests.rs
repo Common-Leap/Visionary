@@ -165,7 +165,7 @@ mod table {
         let mut keys = std::collections::HashSet::new();
         for entry in RESOURCES {
             assert!(keys.insert(entry.key), "duplicate key {}", entry.key);
-            if entry.writer == Writer::PartnerDamage {
+            if entry.writer.is_partner() {
                 continue;
             }
             let kind = if entry.kind == NativeKind::Int {

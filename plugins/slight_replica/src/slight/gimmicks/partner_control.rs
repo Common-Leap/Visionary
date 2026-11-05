@@ -94,6 +94,29 @@ pub(crate) fn add_damage(boid: u32, fighter: &str, identity: Identity, delta: f3
     }
 }
 
+/// Sends the partner to one action. With no partner on stage there is nothing to do.
+pub(crate) fn request_status(
+    boid: u32,
+    fighter: &str,
+    identity: Identity,
+    status: &str,
+) -> Result<(), String> {
+    let status = match status {
+        "FIGHTER_STATUS_KIND_WAIT" => *FIGHTER_STATUS_KIND_WAIT,
+        "FIGHTER_STATUS_KIND_JUMP_SQUAT" => *FIGHTER_STATUS_KIND_JUMP_SQUAT,
+        "FIGHTER_STATUS_KIND_ATTACK" => *FIGHTER_STATUS_KIND_ATTACK,
+        "FIGHTER_STATUS_KIND_SPECIAL_N" => *FIGHTER_STATUS_KIND_SPECIAL_N,
+        "FIGHTER_STATUS_KIND_GUARD_ON" => *FIGHTER_STATUS_KIND_GUARD_ON,
+        other => return Err(format!("unknown partner action {other}")),
+    };
+    unsafe {
+        if let Some(module) = partner(boid, fighter, identity) {
+            StatusModule::change_status_request(module, status, false);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn sample(
     boid: u32,
     fighter: &str,

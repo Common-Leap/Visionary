@@ -1402,18 +1402,25 @@ pub(crate) fn motion_text(action: &Action) -> (&'static str, String) {
             ("Add held opponent damage %", value_text(amount))
         }
         Action::ThrowHeldOpponent { direction } => {
-            ("Throw held opponent now", format!("{direction:?}"))
+            ("Throw the held opponent", format!("{direction:?}"))
         }
-        Action::ReleaseHeldOpponent => ("Release held opponent", String::new()),
-        Action::AddDamage { amount } => ("Add to damage %", value_text(amount)),
+        Action::ReleaseHeldOpponent => ("Let go of the held opponent", String::new()),
+        Action::AddDamage { amount } => ("Add to own damage", value_text(amount)),
         Action::CombatPolicy { scope, op } => (
             "Combat policy",
             super::editor::combat_text(op, *scope, value_text),
         ),
-        Action::CancelIncomingHit => ("Cancel incoming hit", String::new()),
+        Action::CancelIncomingHit => ("Ignore this hit", String::new()),
         Action::Resource(command) => (
-            "Change a meter",
-            format!("{} {}", command.label(), value_text(&command.amount)),
+            "Fighter special",
+            if matches!(
+                command.resource.entry().writer,
+                super::resource_commands::Writer::PartnerAction(_)
+            ) {
+                command.label()
+            } else {
+                format!("{} {}", command.label(), value_text(&command.amount))
+            },
         ),
         Action::ChooseHeroMenuSpell { slot } => ("Choose Hero menu spell", format!("slot {slot}")),
         Action::Movement(op) => (
