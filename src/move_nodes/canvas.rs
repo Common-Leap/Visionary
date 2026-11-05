@@ -1510,7 +1510,7 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
                         "Article visibility",
                         format!(
                             "{} · {}",
-                            super::view::short_symbol(symbol),
+                            super::plain::object_name(symbol),
                             if *visible { "Visible" } else { "Hidden" }
                         ),
                     );
@@ -1525,7 +1525,7 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
                         },
                         format!(
                             "{} · {}",
-                            super::view::short_symbol(symbol),
+                            super::plain::object_name(symbol),
                             super::view::article_target_label(*target)
                         ),
                     );

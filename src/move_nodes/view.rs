@@ -3875,16 +3875,16 @@ fn article_motion_ui(
     motion: &mut String,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Article");
+        ui.label("Object");
         egui::ComboBox::from_id_salt("timeline_motion_article")
-            .selected_text(short_symbol(symbol))
+            .selected_text(super::plain::object_name(symbol))
             .show_ui(ui, |ui| {
                 for entry in measured_motion_articles_on_track(fighter, track) {
                     if ui
                         .selectable_value(
                             symbol,
                             entry.symbol.to_owned(),
-                            short_symbol(entry.symbol),
+                            super::plain::object_name(entry.symbol),
                         )
                         .on_hover_text(entry.symbol)
                         .changed()
@@ -4179,9 +4179,9 @@ fn native_command_ui(
             }
             let (label, symbol) = match call {
                 crate::data::ArticleLifecycleCall::Generate { symbol } => ("Generate", symbol),
-                crate::data::ArticleLifecycleCall::RemoveAll { symbol } => ("Remove all", symbol),
+                crate::data::ArticleLifecycleCall::RemoveAll { symbol } => ("Object", symbol),
                 crate::data::ArticleLifecycleCall::SetVisibilityWhole { symbol, .. } => {
-                    ("Article", symbol)
+                    ("Object", symbol)
                 }
                 crate::data::ArticleLifecycleCall::Shoot { symbol, .. } => ("Launch", symbol),
                 crate::data::ArticleLifecycleCall::ShootExist { symbol, .. } => {
@@ -4212,7 +4212,7 @@ fn native_command_ui(
                 crate::data::ArticleLifecycleCall::Shoot { target, .. }
                 | crate::data::ArticleLifecycleCall::ShootExist { target, .. } => {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Instances");
+                        ui.label("Which");
                         egui::ComboBox::from_id_salt("timeline_article_target")
                             .selected_text(article_target_label(*target))
                             .show_ui(ui, |ui| {
@@ -4229,11 +4229,10 @@ fn native_command_ui(
                                 }
                             });
                     });
-                    ui.weak("Existing articles only").on_hover_text("Generate an article separately, then launch it at the required frame. Launch and Launch if present retain distinct native APIs and the fixed false tail. Launching does not establish projectile-hit or ownership-transfer events.");
+                    ui.weak("Only objects already out").on_hover_text("Generate an article separately, then launch it at the required frame. Launch and Launch if present retain distinct native APIs and the fixed false tail. Launching does not establish projectile-hit or ownership-transfer events.");
                 }
                 _ => {}
             }
-            ui.weak("Timed article action").on_hover_text("Executes at this position in the move's ACMD track. To react live to a timer, status or named event, use a character controller article action. Removal targets all instances of this exact owned article kind.");
         }
         ExcuteStmt::ItemVisibility { visible } => {
             ui.checkbox(visible, "Held item visible").on_hover_text("Controls held item slot 0 on this fighter. This is not article generation, equipment ownership, or a collision event.");
@@ -4500,13 +4499,13 @@ fn article_state_ui(
 
 fn enabled_article_ui(ui: &mut Ui, fighter: &str, symbol: &mut String) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Article");
+        ui.label("Object");
         egui::ComboBox::from_id_salt("enabled_article")
-            .selected_text(short_symbol(symbol))
+            .selected_text(super::plain::object_name(symbol))
             .show_ui(ui, |ui| {
                 for &(owner, choice, _) in crate::data::PINNED_ENABLED_ARTICLE_COUNTS {
                     if owner == fighter {
-                        ui.selectable_value(symbol, choice.to_owned(), short_symbol(choice))
+                        ui.selectable_value(symbol, choice.to_owned(), super::plain::object_name(choice))
                             .on_hover_text(choice);
                     }
                 }
