@@ -154,6 +154,9 @@ pub fn compare(op: NativeComparison) -> &'static str {
 /// The last part of a game symbol, in lower-case words.
 pub fn symbol_words(symbol: &str) -> String {
     let symbol = symbol.trim_start_matches('*');
+    if let Some(label) = crate::gimmicks::native_catalog::label_for(symbol) {
+        return label.to_lowercase();
+    }
     let tail = [
         "WORK_ID_",
         "_WORK_INT_",

@@ -27,6 +27,14 @@ pub fn for_fighter(fighter: &str) -> impl Iterator<Item = &'static NativeGimmick
         .filter(move |entry| entry.fighter == fighter)
 }
 
+/// The hand-written name of a game value, whichever fighter owns it.
+pub fn label_for(symbol: &str) -> Option<&'static str> {
+    GIMMICKS
+        .iter()
+        .find(|entry| entry.symbol == symbol)
+        .map(|entry| entry.label)
+}
+
 /// Marks a value listed straight from the game's own names, with no hand-written label.
 pub const LISTED_FROM_GAME: &str = "Listed from the game's own names.";
 
