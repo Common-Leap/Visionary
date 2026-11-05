@@ -3766,12 +3766,6 @@ pub unsafe fn inject_tick(lua_state: u64) {
             }
             if category == node_steps::CAT_NODE_STEP {
                 let mut agent = smash::lib::L2CAgent::new(lua_state);
-                for arg in &inj.args {
-                    if !matches!(arg, LuaArg::Hash(_)) {
-                        let mut value = arg.to_l2c();
-                        agent.push_lua_stack(&mut value);
-                    }
-                }
                 let command = inj.command.as_deref().unwrap_or_default();
                 let done = {
                     let _g = InjectGuard::new();

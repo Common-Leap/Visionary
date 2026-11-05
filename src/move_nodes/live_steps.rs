@@ -101,9 +101,123 @@ fn step_for(fighter: &str, command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
                 vec![A::Hash(hash40::hash40(&symbol).0)],
             )
         }
-        _ => return None,
+        _ => return generic_step(command),
     };
     Some((name.to_owned(), args))
+}
+
+/// Game calls the plugin can make by name. **Must match the plugin's `generic` table.**
+const GENERIC: &[&str] = &[
+    "AttackModule::set_size",
+    "AttackModule::set_add_reaction_frame",
+    "AttackModule::set_add_reaction_frame_revised",
+    "AttackModule::set_damage_shake_scale",
+    "AttackModule::set_no_uniq_effect_all",
+    "AttackModule::init_attack_pos",
+    "AttackModule::set_no_damage_fly_smoke_all",
+    "AttackModule::disable_tip",
+    "AttackModule::enable_safe_pos",
+    "AttackModule::set_attack_keep_rumble",
+    "AttackModule::set_force_reaction",
+    "AttackModule::set_attack_level",
+    "AttackModule::set_invalid_xlu",
+    "AttackModule::set_no_finish_camera_ex",
+    "AttackModule::set_final_finish_cut_in",
+    "AttackModule::set_attack_camera_quake_forced",
+    "AttackModule::set_ink_value",
+    "AttackModule::set_target_category",
+    "AttackModule::set_attack_height_all",
+    "ItemModule::set_have_item_visibility",
+    "ItemModule::set_attach_item_visibility",
+    "FighterAreaModuleImpl::enable_fix_jostle_area",
+    "FighterAreaModuleImpl::enable_fix_jostle_area_xy",
+    "VisibilityModule::set_int64",
+    "VisibilityModule::set_default_int64",
+    "VisibilityModule::set_status_default_int64",
+    "ArticleModule::change_status",
+    "ArticleModule::change_status_exist",
+    "ArticleModule::change_motion",
+    "ArticleModule::shoot_exist",
+    "ArticleModule::set_visibility",
+    "GrabModule::set_rebound",
+    "GrabModule::set_constraint",
+    "WorkModule::set_int",
+    "WorkModule::set_float",
+    "ModelModule::disable_gold_eye",
+    "GroundModule::select_cliff_hangdata",
+    "StatusModule::change_status_request_from_script",
+    "ControlModule::set_rumble",
+    "macros::FT_ADD_DAMAGE",
+    "macros::FT_LEAVE_NEAR_OTTOTTO",
+    "macros::COL_PRI",
+    "macros::QUAKE",
+    "macros::SLOW_OPPONENT",
+    "macros::FILL_SCREEN_MODEL_COLOR",
+    "macros::CANCEL_FILL_SCREEN",
+    "macros::RUMBLE_HIT_STATUS",
+    "macros::SHOOT_ITEM_BULLET",
+];
+
+/// Marks a wire hash as the name of a game constant. **Must match the plugin.**
+const CONST_BIT: u64 = 1 << 63;
+
+/// One argument of a block's game call, as the export would write it.
+fn generic_arg(token: &str) -> Option<A> {
+    let token = token.trim();
+    match token {
+        "true" => return Some(A::Bool(true)),
+        "false" => return Some(A::Bool(false)),
+        _ => {}
+    }
+    if let Some(start) = token.find('"') {
+        let name = token[start + 1..].split('"').next()?;
+        return Some(A::Hash(hash40::hash40(name).0));
+    }
+    if let Some(start) = token.find('*') {
+        let name: String = token[start + 1..]
+            .chars()
+            .take_while(|letter| letter.is_ascii_alphanumeric() || *letter == '_')
+            .collect();
+        return Some(A::Hash(hash40::hash40(&name).0 | CONST_BIT));
+    }
+    if let Ok(value) = token.parse::<i64>() {
+        return Some(A::Int(value));
+    }
+    token.parse::<f32>().ok().map(A::Num)
+}
+
+/// A block whose one-line game call is in [`GENERIC`].
+fn generic_step(command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
+    let lines = crate::acmd::preview_excute_stmts(std::slice::from_ref(command));
+    let [line] = lines.as_slice() else {
+        return None;
+    };
+    let (name, rest) = line.trim().split_once('(')?;
+    let name = GENERIC.iter().find(|known| **known == name)?;
+    let inner = rest.trim_end().strip_suffix(");")?;
+    let mut tokens = Vec::new();
+    let (mut depth, mut quoted, mut start) = (0, false, 0);
+    for (at, letter) in inner.char_indices() {
+        match letter {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                tokens.push(&inner[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    tokens.push(&inner[start..]);
+    // The first token is `agent` or `agent.module_accessor`.
+    let args = tokens
+        .into_iter()
+        .skip(1)
+        .filter(|token| !token.trim().is_empty())
+        .map(generic_arg)
+        .collect::<Option<Vec<_>>>()?;
+    Some(((*name).to_owned(), args))
 }
 
 /// True when this command has some way to reach a running match.
@@ -184,6 +298,10 @@ fn guard_for(condition: &MoveCondition) -> Option<LiveGuard> {
                 super::model::CharacterValue::Flag(value) => f32::from(u8::from(*value)),
             },
         },
+        MoveCondition::HoldingItemKind { item } => LiveGuard::Item {
+            symbol: hash40::hash40(item.trim_start_matches('*')).0,
+        },
+        MoveCondition::MotionChanging => LiveGuard::AnimationChanging,
         MoveCondition::InStatus { symbol } => LiveGuard::Status {
             symbol: hash40::hash40(symbol.trim_start_matches('*')).0,
         },
@@ -304,6 +422,8 @@ fn suppress_category(command: &str) -> Option<u8> {
         "REVERSE_LR" => link::CAT_REVERSE_LR,
         "clear_speed_all" => link::CAT_KINETIC_CLEAR_SPEED_ALL,
         "generate_article" => link::CAT_ARTICLE_GENERATE,
+        "on_flag" | "off_flag" => link::CAT_WORK_FLAG,
+        "enable_term" | "unable_term" => link::CAT_WORK_TRANSITION_TERM,
         _ => return None,
     })
 }
@@ -507,6 +627,22 @@ pub fn removed_spawns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_line_block_call_becomes_a_named_step() {
+        let command = ExcuteStmt::AttackModuleAddReactionFrame { id: 2, frames: 4.5 };
+        let (name, args) = step_for("mario", &command).unwrap();
+        assert_eq!(name, "AttackModule::set_add_reaction_frame");
+        assert_eq!(args, vec![A::Int(2), A::Num(4.5), A::Bool(false)]);
+        assert_eq!(
+            generic_arg("*FOO as u32"),
+            Some(A::Hash(hash40::hash40("FOO").0 | CONST_BIT))
+        );
+        assert_eq!(
+            generic_arg("hash40(\"body\") as i64"),
+            Some(A::Hash(hash40::hash40("body").0))
+        );
+    }
 
     const FIREBALL: &str = "unsafe extern \"C\" fn game_specialn(agent: &mut L2CAgentBase) {\n    macros::FT_MOTION_RATE(agent, 1.15);\n    frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, false, -1);\n    }\n}\n";
 

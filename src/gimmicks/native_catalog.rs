@@ -27,6 +27,64 @@ pub fn for_fighter(fighter: &str) -> impl Iterator<Item = &'static NativeGimmick
         .filter(move |entry| entry.fighter == fighter)
 }
 
+/// Marks a value listed straight from the game's own names, with no hand-written label.
+pub const LISTED_FROM_GAME: &str = "Listed from the game's own names.";
+
+/// Every value of this fighter a block can use: the named ones first, then the rest of what the
+/// game keeps per fighter, such as Steve's materials or Villager's pocket.
+pub fn all_for_fighter(fighter: &str) -> &'static [NativeGimmick] {
+    use super::registry::{entries_for, IdentifierKind as Id};
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LISTS: OnceLock<Mutex<HashMap<String, &'static [NativeGimmick]>>> = OnceLock::new();
+    let mut lists = LISTS.get_or_init(Default::default).lock().unwrap();
+    if let Some(list) = lists.get(fighter) {
+        return list;
+    }
+    let mut list: Vec<NativeGimmick> = for_fighter(fighter).copied().collect();
+    for (id, kind) in [
+        (Id::WorkInt, NativeKind::Int),
+        (Id::WorkFloat, NativeKind::Float),
+        (Id::WorkFlag, NativeKind::Flag),
+    ] {
+        for entry in entries_for(fighter, id) {
+            let Some((_, name)) = entry.symbol.split_once("_INSTANCE_WORK_ID_") else {
+                continue;
+            };
+            let internal = ["HANDLE", "OBJECT_ID", "HASH", "EXTEND_BUFFER", "_TASK_"];
+            if !entry.group.is_empty()
+                || internal.iter().any(|word| name.contains(word))
+                || list.iter().any(|known| known.symbol == entry.symbol)
+                || super::native_inputs::NativeInput::from_registry(fighter, entry.symbol, kind)
+                    .is_err()
+            {
+                continue;
+            }
+            let words = name
+                .trim_start_matches("INT_")
+                .trim_start_matches("FLOAT_")
+                .trim_start_matches("FLAG_")
+                .replace('_', " ")
+                .to_lowercase();
+            let mut letters = words.chars();
+            let label: String = letters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(letters).collect()
+            });
+            list.push(NativeGimmick {
+                fighter: entry.fighter,
+                label: Box::leak(label.into_boxed_str()),
+                symbol: entry.symbol,
+                kind,
+                range: None,
+                note: LISTED_FROM_GAME,
+            });
+        }
+    }
+    let list: &'static [NativeGimmick] = Box::leak(list.into_boxed_slice());
+    lists.insert(fighter.to_owned(), list);
+    list
+}
+
 // Grouping by owner keeps the data compact without deriving symbol spellings.
 macro_rules! gimmicks {
     ($($fighter:literal => [$(($label:literal, $symbol:literal, $kind:ident, $range:expr, $note:literal)),* $(,)?]),* $(,)?) => {

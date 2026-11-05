@@ -1079,6 +1079,10 @@ pub enum LiveGuard {
     Article {
         symbol: u64,
     },
+    Item {
+        symbol: u64,
+    },
+    AnimationChanging,
     Value {
         chart: String,
         var: String,

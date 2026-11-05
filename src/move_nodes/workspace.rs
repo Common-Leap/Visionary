@@ -249,7 +249,7 @@ fn catalog(fighter: &str, track: Track, draft: &MoveGraph) -> Vec<Entry> {
         block: PaletteBlock::Character(CharacterBlock::EventTransition),
     });
     if track == Track::Game {
-        for entry in crate::gimmicks::native_catalog::for_fighter(fighter) {
+        for entry in crate::gimmicks::native_catalog::all_for_fighter(fighter) {
             for (verb, use_) in [("If", NativeUse::Test), ("Set", NativeUse::Set)] {
                 // Values the runtime refuses to write (Kirby's copy ability) are test-only here too.
                 let writable = crate::gimmicks::native_inputs::NativeInput::from_registry(
@@ -294,6 +294,10 @@ fn is_common(block: &PaletteBlock) -> bool {
                 | HookName::OnTakeDamage
                 | HookName::OnStatusEnter
         ),
+        // The long list of values from the game stays folded until the user searches.
+        PaletteBlock::Native(entry, _) => {
+            entry.note != crate::gimmicks::native_catalog::LISTED_FROM_GAME
+        }
         // Whole-controller presets are also under Gimmicks > Start from; keep the list short.
         PaletteBlock::Preset(_) => false,
         _ => true,
