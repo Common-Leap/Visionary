@@ -91,8 +91,7 @@ Visionary does not read. What the preview is authoritative about is the order.
 
 Adds a character as a **costume of an existing fighter**. It gets its own model, animations,
 effects, display name, and moveset, and you select it by choosing that fighter and then its
-costume. It does not get its own square on the select screen; see `docs/roster/PLAN.md` for the
-measurement behind that.
+costume. It does not get its own square on the select screen.
 
 Creating one makes the folders your model and animations go in and adds them to the mod
 library, so the slot is editable immediately. The panel reports what is still missing —
