@@ -673,9 +673,27 @@ fn dispatch_inner(
     resource: Option<&model::ResourceSource>,
     contact: Option<super::damage_dispatch::Event>,
 ) {
-    let Some(record) = crate::slight::agents::lookup(boid) else {
+    let Some(mut record) = crate::slight::agents::lookup(boid) else {
         return;
     };
+    // Nana is her own fighter object with no gimmicks of her own. Whatever happens to her in a
+    // fight counts for the Ice Climbers' rules, which belong to Popo on the same player entry.
+    let mut boid = boid;
+    if contact.is_some() && record.kind == *smash::lib::lua_const::FIGHTER_KIND_NANA {
+        let entry = record.entry_id;
+        let Some(popo) = crate::slight::agents::all_records()
+            .into_iter()
+            .find(|other| {
+                other.category == 0
+                    && other.entry_id == entry
+                    && other.kind == *smash::lib::lua_const::FIGHTER_KIND_POPO
+            })
+        else {
+            return;
+        };
+        boid = popo.boid;
+        record = popo;
+    }
     let Some(fighter) = registry::fighter_name(record.kind) else {
         return;
     };

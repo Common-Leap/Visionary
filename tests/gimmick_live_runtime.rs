@@ -62,6 +62,8 @@ pub mod lib {
             std::sync::LazyLock::new(|| 482);
 
         pub static FIGHTER_KIND_CLOUD: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| 62);
+        pub static FIGHTER_KIND_POPO: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| 0x4B);
+        pub static FIGHTER_KIND_NANA: std::sync::LazyLock<i32> = std::sync::LazyLock::new(|| 0x4C);
     }
 }
 

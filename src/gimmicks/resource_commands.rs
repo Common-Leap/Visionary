@@ -35,6 +35,7 @@ pub enum Writer {
 
 impl Writer {
     /// Partner rows live on the partner, so they have no Work field of this fighter behind them.
+    #[allow(dead_code)] // Not used by every crate that includes this file.
     pub fn is_partner(self) -> bool {
         matches!(self, Self::PartnerDamage | Self::PartnerAction(_))
     }

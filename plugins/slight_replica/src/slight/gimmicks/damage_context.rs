@@ -17,7 +17,12 @@ pub(super) fn input(event: Event) -> Result<native_inputs::DamageInput, String> 
     }
     .with_projectile(event.contact().weapon.is_some())
     .with_receiver_status(
-        event.receiver().identity.kind,
+        // Nana shares Popo's action numbers and has no fighter entry of her own.
+        if event.receiver().identity.kind == *smash::lib::lua_const::FIGHTER_KIND_NANA {
+            *smash::lib::lua_const::FIGHTER_KIND_POPO
+        } else {
+            event.receiver().identity.kind
+        },
         event.receiver_status_at_contact(),
     )
 }
@@ -28,6 +33,13 @@ pub(super) fn input(event: Event) -> Result<native_inputs::DamageInput, String> 
 pub(super) fn is_current(event: Option<Event>, boid: u32, identity: Identity) -> bool {
     event.is_none_or(|event| {
         let receiver = event.receiver();
+        // Nana's contacts run Popo's rules: same player entry, her own object and stock count.
+        if receiver.identity.kind == *smash::lib::lua_const::FIGHTER_KIND_NANA
+            && identity.fighter_kind == *smash::lib::lua_const::FIGHTER_KIND_POPO
+        {
+            return receiver.identity.entry == identity.entry_id
+                && super::damage_feed::event_is_current(event);
+        }
         receiver.identity.object_id == boid
             && receiver.identity.kind == identity.fighter_kind
             && receiver.identity.entry == identity.entry_id
