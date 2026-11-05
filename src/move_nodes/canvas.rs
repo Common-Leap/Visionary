@@ -1276,7 +1276,11 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
             {
                 (
                     "Set slowdown",
-                    format!("{multiplier} / {frames} · Source export"),
+                    if *frames == 0 {
+                        format!("{multiplier}x slower until cleared")
+                    } else {
+                        format!("{multiplier}x slower for {frames} frames")
+                    },
                 )
             } else {
                 ("Native slowdown", "Preserved source".into())

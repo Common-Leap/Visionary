@@ -113,7 +113,7 @@ pub const SIGNATURES: &[Signature] = &[
         "AttackModule::set_ink_value",
         "Set attack ink",
         "agent.module_accessor",
-        &[("Attack ID", Integer(&[])), ("Ink", Float(true))],
+        &[("Hitbox slot", Integer(&[])), ("Ink", Float(true))],
     ),
     // skyline-smash cpp.rs: accessor, c_int, bool, bool. Keep all operands editable.
     signature(
@@ -121,7 +121,7 @@ pub const SIGNATURES: &[Signature] = &[
         "Set force reaction",
         "agent.module_accessor",
         &[
-            ("Attack ID", Integer(&[])),
+            ("Hitbox slot", Integer(&[])),
             ("Enable", Bool),
             ("Argument 4", Bool),
         ],
@@ -131,9 +131,9 @@ pub const SIGNATURES: &[Signature] = &[
         "Shield setoff multiplier (three attacks)",
         "agent",
         &[
-            ("Attack ID 1", Unsigned),
-            ("Attack ID 2", Unsigned),
-            ("Attack ID 3", Unsigned),
+            ("Hitbox slot 1", Unsigned),
+            ("Hitbox slot 2", Unsigned),
+            ("Hitbox slot 3", Unsigned),
             ("Multiplier", Float(true)),
         ],
     ),
@@ -142,10 +142,10 @@ pub const SIGNATURES: &[Signature] = &[
         "Shield setoff multiplier (four attacks)",
         "agent",
         &[
-            ("Attack ID 1", Unsigned),
-            ("Attack ID 2", Unsigned),
-            ("Attack ID 3", Unsigned),
-            ("Attack ID 4", Unsigned),
+            ("Hitbox slot 1", Unsigned),
+            ("Hitbox slot 2", Unsigned),
+            ("Hitbox slot 3", Unsigned),
+            ("Hitbox slot 4", Unsigned),
             ("Multiplier", Float(true)),
         ],
     ),
@@ -248,7 +248,7 @@ pub const SIGNATURES: &[Signature] = &[
         "AttackModule::set_attack_keep_rumble",
         "Keep attack rumble",
         "agent.module_accessor",
-        &[("Attack ID", Integer(&[])), ("Keep", Bool)],
+        &[("Hitbox slot", Integer(&[])), ("Keep", Bool)],
     ),
     signature(
         "GroundModule::select_cliff_hangdata",
@@ -355,7 +355,7 @@ pub const SIGNATURES: &[Signature] = &[
         "macros::ATK_SET_SHIELD_SETOFF_MUL",
         "Shield setoff multiplier",
         "agent",
-        &[("Attack ID", Unsigned), ("Multiplier", Float(true))],
+        &[("Hitbox slot", Unsigned), ("Multiplier", Float(true))],
     ),
     Signature {
         stack_wrapper: true,
@@ -430,7 +430,7 @@ pub const SIGNATURES: &[Signature] = &[
         "Attack level",
         "agent.module_accessor",
         &[
-            ("Attack ID", Integer(&[])),
+            ("Hitbox slot", Integer(&[])),
             (
                 "Level",
                 Byte(&[
@@ -559,7 +559,7 @@ pub const SIGNATURES: &[Signature] = &[
         "agent",
         &[
             ("Command", Exact("*MA_MSC_CMD_SEARCH_SEARCH_SCH_CLR")),
-            ("Search ID", Integer(&[])),
+            ("Detection slot", Integer(&[])),
         ],
     ),
     signature(
@@ -568,7 +568,7 @@ pub const SIGNATURES: &[Signature] = &[
         "agent",
         &[
             ("Command", Exact("*MA_MSC_CMD_SEARCH_SET_OPPONENT")),
-            ("Search ID", Integer(&[])),
+            ("Detection slot", Integer(&[])),
             ("Argument 2", Integer(&[])),
             ("Property", Exact("*COLLISION_TARGET_PROPERTY")),
             ("Mask", Exact("*COLLISION_PROPERTY_MASK_REFLECT")),
@@ -686,7 +686,7 @@ pub const SIGNATURES: &[Signature] = &[
         "Shield setoff multiplier",
         "agent",
         &[
-            ("Attack ID", Unsigned),
+            ("Hitbox slot", Unsigned),
             ("Argument 2", Number),
             ("Multiplier", Float(true)),
         ],
@@ -937,7 +937,7 @@ pub const SIGNATURES: &[Signature] = &[
         "agent",
         &[
             ("Command", Exact("*MA_MSC_CMD_ATTACK_NODE")),
-            ("Attack ID", Unsigned),
+            ("Hitbox slot", Unsigned),
             ("Bone", Hash),
             ("X", Number),
             ("Y", Number),
@@ -1100,7 +1100,7 @@ pub const SIGNATURES: &[Signature] = &[
         "agent",
         &[
             ("Command", Exact("*MA_MSC_CMD_GRAB_CLEAR")),
-            ("Grab ID", Integer(&[])),
+            ("Grab slot", Integer(&[])),
         ],
     ),
     signature(
@@ -1195,7 +1195,7 @@ pub const SIGNATURES: &[Signature] = &[
         "Attack camera quake",
         "agent.module_accessor",
         &[
-            ("Attack ID", Integer(&[])),
+            ("Hitbox slot", Integer(&[])),
             (
                 "Quake",
                 Integer(&[
@@ -1213,20 +1213,20 @@ pub const SIGNATURES: &[Signature] = &[
         "GrabModule::set_constraint",
         "Constrain grab",
         "agent.module_accessor",
-        &[("Grab ID", Integer(&[])), ("Enabled", Bool)],
+        &[("Grab slot", Integer(&[])), ("Enabled", Bool)],
     ),
     signature(
         "AttackModule::set_invalid_xlu",
         "Ignore translucency",
         "agent.module_accessor",
-        &[("Attack ID", Integer(&[])), ("Enabled", Bool)],
+        &[("Hitbox slot", Integer(&[])), ("Enabled", Bool)],
     ),
     signature(
         "AttackModule::set_no_finish_camera_ex",
         "Disable finish camera",
         "agent.module_accessor",
         &[
-            ("Attack ID", Integer(&[])),
+            ("Hitbox slot", Integer(&[])),
             ("Disabled", Bool),
             ("Flag 2", Bool),
         ],

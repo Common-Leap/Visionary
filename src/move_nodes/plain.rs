@@ -32,6 +32,14 @@ pub fn block_name(internal: &str) -> &str {
         "Define absolute attack" => "Fixed attack",
         "Apply throw" => "Throw opponent",
         "Native flag" | "Work flag" => "Game flag",
+        "Set slowdown" => "Slow down time",
+        "Clear slowdown" => "Back to normal time",
+        "Slow opponents" => "Slow opponents",
+        "Shield setoff multiplier (three attacks)"
+        | "Shield setoff (three attacks)"
+        | "Shield setoff multiplier (four attacks)"
+        | "Shield setoff (four attacks)"
+        | "Shield setoff multiplier" => "Shield pushback",
         "Notify event" => "Game notice",
         "Change status" => "Go to another action",
         "Allow transition" | "Allow transition group" => "Allow cancel",
@@ -109,6 +117,9 @@ pub fn block_help(name: &str) -> Option<&'static str> {
         "Go airborne" => "Puts the fighter in the air.",
         "Turn around" => "Flips the way the fighter is facing.",
         "Animation speed" => "Stretches the animation. 1 is normal, 2 takes twice as long, 0.5 takes half as long.",
+        "Slow down time" => "Slows the whole match, like a big hit does.",
+        "Back to normal time" => "Ends Slow down time.",
+        "Shield pushback" => "Changes how far these hitboxes push a shield back.",
         "Spawn object" => "Creates a projectile or other object that belongs to this fighter.",
         "Remove object" => "Removes this fighter's object.",
         "Throw damage" => "Sets the damage and launch of a throw.",

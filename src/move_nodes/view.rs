@@ -3672,7 +3672,7 @@ fn fixed_jostle_area_ui(ui: &mut Ui, call: &mut crate::data::FixedJostleAreaCall
             );
         }
     });
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Reconstructs enable_fix_jostle_area or enable_fix_jostle_area_xy. This does not enable jostling, create an attack volume, or publish a flat live override.",
     );
 }
@@ -3731,7 +3731,7 @@ fn transition_permission_ui(
     } else {
         ui.weak("Unsupported source · retained unchanged");
     }
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Changes native transition permission at this point in the Game track. The operation and fighter accessor stay fixed; choices are source-proven for this fighter. Permission does not force a status change or emit an event. No flat live native writes are sent.",
     );
 }
@@ -3962,7 +3962,7 @@ fn native_command_ui(
                     "Native reaction-frame adjustment. Negative values are supported; this is not a timer or a reaction event.",
                 ));
             });
-            ui.weak("Advanced").on_hover_text(
+            ui.weak("?").on_hover_text(
                 "Retains the selected native API and its fixed false tail. Original and revised calls are separate blocks; neither is a timer or hit event.",
             );
         }
@@ -4241,16 +4241,16 @@ fn native_command_ui(
         }
         ExcuteStmt::ShootItemBullet => {
             ui.label("Fire held item");
-            ui.weak("Advanced").on_hover_text("Runs the native SHOOT_ITEM_BULLET command in a root Game Execute block, not inside Branch or Repeat. Its effect depends on the current item; it does not give the fighter an item, generate an article, or create a projectile-hit trigger. flat live preview cannot send this command.");
+            ui.weak("?").on_hover_text("Runs the native SHOOT_ITEM_BULLET command in a root Game Execute block, not inside Branch or Repeat. Its effect depends on the current item; it does not give the fighter an item, generate an article, or create a projectile-hit trigger. flat live preview cannot send this command.");
         }
         ExcuteStmt::StartInfoFlashEye => {
-            ui.weak("Advanced").on_hover_text("Runs START_INFO_FLASH_EYE at this motion frame in a root Game or Expression Execute block. It has no editable payload. Keep imported category and placement; it is not a fighter-color setting, article spawn, collision trigger or live replay. the result depends on native fighter state.");
+            ui.weak("?").on_hover_text("Runs START_INFO_FLASH_EYE at this motion frame in a root Game or Expression Execute block. It has no editable payload. Keep imported category and placement; it is not a fighter-color setting, article spawn, collision trigger or live replay. the result depends on native fighter state.");
         }
         ExcuteStmt::CameraZoomOut => {
-            ui.weak("Advanced").on_hover_text("Runs CAM_ZOOM_OUT at this motion frame in a root Game Execute block. There are no editable camera arguments. This is not CAM_ZOOM_OUT_FINAL, a throw-finish zoom-rate setting or a live camera slider. native camera context still controls the result.");
+            ui.weak("?").on_hover_text("Runs CAM_ZOOM_OUT at this motion frame in a root Game Execute block. There are no editable camera arguments. This is not CAM_ZOOM_OUT_FINAL, a throw-finish zoom-rate setting or a live camera slider. native camera context still controls the result.");
         }
         ExcuteStmt::StartCutIn => {
-            ui.weak("Advanced").on_hover_text("Runs FT_START_CUTIN at this motion frame in a root Game Execute block. It has no payload and depends on native cinematic context. It does not choose a camera, request a status or create a confirmed-hit event.");
+            ui.weak("?").on_hover_text("Runs FT_START_CUTIN at this motion frame in a root Game Execute block. It has no payload and depends on native cinematic context. It does not choose a camera, request a status or create a confirmed-hit event.");
         }
         ExcuteStmt::CaptureCutCommon => {
             ui.weak("Top-level helper").on_hover_text("Runs game_CaptureCutCommon exactly once here. The pinned helper owns its Execute guard and defines the native default absolute Catch attack; it does not create a grab volume or apply throw damage. Keep it outside Execute, Branch and Repeat. Use separate blocks for authored collision volumes and throw application.");
@@ -4572,7 +4572,6 @@ fn finish_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinishCa
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor pair · Preserved until repaired");
     } else {
-        ui.weak("Advanced");
     }
 }
 
@@ -4601,7 +4600,6 @@ fn final_start_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Fin
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor tuple · Preserved until repaired");
     } else {
-        ui.weak("Advanced");
     }
 }
 
@@ -4624,7 +4622,6 @@ fn final_fear_face_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinalF
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor argument · Preserved until repaired");
     } else {
-        ui.weak("Advanced");
     }
 }
 
@@ -4741,7 +4738,7 @@ fn optional_hit_feedback_ui(
         }
         _ => {}
     }
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Retains the native optional-hit-feedback command. This is not a live effect/sound spawn, an On-hit event or proof that the selected resource exists.",
     );
 }
@@ -4761,13 +4758,17 @@ fn slow_opponent_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::
             "Native slow_time argument. Editor range: 5–130. Its units are not established; this is not an authored timer.",
         ));
     });
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Exports SLOW_OPPONENT(agent, multiplier, time argument). Frame and Wait connections schedule the call. ordinary live preview cannot publish this command.",
     );
 }
 
 fn slow_whole_pair_label(multiplier: u8, frames: i32) -> String {
-    format!("Multiplier {multiplier} · frame arg {frames}")
+    if frames == 0 {
+        format!("{multiplier}x slower until cleared")
+    } else {
+        format!("{multiplier}x slower for {frames} frames")
+    }
 }
 
 fn slow_whole_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::SlowWholeCall) {
@@ -4812,7 +4813,7 @@ fn slow_whole_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Slo
             return;
         }
     }
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Retains the measured native whole-slow operation on this fighter's module accessor. Frame and Wait connections determine when it runs. The two setter arguments are a reviewed pair; zero remains the exact native frame argument, not an authored timer. Clear slowdown is a separate block. No global-game or live slowdown write is published.",
     );
 }
@@ -4863,7 +4864,7 @@ fn source_work_module_set_ui(
                 }
             });
     });
-    ui.weak("Advanced").on_hover_text(if descriptor.kind.is_float() {
+    ui.weak("?").on_hover_text(if descriptor.kind.is_float() {
         "Retains the measured Final wave-angle setter for Mii Swordfighter. Choose a reviewed value, and connect Frame or Wait for timing. Units are not inferred. This does not spawn a wave, force a status, or publish a live native write."
     } else {
         "Records the reviewed sword open-motion name for this donor. Pyra and Mythra have separate measured choices; the shared native slot spelling does not make them interchangeable. This does not play a motion, verify an asset, or publish a live native write."
@@ -4902,7 +4903,7 @@ fn item_pull_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Work
         ui.label("Item pull offset limit · 4")
             .on_hover_text(provenance);
     }
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Reconstructs the exact shared setter measured in ItemGrassPull. Connect after Frame or Wait to choose when it runs. The offset limit retains the measured value 4; its units are not inferred. These blocks do not create an item, force a fighter status, or publish a live native write.",
     );
 }
@@ -5658,7 +5659,7 @@ fn effect_command_ui_mode(
         EffectMacro::Control(EffectControl::ReqScreen { preset_id }) => {
             ui.label("Screen graphic");
             screen_effect_preset_ui(ui, preset_id);
-            ui.weak("Advanced").on_hover_text(
+            ui.weak("?").on_hover_text(
                 "Requests the selected native screen graphic. Its three flags stay together; their gameplay meanings are not inferred. Check the mod's graphic resources before game testing.",
             );
         }
@@ -6453,7 +6454,7 @@ fn native_comparison_picker(ui: &mut Ui, op: &mut super::model::NativeComparison
 }
 
 fn native_branch_hint(ui: &mut Ui) {
-    ui.weak("Advanced").on_hover_text(
+    ui.weak("?").on_hover_text(
         "Reads native state at this move's branch. It does not write a resource or infer a hit, spend or refill event. Status-dependent fields require their original valid status context; this is not a live character-controller input."
     );
 }
