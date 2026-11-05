@@ -44,7 +44,11 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
     // A partner's damage lives on the partner, not in a Work field of this fighter.
     if entry.writer == Writer::PartnerDamage {
         let value = super::partner_control::damage(boid, entry.fighter, expected);
-        return Ok((value.unwrap_or(0.0), command.target(value.unwrap_or(0.0))?, 0));
+        return Ok((
+            value.unwrap_or(0.0),
+            command.target(value.unwrap_or(0.0))?,
+            0,
+        ));
     }
     let module = expected.module_accessor_addr as *mut app::BattleObjectModuleAccessor;
     let integer = entry.kind == super::native_inputs::NativeKind::Int;
@@ -69,6 +73,8 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
         Writer::CloudLimit => {
             super::cloud_resource::preflight(boid, expected, cloud(command, value, target))?
         }
+        // Steve's counts change during his own attacks, so earning them on a hit is safe.
+        Writer::PickelMaterial(_) => {}
         // Other helpers stay on stable idle/fall/guard, where summon and HUD code is not running.
         _ => unsafe {
             let status = StatusModule::status_kind(module);
