@@ -51,7 +51,3 @@ impl FromStr for Button {
         Err(())
     }
 }
-
-pub fn parse_button(s: &str) -> Button {
-    s.parse().unwrap_or(Button::Unknown)
-}

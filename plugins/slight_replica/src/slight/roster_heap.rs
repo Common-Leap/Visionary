@@ -51,10 +51,6 @@ fn hash40(s: &str) -> u64 {
     (!hash) as u64 | (s.len() as u64) << 32
 }
 
-pub fn patch_raw_prc(_order: &BTreeMap<String, i8>, _hidden: &BTreeSet<String>) -> usize {
-    0
-}
-
 /// Try to patch the parsed heap copy of db_root.
 /// This is the instant path: the UI reads this copy every frame, so patching
 /// it makes the grid move without a reload.

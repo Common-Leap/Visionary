@@ -23,7 +23,3 @@ impl PatternRule {
 
 static EFFECT_KEY: LazyLock<PatternRule> =
     LazyLock::new(|| PatternRule::compile("Effect data").expect("effect data literal"));
-
-pub fn effect_data_key_matches(haystack: &[u8]) -> bool {
-    EFFECT_KEY.is_match(haystack)
-}

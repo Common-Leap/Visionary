@@ -55,10 +55,45 @@ motion parts. This includes Kirby copy-ability animations stored in donor body
 directories, so copied specials preview with their intended animation when the
 corresponding files are present in the export.
 
+## Making moves and gimmicks with nodes
+
+The node system is not finished. Some blocks don't update live yet, many fighter mechanics aren't
+supported as gimmicks, and most testing so far has been on Mario.
+
+Open the **Move nodes** tab, or start from **Gimmicks** to work on a whole character.
+
+**Make a move**
+
+1. Pick the fighter and the move slot to replace, such as Mario's `special_n`.
+2. Under **Start a new move**, click a starter such as *Quick strike* or *Shoot a projectile*.
+   *Empty move* starts from nothing. Undo brings back what was there.
+3. Click a block to change it. Each block explains itself at the top of the panel.
+4. Add more from the list on the left. Clicking one adds it after the selected block.
+
+Blocks run left to right, and the frame ruler along the top shows when. With nothing selected,
+**What this move does** reads the whole move back in sentences. Click a line to find its block.
+An **If** block has three outputs: **Yes** and **No** say what runs for each answer, and
+**After** runs either way.
+
+**Everything updates live.** With the game connected, each finished edit reaches the match by
+itself, with no restart and no export. **● Updates live** at the top confirms it; if a block
+can't go live yet, that label names it. To keep a move, use **Project → Export Mod Folder**. The
+folder it makes is a complete mod: drop it in your mods folder and it works without the editor,
+exactly as you tested it. You don't need Rust. Keep only one copy of the plugin installed, so remove
+any other copy from Skyline's plugins folder.
+
+**Make a gimmick**
+
+The **Gimmick** section of the block list adds rules that run all the time: *When: deals damage*,
+*When: takes damage*, timers and meters. Ready-made gimmicks such as extra jumps are in the same
+section, and **Tell a gimmick** lets a move talk to one. The **Gimmicks** tab also edits a
+fighter's personal parameters. Custom characters inherit their donor's controls, and costumes of
+one donor share its gimmick state.
+
 ## Roster
 
-The **Roster** window (Windows → Roster, or File → Mod Library) covers everything about a
-fighter that is not one move.
+The **Roster** window (Windows → Roster, or File → Mod Library) manages imported mods,
+character select entries, new donor-backed characters, and shared fighter traits.
 
 ### Mod library
 
@@ -145,6 +180,10 @@ the executable for native window decorations on Windows and X11.
 
 Visionary reads the dumped data from its existing location and remembers the
 selected export root for future sessions.
+
+When managing a plugin build or a separate test installation manually, set
+`VISIONARY_DISABLE_PLUGIN_AUTO_DEPLOY=1` before starting the editor. This disables
+the startup plugin rebuild/deployment check without disabling live editing.
 
 ### Editing a move
 
@@ -755,9 +794,7 @@ transplant edits together:
 - **Export Project** writes a portable `modproject.json` and adopts its path.
   These editable files are exported separately from mod and developer files.
 - **Load Project** replaces the current project, restores every edit, and sends
-  the available live rules and effects to a connected game. Added or retimed
-  move events may ask you to perform that move once so the plugin can capture
-  the original arguments safely.
+  the available live rules and effects to a connected game.
 - **Import Mod as Project** adopts any mod folder: `ui_chara_db` diffs
   (order/visibility/row fields), `.xmsbt` names, BNTX portraits→PNG assets, and
   `fighter_param` diffs become editable; source text is copied as reference and
@@ -815,9 +852,3 @@ emulator SD directory. Save your work before testing it in-game.
 Preview snapshots are immutable and old generations are reclaimed after the
 plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
 limit; stop the game before manually clearing that cache.
-
-## Additional tools
-
-Reusable game-analysis utilities are available in `research/decomp/ssbu-re/`.
-Each tool reads its inputs from the external directory selected through
-`SSBU_DUMP_DIR`.

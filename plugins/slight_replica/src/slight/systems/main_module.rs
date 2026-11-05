@@ -8,6 +8,7 @@ pub fn install() {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
+    crate::slight::gimmicks::install();
     skyline::println!("[SLight] Main install");
 }
 
@@ -19,6 +20,8 @@ pub fn on_init_fighter(boid: u32) {
     crate::slight::systems::damage_manager::init_agent(boid, unsafe {
         smash::app::sv_battle_object::module_accessor(boid)
     });
+    // A new stock must start clean before StockStart handlers see it.
+    crate::slight::gimmicks::on_init_fighter(boid);
     crate::slight::systems::event_system::emit(
         crate::slight::systems::event_system::GameEvent::Spawn { boid },
     );
@@ -28,26 +31,36 @@ pub fn on_init_fighter(boid: u32) {
 
 pub fn on_reinit_fighter(boid: u32) {
     skyline::println!("[SLight] Reinit fighter {boid}");
-    skyline::println!("[SLight] Reinitializing fighter over facade");
-    crate::slight::systems::animation_sequencer::remove(boid);
-    crate::slight::systems::animation_sequencer::create(boid, &format!("fighter_{boid}"));
-    crate::slight::systems::fighter_data_space::init_fighter(boid);
-    crate::slight::systems::dynamic_memory::ensure_agent(boid);
+    refresh_fighter(boid);
+    // This entry point is reserved for an identified lifecycle replacement
+    // (magic change, explicit timed reinit, or dead -> live transition). An
+    // ordinary animation/status refresh must use `refresh_fighter` below so
+    // it cannot wipe behavior state or discard a status edge every action.
+    crate::slight::gimmicks::on_init_fighter(boid);
     crate::slight::systems::event_system::emit(
         crate::slight::systems::event_system::GameEvent::Respawn { boid },
     );
 }
 
+/// Refresh the framework state needed after an ordinary motion or status
+/// change. This intentionally is not a stock lifecycle: status-edge and
+/// generated-behavior state remain armed across it.
+pub fn refresh_fighter(boid: u32) {
+    skyline::println!("[SLight] Reinitializing fighter over facade");
+    crate::slight::systems::animation_sequencer::remove(boid);
+    crate::slight::systems::animation_sequencer::create(boid, &format!("fighter_{boid}"));
+    crate::slight::systems::fighter_data_space::init_fighter(boid);
+    crate::slight::systems::dynamic_memory::ensure_agent(boid);
+}
+
 pub fn on_reset_fighter(boid: u32) {
     skyline::println!("[SLight] Started reset fighter");
+    crate::slight::gimmicks::on_reset_fighter(boid);
     crate::slight::systems::animation_sequencer::remove(boid);
     crate::slight::effect_viewer::tracker::EFFECT_TRACKER
         .lock()
         .invalidate_boid(boid);
     crate::slight::systems::init_frame::clear_boid(boid);
-    crate::slight::systems::event_system::emit(
-        crate::slight::systems::event_system::GameEvent::StatusChange { boid, status: 0 },
-    );
     // FUN_71000bf23c: DAT_71001e3254 (FIGHT_STARTED) is cleared unconditionally on every reset,
     // but DAT_71001e3238 (IS_AFTER_WIN_SCREEN) is cleared ONLY when the fighter is dead
     // (status_kind == -1) or the match is in training mode.
@@ -69,6 +82,7 @@ pub fn on_init_weapon(boid: u32) {
 
 pub fn on_reset_weapon(boid: u32) {
     skyline::println!("[SLight] After resetting weapon");
+    crate::slight::gimmicks::on_reset_weapon(boid);
     crate::slight::effect_viewer::tracker::EFFECT_TRACKER
         .lock()
         .invalidate_boid(boid);
@@ -77,6 +91,7 @@ pub fn on_reset_weapon(boid: u32) {
 
 pub fn on_uninstall() {
     skyline::println!("[SLight] Start uninstall");
+    crate::slight::gimmicks::on_uninstall();
     crate::slight::frame_context::clear_after_win("uninstall");
     skyline::println!("[SLight] SLight framework uninstalled!");
     crate::slight::systems::clear_all();

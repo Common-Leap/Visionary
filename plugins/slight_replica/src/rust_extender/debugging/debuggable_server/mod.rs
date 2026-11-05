@@ -1,6 +1,6 @@
 //! Jorge debuggable_server — Notify/Remove + SD transactions + TCP inbound.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,12 @@ use crate::slight::effect_viewer::effect_data::{Color, EffectData, Point3D, RpmE
 use crate::slight::smash_utils;
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
+static GIMMICK_AGENTS_SEQ: AtomicU64 = AtomicU64::new(1);
+static GIMMICK_METERS_SEQ: AtomicU64 = AtomicU64::new(1);
+static GIMMICK_LIVE_SEQ: AtomicU64 = AtomicU64::new(1);
+static GIMMICK_CONTROLLER_CAPABILITIES_SEQ: AtomicU64 = AtomicU64::new(1);
+static GIMMICK_FEATURE_CAPABILITIES_SEQ: AtomicU64 = AtomicU64::new(1);
+static TRACE_NEXT_NONEMPTY_GIMMICK_ROSTER: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize)]
 struct OutRecord {
@@ -36,6 +42,7 @@ pub fn on_rpm_client_connected(client_id: u64) {
     // connected went to the SD fallback, so without this the editor starts blind.
     crate::slight::effect_viewer::effect_reload::reset_carrier_status_latch();
     crate::slight::effect_viewer::asset_bundle::reset_status_latch();
+    TRACE_NEXT_NONEMPTY_GIMMICK_ROSTER.store(true, Ordering::Release);
 
     // Do NOT touch shared state (kinds/tracker) from this SERVER thread: a contended
     // parking_lot lock parks the waiter, and parked threads never wake in this environment
@@ -60,6 +67,7 @@ pub fn resync_if_requested() {
     }
     // The new client also gets the whole ACMD capture log (drained by the facade).
     crate::slight::hitbox_viewer::requeue_all();
+    notify_gimmick_agents();
     skyline::println!("[SLight] RPM resync — flushed {count} kind tab(s)");
 }
 
@@ -197,10 +205,6 @@ pub fn remove_effect(id: u64) {
     emit("Remove", &serde_json::json!({ "Remove": { "id": id } }));
 }
 
-pub fn remove_all() {
-    emit("RemoveAll", &serde_json::json!({}));
-}
-
 /// Jorge FUN_71000936c8 — multiplier registry changed.
 pub fn notify_multipliers(direct_rules: usize, pattern_rules: usize) {
     emit(
@@ -218,6 +222,102 @@ pub fn notify_multipliers(direct_rules: usize, pattern_rules: usize) {
 /// Jorge FUN_71001078f8 — serialized agent row on init when after-win.
 pub fn notify_agent_info(info: &crate::slight::systems::agent_info::AgentInfo) {
     emit("AgentInfo", &serde_json::json!({ "AgentInfo": info }));
+}
+
+/// Replace the desktop's live-object picker snapshot. This is deliberately a
+/// small identity-only view: no module pointers cross the wire, and operation
+/// execution still revalidates every object and symbolic identifier in game.
+pub fn notify_gimmick_agents() {
+    if !crate::rust_extender::net::simple_server::has_client() {
+        return;
+    }
+    let mut records = crate::slight::agents::all_records();
+    records.retain(|record| matches!(record.category, 0 | 1));
+    records.sort_by_key(|record| (record.category, record.entry_id, record.boid));
+    let agents = records
+        .into_iter()
+        .filter_map(|record| {
+            let fighter = if record.category == 0 {
+                Some(crate::slight::gimmicks::registry::fighter_name(
+                    record.kind,
+                )?)
+            } else {
+                None
+            };
+            let owner_boid = if record.category == 1 {
+                // Zero is the first fighter's valid battle-object id. A
+                // failed resolution returns the weapon itself, which cannot
+                // match a fighter selection and is rechecked at execution.
+                Some(crate::slight::systems::article_notifier::weapon_owner_boid(
+                    record.boid,
+                ))
+            } else {
+                None
+            };
+            Some(serde_json::json!({
+                "boid": record.boid,
+                "category": record.category,
+                "kind": record.kind,
+                "entry_id": record.entry_id,
+                "owner_boid": owner_boid,
+                "fighter": fighter,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if !agents.is_empty() && TRACE_NEXT_NONEMPTY_GIMMICK_ROSTER.swap(false, Ordering::AcqRel) {
+        crate::slight::diag::note(format!("GIMMICK roster rows={agents:?}"));
+    }
+    let parameter_health = crate::slight::gimmicks::live_parameters::wire_health();
+    emit(
+        "GimmickFeatureCapabilities",
+        &serde_json::json!({"GimmickFeatureCapabilities":
+            crate::slight::gimmicks::live_behavior::native_feature_capabilities(
+                GIMMICK_FEATURE_CAPABILITIES_SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        }),
+    );
+    emit(
+        "GimmickControllerCapabilities",
+        &serde_json::json!({"GimmickControllerCapabilities":
+            crate::slight::gimmicks::live_behavior::controller_capabilities(
+                GIMMICK_CONTROLLER_CAPABILITIES_SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        }),
+    );
+    let (behavior_revision, behavior_rows) =
+        crate::slight::gimmicks::live_behavior::wire_snapshot();
+    emit(
+        "GimmickLiveState",
+        &serde_json::json!({"GimmickLiveState": {
+            "version": 1,
+            "seq": GIMMICK_LIVE_SEQ.fetch_add(1, Ordering::Relaxed),
+            "behavior_revision": behavior_revision,
+            "parameter_revision": parameter_health.revision,
+            "behavior": behavior_rows,
+            "parameters": crate::slight::gimmicks::live_parameters::wire_rows(),
+            "parameter_health": parameter_health,
+        }}),
+    );
+    emit(
+        "GimmickAgents",
+        &serde_json::json!({
+            "GimmickAgents": {
+                "version": 1,
+                "seq": GIMMICK_AGENTS_SEQ.fetch_add(1, Ordering::Relaxed),
+                "agents": agents,
+            }
+        }),
+    );
+    emit(
+        "GimmickMeters",
+        &serde_json::json!({
+            "GimmickMeters": {
+                "version": 1,
+                "seq": GIMMICK_METERS_SEQ.fetch_add(1, Ordering::Relaxed),
+                "values": crate::slight::gimmicks::meter_wire_rows(),
+            }
+        }),
+    );
 }
 
 pub fn notify_acmd_capture_cleared() {
@@ -243,7 +343,50 @@ struct IncomingEdit {
 }
 
 /// RPM edits sent over TCP (plain JSON or framed envelope body).
+/// File an exported mod keeps its rules in. Must match the editor's value.
+const RULE_PACK_FILE: &str = "visionary_rules.jsonl";
+
+/// Replays every installed mod's rules once, as if an editor had sent them. Rule lists from
+/// different mods add up; a connected editor's full lists then replace them.
+fn load_rule_packs() {
+    let Ok(mods) = std::fs::read_dir("sd:/ultimate/mods") else {
+        return;
+    };
+    let mut lists: std::collections::BTreeMap<String, Vec<serde_json::Value>> = Default::default();
+    for folder in mods.flatten() {
+        // ARCropolis treats a leading dot as a disabled mod.
+        if folder.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let Ok(pack) = std::fs::read_to_string(folder.path().join(RULE_PACK_FILE)) else {
+            continue;
+        };
+        crate::slight::diag::note(format!("rule pack: {:?}", folder.file_name()));
+        for line in pack.lines() {
+            let Ok(serde_json::Value::Object(message)) = serde_json::from_str(line) else {
+                continue;
+            };
+            for (key, value) in message {
+                match value {
+                    serde_json::Value::Array(rules) => lists.entry(key).or_default().extend(rules),
+                    _ => {
+                        parse_tcp_payload(&serde_json::json!({ key: value }).to_string());
+                    }
+                }
+            }
+        }
+    }
+    for (key, rules) in lists {
+        let raw = serde_json::json!({ key: rules }).to_string();
+        if !apply_timing_rules_from_network(&raw) {
+            parse_tcp_payload(&raw);
+        }
+    }
+}
+
 pub fn poll_tcp_edits() -> Vec<ParsedEdit> {
+    static RULE_PACKS: std::sync::Once = std::sync::Once::new();
+    RULE_PACKS.call_once(load_rule_packs);
     let mut out = Vec::new();
     for raw in crate::rust_extender::net::simple_server::take_inbound() {
         if let Some(edit) = parse_tcp_payload(&raw) {
@@ -283,6 +426,66 @@ pub fn apply_timing_rules_from_network(raw: &str) -> bool {
 
 fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if v.get("gimmick_parameters").is_some() {
+        let ack = crate::slight::gimmicks::live_parameters::handle(raw);
+        emit(
+            "GimmickLiveAck",
+            &serde_json::json!({"GimmickLiveAck": {
+                "version": ack.version, "family": "parameters", "revision": ack.revision,
+                "accepted": ack.accepted, "message": ack.message,
+            }}),
+        );
+        return None;
+    }
+    if v.get("gimmick_behavior").is_some() {
+        let ack = crate::slight::gimmicks::live_behavior::handle(raw);
+        emit(
+            "GimmickLiveAck",
+            &serde_json::json!({"GimmickLiveAck": ack}),
+        );
+        return None;
+    }
+    if let Some(value) = v.get("gimmick_restart") {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Restart {
+            fighter: String,
+            boid: u32,
+            expected_revision: u64,
+            #[serde(default)]
+            chart_id: Option<String>,
+        }
+        if let Ok(request) = serde_json::from_value::<Restart>(value.clone()) {
+            let ack = if let Some(chart_id) = request.chart_id {
+                crate::slight::gimmicks::live_behavior::restart_controller_chart(
+                    &request.fighter,
+                    request.boid,
+                    &chart_id,
+                    request.expected_revision,
+                )
+            } else {
+                crate::slight::gimmicks::live_behavior::restart(
+                    &request.fighter,
+                    request.boid,
+                    request.expected_revision,
+                )
+            };
+            emit(
+                "GimmickLiveAck",
+                &serde_json::json!({"GimmickLiveAck": ack}),
+            );
+        }
+        return None;
+    }
+
+    // F1.5 operations run only here, on the game-thread half of the TCP
+    // bridge. The network thread merely queues strings, so no engine module
+    // can be reached from socket I/O. The adapter revalidates symbols and
+    // proves fighter/weapon ownership and type before any engine call.
+    if v.get("gimmick_operation").is_some() {
+        crate::slight::gimmicks::operations::handle(raw);
+        return None;
+    }
 
     // Editor commands (no effect-edit payload).
     if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {

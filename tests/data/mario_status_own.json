@@ -1,0 +1,116 @@
+{
+ "initial": "idle",
+ "states": [
+  {
+   "name": "idle"
+  },
+  {
+   "name": "cape",
+   "status": {
+    "target": "FIGHTER_STATUS_KIND_SPECIAL_S",
+    "policy": "Owned",
+    "roots": {
+     "Pre": [
+      0
+     ],
+     "MainEnter": [
+      1
+     ],
+     "MainLoop": [
+      2
+     ]
+    }
+   }
+  }
+ ],
+ "vars": [],
+ "transitions": [
+  {
+   "from": "cape",
+   "to": "cape",
+   "guard": {
+    "Compare": {
+     "op": "Eq",
+     "left": {
+      "Const": {
+       "Int": 1
+      }
+     },
+     "right": {
+      "Const": {
+       "Int": 1
+      }
+     }
+    }
+   },
+   "actions": [
+    {
+     "Status": {
+      "InitializeStatus": {}
+     }
+    }
+   ],
+   "on_frame": false
+  },
+  {
+   "from": "cape",
+   "to": "cape",
+   "guard": {
+    "Compare": {
+     "op": "Eq",
+     "left": {
+      "Const": {
+       "Int": 1
+      }
+     },
+     "right": {
+      "Const": {
+       "Int": 1
+      }
+     }
+    }
+   },
+   "actions": [
+    {
+     "Status": {
+      "PlayMotion": {
+       "motion": "appeal_hi_r",
+       "frame": {
+        "Start": {
+         "Const": {
+          "Float": 0.0
+         }
+        }
+       },
+       "rate": {
+        "Const": {
+         "Float": 1.0
+        }
+       }
+      }
+     }
+    }
+   ],
+   "on_frame": false
+  },
+  {
+   "from": "cape",
+   "to": "idle",
+   "guard": "MotionEnded",
+   "actions": [
+    {
+     "Status": {
+      "ChangeStatusNow": {
+       "symbol": "FIGHTER_STATUS_KIND_WAIT"
+      }
+     }
+    }
+   ],
+   "on_frame": false
+  }
+ ],
+ "emission_plan": {
+  "bindings": [],
+  "event_bindings": []
+ }
+}

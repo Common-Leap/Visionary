@@ -81,11 +81,11 @@ pub fn on_collision_hit(ctx: &crate::slight::systems::skyline_hook::CollisionCon
     // +0x2b0 attacker-side and +0x2e0 defender-side both get the hit record.
     push_collision(&COLLISION_QUEUE, rec.clone());
     push_collision(&DEFENDER_QUEUE, rec.clone());
-    // FUN_71000d210c: for an article attacker (category 6) the overload is attributed to the
+    // FUN_71000d210c: for a weapon/article attacker the overload is attributed to the
     // article's FOUNDER (owner fighter) — resolved via FUN_7100107404 + FUN_71000db2b4 — not to
     // the article itself.
     let attacker_category = unsafe { smash::app::sv_battle_object::category(ctx.attacker_boid) };
-    if attacker_category == 6 {
+    if attacker_category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON {
         let founder_id = unsafe { smash::app::sv_battle_object::get_founder_id(ctx.attacker_boid) };
         if let Some(owner) = crate::slight::agents::lookup_by_founder(founder_id) {
             let mut owner_rec = rec;
@@ -112,10 +112,6 @@ fn agent_kind(boid: u32) -> u32 {
 
 pub fn drain_collision_hits() -> Vec<CollisionHitRecord> {
     COLLISION_QUEUE.lock().drain(..).collect()
-}
-
-pub fn drain_overload_hits() -> Vec<CollisionHitRecord> {
-    OVERLOAD_QUEUE.lock().drain(..).collect()
 }
 
 pub fn drain_defender_hits() -> Vec<CollisionHitRecord> {

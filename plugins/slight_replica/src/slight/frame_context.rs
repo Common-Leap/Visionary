@@ -138,26 +138,12 @@ pub fn weapon_frame() -> u32 {
     WEAPON_FRAME.load(Ordering::Relaxed)
 }
 
-pub fn match_ticks() -> u64 {
-    MATCH_TICKS.load(Ordering::Relaxed)
-}
-
 pub fn set_current_agent(agent: Option<AgentRecord>) {
     *CURRENT_AGENT.lock() = agent;
 }
 
 pub fn current_agent() -> Option<AgentRecord> {
     CURRENT_AGENT.lock().clone()
-}
-
-pub fn for_each_live_agent(mut f: impl FnMut(&AgentRecord)) {
-    let mut recs = super::agents::all_records();
-    recs.sort_by_key(|rec| rec.boid);
-    for rec in recs {
-        set_current_agent(Some(rec.clone()));
-        f(&rec);
-    }
-    set_current_agent(None);
 }
 
 pub fn reset() {

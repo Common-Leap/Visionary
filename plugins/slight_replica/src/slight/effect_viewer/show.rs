@@ -28,7 +28,3 @@ pub fn hide_effect(id: u64, rpm_notified: bool) {
 pub fn queue_show(id: u64) {
     crate::slight::pending::queue_notify(id);
 }
-
-pub fn queue_hide(id: u64, notified: bool) {
-    crate::slight::pending::queue_remove(id, notified);
-}

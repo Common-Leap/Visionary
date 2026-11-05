@@ -4,7 +4,7 @@
 //! character's `db_root` entry, sorted ascending — **not** the list order, and not `save_no`.
 //! The two `I8` fields agree for 110 of vanilla's 121 entries, which is exactly why it had to
 //! be measured; they diverge on Inkling/Ridley/Simon/Richter/K. Rool, and the real select
-//! screen follows `disp_order`. See `docs/roster/PLAN.md` for the evidence.
+//! screen follows `disp_order`.
 //!
 //! Three properties of the field shape everything here:
 //!

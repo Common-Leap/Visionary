@@ -2,6 +2,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Aggregate preview work is bounded before any repeated statement is evaluated.
+pub const MAX_PREVIEW_EXPANDED_WORK: u64 = 100_000;
+const MAX_PREVIEW_AST_DEPTH: usize = 64;
+
+#[path = "article_status_catalog.rs"]
+pub(crate) mod article_status_catalog;
+#[path = "body_visibility_catalog.rs"]
+pub(crate) mod body_visibility_catalog;
+
 /// The `ATTACK`-family macro assumed when nothing says otherwise — the overwhelming majority
 /// of collisions, and what every project written before [`Hitbox::func`] existed contains.
 pub fn default_attack_func() -> String {
@@ -1829,18 +1838,2017 @@ impl DamageNoReactionCall {
     }
 }
 
+/// The closed slope statuses used by the measured `slope!` source forms.
+///
+/// The spellings are backed by the pinned `skyline-smash` `lua_const.rs`; retaining the enum
+/// rather than arbitrary source tokens prevents this presentation command from becoming a
+/// general `sv_module_access::slope` write surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlopeStatus {
+    Lr,
+    Top,
+    None,
+    Left,
+    Right,
+}
+
+impl SlopeStatus {
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Lr => "LR",
+            Self::Top => "TOP",
+            Self::None => "NONE",
+            Self::Left => "L",
+            Self::Right => "R",
+        }
+    }
+
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Lr => "*SLOPE_STATUS_LR",
+            Self::Top => "*SLOPE_STATUS_TOP",
+            Self::None => "*SLOPE_STATUS_NONE",
+            Self::Left => "*SLOPE_STATUS_L",
+            Self::Right => "*SLOPE_STATUS_R",
+        }
+    }
+}
+
+/// One of the two exact measured source forms for the fighter's slope presentation command.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlopeCall {
+    /// `slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_…);`
+    Set { status: SlopeStatus },
+    /// `slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_…, frames[, bool]);`
+    Interpolate {
+        status: SlopeStatus,
+        frames: i32,
+        trailing_flag: Option<bool>,
+    },
+}
+
+/// Largest interpolation frame count accepted from imported or authored source.
+pub const MAX_SLOPE_INTERPOLATION_FRAMES: i32 = 600;
+
+/// Measured ArticleModule lifecycle calls supported by the move timeline.
+///
+/// The article remains a symbolic, fighter-owned lua constant. This is deliberately not a
+/// general native ArticleModule interface: only the fixed corpus forms are represented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleLifecycleCall {
+    /// `ArticleModule::generate_article(..., *SYMBOL, false, -1)`.
+    Generate { symbol: String },
+    /// Distinct `generate_article_enable` API with the measured `false, -1` tail.
+    /// It is not an alias for ordinary generation or proof of an engine resource binding.
+    GenerateEnabled { symbol: String },
+    /// A measured article/status/API tuple. `if_present` retains `change_status_exist`;
+    /// otherwise the native `change_status` uses the fixed All operation target.
+    ChangeStatus {
+        symbol: String,
+        status: String,
+        if_present: bool,
+    },
+    /// `ArticleModule::remove_exist(..., *SYMBOL, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL))`.
+    RemoveAll { symbol: String },
+    /// `ArticleModule::change_motion(..., *SYMBOL, Hash40::new("motion"), false, -1.0)`.
+    ChangeMotion { symbol: String, motion: String },
+    /// `ArticleModule::set_visibility_whole(..., *SYMBOL, visible, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL))`.
+    SetVisibilityWhole { symbol: String, visible: bool },
+    /// Native `shoot` with an exact symbolic target; emitted through `ArticleOperationTarget`.
+    Shoot {
+        symbol: String,
+        target: ArticleTarget,
+    },
+    /// Distinct native `shoot_exist` call with the same reviewed target and fixed false tail.
+    ShootExist {
+        symbol: String,
+        target: ArticleTarget,
+    },
+    /// One exact source tuple from the closed Eflame/Elight E-Sword partial-motion presets.
+    AddMotionPartial { preset: ArticlePartialMotionPreset },
+}
+
+/// Exact article-instance selection tokens measured for source-only shooting calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleTarget {
+    All,
+    Last,
+}
+
+/// Exact owner/symbol rows observed with `generate_article_enable(..., false, -1)`.
+/// The incomplete three-argument Villager call does not authorize a new preset.
+pub(crate) const PINNED_ENABLED_ARTICLE_COUNTS: &[(&str, &str, usize)] = &[
+    ("koopajr", "FIGHTER_KOOPAJR_GENERATE_ARTICLE_HAMMER", 7),
+    ("koopajr", "FIGHTER_KOOPAJR_GENERATE_ARTICLE_KART", 3),
+    ("koopajr", "FIGHTER_KOOPAJR_GENERATE_ARTICLE_MECHAKOOPA", 2),
+    (
+        "koopajr",
+        "FIGHTER_KOOPAJR_GENERATE_ARTICLE_PICOPICOHAMMER",
+        10,
+    ),
+    ("mariod", "FIGHTER_MARIOD_GENERATE_ARTICLE_DRCAPSULE", 6),
+    ("mariod", "FIGHTER_MARIOD_GENERATE_ARTICLE_STETHOSCOPE", 2),
+    (
+        "miifighter",
+        "FIGHTER_MIIFIGHTER_GENERATE_ARTICLE_IRONBALL",
+        2,
+    ),
+    (
+        "miigunner",
+        "FIGHTER_MIIGUNNER_GENERATE_ARTICLE_GRENADELAUNCHER",
+        2,
+    ),
+    (
+        "miigunner",
+        "FIGHTER_MIIGUNNER_GENERATE_ARTICLE_GUNNERCHARGE",
+        2,
+    ),
+    ("murabito", "FIGHTER_MURABITO_GENERATE_ARTICLE_SEED", 2),
+    ("rockman", "FIGHTER_ROCKMAN_GENERATE_ARTICLE_CRASHBOMB", 2),
+    ("rockman", "FIGHTER_ROCKMAN_GENERATE_ARTICLE_LEAFSHIELD", 2),
+    ("rockman", "FIGHTER_ROCKMAN_GENERATE_ARTICLE_METALBLADE", 4),
+    ("rockman", "FIGHTER_ROCKMAN_GENERATE_ARTICLE_ROCKBUSTER", 3),
+    ("samusd", "FIGHTER_SAMUSD_GENERATE_ARTICLE_CSHOT", 2),
+    ("samus", "FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT", 2),
+    ("zelda", "FIGHTER_ZELDA_GENERATE_ARTICLE_PHANTOM", 1),
+];
+
+pub(crate) fn is_measured_enabled_article(fighter: &str, symbol: &str) -> bool {
+    PINNED_ENABLED_ARTICLE_COUNTS
+        .iter()
+        .any(|(owner, measured_symbol, _)| *owner == fighter && *measured_symbol == symbol)
+}
+
+impl ArticleTarget {
+    pub const fn source_token(self) -> &'static str {
+        match self {
+            Self::All => "*ARTICLE_OPE_TARGET_ALL",
+            Self::Last => "*ARTICLE_OPE_TARGET_LAST",
+        }
+    }
+}
+
+/// Exact article-motion pairs observed in the pinned Kirby source cache.
+///
+/// This intentionally remains a closed list: it is not evidence that another article accepts
+/// the same motion, nor that an unobserved clip is valid.
+pub(crate) fn measured_article_motions(symbol: &str) -> &'static [&'static str] {
+    match symbol {
+        "FIGHTER_KIRBY_GENERATE_ARTICLE_FINALCUTTER" => {
+            &["special_hi", "special_hi2", "special_hi3", "special_hi4"]
+        }
+        "FIGHTER_KIRBY_GENERATE_ARTICLE_STONE" => &[
+            "special_air_lw",
+            "special_air_lw2",
+            "special_lw",
+            "special_lw2",
+            "special_lw_to_air",
+            "special_lw_to_ground",
+        ],
+        "FIGHTER_KIRBY_GENERATE_ARTICLE_ULTRASWORD"
+        | "FIGHTER_KIRBY_GENERATE_ARTICLE_ULTRASWORDHAT" => &["final_attack", "final_start"],
+        "FIGHTER_KIRBY_GENERATE_ARTICLE_WINDUMMY" => &[
+            "win_1",
+            "win_1_wait",
+            "win_2",
+            "win_2_wait",
+            "win_3",
+            "win_3_wait",
+        ],
+        _ => &[],
+    }
+}
+
+/// Closed Expression article-motion pairs from parsed, direct-root pinned source sites.
+/// The registry still validates the destination owner; a motion is not an article generator.
+pub(crate) const EXPRESSION_ARTICLE_MOTIONS: &[(&str, &[&str])] = &[
+    (
+        "FIGHTER_BRAVE_GENERATE_ARTICLE_BLUE",
+        &["appeal_lw_l", "appeal_lw_r"],
+    ),
+    (
+        "FIGHTER_BUDDY_GENERATE_ARTICLE_HORN",
+        &["final_end", "win_3", "win_3_wait"],
+    ),
+    (
+        "FIGHTER_BUDDY_GENERATE_ARTICLE_PIECE",
+        &["win_1", "win_1_wait"],
+    ),
+    (
+        "FIGHTER_BUDDY_GENERATE_ARTICLE_STRINGS",
+        &["win_3", "win_3_wait"],
+    ),
+    (
+        "FIGHTER_DEDEDE_GENERATE_ARTICLE_JETHAMMER",
+        &["win_3", "win_3_wait"],
+    ),
+    ("FIGHTER_GANON_GENERATE_ARTICLE_SWORD", &["appeal_lw"]),
+    (
+        "FIGHTER_METAKNIGHT_GENERATE_ARTICLE_MANTLE",
+        &[
+            "appeal_hi",
+            "guard",
+            "guard_damage",
+            "guard_off",
+            "guard_on",
+            "wait3",
+            "win2_wait",
+        ],
+    ),
+    (
+        "FIGHTER_MURABITO_GENERATE_ARTICLE_BEETLE",
+        &["win1", "win1_wait"],
+    ),
+    (
+        "FIGHTER_MURABITO_GENERATE_ARTICLE_BUTTERFLYNET",
+        &["win1", "win1_wait"],
+    ),
+    (
+        "FIGHTER_PACKUN_GENERATE_ARTICLE_MARIO",
+        &["win_2", "win_2_wait"],
+    ),
+    (
+        "FIGHTER_PEACH_GENERATE_ARTICLE_KASSAR",
+        &["win_1", "win_1_wait"],
+    ),
+    ("FIGHTER_SAMUSD_GENERATE_ARTICLE_BUNSHIN", &["win_2"]),
+    (
+        "FIGHTER_SAMUSD_GENERATE_ARTICLE_GBEAM",
+        &[
+            "catch",
+            "catch_dash",
+            "catch_turn",
+            "throw_b",
+            "throw_f",
+            "throw_lw",
+        ],
+    ),
+    (
+        "FIGHTER_SAMUSD_GENERATE_ARTICLE_GUN",
+        &[
+            "air_catch",
+            "air_catch_hang",
+            "air_catch_hit",
+            "air_catch_pose",
+            "appeal_sr",
+            "catch",
+            "catch_attack",
+            "catch_cut",
+            "catch_dash",
+            "catch_pull",
+            "catch_turn",
+            "catch_wait",
+            "s4_hold",
+            "s4s",
+            "special_n",
+            "special_s",
+            "throw_b",
+            "throw_f",
+            "throw_hi",
+            "throw_lw",
+        ],
+    ),
+    (
+        "FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM",
+        &[
+            "catch",
+            "catch_dash",
+            "catch_turn",
+            "throw_b",
+            "throw_f",
+            "throw_lw",
+        ],
+    ),
+    (
+        "FIGHTER_SAMUS_GENERATE_ARTICLE_GUN",
+        &[
+            "air_catch",
+            "air_catch_hang",
+            "air_catch_hit",
+            "air_catch_pose",
+            "appeal_sl",
+            "appeal_sr",
+            "catch",
+            "catch_attack",
+            "catch_cut",
+            "catch_dash",
+            "catch_pull",
+            "catch_turn",
+            "catch_wait",
+            "s4_hold",
+            "s4s",
+            "special_n",
+            "special_s",
+            "throw_b",
+            "throw_f",
+            "throw_hi",
+            "throw_lw",
+            "win_3",
+        ],
+    ),
+    ("FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE", &["win_3"]),
+    ("FIGHTER_YOUNGLINK_GENERATE_ARTICLE_MILK", &["appeal_lw_r"]),
+    (
+        "FIGHTER_ZELDA_GENERATE_ARTICLE_PHANTOM",
+        &["demo", "demo_wait"],
+    ),
+];
+
+pub(crate) fn measured_expression_article_motions(symbol: &str) -> &'static [&'static str] {
+    for &(candidate, motions) in EXPRESSION_ARTICLE_MOTIONS {
+        if candidate == symbol {
+            return motions;
+        }
+    }
+    &[]
+}
+
+/// Maximum encoded length accepted for an article lua constant symbol.
+pub const MAX_ARTICLE_SYMBOL_BYTES: usize = 128;
+
+/// The exact twelve `ArticleModule::add_motion_partial` source tuples measured for the
+/// Eflame/Elight E-Sword. Each value includes both owner and every native argument; this is not
+/// a general numeric or article-motion escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArticlePartialMotionPreset {
+    EflameOpen333,
+    EflameOpen5,
+    EflameOpen10,
+    EflameClose333,
+    EflameClose5,
+    EflameClose10,
+    ElightOpen333,
+    ElightOpen5,
+    ElightOpen10,
+    ElightClose333,
+    ElightClose5,
+    ElightClose10,
+}
+
+impl ArticlePartialMotionPreset {
+    pub(crate) const ALL: [Self; 12] = [
+        Self::EflameOpen333,
+        Self::EflameOpen5,
+        Self::EflameOpen10,
+        Self::EflameClose333,
+        Self::EflameClose5,
+        Self::EflameClose10,
+        Self::ElightOpen333,
+        Self::ElightOpen5,
+        Self::ElightOpen10,
+        Self::ElightClose333,
+        Self::ElightClose5,
+        Self::ElightClose10,
+    ];
+
+    pub(crate) const fn fighter(self) -> &'static str {
+        match self {
+            Self::EflameOpen333
+            | Self::EflameOpen5
+            | Self::EflameOpen10
+            | Self::EflameClose333
+            | Self::EflameClose5
+            | Self::EflameClose10 => "eflame",
+            Self::ElightOpen333
+            | Self::ElightOpen5
+            | Self::ElightOpen10
+            | Self::ElightClose333
+            | Self::ElightClose5
+            | Self::ElightClose10 => "elight",
+        }
+    }
+
+    pub(crate) const fn article_symbol(self) -> &'static str {
+        match self {
+            Self::EflameOpen333
+            | Self::EflameOpen5
+            | Self::EflameOpen10
+            | Self::EflameClose333
+            | Self::EflameClose5
+            | Self::EflameClose10 => "FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD",
+            Self::ElightOpen333
+            | Self::ElightOpen5
+            | Self::ElightOpen10
+            | Self::ElightClose333
+            | Self::ElightClose5
+            | Self::ElightClose10 => "FIGHTER_ELIGHT_GENERATE_ARTICLE_ESWORD",
+        }
+    }
+
+    pub(crate) const fn partset_symbol(self) -> &'static str {
+        match self {
+            Self::EflameOpen333
+            | Self::EflameOpen5
+            | Self::EflameOpen10
+            | Self::EflameClose333
+            | Self::EflameClose5
+            | Self::EflameClose10 => "WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE",
+            Self::ElightOpen333
+            | Self::ElightOpen5
+            | Self::ElightOpen10
+            | Self::ElightClose333
+            | Self::ElightClose5
+            | Self::ElightClose10 => "WEAPON_ELIGHT_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE",
+        }
+    }
+
+    pub(crate) const fn motion(self) -> &'static str {
+        match self {
+            Self::EflameOpen333
+            | Self::EflameOpen5
+            | Self::EflameOpen10
+            | Self::ElightOpen333
+            | Self::ElightOpen5
+            | Self::ElightOpen10 => "to_open",
+            Self::EflameClose333
+            | Self::EflameClose5
+            | Self::EflameClose10
+            | Self::ElightClose333
+            | Self::ElightClose5
+            | Self::ElightClose10 => "to_close",
+        }
+    }
+
+    /// Exact measured token shared by the two timing arguments.
+    pub(crate) const fn timing(self) -> &'static str {
+        match self {
+            Self::EflameOpen333
+            | Self::EflameClose333
+            | Self::ElightOpen333
+            | Self::ElightClose333 => "3.33",
+            Self::EflameOpen5 | Self::EflameClose5 | Self::ElightOpen5 | Self::ElightClose5 => {
+                "5.0"
+            }
+            Self::EflameOpen10 | Self::EflameClose10 | Self::ElightOpen10 | Self::ElightClose10 => {
+                "10.0"
+            }
+        }
+    }
+
+    pub(crate) fn label(self) -> String {
+        format!(
+            "{} · {} / {}",
+            if self.motion() == "to_open" {
+                "Open"
+            } else {
+                "Close"
+            },
+            self.timing(),
+            self.timing()
+        )
+    }
+
+    /// Emit the exact canonical one-line call, retaining the measured float lexemes and fixed
+    /// positional tail so opaque source wrappers can be reconstructed without normalization.
+    pub(crate) fn source_line(self) -> String {
+        format!(
+            "ArticleModule::add_motion_partial(agent.module_accessor, *{}, *{}, Hash40::new(\"{}\"), {}, {}, false, false, 0.0, false, true, false);",
+            self.article_symbol(),
+            self.partset_symbol(),
+            self.motion(),
+            self.timing(),
+            self.timing(),
+        )
+    }
+
+    pub(crate) fn from_source_line(source: &str) -> Option<Self> {
+        let source = source.trim();
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.source_line() == source)
+    }
+}
+
+/// Closed source set for the two observed all-hitbox AttackModule setters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AttackModuleSetAllKind {
+    NoDeadAll,
+    CatchOnlyAll,
+}
+
+/// Observed indexed AttackModule setters with the same native `(i32, bool, bool)` tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AttackModuleSetIndexedKind {
+    NoFinishCamera,
+    ForceReaction,
+}
+
+/// Closed measured numeric spellings for `AttackModule::set_damage_shake_scale`.
+///
+/// Integer-looking source tokens (`0`, `1`) are intentionally absent because the pinned
+/// binding takes `f32` and those tokens do not establish that type at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackModuleDamageShakeScale {
+    PointOne,
+    PointEighteen,
+    PointThree,
+    PointFive,
+    PointSixtySeven,
+    OnePointFive,
+}
+
+impl AttackModuleDamageShakeScale {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::PointOne,
+        Self::PointEighteen,
+        Self::PointThree,
+        Self::PointFive,
+        Self::PointSixtySeven,
+        Self::OnePointFive,
+    ];
+
+    pub(crate) const fn source_token(self) -> &'static str {
+        match self {
+            Self::PointOne => "0.1",
+            Self::PointEighteen => "0.18",
+            Self::PointThree => "0.3",
+            Self::PointFive => "0.5",
+            Self::PointSixtySeven => "0.67",
+            Self::OnePointFive => "1.5",
+        }
+    }
+
+    pub(crate) fn from_source_token(token: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|value| value.source_token() == token)
+    }
+}
+
+/// Closed measured boolean pairs for `AttackModule::set_no_uniq_effect_all`.
+///
+/// Names identify the positional literal pair only; they do not assign semantics to either
+/// native flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackModuleNoUniqEffectAllPair {
+    TrueFalse,
+    TrueTrue,
+}
+
+impl AttackModuleNoUniqEffectAllPair {
+    pub(crate) const ALL: [Self; 2] = [Self::TrueFalse, Self::TrueTrue];
+
+    pub(crate) const fn source_args(self) -> (&'static str, &'static str) {
+        match self {
+            Self::TrueFalse => ("true", "false"),
+            Self::TrueTrue => ("true", "true"),
+        }
+    }
+
+    pub(crate) fn from_source_args(arg2: &str, arg3: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|pair| pair.source_args() == (arg2, arg3))
+    }
+}
+
+/// The three measured attack IDs accepted by the closed `set_target_category` source form.
+/// The category mask is fixed separately by the emitter; this type is not a general mask API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackModuleTargetCategoryId {
+    Zero,
+    One,
+    Two,
+}
+
+impl AttackModuleTargetCategoryId {
+    pub(crate) const ALL: [Self; 3] = [Self::Zero, Self::One, Self::Two];
+
+    pub(crate) const fn attack_id(self) -> i32 {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+
+    pub(crate) fn from_attack_id(attack_id: i32) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|value| value.attack_id() == attack_id)
+    }
+}
+
+/// Closed exact source tuples measured for `AttackModule::set_vec_target_pos`.
+///
+/// The pinned binding takes `&Vector2f`; the receiver, bone token and final `false` are fixed.
+/// The unsigned integer argument is kept as neutral `arg5` because its units and meaning are not
+/// established here. Variants identify complete lexical tuples, including `arg5`, so unmeasured
+/// combinations cannot be authored. The source table is append-only to keep serde IDs stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum AttackModuleVecTargetPosPreset {
+    #[serde(rename = "id0_xneg7_0_y10_0_arg8")]
+    Id0XNeg7_0Y10_0Arg8,
+    #[serde(rename = "id0_xneg9_0_y2_0_arg8")]
+    Id0XNeg9_0Y2_0Arg8,
+    #[serde(rename = "id0_x0_0_y18_0_arg8")]
+    Id0X0_0Y18_0Arg8,
+    #[serde(rename = "id0_x0_0_y8_0_arg8")]
+    Id0X0_0Y8_0Arg8,
+    #[serde(rename = "id0_x0_0_y8_0_arg9")]
+    Id0X0_0Y8_0Arg9,
+    #[serde(rename = "id0_x12_0_y5_0_arg13")]
+    Id0X12_0Y5_0Arg13,
+    #[serde(rename = "id0_x13_0_y3_0_arg2")]
+    Id0X13_0Y3_0Arg2,
+    #[serde(rename = "id0_x13_0_y4_0_arg13")]
+    Id0X13_0Y4_0Arg13,
+    #[serde(rename = "id0_x13_0_y5_0_arg5")]
+    Id0X13_0Y5_0Arg5,
+    #[serde(rename = "id0_x13_0_y8_0_arg10")]
+    Id0X13_0Y8_0Arg10,
+    #[serde(rename = "id0_x14_0_y8_0_arg14")]
+    Id0X14_0Y8_0Arg14,
+    #[serde(rename = "id0_x15_0_y0_0_arg5")]
+    Id0X15_0Y0_0Arg5,
+    #[serde(rename = "id0_x15_0_y1_0_arg9")]
+    Id0X15_0Y1_0Arg9,
+    #[serde(rename = "id0_x16_0_y2_0_arg2")]
+    Id0X16_0Y2_0Arg2,
+    #[serde(rename = "id0_x16_0_y40_0_arg4")]
+    Id0X16_0Y40_0Arg4,
+    #[serde(rename = "id0_x16_0_y41_0_arg2")]
+    Id0X16_0Y41_0Arg2,
+    #[serde(rename = "id0_x18_0_y44_0_arg7")]
+    Id0X18_0Y44_0Arg7,
+    #[serde(rename = "id0_x2_0_y45_0_arg5")]
+    Id0X2_0Y45_0Arg5,
+    #[serde(rename = "id0_x20_0_y0_0_arg2")]
+    Id0X20_0Y0_0Arg2,
+    #[serde(rename = "id0_x20_0_y2_0_arg13")]
+    Id0X20_0Y2_0Arg13,
+    #[serde(rename = "id0_x22_0_y4_0_arg10")]
+    Id0X22_0Y4_0Arg10,
+    #[serde(rename = "id0_x22_0_y4_0_arg14")]
+    Id0X22_0Y4_0Arg14,
+    #[serde(rename = "id0_x28_0_y5_0_arg13")]
+    Id0X28_0Y5_0Arg13,
+    #[serde(rename = "id0_x3_0_y27_0_arg8")]
+    Id0X3_0Y27_0Arg8,
+    #[serde(rename = "id0_x3_8_y23_5_arg10")]
+    Id0X3_8Y23_5Arg10,
+    #[serde(rename = "id0_x37_0_y4_0_arg13")]
+    Id0X37_0Y4_0Arg13,
+    #[serde(rename = "id0_x44_0_y8_0_arg14")]
+    Id0X44_0Y8_0Arg14,
+    #[serde(rename = "id0_x46_0_y8_0_arg10")]
+    Id0X46_0Y8_0Arg10,
+    #[serde(rename = "id0_x50_0_y3_0_arg1")]
+    Id0X50_0Y3_0Arg1,
+    #[serde(rename = "id0_x60_0_y4_0_arg1")]
+    Id0X60_0Y4_0Arg1,
+    #[serde(rename = "id1_xneg1_0_y23_0_arg10")]
+    Id1XNeg1_0Y23_0Arg10,
+    #[serde(rename = "id1_xneg10_0_y20_0_arg10")]
+    Id1XNeg10_0Y20_0Arg10,
+    #[serde(rename = "id1_xneg6_0_y22_0_arg10")]
+    Id1XNeg6_0Y22_0Arg10,
+    #[serde(rename = "id1_xneg8_0_y16_0_arg5")]
+    Id1XNeg8_0Y16_0Arg5,
+    #[serde(rename = "id1_x0_0_y17_0_arg8")]
+    Id1X0_0Y17_0Arg8,
+    #[serde(rename = "id1_x0_0_y18_0_arg8")]
+    Id1X0_0Y18_0Arg8,
+    #[serde(rename = "id1_x0_0_y46_0_arg6")]
+    Id1X0_0Y46_0Arg6,
+    #[serde(rename = "id1_x0_0_y8_0_arg8")]
+    Id1X0_0Y8_0Arg8,
+    #[serde(rename = "id1_x0_0_y8_0_arg9")]
+    Id1X0_0Y8_0Arg9,
+    #[serde(rename = "id1_x10_0_y20_0_arg10")]
+    Id1X10_0Y20_0Arg10,
+    #[serde(rename = "id1_x12_0_y3_0_arg8")]
+    Id1X12_0Y3_0Arg8,
+    #[serde(rename = "id1_x13_0_y10_0_arg15")]
+    Id1X13_0Y10_0Arg15,
+    #[serde(rename = "id1_x13_0_y7_0_arg15")]
+    Id1X13_0Y7_0Arg15,
+    #[serde(rename = "id1_x15_0_y0_0_arg5")]
+    Id1X15_0Y0_0Arg5,
+    #[serde(rename = "id1_x15_0_y20_0_arg5")]
+    Id1X15_0Y20_0Arg5,
+    #[serde(rename = "id1_x15_0_y4_0_arg10")]
+    Id1X15_0Y4_0Arg10,
+    #[serde(rename = "id1_x16_0_y10_0_arg15")]
+    Id1X16_0Y10_0Arg15,
+    #[serde(rename = "id1_x16_0_y2_0_arg2")]
+    Id1X16_0Y2_0Arg2,
+    #[serde(rename = "id1_x19_0_y5_0_arg15")]
+    Id1X19_0Y5_0Arg15,
+    #[serde(rename = "id1_x20_0_y0_0_arg2")]
+    Id1X20_0Y0_0Arg2,
+    #[serde(rename = "id1_x20_0_y4_0_arg15")]
+    Id1X20_0Y4_0Arg15,
+    #[serde(rename = "id1_x22_0_y7_0_arg15")]
+    Id1X22_0Y7_0Arg15,
+    #[serde(rename = "id1_x26_0_y5_0_arg15")]
+    Id1X26_0Y5_0Arg15,
+    #[serde(rename = "id1_x37_0_y10_0_arg15")]
+    Id1X37_0Y10_0Arg15,
+    #[serde(rename = "id1_x37_0_y7_0_arg15")]
+    Id1X37_0Y7_0Arg15,
+    #[serde(rename = "id1_x4_0_y22_0_arg4")]
+    Id1X4_0Y22_0Arg4,
+    #[serde(rename = "id1_x46_0_y12_0_arg15")]
+    Id1X46_0Y12_0Arg15,
+    #[serde(rename = "id1_x52_0_y10_0_arg15")]
+    Id1X52_0Y10_0Arg15,
+    #[serde(rename = "id1_x6_0_y25_0_arg12")]
+    Id1X6_0Y25_0Arg12,
+    #[serde(rename = "id2_xneg12_0_y12_0_arg5")]
+    Id2XNeg12_0Y12_0Arg5,
+    #[serde(rename = "id2_xneg3_0_y30_0_arg10")]
+    Id2XNeg3_0Y30_0Arg10,
+    #[serde(rename = "id2_x0_0_y18_0_arg8")]
+    Id2X0_0Y18_0Arg8,
+    #[serde(rename = "id2_x0_0_y24_0_arg7")]
+    Id2X0_0Y24_0Arg7,
+    #[serde(rename = "id2_x0_0_y8_0_arg8")]
+    Id2X0_0Y8_0Arg8,
+    #[serde(rename = "id2_x0_0_y8_0_arg9")]
+    Id2X0_0Y8_0Arg9,
+    #[serde(rename = "id2_x4_0_y22_0_arg4")]
+    Id2X4_0Y22_0Arg4,
+    #[serde(rename = "id2_x5_0_y29_0_arg7")]
+    Id2X5_0Y29_0Arg7,
+    #[serde(rename = "id2_x6_0_y25_0_arg12")]
+    Id2X6_0Y25_0Arg12,
+    #[serde(rename = "id3_xneg12_0_y12_0_arg5")]
+    Id3XNeg12_0Y12_0Arg5,
+    #[serde(rename = "id3_x0_0_y24_5_arg10")]
+    Id3X0_0Y24_5Arg10,
+    #[serde(rename = "id3_x8_0_y23_0_arg6")]
+    Id3X8_0Y23_0Arg6,
+}
+
+impl AttackModuleVecTargetPosPreset {
+    pub(crate) const ALL: [Self; 71] = [
+        Self::Id0XNeg7_0Y10_0Arg8,
+        Self::Id0XNeg9_0Y2_0Arg8,
+        Self::Id0X0_0Y18_0Arg8,
+        Self::Id0X0_0Y8_0Arg8,
+        Self::Id0X0_0Y8_0Arg9,
+        Self::Id0X12_0Y5_0Arg13,
+        Self::Id0X13_0Y3_0Arg2,
+        Self::Id0X13_0Y4_0Arg13,
+        Self::Id0X13_0Y5_0Arg5,
+        Self::Id0X13_0Y8_0Arg10,
+        Self::Id0X14_0Y8_0Arg14,
+        Self::Id0X15_0Y0_0Arg5,
+        Self::Id0X15_0Y1_0Arg9,
+        Self::Id0X16_0Y2_0Arg2,
+        Self::Id0X16_0Y40_0Arg4,
+        Self::Id0X16_0Y41_0Arg2,
+        Self::Id0X18_0Y44_0Arg7,
+        Self::Id0X2_0Y45_0Arg5,
+        Self::Id0X20_0Y0_0Arg2,
+        Self::Id0X20_0Y2_0Arg13,
+        Self::Id0X22_0Y4_0Arg10,
+        Self::Id0X22_0Y4_0Arg14,
+        Self::Id0X28_0Y5_0Arg13,
+        Self::Id0X3_0Y27_0Arg8,
+        Self::Id0X3_8Y23_5Arg10,
+        Self::Id0X37_0Y4_0Arg13,
+        Self::Id0X44_0Y8_0Arg14,
+        Self::Id0X46_0Y8_0Arg10,
+        Self::Id0X50_0Y3_0Arg1,
+        Self::Id0X60_0Y4_0Arg1,
+        Self::Id1XNeg1_0Y23_0Arg10,
+        Self::Id1XNeg10_0Y20_0Arg10,
+        Self::Id1XNeg6_0Y22_0Arg10,
+        Self::Id1XNeg8_0Y16_0Arg5,
+        Self::Id1X0_0Y17_0Arg8,
+        Self::Id1X0_0Y18_0Arg8,
+        Self::Id1X0_0Y46_0Arg6,
+        Self::Id1X0_0Y8_0Arg8,
+        Self::Id1X0_0Y8_0Arg9,
+        Self::Id1X10_0Y20_0Arg10,
+        Self::Id1X12_0Y3_0Arg8,
+        Self::Id1X13_0Y10_0Arg15,
+        Self::Id1X13_0Y7_0Arg15,
+        Self::Id1X15_0Y0_0Arg5,
+        Self::Id1X15_0Y20_0Arg5,
+        Self::Id1X15_0Y4_0Arg10,
+        Self::Id1X16_0Y10_0Arg15,
+        Self::Id1X16_0Y2_0Arg2,
+        Self::Id1X19_0Y5_0Arg15,
+        Self::Id1X20_0Y0_0Arg2,
+        Self::Id1X20_0Y4_0Arg15,
+        Self::Id1X22_0Y7_0Arg15,
+        Self::Id1X26_0Y5_0Arg15,
+        Self::Id1X37_0Y10_0Arg15,
+        Self::Id1X37_0Y7_0Arg15,
+        Self::Id1X4_0Y22_0Arg4,
+        Self::Id1X46_0Y12_0Arg15,
+        Self::Id1X52_0Y10_0Arg15,
+        Self::Id1X6_0Y25_0Arg12,
+        Self::Id2XNeg12_0Y12_0Arg5,
+        Self::Id2XNeg3_0Y30_0Arg10,
+        Self::Id2X0_0Y18_0Arg8,
+        Self::Id2X0_0Y24_0Arg7,
+        Self::Id2X0_0Y8_0Arg8,
+        Self::Id2X0_0Y8_0Arg9,
+        Self::Id2X4_0Y22_0Arg4,
+        Self::Id2X5_0Y29_0Arg7,
+        Self::Id2X6_0Y25_0Arg12,
+        Self::Id3XNeg12_0Y12_0Arg5,
+        Self::Id3X0_0Y24_5Arg10,
+        Self::Id3X8_0Y23_0Arg6,
+    ];
+
+    pub(crate) const fn source_parts(
+        self,
+    ) -> (&'static str, &'static str, &'static str, &'static str) {
+        const PARTS: [(&str, &str, &str, &str); 71] = [
+            ("0", "-7.0", "10.0", "8"),
+            ("0", "-9.0", "2.0", "8"),
+            ("0", "0.0", "18.0", "8"),
+            ("0", "0.0", "8.0", "8"),
+            ("0", "0.0", "8.0", "9"),
+            ("0", "12.0", "5.0", "13"),
+            ("0", "13.0", "3.0", "2"),
+            ("0", "13.0", "4.0", "13"),
+            ("0", "13.0", "5.0", "5"),
+            ("0", "13.0", "8.0", "10"),
+            ("0", "14.0", "8.0", "14"),
+            ("0", "15.0", "0.0", "5"),
+            ("0", "15.0", "1.0", "9"),
+            ("0", "16.0", "2.0", "2"),
+            ("0", "16.0", "40.0", "4"),
+            ("0", "16.0", "41.0", "2"),
+            ("0", "18.0", "44.0", "7"),
+            ("0", "2.0", "45.0", "5"),
+            ("0", "20.0", "0.0", "2"),
+            ("0", "20.0", "2.0", "13"),
+            ("0", "22.0", "4.0", "10"),
+            ("0", "22.0", "4.0", "14"),
+            ("0", "28.0", "5.0", "13"),
+            ("0", "3.0", "27.0", "8"),
+            ("0", "3.8", "23.5", "10"),
+            ("0", "37.0", "4.0", "13"),
+            ("0", "44.0", "8.0", "14"),
+            ("0", "46.0", "8.0", "10"),
+            ("0", "50.0", "3.0", "1"),
+            ("0", "60.0", "4.0", "1"),
+            ("1", "-1.0", "23.0", "10"),
+            ("1", "-10.0", "20.0", "10"),
+            ("1", "-6.0", "22.0", "10"),
+            ("1", "-8.0", "16.0", "5"),
+            ("1", "0.0", "17.0", "8"),
+            ("1", "0.0", "18.0", "8"),
+            ("1", "0.0", "46.0", "6"),
+            ("1", "0.0", "8.0", "8"),
+            ("1", "0.0", "8.0", "9"),
+            ("1", "10.0", "20.0", "10"),
+            ("1", "12.0", "3.0", "8"),
+            ("1", "13.0", "10.0", "15"),
+            ("1", "13.0", "7.0", "15"),
+            ("1", "15.0", "0.0", "5"),
+            ("1", "15.0", "20.0", "5"),
+            ("1", "15.0", "4.0", "10"),
+            ("1", "16.0", "10.0", "15"),
+            ("1", "16.0", "2.0", "2"),
+            ("1", "19.0", "5.0", "15"),
+            ("1", "20.0", "0.0", "2"),
+            ("1", "20.0", "4.0", "15"),
+            ("1", "22.0", "7.0", "15"),
+            ("1", "26.0", "5.0", "15"),
+            ("1", "37.0", "10.0", "15"),
+            ("1", "37.0", "7.0", "15"),
+            ("1", "4.0", "22.0", "4"),
+            ("1", "46.0", "12.0", "15"),
+            ("1", "52.0", "10.0", "15"),
+            ("1", "6.0", "25.0", "12"),
+            ("2", "-12.0", "12.0", "5"),
+            ("2", "-3.0", "30.0", "10"),
+            ("2", "0.0", "18.0", "8"),
+            ("2", "0.0", "24.0", "7"),
+            ("2", "0.0", "8.0", "8"),
+            ("2", "0.0", "8.0", "9"),
+            ("2", "4.0", "22.0", "4"),
+            ("2", "5.0", "29.0", "7"),
+            ("2", "6.0", "25.0", "12"),
+            ("3", "-12.0", "12.0", "5"),
+            ("3", "0.0", "24.5", "10"),
+            ("3", "8.0", "23.0", "6"),
+        ];
+        PARTS[self as usize]
+    }
+
+    pub(crate) fn from_source_parts(id: &str, x: &str, y: &str, arg5: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.source_parts() == (id, x, y, arg5))
+    }
+
+    pub(crate) fn source_line(self) -> String {
+        let (id, x, y, arg5) = self.source_parts();
+        format!(
+            "AttackModule::set_vec_target_pos(agent.module_accessor, {id}, Hash40::new(\"top\"), &Vector2f{{x: {x}, y: {y}}}, {arg5}, false);"
+        )
+    }
+}
+
+/// Closed exact source tuples measured for `AttackModule::set_size`.
+///
+/// The ID and decimal token are kept together: this does not create a general float input, and
+/// emission preserves the original `f32`-typed decimal spelling without numeric normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackModuleSizePreset {
+    Id0Size0,
+    Id0Size3,
+    Id0Size6_5,
+    Id0Size16,
+    Id0Size5_2,
+    Id0Size5_8,
+    Id0Size0_1,
+    Id1Size0,
+    Id1Size5,
+    Id1Size4_7,
+    Id1Size5_8,
+    Id1Size16,
+    Id1Size0_1,
+    Id2Size3_8,
+    Id2Size0,
+    Id2Size0_1,
+}
+
+impl AttackModuleSizePreset {
+    pub(crate) const ALL: [Self; 16] = [
+        Self::Id0Size0,
+        Self::Id0Size3,
+        Self::Id0Size6_5,
+        Self::Id0Size16,
+        Self::Id0Size5_2,
+        Self::Id0Size5_8,
+        Self::Id0Size0_1,
+        Self::Id1Size0,
+        Self::Id1Size5,
+        Self::Id1Size4_7,
+        Self::Id1Size5_8,
+        Self::Id1Size16,
+        Self::Id1Size0_1,
+        Self::Id2Size3_8,
+        Self::Id2Size0,
+        Self::Id2Size0_1,
+    ];
+
+    pub(crate) const fn attack_id(self) -> u8 {
+        match self {
+            Self::Id0Size0
+            | Self::Id0Size3
+            | Self::Id0Size6_5
+            | Self::Id0Size16
+            | Self::Id0Size5_2
+            | Self::Id0Size5_8
+            | Self::Id0Size0_1 => 0,
+            Self::Id1Size0
+            | Self::Id1Size5
+            | Self::Id1Size4_7
+            | Self::Id1Size5_8
+            | Self::Id1Size16
+            | Self::Id1Size0_1 => 1,
+            Self::Id2Size3_8 | Self::Id2Size0 | Self::Id2Size0_1 => 2,
+        }
+    }
+
+    pub(crate) const fn size_token(self) -> &'static str {
+        match self {
+            Self::Id0Size0 | Self::Id1Size0 | Self::Id2Size0 => "0.0",
+            Self::Id0Size3 => "3.0",
+            Self::Id0Size6_5 => "6.5",
+            Self::Id0Size16 | Self::Id1Size16 => "16.0",
+            Self::Id0Size5_2 => "5.2",
+            Self::Id0Size5_8 | Self::Id1Size5_8 => "5.8",
+            Self::Id0Size0_1 | Self::Id1Size0_1 | Self::Id2Size0_1 => "0.1",
+            Self::Id1Size5 => "5.0",
+            Self::Id1Size4_7 => "4.7",
+            Self::Id2Size3_8 => "3.8",
+        }
+    }
+
+    pub(crate) fn from_source_parts(id: &str, size: &str) -> Option<Self> {
+        let id = match id {
+            "0" => 0,
+            "1" => 1,
+            "2" => 2,
+            _ => return None,
+        };
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.attack_id() == id && preset.size_token() == size)
+    }
+}
+
+/// Closed observed selector set for `AttackModule::set_attack_height_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AttackHeightAllKind {
+    High,
+    Low,
+}
+
+/// Closed tuples measured for `AttackModule::set_attack_reference_joint_id`.
+/// The labels identify source spellings only; they do not assign meanings to the axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AttackReferenceJointKind {
+    TopYZX,
+    TopYNoneNone,
+    ToerYMinusXZ,
+    JointArmlXYZ,
+    JointArmlXZY,
+    JointArmlYXZ,
+    JointArmlZXY,
+    JointArmrYXZ,
+    JointArmrYMinusXZ,
+    JointArmrZXY,
+    JointBustXZY,
+    JointDuckheadXYZ,
+    JointHandlXYZMinus,
+    JointHandlYXZ,
+    JointHandlZXY,
+    JointHandlZMinusXY,
+    JointHandrYXZ,
+    JointHandrYMinusXZ,
+    JointHandrZMinusXY,
+    JointHavelYZX,
+    JointHavelZYX,
+    JointHaverXYZ,
+    JointHaverYNoneNone,
+    JointHaverYXZ,
+    JointHaverYZX,
+    JointHaverYMinusZMinusX,
+    JointHaverZYX,
+    JointHaverZYMinusX,
+    JointHaverZMinusYX,
+    JointHaverZMinusYMinusX,
+    JointHeadYXZ,
+    JointKnifeYZX,
+    JointKnifeZYX,
+    JointKnifeZMinusYX,
+    JointMouthXMinusYZ,
+    JointMouth1YXZ,
+    JointMouth1YZX,
+    JointPizzapacmanYXZ,
+    JointPizzapacmanYXMinusZ,
+    JointRotYXZ,
+    JointRotZYX,
+    JointRotZYMinusX,
+    JointSTail1ZMinusXY,
+    JointSwordXYMinusZMinus,
+    JointSwordZXY,
+    JointSwordZYX,
+    JointSwordZMinusXY,
+    JointSwordZMinusYX,
+    JointSword1XYZ,
+    JointSword1XZY,
+    JointSword1XZMinusY,
+    JointSword1XMinusYMinusZMinus,
+    JointSword1XMinusZYMinus,
+    JointSword1YMinusZMinusXMinus,
+    JointSword1ZXY,
+    JointSword1ZXYMinus,
+    JointSword1ZXMinusY,
+    JointSword1ZYX,
+    JointSwordlZYX,
+    JointSwordlZYMinusX,
+    JointSwordl1XZY,
+    JointSwordl1ZXY,
+    JointSwordrXNoneNone,
+    JointSwordrZXY,
+    JointSwordr1ZYX,
+    JointTail7YXZ,
+    JointTail8XYZ,
+    JointTail8XZY,
+    JointTail8YXZ,
+    JointToelXYZ,
+    JointTopNoneNoneNone,
+    JointTopXYMinusZ,
+    JointTopXMinusZY,
+    JointTopYZMinusX,
+    JointTopYMinusZX,
+    JointTopYMinusZMinusX,
+    JointTopZNoneNone,
+    JointTopZXMinusY,
+    JointTopZYX,
+    JointTopZYMinusX,
+    JointTopZMinusYX,
+    JointWingl7ZMinusXMinusY,
+    JointWingr1XYZ,
+    JointWingr7XMinusZY,
+}
+
+impl AttackReferenceJointKind {
+    /// Original Game parser choices. Keep the live/source admission set unchanged.
+    pub const GAME_CHOICES: [Self; 3] = [Self::TopYZX, Self::TopYNoneNone, Self::ToerYMinusXZ];
+
+    /// Exact closed tuples measured in mapped direct-root Expression Execute sites.
+    pub const EXPRESSION_CHOICES: [Self; 84] = [
+        Self::TopYZX,
+        Self::TopYNoneNone,
+        Self::ToerYMinusXZ,
+        Self::JointArmlXYZ,
+        Self::JointArmlXZY,
+        Self::JointArmlYXZ,
+        Self::JointArmlZXY,
+        Self::JointArmrYXZ,
+        Self::JointArmrYMinusXZ,
+        Self::JointArmrZXY,
+        Self::JointBustXZY,
+        Self::JointDuckheadXYZ,
+        Self::JointHandlXYZMinus,
+        Self::JointHandlYXZ,
+        Self::JointHandlZXY,
+        Self::JointHandlZMinusXY,
+        Self::JointHandrYXZ,
+        Self::JointHandrYMinusXZ,
+        Self::JointHandrZMinusXY,
+        Self::JointHavelYZX,
+        Self::JointHavelZYX,
+        Self::JointHaverXYZ,
+        Self::JointHaverYNoneNone,
+        Self::JointHaverYXZ,
+        Self::JointHaverYZX,
+        Self::JointHaverYMinusZMinusX,
+        Self::JointHaverZYX,
+        Self::JointHaverZYMinusX,
+        Self::JointHaverZMinusYX,
+        Self::JointHaverZMinusYMinusX,
+        Self::JointHeadYXZ,
+        Self::JointKnifeYZX,
+        Self::JointKnifeZYX,
+        Self::JointKnifeZMinusYX,
+        Self::JointMouthXMinusYZ,
+        Self::JointMouth1YXZ,
+        Self::JointMouth1YZX,
+        Self::JointPizzapacmanYXZ,
+        Self::JointPizzapacmanYXMinusZ,
+        Self::JointRotYXZ,
+        Self::JointRotZYX,
+        Self::JointRotZYMinusX,
+        Self::JointSTail1ZMinusXY,
+        Self::JointSwordXYMinusZMinus,
+        Self::JointSwordZXY,
+        Self::JointSwordZYX,
+        Self::JointSwordZMinusXY,
+        Self::JointSwordZMinusYX,
+        Self::JointSword1XYZ,
+        Self::JointSword1XZY,
+        Self::JointSword1XZMinusY,
+        Self::JointSword1XMinusYMinusZMinus,
+        Self::JointSword1XMinusZYMinus,
+        Self::JointSword1YMinusZMinusXMinus,
+        Self::JointSword1ZXY,
+        Self::JointSword1ZXYMinus,
+        Self::JointSword1ZXMinusY,
+        Self::JointSword1ZYX,
+        Self::JointSwordlZYX,
+        Self::JointSwordlZYMinusX,
+        Self::JointSwordl1XZY,
+        Self::JointSwordl1ZXY,
+        Self::JointSwordrXNoneNone,
+        Self::JointSwordrZXY,
+        Self::JointSwordr1ZYX,
+        Self::JointTail7YXZ,
+        Self::JointTail8XYZ,
+        Self::JointTail8XZY,
+        Self::JointTail8YXZ,
+        Self::JointToelXYZ,
+        Self::JointTopNoneNoneNone,
+        Self::JointTopXYMinusZ,
+        Self::JointTopXMinusZY,
+        Self::JointTopYZMinusX,
+        Self::JointTopYMinusZX,
+        Self::JointTopYMinusZMinusX,
+        Self::JointTopZNoneNone,
+        Self::JointTopZXMinusY,
+        Self::JointTopZYX,
+        Self::JointTopZYMinusX,
+        Self::JointTopZMinusYX,
+        Self::JointWingl7ZMinusXMinusY,
+        Self::JointWingr1XYZ,
+        Self::JointWingr7XMinusZY,
+    ];
+
+    /// Return the exact measured bone and three symbolic axis tokens, without assigning
+    /// semantic meaning to those native arguments.
+    pub const fn native_parts(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::TopYZX => (
+                "top",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::TopYNoneNone => (
+                "top",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+            ),
+            Self::ToerYMinusXZ => (
+                "toer",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointArmlXYZ => (
+                "arml",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointArmlXZY => (
+                "arml",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointArmlYXZ => (
+                "arml",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointArmlZXY => (
+                "arml",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointArmrYXZ => (
+                "armr",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointArmrYMinusXZ => (
+                "armr",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointArmrZXY => (
+                "armr",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointBustXZY => (
+                "bust",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointDuckheadXYZ => (
+                "duckhead",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHandlXYZMinus => (
+                "handl",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z_MINUS",
+            ),
+            Self::JointHandlYXZ => (
+                "handl",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHandlZXY => (
+                "handl",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointHandlZMinusXY => (
+                "handl",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointHandrYXZ => (
+                "handr",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHandrYMinusXZ => (
+                "handr",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHandrZMinusXY => (
+                "handr",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointHavelYZX => (
+                "havel",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHavelZYX => (
+                "havel",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverXYZ => (
+                "haver",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHaverYNoneNone => (
+                "haver",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+            ),
+            Self::JointHaverYXZ => (
+                "haver",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointHaverYZX => (
+                "haver",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverYMinusZMinusX => (
+                "haver",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverZYX => (
+                "haver",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverZYMinusX => (
+                "haver",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverZMinusYX => (
+                "haver",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHaverZMinusYMinusX => (
+                "haver",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointHeadYXZ => (
+                "head",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointKnifeYZX => (
+                "knife",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointKnifeZYX => (
+                "knife",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointKnifeZMinusYX => (
+                "knife",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointMouthXMinusYZ => (
+                "mouth",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointMouth1YXZ => (
+                "mouth1",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointMouth1YZX => (
+                "mouth1",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointPizzapacmanYXZ => (
+                "pizzapacman",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointPizzapacmanYXMinusZ => (
+                "pizzapacman",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointRotYXZ => (
+                "rot",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointRotZYX => (
+                "rot",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointRotZYMinusX => (
+                "rot",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSTail1ZMinusXY => (
+                "s_tail1",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordXYMinusZMinus => (
+                "sword",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z_MINUS",
+            ),
+            Self::JointSwordZXY => (
+                "sword",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordZYX => (
+                "sword",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSwordZMinusXY => (
+                "sword",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordZMinusYX => (
+                "sword",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSword1XYZ => (
+                "sword1",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointSword1XZY => (
+                "sword1",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSword1XZMinusY => (
+                "sword1",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSword1XMinusYMinusZMinus => (
+                "sword1",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z_MINUS",
+            ),
+            Self::JointSword1XMinusZYMinus => (
+                "sword1",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y_MINUS",
+            ),
+            Self::JointSword1YMinusZMinusXMinus => (
+                "sword1",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X_MINUS",
+            ),
+            Self::JointSword1ZXY => (
+                "sword1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSword1ZXYMinus => (
+                "sword1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y_MINUS",
+            ),
+            Self::JointSword1ZXMinusY => (
+                "sword1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSword1ZYX => (
+                "sword1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSwordlZYX => (
+                "swordl",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSwordlZYMinusX => (
+                "swordl",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointSwordl1XZY => (
+                "swordl1",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordl1ZXY => (
+                "swordl1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordrXNoneNone => (
+                "swordr",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+            ),
+            Self::JointSwordrZXY => (
+                "swordr",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointSwordr1ZYX => (
+                "swordr1",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTail7YXZ => (
+                "tail7",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointTail8XYZ => (
+                "tail8",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointTail8XZY => (
+                "tail8",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointTail8YXZ => (
+                "tail8",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointToelXYZ => (
+                "toel",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointTopNoneNoneNone => (
+                "top",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+            ),
+            Self::JointTopXYMinusZ => (
+                "top",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointTopXMinusZY => (
+                "top",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointTopYZMinusX => (
+                "top",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTopYMinusZX => (
+                "top",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTopYMinusZMinusX => (
+                "top",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTopZNoneNone => (
+                "top",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_NONE",
+                "ATTACK_DIRECTION_NONE",
+            ),
+            Self::JointTopZXMinusY => (
+                "top",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointTopZYX => (
+                "top",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTopZYMinusX => (
+                "top",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y_MINUS",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointTopZMinusYX => (
+                "top",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+            ),
+            Self::JointWingl7ZMinusXMinusY => (
+                "wingl7",
+                "ATTACK_DIRECTION_Z_MINUS",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Y",
+            ),
+            Self::JointWingr1XYZ => (
+                "wingr1",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_Z",
+            ),
+            Self::JointWingr7XMinusZY => (
+                "wingr7",
+                "ATTACK_DIRECTION_X_MINUS",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+        }
+    }
+}
+
+/// Maximum absolute value accepted for an authored fixed-jostle-area native float argument.
+pub const MAX_FIXED_JOSTLE_AREA_ARGUMENT: f32 = 10_000.0;
+
+/// One closed observed fixed-jostle-area setter form. Argument names are kept native/generic;
+/// source and bindings do not establish user-facing meanings for these slots.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum FixedJostleAreaCall {
+    EnableFix {
+        arg2: f32,
+        arg3: f32,
+    },
+    EnableFixXy {
+        arg2: f32,
+        arg3: f32,
+        arg4: f32,
+        arg5: f32,
+    },
+}
+
+/// One source-observed `SlowModule::set_whole` argument pair.
+///
+/// These values are admitted only for source reconstruction; they do not authorize a flat live
+/// rule or make other slowdown values editable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SlowWholeSetPair {
+    pub multiplier: u8,
+    pub frames: i32,
+}
+
+/// Measured `SlowModule::set_whole` value pairs, shared with bounded selectors and validation.
+pub const SLOW_WHOLE_SET_PAIRS: &[SlowWholeSetPair] = &[
+    SlowWholeSetPair {
+        multiplier: 4,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 2,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 20,
+        frames: 30,
+    },
+    SlowWholeSetPair {
+        multiplier: 3,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 5,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 30,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 6,
+        frames: 0,
+    },
+    SlowWholeSetPair {
+        multiplier: 20,
+        frames: 0,
+    },
+];
+
+/// Per-argument bounds for the measured `SLOW_OPPONENT` source editor. These are the inclusive
+/// extrema present in the pinned public corpus, not inferred native semantic limits or units.
+pub const SLOW_OPPONENT_SLOW_MUL_MIN: f32 = 2.0;
+pub const SLOW_OPPONENT_SLOW_MUL_MAX: f32 = 80.0;
+pub const SLOW_OPPONENT_SLOW_TIME_MIN: f32 = 5.0;
+pub const SLOW_OPPONENT_SLOW_TIME_MAX: f32 = 130.0;
+
+/// Borrow the bounded measured `set_whole` pairs for selectors and validators.
+pub const fn measured_slow_whole_set_pairs() -> &'static [SlowWholeSetPair] {
+    SLOW_WHOLE_SET_PAIRS
+}
+
+/// The closed `SLOW_OPPONENT` wrapper with its two named `f32` inputs. The bounded field ranges
+/// are derived only from the extrema in the pinned source corpus; they make no claim about
+/// native units or behavior outside the observed range.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SlowOpponentCall {
+    pub slow_mul: f32,
+    pub slow_time: f32,
+}
+
+impl SlowOpponentCall {
+    pub fn is_valid(&self) -> bool {
+        self.slow_mul.is_finite()
+            && (SLOW_OPPONENT_SLOW_MUL_MIN..=SLOW_OPPONENT_SLOW_MUL_MAX).contains(&self.slow_mul)
+            && self.slow_time.is_finite()
+            && (SLOW_OPPONENT_SLOW_TIME_MIN..=SLOW_OPPONENT_SLOW_TIME_MAX).contains(&self.slow_time)
+    }
+}
+
+/// The two exact source tokens for `macros::CHECK_FINISH_CAMERA(agent, arg1, arg2)`.
+///
+/// The pinned wrapper accepts `ToF32`; these fields deliberately retain the authored token
+/// spelling instead of assigning axes, units, or arbitrary numeric edit semantics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishCameraCall {
+    pub arg1: String,
+    pub arg2: String,
+}
+
+/// One literal pair observed for one fighter directory in the pinned public source corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinishCameraPreset {
+    pub fighter: &'static str,
+    pub arg1: &'static str,
+    pub arg2: &'static str,
+}
+
+include!("finish_camera_catalog.rs");
+
+impl FinishCameraCall {
+    /// Generic parsing can identify only tuples present somewhere in the measured corpus.
+    pub fn is_measured_tuple(&self) -> bool {
+        FINISH_CAMERA_PRESETS
+            .iter()
+            .any(|preset| preset.arg1 == self.arg1.as_str() && preset.arg2 == self.arg2.as_str())
+    }
+
+    /// Editing additionally requires the exact donor fighter and tuple combination.
+    pub fn is_measured_for(&self, fighter: &str) -> bool {
+        FINISH_CAMERA_PRESETS.iter().any(|preset| {
+            preset.fighter == fighter
+                && preset.arg1 == self.arg1.as_str()
+                && preset.arg2 == self.arg2.as_str()
+        })
+    }
+}
+
+/// The exact six source tokens for
+/// `macros::CHECK_VALID_FINAL_START_CAMERA(agent, arg1, arg2, arg3, arg4, arg5, arg6)`.
+///
+/// This remains one closed tuple: the pinned wrapper names its payload parameters `unk1..unk6`,
+/// and the source corpus does not establish independent units or editable numeric semantics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalStartCameraCall {
+    pub args: [String; 6],
+}
+
+/// One exact six-token tuple observed in one donor's Game source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalStartCameraPreset {
+    pub fighter: &'static str,
+    pub args: [&'static str; 6],
+}
+
+include!("final_start_camera_catalog.rs");
+
+impl FinalStartCameraCall {
+    /// Parser admission is global because `parse_acmd_script` has no donor argument.
+    pub fn is_measured_tuple(&self) -> bool {
+        FINAL_START_CAMERA_PRESETS.iter().any(|preset| {
+            self.args
+                .iter()
+                .zip(preset.args)
+                .all(|(actual, measured)| actual.as_str() == measured)
+        })
+    }
+
+    /// Timeline editability requires the exact owner/tuple pair.
+    pub fn is_measured_for(&self, fighter: &str) -> bool {
+        FINAL_START_CAMERA_PRESETS.iter().any(|preset| {
+            preset.fighter == fighter
+                && self
+                    .args
+                    .iter()
+                    .zip(preset.args)
+                    .all(|(actual, measured)| actual.as_str() == measured)
+        })
+    }
+}
+
+/// One opaque integer source token for `macros::FT_SET_FINAL_FEAR_FACE(agent, argument)`.
+/// The pinned wrapper calls this payload `unk`; its unit and meaning are not established.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalFearFaceCall {
+    pub argument: String,
+}
+
+/// An exact owner/token pair observed in the pinned Game-source corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalFearFacePreset {
+    pub fighter: &'static str,
+    pub argument: &'static str,
+}
+
+include!("final_fear_face_catalog.rs");
+
+impl FinalFearFaceCall {
+    /// Generic parsing has no owner context, so it accepts only a globally measured token.
+    pub fn is_measured_token(&self) -> bool {
+        FINAL_FEAR_FACE_PRESETS
+            .iter()
+            .any(|preset| preset.argument == self.argument.as_str())
+    }
+
+    /// Timeline editability is restricted to the exact measured owner/token pair.
+    pub fn is_measured_for(&self, fighter: &str) -> bool {
+        FINAL_FEAR_FACE_PRESETS
+            .iter()
+            .any(|preset| preset.fighter == fighter && preset.argument == self.argument.as_str())
+    }
+}
+
+/// A value-only Hash40 literal used by source-only native controls.
+///
+/// `Name` stores text to be hashed by `Hash40::new`; `Raw` retains an already encoded hash and
+/// must never be reverse-resolved to a guessed name. This is data, not a Rust source expression.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hash40Literal {
+    Name(String),
+    Raw(u64),
+}
+
+impl Hash40Literal {
+    /// Hash40's named spelling stores its UTF-8 byte length in the length field.
+    pub const MAX_NAME_BYTES: usize = 255;
+
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Name(name) => {
+                !name.is_empty() && name.len() <= Self::MAX_NAME_BYTES && !name.contains('\0')
+            }
+            Self::Raw(_) => true,
+        }
+    }
+
+    pub(crate) fn source_expr(&self) -> String {
+        match self {
+            // Debug formatting for a Rust string escapes quotes, slashes, controls and newlines;
+            // the value cannot introduce source code.
+            Self::Name(name) => format!("Hash40::new({name:?})"),
+            Self::Raw(value) => format!("Hash40::new_raw(0x{value:x})"),
+        }
+    }
+}
+
+/// Which of the two same-ABI optional hit-feedback natives is being called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalHitFeedbackKind {
+    Effect,
+    Sound,
+}
+
+/// One source-only `AttackModule::set_optional_hit_{effect,sound}` command.
+///
+/// The SDK calls the signed native integer `arg2`; its semantic meaning is not declared there.
+/// Keep that neutral label and the editor's observed inclusive 0–4 value bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OptionalHitFeedbackCall {
+    pub kind: OptionalHitFeedbackKind,
+    pub arg2: i32,
+    pub hash: Hash40Literal,
+}
+
+impl OptionalHitFeedbackCall {
+    pub const MIN_ARG2: i32 = 0;
+    pub const MAX_ARG2: i32 = 4;
+
+    pub fn is_valid(&self) -> bool {
+        (Self::MIN_ARG2..=Self::MAX_ARG2).contains(&self.arg2) && self.hash.is_valid()
+    }
+}
+
+/// A measured whole-fighter slowdown operation. The receiver is closed to the native ACMD agent
+/// accessor and is therefore not user-authored data.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlowWholeCall {
+    Set { multiplier: u8, frames: i32 },
+    Clear,
+}
+
 /// One statement inside an is_excute block.
 // AttackCall is intentionally inline: ATTACK statements dominate these short-lived syntax
 // trees, so boxing every normal statement would add allocations to optimize the rare Raw case.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ExcuteStmt {
+    /// Source-only effect command inside a structured Execute branch.
+    Effect(Box<EffectMacro>),
+    NativeCall(crate::move_nodes::native_calls::NativeCall),
     Attack(AttackCall),
     /// CATCH — a grab box. Its own family: `CATCH` shares no argument layout with `ATTACK`
     /// and is cleared by `GrabModule`, not `AttackModule`.
     Catch(CatchCall),
     /// ATTACK_ABS — damage applied to an opponent already caught. No volume, no bone.
     AttackAbs(AttackAbsCall),
+    /// Exact bundled target lookup and `ATK_HIT_ABS` source form used for standard throws.
+    ///
+    /// The three target reads and the application call are one source command so authored
+    /// instances always define their local target values in the same execute scope. This is
+    /// source-only; it is not an absolute-hitbox definition or a flattened live collision.
+    AttackAbsApplyThrow,
     /// ATTACK_FP — fighter-position collision with a separate 41-slot payload.
     AttackFp(AttackFpCall),
     /// SEARCH — a detection volume. Its own family for the same reason `CATCH` is: it shares
@@ -1852,6 +3860,10 @@ pub enum ExcuteStmt {
     ClearAll,
     /// GrabModule::clear_all — ends every open grab box, and only grab boxes.
     GrabClearAll,
+    /// `GrabModule::set_rebound(agent.module_accessor, bool)`; source-only native state.
+    GrabRebound {
+        enabled: bool,
+    },
     /// `HIT_NODE` / `HIT_NO` — set one bone's or one group's hurtbox state.
     ///
     /// Not a collision: this changes how the fighter *receives* hits, so it neither appears in
@@ -1881,6 +3893,167 @@ pub enum ExcuteStmt {
     ColPri(i64),
     /// `COL_NORMAL` — clear the colour blend, ending an open `COL_PRI` or `FLASH`.
     ColNormal,
+    /// `slope!` — set a closed, measured fighter-presentation slope form.
+    ///
+    /// This remains source-only in Visionary's live move rules: it is not a collision or a
+    /// general native `WorkModule` write.
+    Slope(SlopeCall),
+    /// `ItemModule::set_have_item_visibility(agent.module_accessor, bool, 0)`.
+    ///
+    /// The receiver and slot are fixed to the only measured corpus form. This is source-only
+    /// presentation state; it does not become a generic ItemModule write or live rule.
+    ItemVisibility {
+        visible: bool,
+    },
+    /// `macros::SHOOT_ITEM_BULLET(agent)` — run the current item's bullet action.
+    ///
+    /// This closed source command has no author-controlled payload and is not a live rule.
+    ShootItemBullet,
+    /// `macros::START_INFO_FLASH_EYE(agent)` — exact no-payload, source-only ACMD call.
+    ///
+    /// It is admitted only from a direct, unattributed root Game or Expression Execute block.
+    /// This is not represented by [`EffectMacro::Color`]: it has no color payload, and this
+    /// command does not broaden color-editing or live replay support.
+    StartInfoFlashEye,
+    /// `macros::CAM_ZOOM_OUT(agent)` — exact no-payload, source-only ACMD call.
+    ///
+    /// It is admitted only from a direct, unattributed root Game Execute block and does not
+    /// enable camera playback through Visionary's live move model.
+    CameraZoomOut,
+    /// Exact no-payload macros::FT_START_CUTIN(agent), retained as source-only ACMD.
+    ///
+    /// It is admitted only from a direct, unattributed root Game Execute block.
+    StartCutIn,
+    /// Exact macros::game_CaptureCutCommon(agent); the helper owns its Execute guard.
+    ///
+    /// Preserve only as a direct, unattributed root Game bare statement. Emitting it inside
+    /// another Execute block would duplicate its guard and change the captured source structure.
+    CaptureCutCommon,
+    /// `JostleModule::set_status(agent.module_accessor, bool)`.
+    ///
+    /// Source-only collision state; the flattened live move model does not reproduce jostle.
+    JostleSetStatus {
+        enabled: bool,
+    },
+    /// One exact source-only `FighterAreaModuleImpl::enable_fix_jostle_area[_xy]` call.
+    FixedJostleArea(FixedJostleAreaCall),
+    /// `VisibilityModule::set_int64(agent.module_accessor, hash40(group) as i64, hash40(status) as i64)`.
+    ///
+    /// Only measured literal names are retained. This is source-only presentation state.
+    VisibilitySetInt64 {
+        group: String,
+        status: String,
+    },
+    /// Authoring-only `VisibilityModule::set_default_int64` with an owner-closed hash token.
+    ///
+    /// This node emits the canonical `hash40("group") as i64` form. It does not import the
+    /// corpus's original `Hash40::new(...)` calls or infer model-resource behavior.
+    VisibilitySetDefaultInt64 {
+        group: String,
+    },
+    /// `VisibilityModule::set_whole(agent.module_accessor, bool)` as a source-only statement.
+    ///
+    /// This retains only the native call's boolean argument. It assigns no further meaning and
+    /// is not replayed by the flattened live-move model.
+    VisibilitySetWhole {
+        visible: bool,
+    },
+    /// One of the measured `AttackModule::*_all(accessor, bool, bool)` calls. The native
+    /// bindings confirm only the two boolean argument types; their meanings are not inferred.
+    /// These commands stay source-only and do not become flattened live rules.
+    AttackModuleSetAll {
+        kind: AttackModuleSetAllKind,
+        arg2: bool,
+        arg3: bool,
+    },
+    /// One of the observed indexed AttackModule calls. The native arguments remain positional;
+    /// only the method name is closed over the measured source forms. This is source-only and
+    /// intentionally has no flattened live-move behavior.
+    AttackModuleSetIndexed {
+        kind: AttackModuleSetIndexedKind,
+        id: i32,
+        arg3: bool,
+        arg4: bool,
+    },
+    /// Exact source-only `AttackModule::set_attack_height_all` form. The native tail is
+    /// positional and only the observed `false` value is editable.
+    AttackModuleSetHeightAll {
+        height: AttackHeightAllKind,
+        arg3: bool,
+    },
+    /// Exact source-only `AttackModule::set_final_finish_cut_in` form. Keep native arguments
+    /// positional rather than assigning unverified meanings to their values.
+    AttackModuleSetFinalFinishCutIn {
+        id: i32,
+        arg3: bool,
+        arg4: bool,
+        arg5: f32,
+        arg6: bool,
+    },
+    /// Exact source-only `AttackModule::init_attack_pos` call shape (id 0 only).
+    AttackModuleInitAttackPos {
+        id: i32,
+    },
+    /// One exact, closed source tuple for `AttackModule::set_attack_reference_joint_id`.
+    AttackModuleSetAttackReferenceJointId {
+        kind: AttackReferenceJointKind,
+    },
+    /// Exact observed `AttackModule::set_no_damage_fly_smoke_all` positional boolean pair.
+    AttackModuleSetNoDamageFlySmokeAll {
+        arg2: bool,
+        arg3: bool,
+    },
+    /// Exact source-only measured `AttackModule::set_damage_shake_scale` numeric spelling.
+    AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale),
+    /// Exact source-only measured `AttackModule::set_no_uniq_effect_all` boolean pair.
+    AttackModuleSetNoUniqEffectAll(AttackModuleNoUniqEffectAllPair),
+    /// Exact source-only measured `AttackModule::set_target_category` form. The category mask
+    /// is fixed to `COLLISION_CATEGORY_MASK_NO_IF as u32` during emission.
+    AttackModuleSetTargetCategory(AttackModuleTargetCategoryId),
+    /// Exact source-only global normal hit-status restoration call.
+    HitModuleSetStatusAllNormal,
+    /// One closed, exact measured `AttackModule::set_size` `(attack ID, f32 token)` tuple.
+    AttackModuleSetSize(AttackModuleSizePreset),
+    /// One closed exact source tuple for the pinned Vector2f `AttackModule::set_vec_target_pos`.
+    AttackModuleSetVecTargetPos(AttackModuleVecTargetPosPreset),
+    /// Source-only optional hit feedback. `arg2` stays neutral because the pinned SDK only
+    /// declares its C integer type, not an attack-ID, timing, or other gameplay meaning.
+    #[serde(rename = "optional_hit_feedback")]
+    OptionalHitFeedback(OptionalHitFeedbackCall),
+    /// Exact measured `AttackModule::set_add_reaction_frame` source call. Only IDs 0–8,
+    /// a finite float, the normal module receiver, and the fixed trailing `false` are typed.
+    AttackModuleAddReactionFrame {
+        id: u32,
+        frames: f32,
+    },
+    /// Distinct revised native API; never substituted for the non-revised call.
+    /// The same measured literal ID/frame boundary and fixed false tail apply.
+    AttackModuleAddReactionFrameRevised {
+        id: u32,
+        frames: f32,
+    },
+    /// One of the exact, registry-checked source-only ArticleModule lifecycle calls.
+    ArticleLifecycle(ArticleLifecycleCall),
+    /// Source-only handoff to a named live gimmick event receiver. Project expansion requires
+    /// this name to be present in the fighter's compiled event bindings.
+    GimmickEvent {
+        name: String,
+    },
+    /// Source-only handoff to one exact non-main controller chart's named event.
+    /// Project expansion validates the chart and zero-payload event against the
+    /// same fighter's compiled controller set before source can be applied.
+    GimmickChartEvent {
+        chart_id: String,
+        name: String,
+    },
+    /// Source-only send of up to eight named scalar constants to a controller chart event.
+    /// Unlike `GimmickChartEvent`, this additive node carries its source argument order and
+    /// never changes the legacy zero-payload event's serialized shape.
+    GimmickChartEventValues {
+        chart_id: String,
+        name: String,
+        arguments: Vec<crate::gimmicks::event_payload::Argument>,
+    },
     /// `ATK_POWER` / `ATK_SET_SHIELD_SETOFF_MUL` — retune a hitbox that is already out.
     ///
     /// Not a collision of its own, so it does not appear in [`AcmdScript::to_hitboxes`]: it
@@ -1916,6 +4089,13 @@ pub enum ExcuteStmt {
     /// the macro takes no arguments after `agent`, so the meaningful edits are whether it is
     /// present and which frame it runs on.
     ReverseLr,
+    /// A measured source-only `CHECK_FINISH_CAMERA` literal pair, closed by fighter donor.
+    /// The values remain exact source tokens; their native semantic labels are undocumented.
+    CheckFinishCamera(FinishCameraCall),
+    /// A closed source-only six-token final-start-camera call with unknown per-token semantics.
+    CheckFinalStartCamera(FinalStartCameraCall),
+    /// A closed source-only one-token final fear-face call; payload meaning is undocumented.
+    FinalFearFace(FinalFearFaceCall),
     /// `SET_SPEED_EX` — set the x/y velocity of one kinetic-energy reserve.
     SetSpeedEx(SetSpeedExCall),
     /// `SET_SPEED` — set the fighter's x/y velocity directly.
@@ -2015,8 +4195,31 @@ pub enum ExcuteStmt {
     /// Only the measured direct receiver and operation-specific value/slot tokens are typed;
     /// authored names and expressions remain source-owned for export and source sync.
     WorkModuleSet(WorkModuleSetCall),
+    /// Exact receiver and closed source-only argument model for SlowModule whole slowdown.
+    SlowWhole(SlowWholeCall),
+    /// `macros::SLOW_OPPONENT(agent, slow_mul, slow_time)` with finite inputs inside the
+    /// independently observed corpus bounds. It remains a Game source-only command.
+    SlowOpponent(SlowOpponentCall),
     /// Any other line we don't interpret — preserved verbatim.
     Raw(String),
+}
+
+/// Exact owner-scoped corpus counts for the authoring-only model-default hash setter.
+/// These rows authorize only the listed generated group tokens; they do not make matching
+/// `Hash40::new(...)` source calls editable imports.
+pub(crate) const PINNED_DEFAULT_INT64_GROUP_COUNTS: &[(&str, &str, usize)] = &[
+    ("gamewatch", "panel", 19),
+    ("gamewatch", "lhand", 1),
+    ("pitb", "weapon", 16),
+    ("pit", "weapon", 12),
+    ("koopajr", "clown", 2),
+    ("koopajr", "clown_face", 2),
+];
+
+pub(crate) fn is_measured_default_int64_group(fighter: &str, group: &str) -> bool {
+    PINNED_DEFAULT_INT64_GROUP_COUNTS
+        .iter()
+        .any(|(owner, measured_group, _)| *owner == fighter && *measured_group == group)
 }
 
 /// A call from the `PLAY_SE` family, as written.
@@ -2375,14 +4578,46 @@ impl WorkTransitionTermAction {
     }
 }
 
+/// Exact receiver spelling retained for a measured WorkModule transition-term call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WorkTransitionTermReceiver {
+    /// Canonical receiver used by source-only editing and by legacy serialized calls.
+    #[default]
+    AgentAccessor,
+    /// HDR/source spelling retained for round-trip and flat source synchronization.
+    Boma,
+}
+
+impl WorkTransitionTermReceiver {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::AgentAccessor => "agent.module_accessor",
+            Self::Boma => "boma",
+        }
+    }
+}
+
 /// A parsed direct WorkModule transition-term or transition-term-group call. The token field is
 /// intentionally shared because the measured native wrappers all take one integer after the
-/// receiver; the exact function name remains in [`WorkTransitionTermAction`].
+/// receiver; the exact function name remains in [`WorkTransitionTermAction`]. The receiver is
+/// retained as a closed token so flat/source-sync paths can preserve `boma` without normalizing it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorkTransitionTermCall {
     pub action: WorkTransitionTermAction,
+    /// Exact measured receiver spelling. Old serialized calls default to the canonical accessor.
+    #[serde(
+        default,
+        skip_serializing_if = "WorkTransitionTermReceiver::is_agent_accessor"
+    )]
+    pub receiver: WorkTransitionTermReceiver,
     /// Authored transition-term or group token, usually a dereferenced lua constant.
     pub transition_term: String,
+}
+
+impl WorkTransitionTermReceiver {
+    const fn is_agent_accessor(&self) -> bool {
+        matches!(self, Self::AgentAccessor)
+    }
 }
 
 impl WorkTransitionTermCall {
@@ -2496,104 +4731,48 @@ pub struct ReverseLrEvent {
     pub site: usize,
 }
 
-/// A resolved `SET_SPEED_EX` point event at the one-based game frame it fires on.
+/// A resolved direct call `C` at the one-based game frame it fires on. `site` is its source
+/// ordinal among calls of the same family, independent of every other family.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SetSpeedExEvent {
+pub struct PointEvent<C> {
     pub frame: u32,
-    pub call: SetSpeedExCall,
+    pub call: C,
     #[serde(default)]
     pub site: usize,
 }
+
+/// A resolved `SET_SPEED_EX` point event at the one-based game frame it fires on.
+pub type SetSpeedExEvent = PointEvent<SetSpeedExCall>;
 
 /// A resolved `SET_SPEED` point event at the one-based game frame it fires on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct SetSpeedEvent {
-    pub frame: u32,
-    pub call: SetSpeedCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type SetSpeedEvent = PointEvent<SetSpeedCall>;
 
 /// A resolved `ADD_SPEED_NO_LIMIT` point event at the one-based game frame it fires on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AddSpeedNoLimitEvent {
-    pub frame: u32,
-    pub call: AddSpeedNoLimitCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type AddSpeedNoLimitEvent = PointEvent<AddSpeedNoLimitCall>;
 
 /// A resolved `CORRECT` point event at the one-based game frame it fires on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct CorrectEvent {
-    pub frame: u32,
-    pub call: CorrectCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type CorrectEvent = PointEvent<CorrectCall>;
 
 /// A resolved `FT_CATCH_STOP` point event at the one-based game frame it fires on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FtCatchStopEvent {
-    pub frame: u32,
-    pub call: FtCatchStopCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type FtCatchStopEvent = PointEvent<FtCatchStopCall>;
 
 /// A resolved `FT_START_ADJUST_MOTION_FRAME_arg1` point event at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct FtStartAdjustMotionFrameEvent {
-    pub frame: u32,
-    pub call: FtStartAdjustMotionFrameCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type FtStartAdjustMotionFrameEvent = PointEvent<FtStartAdjustMotionFrameCall>;
 
 /// A resolved direct `MotionModule::set_rate` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MotionModuleSetRateEvent {
-    pub frame: u32,
-    pub call: MotionModuleSetRateCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type MotionModuleSetRateEvent = PointEvent<MotionModuleSetRateCall>;
 
 /// A resolved direct `MotionModule::set_helper_calculation` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MotionModuleSetHelperCalculationEvent {
-    pub frame: u32,
-    pub call: MotionModuleSetHelperCalculationCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type MotionModuleSetHelperCalculationEvent = PointEvent<MotionModuleSetHelperCalculationCall>;
 
 /// A resolved direct `MotionModule::set_rate_partial` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MotionModuleSetRatePartialEvent {
-    pub frame: u32,
-    pub call: MotionModuleSetRatePartialCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type MotionModuleSetRatePartialEvent = PointEvent<MotionModuleSetRatePartialCall>;
 
 /// A resolved direct `MotionModule::set_frame_partial` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct MotionModuleSetFramePartialEvent {
-    pub frame: u32,
-    pub call: MotionModuleSetFramePartialCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type MotionModuleSetFramePartialEvent = PointEvent<MotionModuleSetFramePartialCall>;
 
 /// A resolved `CLR_SPEED` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ClrSpeedEvent {
-    pub frame: u32,
-    pub call: ClrSpeedCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type ClrSpeedEvent = PointEvent<ClrSpeedCall>;
 
 /// A resolved `SET_AIR` point at the one-based game frame.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2612,76 +4791,28 @@ pub struct KineticClearSpeedAllEvent {
 }
 
 /// A resolved direct `KineticModule::set_consider_ground_friction` point.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct KineticSetConsiderGroundFrictionEvent {
-    pub frame: u32,
-    pub call: KineticSetConsiderGroundFrictionCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type KineticSetConsiderGroundFrictionEvent = PointEvent<KineticSetConsiderGroundFrictionCall>;
 
 /// A resolved `KineticModule::change_kinetic` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ChangeKineticEvent {
-    pub frame: u32,
-    pub call: ChangeKineticCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type ChangeKineticEvent = PointEvent<ChangeKineticCall>;
 
 /// A resolved direct kinetic-energy toggle at its one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct KineticEnergyEvent {
-    pub frame: u32,
-    pub call: KineticEnergyCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type KineticEnergyEvent = PointEvent<KineticEnergyCall>;
 
 /// A resolved direct `KineticModule::add_speed` point at its one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct KineticAddSpeedEvent {
-    pub frame: u32,
-    pub call: KineticAddSpeedCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type KineticAddSpeedEvent = PointEvent<KineticAddSpeedCall>;
 
 /// A resolved direct WorkModule flag point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WorkFlagEvent {
-    pub frame: u32,
-    pub call: WorkFlagCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type WorkFlagEvent = PointEvent<WorkFlagCall>;
 
 /// A resolved direct WorkModule transition-term point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WorkTransitionTermEvent {
-    pub frame: u32,
-    pub call: WorkTransitionTermCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type WorkTransitionTermEvent = PointEvent<WorkTransitionTermCall>;
 
 /// A resolved direct `WorkModule::inc_int` point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WorkModuleIncIntEvent {
-    pub frame: u32,
-    pub call: WorkModuleIncIntCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type WorkModuleIncIntEvent = PointEvent<WorkModuleIncIntCall>;
 
 /// A resolved direct WorkModule value-set point at the one-based game frame.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WorkModuleSetEvent {
-    pub frame: u32,
-    pub call: WorkModuleSetCall,
-    #[serde(default)]
-    pub site: usize,
-}
+pub type WorkModuleSetEvent = PointEvent<WorkModuleSetCall>;
 
 /// A resolved sound with the frame it fires on.
 ///
@@ -2696,7 +4827,7 @@ pub struct SoundEvent {
     /// A looped `PLAY_SE` produces one event per iteration and every one of them carries the
     /// same site, because all of them are the one line in the file. Write-back resolves a site
     /// against a textual scan of the source, so this has to be the ordinal a pre-order read of
-    /// the text would give — see [`WalkAccum::next_sound_site`].
+    /// the text would give — see [`WalkAccum::sites`].
     ///
     /// Counted separately from the hurtbox and attack-modifier ordinals. They are three
     /// independent spaces over three different sets of macros; sharing a counter would make
@@ -2705,16 +4836,82 @@ pub struct SoundEvent {
     pub site: usize,
 }
 
+/// Whether a loop runs `count` times or once per motion cycle, and which native call ends each
+/// cycle. Saved as `false` / `true` / `"sync_motion"`, so loops saved as the earlier
+/// `motion_loop: bool` read back unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MotionLoop {
+    /// A counted `for` loop.
+    #[default]
+    No,
+    /// Each cycle ends with `wait_loop_clear` (rapid jabs, held specials).
+    Clear,
+    /// Each cycle ends with `wait_loop_sync_mot` (run, walk and idle presentation).
+    SyncMotion,
+}
+
+impl MotionLoop {
+    pub fn is_no(&self) -> bool {
+        *self == MotionLoop::No
+    }
+    pub fn is_loop(&self) -> bool {
+        *self != MotionLoop::No
+    }
+}
+
+impl serde::Serialize for MotionLoop {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            MotionLoop::No => serializer.serialize_bool(false),
+            MotionLoop::Clear => serializer.serialize_bool(true),
+            MotionLoop::SyncMotion => serializer.serialize_str("sync_motion"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MotionLoop {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Flag(bool),
+            Name(String),
+        }
+        match Saved::deserialize(deserializer)? {
+            Saved::Flag(false) => Ok(MotionLoop::No),
+            Saved::Flag(true) => Ok(MotionLoop::Clear),
+            Saved::Name(name) if name == "clear" => Ok(MotionLoop::Clear),
+            Saved::Name(name) if name == "sync_motion" => Ok(MotionLoop::SyncMotion),
+            Saved::Name(name) => Err(serde::de::Error::custom(format!(
+                "unknown motion loop {name:?}"
+            ))),
+        }
+    }
+}
+
 /// A timing statement in the script.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AcmdStmt {
     Frame(f32),
+    /// Native sv_animcmd::execute at the fixed agent Lua state, outside Execute guards.
+    /// This source-only primitive is distinct from frame(), wait() and authored timers.
+    NativeExecuteFrame(f32),
+    /// Exact native motion-loop synchronization; never simulated as a host loop or timer.
+    NativeMotionLoopSync,
     Wait(f32),
+    /// Native `sv_animcmd::wait_loop_clear`: wait for the motion to loop, then restart the
+    /// frame count. Exported through smash-script's `macros::wait_loop_clear(agent)`.
     WaitLoopClear,
     Excute(Vec<ExcuteStmt>),
     Loop {
         count: usize,
         body: Vec<AcmdStmt>,
+        /// `loop { body; wait }`: the body runs once per motion cycle until the script is
+        /// replaced — the native scheduler loop of rapid jabs, runs and walks. `count` is 1
+        /// (one pass per cycle), so frame walks that multiply by it see the first cycle. The
+        /// trailing wait is implied, so an endless loop can never spin without yielding.
+        #[serde(default, skip_serializing_if = "MotionLoop::is_no")]
+        motion_loop: MotionLoop,
     },
     /// A block the editor does not model, kept whole: a runtime branch
     /// (`if WorkModule::is_flag(…) {`), its `else {`, a raw `for`.
@@ -2758,6 +4955,49 @@ pub enum AcmdStmt {
     Raw(String),
 }
 
+fn acmd_preview_budget_error(stmts: &[AcmdStmt]) -> Option<String> {
+    fn list_work(stmts: &[AcmdStmt], depth: usize) -> Result<u64, String> {
+        if depth > MAX_PREVIEW_AST_DEPTH {
+            return Err(format!(
+                "ACMD preview structure exceeds nesting limit {MAX_PREVIEW_AST_DEPTH}"
+            ));
+        }
+        let mut total = 0u64;
+        for stmt in stmts {
+            let work = match stmt {
+                AcmdStmt::Loop { count, body, .. } => {
+                    // Even an empty loop body still consumes one interpreter step per
+                    // iteration. Charging at least one prevents an enormous empty repeat from
+                    // escaping the aggregate witness while the legacy walker burns CPU.
+                    let body_work = list_work(body, depth + 1)?.max(1);
+                    let iterations = u64::try_from(*count).unwrap_or(u64::MAX).saturating_add(1);
+                    1u64.saturating_add(body_work.saturating_mul(iterations))
+                }
+                AcmdStmt::RawBlock { body, .. } => 1u64.saturating_add(list_work(body, depth + 1)?),
+                AcmdStmt::Excute(commands) => 1u64.saturating_add(commands.len() as u64),
+                AcmdStmt::Bare(_) => 2,
+                AcmdStmt::Frame(_)
+                | AcmdStmt::NativeExecuteFrame(_)
+                | AcmdStmt::NativeMotionLoopSync
+                | AcmdStmt::Wait(_)
+                | AcmdStmt::WaitLoopClear
+                | AcmdStmt::MotionRate(_)
+                | AcmdStmt::Raw(_) => 1,
+            };
+            total = total.saturating_add(work);
+            if total > MAX_PREVIEW_EXPANDED_WORK {
+                return Err(format!(
+                    "ACMD preview expansion exceeds the {}-work limit",
+                    MAX_PREVIEW_EXPANDED_WORK
+                ));
+            }
+        }
+        Ok(total)
+    }
+
+    list_work(stmts, 0).err()
+}
+
 /// The parsed ACMD game_ function, preserving full structure for export.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AcmdScript {
@@ -2779,6 +5019,14 @@ pub struct RateSpan {
 }
 
 impl AcmdScript {
+    /// Return a diagnostic when any flattening/preview walk would exceed its aggregate work
+    /// budget or nesting bound. UI and export callers must surface this before consuming the
+    /// legacy Vec-returning preview helpers; those helpers refuse to unroll and return empty
+    /// outputs when this check fails.
+    pub fn preview_budget_error(&self) -> Option<String> {
+        acmd_preview_budget_error(&self.stmts)
+    }
+
     /// Count runtime conditional blocks preserved in this script.
     ///
     /// A live capture observes one execution path, while a source script may contain several
@@ -2898,6 +5146,14 @@ impl AcmdScript {
         span.from_game + (motion - span.from_motion) * span.rate
     }
 
+    /// One walk of the script, keeping everything but hitboxes.
+    fn walk(&self) -> WalkAccum {
+        let mut hitboxes: Vec<Hitbox> = Vec::new();
+        let mut acc = WalkAccum::default();
+        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
+        acc
+    }
+
     /// Flatten the script into display hitboxes with computed frame ranges.
     pub fn to_hitboxes(&self) -> Vec<Hitbox> {
         let mut hitboxes: Vec<Hitbox> = Vec::new();
@@ -2973,10 +5229,7 @@ impl AcmdScript {
     ///
     /// No end-frame pass like the two above: these are point events. See [`AttackModState`].
     pub fn to_attack_mods(&self) -> Vec<AttackModState> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.mods
+        self.walk().mods
     }
 
     /// Flatten the script into the sounds it plays, each at the frame it fires on.
@@ -2991,10 +5244,7 @@ impl AcmdScript {
     ///
     /// [`to_hurtboxes`]: Self::to_hurtboxes
     pub fn to_sound_events(&self) -> Vec<SoundEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.sounds
+        self.walk().sounds
     }
 
     /// Flatten the measured expression calls into frame events.
@@ -3003,10 +5253,7 @@ impl AcmdScript {
     /// stored in the same `AcmdStmt` tree, so a looped or branched call cannot quietly acquire a
     /// second timing implementation.
     pub fn to_expression_events(&self) -> Vec<ExpressionEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.expressions
+        self.walk().expressions
     }
 
     /// Flatten source-preserved partial-frame calls into read-only frame events.
@@ -3015,201 +5262,217 @@ impl AcmdScript {
     /// boolean value for the native binding's fourth argument, so the editor may report the
     /// authored line but must not offer a live or typed edit for it.
     pub fn to_raw_partial_frame_events(&self) -> Vec<RawPartialFrameEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.raw_partial_frames
+        self.walk().raw_partial_frames
     }
 
     /// Flatten `REVERSE_LR` calls into point events at their one-based game frames.
     pub fn to_reverse_lr_events(&self) -> Vec<ReverseLrEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.reverse_lrs
+        self.walk().reverse_lrs
     }
 
     /// Flatten `SET_SPEED_EX` calls into editable point events at their one-based game frames.
     pub fn to_speed_ex_events(&self) -> Vec<SetSpeedExEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.speed_exs
+        self.walk().speed_exs
     }
 
     /// Flatten `SET_SPEED` calls into editable point events at their one-based game frames.
     pub fn to_speed_events(&self) -> Vec<SetSpeedEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.speeds
+        self.walk().speeds
     }
 
     /// Flatten `ADD_SPEED_NO_LIMIT` calls into editable point events at their one-based game
     /// frames.
     pub fn to_add_speed_no_limit_events(&self) -> Vec<AddSpeedNoLimitEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.add_speed_no_limits
+        self.walk().add_speed_no_limits
     }
 
     /// Flatten `CORRECT` calls into editable point events at their one-based game frames.
     pub fn to_correct_events(&self) -> Vec<CorrectEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.corrects
+        self.walk().corrects
     }
 
     /// Flatten `FT_CATCH_STOP` calls into editable point events at their one-based game frames.
     pub fn to_ft_catch_stop_events(&self) -> Vec<FtCatchStopEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.ft_catch_stops
+        self.walk().ft_catch_stops
     }
 
     /// Flatten `FT_START_ADJUST_MOTION_FRAME_arg1` calls into editable numeric point events.
     pub fn to_ft_start_adjust_motion_frame_events(&self) -> Vec<FtStartAdjustMotionFrameEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.ft_start_adjust_motion_frames
+        self.walk().ft_start_adjust_motion_frames
     }
 
     /// Flatten direct `MotionModule::set_rate` calls into editable numeric point events.
     pub fn to_motion_module_set_rate_events(&self) -> Vec<MotionModuleSetRateEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.motion_module_set_rates
+        self.walk().motion_module_set_rates
     }
 
     /// Flatten direct `MotionModule::set_helper_calculation` calls into editable boolean points.
     pub fn to_motion_module_set_helper_calculation_events(
         &self,
     ) -> Vec<MotionModuleSetHelperCalculationEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.motion_module_set_helper_calculations
+        self.walk().motion_module_set_helper_calculations
     }
 
     /// Flatten direct `MotionModule::set_rate_partial` calls into editable numeric point events.
     pub fn to_motion_module_set_rate_partial_events(&self) -> Vec<MotionModuleSetRatePartialEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.motion_module_set_rate_partials
+        self.walk().motion_module_set_rate_partials
     }
 
     /// Flatten direct `MotionModule::set_frame_partial` calls into editable point events.
     pub fn to_motion_module_set_frame_partial_events(
         &self,
     ) -> Vec<MotionModuleSetFramePartialEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.motion_module_set_frame_partials
+        self.walk().motion_module_set_frame_partials
     }
 
     /// Flatten `CLR_SPEED` calls into source-token kinetic point events.
     pub fn to_clr_speed_events(&self) -> Vec<ClrSpeedEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.clr_speeds
+        self.walk().clr_speeds
     }
 
     /// Flatten `SET_AIR` calls into argument-less kinetic point events.
     pub fn to_set_air_events(&self) -> Vec<SetAirEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.set_airs
+        self.walk().set_airs
     }
 
     /// Flatten direct `KineticModule::clear_speed_all` calls into argument-less kinetic points.
     pub fn to_kinetic_clear_speed_all_events(&self) -> Vec<KineticClearSpeedAllEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.kinetic_clear_speed_alls
+        self.walk().kinetic_clear_speed_alls
     }
 
     /// Flatten direct `KineticModule::set_consider_ground_friction` calls into editable points.
     pub fn to_kinetic_set_consider_ground_friction_events(
         &self,
     ) -> Vec<KineticSetConsiderGroundFrictionEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.kinetic_set_consider_ground_frictions
+        self.walk().kinetic_set_consider_ground_frictions
     }
 
     /// Flatten direct kinetic-type changes into authored-token point events.
     pub fn to_change_kinetic_events(&self) -> Vec<ChangeKineticEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.change_kinetics
+        self.walk().change_kinetics
     }
 
     /// Flatten direct kinetic-vector additions into editable x/y point events.
     pub fn to_kinetic_add_speed_events(&self) -> Vec<KineticAddSpeedEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.kinetic_add_speeds
+        self.walk().kinetic_add_speeds
     }
 
     /// Flatten direct kinetic-energy suspend/resume calls into editable point events.
     pub fn to_kinetic_energy_events(&self) -> Vec<KineticEnergyEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.kinetic_energies
+        self.walk().kinetic_energies
     }
 
     /// Flatten direct `WorkModule::on_flag` / `off_flag` calls into authored-token point events.
     pub fn to_work_flag_events(&self) -> Vec<WorkFlagEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.work_flags
+        self.walk().work_flags
     }
 
     /// Flatten direct WorkModule transition-term calls into authored-token point events.
     pub fn to_work_transition_term_events(&self) -> Vec<WorkTransitionTermEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.work_transition_terms
+        self.walk().work_transition_terms
     }
 
     /// Flatten direct `WorkModule::inc_int` calls into authored-token point events.
     pub fn to_work_module_inc_int_events(&self) -> Vec<WorkModuleIncIntEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.work_module_inc_ints
+        self.walk().work_module_inc_ints
     }
 
     /// Flatten direct WorkModule value setters into authored-token point events.
     pub fn to_work_module_set_events(&self) -> Vec<WorkModuleSetEvent> {
-        let mut hitboxes: Vec<Hitbox> = Vec::new();
-        let mut acc = WalkAccum::default();
-        eval_stmts(&self.stmts, 0.0, &mut hitboxes, &mut acc);
-        acc.work_module_sets
+        self.walk().work_module_sets
     }
 }
 
+/// `pub fn $name(&mut self, site) -> Option<&mut $call>`: the `ExcuteStmt::$variant` call an
+/// event site's ordinal refers to, in source order (see [`AcmdScript::excute_site_mut`]).
+macro_rules! excute_site_accessors {
+    ($($name:ident: $variant:ident => $call:ty;)*) => {$(
+        pub fn $name(&mut self, site: usize) -> Option<&mut $call> {
+            self.excute_site_mut(site, |stmt| match stmt {
+                ExcuteStmt::$variant(call) => Some(call),
+                _ => None,
+            })
+        }
+    )*};
+}
+
 impl AcmdScript {
+    /// The `site`-th call `pick` accepts, pre-order over the source with each `for` body
+    /// entered once — the ordinal [`WalkAccum::sites`] assigns. Counts calls both inside
+    /// `is_excute` blocks and bare.
+    fn excute_site_mut<T>(
+        &mut self,
+        site: usize,
+        pick: fn(&mut ExcuteStmt) -> Option<&mut T>,
+    ) -> Option<&mut T> {
+        fn walk<'a, T>(
+            stmts: &'a mut [AcmdStmt],
+            site: usize,
+            seen: &mut usize,
+            pick: fn(&mut ExcuteStmt) -> Option<&mut T>,
+        ) -> Option<&'a mut T> {
+            for stmt in stmts {
+                match stmt {
+                    AcmdStmt::Excute(inner) => {
+                        for call in inner.iter_mut().filter_map(pick) {
+                            if *seen == site {
+                                return Some(call);
+                            }
+                            *seen += 1;
+                        }
+                    }
+                    AcmdStmt::Bare(inner) => {
+                        if let Some(call) = pick(inner.as_mut()) {
+                            if *seen == site {
+                                return Some(call);
+                            }
+                            *seen += 1;
+                        }
+                    }
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
+                        if let Some(found) = walk(body, site, seen, pick) {
+                            return Some(found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        walk(&mut self.stmts, site, &mut 0, pick)
+    }
+
+    excute_site_accessors! {
+        expression_stmt_mut: Expression => ExpressionCall;
+        speed_ex_stmt_mut: SetSpeedEx => SetSpeedExCall;
+        set_speed_stmt_mut: SetSpeed => SetSpeedCall;
+        add_speed_no_limit_stmt_mut: AddSpeedNoLimit => AddSpeedNoLimitCall;
+        correct_stmt_mut: Correct => CorrectCall;
+        ft_catch_stop_stmt_mut: FtCatchStop => FtCatchStopCall;
+        ft_start_adjust_motion_frame_stmt_mut: FtStartAdjustMotionFrame => FtStartAdjustMotionFrameCall;
+        motion_module_set_rate_stmt_mut: MotionModuleSetRate => MotionModuleSetRateCall;
+        motion_module_set_helper_calculation_stmt_mut:
+            MotionModuleSetHelperCalculation => MotionModuleSetHelperCalculationCall;
+        motion_module_set_rate_partial_stmt_mut:
+            MotionModuleSetRatePartial => MotionModuleSetRatePartialCall;
+        motion_module_set_frame_partial_stmt_mut:
+            MotionModuleSetFramePartial => MotionModuleSetFramePartialCall;
+        clr_speed_stmt_mut: ClrSpeed => ClrSpeedCall;
+        change_kinetic_stmt_mut: ChangeKinetic => ChangeKineticCall;
+        kinetic_set_consider_ground_friction_stmt_mut:
+            KineticSetConsiderGroundFriction => KineticSetConsiderGroundFrictionCall;
+        kinetic_add_speed_stmt_mut: KineticAddSpeed => KineticAddSpeedCall;
+        kinetic_energy_stmt_mut: KineticEnergy => KineticEnergyCall;
+        work_flag_stmt_mut: WorkFlag => WorkFlagCall;
+        work_transition_term_stmt_mut: WorkTransitionTerm => WorkTransitionTermCall;
+        work_module_set_stmt_mut: WorkModuleSet => WorkModuleSetCall;
+        work_module_inc_int_stmt_mut: WorkModuleIncInt => WorkModuleIncIntCall;
+    }
+
     /// The hurtbox statement a span's [`site`](HurtboxState::site) refers to.
     ///
     /// Pre-order over the source with each `for` body entered exactly once, which is the
-    /// definition [`WalkAccum::next_site`] is written to reproduce. Editing through this is
+    /// definition [`WalkAccum::sites`] is written to reproduce. Editing through this is
     /// what makes a panel change reach the export: these statements are carried through the
     /// script rather than rebuilt from a list, so the script *is* the model.
     pub fn hurt_stmt_mut(&mut self, site: HurtSite) -> Option<&mut ExcuteStmt> {
@@ -3454,7 +5717,7 @@ impl AcmdScript {
 
     /// The sound call a [`SoundEvent::site`] refers to, for writing an edit back into the IR.
     ///
-    /// Walks the same shapes [`count_sound_stmts`] counts, in the same order — including `Bare`,
+    /// Walks the same shapes [`count_sites`] counts, in the same order — including `Bare`,
     /// which the two functions above genuinely do not have to handle: no hurtbox or attack
     /// modifier is ever written outside an `is_excute` block. `RawBlock` used to be listed here
     /// as a second such exemption and was not one — the two above skipped it while `eval_stmts`
@@ -3599,47 +5862,6 @@ impl AcmdScript {
         self.insert_flat_call_at_frame(frame, ExcuteStmt::Sound(call))
     }
 
-    /// The expression call an [`ExpressionEvent::site`] refers to, in source order.
-    pub fn expression_stmt_mut(&mut self, site: usize) -> Option<&mut ExpressionCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut ExpressionCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for expression in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::Expression(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(expression);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::Expression(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
     /// Whether an expression site is a flat, unconditional source call suitable for retiming.
     pub fn expression_site_is_flat(&self, site: usize) -> bool {
         fn walk(stmts: &[AcmdStmt], site: usize, seen: &mut usize, nested: bool) -> Option<bool> {
@@ -3753,810 +5975,6 @@ impl AcmdScript {
         self.stmts
             .insert(insert_at + 1, AcmdStmt::Excute(vec![call]));
         true
-    }
-
-    /// The `SET_SPEED_EX` call an event site's ordinal refers to, in source order.
-    pub fn speed_ex_stmt_mut(&mut self, site: usize) -> Option<&mut SetSpeedExCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut SetSpeedExCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::SetSpeedEx(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::SetSpeedEx(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `SET_SPEED` call an event site's ordinal refers to, in source order.
-    pub fn set_speed_stmt_mut(&mut self, site: usize) -> Option<&mut SetSpeedCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut SetSpeedCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::SetSpeed(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::SetSpeed(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `ADD_SPEED_NO_LIMIT` call an event site's ordinal refers to, in source order.
-    pub fn add_speed_no_limit_stmt_mut(&mut self, site: usize) -> Option<&mut AddSpeedNoLimitCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut AddSpeedNoLimitCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::AddSpeedNoLimit(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::AddSpeedNoLimit(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `CORRECT` call an event site's ordinal refers to, in source order.
-    pub fn correct_stmt_mut(&mut self, site: usize) -> Option<&mut CorrectCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut CorrectCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::Correct(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::Correct(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `FT_CATCH_STOP` call an event site's ordinal refers to, in source order.
-    pub fn ft_catch_stop_stmt_mut(&mut self, site: usize) -> Option<&mut FtCatchStopCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut FtCatchStopCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::FtCatchStop(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::FtCatchStop(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `FT_START_ADJUST_MOTION_FRAME_arg1` call an event site's ordinal refers to.
-    pub fn ft_start_adjust_motion_frame_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut FtStartAdjustMotionFrameCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut FtStartAdjustMotionFrameCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::FtStartAdjustMotionFrame(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::FtStartAdjustMotionFrame(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `MotionModule::set_rate` call an event site's ordinal refers to.
-    pub fn motion_module_set_rate_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut MotionModuleSetRateCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut MotionModuleSetRateCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::MotionModuleSetRate(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::MotionModuleSetRate(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `MotionModule::set_helper_calculation` call an event site's ordinal refers to.
-    pub fn motion_module_set_helper_calculation_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut MotionModuleSetHelperCalculationCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut MotionModuleSetHelperCalculationCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::MotionModuleSetHelperCalculation(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::MotionModuleSetHelperCalculation(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `MotionModule::set_rate_partial` call an event site's ordinal refers to.
-    pub fn motion_module_set_rate_partial_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut MotionModuleSetRatePartialCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut MotionModuleSetRatePartialCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::MotionModuleSetRatePartial(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::MotionModuleSetRatePartial(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `MotionModule::set_frame_partial` call an event site's ordinal refers to.
-    pub fn motion_module_set_frame_partial_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut MotionModuleSetFramePartialCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut MotionModuleSetFramePartialCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::MotionModuleSetFramePartial(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::MotionModuleSetFramePartial(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The `CLR_SPEED` call an event site's ordinal refers to.
-    pub fn clr_speed_stmt_mut(&mut self, site: usize) -> Option<&mut ClrSpeedCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut ClrSpeedCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::ClrSpeed(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::ClrSpeed(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `KineticModule::change_kinetic` call an event site's ordinal refers to.
-    pub fn change_kinetic_stmt_mut(&mut self, site: usize) -> Option<&mut ChangeKineticCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut ChangeKineticCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::ChangeKinetic(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::ChangeKinetic(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `KineticModule::set_consider_ground_friction` call an event site's ordinal
-    /// refers to.
-    pub fn kinetic_set_consider_ground_friction_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut KineticSetConsiderGroundFrictionCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut KineticSetConsiderGroundFrictionCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::KineticSetConsiderGroundFriction(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::KineticSetConsiderGroundFriction(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `KineticModule::add_speed` call an event site's ordinal refers to.
-    pub fn kinetic_add_speed_stmt_mut(&mut self, site: usize) -> Option<&mut KineticAddSpeedCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut KineticAddSpeedCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::KineticAddSpeed(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::KineticAddSpeed(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct kinetic-energy call an event site's ordinal refers to.
-    pub fn kinetic_energy_stmt_mut(&mut self, site: usize) -> Option<&mut KineticEnergyCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut KineticEnergyCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::KineticEnergy(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::KineticEnergy(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct WorkModule flag call an event site's ordinal refers to.
-    pub fn work_flag_stmt_mut(&mut self, site: usize) -> Option<&mut WorkFlagCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut WorkFlagCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::WorkFlag(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::WorkFlag(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct WorkModule transition-term call an event site's ordinal refers to.
-    pub fn work_transition_term_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut WorkTransitionTermCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut WorkTransitionTermCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::WorkTransitionTerm(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::WorkTransitionTerm(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct WorkModule value-set call an event site's ordinal refers to.
-    pub fn work_module_set_stmt_mut(&mut self, site: usize) -> Option<&mut WorkModuleSetCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut WorkModuleSetCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::WorkModuleSet(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::WorkModuleSet(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
-    }
-
-    /// The direct `WorkModule::inc_int` call an event site's ordinal refers to.
-    pub fn work_module_inc_int_stmt_mut(
-        &mut self,
-        site: usize,
-    ) -> Option<&mut WorkModuleIncIntCall> {
-        fn walk<'a>(
-            stmts: &'a mut [AcmdStmt],
-            site: usize,
-            seen: &mut usize,
-        ) -> Option<&'a mut WorkModuleIncIntCall> {
-            for stmt in stmts {
-                match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        for call in inner.iter_mut().filter_map(|stmt| match stmt {
-                            ExcuteStmt::WorkModuleIncInt(call) => Some(call),
-                            _ => None,
-                        }) {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Bare(inner) => {
-                        if let ExcuteStmt::WorkModuleIncInt(call) = inner.as_mut() {
-                            if *seen == site {
-                                return Some(call);
-                            }
-                            *seen += 1;
-                        }
-                    }
-                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                        if let Some(found) = walk(body, site, seen) {
-                            return Some(found);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            None
-        }
-        walk(&mut self.stmts, site, &mut 0)
     }
 
     /// Remove a `SET_AIR` source statement at its source ordinal.
@@ -5091,121 +6509,121 @@ struct WalkAccum {
     work_transition_terms: Vec<WorkTransitionTermEvent>,
     work_module_inc_ints: Vec<WorkModuleIncIntEvent>,
     work_module_sets: Vec<WorkModuleSetEvent>,
-    /// Site to hand to the next hurtbox statement encountered.
+    /// Next site per [`SiteFamily`], each family numbered independently.
     ///
     /// A *source* ordinal, not an execution counter: [`eval_stmts`] unrolls `for` bodies, and
     /// every iteration of a looped `HIT_NODE` is the same line in the file, so all of them must
     /// come back with the same site or an edit would land on whichever iteration was clicked.
-    next_site: usize,
-    /// Site for the next damage-reaction condition statement. Kept separate from hurtbox target
-    /// sites because the condition panel is read-only and must not shift editable HIT_NODE sites.
-    next_condition_site: usize,
-    /// Site for the next attack-modifier statement, counted separately — see [`AttackModSite`].
-    next_mod_site: usize,
-    /// Site for the next sound call, counted separately again — see [`SoundEvent::site`].
-    next_sound_site: usize,
-    /// Site for the next expression call, independent of every other family.
-    next_expression_site: usize,
-    /// Site for the next `REVERSE_LR`, independent of every other point-event family.
-    next_reverse_lr_site: usize,
-    /// Site for the next `SET_SPEED_EX`, independent of every other point-event family.
-    next_speed_ex_site: usize,
-    /// Site for the next `SET_SPEED`, independent of every other point-event family.
-    next_speed_site: usize,
-    /// Site for the next `ADD_SPEED_NO_LIMIT`, independent of every other point-event family.
-    next_add_speed_no_limit_site: usize,
-    /// Site for the next `CORRECT`, independent of every other point-event family.
-    next_correct_site: usize,
-    /// Site for the next `FT_CATCH_STOP`, independent of every other point-event family.
-    next_ft_catch_stop_site: usize,
-    /// Site for the next `FT_START_ADJUST_MOTION_FRAME_arg1`, independent of every other point
-    /// event family.
-    next_ft_start_adjust_motion_frame_site: usize,
-    /// Site for the next direct `MotionModule::set_rate`, independent of every other point
-    /// event family.
-    next_motion_module_set_rate_site: usize,
-    /// Site for the next direct `MotionModule::set_helper_calculation`, independent of every
-    /// other point event family.
-    next_motion_module_set_helper_calculation_site: usize,
-    /// Site for the next direct `MotionModule::set_rate_partial`, independent of every other
-    /// point event family.
-    next_motion_module_set_rate_partial_site: usize,
-    next_motion_module_set_frame_partial_site: usize,
-    /// Site for the next `CLR_SPEED`, independent of every other point event family.
-    next_clr_speed_site: usize,
-    /// Site for the next `SET_AIR`, independent of every other point event family.
-    next_set_air_site: usize,
-    /// Site for the next direct `KineticModule::clear_speed_all`, independent of every other
-    /// point event family.
-    next_kinetic_clear_speed_all_site: usize,
-    /// Site for the next direct `KineticModule::set_consider_ground_friction`, independent of
-    /// every other point event family.
-    next_kinetic_set_consider_ground_friction_site: usize,
-    /// Site for the next direct `KineticModule::change_kinetic`, independent of every other point
-    /// event family.
-    next_change_kinetic_site: usize,
-    /// Site for the next direct kinetic-energy toggle, independent of every other point event
-    /// family.
-    next_kinetic_energy_site: usize,
-    /// Site for the next direct `KineticModule::add_speed`, independent of every other point
-    /// event family.
-    next_kinetic_add_speed_site: usize,
-    /// Site for the next direct WorkModule flag call, independent of every other point event
-    /// family.
-    next_work_flag_site: usize,
-    /// Site for the next direct WorkModule transition-term call, independent of every other
-    /// point event family.
-    next_work_transition_term_site: usize,
-    /// Site for the next direct `WorkModule::inc_int`, independent of every other point event
-    /// family.
-    next_work_module_inc_int_site: usize,
-    /// Site for the next direct WorkModule value-set call, independent of every other point
-    /// event family.
-    next_work_module_set_site: usize,
+    /// Families never share a counter: a sound site must not shift because the script gained a
+    /// `HIT_NODE`, and the read-only condition panel must not shift editable hurtbox sites.
+    sites: [usize; SITE_FAMILIES],
 }
 
-/// Hurtbox statements in a subtree, counted in source order.
-///
-/// Used to step [`WalkAccum::next_site`] over a `for` body whose count is zero, so that a
-/// statement *after* an empty loop still gets the ordinal a plain pre-order walk of the source
-/// would give it. Without this the two definitions of "site" diverge exactly when a loop runs
-/// no iterations, and the editor would resolve a site to the wrong line.
-///
-/// Counts [`AcmdStmt::RawBlock`] for the reason [`count_sound_stmts`] gives — [`eval_stmts`]
-/// descends into a runtime branch, so a hurtbox inside one takes a site. This arm was missing
-/// until B6, and the corpus could not have found it: **no** hurtbox statement anywhere in the
-/// cache sits inside a raw block, against 26 sounds that do. It is reachable from a user's own
-/// script, where an `if` around a `HIT_NODE` is nothing unusual.
-fn count_hurt_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner.iter().filter(|s| is_hurt_stmt(s)).count(),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => count_hurt_stmts(body),
-            _ => 0,
+/// The independent source-ordinal spaces a script walk numbers statements in.
+#[derive(Clone, Copy)]
+enum SiteFamily {
+    Hurt,
+    Condition,
+    AttackMod,
+    Sound,
+    Expression,
+    ReverseLr,
+    SpeedEx,
+    Speed,
+    AddSpeedNoLimit,
+    Correct,
+    FtCatchStop,
+    FtStartAdjustMotionFrame,
+    MotionModuleSetRate,
+    MotionModuleSetHelperCalculation,
+    MotionModuleSetRatePartial,
+    MotionModuleSetFramePartial,
+    ClrSpeed,
+    SetAir,
+    KineticClearSpeedAll,
+    KineticSetConsiderGroundFriction,
+    ChangeKinetic,
+    KineticEnergy,
+    KineticAddSpeed,
+    WorkFlag,
+    WorkTransitionTerm,
+    WorkModuleIncInt,
+    WorkModuleSet,
+}
+
+const SITE_FAMILIES: usize = SiteFamily::WorkModuleSet as usize + 1;
+
+impl SiteFamily {
+    /// The family whose site `stmt` consumes, if any. Families are disjoint.
+    fn of(stmt: &ExcuteStmt) -> Option<Self> {
+        Some(match stmt {
+            s if is_hurt_stmt(s) => Self::Hurt,
+            ExcuteStmt::DamageNoReaction(_) => Self::Condition,
+            s if is_attack_mod_stmt(s) => Self::AttackMod,
+            s if is_sound_stmt(s) => Self::Sound,
+            s if is_expression_stmt(s) => Self::Expression,
+            ExcuteStmt::ReverseLr => Self::ReverseLr,
+            ExcuteStmt::SetSpeedEx(_) => Self::SpeedEx,
+            ExcuteStmt::SetSpeed(_) => Self::Speed,
+            ExcuteStmt::AddSpeedNoLimit(_) => Self::AddSpeedNoLimit,
+            ExcuteStmt::Correct(_) => Self::Correct,
+            ExcuteStmt::FtCatchStop(_) => Self::FtCatchStop,
+            ExcuteStmt::FtStartAdjustMotionFrame(_) => Self::FtStartAdjustMotionFrame,
+            ExcuteStmt::MotionModuleSetRate(_) => Self::MotionModuleSetRate,
+            ExcuteStmt::MotionModuleSetHelperCalculation(_) => {
+                Self::MotionModuleSetHelperCalculation
+            }
+            ExcuteStmt::MotionModuleSetRatePartial(_) => Self::MotionModuleSetRatePartial,
+            ExcuteStmt::MotionModuleSetFramePartial(_) => Self::MotionModuleSetFramePartial,
+            ExcuteStmt::ClrSpeed(_) => Self::ClrSpeed,
+            ExcuteStmt::SetAir => Self::SetAir,
+            ExcuteStmt::KineticClearSpeedAll => Self::KineticClearSpeedAll,
+            ExcuteStmt::KineticSetConsiderGroundFriction(_) => {
+                Self::KineticSetConsiderGroundFriction
+            }
+            ExcuteStmt::ChangeKinetic(_) => Self::ChangeKinetic,
+            ExcuteStmt::KineticEnergy(_) => Self::KineticEnergy,
+            ExcuteStmt::KineticAddSpeed(_) => Self::KineticAddSpeed,
+            ExcuteStmt::WorkFlag(_) => Self::WorkFlag,
+            ExcuteStmt::WorkTransitionTerm(_) => Self::WorkTransitionTerm,
+            ExcuteStmt::WorkModuleIncInt(_) => Self::WorkModuleIncInt,
+            ExcuteStmt::WorkModuleSet(_) => Self::WorkModuleSet,
+            _ => return None,
         })
-        .sum()
+    }
+
+    /// Whether a bare (non-`is_excute`) statement is counted when stepping over a loop body.
+    /// Hurtbox and attack-modifier sites only ever count statements inside `is_excute`.
+    fn counts_bare(self) -> bool {
+        !matches!(self, Self::Hurt | Self::AttackMod)
+    }
 }
 
-/// Damage-reaction condition statements in a subtree, counted in source order for loop site
-/// resolution. This numbering is intentionally independent of editable HIT_NODE sites.
-fn count_condition_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|statement| matches!(statement, ExcuteStmt::DamageNoReaction(_)))
-                .count(),
+/// Add every family's statements in a subtree to `sites`, counted once in source order.
+///
+/// Steps the site cursor over a `for` body however many times it ran, so a statement *after*
+/// the loop gets the ordinal a plain pre-order walk of the source would give it — including
+/// when the loop ran zero times. Descends into [`AcmdStmt::RawBlock`] because [`eval_stmts`]
+/// does: a statement inside a runtime branch takes a site.
+fn count_sites(stmts: &[AcmdStmt], sites: &mut [usize; SITE_FAMILIES]) {
+    for stmt in stmts {
+        match stmt {
+            AcmdStmt::Excute(inner) => {
+                for family in inner.iter().filter_map(SiteFamily::of) {
+                    sites[family as usize] += 1;
+                }
+            }
             AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::DamageNoReaction(_)))
+                if let Some(family) = SiteFamily::of(inner).filter(|f| f.counts_bare()) {
+                    sites[family as usize] += 1;
+                }
             }
             AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_condition_stmts(body)
+                count_sites(body, sites)
             }
-            _ => 0,
-        })
-        .sum()
+            _ => {}
+        }
+    }
 }
 
 /// Does this statement consume a hurtbox site?
@@ -5228,31 +6646,6 @@ fn is_attack_mod_stmt(stmt: &ExcuteStmt) -> bool {
     matches!(stmt, ExcuteStmt::AttackMod { .. })
 }
 
-/// Sound calls in a subtree, counted in source order.
-///
-/// Serves [`WalkAccum::next_sound_site`] the way [`count_hurt_stmts`] serves `next_site`, with
-/// one difference that is not cosmetic: it counts [`AcmdStmt::Bare`] as well as
-/// [`AcmdStmt::Excute`]. Fifteen corpus scripts write a sound outside every `is_excute` block,
-/// so a count that saw only wrapped calls would under-count a body and mis-number every site
-/// after the loop containing it.
-///
-/// [`AcmdStmt::RawBlock`] is counted for the same reason: [`eval_stmts`] walks a raw block's
-/// body, so a sound inside one takes a site, and a count that disagreed with the walk is the
-/// bug this function exists to prevent.
-fn count_sound_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner.iter().filter(|s| is_sound_stmt(s)).count(),
-            AcmdStmt::Bare(inner) => usize::from(is_sound_stmt(inner)),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_sound_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
 /// Does this statement consume a sound site?
 fn is_sound_stmt(stmt: &ExcuteStmt) -> bool {
     matches!(stmt, ExcuteStmt::Sound(_))
@@ -5263,494 +6656,10 @@ fn is_expression_stmt(stmt: &ExcuteStmt) -> bool {
     matches!(stmt, ExcuteStmt::Expression(_))
 }
 
-/// Expression calls in a subtree, counted in source order for loop/site resolution.
-fn count_expression_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner.iter().filter(|s| is_expression_stmt(s)).count(),
-            AcmdStmt::Bare(inner) => usize::from(is_expression_stmt(inner)),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_expression_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `REVERSE_LR` calls in a subtree, counted in source order for loop/site resolution.
-fn count_reverse_lr_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::ReverseLr))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::ReverseLr)),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_reverse_lr_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `SET_SPEED_EX` calls in a subtree, counted in source order for loop/site resolution.
-fn count_speed_ex_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::SetSpeedEx(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::SetSpeedEx(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_speed_ex_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `SET_SPEED` calls in a subtree, counted in source order for loop/site resolution.
-fn count_speed_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::SetSpeed(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::SetSpeed(_))),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_speed_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `ADD_SPEED_NO_LIMIT` calls in a subtree, counted in source order for loop/site resolution.
-fn count_add_speed_no_limit_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::AddSpeedNoLimit(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::AddSpeedNoLimit(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_add_speed_no_limit_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `CORRECT` calls in a subtree, counted in source order for loop/site resolution.
-fn count_correct_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::Correct(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::Correct(_))),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_correct_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `FT_CATCH_STOP` calls in a subtree, counted in source order for loop/site resolution.
-fn count_ft_catch_stop_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::FtCatchStop(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::FtCatchStop(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_ft_catch_stop_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `FT_START_ADJUST_MOTION_FRAME_arg1` calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_ft_start_adjust_motion_frame_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::FtStartAdjustMotionFrame(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(
-                inner.as_ref(),
-                ExcuteStmt::FtStartAdjustMotionFrame(_)
-            )),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_ft_start_adjust_motion_frame_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `MotionModule::set_rate` calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_motion_module_set_rate_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::MotionModuleSetRate(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::MotionModuleSetRate(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_motion_module_set_rate_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `MotionModule::set_helper_calculation` calls in a subtree, counted in source order for
-/// loop/site resolution.
-fn count_motion_module_set_helper_calculation_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::MotionModuleSetHelperCalculation(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(
-                inner.as_ref(),
-                ExcuteStmt::MotionModuleSetHelperCalculation(_)
-            )),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_motion_module_set_helper_calculation_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `MotionModule::set_rate_partial` calls in a subtree, counted in source order for
-/// loop/site resolution.
-fn count_motion_module_set_rate_partial_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::MotionModuleSetRatePartial(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(
-                inner.as_ref(),
-                ExcuteStmt::MotionModuleSetRatePartial(_)
-            )),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_motion_module_set_rate_partial_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `MotionModule::set_frame_partial` calls in a subtree, counted in source order for
-/// loop/site resolution.
-fn count_motion_module_set_frame_partial_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::MotionModuleSetFramePartial(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(
-                inner.as_ref(),
-                ExcuteStmt::MotionModuleSetFramePartial(_)
-            )),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_motion_module_set_frame_partial_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `CLR_SPEED` calls in a subtree, counted in source order for loop/site resolution.
-fn count_clr_speed_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::ClrSpeed(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::ClrSpeed(_))),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_clr_speed_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// `SET_AIR` calls in a subtree, counted in source order for loop/site resolution.
-fn count_set_air_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::SetAir))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::SetAir)),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_set_air_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `KineticModule::clear_speed_all` calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_kinetic_clear_speed_all_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::KineticClearSpeedAll))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::KineticClearSpeedAll))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_kinetic_clear_speed_all_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `KineticModule::set_consider_ground_friction` calls in a subtree, counted in source
-/// order for loop/site resolution.
-fn count_kinetic_set_consider_ground_friction_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::KineticSetConsiderGroundFriction(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(
-                inner.as_ref(),
-                ExcuteStmt::KineticSetConsiderGroundFriction(_)
-            )),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_kinetic_set_consider_ground_friction_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct kinetic-type changes in a subtree, counted in source order for loop/site resolution.
-fn count_change_kinetic_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::ChangeKinetic(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::ChangeKinetic(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_change_kinetic_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct kinetic-vector additions in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_kinetic_add_speed_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::KineticAddSpeed(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::KineticAddSpeed(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_kinetic_add_speed_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct kinetic-energy toggles in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_kinetic_energy_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::KineticEnergy(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::KineticEnergy(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_kinetic_energy_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct WorkModule flag calls in a subtree, counted in source order for loop/site resolution.
-fn count_work_flag_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::WorkFlag(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::WorkFlag(_))),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_work_flag_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct WorkModule transition-term calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_work_transition_term_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::WorkTransitionTerm(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::WorkTransitionTerm(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_work_transition_term_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct `WorkModule::inc_int` calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_work_module_inc_int_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::WorkModuleIncInt(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::WorkModuleIncInt(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_work_module_inc_int_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Direct WorkModule value-set calls in a subtree, counted in source order for loop/site
-/// resolution.
-fn count_work_module_set_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner
-                .iter()
-                .filter(|s| matches!(s, ExcuteStmt::WorkModuleSet(_)))
-                .count(),
-            AcmdStmt::Bare(inner) => {
-                usize::from(matches!(inner.as_ref(), ExcuteStmt::WorkModuleSet(_)))
-            }
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_work_module_set_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Attack-modifier statements in a subtree, counted in source order.
-///
-/// The [`count_hurt_stmts`] argument applies unchanged, including its `RawBlock` arm and the
-/// reason that arm cannot be justified from the corpus: a zero-iteration `for` still has to step
-/// the cursor over its body, or a statement after it resolves to the wrong line.
-fn count_attack_mod_stmts(stmts: &[AcmdStmt]) -> usize {
-    stmts
-        .iter()
-        .map(|stmt| match stmt {
-            AcmdStmt::Excute(inner) => inner.iter().filter(|s| is_attack_mod_stmt(s)).count(),
-            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => {
-                count_attack_mod_stmts(body)
-            }
-            _ => 0,
-        })
-        .sum()
-}
-
 impl WalkAccum {
-    fn take_site(&mut self) -> usize {
-        let site = self.next_site;
-        self.next_site += 1;
-        site
-    }
-
-    fn take_condition_site(&mut self) -> usize {
-        let site = self.next_condition_site;
-        self.next_condition_site += 1;
+    fn take(&mut self, family: SiteFamily) -> usize {
+        let site = self.sites[family as usize];
+        self.sites[family as usize] += 1;
         site
     }
 
@@ -5831,156 +6740,6 @@ impl WalkAccum {
         }
     }
 
-    fn take_mod_site(&mut self) -> usize {
-        let site = self.next_mod_site;
-        self.next_mod_site += 1;
-        site
-    }
-
-    fn take_sound_site(&mut self) -> usize {
-        let site = self.next_sound_site;
-        self.next_sound_site += 1;
-        site
-    }
-
-    fn take_expression_site(&mut self) -> usize {
-        let site = self.next_expression_site;
-        self.next_expression_site += 1;
-        site
-    }
-
-    fn take_reverse_lr_site(&mut self) -> usize {
-        let site = self.next_reverse_lr_site;
-        self.next_reverse_lr_site += 1;
-        site
-    }
-
-    fn take_speed_ex_site(&mut self) -> usize {
-        let site = self.next_speed_ex_site;
-        self.next_speed_ex_site += 1;
-        site
-    }
-
-    fn take_speed_site(&mut self) -> usize {
-        let site = self.next_speed_site;
-        self.next_speed_site += 1;
-        site
-    }
-
-    fn take_add_speed_no_limit_site(&mut self) -> usize {
-        let site = self.next_add_speed_no_limit_site;
-        self.next_add_speed_no_limit_site += 1;
-        site
-    }
-
-    fn take_correct_site(&mut self) -> usize {
-        let site = self.next_correct_site;
-        self.next_correct_site += 1;
-        site
-    }
-
-    fn take_ft_catch_stop_site(&mut self) -> usize {
-        let site = self.next_ft_catch_stop_site;
-        self.next_ft_catch_stop_site += 1;
-        site
-    }
-
-    fn take_ft_start_adjust_motion_frame_site(&mut self) -> usize {
-        let site = self.next_ft_start_adjust_motion_frame_site;
-        self.next_ft_start_adjust_motion_frame_site += 1;
-        site
-    }
-
-    fn take_motion_module_set_rate_site(&mut self) -> usize {
-        let site = self.next_motion_module_set_rate_site;
-        self.next_motion_module_set_rate_site += 1;
-        site
-    }
-
-    fn take_motion_module_set_helper_calculation_site(&mut self) -> usize {
-        let site = self.next_motion_module_set_helper_calculation_site;
-        self.next_motion_module_set_helper_calculation_site += 1;
-        site
-    }
-
-    fn take_motion_module_set_rate_partial_site(&mut self) -> usize {
-        let site = self.next_motion_module_set_rate_partial_site;
-        self.next_motion_module_set_rate_partial_site += 1;
-        site
-    }
-
-    fn take_motion_module_set_frame_partial_site(&mut self) -> usize {
-        let site = self.next_motion_module_set_frame_partial_site;
-        self.next_motion_module_set_frame_partial_site += 1;
-        site
-    }
-
-    fn take_clr_speed_site(&mut self) -> usize {
-        let site = self.next_clr_speed_site;
-        self.next_clr_speed_site += 1;
-        site
-    }
-
-    fn take_set_air_site(&mut self) -> usize {
-        let site = self.next_set_air_site;
-        self.next_set_air_site += 1;
-        site
-    }
-
-    fn take_kinetic_clear_speed_all_site(&mut self) -> usize {
-        let site = self.next_kinetic_clear_speed_all_site;
-        self.next_kinetic_clear_speed_all_site += 1;
-        site
-    }
-
-    fn take_kinetic_set_consider_ground_friction_site(&mut self) -> usize {
-        let site = self.next_kinetic_set_consider_ground_friction_site;
-        self.next_kinetic_set_consider_ground_friction_site += 1;
-        site
-    }
-
-    fn take_change_kinetic_site(&mut self) -> usize {
-        let site = self.next_change_kinetic_site;
-        self.next_change_kinetic_site += 1;
-        site
-    }
-
-    fn take_kinetic_add_speed_site(&mut self) -> usize {
-        let site = self.next_kinetic_add_speed_site;
-        self.next_kinetic_add_speed_site += 1;
-        site
-    }
-
-    fn take_kinetic_energy_site(&mut self) -> usize {
-        let site = self.next_kinetic_energy_site;
-        self.next_kinetic_energy_site += 1;
-        site
-    }
-
-    fn take_work_flag_site(&mut self) -> usize {
-        let site = self.next_work_flag_site;
-        self.next_work_flag_site += 1;
-        site
-    }
-
-    fn take_work_transition_term_site(&mut self) -> usize {
-        let site = self.next_work_transition_term_site;
-        self.next_work_transition_term_site += 1;
-        site
-    }
-
-    fn take_work_module_inc_int_site(&mut self) -> usize {
-        let site = self.next_work_module_inc_int_site;
-        self.next_work_module_inc_int_site += 1;
-        site
-    }
-
-    fn take_work_module_set_site(&mut self) -> usize {
-        let site = self.next_work_module_set_site;
-        self.next_work_module_set_site += 1;
-        site
-    }
-
     /// Record a modifier. There is nothing to close: these are point events, and no macro takes
     /// one back, so a span here would be invented rather than read.
     fn add_mod(&mut self, kind: AttackModKind, id: i64, value: f32, frame: u32, site: usize) {
@@ -6012,6 +6771,18 @@ fn record_raw_partial_frame(line: &str, frame: f32, hurt: &mut WalkAccum) {
 /// Split out of [`eval_stmts`] when [`AcmdStmt::Bare`] arrived so both routes share one
 /// implementation. A second copy for the bare case would be a rule about what a command does
 /// that depends on whether the author wrapped it, which is not a rule the game has.
+/// Record a point event of `$family` at `$frame`, taking the family's next source site.
+macro_rules! point_event {
+    ($acc:ident, $family:ident, $list:ident, $event:ident, $frame:expr $(, $call:ident)?) => {{
+        let site = $acc.take(SiteFamily::$family);
+        $acc.$list.push($event {
+            frame: script_frame($frame),
+            $(call: $call.clone(),)?
+            site,
+        });
+    }};
+}
+
 fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt: &mut WalkAccum) {
     match s {
         ExcuteStmt::Attack(call) => {
@@ -6123,6 +6894,9 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
             }
             hitboxes.push(call.to_hitbox(spawn));
         }
+        // The bundled throw-target reads and application call remain source-only. The flat
+        // move model has no measured representation for the native target tuple or its effects.
+        ExcuteStmt::AttackAbsApplyThrow => {}
         // Deliberately not ended by any clear. `AttackModule::clear_all` does
         // not touch a search volume, and none of the 7 corpus scripts contains
         // a clear of any kind for one — the two that do end (kirby's inhale)
@@ -6146,7 +6920,7 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
             hitboxes.push(call.to_hitbox(spawn));
         }
         ExcuteStmt::HitStatus { target, status } => {
-            let site = hurt.take_site();
+            let site = hurt.take(SiteFamily::Hurt);
             let frame = script_frame(frame);
             hurt.set_status(target, status, frame, site);
             hurt.events.push(HurtboxEvent::Set {
@@ -6157,7 +6931,7 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
             });
         }
         ExcuteStmt::HitResetAll => {
-            hurt.take_site();
+            hurt.take(SiteFamily::Hurt);
             let frame = script_frame(frame);
             hurt.reset_all(frame);
             hurt.events.push(HurtboxEvent::ResetAll {
@@ -6166,7 +6940,7 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
             });
         }
         ExcuteStmt::DamageNoReaction(call) => {
-            let site = hurt.take_condition_site();
+            let site = hurt.take(SiteFamily::Condition);
             let frame = script_frame(frame);
             let condition = call.condition();
             hurt.set_condition(condition.clone(), frame, site);
@@ -6177,219 +6951,213 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
             });
         }
         ExcuteStmt::ColPri(pri) => {
-            let site = hurt.take_site();
+            let site = hurt.take(SiteFamily::Hurt);
             hurt.set_pri(*pri, script_frame(frame), site);
         }
         ExcuteStmt::ColNormal => {
-            hurt.take_site();
+            hurt.take(SiteFamily::Hurt);
             hurt.close_pri(script_frame(frame));
         }
+        // Slope is a source-only presentation call here; it does not alter the hitbox/hurtbox
+        // live model and has no corresponding live-move rule.
+        ExcuteStmt::Slope(_) => {}
+        // Item visibility is source-only presentation state as well; the flat live move model
+        // has no safe way to replay native ItemModule writes.
+        ExcuteStmt::ItemVisibility { .. } => {}
+        // Item firing remains in its ACMD source; the flattened hitbox model has no equivalent.
+        ExcuteStmt::ShootItemBullet | ExcuteStmt::NativeCall(_) | ExcuteStmt::Effect(_) => {}
+        // The start-info eye flash is a closed source-only point call with no live-model effect.
+        ExcuteStmt::StartInfoFlashEye => {}
+        // Camera zoom-out remains a point in ACMD source; the flattened live model cannot replay it.
+        ExcuteStmt::CameraZoomOut => {}
+        // These calls are source-only; no camera, collision, or hitbox effect is replayed here.
+        ExcuteStmt::StartCutIn | ExcuteStmt::CaptureCutCommon => {}
+        // Jostle and model visibility mutate native presentation/collision state that is not
+        // represented by the flattened live move protocol.
+        ExcuteStmt::JostleSetStatus { .. }
+        | ExcuteStmt::FixedJostleArea(_)
+        | ExcuteStmt::VisibilitySetInt64 { .. }
+        | ExcuteStmt::VisibilitySetDefaultInt64 { .. }
+        | ExcuteStmt::VisibilitySetWhole { .. }
+        | ExcuteStmt::AttackModuleSetAll { .. }
+        | ExcuteStmt::AttackModuleSetIndexed { .. }
+        | ExcuteStmt::AttackModuleSetHeightAll { .. }
+        | ExcuteStmt::AttackModuleSetFinalFinishCutIn { .. }
+        | ExcuteStmt::AttackModuleInitAttackPos { .. }
+        | ExcuteStmt::AttackModuleSetAttackReferenceJointId { .. }
+        | ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll { .. }
+        | ExcuteStmt::AttackModuleSetDamageShakeScale(_)
+        | ExcuteStmt::AttackModuleSetNoUniqEffectAll(_)
+        | ExcuteStmt::AttackModuleSetTargetCategory(_)
+        | ExcuteStmt::HitModuleSetStatusAllNormal
+        | ExcuteStmt::AttackModuleSetSize(_)
+        | ExcuteStmt::AttackModuleSetVecTargetPos(_)
+        | ExcuteStmt::OptionalHitFeedback(_)
+        | ExcuteStmt::CheckFinishCamera(_)
+        | ExcuteStmt::CheckFinalStartCamera(_)
+        | ExcuteStmt::FinalFearFace(_)
+        | ExcuteStmt::AttackModuleAddReactionFrame { .. }
+        | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
+        | ExcuteStmt::GrabRebound { .. } => {}
+        // Article creation/removal stays in source. The flat live move protocol has no safe
+        // ordering/ownership representation for native article lifecycle changes.
+        ExcuteStmt::ArticleLifecycle(_)
+        | ExcuteStmt::GimmickEvent { .. }
+        | ExcuteStmt::GimmickChartEvent { .. }
+        | ExcuteStmt::GimmickChartEventValues { .. } => {}
         ExcuteStmt::AttackMod { kind, id, value } => {
-            let site = hurt.take_mod_site();
+            let site = hurt.take(SiteFamily::AttackMod);
             hurt.add_mod(*kind, *id, *value, script_frame(frame), site);
         }
-        ExcuteStmt::Sound(call) => {
-            let site = hurt.take_sound_site();
-            hurt.sounds.push(SoundEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
+        ExcuteStmt::Sound(call) => point_event!(hurt, Sound, sounds, SoundEvent, frame, call),
         ExcuteStmt::Expression(call) => {
-            let site = hurt.take_expression_site();
-            hurt.expressions.push(ExpressionEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
+            point_event!(hurt, Expression, expressions, ExpressionEvent, frame, call)
         }
-        ExcuteStmt::ReverseLr => {
-            let site = hurt.take_reverse_lr_site();
-            hurt.reverse_lrs.push(ReverseLrEvent {
-                frame: script_frame(frame),
-                site,
-            });
-        }
+        ExcuteStmt::ReverseLr => point_event!(hurt, ReverseLr, reverse_lrs, ReverseLrEvent, frame),
         ExcuteStmt::SetSpeedEx(call) => {
-            let site = hurt.take_speed_ex_site();
-            hurt.speed_exs.push(SetSpeedExEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
+            point_event!(hurt, SpeedEx, speed_exs, PointEvent, frame, call)
         }
-        ExcuteStmt::SetSpeed(call) => {
-            let site = hurt.take_speed_site();
-            hurt.speeds.push(SetSpeedEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::AddSpeedNoLimit(call) => {
-            let site = hurt.take_add_speed_no_limit_site();
-            hurt.add_speed_no_limits.push(AddSpeedNoLimitEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::Correct(call) => {
-            let site = hurt.take_correct_site();
-            hurt.corrects.push(CorrectEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
+        ExcuteStmt::SetSpeed(call) => point_event!(hurt, Speed, speeds, PointEvent, frame, call),
+        ExcuteStmt::AddSpeedNoLimit(call) => point_event!(
+            hurt,
+            AddSpeedNoLimit,
+            add_speed_no_limits,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::Correct(call) => point_event!(hurt, Correct, corrects, PointEvent, frame, call),
         ExcuteStmt::FtCatchStop(call) => {
-            let site = hurt.take_ft_catch_stop_site();
-            hurt.ft_catch_stops.push(FtCatchStopEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
+            point_event!(hurt, FtCatchStop, ft_catch_stops, PointEvent, frame, call)
         }
-        ExcuteStmt::FtStartAdjustMotionFrame(call) => {
-            let site = hurt.take_ft_start_adjust_motion_frame_site();
-            hurt.ft_start_adjust_motion_frames
-                .push(FtStartAdjustMotionFrameEvent {
-                    frame: script_frame(frame),
-                    call: call.clone(),
-                    site,
-                });
-        }
-        ExcuteStmt::MotionModuleSetRate(call) => {
-            let site = hurt.take_motion_module_set_rate_site();
-            hurt.motion_module_set_rates.push(MotionModuleSetRateEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::MotionModuleSetHelperCalculation(call) => {
-            let site = hurt.take_motion_module_set_helper_calculation_site();
-            hurt.motion_module_set_helper_calculations.push(
-                MotionModuleSetHelperCalculationEvent {
-                    frame: script_frame(frame),
-                    call: call.clone(),
-                    site,
-                },
-            );
-        }
-        ExcuteStmt::MotionModuleSetRatePartial(call) => {
-            let site = hurt.take_motion_module_set_rate_partial_site();
-            hurt.motion_module_set_rate_partials
-                .push(MotionModuleSetRatePartialEvent {
-                    frame: script_frame(frame),
-                    call: call.clone(),
-                    site,
-                });
-        }
-        ExcuteStmt::MotionModuleSetFramePartial(call) => {
-            let site = hurt.take_motion_module_set_frame_partial_site();
-            hurt.motion_module_set_frame_partials
-                .push(MotionModuleSetFramePartialEvent {
-                    frame: script_frame(frame),
-                    call: call.clone(),
-                    site,
-                });
-        }
+        ExcuteStmt::FtStartAdjustMotionFrame(call) => point_event!(
+            hurt,
+            FtStartAdjustMotionFrame,
+            ft_start_adjust_motion_frames,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::MotionModuleSetRate(call) => point_event!(
+            hurt,
+            MotionModuleSetRate,
+            motion_module_set_rates,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::MotionModuleSetHelperCalculation(call) => point_event!(
+            hurt,
+            MotionModuleSetHelperCalculation,
+            motion_module_set_helper_calculations,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::MotionModuleSetRatePartial(call) => point_event!(
+            hurt,
+            MotionModuleSetRatePartial,
+            motion_module_set_rate_partials,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::MotionModuleSetFramePartial(call) => point_event!(
+            hurt,
+            MotionModuleSetFramePartial,
+            motion_module_set_frame_partials,
+            PointEvent,
+            frame,
+            call
+        ),
         ExcuteStmt::ClrSpeed(call) => {
-            let site = hurt.take_clr_speed_site();
-            hurt.clr_speeds.push(ClrSpeedEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
+            point_event!(hurt, ClrSpeed, clr_speeds, PointEvent, frame, call)
         }
-        ExcuteStmt::SetAir => {
-            let site = hurt.take_set_air_site();
-            hurt.set_airs.push(SetAirEvent {
-                frame: script_frame(frame),
-                site,
-            });
-        }
-        ExcuteStmt::KineticClearSpeedAll => {
-            let site = hurt.take_kinetic_clear_speed_all_site();
-            hurt.kinetic_clear_speed_alls
-                .push(KineticClearSpeedAllEvent {
-                    frame: script_frame(frame),
-                    site,
-                });
-        }
-        ExcuteStmt::KineticSetConsiderGroundFriction(call) => {
-            let site = hurt.take_kinetic_set_consider_ground_friction_site();
-            hurt.kinetic_set_consider_ground_frictions.push(
-                KineticSetConsiderGroundFrictionEvent {
-                    frame: script_frame(frame),
-                    call: call.clone(),
-                    site,
-                },
-            );
-        }
-        ExcuteStmt::ChangeKinetic(call) => {
-            let site = hurt.take_change_kinetic_site();
-            hurt.change_kinetics.push(ChangeKineticEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::KineticAddSpeed(call) => {
-            let site = hurt.take_kinetic_add_speed_site();
-            hurt.kinetic_add_speeds.push(KineticAddSpeedEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::KineticEnergy(call) => {
-            let site = hurt.take_kinetic_energy_site();
-            hurt.kinetic_energies.push(KineticEnergyEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
+        ExcuteStmt::SetAir => point_event!(hurt, SetAir, set_airs, SetAirEvent, frame),
+        ExcuteStmt::KineticClearSpeedAll => point_event!(
+            hurt,
+            KineticClearSpeedAll,
+            kinetic_clear_speed_alls,
+            KineticClearSpeedAllEvent,
+            frame
+        ),
+        ExcuteStmt::KineticSetConsiderGroundFriction(call) => point_event!(
+            hurt,
+            KineticSetConsiderGroundFriction,
+            kinetic_set_consider_ground_frictions,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::ChangeKinetic(call) => point_event!(
+            hurt,
+            ChangeKinetic,
+            change_kinetics,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::KineticAddSpeed(call) => point_event!(
+            hurt,
+            KineticAddSpeed,
+            kinetic_add_speeds,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::KineticEnergy(call) => point_event!(
+            hurt,
+            KineticEnergy,
+            kinetic_energies,
+            PointEvent,
+            frame,
+            call
+        ),
         ExcuteStmt::WorkFlag(call) => {
-            let site = hurt.take_work_flag_site();
-            hurt.work_flags.push(WorkFlagEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
+            point_event!(hurt, WorkFlag, work_flags, PointEvent, frame, call)
         }
-        ExcuteStmt::WorkTransitionTerm(call) => {
-            let site = hurt.take_work_transition_term_site();
-            hurt.work_transition_terms.push(WorkTransitionTermEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::WorkModuleIncInt(call) => {
-            let site = hurt.take_work_module_inc_int_site();
-            hurt.work_module_inc_ints.push(WorkModuleIncIntEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
-        ExcuteStmt::WorkModuleSet(call) => {
-            let site = hurt.take_work_module_set_site();
-            hurt.work_module_sets.push(WorkModuleSetEvent {
-                frame: script_frame(frame),
-                call: call.clone(),
-                site,
-            });
-        }
+        ExcuteStmt::WorkTransitionTerm(call) => point_event!(
+            hurt,
+            WorkTransitionTerm,
+            work_transition_terms,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::WorkModuleIncInt(call) => point_event!(
+            hurt,
+            WorkModuleIncInt,
+            work_module_inc_ints,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::WorkModuleSet(call) => point_event!(
+            hurt,
+            WorkModuleSet,
+            work_module_sets,
+            PointEvent,
+            frame,
+            call
+        ),
+        ExcuteStmt::SlowWhole(_) | ExcuteStmt::SlowOpponent(_) => {}
         ExcuteStmt::Raw(line) => record_raw_partial_frame(line, frame, hurt),
     }
 }
 
 fn eval_stmts(
+    stmts: &[AcmdStmt],
+    start_frame: f32,
+    hitboxes: &mut Vec<Hitbox>,
+    hurt: &mut WalkAccum,
+) -> f32 {
+    if acmd_preview_budget_error(stmts).is_some() {
+        return start_frame;
+    }
+    eval_stmts_unchecked(stmts, start_frame, hitboxes, hurt)
+}
+
+fn eval_stmts_unchecked(
     stmts: &[AcmdStmt],
     start_frame: f32,
     hitboxes: &mut Vec<Hitbox>,
@@ -6406,6 +7174,9 @@ fn eval_stmts(
             // see [`game_frame_spans`] — and applying it here would move every hitbox to a
             // frame its own source does not mention.
             AcmdStmt::WaitLoopClear | AcmdStmt::MotionRate(_) => {}
+            // Kept in structured source. This preview does not simulate the native
+            // execute scheduler or reinterpret it as frame()/wait().
+            AcmdStmt::NativeExecuteFrame(_) | AcmdStmt::NativeMotionLoopSync => {}
             AcmdStmt::Raw(line) => record_raw_partial_frame(line, frame, hurt),
             AcmdStmt::Excute(stmts) => {
                 for s in stmts {
@@ -6415,123 +7186,16 @@ fn eval_stmts(
             // A bare command runs where it is written, on the frame the cursor is on — the
             // `is_excute` wrapper decides whether a command runs at all, never when.
             AcmdStmt::Bare(s) => eval_excute_stmt(s, frame, hitboxes, hurt),
-            AcmdStmt::Loop { count, body } => {
+            AcmdStmt::Loop { count, body, .. } => {
                 // Rewind the site cursor for every iteration so all of them agree, then step it
                 // over the body once regardless of how many iterations actually ran.
-                let site_at_entry = hurt.next_site;
-                let condition_site_at_entry = hurt.next_condition_site;
-                let mod_site_at_entry = hurt.next_mod_site;
-                let sound_site_at_entry = hurt.next_sound_site;
-                let expression_site_at_entry = hurt.next_expression_site;
-                let reverse_lr_site_at_entry = hurt.next_reverse_lr_site;
-                let speed_ex_site_at_entry = hurt.next_speed_ex_site;
-                let speed_site_at_entry = hurt.next_speed_site;
-                let add_speed_no_limit_site_at_entry = hurt.next_add_speed_no_limit_site;
-                let correct_site_at_entry = hurt.next_correct_site;
-                let ft_catch_stop_site_at_entry = hurt.next_ft_catch_stop_site;
-                let ft_start_adjust_motion_frame_site_at_entry =
-                    hurt.next_ft_start_adjust_motion_frame_site;
-                let motion_module_set_rate_site_at_entry = hurt.next_motion_module_set_rate_site;
-                let motion_module_set_helper_calculation_site_at_entry =
-                    hurt.next_motion_module_set_helper_calculation_site;
-                let motion_module_set_rate_partial_site_at_entry =
-                    hurt.next_motion_module_set_rate_partial_site;
-                let motion_module_set_frame_partial_site_at_entry =
-                    hurt.next_motion_module_set_frame_partial_site;
-                let clr_speed_site_at_entry = hurt.next_clr_speed_site;
-                let set_air_site_at_entry = hurt.next_set_air_site;
-                let kinetic_clear_speed_all_site_at_entry = hurt.next_kinetic_clear_speed_all_site;
-                let kinetic_set_consider_ground_friction_site_at_entry =
-                    hurt.next_kinetic_set_consider_ground_friction_site;
-                let change_kinetic_site_at_entry = hurt.next_change_kinetic_site;
-                let kinetic_energy_site_at_entry = hurt.next_kinetic_energy_site;
-                let kinetic_add_speed_site_at_entry = hurt.next_kinetic_add_speed_site;
-                let work_flag_site_at_entry = hurt.next_work_flag_site;
-                let work_transition_term_site_at_entry = hurt.next_work_transition_term_site;
-                let work_module_inc_int_site_at_entry = hurt.next_work_module_inc_int_site;
-                let work_module_set_site_at_entry = hurt.next_work_module_set_site;
+                let sites_at_entry = hurt.sites;
                 for _ in 0..*count {
-                    hurt.next_site = site_at_entry;
-                    hurt.next_condition_site = condition_site_at_entry;
-                    hurt.next_mod_site = mod_site_at_entry;
-                    hurt.next_sound_site = sound_site_at_entry;
-                    hurt.next_expression_site = expression_site_at_entry;
-                    hurt.next_reverse_lr_site = reverse_lr_site_at_entry;
-                    hurt.next_speed_ex_site = speed_ex_site_at_entry;
-                    hurt.next_speed_site = speed_site_at_entry;
-                    hurt.next_add_speed_no_limit_site = add_speed_no_limit_site_at_entry;
-                    hurt.next_correct_site = correct_site_at_entry;
-                    hurt.next_ft_catch_stop_site = ft_catch_stop_site_at_entry;
-                    hurt.next_ft_start_adjust_motion_frame_site =
-                        ft_start_adjust_motion_frame_site_at_entry;
-                    hurt.next_motion_module_set_rate_site = motion_module_set_rate_site_at_entry;
-                    hurt.next_motion_module_set_helper_calculation_site =
-                        motion_module_set_helper_calculation_site_at_entry;
-                    hurt.next_motion_module_set_rate_partial_site =
-                        motion_module_set_rate_partial_site_at_entry;
-                    hurt.next_motion_module_set_frame_partial_site =
-                        motion_module_set_frame_partial_site_at_entry;
-                    hurt.next_clr_speed_site = clr_speed_site_at_entry;
-                    hurt.next_set_air_site = set_air_site_at_entry;
-                    hurt.next_kinetic_clear_speed_all_site = kinetic_clear_speed_all_site_at_entry;
-                    hurt.next_kinetic_set_consider_ground_friction_site =
-                        kinetic_set_consider_ground_friction_site_at_entry;
-                    hurt.next_change_kinetic_site = change_kinetic_site_at_entry;
-                    hurt.next_kinetic_energy_site = kinetic_energy_site_at_entry;
-                    hurt.next_kinetic_add_speed_site = kinetic_add_speed_site_at_entry;
-                    hurt.next_work_flag_site = work_flag_site_at_entry;
-                    hurt.next_work_transition_term_site = work_transition_term_site_at_entry;
-                    hurt.next_work_module_inc_int_site = work_module_inc_int_site_at_entry;
-                    hurt.next_work_module_set_site = work_module_set_site_at_entry;
-                    frame = eval_stmts(body, frame, hitboxes, hurt);
+                    hurt.sites = sites_at_entry;
+                    frame = eval_stmts_unchecked(body, frame, hitboxes, hurt);
                 }
-                hurt.next_site = site_at_entry + count_hurt_stmts(body);
-                hurt.next_condition_site = condition_site_at_entry + count_condition_stmts(body);
-                hurt.next_mod_site = mod_site_at_entry + count_attack_mod_stmts(body);
-                hurt.next_sound_site = sound_site_at_entry + count_sound_stmts(body);
-                hurt.next_expression_site = expression_site_at_entry + count_expression_stmts(body);
-                hurt.next_reverse_lr_site = reverse_lr_site_at_entry + count_reverse_lr_stmts(body);
-                hurt.next_speed_ex_site = speed_ex_site_at_entry + count_speed_ex_stmts(body);
-                hurt.next_speed_site = speed_site_at_entry + count_speed_stmts(body);
-                hurt.next_add_speed_no_limit_site =
-                    add_speed_no_limit_site_at_entry + count_add_speed_no_limit_stmts(body);
-                hurt.next_correct_site = correct_site_at_entry + count_correct_stmts(body);
-                hurt.next_ft_catch_stop_site =
-                    ft_catch_stop_site_at_entry + count_ft_catch_stop_stmts(body);
-                hurt.next_ft_start_adjust_motion_frame_site =
-                    ft_start_adjust_motion_frame_site_at_entry
-                        + count_ft_start_adjust_motion_frame_stmts(body);
-                hurt.next_motion_module_set_rate_site =
-                    motion_module_set_rate_site_at_entry + count_motion_module_set_rate_stmts(body);
-                hurt.next_motion_module_set_helper_calculation_site =
-                    motion_module_set_helper_calculation_site_at_entry
-                        + count_motion_module_set_helper_calculation_stmts(body);
-                hurt.next_motion_module_set_rate_partial_site =
-                    motion_module_set_rate_partial_site_at_entry
-                        + count_motion_module_set_rate_partial_stmts(body);
-                hurt.next_motion_module_set_frame_partial_site =
-                    motion_module_set_frame_partial_site_at_entry
-                        + count_motion_module_set_frame_partial_stmts(body);
-                hurt.next_clr_speed_site = clr_speed_site_at_entry + count_clr_speed_stmts(body);
-                hurt.next_set_air_site = set_air_site_at_entry + count_set_air_stmts(body);
-                hurt.next_kinetic_clear_speed_all_site = kinetic_clear_speed_all_site_at_entry
-                    + count_kinetic_clear_speed_all_stmts(body);
-                hurt.next_kinetic_set_consider_ground_friction_site =
-                    kinetic_set_consider_ground_friction_site_at_entry
-                        + count_kinetic_set_consider_ground_friction_stmts(body);
-                hurt.next_change_kinetic_site =
-                    change_kinetic_site_at_entry + count_change_kinetic_stmts(body);
-                hurt.next_kinetic_energy_site =
-                    kinetic_energy_site_at_entry + count_kinetic_energy_stmts(body);
-                hurt.next_kinetic_add_speed_site =
-                    kinetic_add_speed_site_at_entry + count_kinetic_add_speed_stmts(body);
-                hurt.next_work_flag_site = work_flag_site_at_entry + count_work_flag_stmts(body);
-                hurt.next_work_transition_term_site =
-                    work_transition_term_site_at_entry + count_work_transition_term_stmts(body);
-                hurt.next_work_module_inc_int_site =
-                    work_module_inc_int_site_at_entry + count_work_module_inc_int_stmts(body);
-                hurt.next_work_module_set_site =
-                    work_module_set_site_at_entry + count_work_module_set_stmts(body);
+                hurt.sites = sites_at_entry;
+                count_sites(body, &mut hurt.sites);
             }
             // Walked as though the branch always runs, which is what happened before it was a
             // block at all: its lines used to be parsed as siblings of the branch, so a hitbox
@@ -6540,7 +7204,7 @@ fn eval_stmts(
             // point — the fix here is to the *brace*, not to the condition, and changing both
             // at once would leave neither tested.
             AcmdStmt::RawBlock { body, .. } => {
-                frame = eval_stmts(body, frame, hitboxes, hurt);
+                frame = eval_stmts_unchecked(body, frame, hitboxes, hurt);
             }
         }
     }
@@ -6712,7 +7376,6 @@ pub enum FighterSource {
 pub struct FighterEntry {
     pub name: String,
     pub display_name: String,
-    #[allow(dead_code)]
     pub param_path: PathBuf,
     pub motion_dir: PathBuf,
     pub model_dir: PathBuf,
@@ -6740,6 +7403,10 @@ impl FighterEntry {
 }
 
 pub struct AppState {
+    /// The game's own script for this move, which live node steps compare against.
+    pub source_script: AcmdScript,
+    /// Graphics the game's own effect script spawns, including inside its `if`s.
+    pub source_effect_spawns: std::collections::BTreeSet<String>,
     pub data_root: Option<PathBuf>,
     pub fighters: Vec<FighterEntry>,
     pub labels: HashMap<u64, String>,
@@ -6796,59 +7463,8 @@ pub struct AppState {
     /// Post-hoc hitbox modifiers as loaded, on the same terms as `hurtboxes_pristine`: the
     /// script is the edited model, so the current list is always `script.to_attack_mods()`.
     pub attack_mods_pristine: Vec<AttackModState>,
-    /// `REVERSE_LR` point events as loaded, for sparse live suppression/injection rules.
-    pub reverse_lr_pristine: Vec<ReverseLrEvent>,
-    /// `SET_SPEED_EX` point events as loaded, for sparse live velocity rules and source syncing.
-    pub speed_ex_pristine: Vec<SetSpeedExEvent>,
-    /// `SET_SPEED` point events as loaded, for sparse live velocity rules and source syncing.
-    pub speed_pristine: Vec<SetSpeedEvent>,
-    /// `ADD_SPEED_NO_LIMIT` point events as loaded, for sparse live velocity rules and source
-    /// syncing.
-    pub add_speed_no_limit_pristine: Vec<AddSpeedNoLimitEvent>,
-    /// `CORRECT` point events as loaded, for sparse live correction rules and source syncing.
-    pub correct_pristine: Vec<CorrectEvent>,
-    /// `FT_CATCH_STOP` point events as loaded, for sparse live argument rules and source syncing.
-    pub ft_catch_stop_pristine: Vec<FtCatchStopEvent>,
-    /// `FT_START_ADJUST_MOTION_FRAME_arg1` point events as loaded, for sparse live value rules
-    /// and source syncing.
-    pub ft_start_adjust_motion_frame_pristine: Vec<FtStartAdjustMotionFrameEvent>,
-    /// Direct `MotionModule::set_rate` point events as loaded, for sparse live rules and source
-    /// syncing.
-    pub motion_module_set_rate_pristine: Vec<MotionModuleSetRateEvent>,
-    /// Direct `MotionModule::set_helper_calculation` point events as loaded, for sparse live
-    /// rules and source syncing.
-    pub motion_module_set_helper_calculation_pristine: Vec<MotionModuleSetHelperCalculationEvent>,
-    /// Direct `MotionModule::set_rate_partial` point events as loaded, for sparse live rules and
-    /// source syncing.
-    pub motion_module_set_rate_partial_pristine: Vec<MotionModuleSetRatePartialEvent>,
-    pub motion_module_set_frame_partial_pristine: Vec<MotionModuleSetFramePartialEvent>,
-    /// `CLR_SPEED` point events as loaded, for sparse live kinetic rules and source syncing.
-    pub clr_speed_pristine: Vec<ClrSpeedEvent>,
-    /// `SET_AIR` point events as loaded, for sparse live kinetic rules and source syncing.
-    pub set_air_pristine: Vec<SetAirEvent>,
-    /// Direct `KineticModule::clear_speed_all` point events as loaded, for sparse live rules and
-    /// source syncing.
-    pub kinetic_clear_speed_all_pristine: Vec<KineticClearSpeedAllEvent>,
-    /// Direct `KineticModule::set_consider_ground_friction` point events as loaded, for sparse
-    /// live rules and source syncing.
-    pub kinetic_set_consider_ground_friction_pristine: Vec<KineticSetConsiderGroundFrictionEvent>,
-    /// Direct kinetic-type point events as loaded, for sparse live rules and source syncing.
-    pub change_kinetic_pristine: Vec<ChangeKineticEvent>,
-    /// Direct kinetic-energy point events as loaded, for sparse live rules and source syncing.
-    pub kinetic_energy_pristine: Vec<KineticEnergyEvent>,
-    /// Direct kinetic-vector point events as loaded, for sparse live rules and source syncing.
-    pub kinetic_add_speed_pristine: Vec<KineticAddSpeedEvent>,
-    /// Direct WorkModule flag point events as loaded, for sparse live rules and source syncing.
-    pub work_flag_pristine: Vec<WorkFlagEvent>,
-    /// Direct WorkModule transition-term point events as loaded, for sparse live rules and source
-    /// syncing.
-    pub work_transition_term_pristine: Vec<WorkTransitionTermEvent>,
-    /// Direct `WorkModule::inc_int` point events as loaded, for sparse live rules and source
-    /// syncing.
-    pub work_module_inc_int_pristine: Vec<WorkModuleIncIntEvent>,
-    /// Direct WorkModule value-set point events as loaded, for sparse live rules and source
-    /// syncing.
-    pub work_module_set_pristine: Vec<WorkModuleSetEvent>,
+    /// Original direct point events for source and live edit comparison.
+    pub point_originals: PointOriginals,
     /// Provenance of the current move's ACMD data ("", "GitHub", "Live capture").
     pub acmd_source: String,
     /// "fighter/move" → the warning captured when a live performance observed only one arm of
@@ -6907,9 +7523,30 @@ pub struct MoveEntry {
     pub anim_path: Option<PathBuf>,
 }
 
+/// Replace only the display-name placeholder used when a motion hash had no label at load
+/// time. Labels may arrive asynchronously after the move list is built, so this helper can be
+/// applied again without overwriting names that were already resolved or edited by the user.
+/// All fields other than `name` are left untouched. Returns the number of renamed entries.
+pub fn resolve_move_entry_names(entries: &mut [MoveEntry], labels: &HashMap<u64, String>) -> usize {
+    entries
+        .iter_mut()
+        .filter(|entry| entry.name == format!("{:#018x}", entry.hash))
+        .filter_map(|entry| {
+            let label = labels.get(&entry.hash)?;
+            if label.is_empty() || *label == entry.name {
+                return None;
+            }
+            entry.name.clone_from(label);
+            Some(())
+        })
+        .count()
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            source_script: AcmdScript::default(),
+            source_effect_spawns: Default::default(),
             data_root: None,
             fighters: Vec::new(),
             labels: HashMap::new(),
@@ -6939,28 +7576,7 @@ impl Default for AppState {
             hurtboxes_pristine: (Vec::new(), Vec::new()),
             hurtbox_conditions_pristine: Vec::new(),
             attack_mods_pristine: Vec::new(),
-            reverse_lr_pristine: Vec::new(),
-            speed_ex_pristine: Vec::new(),
-            speed_pristine: Vec::new(),
-            add_speed_no_limit_pristine: Vec::new(),
-            correct_pristine: Vec::new(),
-            ft_catch_stop_pristine: Vec::new(),
-            ft_start_adjust_motion_frame_pristine: Vec::new(),
-            motion_module_set_rate_pristine: Vec::new(),
-            motion_module_set_helper_calculation_pristine: Vec::new(),
-            motion_module_set_rate_partial_pristine: Vec::new(),
-            motion_module_set_frame_partial_pristine: Vec::new(),
-            clr_speed_pristine: Vec::new(),
-            set_air_pristine: Vec::new(),
-            kinetic_clear_speed_all_pristine: Vec::new(),
-            kinetic_set_consider_ground_friction_pristine: Vec::new(),
-            change_kinetic_pristine: Vec::new(),
-            kinetic_energy_pristine: Vec::new(),
-            kinetic_add_speed_pristine: Vec::new(),
-            work_flag_pristine: Vec::new(),
-            work_transition_term_pristine: Vec::new(),
-            work_module_inc_int_pristine: Vec::new(),
-            work_module_set_pristine: Vec::new(),
+            point_originals: PointOriginals::default(),
             acmd_source: String::new(),
             capture_branch_warnings: HashMap::new(),
             loaded_body: String::new(),
@@ -6976,6 +7592,65 @@ impl Default for AppState {
     }
 }
 
+/// Invoke `$mac!` with every direct point family as `pristine_field: events_method,`. One list,
+/// so re-baselining and the "has any point been edited" check cannot miss a family.
+macro_rules! with_point_families {
+    ($mac:ident) => {
+        $mac! {
+            reverse_lr_pristine: ReverseLrEvent => to_reverse_lr_events,
+            speed_ex_pristine: SetSpeedExEvent => to_speed_ex_events,
+            speed_pristine: SetSpeedEvent => to_speed_events,
+            add_speed_no_limit_pristine: AddSpeedNoLimitEvent => to_add_speed_no_limit_events,
+            correct_pristine: CorrectEvent => to_correct_events,
+            ft_catch_stop_pristine: FtCatchStopEvent => to_ft_catch_stop_events,
+            ft_start_adjust_motion_frame_pristine: FtStartAdjustMotionFrameEvent => to_ft_start_adjust_motion_frame_events,
+            motion_module_set_rate_pristine: MotionModuleSetRateEvent => to_motion_module_set_rate_events,
+            motion_module_set_helper_calculation_pristine: MotionModuleSetHelperCalculationEvent => to_motion_module_set_helper_calculation_events,
+            motion_module_set_rate_partial_pristine: MotionModuleSetRatePartialEvent => to_motion_module_set_rate_partial_events,
+            motion_module_set_frame_partial_pristine: MotionModuleSetFramePartialEvent => to_motion_module_set_frame_partial_events,
+            clr_speed_pristine: ClrSpeedEvent => to_clr_speed_events,
+            set_air_pristine: SetAirEvent => to_set_air_events,
+            kinetic_clear_speed_all_pristine: KineticClearSpeedAllEvent => to_kinetic_clear_speed_all_events,
+            kinetic_set_consider_ground_friction_pristine: KineticSetConsiderGroundFrictionEvent => to_kinetic_set_consider_ground_friction_events,
+            change_kinetic_pristine: ChangeKineticEvent => to_change_kinetic_events,
+            kinetic_energy_pristine: KineticEnergyEvent => to_kinetic_energy_events,
+            kinetic_add_speed_pristine: KineticAddSpeedEvent => to_kinetic_add_speed_events,
+            work_flag_pristine: WorkFlagEvent => to_work_flag_events,
+            work_transition_term_pristine: WorkTransitionTermEvent => to_work_transition_term_events,
+            work_module_inc_int_pristine: WorkModuleIncIntEvent => to_work_module_inc_int_events,
+            work_module_set_pristine: WorkModuleSetEvent => to_work_module_set_events,
+        }
+    };
+}
+
+macro_rules! define_point_originals {
+    ($($field:ident: $ty:ty => $events:ident,)*) => {
+        #[derive(Debug, Clone, Default, PartialEq)]
+        pub struct PointOriginals {
+            $(pub $field: Vec<$ty>,)*
+        }
+
+        impl PointOriginals {
+            pub fn snapshot(script: &AcmdScript) -> Self {
+                Self { $($field: script.$events(),)* }
+            }
+
+            pub fn restore(self, state: &mut AppState) {
+                state.point_originals = self;
+            }
+
+            pub fn clear(&mut self) {
+                $(self.$field.clear();)*
+            }
+
+            pub fn edited(&self, script: &AcmdScript) -> bool {
+                false $(|| script.$events() != self.$field)*
+            }
+        }
+    };
+}
+with_point_families!(define_point_originals);
+
 impl AppState {
     /// Install a freshly loaded script and re-baseline the hurtbox spans it resolves to.
     ///
@@ -6986,34 +7661,22 @@ impl AppState {
         self.hurtboxes_pristine = script.to_hurtboxes();
         self.hurtbox_conditions_pristine = script.to_hurtbox_conditions();
         self.attack_mods_pristine = script.to_attack_mods();
-        self.reverse_lr_pristine = script.to_reverse_lr_events();
-        self.speed_ex_pristine = script.to_speed_ex_events();
-        self.speed_pristine = script.to_speed_events();
-        self.add_speed_no_limit_pristine = script.to_add_speed_no_limit_events();
-        self.correct_pristine = script.to_correct_events();
-        self.ft_catch_stop_pristine = script.to_ft_catch_stop_events();
-        self.ft_start_adjust_motion_frame_pristine =
-            script.to_ft_start_adjust_motion_frame_events();
-        self.motion_module_set_rate_pristine = script.to_motion_module_set_rate_events();
-        self.motion_module_set_helper_calculation_pristine =
-            script.to_motion_module_set_helper_calculation_events();
-        self.motion_module_set_rate_partial_pristine =
-            script.to_motion_module_set_rate_partial_events();
-        self.motion_module_set_frame_partial_pristine =
-            script.to_motion_module_set_frame_partial_events();
-        self.clr_speed_pristine = script.to_clr_speed_events();
-        self.set_air_pristine = script.to_set_air_events();
-        self.kinetic_clear_speed_all_pristine = script.to_kinetic_clear_speed_all_events();
-        self.kinetic_set_consider_ground_friction_pristine =
-            script.to_kinetic_set_consider_ground_friction_events();
-        self.change_kinetic_pristine = script.to_change_kinetic_events();
-        self.kinetic_energy_pristine = script.to_kinetic_energy_events();
-        self.kinetic_add_speed_pristine = script.to_kinetic_add_speed_events();
-        self.work_flag_pristine = script.to_work_flag_events();
-        self.work_transition_term_pristine = script.to_work_transition_term_events();
-        self.work_module_inc_int_pristine = script.to_work_module_inc_int_events();
-        self.work_module_set_pristine = script.to_work_module_set_events();
+        self.rebaseline_points(&script);
         self.script = script;
+    }
+
+    /// Re-baseline every direct point family to the loaded script.
+    pub fn rebaseline_points(&mut self, script: &AcmdScript) {
+        self.point_originals = PointOriginals::snapshot(script);
+        self.source_script = script.clone();
+    }
+
+    pub fn clear_point_originals(&mut self) {
+        self.point_originals.clear();
+    }
+
+    pub fn point_events_edited(&self) -> bool {
+        self.point_originals.edited(&self.script)
     }
 }
 
@@ -7360,6 +8023,7 @@ pub fn fighter_display_name(name: &str) -> String {
         ("miisword", "Mii Swordfighter"),
         ("miiswordsman", "Mii Swordfighter"),
         ("murabito", "Villager"),
+        ("nana", "Ice Climbers · Nana"),
         ("ness", "Ness"),
         ("packun", "Piranha Plant"),
         ("pacman", "Pac-Man"),
@@ -7373,6 +8037,7 @@ pub fn fighter_display_name(name: &str) -> String {
         ("pit", "Pit"),
         ("pitb", "Dark Pit"),
         ("plizardon", "Charizard"),
+        ("popo", "Ice Climbers · Popo"),
         ("purin", "Jigglypuff"),
         ("pzenigame", "Squirtle"),
         ("reflet", "Robin"),
@@ -7419,9 +8084,8 @@ pub fn fighter_display_name(name: &str) -> String {
 
 /// A point control in an `effect_` script.
 ///
-/// These commands act on an existing effect handle or on an AreaModule state; they do not
-/// start or end an [`EffectCall`]. Keeping them as their own payload is what prevents a detach
-/// from being mistaken for the `EFFECT_OFF_KIND` that closes a following effect.
+/// These point commands do not describe an effect lifetime or transform and do not start or end
+/// an [`EffectCall`].
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EffectControl {
     /// Detach every effect of a named kind without killing it.
@@ -7433,19 +8097,317 @@ pub enum EffectControl {
     /// other symbolic source constants remain source/export data because the editor cannot safely
     /// resolve them offline.
     DetachKindWork { work: String, unk: i64 },
+    /// Disable an effect held in one of the closed, owner-specific Work slots measured from
+    /// native fighter scripts. Both flags remain opaque source literals.
+    OffKindWork { preset_id: String },
     /// Enable an existing fighter area.
     EnableArea { kind: String },
     /// Disable an existing fighter area.
     UnableArea { kind: String },
+    /// Apply the native render-offset setting to the effect most recently spawned.
+    SetDisableRenderOffsetLast,
+    /// Synchronize the initial position of the most recently spawned effect.
+    EnableSyncInitPosLast,
+    /// Request one of the source-measured req_screen presets.
+    /// `preset_id` is validated against the fixed measured preset table; arbitrary Hash40 values
+    /// are not authored. The source call's three literal flags are part of that preset.
+    ReqScreen { preset_id: String },
+    /// Set the exact bool accepted by ColorBlendModule's camera-depth influence control.
+    SetDisableCameraDepthInfluence { value: bool },
 }
+
+/// A closed, corpus-measured `EffectModule::req_screen` source choice.
+///
+/// IDs are the exact stable Hash40 source names. Only 110 observed `(name, bool, bool, bool)`
+/// tuples are admitted; the three booleans are source data, not claims about their semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectReqScreenPreset {
+    pub id: &'static str,
+    pub effect_name: &'static str,
+    pub flags: [bool; 3],
+}
+
+/// A closed, source-measured `EFFECT_OFF_KIND_WORK` tuple. Slot ownership and both literal
+/// flags are part of the preset; callers must still check the fighter before admitting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectOffKindWorkPreset {
+    pub id: &'static str,
+    pub fighter: &'static str,
+    pub work_symbol: &'static str,
+    pub flags: [bool; 2],
+}
+
+impl EffectOffKindWorkPreset {
+    const PRESETS: [Self; 13] = [
+        Self {
+            id: "bayonetta_attack_100a_ff",
+            fighter: "bayonetta",
+            work_symbol: "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_ATTACK_100A",
+            flags: [false, false],
+        },
+        Self {
+            id: "brave_sword_flare_ft",
+            fighter: "brave",
+            work_symbol: "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            flags: [false, true],
+        },
+        Self {
+            id: "brave_sword_flare_tt",
+            fighter: "brave",
+            work_symbol: "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            flags: [true, true],
+        },
+        Self {
+            id: "brave_lightning_sword_flare_ft",
+            fighter: "brave",
+            work_symbol: "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_LIGHTNING_SWORD_FLARE",
+            flags: [false, true],
+        },
+        Self {
+            id: "buddy_flying_ft",
+            fighter: "buddy",
+            work_symbol: "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_EFFECT_KIND_FLYING",
+            flags: [false, true],
+        },
+        Self {
+            id: "buddy_scatter_ft",
+            fighter: "buddy",
+            work_symbol: "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_EFFECT_KIND_SCATTER",
+            flags: [false, true],
+        },
+        Self {
+            id: "cloud_sword_flare_ft",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            flags: [false, true],
+        },
+        Self {
+            id: "cloud_sword_flare_tt",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            flags: [true, true],
+        },
+        Self {
+            id: "cloud_sword_flare_lb_ft",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE_LB",
+            flags: [false, true],
+        },
+        Self {
+            id: "cloud_sword_flare_lb_tt",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE_LB",
+            flags: [true, true],
+        },
+        Self {
+            id: "cloud_climhazzard_sword_ft",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_CLIMHAZZARD_SWORD",
+            flags: [false, true],
+        },
+        Self {
+            id: "miiswordsman_sword_flare_ff",
+            fighter: "miiswordsman",
+            work_symbol: "FIGHTER_MIISWORDSMAN_INSTANCE_WORK_ID_INT_EFT_ID_SWORD_FLARE",
+            flags: [false, false],
+        },
+        Self {
+            id: "miiswordsman_sword_flare_ft",
+            fighter: "miiswordsman",
+            work_symbol: "FIGHTER_MIISWORDSMAN_INSTANCE_WORK_ID_INT_EFT_ID_SWORD_FLARE",
+            flags: [false, true],
+        },
+    ];
+
+    pub fn all() -> &'static [Self; 13] {
+        &EFFECT_OFF_KIND_WORK_PRESETS
+    }
+
+    pub fn by_id(id: &str) -> Option<&'static Self> {
+        Self::all().iter().find(|preset| preset.id == id)
+    }
+
+    pub fn from_source_parts(
+        fighter: &str,
+        work_symbol: &str,
+        flags: [bool; 2],
+    ) -> Option<&'static Self> {
+        Self::all().iter().find(|preset| {
+            preset.fighter == fighter && preset.work_symbol == work_symbol && preset.flags == flags
+        })
+    }
+}
+
+/// Fixed measured table exposed to source-only authoring controls.
+pub static EFFECT_OFF_KIND_WORK_PRESETS: [EffectOffKindWorkPreset; 13] =
+    EffectOffKindWorkPreset::PRESETS;
+
+impl EffectReqScreenPreset {
+    const SOURCE_TUPLES: [(&'static str, [bool; 3]); 110] = [
+        ("bg_bayonetta_final", [false; 3]),
+        ("bg_brave_final", [false; 3]),
+        ("bg_buddy_final", [false; 3]),
+        ("bg_captain_final", [false; 3]),
+        ("bg_chrom_final1", [false; 3]),
+        ("bg_chrom_final2", [false; 3]),
+        ("bg_cloud_final", [false; 3]),
+        ("bg_cloud_final2", [false; 3]),
+        ("bg_daisy_final", [false; 3]),
+        ("bg_dedede_final", [false; 3]),
+        ("bg_demon_final", [false; 3]),
+        ("bg_diddy_final", [false; 3]),
+        ("bg_dolly_final", [false; 3]),
+        ("bg_donkey_final", [false; 3]),
+        ("bg_donkey_final2", [false; 3]),
+        ("bg_donkey_final2b", [false; 3]),
+        ("bg_duckhunt_final", [false; 3]),
+        ("bg_edge_final", [false; 3]),
+        ("bg_edge_final_end", [false; 3]),
+        ("bg_eelight_final", [false; 3]),
+        ("bg_eelight_final2", [false; 3]),
+        ("bg_eflame_final", [false; 3]),
+        ("bg_eflame_final2", [false; 3]),
+        ("bg_gamewatch_final", [false; 3]),
+        ("bg_ganon_final", [false; 3]),
+        ("bg_gaogaen_final", [false; 3]),
+        ("bg_gaogaen_final_end", [false; 3]),
+        ("bg_gekkouga_final", [false; 3]),
+        ("bg_ike_final", [false; 3]),
+        ("bg_inkling_final_l", [false; 3]),
+        ("bg_inkling_final_l2", [false; 3]),
+        ("bg_inkling_final_r", [false; 3]),
+        ("bg_inkling_final_r2", [false; 3]),
+        ("bg_jack_final", [false; 3]),
+        ("bg_kamui_final", [false; 3]),
+        ("bg_ken_final_shinryuken", [false; 3]),
+        ("bg_ken_final_shippu", [false; 3]),
+        ("bg_kirby_final", [false; 3]),
+        ("bg_koopa_final", [false; 3]),
+        ("bg_koopajr_final", [false; 3]),
+        ("bg_krool_final", [false; 3]),
+        ("bg_link_final", [false; 3]),
+        ("bg_littlemac_final", [false; 3]),
+        ("bg_littlemac_final2", [false; 3]),
+        ("bg_lucas_final", [false; 3]),
+        ("bg_lucina_final", [false; 3]),
+        ("bg_luigi_final", [false; 3]),
+        ("bg_mario_final", [false; 3]),
+        ("bg_mariod_final", [false; 3]),
+        ("bg_marth_final", [false; 3]),
+        ("bg_master_final", [false; 3]),
+        ("bg_master_final_end", [false; 3]),
+        ("bg_metaknight_final", [false; 3]),
+        ("bg_mewtwo_final", [false; 3]),
+        ("bg_miifighter_final", [false; 3]),
+        ("bg_miifighter_final2", [false; 3]),
+        ("bg_miigunner_final", [false; 3]),
+        ("bg_miiswordsman_final", [false; 3]),
+        ("bg_murabito_final", [false; 3]),
+        ("bg_ness_final", [false; 3]),
+        ("bg_packun_final1", [false; 3]),
+        ("bg_pacman_final", [false; 3]),
+        ("bg_pacman_final_end", [false; 3]),
+        ("bg_palutena_final", [false; 3]),
+        ("bg_peach_final", [false; 3]),
+        ("bg_pichu_final", [false; 3]),
+        ("bg_pickel_final_end", [false; 3]),
+        ("bg_pickel_final_l", [false; 3]),
+        ("bg_pickel_final_r", [false; 3]),
+        ("bg_pikachu_final", [false; 3]),
+        ("bg_pit_final", [false; 3]),
+        ("bg_pitb_final", [false; 3]),
+        ("bg_popo_final", [false; 3]),
+        ("bg_ptrainer_final", [false; 3]),
+        ("bg_purin_final", [false; 3]),
+        ("bg_reflet_final", [false; 3]),
+        ("bg_reflet_final2", [false; 3]),
+        ("bg_richter_final", [false; 3]),
+        ("bg_ridley_final", [false; 3]),
+        ("bg_robot_final", [false; 3]),
+        ("bg_rockman_final", [false; 3]),
+        ("bg_rosetta_final", [false; 3]),
+        ("bg_roy_final", [false; 3]),
+        ("bg_ryu_final_shinkuhado", [false; 3]),
+        ("bg_ryu_final_shinsyoryu", [false; 3]),
+        ("bg_samus_final", [false; 3]),
+        ("bg_samusd_final", [false; 3]),
+        ("bg_sheik_final", [false; 3]),
+        ("bg_shizue_final", [false; 3]),
+        ("bg_shulk_final", [false; 3]),
+        ("bg_simon_final", [false; 3]),
+        ("bg_snake_final", [false; 3]),
+        ("bg_sonic_final", [false; 3]),
+        ("bg_szerosuit_final", [false; 3]),
+        ("bg_tantan_final_end", [false; 3]),
+        ("bg_tantan_final_l", [false; 3]),
+        ("bg_tantan_final_r", [false; 3]),
+        ("bg_toonlink_final", [false; 3]),
+        ("bg_toonlink_final_start", [false; 3]),
+        ("bg_trail_final", [false; 3]),
+        ("bg_wario_final", [false; 3]),
+        ("bg_wario_final2", [false; 3]),
+        ("bg_wiifit_final", [false; 3]),
+        ("bg_yoshi_final", [false; 3]),
+        ("bg_younglink_final", [false; 3]),
+        ("bg_younglink_final_start", [false; 3]),
+        ("bg_zelda_final", [false; 3]),
+        ("demon_ragedrive_bg", [true, false, false]),
+        ("edge_fire3_screen1", [false; 3]),
+        ("edge_wing_screen", [false; 3]),
+    ];
+
+    const fn build_all() -> [Self; 110] {
+        let mut all = [Self {
+            id: "",
+            effect_name: "",
+            flags: [false; 3],
+        }; 110];
+        let mut index = 0;
+        while index < Self::SOURCE_TUPLES.len() {
+            let (name, flags) = Self::SOURCE_TUPLES[index];
+            all[index] = Self {
+                id: name,
+                effect_name: name,
+                flags,
+            };
+            index += 1;
+        }
+        all
+    }
+
+    pub fn all() -> &'static [Self; 110] {
+        &EFFECT_REQ_SCREEN_PRESETS
+    }
+
+    pub fn by_id(id: &str) -> Option<&'static Self> {
+        Self::all().iter().find(|preset| preset.id == id)
+    }
+
+    pub fn from_source_parts(effect_name: &str, flags: [bool; 3]) -> Option<&'static Self> {
+        Self::all()
+            .iter()
+            .find(|preset| preset.effect_name == effect_name && preset.flags == flags)
+    }
+}
+
+/// Fixed measured table exposed to searchable source-only authoring controls.
+pub static EFFECT_REQ_SCREEN_PRESETS: [EffectReqScreenPreset; 110] =
+    EffectReqScreenPreset::build_all();
 
 impl EffectControl {
     pub fn command_name(&self) -> &'static str {
         match self {
             Self::DetachKind { .. } => "EFFECT_DETACH_KIND",
             Self::DetachKindWork { .. } => "EFFECT_DETACH_KIND_WORK",
+            Self::OffKindWork { .. } => "EFFECT_OFF_KIND_WORK",
             Self::EnableArea { .. } => "ENABLE_AREA",
             Self::UnableArea { .. } => "UNABLE_AREA",
+            Self::SetDisableRenderOffsetLast => "EffectModule::set_disable_render_offset_last",
+            Self::EnableSyncInitPosLast => "EffectModule::enable_sync_init_pos_last",
+            Self::ReqScreen { .. } => "EffectModule::req_screen",
+            Self::SetDisableCameraDepthInfluence { .. } => {
+                "ColorBlendModule::set_disable_camera_depth_influence"
+            }
         }
     }
 }
@@ -7453,6 +8415,7 @@ impl EffectControl {
 /// A single effect macro call inside an is_excute block.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EffectMacro {
+    NativeCall(crate::move_nodes::native_calls::NativeCall),
     /// EFFECT / EFFECT_FOLLOW / EFFECT_FOLLOW_FLIP / EFFECT_FLIP /
     /// FOOT_EFFECT / LANDING_EFFECT — all share the same data shape.
     Effect {
@@ -7482,7 +8445,18 @@ pub enum EffectMacro {
         #[serde(default)]
         flip_axis: Option<String>,
     },
-    /// AFTER_IMAGE4_ON / AFTER_IMAGE_ON — sword/weapon trail effects.
+    /// Native source-only `EFFECT_FOLLOW_WORK`: its first non-agent argument is a
+    /// fighter-owned WorkInt slot, not an ordinary effect resource. Only the measured
+    /// transform is editable; the slot, bone, and opaque `unk8` bit are baseline-locked.
+    EffectFollowWork {
+        work_symbol: String,
+        bone_name: String,
+        offset: [f32; 3],
+        rotation: [f32; 3],
+        scale: f32,
+        unk8: bool,
+    },
+    /// Sword/weapon trail source, including the measured `AFTER_IMAGE4_ON_arg29` wrapper.
     AfterImage {
         /// Exact trail command family (`AFTER_IMAGE3_ON`, `AFTER_IMAGE4_ON_arg29`, ...).
         /// Older serialized scripts omitted this and use the legacy raw line instead.
@@ -7494,8 +8468,8 @@ pub enum EffectMacro {
         /// separate from `bone_name` and why it is optional.
         #[serde(default)]
         bone_name2: Option<String>,
-        /// The call verbatim. A trail's arguments are textures and per-frame trail
-        /// parameters, not a transform, so there is nothing to recompose it from.
+        /// The call verbatim. Supported literal wrapper properties are edited by validated
+        /// argument-span splices; other native trail families remain preserved source.
         #[serde(default)]
         raw: String,
     },
@@ -7503,9 +8477,12 @@ pub enum EffectMacro {
     ///
     /// Carries its one argument. `macros::AFTER_IMAGE_OFF` is declared
     /// `<F: ToF32>(agent, unk: F)`, so a call written without it does not compile — which is
-    /// exactly what the export used to emit. The value is undocumented beyond `unk`, and the
-    /// corpus writes `0` twice and `3` twice, so it is carried rather than normalised.
-    AfterImageOff { arg: f32 },
+    /// exactly what the export used to emit. The value is undocumented beyond `unk`; the
+    /// pinned fighter corpus uses multiple values from 0 through 14. It is carried rather
+    /// than normalised or labelled as a duration/object ID.
+    AfterImageOff {
+        arg: f32,
+    },
     /// EFFECT_OFF_KIND — terminates a following effect by name.
     ///
     /// Carries its two trailing booleans, for the same reason [`AfterImageOff`] carries its
@@ -7527,42 +8504,177 @@ pub enum EffectMacro {
         detach: bool,
     },
     /// LAST_EFFECT_SET_RATE — modifies the rate of the last spawned effect.
-    LastEffectSetRate { rate: f32 },
+    LastEffectSetRate {
+        rate: f32,
+    },
     /// LAST_EFFECT_SET_WORK_INT — stores the last effect handle in a WorkModule slot.
     ///
     /// The source token names the slot, not the runtime handle. It is retained without a
     /// leading `*` so the same representation can hold both the dumped `*CONST` spelling and
     /// a numeric or live-captured value; the exporter restores the compile-time constant form
     /// where needed.
-    LastEffectSetWorkInt { work: String },
+    LastEffectSetWorkInt {
+        work: String,
+    },
     /// LAST_EFFECT_SET_OFFSET_TO_CAMERA_FLAT — offsets the last spawned effect along the
     /// camera-flat axis. The wrapper takes one numeric value after `agent`.
-    LastEffectSetOffsetToCameraFlat { offset: f32 },
+    LastEffectSetOffsetToCameraFlat {
+        offset: f32,
+    },
     /// LAST_EFFECT_SET_COLOR — retints the last spawned effect.
     ///
     /// Three arguments in every one of the corpus's 65 calls, and no alpha among them: opacity
     /// is [`LastEffectSetAlpha`](Self::LastEffectSetAlpha), a separate line and a separate
     /// decision. Keeping them apart is what lets a script that sets only one export only one.
-    LastEffectSetColor { rgb: [f32; 3] },
+    LastEffectSetColor {
+        rgb: [f32; 3],
+    },
     /// LAST_PARTICLE_SET_COLOR — retints the last spawned particle.
     ///
     /// This is deliberately separate from [`LastEffectSetColor`](Self::LastEffectSetColor):
     /// the game exposes two different "last" targets, and a particle colour must not be
     /// exported as an effect colour merely because both carry three floats.
-    LastParticleSetColor { rgb: [f32; 3] },
+    LastParticleSetColor {
+        rgb: [f32; 3],
+    },
     /// LAST_EFFECT_SET_ALPHA — sets the opacity of the last spawned effect.
-    LastEffectSetAlpha { alpha: f32 },
+    LastEffectSetAlpha {
+        alpha: f32,
+    },
     /// LAST_EFFECT_SET_SCALE_W — scales the last spawned effect with the native primitive's
     /// dynamic one-to-three-value Lua stack contract. The vendored smash-script wrapper only
     /// exposes the three-value spelling, so the exporter uses a local stack helper while
     /// retaining the authored arity here.
-    LastEffectSetScaleW { values: Vec<f32> },
-    /// A detach or area-state point command. These are not effect spawns and never close one.
+    LastEffectSetScaleW {
+        values: Vec<f32>,
+    },
+    /// A closed point control. These are not effect spawns and never close one.
     Control(EffectControl),
     /// FLASH / BURN_COLOR and their relatives — see [`ColorCall`].
-    Color { command: String, color: ColorCall },
+    Color {
+        command: String,
+        color: ColorCall,
+    },
     /// Any unrecognised line, preserved verbatim.
     Raw(String),
+}
+
+/// One observed `EFFECT_FOLLOW_WORK` WorkInt slot. The table is closed so a project cannot
+/// turn this source-editing feature into an arbitrary WorkModule write surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectFollowWorkPreset {
+    pub id: &'static str,
+    pub fighter: &'static str,
+    pub work_symbol: &'static str,
+}
+
+impl EffectFollowWorkPreset {
+    const PRESETS: [Self; 17] = [
+        Self {
+            id: "bayonetta_afterburner_line",
+            fighter: "bayonetta",
+            work_symbol:
+                "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_AFTERBURNER_LINE",
+        },
+        Self {
+            id: "bayonetta_attack_100end",
+            fighter: "bayonetta",
+            work_symbol:
+                "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_ATTACK_100END",
+        },
+        Self {
+            id: "bayonetta_attack_arc1",
+            fighter: "bayonetta",
+            work_symbol: "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_ATTACK_ARC1",
+        },
+        Self {
+            id: "bayonetta_attack_arc2",
+            fighter: "bayonetta",
+            work_symbol: "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_ATTACK_ARC2",
+        },
+        Self {
+            id: "bayonetta_attack_line1",
+            fighter: "bayonetta",
+            work_symbol:
+                "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_ATTACK_LINE1",
+        },
+        Self {
+            id: "bayonetta_stiletto",
+            fighter: "bayonetta",
+            work_symbol: "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_STILETTO",
+        },
+        Self {
+            id: "bayonetta_witchtwist_spiral",
+            fighter: "bayonetta",
+            work_symbol:
+                "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_WITCHTWIST_SPIRAL",
+        },
+        Self {
+            id: "bayonetta_witchtwist_wind",
+            fighter: "bayonetta",
+            work_symbol:
+                "FIGHTER_BAYONETTA_INSTANCE_WORK_ID_INT_EFFECT_KIND_BAYONETTA_WITCHTWIST_WIND",
+        },
+        Self {
+            id: "brave_lightning_sword_flare",
+            fighter: "brave",
+            work_symbol: "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_LIGHTNING_SWORD_FLARE",
+        },
+        Self {
+            id: "brave_sword_flare",
+            fighter: "brave",
+            work_symbol: "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+        },
+        Self {
+            id: "buddy_flying",
+            fighter: "buddy",
+            work_symbol: "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_EFFECT_KIND_FLYING",
+        },
+        Self {
+            id: "buddy_rolling",
+            fighter: "buddy",
+            work_symbol: "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_EFFECT_KIND_ROLLING",
+        },
+        Self {
+            id: "buddy_scatter",
+            fighter: "buddy",
+            work_symbol: "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_EFFECT_KIND_SCATTER",
+        },
+        Self {
+            id: "cloud_climhazzard_sword",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_CLIMHAZZARD_SWORD",
+        },
+        Self {
+            id: "cloud_sword_flare",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+        },
+        Self {
+            id: "cloud_sword_flare_lb",
+            fighter: "cloud",
+            work_symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE_LB",
+        },
+        Self {
+            id: "miiswordsman_sword_flare",
+            fighter: "miiswordsman",
+            work_symbol: "FIGHTER_MIISWORDSMAN_INSTANCE_WORK_ID_INT_EFT_ID_SWORD_FLARE",
+        },
+    ];
+
+    pub fn all() -> &'static [Self; 17] {
+        &Self::PRESETS
+    }
+    pub fn by_work_symbol(work_symbol: &str) -> Option<&'static Self> {
+        Self::all()
+            .iter()
+            .find(|preset| preset.work_symbol == work_symbol)
+    }
+    pub fn from_source_parts(fighter: &str, work_symbol: &str) -> Option<&'static Self> {
+        Self::all()
+            .iter()
+            .find(|preset| preset.fighter == fighter && preset.work_symbol == work_symbol)
+    }
 }
 
 /// The colour payload of a `FLASH` / `BURN_COLOR` command.
@@ -7635,9 +8747,9 @@ pub fn is_color_command(name: &str) -> bool {
 /// Trail commands the corpus writes as a raw `effect(*MA_MSC_CMD_…, …)` call rather than
 /// through a `macros::` wrapper, mapped to the name the rest of the editor knows them by.
 ///
-/// C2 assumed sword trails were `macros::AFTER_IMAGE4_ON`/`_arg29`/`AFTER_IMAGE_ON`, and all
-/// three have zero corpus calls. The four real trail-ON calls — kirby `SpecialHi2` and
-/// `SpecialAirHi2`, twice each — are `effect(*MA_MSC_CMD_EFFECT_AFTER_IMAGE3_ON, …)`. There is
+/// The pinned fighter corpus contains both `macros::AFTER_IMAGE4_ON_arg29` wrappers and
+/// raw `effect(*MA_MSC_CMD_EFFECT_AFTER_IMAGE3_ON, …)` calls. The raw family is a separate
+/// layout, not an alias of the wrapper's 30-argument form. There is
 /// no `macros::AFTER_IMAGE3_ON` to call: `lua_const` declares the command, smash-script never
 /// wrapped it, so the game is reached through the command id and an export must re-emit that
 /// same form.
@@ -7692,12 +8804,22 @@ pub fn color_slots(has_transition: bool) -> (Option<usize>, [usize; 4]) {
 /// A timing statement in an effect_ script — mirrors `AcmdStmt`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EffectStmt {
+    /// An effect command whose execution guard is represented by the enclosing condition.
+    BareEffect(Box<EffectMacro>),
+    BareNativeCall(crate::move_nodes::native_calls::NativeCall),
     Frame(f32),
+    /// The same source-only native frame-execution primitive as AcmdStmt.
+    NativeExecuteFrame(f32),
+    /// Source-only native motion-loop synchronization on the fixed agent Lua state.
+    NativeMotionLoopSync,
     Wait(f32),
     Excute(Vec<EffectMacro>),
     Loop {
         count: usize,
         body: Vec<EffectStmt>,
+        /// See [`AcmdStmt::Loop`]: once per motion cycle, ending with the implied native wait.
+        #[serde(default, skip_serializing_if = "MotionLoop::is_no")]
+        motion_loop: MotionLoop,
     },
     /// A block this parser has no typed form for — in practice `if <costume check> {`,
     /// `if !WorkModule::is_flag(…) {`, and `else {`.
@@ -7716,6 +8838,58 @@ pub enum EffectStmt {
         body: Vec<EffectStmt>,
     },
     Raw(String),
+}
+
+/// Execute alternatives require structured source export; the flat effect stream cannot
+/// retain both the execution predicate and its lexical alternate.
+pub(crate) fn effect_execute_arm(stmts: &[EffectStmt], index: usize) -> bool {
+    let EffectStmt::Cond { header, .. } = &stmts[index] else {
+        return false;
+    };
+    header == "if macros::is_excute(agent) {"
+        || header == "else {" && index.checked_sub(1).is_some_and(|previous| {
+            matches!(&stmts[previous], EffectStmt::Cond { header, .. } if header == "if macros::is_excute(agent) {")
+        })
+}
+
+fn effect_preview_budget_error(stmts: &[EffectStmt]) -> Option<String> {
+    fn list_work(stmts: &[EffectStmt], depth: usize) -> Result<u64, String> {
+        if depth > MAX_PREVIEW_AST_DEPTH {
+            return Err(format!(
+                "Effect preview structure exceeds nesting limit {MAX_PREVIEW_AST_DEPTH}"
+            ));
+        }
+        let mut total = 0u64;
+        for stmt in stmts {
+            let work = match stmt {
+                EffectStmt::Loop { count, body, .. } => {
+                    // Empty repeats still execute the loop control step once per iteration.
+                    let body_work = list_work(body, depth + 1)?.max(1);
+                    let iterations = u64::try_from(*count).unwrap_or(u64::MAX).saturating_add(1);
+                    1u64.saturating_add(body_work.saturating_mul(iterations))
+                }
+                EffectStmt::Cond { body, .. } => 1u64.saturating_add(list_work(body, depth + 1)?),
+                EffectStmt::Excute(macros) => 1u64.saturating_add(macros.len() as u64),
+                EffectStmt::Frame(_)
+                | EffectStmt::NativeExecuteFrame(_)
+                | EffectStmt::NativeMotionLoopSync
+                | EffectStmt::Wait(_)
+                | EffectStmt::BareNativeCall(_)
+                | EffectStmt::BareEffect(_)
+                | EffectStmt::Raw(_) => 1,
+            };
+            total = total.saturating_add(work);
+            if total > MAX_PREVIEW_EXPANDED_WORK {
+                return Err(format!(
+                    "Effect preview expansion exceeds the {}-work limit",
+                    MAX_PREVIEW_EXPANDED_WORK
+                ));
+            }
+        }
+        Ok(total)
+    }
+
+    list_work(stmts, 0).err()
 }
 
 /// The parsed effect_ function, preserving full structure.
@@ -8004,6 +9178,13 @@ pub enum EffectCallOp {
 }
 
 impl EffectScript {
+    /// Return a diagnostic when effect flattening would exceed its aggregate work budget or
+    /// nesting bound. Callers must surface this before consuming the legacy Vec-returning
+    /// preview helpers; those helpers refuse to unroll and return empty outputs when it fails.
+    pub fn preview_budget_error(&self) -> Option<String> {
+        effect_preview_budget_error(&self.stmts)
+    }
+
     /// Flatten the script into resolved `EffectCall`s with computed frame ranges.
     pub fn to_effect_calls(&self) -> Vec<EffectCall> {
         self.to_effect_calls_and_residue().0
@@ -8038,9 +9219,12 @@ impl EffectScript {
         Vec<EffectCall>,
         std::collections::BTreeMap<u32, Vec<String>>,
     ) {
+        if self.preview_budget_error().is_some() {
+            return (Vec::new(), std::collections::BTreeMap::new());
+        }
         let mut calls: Vec<EffectCall> = Vec::new();
         let mut walk = EffectWalk::default();
-        let end = eval_effect_stmts(&self.stmts, 0.0, &mut calls, &mut walk);
+        let end = eval_effect_stmts_unchecked(&self.stmts, 0.0, &mut calls, &mut walk);
         walk.end_frame(end);
         for call in &mut calls {
             call.normalize_timing();
@@ -8153,14 +9337,17 @@ pub(crate) fn script_to_motion_frame(frame: u32) -> f32 {
     frame.max(1).saturating_sub(1) as f32
 }
 
-fn eval_effect_stmts(
+fn eval_effect_stmts_unchecked(
     stmts: &[EffectStmt],
     start_frame: f32,
     calls: &mut Vec<EffectCall>,
     walk: &mut EffectWalk,
 ) -> f32 {
     let mut frame = start_frame;
-    for stmt in stmts {
+    for (index, stmt) in stmts.iter().enumerate() {
+        if effect_execute_arm(stmts, index) {
+            continue;
+        }
         match stmt {
             // `end_frame` is handed the frame being *left*, not the one being entered — the
             // pending residue was written under the old cursor and has to be emitted there.
@@ -8180,7 +9367,12 @@ fn eval_effect_stmts(
             // coroutine a second time on top of that and shift every effect after it — the
             // export would compile and play wrong, which is worse than the current honest
             // deletion. `unexportable_effect_lines` still names each one.
-            EffectStmt::Raw(_) => {}
+            EffectStmt::BareNativeCall(call) => walk.residue(&call.source(), calls),
+            // Execute alternatives remain structured source; do not flatten either arm.
+            EffectStmt::BareEffect(_) => {}
+            EffectStmt::NativeExecuteFrame(_)
+            | EffectStmt::NativeMotionLoopSync
+            | EffectStmt::Raw(_) => {}
             EffectStmt::Cond { header, body } => {
                 // One level only. A guard inside a guard would overwrite `walk.guard` and
                 // export the inner condition while silently discarding the outer, which is a
@@ -8191,7 +9383,7 @@ fn eval_effect_stmts(
                 if outer.is_none() {
                     walk.guard = Some(header.clone());
                 }
-                frame = eval_effect_stmts(body, frame, calls, walk);
+                frame = eval_effect_stmts_unchecked(body, frame, calls, walk);
                 walk.guard = outer;
             }
             EffectStmt::Excute(macros) => {
@@ -8469,6 +9661,7 @@ fn eval_effect_stmts(
                                 calls,
                             ),
                         },
+                        EffectMacro::NativeCall(call) => walk.residue(&call.source(), calls),
                         EffectMacro::Control(control) => {
                             // A control is a point event. It must not close or shorten a
                             // following effect, and it must not become the anchor for a
@@ -8555,6 +9748,12 @@ fn eval_effect_stmts(
                             walk.last_spawn = Some(calls.len() - 1);
                             anchor = None;
                         }
+                        // Not an ordinary `EffectCall`: keep the WorkInt slot-bearing wrapper
+                        // in the legacy residue stream rather than flattening it into EFFECT.
+                        EffectMacro::EffectFollowWork { .. } => {
+                            walk.residue(&crate::acmd::preview_effect_macro(m), calls);
+                            anchor = None;
+                        }
                         // An effect macro with no typed form. Carried verbatim, unlike its
                         // statement-level twin above, because inside an `is_excute` block a line
                         // cannot be a timing primitive — everything here acts on effects.
@@ -8565,7 +9764,7 @@ fn eval_effect_stmts(
                     }
                 }
             }
-            EffectStmt::Loop { count, body } => {
+            EffectStmt::Loop { count, body, .. } => {
                 // Every iteration re-runs the SAME text, so the pending residue is rewound to
                 // where the loop started each time. The calls are genuinely unrolled — four
                 // iterations spawn four effects, and each carries its own copy of the lines that
@@ -8581,7 +9780,7 @@ fn eval_effect_stmts(
                 let pending_at_entry = walk.pending.clone();
                 for _ in 0..*count {
                     walk.pending.clone_from(&pending_at_entry);
-                    frame = eval_effect_stmts(body, frame, calls, walk);
+                    frame = eval_effect_stmts_unchecked(body, frame, calls, walk);
                 }
             }
         }
@@ -8618,7 +9817,10 @@ impl EffectScript {
     /// statement tree exactly the way `eval_effect_stmts` does. Keep them in step.
     pub fn call_macro_ordinals(&self) -> Vec<usize> {
         fn walk(stmts: &[EffectStmt], next: &mut usize, out: &mut Vec<usize>) {
-            for stmt in stmts {
+            for (index, stmt) in stmts.iter().enumerate() {
+                if effect_execute_arm(stmts, index) {
+                    continue;
+                }
                 match stmt {
                     EffectStmt::Excute(macros) => {
                         for m in macros {
@@ -8638,7 +9840,7 @@ impl EffectScript {
                             }
                         }
                     }
-                    EffectStmt::Loop { count, body } => {
+                    EffectStmt::Loop { count, body, .. } => {
                         // Every iteration re-runs the SAME text: restore the counter so the
                         // second pass lands on the same ordinals as the first.
                         let start = *next;
@@ -8651,11 +9853,20 @@ impl EffectScript {
                     // inside a conditional into real calls, so this walk has to number them or
                     // every later call would be attributed to the wrong line of source.
                     EffectStmt::Cond { body, .. } => walk(body, next, out),
-                    EffectStmt::Frame(_) | EffectStmt::Wait(_) | EffectStmt::Raw(_) => {}
+                    EffectStmt::Frame(_)
+                    | EffectStmt::NativeExecuteFrame(_)
+                    | EffectStmt::NativeMotionLoopSync
+                    | EffectStmt::Wait(_)
+                    | EffectStmt::BareNativeCall(_)
+                    | EffectStmt::BareEffect(_)
+                    | EffectStmt::Raw(_) => {}
                 }
             }
         }
         let mut out = Vec::new();
+        if self.preview_budget_error().is_some() {
+            return out;
+        }
         walk(&self.stmts, &mut 0, &mut out);
         out
     }
@@ -8664,6 +9875,378 @@ impl EffectScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_expansion_preflight_is_bounded_for_acmd_and_effect_trees() {
+        let acmd_leaf = AcmdStmt::Excute(vec![ExcuteStmt::WorkFlag(WorkFlagCall {
+            action: WorkFlagAction::On,
+            flag: "*FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO".into(),
+        })]);
+        let small_acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 10,
+                body: vec![AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 10,
+                    body: vec![acmd_leaf.clone()],
+                }],
+            }],
+        };
+        assert_eq!(small_acmd.preview_budget_error(), None);
+        assert_eq!(small_acmd.to_work_flag_events().len(), 100);
+
+        let huge_acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 100,
+                body: vec![AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 100,
+                    body: vec![AcmdStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count: 100,
+                        body: vec![acmd_leaf],
+                    }],
+                }],
+            }],
+        };
+        assert!(huge_acmd
+            .preview_budget_error()
+            .is_some_and(|error| error.contains("100000-work limit")));
+        assert!(huge_acmd.to_work_flag_events().is_empty());
+        assert!(huge_acmd.to_hitboxes().is_empty());
+        let (hurtboxes, priorities) = huge_acmd.to_hurtboxes();
+        assert!(hurtboxes.is_empty() && priorities.is_empty());
+        assert!(huge_acmd.to_hurtbox_events().is_empty());
+        assert!(huge_acmd.to_hurtbox_condition_events().is_empty());
+        assert!(huge_acmd.to_hurtbox_conditions().is_empty());
+        assert!(huge_acmd.to_attack_mods().is_empty());
+        assert!(huge_acmd.to_sound_events().is_empty());
+        assert!(huge_acmd.to_expression_events().is_empty());
+        assert!(huge_acmd.to_raw_partial_frame_events().is_empty());
+        assert!(huge_acmd.to_reverse_lr_events().is_empty());
+        assert!(huge_acmd.to_speed_ex_events().is_empty());
+        assert!(huge_acmd.to_speed_events().is_empty());
+        assert!(huge_acmd.to_add_speed_no_limit_events().is_empty());
+        assert!(huge_acmd.to_correct_events().is_empty());
+        assert!(huge_acmd.to_ft_catch_stop_events().is_empty());
+        assert!(huge_acmd
+            .to_ft_start_adjust_motion_frame_events()
+            .is_empty());
+        assert!(huge_acmd.to_motion_module_set_rate_events().is_empty());
+        assert!(huge_acmd
+            .to_motion_module_set_helper_calculation_events()
+            .is_empty());
+        assert!(huge_acmd
+            .to_motion_module_set_rate_partial_events()
+            .is_empty());
+        assert!(huge_acmd
+            .to_motion_module_set_frame_partial_events()
+            .is_empty());
+        assert!(huge_acmd.to_clr_speed_events().is_empty());
+        assert!(huge_acmd.to_set_air_events().is_empty());
+        assert!(huge_acmd.to_kinetic_clear_speed_all_events().is_empty());
+        assert!(huge_acmd
+            .to_kinetic_set_consider_ground_friction_events()
+            .is_empty());
+        assert!(huge_acmd.to_change_kinetic_events().is_empty());
+        assert!(huge_acmd.to_kinetic_add_speed_events().is_empty());
+        assert!(huge_acmd.to_kinetic_energy_events().is_empty());
+        assert!(huge_acmd.to_work_transition_term_events().is_empty());
+        assert!(huge_acmd.to_work_module_inc_int_events().is_empty());
+        assert!(huge_acmd.to_work_module_set_events().is_empty());
+
+        let overflow_acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: vec![AcmdStmt::Frame(1.0)],
+            }],
+        };
+        assert!(overflow_acmd.preview_budget_error().is_some());
+        assert!(overflow_acmd.to_work_flag_events().is_empty());
+        let overflow_empty_acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: Vec::new(),
+            }],
+        };
+        assert!(overflow_empty_acmd.preview_budget_error().is_some());
+        assert!(overflow_empty_acmd.to_work_flag_events().is_empty());
+        let large_empty_acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: MAX_PREVIEW_EXPANDED_WORK as usize,
+                body: Vec::new(),
+            }],
+        };
+        assert!(large_empty_acmd.preview_budget_error().is_some());
+        assert!(large_empty_acmd.to_work_flag_events().is_empty());
+
+        let many_acmd_commands = AcmdScript {
+            stmts: vec![AcmdStmt::Excute(vec![
+                ExcuteStmt::Raw("unknown();".into());
+                MAX_PREVIEW_EXPANDED_WORK as usize
+            ])],
+        };
+        assert!(many_acmd_commands.preview_budget_error().is_some());
+
+        let raw_block_children = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 2,
+                body: vec![AcmdStmt::RawBlock {
+                    header: "if unknown {".into(),
+                    body: vec![AcmdStmt::Frame(1.0); 50_001],
+                }],
+            }],
+        };
+        assert!(raw_block_children.preview_budget_error().is_some());
+
+        let deep_acmd = AcmdScript {
+            stmts: (0..=MAX_PREVIEW_AST_DEPTH).fold(vec![AcmdStmt::Frame(1.0)], |body, _| {
+                vec![AcmdStmt::RawBlock {
+                    header: "if unknown {".into(),
+                    body,
+                }]
+            }),
+        };
+        assert!(deep_acmd
+            .preview_budget_error()
+            .is_some_and(|error| error.contains("nesting limit")));
+        assert!(deep_acmd.to_work_flag_events().is_empty());
+
+        let effect_leaf = EffectStmt::Excute(vec![EffectMacro::Effect {
+            effect_name: "sys_hit_fire".into(),
+            effect_name_alt: None,
+            spawn_func: "EFFECT".into(),
+            bone_name: "top".into(),
+            offset: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            follows_bone: false,
+            extra_args: Vec::new(),
+            flip_axis: None,
+        }]);
+        let small_effect = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 10,
+                body: vec![EffectStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 10,
+                    body: vec![effect_leaf.clone()],
+                }],
+            }],
+        };
+        assert_eq!(small_effect.preview_budget_error(), None);
+        assert_eq!(small_effect.to_effect_calls().len(), 100);
+        assert_eq!(small_effect.call_macro_ordinals().len(), 100);
+
+        let huge_effect = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 100,
+                body: vec![EffectStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 100,
+                    body: vec![EffectStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count: 100,
+                        body: vec![effect_leaf],
+                    }],
+                }],
+            }],
+        };
+        assert!(huge_effect
+            .preview_budget_error()
+            .is_some_and(|error| error.contains("100000-work limit")));
+        assert!(huge_effect.to_effect_calls().is_empty());
+        assert!(huge_effect.to_effect_calls_and_residue().1.is_empty());
+        assert!(huge_effect.call_macro_ordinals().is_empty());
+
+        let overflow_effect = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: vec![EffectStmt::Frame(1.0)],
+            }],
+        };
+        assert!(overflow_effect.preview_budget_error().is_some());
+        assert!(overflow_effect.to_effect_calls().is_empty());
+        assert!(overflow_effect.call_macro_ordinals().is_empty());
+        let overflow_empty_effect = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: Vec::new(),
+            }],
+        };
+        assert!(overflow_empty_effect.preview_budget_error().is_some());
+        assert!(overflow_empty_effect.to_effect_calls().is_empty());
+        assert!(overflow_empty_effect.call_macro_ordinals().is_empty());
+        let large_empty_effect = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: MAX_PREVIEW_EXPANDED_WORK as usize,
+                body: Vec::new(),
+            }],
+        };
+        assert!(large_empty_effect.preview_budget_error().is_some());
+        assert!(large_empty_effect.to_effect_calls().is_empty());
+        assert!(large_empty_effect.call_macro_ordinals().is_empty());
+
+        let many_effect_commands = EffectScript {
+            stmts: vec![EffectStmt::Excute(vec![
+                EffectMacro::Raw(
+                    "unknown();".into()
+                );
+                MAX_PREVIEW_EXPANDED_WORK as usize
+            ])],
+        };
+        assert!(many_effect_commands.preview_budget_error().is_some());
+
+        let conditional_children = EffectScript {
+            stmts: vec![EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 2,
+                body: vec![EffectStmt::Cond {
+                    header: "if unknown {".into(),
+                    body: vec![EffectStmt::Frame(1.0); 50_001],
+                }],
+            }],
+        };
+        assert!(conditional_children.preview_budget_error().is_some());
+    }
+
+    #[test]
+    fn article_partial_motion_presets_are_closed_owner_bound_source_rows() {
+        let mut rows = std::collections::BTreeSet::new();
+        let mut serialized = std::collections::BTreeSet::new();
+        for preset in ArticlePartialMotionPreset::ALL {
+            assert!(rows.insert(preset.source_line()));
+            assert_eq!(
+                ArticlePartialMotionPreset::from_source_line(&preset.source_line()),
+                Some(preset)
+            );
+            assert!(preset
+                .article_symbol()
+                .contains(preset.fighter().to_ascii_uppercase().as_str()));
+            assert!(preset
+                .partset_symbol()
+                .contains(preset.fighter().to_ascii_uppercase().as_str()));
+            assert!(matches!(preset.motion(), "to_open" | "to_close"));
+            assert!(matches!(preset.timing(), "3.33" | "5.0" | "10.0"));
+            assert_eq!(preset.label().split(" / ").count(), 2);
+            serialized.insert(serde_json::to_string(&preset).unwrap());
+        }
+        assert_eq!(rows.len(), 12);
+        assert_eq!(serialized.len(), 12);
+        assert_eq!(
+            ArticlePartialMotionPreset::ALL
+                .into_iter()
+                .filter(|preset| preset.fighter() == "eflame")
+                .count(),
+            6
+        );
+        assert_eq!(
+            ArticlePartialMotionPreset::ALL
+                .into_iter()
+                .filter(|preset| preset.fighter() == "elight")
+                .count(),
+            6
+        );
+        assert!(ArticlePartialMotionPreset::from_source_line(
+            "ArticleModule::add_motion_partial(agent.module_accessor, *FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD, *WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE, Hash40::new(\"to_open\"), 5.0, 5.0, false, true, 0.0, false, true, false);"
+        )
+        .is_none());
+        assert!(ArticlePartialMotionPreset::from_source_line(
+            "ArticleModule::add_motion_partial(agent.module_accessor, *FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD, *WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE, Hash40::new(\"to_open\"), 5, 5.0, false, false, 0.0, false, true, false);"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn late_move_labels_resolve_only_hash_fallbacks_and_are_idempotent() {
+        let first_hash = 0x0123_4567_89ab_cdef;
+        let second_hash = 0x1111_2222_3333_4444;
+        let missing_hash = 0x9999_aaaa_bbbb_cccc;
+        let path = PathBuf::from("motion/attack11.nuanmb");
+        let mut entries = vec![
+            MoveEntry {
+                name: format!("{first_hash:#018x}"),
+                hash: first_hash,
+                frame_count: 17,
+                anim_path: Some(path.clone()),
+            },
+            MoveEntry {
+                name: format!("{second_hash:#018x}"),
+                hash: second_hash,
+                frame_count: 0,
+                anim_path: None,
+            },
+            MoveEntry {
+                name: format!("{missing_hash:#018x}"),
+                hash: missing_hash,
+                frame_count: 8,
+                anim_path: None,
+            },
+            MoveEntry {
+                name: "user_favorite_motion".into(),
+                hash: first_hash,
+                frame_count: 4,
+                anim_path: None,
+            },
+        ];
+        let original_non_names = entries
+            .iter()
+            .map(|entry| (entry.hash, entry.frame_count, entry.anim_path.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolve_move_entry_names(&mut entries, &HashMap::new()), 0);
+        let labels = HashMap::from([
+            (first_hash, "attack11".to_owned()),
+            (second_hash, "specialn".to_owned()),
+        ]);
+        assert_eq!(resolve_move_entry_names(&mut entries, &labels), 2);
+        assert_eq!(entries[0].name, "attack11");
+        assert_eq!(entries[1].name, "specialn");
+        assert_eq!(entries[2].name, format!("{missing_hash:#018x}"));
+        assert_eq!(entries[3].name, "user_favorite_motion");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.hash, entry.frame_count, entry.anim_path.clone()))
+                .collect::<Vec<_>>(),
+            original_non_names,
+            "resolution may change only the display name"
+        );
+        assert_eq!(resolve_move_entry_names(&mut entries, &labels), 0);
+    }
+
+    #[test]
+    fn late_labels_resolve_multiple_entries_with_the_same_hash() {
+        let hash = 0x0102_0304_0506_0708;
+        let mut entries = [
+            MoveEntry {
+                name: format!("{hash:#018x}"),
+                hash,
+                frame_count: 1,
+                anim_path: None,
+            },
+            MoveEntry {
+                name: format!("{hash:#018x}"),
+                hash,
+                frame_count: 2,
+                anim_path: Some(PathBuf::from("body/motion.nuanmb")),
+            },
+        ];
+        let labels = HashMap::from([(hash, "specialhi".to_owned())]);
+        assert_eq!(resolve_move_entry_names(&mut entries, &labels), 2);
+        assert!(entries.iter().all(|entry| entry.name == "specialhi"));
+    }
 
     /// kirby's down smash, which is the clearest case in the corpus: it sets `0.25`, crosses
     /// four motion frames of windup, then restores `1.0` and plays one more.
@@ -8769,6 +10352,7 @@ mod tests {
                     ExcuteStmt::Raw("unknown_sound_line(agent);".into()),
                 ]),
                 AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
                     count: 2,
                     body: vec![
                         AcmdStmt::Wait(1.0),
@@ -9816,6 +11400,7 @@ mod tests {
             stmts: vec![
                 AcmdStmt::Frame(2.0),
                 AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
                     count: 2,
                     body: vec![
                         AcmdStmt::Excute(vec![ExcuteStmt::HitStatus {
@@ -10007,6 +11592,7 @@ mod tests {
                     },
                 ))),
                 AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
                     count: 2,
                     body: vec![AcmdStmt::Excute(vec![ExcuteStmt::DamageNoReaction(
                         DamageNoReactionCall {
@@ -10050,50 +11636,5 @@ mod tests {
                 }
             ]
         ));
-    }
-
-    #[test]
-    fn optional_parameter_corpus_audit_is_data_root_scoped() {
-        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT").map(PathBuf::from) else {
-            return;
-        };
-        let fighter_root = root.join("fighter");
-        let Ok(fighters) = std::fs::read_dir(fighter_root) else {
-            return;
-        };
-        let mut files = 0usize;
-        let mut entries = 0usize;
-        for fighter in fighters.flatten() {
-            let dir = fighter.path();
-            let param_dir = dir.join("param");
-            let path = [
-                param_dir.join("vl.prc"),
-                param_dir.join("fighter_param.prc"),
-            ]
-            .into_iter()
-            .find(|path| path.exists());
-            let Some(path) = path else { continue };
-            let skeleton = dir
-                .join("model")
-                .join("body")
-                .join("c00")
-                .join("model.nusktb");
-            let bones = ssbh_data::skel_data::SkelData::from_file(skeleton)
-                .map(|skel| {
-                    skel.bones
-                        .into_iter()
-                        .map(|bone| bone.name)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let result = load_hurtbox_volumes(&path, &bones);
-            files += 1;
-            entries += result.volumes.len();
-        }
-        eprintln!("hurtbox corpus audit: {files} parameter files, {entries} entries");
-        assert!(
-            files > 0,
-            "VISIONARY_DATA_ROOT contained no parameter files"
-        );
     }
 }

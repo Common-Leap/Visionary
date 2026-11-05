@@ -97,13 +97,6 @@ impl RealDataMap {
         let idx = self.data_map_index;
         self.maps.get_mut(idx)
     }
-
-    pub fn union_maps(&mut self, other: RealDataMap) {
-        self.maps.extend(other.maps);
-        if self.data_map_index >= self.maps.len() {
-            self.data_map_index = self.maps.len().saturating_sub(1);
-        }
-    }
 }
 
 pub fn install() {
@@ -201,59 +194,12 @@ pub fn unwrap_effect_data(boid: u32) -> Result<EffectData, &'static str> {
     Ok(map.effect_data.clone())
 }
 
-pub fn effect_data_for(boid: u32) -> Option<EffectData> {
-    get_effect_data(boid).or_else(|| {
-        COMMON_SPACES
-            .lock()
-            .get(&INSTALL_INDEX)
-            .and_then(|s| s.active_map().map(|m| m.effect_data.clone()))
-    })
-}
-
 pub fn set_damage(boid: u32, damage: f32) {
     let mut spaces = COMMON_SPACES.lock();
     let space = spaces.entry(boid).or_insert_with(|| new_common_space(boid));
     if let Some(map) = space.active_map_mut() {
         map.debug.current.damage = damage;
     }
-}
-
-pub fn set_data_map_index(boid: u32, index: usize) {
-    let mut spaces = COMMON_SPACES.lock();
-    if let Some(space) = spaces.get_mut(&boid) {
-        space.data_map_index = index;
-    }
-}
-
-pub fn mark_invalid(boid: u32, invalid_drop: bool) {
-    let mut spaces = COMMON_SPACES.lock();
-    if let Some(space) = spaces.get_mut(&boid) {
-        if let Some(map) = space.active_map_mut() {
-            map.invalid = true;
-            map.invalid_drop = invalid_drop;
-        }
-    }
-}
-
-/// Jorge invalid_drop — refuse drop when flagged, else remove map entry.
-pub fn drop_map(boid: u32) -> bool {
-    let mut spaces = COMMON_SPACES.lock();
-    let Some(space) = spaces.get_mut(&boid) else {
-        return false;
-    };
-    let invalid_drop = space.active_map().map(|m| m.invalid_drop).unwrap_or(false);
-    if invalid_drop {
-        skyline::println!("[SLight] Invalid drop");
-        return false;
-    }
-    if crate::slight::smash_utils::debug_logging_enabled() {
-        skyline::println!(
-            "[SLight] Trying to drop map in {boid:?} - Map removed (Purpose: {:?})",
-            space.purpose
-        );
-    }
-    spaces.remove(&boid);
-    true
 }
 
 pub fn on_frame() {
@@ -375,27 +321,6 @@ pub fn init_fighter(boid: u32) {
     let space = common_space(boid);
     let _ = personal_space(space.lua_state_agent.lua_state, boid);
     skyline::println!("[SLight] Common data space for an index — fighter {boid}");
-}
-
-pub fn init_personal(lua_state: u64, boid: u32) {
-    let _ = personal_space(lua_state, boid);
-    if crate::slight::smash_utils::debug_logging_enabled() {
-        skyline::println!("[SLight] Personal data space — lua {lua_state:#x} fighter {boid}");
-    }
-}
-
-pub fn debug_pair(boid: u32) -> Option<DebugPair> {
-    COMMON_SPACES
-        .lock()
-        .get(&boid)
-        .and_then(|s| s.active_map().map(|m| m.debug.clone()))
-}
-
-pub fn keyed_get(boid: u32, key: &str) -> Result<EffectData, &'static str> {
-    if key != EFFECT_DATA_KEY {
-        return Err("Error. Tried unwrapping key , but it doesn't exists");
-    }
-    unwrap_effect_data(boid)
 }
 
 pub fn clear() {

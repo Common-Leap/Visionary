@@ -15,7 +15,6 @@ fn synthetic_top_matrix(bones: &std::collections::HashMap<String, glam::Mat4>) -
         .unwrap_or(glam::Mat4::IDENTITY)
 }
 
-#[allow(dead_code)]
 pub struct Camera {
     pub translation: Vec3,
     pub rotation: Vec3,
@@ -79,8 +78,6 @@ pub struct HitboxRenderState {
     pub renderer: SsbhRenderer,
     pub shared_data: SharedRenderData,
     pub render_models: Vec<RenderModel>,
-    #[allow(dead_code)]
-    pub render_settings: RenderSettings,
     pub model_render_options: ModelRenderOptions,
     pub camera: Camera,
     pub current_width: u32,
@@ -133,7 +130,6 @@ impl HitboxRenderState {
             renderer,
             shared_data,
             render_models: Vec::new(),
-            render_settings,
             model_render_options: ModelRenderOptions::default(),
             camera: Camera::default(),
             current_width: 0,
@@ -311,20 +307,11 @@ impl HitboxRenderState {
         self.renderer.update_camera(queue, transforms);
     }
 
-    /// Returns all bone names from the cached skeleton.
-    #[allow(dead_code)]
-    pub fn bone_names(&self) -> Vec<String> {
-        self.cached_skel
-            .as_ref()
-            .map(|(_, s)| s.bones.iter().map(|b| b.name.clone()).collect())
-            .unwrap_or_default()
-    }
-
     pub fn weapon_skel_count(&self) -> usize {
         self.weapon_skels.len()
     }
 
-    /// Eagerly load skeleton data so bone_world_matrices() returns valid results
+    /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
         self.cached_skel = ssbh_data::skel_data::SkelData::from_file(skel_path)
@@ -332,15 +319,8 @@ impl HitboxRenderState {
             .map(|s| (skel_path.to_path_buf(), s));
     }
 
-    /// Returns a map of bone name -> world matrix for the current frame.
-    /// Includes both body skeleton bones and weapon skeleton bones.
-    /// The offset from ACMD should be transformed by this matrix (not just added).
-    pub fn bone_world_matrices(&self) -> std::collections::HashMap<String, glam::Mat4> {
-        self.bone_world_matrices_at(self.last_frame.max(0.0))
-    }
-
-    /// Like `bone_world_matrices()` but evaluates animation at an explicit `frame`
-    /// instead of `self.last_frame`. Use this from the simulation code so bone
+    /// Bone name -> world matrix (body and weapon skeletons) at an explicit `frame`.
+    /// The offset from ACMD should be transformed by this matrix (not just added). Use this from the simulation code so bone
     /// positions are correct on the very first frame (no 1-frame delay).
     pub fn bone_world_matrices_at(
         &self,
@@ -562,15 +542,6 @@ pub fn compute_bone_world_matrices(
 }
 
 impl HitboxRenderState {
-    /// Returns a map of bone name -> world position (convenience wrapper).
-    #[allow(dead_code)]
-    pub fn bone_world_positions(&self) -> std::collections::HashMap<String, glam::Vec3> {
-        self.bone_world_matrices()
-            .into_iter()
-            .map(|(k, m)| (k, m.col(3).truncate()))
-            .collect()
-    }
-
     /// Projects a 3D world position to normalized device coordinates (NDC),
     /// then to pixel coordinates within the given viewport rect.
     pub fn world_to_screen(
@@ -697,113 +668,6 @@ mod tests {
         assert_eq!(layers.len(), 2);
         assert!(std::ptr::eq(layers[0], &default));
         assert!(std::ptr::eq(layers[1], &selected));
-    }
-
-    /// Benchmark for the editor's dominant per-frame CPU cost. Ignored by default because it
-    /// needs real game files; run it against an extracted data root with:
-    ///
-    /// ```text
-    /// VISIONARY_BENCH_FIGHTER=/path/to/export/fighter/mario \
-    ///   cargo test --release -- --ignored --nocapture bone_matrix_cost
-    /// ```
-    #[test]
-    #[ignore = "needs a real extracted data root; see VISIONARY_BENCH_FIGHTER"]
-    fn bone_matrix_cost() {
-        use std::time::Instant;
-        let Some(root) = std::env::var_os("VISIONARY_BENCH_FIGHTER").map(std::path::PathBuf::from)
-        else {
-            panic!("set VISIONARY_BENCH_FIGHTER to a fighter dir, e.g. .../export/fighter/mario");
-        };
-        let model_root = root.join("model");
-        let skel_path = model_root.join("body").join("c00").join("model.nusktb");
-        let skel = ssbh_data::skel_data::SkelData::from_file(&skel_path)
-            .unwrap_or_else(|e| panic!("read {skel_path:?}: {e}"));
-
-        // Any body motion will do — pick the first one on disk for a stable, real workload.
-        let anim_dir = root.join("motion").join("body").join("c00");
-        let anim_path = std::fs::read_dir(&anim_dir)
-            .ok()
-            .and_then(|d| {
-                let mut v: Vec<_> = d
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.extension().is_some_and(|x| x == "nuanmb"))
-                    .collect();
-                v.sort();
-                v.into_iter().next()
-            })
-            .expect("no .nuanmb under motion/body/c00");
-        let anim = ssbh_data::anim_data::AnimData::from_file(&anim_path).ok();
-
-        // Load weapon skeletons the way `load_model` does.
-        let mut weapons: Vec<(String, ssbh_data::skel_data::SkelData, String)> = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&model_root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name == "body" {
-                    continue;
-                }
-                let Some(p) = (0..8)
-                    .map(|s| entry.path().join(format!("c{s:02}")).join("model.nusktb"))
-                    .find(|p| p.exists())
-                else {
-                    continue;
-                };
-                if let Ok(s) = ssbh_data::skel_data::SkelData::from_file(&p) {
-                    let attach = super::weapon_attach_bone(&name);
-                    weapons.push((name, s, attach));
-                }
-            }
-        }
-
-        eprintln!(
-            "\n[bench] {} body bones, anim {:?}, {} weapon skeletons ({} bones)",
-            skel.bones.len(),
-            anim_path.file_name().unwrap(),
-            weapons.len(),
-            weapons.iter().map(|(_, s, _)| s.bones.len()).sum::<usize>(),
-        );
-
-        const N: usize = 200;
-        // Warm up so we time steady state rather than first-touch page faults.
-        for f in 0..10 {
-            std::hint::black_box(super::compute_bone_world_matrices(
-                &skel,
-                anim.as_ref(),
-                &weapons,
-                f as f32,
-            ));
-        }
-
-        // Case A: a different frame each call (animation playing) — always real work.
-        let t = Instant::now();
-        let mut entries = 0;
-        for i in 0..N {
-            let m =
-                super::compute_bone_world_matrices(&skel, anim.as_ref(), &weapons, (i % 60) as f32);
-            entries += m.len();
-        }
-        let moving = t.elapsed();
-
-        // Case B: the same frame every call — the common editor case (idle repaints, mouse
-        // moves, slider drags all recompute an identical result).
-        let t = Instant::now();
-        for _ in 0..N {
-            std::hint::black_box(super::compute_bone_world_matrices(
-                &skel,
-                anim.as_ref(),
-                &weapons,
-                7.0,
-            ));
-        }
-        let still = t.elapsed();
-
-        eprintln!(
-            "[bench] moving frame: {:.3} ms/call\n[bench] same frame:   {:.3} ms/call\n[bench] {} map entries per call\n",
-            moving.as_secs_f64() * 1000.0 / N as f64,
-            still.as_secs_f64() * 1000.0 / N as f64,
-            entries / N,
-        );
     }
 }
 

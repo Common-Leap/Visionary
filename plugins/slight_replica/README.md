@@ -213,6 +213,21 @@ Create `sd:/slight/debug/trace.txt` before starting the game to enable it, and
 delete the file to turn it back off. With the trace off, the plugin's own log is
 `sd:/slight/diag.txt`, which is buffered and written from the frame path.
 
+## Gimmick live preview
+
+The main Gimmicks editor also uses this same plugin for live saved-controller
+snapshots and bounded float/int personal-parameter getter overlays. No second
+plugin is needed. Controller state is per player/object and resets with its stock;
+unchanged programs retain state on reconnect. Engine actions remain allowlisted
+and game-thread-only. Parameter overlays affect subsequent getter reads, not
+already cached native values. The desktop separates snapshot acceptance from
+observed parameter reads and exposes timer countdowns and per-player restarts.
+
+Updating these getter hooks requires a full game restart. Successful builds and
+host tests do not prove compatibility with another plugin's hooks; the first
+in-game check must use the actual installed mod stack. Keep backups outside the
+Skyline plugin directory, whose loader does not distinguish backup extensions.
+
 ## Bisecting a load hang
 
 The plugin installs seven independent groups of hooks, several of them inside the

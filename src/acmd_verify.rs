@@ -136,39 +136,6 @@ impl Report {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-/// Verify a generated project against the edits it was built from.
-///
-/// `acmd_edits` and `effect_edits` are the same `(fighter, move, …)` lists handed to
-/// [`crate::acmd::build_mod_project_full`], so this checks the code that is actually about to
-/// be written rather than a re-derivation of it.
-///
-/// `dropped` is keyed `"fighter/move"` and holds what the effect export threw away when that
-/// move was last read from a script. It is separate from `effect_edits` because it is the one
-/// input here that no amount of looking at the generated project can recover: the export builds
-/// the function out of the calls it understood, so a line that became no call left no trace in
-/// either the edits or the output. A move missing from the map had no source in hand, which is
-/// not the same as a move that had one and lost nothing — but both produce no findings, so the
-/// distinction costs nothing to collapse and empty lists are not stored.
-#[allow(dead_code)]
-pub fn verify_export(
-    project: &ModProject,
-    acmd_edits: &[(String, String, AcmdScript)],
-    effect_edits: &[crate::acmd::EffectExport],
-    sound_edits: &[(String, String, AcmdScript)],
-    tweaks: &[LiveTweak],
-    dropped: &HashMap<String, Vec<String>>,
-) -> Report {
-    verify_export_with_expression(
-        project,
-        acmd_edits,
-        effect_edits,
-        sound_edits,
-        &[],
-        tweaks,
-        dropped,
-    )
-}
-
 /// [`verify_export`] with the measured `expression_` script family included.
 pub fn verify_export_with_expression(
     project: &ModProject,
@@ -199,11 +166,7 @@ pub fn verify_export_with_expression(
         // A costume-gated move ships the same body under `<name>_costume`, so the shipped
         // text is compared against both spellings. Dropping this check for gated moves would
         // stop verifying that the body reached disk at all.
-        let gated = crate::roster::scaffold::costume_arm_source(&emitted);
-        if !sources
-            .iter()
-            .any(|text| text.contains(&emitted) || text.contains(&gated))
-        {
+        if !emitted_or_costume_arm_is_shipped(&sources, &emitted) {
             report.blocker(
                 &subject,
                 "the generated hitbox script is missing from the exported project",
@@ -218,6 +181,8 @@ pub fn verify_export_with_expression(
         let key = format!("{fighter}/{move_name}");
         let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
         let emitted = crate::acmd::preview_effect_fn(calls, &script_move, tweaks, residue);
+        check_effect_off_kind_work_owner(fighter, &subject, calls, &mut report);
+        check_legacy_follow_work_residue(&subject, calls, residue, &mut report);
         // C5 left this call passing `None`, because a saved project remembered the resolved
         // calls and nothing about the lines that became none of them. C6c gave the project
         // somewhere to keep that list, so both halves of the loss report now reach an export
@@ -231,7 +196,7 @@ pub fn verify_export_with_expression(
             residue,
             &mut report,
         );
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        if !emitted_or_costume_arm_is_shipped(&sources, &emitted) {
             report.blocker(
                 &subject,
                 "the generated effect script is missing from the exported project",
@@ -244,7 +209,7 @@ pub fn verify_export_with_expression(
         let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
         let emitted = crate::acmd::preview_sound_fn(script, &script_move);
         verify_sound_move(&subject, script, &emitted, &mut report);
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        if !emitted_or_costume_arm_is_shipped(&sources, &emitted) {
             report.blocker(
                 &subject,
                 "the generated sound script is missing from the exported project",
@@ -257,7 +222,7 @@ pub fn verify_export_with_expression(
         let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
         let emitted = crate::acmd::preview_expression_fn(script, &script_move);
         verify_expression_move(&subject, script, &emitted, &mut report);
-        if !sources.iter().any(|text| text.contains(&emitted)) {
+        if !emitted_or_costume_arm_is_shipped(&sources, &emitted) {
             report.blocker(
                 &subject,
                 "the generated expression script is missing from the exported project",
@@ -268,6 +233,110 @@ pub fn verify_export_with_expression(
     report
 }
 
+/// The legacy `EffectCall` path can only carry `EFFECT_FOLLOW_WORK` as opaque text attached to a
+/// neighboring spawn. Disabling that carrier omits its trailing text; retiming it moves the text
+/// with the carrier. This flat representation has no source-frame witness, so generated-project
+/// export must use the structured mixed-effect path for any such source instead.
+fn check_legacy_follow_work_residue(
+    subject: &str,
+    calls: &[EffectCall],
+    residue: &std::collections::BTreeMap<u32, Vec<String>>,
+    report: &mut Report,
+) {
+    let carries_work_follow = calls.iter().any(|call| {
+        call.leading
+            .iter()
+            .chain(&call.trailing)
+            .any(|line| line.contains("macros::EFFECT_FOLLOW_WORK("))
+    }) || residue
+        .values()
+        .flatten()
+        .any(|line| line.contains("macros::EFFECT_FOLLOW_WORK("));
+    if carries_work_follow {
+        report.blocker(
+            subject,
+            "legacy EFFECT_FOLLOW_WORK residue has no source-slot/frame witness; reimport the native Effect track and Apply nodes before project export",
+        );
+    }
+}
+
+/// Project export has the exact target fighter available, unlike source-only value previews.
+/// An otherwise valid closed preset must not be replayed under another fighter's function.
+fn check_effect_off_kind_work_owner(
+    fighter: &str,
+    subject: &str,
+    calls: &[EffectCall],
+    report: &mut Report,
+) {
+    for call in calls.iter().filter(|call| !call.disabled) {
+        let Some(crate::data::EffectControl::OffKindWork { preset_id }) = call.control.as_ref()
+        else {
+            continue;
+        };
+        let Some(preset) = crate::data::EffectOffKindWorkPreset::by_id(preset_id) else {
+            continue; // The value verifier reports the invalid preset ID.
+        };
+        let slot_valid = crate::gimmicks::registry::resolve(
+            fighter,
+            preset.work_symbol,
+            crate::gimmicks::registry::IdentifierKind::WorkInt,
+        )
+        .is_ok_and(|entry| entry.group.is_empty());
+        if preset.fighter != fighter || !slot_valid {
+            report.blocker(
+                subject,
+                format!(
+                    "fighter {fighter}: {} uses off-kind Work preset {:?} outside its exact {} owner",
+                    call.spawn_func, preset_id, preset.fighter
+                ),
+            );
+        }
+    }
+}
+
+/// Scoped category replacements are renamed to the generated `_costume` arm before the
+/// dispatcher is emitted. Verify the actual source body under either its normal name or that
+/// arm name, just as the game-track verifier does.
+fn emitted_or_costume_arm_is_shipped(sources: &[&str], emitted: &str) -> bool {
+    let costume_arm = crate::roster::scaffold::costume_arm_source(emitted);
+    sources
+        .iter()
+        .any(|text| text.contains(emitted) || text.contains(&costume_arm))
+}
+
+/// Check full effect control trees in their shipped functions, without resolving branches
+/// into the flat legacy spawn list. Typed node validation runs before this shipping check.
+pub fn verify_effect_structures(
+    project: &ModProject,
+    scripts: &[(String, String, AcmdScript)],
+    report: &mut Report,
+) {
+    for (fighter, move_name, script) in scripts {
+        let subject = format!("{fighter} / {move_name}");
+        if check_acmd_preview_budget(&subject, script, report) {
+            continue;
+        }
+        let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
+        let emitted = crate::acmd::preview_effect_structure_fn(script, &script_move);
+        if syn::parse_file(&emitted).is_err() {
+            report.blocker(&subject, "the structured effect script is not valid Rust");
+            continue;
+        }
+        let sources = project
+            .files
+            .iter()
+            .filter(|file| file.rel_path.ends_with(".rs"))
+            .map(|file| file.contents.as_str())
+            .collect::<Vec<_>>();
+        if !emitted_or_costume_arm_is_shipped(&sources, &emitted) {
+            report.blocker(
+                &subject,
+                "the structured effect control tree is missing or changed in the exported project",
+            );
+        }
+    }
+}
+
 /// Verify the typed expression calls that the editor models. Unknown expression lines remain
 /// raw and are checked by the generated Rust/source-presence checks around this function.
 pub fn verify_expression_move(
@@ -276,6 +345,9 @@ pub fn verify_expression_move(
     emitted: &str,
     report: &mut Report,
 ) {
+    if check_acmd_preview_budget(subject, script, report) {
+        return;
+    }
     let expected = script.to_expression_events();
     let round_tripped = crate::acmd::parse_expression_script(emitted).to_expression_events();
     if expected == round_tripped {
@@ -294,6 +366,9 @@ pub fn verify_expression_move(
 /// different `frame` block, or dropped a member it no longer recognised, changes the events and
 /// is caught; one that merely re-indented does not, and should not be.
 pub fn verify_sound_move(subject: &str, script: &AcmdScript, emitted: &str, report: &mut Report) {
+    if check_acmd_preview_budget(subject, script, report) {
+        return;
+    }
     let expected = script.to_sound_events();
     let round_tripped = crate::acmd::parse_sound_script(emitted).to_sound_events();
     if expected == round_tripped {
@@ -320,11 +395,35 @@ pub fn verify_sound_move(subject: &str, script: &AcmdScript, emitted: &str, repo
 
 /// Verify one move's hitbox script on its own, for the editor's generated-source preview.
 pub fn verify_move(subject: &str, script: &AcmdScript, emitted: &str, report: &mut Report) {
+    if check_acmd_preview_budget(subject, script, report) {
+        return;
+    }
     check_hitbox_fidelity(subject, script, emitted, report);
     check_hurtbox_fidelity(subject, script, emitted, report);
     check_speed_fidelity(subject, script, emitted, report);
     check_script_values(subject, script, report);
     check_script_shape(subject, script, report);
+}
+
+/// Add an export blocker for a parsed legacy EffectScript that cannot be previewed safely.
+/// The export layer that still owns the source tree must call this before flattening it into
+/// `EffectCall`s; that flat representation cannot reconstruct the original repeat witness.
+pub fn verify_effect_preview_budget(
+    subject: &str,
+    script: &crate::data::EffectScript,
+    report: &mut Report,
+) {
+    if let Some(error) = script.preview_budget_error() {
+        report.blocker(subject, error);
+    }
+}
+
+fn check_acmd_preview_budget(subject: &str, script: &AcmdScript, report: &mut Report) -> bool {
+    let Some(error) = script.preview_budget_error() else {
+        return false;
+    };
+    report.blocker(subject, error);
+    true
 }
 
 /// Verify one move's effect script on its own, for the editor's generated-source preview.
@@ -1148,6 +1247,7 @@ fn check_script_values(subject: &str, script: &AcmdScript, report: &mut Report) 
                     check_excute_values(subject, excute, report);
                 }
             }
+            AcmdStmt::Bare(command) => check_excute_values(subject, command, report),
             _ => {}
         }
     }
@@ -1192,6 +1292,54 @@ fn check_script_values(subject: &str, script: &AcmdScript, report: &mut Report) 
 
 fn check_excute_values(subject: &str, stmt: &ExcuteStmt, report: &mut Report) {
     match stmt {
+        ExcuteStmt::ArticleLifecycle(crate::data::ArticleLifecycleCall::ChangeStatus { symbol, status, if_present })
+            if !crate::data::article_status_catalog::is_measured_call(symbol, status, *if_present) =>
+        {
+            report.blocker(subject, "article state has an unmeasured article/status/API tuple; choose a measured donor preset");
+        }
+        ExcuteStmt::ArticleLifecycle(crate::data::ArticleLifecycleCall::GenerateEnabled { symbol })
+            if !crate::data::PINNED_ENABLED_ARTICLE_COUNTS.iter().any(|(_, measured, _)| *measured == symbol) =>
+        {
+            report.blocker(subject, "enabled article generation has an unmeasured symbol; choose a measured donor preset");
+        }
+        ExcuteStmt::VisibilitySetInt64 { group, status }
+            if !crate::data::body_visibility_catalog::is_measured_pair(group, status) =>
+        {
+            report.blocker(subject, "model visibility has an unmeasured group/state pair; choose a measured donor preset");
+        }
+        // This is a source-only authoring node. It does not infer default model-resource state
+        // in native move diagnostics.
+        ExcuteStmt::VisibilitySetDefaultInt64 { group }
+            if !crate::data::PINNED_DEFAULT_INT64_GROUP_COUNTS
+                .iter()
+                .any(|(_, measured, _)| *measured == group) =>
+        {
+            report.blocker(subject, "model default has an unmeasured group; choose a measured donor preset");
+        }
+        // The SDK establishes only the boolean source-call shape. Do not infer set_whole
+        // behavior in native move or combat diagnostics from this source node.
+        ExcuteStmt::VisibilitySetWhole { .. } => {}
+        ExcuteStmt::FinalFearFace(call) if !call.is_measured_token() => report.blocker(
+            subject,
+            "final fear face has an unmeasured source-token argument; choose a measured donor preset",
+        ),
+        ExcuteStmt::CheckFinalStartCamera(call) if !call.is_measured_tuple() => report.blocker(
+            subject,
+            "final-start camera has an unmeasured source-token tuple; choose a measured donor preset",
+        ),
+        ExcuteStmt::CheckFinishCamera(call) if !call.is_measured_tuple() => report.blocker(
+            subject,
+            "finish camera has an unmeasured source-token pair; choose a measured donor preset",
+        ),
+        ExcuteStmt::OptionalHitFeedback(call) if !call.is_valid() => report.blocker(
+            subject,
+            format!(
+                "optional hit feedback has an invalid arg2/hash value (arg2 {}..={}, Hash40 name must be non-empty, at most {} UTF-8 bytes, and contain no NUL; raw values retain u64)",
+                crate::data::OptionalHitFeedbackCall::MIN_ARG2,
+                crate::data::OptionalHitFeedbackCall::MAX_ARG2,
+                crate::data::Hash40Literal::MAX_NAME_BYTES
+            ),
+        ),
         ExcuteStmt::Wind(wind) => {
             if !wind.is_valid() {
                 report.blocker(
@@ -1278,6 +1426,16 @@ fn check_excute_values(subject: &str, stmt: &ExcuteStmt, report: &mut Report) {
             check_finite(subject, "FT_CATCH_STOP argument 1", call.arg1, report);
             check_finite(subject, "FT_CATCH_STOP argument 2", call.arg2, report);
         }
+        ExcuteStmt::SlowOpponent(call) => {
+            check_finite(subject, "SLOW_OPPONENT slow_mul", call.slow_mul, report);
+            check_finite(subject, "SLOW_OPPONENT slow_time", call.slow_time, report);
+            if !call.is_valid() {
+                report.blocker(
+                    subject,
+                    "SLOW_OPPONENT inputs must be finite and inside the observed source bounds",
+                );
+            }
+        }
         ExcuteStmt::FtStartAdjustMotionFrame(call) => {
             check_finite(
                 subject,
@@ -1353,6 +1511,39 @@ fn check_effect_values(subject: &str, calls: &[EffectCall], report: &mut Report)
                 | crate::data::EffectControl::UnableArea { kind: work } => {
                     if work.trim().is_empty() {
                         report.blocker(subject, format!("{label} has an empty control value"));
+                    }
+                }
+                crate::data::EffectControl::SetDisableRenderOffsetLast
+                | crate::data::EffectControl::EnableSyncInitPosLast
+                | crate::data::EffectControl::SetDisableCameraDepthInfluence { .. } => {}
+                crate::data::EffectControl::ReqScreen { preset_id } => {
+                    if crate::data::EffectReqScreenPreset::by_id(preset_id).is_none() {
+                        report.blocker(
+                            subject,
+                            format!(
+                                "{label} has an unsupported screen-effect preset: {preset_id:?}"
+                            ),
+                        );
+                    }
+                }
+                crate::data::EffectControl::OffKindWork { preset_id } => {
+                    let valid = crate::data::EffectOffKindWorkPreset::by_id(preset_id).is_some_and(
+                        |preset| {
+                            crate::gimmicks::registry::resolve(
+                                preset.fighter,
+                                preset.work_symbol,
+                                crate::gimmicks::registry::IdentifierKind::WorkInt,
+                            )
+                            .is_ok_and(|entry| entry.group.is_empty())
+                        },
+                    );
+                    if !valid {
+                        report.blocker(
+                            subject,
+                            format!(
+                                "{label} has an unsupported off-kind Work preset: {preset_id:?}"
+                            ),
+                        );
                     }
                 }
             }
@@ -1542,7 +1733,10 @@ fn has_unmodelled_flow(stmts: &[AcmdStmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         // A branch is the strongest form of this: not only is the line unmodelled, whether the
         // lines under it run at all is decided at runtime.
-        AcmdStmt::Raw(_) | AcmdStmt::RawBlock { .. } => true,
+        AcmdStmt::NativeExecuteFrame(_)
+        | AcmdStmt::NativeMotionLoopSync
+        | AcmdStmt::Raw(_)
+        | AcmdStmt::RawBlock { .. } => true,
         AcmdStmt::Loop { body, .. } => has_unmodelled_flow(body),
         _ => false,
     })
@@ -1602,8 +1796,12 @@ fn check_shape(subject: &str, stmts: &[AcmdStmt], clock: &mut f32, report: &mut 
                     );
                 }
             }
-            AcmdStmt::Loop { count, body } => {
-                if *count <= 1 {
+            AcmdStmt::Loop {
+                count,
+                body,
+                motion_loop,
+            } => {
+                if *count <= 1 && motion_loop.is_no() {
                     report.warn(
                         subject,
                         format!("a loop that runs {count} time(s) does not need to be a loop"),
@@ -1632,7 +1830,11 @@ fn check_shape(subject: &str, stmts: &[AcmdStmt], clock: &mut f32, report: &mut 
             // scripts, which this pass does not verify at all.
             AcmdStmt::Bare(_) => {}
             // Unreachable: a branch makes `has_unmodelled_flow` true and this pass never runs.
-            AcmdStmt::WaitLoopClear | AcmdStmt::Raw(_) | AcmdStmt::RawBlock { .. } => {}
+            AcmdStmt::NativeExecuteFrame(_)
+            | AcmdStmt::NativeMotionLoopSync
+            | AcmdStmt::WaitLoopClear
+            | AcmdStmt::Raw(_)
+            | AcmdStmt::RawBlock { .. } => {}
         }
     }
 }
@@ -1657,6 +1859,39 @@ fn flatten(stmts: &[AcmdStmt]) -> Vec<&AcmdStmt> {
 }
 
 #[cfg(test)]
+/// Verify a generated project against the edits it was built from.
+///
+/// `acmd_edits` and `effect_edits` are the same `(fighter, move, …)` lists handed to
+/// [`crate::acmd::build_mod_project_full`], so this checks the code that is actually about to
+/// be written rather than a re-derivation of it.
+///
+/// `dropped` is keyed `"fighter/move"` and holds what the effect export threw away when that
+/// move was last read from a script. It is separate from `effect_edits` because it is the one
+/// input here that no amount of looking at the generated project can recover: the export builds
+/// the function out of the calls it understood, so a line that became no call left no trace in
+/// either the edits or the output. A move missing from the map had no source in hand, which is
+/// not the same as a move that had one and lost nothing — but both produce no findings, so the
+/// distinction costs nothing to collapse and empty lists are not stored.
+pub fn verify_export(
+    project: &ModProject,
+    acmd_edits: &[(String, String, AcmdScript)],
+    effect_edits: &[crate::acmd::EffectExport],
+    sound_edits: &[(String, String, AcmdScript)],
+    tweaks: &[LiveTweak],
+    dropped: &HashMap<String, Vec<String>>,
+) -> Report {
+    verify_export_with_expression(
+        project,
+        acmd_edits,
+        effect_edits,
+        sound_edits,
+        &[],
+        tweaks,
+        dropped,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::acmd::{build_mod_project, parse_acmd_script, preview_game_fn, GeneratedFile};
@@ -1675,6 +1910,281 @@ mod tests {
         let emitted = preview_game_fn(script, "test");
         verify_move("test", script, &emitted, &mut report);
         report
+    }
+
+    #[test]
+    fn export_preflight_reports_over_budget_acmd_and_effect_preview_trees() {
+        let acmd = AcmdScript {
+            stmts: vec![AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 100,
+                body: vec![AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 100,
+                    body: vec![AcmdStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count: 100,
+                        body: vec![AcmdStmt::Frame(1.0)],
+                    }],
+                }],
+            }],
+        };
+        let report = verify(&acmd);
+        assert!(report.has_blockers());
+        assert!(report
+            .blocker_summary()
+            .contains("ACMD preview expansion exceeds the 100000-work limit"));
+
+        let effect = crate::data::EffectScript {
+            stmts: vec![crate::data::EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: 100,
+                body: vec![crate::data::EffectStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 100,
+                    body: vec![crate::data::EffectStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count: 100,
+                        body: vec![crate::data::EffectStmt::Frame(1.0)],
+                    }],
+                }],
+            }],
+        };
+        let mut report = Report::default();
+        verify_effect_preview_budget("mario / repeat", &effect, &mut report);
+        assert!(report.has_blockers());
+        assert!(report
+            .blocker_summary()
+            .contains("Effect preview expansion exceeds the 100000-work limit"));
+    }
+
+    #[test]
+    fn body_visibility_saved_preflight_rejects_unmeasured_and_injected_pairs() {
+        for (group, status) in [
+            ("body", "future_status"),
+            ("sword", "unknown"),
+            ("body\"; injected()", "body_normal"),
+            ("", ""),
+            ("group", "status"),
+        ] {
+            let command = ExcuteStmt::VisibilitySetInt64 {
+                group: group.into(),
+                status: status.into(),
+            };
+            for statement in [
+                AcmdStmt::Excute(vec![command.clone()]),
+                AcmdStmt::Bare(Box::new(command)),
+            ] {
+                let report = verify(&AcmdScript {
+                    stmts: vec![statement],
+                });
+                assert!(messages(&report)
+                    .contains("model visibility has an unmeasured group/state pair"));
+            }
+        }
+    }
+
+    #[test]
+    fn model_default_visibility_saved_preflight_rejects_unmeasured_tokens() {
+        for group in ["unknown", "", "panel\"; injected()", "panel\\n"] {
+            let command = ExcuteStmt::VisibilitySetDefaultInt64 {
+                group: group.into(),
+            };
+            for statement in [
+                AcmdStmt::Excute(vec![command.clone()]),
+                AcmdStmt::Bare(Box::new(command)),
+            ] {
+                let report = verify(&AcmdScript {
+                    stmts: vec![statement],
+                });
+                assert!(messages(&report).contains("model default has an unmeasured group"));
+            }
+        }
+        for &(_, group, _) in crate::data::PINNED_DEFAULT_INT64_GROUP_COUNTS {
+            let report = verify(&AcmdScript {
+                stmts: vec![AcmdStmt::Excute(vec![
+                    ExcuteStmt::VisibilitySetDefaultInt64 {
+                        group: group.into(),
+                    },
+                ])],
+            });
+            assert!(!report.has_blockers());
+        }
+    }
+
+    #[test]
+    fn enabled_generation_saved_preflight_rejects_unknown_or_injected_symbols() {
+        for symbol in [
+            "FIGHTER_KOOPAJR_GENERATE_ARTICLE_CANNONBALL",
+            "",
+            "SYMBOL; injected()",
+            "FUTURE_ARTICLE",
+        ] {
+            let report = verify(&AcmdScript {
+                stmts: vec![AcmdStmt::Excute(vec![ExcuteStmt::ArticleLifecycle(
+                    crate::data::ArticleLifecycleCall::GenerateEnabled {
+                        symbol: symbol.into(),
+                    },
+                )])],
+            });
+            assert!(
+                messages(&report).contains("enabled article generation has an unmeasured symbol")
+            );
+        }
+    }
+
+    #[test]
+    fn article_state_saved_preflight_rejects_injected_unpaired_or_wrong_api_values() {
+        for (symbol, status, if_present) in [
+            (
+                "FIGHTER_MASTER_GENERATE_ARTICLE_SWORD",
+                "WEAPON_JACK_WIREROPE_STATUS_KIND_BACK",
+                false,
+            ),
+            (
+                "FIGHTER_MASTER_GENERATE_ARTICLE_SWORD",
+                "WEAPON_MASTER_SWORD_STATUS_KIND_EXTEND",
+                true,
+            ),
+            ("SYMBOL; injected()", "STATUS", false),
+        ] {
+            let report = verify(&AcmdScript {
+                stmts: vec![AcmdStmt::Excute(vec![ExcuteStmt::ArticleLifecycle(
+                    crate::data::ArticleLifecycleCall::ChangeStatus {
+                        symbol: symbol.into(),
+                        status: status.into(),
+                        if_present,
+                    },
+                )])],
+            });
+            assert!(messages(&report)
+                .contains("article state has an unmeasured article/status/API tuple"));
+        }
+    }
+
+    #[test]
+    fn saved_acmd_preflight_blocks_unmeasured_final_fear_face_tokens() {
+        for token in [
+            "999",
+            "60; injected()",
+            "NaN",
+            "60.0",
+            "60u64",
+            "060",
+            "-1",
+            "0x3c",
+        ] {
+            let call = crate::data::FinalFearFaceCall {
+                argument: token.into(),
+            };
+            for statement in [
+                AcmdStmt::Excute(vec![ExcuteStmt::FinalFearFace(call.clone())]),
+                AcmdStmt::Bare(Box::new(ExcuteStmt::FinalFearFace(call.clone()))),
+            ] {
+                let report = verify(&AcmdScript {
+                    stmts: vec![statement],
+                });
+                assert!(messages(&report)
+                    .contains("final fear face has an unmeasured source-token argument"));
+            }
+        }
+    }
+
+    #[test]
+    fn saved_acmd_preflight_blocks_unmeasured_final_start_camera_tokens() {
+        for token in ["999", "0; injected()", "NaN", "0.0", "0f32"] {
+            let call = crate::data::FinalStartCameraCall {
+                args: [token, "1", "20", "0", "0", "0"].map(str::to_owned),
+            };
+            for statement in [
+                AcmdStmt::Excute(vec![ExcuteStmt::CheckFinalStartCamera(call.clone())]),
+                AcmdStmt::Bare(Box::new(ExcuteStmt::CheckFinalStartCamera(call.clone()))),
+            ] {
+                let report = verify(&AcmdScript {
+                    stmts: vec![statement],
+                });
+                assert!(messages(&report)
+                    .contains("final-start camera has an unmeasured source-token tuple"));
+            }
+        }
+    }
+
+    #[test]
+    fn saved_acmd_preflight_blocks_unmeasured_finish_camera_tokens() {
+        for arg1 in ["999", "15; injected()", "NaN", "15.0"] {
+            let call = crate::data::FinishCameraCall {
+                arg1: arg1.into(),
+                arg2: "5".into(),
+            };
+            for statement in [
+                AcmdStmt::Excute(vec![ExcuteStmt::CheckFinishCamera(call.clone())]),
+                AcmdStmt::Bare(Box::new(ExcuteStmt::CheckFinishCamera(call.clone()))),
+            ] {
+                let report = verify(&AcmdScript {
+                    stmts: vec![statement],
+                });
+                assert!(
+                    messages(&report).contains("finish camera has an unmeasured source-token pair")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_acmd_preflight_blocks_invalid_optional_hit_feedback_values() {
+        use crate::data::{
+            AcmdStmt, ExcuteStmt, Hash40Literal, OptionalHitFeedbackCall, OptionalHitFeedbackKind,
+        };
+
+        let invalid_calls = [
+            OptionalHitFeedbackCall {
+                kind: OptionalHitFeedbackKind::Effect,
+                arg2: -1,
+                hash: Hash40Literal::Name("named".into()),
+            },
+            OptionalHitFeedbackCall {
+                kind: OptionalHitFeedbackKind::Sound,
+                arg2: 5,
+                hash: Hash40Literal::Raw(u64::MAX),
+            },
+            OptionalHitFeedbackCall {
+                kind: OptionalHitFeedbackKind::Effect,
+                arg2: 0,
+                hash: Hash40Literal::Name(String::new()),
+            },
+            OptionalHitFeedbackCall {
+                kind: OptionalHitFeedbackKind::Sound,
+                arg2: 0,
+                hash: Hash40Literal::Name("x".repeat(256)),
+            },
+        ];
+        for call in invalid_calls {
+            let script = AcmdScript {
+                stmts: vec![AcmdStmt::Excute(vec![ExcuteStmt::OptionalHitFeedback(
+                    call,
+                )])],
+            };
+            let report = verify(&script);
+            assert!(
+                messages(&report).contains("optional hit feedback has an invalid arg2/hash value"),
+                "saved AcmdScript must not bypass native value preflight: {}",
+                messages(&report)
+            );
+        }
+
+        // Legacy/direct saved scripts can contain Bare even though new graph authoring does
+        // not permit this family outside Execute. Preflight still validates its typed value.
+        let bare = AcmdScript {
+            stmts: vec![AcmdStmt::Bare(Box::new(ExcuteStmt::OptionalHitFeedback(
+                OptionalHitFeedbackCall {
+                    kind: OptionalHitFeedbackKind::Effect,
+                    arg2: 0,
+                    hash: Hash40Literal::Name("".into()),
+                },
+            )))],
+        };
+        assert!(messages(&verify(&bare))
+            .contains("optional hit feedback has an invalid arg2/hash value"));
     }
 
     fn messages(report: &Report) -> String {
@@ -1873,76 +2383,290 @@ mod tests {
         );
     }
 
-    /// The property the whole module exists for, checked against every script the app has ever
-    /// fetched. The intentional exception is the corpus's malformed zero-argument
-    /// `LAST_PARTICLE_SET_COLOR` line: it is carried faithfully but cannot compile against its
-    /// three-argument wrapper, so the verifier must report that blocker rather than let this
-    /// oracle hide it. Everything else
-    /// still has to be a faithful inverse of the parser across a thousand real functions.
+    fn source_offset(
+        source: &str,
+        line_starts: &[usize],
+        location: proc_macro2::LineColumn,
+    ) -> Option<usize> {
+        let line_start = *line_starts.get(location.line.checked_sub(1)?)?;
+        let line_end = line_starts
+            .get(location.line)
+            .copied()
+            .unwrap_or(source.len());
+        let line = source.get(line_start..line_end)?;
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        line.char_indices()
+            .nth(location.column)
+            .map(|(column, _)| line_start + column)
+            .or_else(|| {
+                (line.chars().count() == location.column).then_some(line_start + line.len())
+            })
+    }
+
+    fn complete_item_fn_source<'a>(source: &'a str, function: &syn::ItemFn) -> Option<&'a str> {
+        use syn::spanned::Spanned;
+
+        let mut line_starts = vec![0];
+        line_starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+        );
+        let span = function.span();
+        let start = source_offset(source, &line_starts, span.start())?;
+        let end = source_offset(source, &line_starts, span.end())?;
+        source.get(start..end)
+    }
+
+    /// Span-based function extraction must not confuse nested braces, comments, or strings with
+    /// top-level function boundaries. This also pins adjacent unindented functions.
     #[test]
-    fn every_cached_script_survives_its_own_export() {
-        let cache = crate::scratch_dirs::app_storage_root().join("script-cache");
-        if !cache.is_dir() {
-            return;
-        }
-        let mut report = Report::default();
-        let mut checked = 0;
-        for fighter in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
-            for file in std::fs::read_dir(fighter.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let Some(whole) = crate::acmd::cached_script_body_at(&file.path()) else {
-                    continue;
-                };
-                // One cached file holds every ACMD function for a motion; an export writes one.
-                for body in whole.split_inclusive("\n}\n") {
-                    let label = format!(
-                        "{}/{}",
-                        fighter.file_name().to_string_lossy(),
-                        file.file_name().to_string_lossy()
-                    );
-                    let parsed = crate::acmd::parse_acmd_script(body);
-                    if !parsed.stmts.is_empty() {
-                        let emitted = preview_game_fn(&parsed, "audit");
-                        verify_move(&label, &parsed, &emitted, &mut report);
-                        checked += 1;
-                    }
-                    let effect_script = crate::acmd::parse_effect_script(body);
-                    let (calls, residue) = effect_script.to_effect_calls_and_residue();
-                    if !calls.is_empty() {
-                        let emitted =
-                            crate::acmd::preview_effect_fn(&calls, "audit", &[], &residue);
-                        verify_effect_move(
-                            &label,
-                            &calls,
-                            &emitted,
-                            &[],
-                            Some(&crate::acmd::unexportable_effect_lines(&effect_script)),
-                            &residue,
-                            &mut report,
-                        );
-                        checked += 1;
-                    }
-                }
-            }
-        }
-        assert!(checked > 100, "the cache held almost nothing: {checked}");
-        let blockers: Vec<String> = report.blockers().map(|f| f.to_string()).collect();
-        let unexpected: Vec<&String> = blockers
+    fn corpus_function_spans_are_complete_around_nested_blocks_comments_and_strings() {
+        let source = r####"// fn game_fake() { }
+unsafe extern "C" fn game_outer() {
+    let text = "} fn effect_fake() {";
+    if true { unsafe { let _nested = { 7 }; } }
+}
+unsafe extern "C" fn effect_real() { if true { let _ = "}"; } }
+fn sound_real() { /* fn expression_fake() {} */ if true { () } }
+fn expression_real() { let _ = r###"fn game_string_fake() { }"###; }
+"####;
+        let file = syn::parse_file(source).unwrap();
+        let functions: Vec<_> = file
+            .items
             .iter()
-            .filter(|line| !line.contains("LAST_PARTICLE_SET_COLOR(agent);"))
+            .filter_map(|item| match item {
+                syn::Item::Fn(function) => Some(function),
+                _ => None,
+            })
             .collect();
-        assert!(
-            unexpected.is_empty(),
-            "{} unexpected blockers among {checked} scripts; only the malformed particle wrapper line is intentional:\n{}",
-            unexpected.len(),
-            unexpected
+        assert_eq!(
+            functions
                 .iter()
-                .map(|line| line.as_str())
+                .map(|function| function.sig.ident.to_string())
+                .collect::<Vec<_>>(),
+            vec!["game_outer", "effect_real", "sound_real", "expression_real"]
+                .into_iter()
+                .map(str::to_owned)
                 .collect::<Vec<_>>()
-                .join("\n")
+        );
+        for (index, function) in functions.iter().enumerate() {
+            let extracted = complete_item_fn_source(source, function).unwrap();
+            assert!(extracted.contains(&format!("fn {}", function.sig.ident)));
+            assert!(extracted.trim_end().ends_with('}'));
+            for next in &functions[index + 1..] {
+                assert!(
+                    !extracted.contains(&format!("fn {}", next.sig.ident)),
+                    "function span swallowed a following item: {extracted}"
+                );
+            }
+            syn::parse_str::<syn::ItemFn>(extracted).unwrap();
+        }
+    }
+
+    #[test]
+    fn corpus_function_spans_preserve_unicode_crlf_and_same_line_items() {
+        let expected = [
+            "fn game_one() { let _ = \"é🪶\"; }",
+            "fn effect_two() { let _ = \"ö\"; }",
+            "fn sound_three() { let _ = \"雪\"; }",
+        ];
+        let source = format!("{}\r\n{} {}\r\n", expected[0], expected[1], expected[2]);
+        let file = syn::parse_file(&source).unwrap();
+        for (item, expected) in file.items.iter().zip(expected) {
+            let syn::Item::Fn(function) = item else {
+                panic!("expected function")
+            };
+            assert_eq!(complete_item_fn_source(&source, function), Some(expected));
+        }
+    }
+
+    #[test]
+    fn screen_effect_export_values_reject_unknown_presets_without_emitting_them() {
+        let source = "unsafe extern \"C\" fn effect_screen(agent: &mut L2CAgentBase) {\n    if macros::is_excute(agent) {\n        EffectModule::req_screen(agent.module_accessor, Hash40::new(\"bg_mario_final\"), false, false, false);\n    }\n}\n";
+        let mut calls = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(calls.len(), 1);
+        for preset in crate::data::EffectReqScreenPreset::all() {
+            calls[0].control = Some(crate::data::EffectControl::ReqScreen {
+                preset_id: preset.id.to_owned(),
+            });
+            let mut report = Report::default();
+            check_effect_values("mario / screen", &calls, &mut report);
+            assert!(!report.has_blockers(), "{}", messages(&report));
+        }
+        calls[0].control = Some(crate::data::EffectControl::ReqScreen {
+            preset_id: "not_a_registered_screen".into(),
+        });
+        let mut report = Report::default();
+        check_effect_values("mario / screen", &calls, &mut report);
+        assert!(report
+            .blockers()
+            .any(|finding| finding.message.contains("unsupported screen-effect preset")));
+    }
+
+    #[test]
+    fn off_kind_work_export_requires_the_exact_legacy_effect_owner() {
+        let source = r#"unsafe extern "C" fn effect_off_kind_work(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT_OFF_KIND_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, false, true);
+    }
+}
+"#;
+        let calls = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(calls.len(), 1);
+        for preset in crate::data::EffectOffKindWorkPreset::all() {
+            let mut tuple_calls = calls.clone();
+            tuple_calls[0].control = Some(crate::data::EffectControl::OffKindWork {
+                preset_id: preset.id.to_owned(),
+            });
+            let mut correct_owner = Report::default();
+            check_effect_off_kind_work_owner(
+                preset.fighter,
+                &format!("{} / effect_test", preset.fighter),
+                &tuple_calls,
+                &mut correct_owner,
+            );
+            check_effect_values(
+                &format!("{} / effect_test", preset.fighter),
+                &tuple_calls,
+                &mut correct_owner,
+            );
+            assert!(
+                !correct_owner.has_blockers(),
+                "{}: {}",
+                preset.id,
+                messages(&correct_owner)
+            );
+        }
+
+        let mut wrong_owner = Report::default();
+        check_effect_off_kind_work_owner("brave", "brave / effect_test", &calls, &mut wrong_owner);
+        assert!(
+            wrong_owner.blockers().any(|finding| {
+                finding.message.contains("cloud_sword_flare_ft")
+                    && finding.message.contains("brave")
+                    && finding.message.contains("cloud")
+            }),
+            "{}",
+            messages(&wrong_owner)
+        );
+    }
+
+    #[test]
+    fn legacy_effect_follow_work_carrier_export_fails_closed_when_disabled_or_retimed() {
+        let source = r#"unsafe extern "C" fn effect_legacy_follow_work(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_hit"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1);
+        macros::EFFECT_FOLLOW_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let script = crate::acmd::parse_effect_script(source);
+        let (calls, residue) = script.to_effect_calls_and_residue();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0]
+            .trailing
+            .iter()
+            .any(|line| line.contains("EFFECT_FOLLOW_WORK")));
+
+        let mut disabled = calls.clone();
+        disabled[0].disabled = true;
+        let disabled_output =
+            crate::acmd::preview_effect_fn(&disabled, "legacy_follow_work", &[], &residue);
+        assert!(
+            !disabled_output.contains("EFFECT_FOLLOW_WORK"),
+            "legacy emitter would silently drop trailing Work-follow when its carrier is disabled"
+        );
+        let mut disabled_report = Report::default();
+        check_legacy_follow_work_residue(
+            "cloud / legacy_follow_work",
+            &disabled,
+            &residue,
+            &mut disabled_report,
+        );
+        assert!(disabled_report.has_blockers());
+
+        let mut retimed = calls.clone();
+        retimed[0].active_start = 9;
+        let retimed_output =
+            crate::acmd::preview_effect_fn(&retimed, "legacy_follow_work", &[], &residue);
+        let follow_position = retimed_output
+            .find("EFFECT_FOLLOW_WORK")
+            .expect("the retimed legacy carrier still emits its opaque tail");
+        let new_frame = retimed_output
+            .find("frame(agent.lua_state_agent, 9.0)")
+            .expect("the carrier's edited frame is emitted");
+        assert!(
+            new_frame < follow_position,
+            "carrier retime also retimes its tail"
+        );
+        let mut retimed_report = Report::default();
+        check_legacy_follow_work_residue(
+            "cloud / legacy_follow_work",
+            &retimed,
+            &residue,
+            &mut retimed_report,
+        );
+        assert!(retimed_report.has_blockers());
+
+        for legacy_calls in [&calls, &disabled, &retimed] {
+            let effect_edits = vec![(
+                "cloud".to_owned(),
+                "legacy_follow_work".to_owned(),
+                legacy_calls.clone(),
+                residue.clone(),
+            )];
+            let project = crate::acmd::build_mod_project_full(
+                &[],
+                &effect_edits,
+                &[],
+                &[],
+                "legacy_follow_work_guard",
+            );
+            let report = verify_export(&project, &[], &effect_edits, &[], &[], &Default::default());
+            assert!(
+                messages(&report).contains("reimport the native Effect track and Apply nodes"),
+                "legacy full-call, disabled-carrier, and retimed-carrier exports all fail closed: {}",
+                messages(&report)
+            );
+        }
+
+        let frame_only = crate::acmd::parse_effect_script(
+            r#"unsafe extern "C" fn effect_work_only(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#,
+        );
+        let (frame_calls, frame_residue) = frame_only.to_effect_calls_and_residue();
+        assert!(frame_calls.is_empty());
+        let frame_edits = vec![(
+            "cloud".to_owned(),
+            "legacy_frame_residue".to_owned(),
+            frame_calls,
+            frame_residue,
+        )];
+        let frame_project = crate::acmd::build_mod_project_full(
+            &[],
+            &frame_edits,
+            &[],
+            &[],
+            "legacy_follow_work_guard",
+        );
+        let frame_report = verify_export(
+            &frame_project,
+            &[],
+            &frame_edits,
+            &[],
+            &[],
+            &Default::default(),
+        );
+        assert!(
+            messages(&frame_report).contains("reimport the native Effect track and Apply nodes")
         );
     }
 
@@ -2212,7 +2936,9 @@ mod tests {
     /// compile, and there is no signature to pad it out from.
     #[test]
     fn a_wind_command_with_the_wrong_number_of_arguments_is_refused() {
-        let mut parsed = script("    if macros::is_excute(agent) {\n        macros::AREA_WIND_2ND_RAD(agent, 4, 0.5, 0.02, 1000, 1, -2, 6, 18);\n    }");
+        let mut parsed = script(
+            "    if macros::is_excute(agent) {\n        macros::AREA_WIND_2ND_RAD(agent, 4, 0.5, 0.02, 1000, 1, -2, 6, 18);\n    }",
+        );
         if let AcmdStmt::Excute(inner) = &mut parsed.stmts[0] {
             if let ExcuteStmt::Wind(WindboxData { args, .. }) = &mut inner[0] {
                 args.pop();
@@ -2265,11 +2991,9 @@ mod tests {
     /// through. Move it again rather than deleting it — the check it guards outlives any one
     /// example of a loss.
     ///
-    /// `wait_loop_sync_mot` is the current example and a more durable one, because it is not
-    /// merely waiting to be modelled: it is dropped *by decision*. It advances the ACMD
-    /// coroutine, while the regenerated function states every frame absolutely with its own
-    /// `frame()` calls — so carrying it would shift every effect after it. Seven sit in the
-    /// corpus and each is a real loss the user should hear about.
+    /// `wait_loop_sync_mot` is a typed source-only primitive, but remains deliberately
+    /// unrepresentable by this older flat effects exporter. Structured node export retains
+    /// it; rebuilding absolute-frame effects is not an equivalent scheduler model.
     #[test]
     fn a_line_the_export_cannot_reproduce_is_named_rather_than_silently_deleted() {
         let src = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
@@ -2277,7 +3001,7 @@ mod tests {
     if macros::is_excute(agent) {
         macros::EFFECT(agent, Hash40::new("sys_atk_smoke"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
     }
-    wait_loop_sync_mot(agent.lua_state_agent, false, 3.0);
+    smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);
 }
 "#;
         let source = crate::acmd::parse_effect_script(src);
@@ -2300,7 +3024,8 @@ mod tests {
             &mut report,
         );
         assert!(
-            messages(&report).contains("wait_loop_sync_mot(agent.lua_state_agent, false, 3.0);"),
+            messages(&report)
+                .contains("smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);"),
             "the dropped line was not named:\n{}",
             messages(&report)
         );

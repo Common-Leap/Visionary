@@ -33,28 +33,4 @@ impl FromStr for ObjectCategory {
     }
 }
 
-pub fn parse_category(s: &str) -> Option<ObjectCategory> {
-    s.parse().ok()
-}
-
-impl ObjectCategory {
-    pub fn as_i32(self) -> i32 {
-        match self {
-            ObjectCategory::Fighter => 0,
-            ObjectCategory::Weapon => 1,
-            ObjectCategory::Enemy => 2,
-            ObjectCategory::Gimmick => 3,
-            ObjectCategory::Invalid => -1,
-        }
-    }
-
-    pub fn from_i32(v: i32) -> Self {
-        match v {
-            0 => ObjectCategory::Fighter,
-            1 => ObjectCategory::Weapon,
-            2 => ObjectCategory::Enemy,
-            3 => ObjectCategory::Gimmick,
-            _ => ObjectCategory::Invalid,
-        }
-    }
-}
+impl ObjectCategory {}

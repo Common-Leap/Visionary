@@ -8,6 +8,7 @@
 //! * `.xmsbt` names → [`RosterMod`] name overrides
 //! * BNTX portraits → PNG assets + [`RosterMod`] image overrides
 //! * `fighter_param` diffs → sparse [`ParamMod`] per fighter
+//! * personal `vl.prc` diffs → sparse [`ParamMod`] personal entries per fighter
 //! * Rust/TOML source text → copied beside the project as reference
 //! * Loose assets (models, motions, …) → linked via the mod library (reported
 //!   here, inserted by the caller)
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::gimmicks::export::{diff_personal, is_personal_prc_path};
 use crate::mod_project::{CharaOverrides, ModProjectFile, NameVariants, ParamMod, ParamValue};
 use crate::roster::{css, traits};
 
@@ -39,18 +41,6 @@ pub enum FileOutcome {
     Linked,
     /// Not adopted, with a reason (missing base dump, unknown row, undecodable).
     Skipped,
-}
-
-impl FileOutcome {
-    #[allow(dead_code)]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Adopted => "adopted",
-            Self::ReferenceOnly => "reference-only",
-            Self::Linked => "linked",
-            Self::Skipped => "skipped",
-        }
-    }
 }
 
 /// One file's outcome in the import report.
@@ -72,19 +62,11 @@ pub struct ImportReport {
     pub warnings: Vec<String>,
     /// How the arc root was found (for the "which level it chose" line).
     pub detection: String,
-    /// Arc root game-relative file count, for the summary line.
-    #[allow(dead_code)]
-    pub arc_root: PathBuf,
 }
 
 impl ImportReport {
     pub fn count(&self, outcome: FileOutcome) -> usize {
         self.files.iter().filter(|f| f.outcome == outcome).count()
-    }
-
-    #[allow(dead_code)]
-    pub fn adopted(&self) -> usize {
-        self.count(FileOutcome::Adopted)
     }
 
     pub fn push(&mut self, path: String, outcome: FileOutcome, detail: String) {
@@ -105,7 +87,7 @@ impl ImportReport {
     /// Exercised by the import acceptance test rather than the import flow
     /// itself; kept as the completeness check the flow will report through
     /// once it surfaces per-file uptake in the UI.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn covers(&self, paths: &[String]) -> Vec<String> {
         let seen: BTreeSet<&str> = self.files.iter().map(|f| f.path.as_str()).collect();
         paths
@@ -521,23 +503,6 @@ pub fn diff_fighter_param(
 
 // ── Portraits ─────────────────────────────────────────────────────────────
 
-/// Parse a portrait filename `<kind>_<name_id>_<slot>.bntx`.
-#[allow(dead_code)]
-fn split_portrait_filename(file_name: &str) -> Option<(String, String, u8)> {
-    let stem = file_name.strip_suffix(".bntx")?;
-    // Slot is the last `_NN`; the kind/name split goes through
-    // `portrait_kind_split` because stock kinds contain an underscore
-    // (`stock_90`) and names may too (`ice_climber`).
-    let slot: u8 = match stem.rsplit_once('_') {
-        Some((_, tail)) if tail.len() == 2 && tail.bytes().all(|b| b.is_ascii_digit()) => {
-            tail.parse().ok()?
-        }
-        _ => return None,
-    };
-    let (kind, name_id) = portrait_kind_split(stem)?;
-    Some((kind.to_string(), name_id.to_string(), slot))
-}
-
 /// Split `<kind>_<name_id>_<slot>` with multi-underscore kinds (`stock_90`).
 fn portrait_kind_split(stem: &str) -> Option<(&str, &str)> {
     // Strip the trailing _NN slot first.
@@ -611,8 +576,9 @@ fn is_reference_only_binary(game_path: &str) -> Option<&'static str> {
     } else if lower.ends_with(".prc")
         && game_path != css::CHARA_DB_PATH
         && game_path != traits::FIGHTER_PARAM_PATH
+        && !is_personal_prc_path(game_path)
     {
-        Some("binary param is reference-only by design (only ui_chara_db and fighter_param diffs are adopted)")
+        Some("binary param is reference-only by design (only ui_chara_db, fighter_param, and personal vl.prc diffs are adopted)")
     } else {
         None
     }
@@ -655,6 +621,7 @@ pub fn workspace_dest_for_game_path(game_path: &str) -> WorkspaceDest {
     let lower = game_path.to_ascii_lowercase();
     if game_path == css::CHARA_DB_PATH
         || game_path == traits::FIGHTER_PARAM_PATH
+        || is_personal_prc_path(game_path)
         || is_xmsbt_path(game_path)
     {
         return WorkspaceDest {
@@ -688,7 +655,7 @@ pub fn workspace_dest_for_game_path(game_path: &str) -> WorkspaceDest {
         return WorkspaceDest {
             support: Ws::Reference,
             workspace: format!("reference/{game_path}"),
-            note: "only ui_chara_db + fighter_param diffs are adopted",
+            note: "only ui_chara_db, fighter_param, and personal vl.prc diffs are adopted",
         };
     }
     // Everything else with a game path is a loose asset the tool links: models,
@@ -785,7 +752,6 @@ pub fn import_mod_as_project(
     let (arc_root, detection) = crate::roster::library::detect_arc_root(mod_folder)?;
     let mut report = ImportReport {
         detection: detection.describe(),
-        arc_root: arc_root.clone(),
         ..Default::default()
     };
 
@@ -854,12 +820,13 @@ pub fn import_mod_as_project(
 
         let game_path = game_relative(path, &arc_root).unwrap_or(display.clone());
 
-        // The two diffed databases and the adopted companions are handled in
+        // The diffed databases and the adopted companions are handled in
         // their own passes below (they need base + cross-file grouping); mark
         // them here as placeholders to be rewritten, so every file is already
         // accounted for even if a later pass bails.
         if game_path == css::CHARA_DB_PATH
             || game_path == traits::FIGHTER_PARAM_PATH
+            || is_personal_prc_path(&game_path)
             || is_xmsbt_path(&game_path)
             || is_portrait_path(&game_path)
         {
@@ -1023,6 +990,111 @@ pub fn import_mod_as_project(
                 traits::FIGHTER_PARAM_PATH.to_string(),
                 FileOutcome::Skipped,
                 format!("could not read the mod values file: {e:?}"),
+            ),
+        }
+    }
+
+    // ── personal vl.prc diffs ─────────────────────────────────────────
+    // One file per fighter, each diffed against its own base twin and merged
+    // into that fighter's sparse personal entries. Merge — not overwrite —
+    // so this pass composes with the fighter_param pass above regardless of
+    // order: the keys never collide, but two writers to one map should not
+    // depend on running first.
+    let personal_files: Vec<(String, String, PathBuf)> = all_files
+        .iter()
+        .filter_map(|path| {
+            if !path.starts_with(&arc_root) {
+                return None;
+            }
+            let game_path = game_relative(path, &arc_root)?;
+            if !is_personal_prc_path(&game_path) {
+                return None;
+            }
+            let fighter = game_path
+                .strip_prefix("fighter/")?
+                .split_once('/')?
+                .0
+                .to_string();
+            Some((fighter, game_path, path.clone()))
+        })
+        .collect();
+    for (fighter, game_path, mod_path) in &personal_files {
+        if !options.known_fighters.iter().any(|known| known == fighter) {
+            report.push(
+                game_path.clone(),
+                FileOutcome::Skipped,
+                format!("{fighter}: names a fighter the base scan has no record of"),
+            );
+            report.warn(format!(
+                "{fighter}: personal file for an unknown fighter, reported and never fabricated"
+            ));
+            continue;
+        }
+        let base_path = options
+            .base_roots
+            .iter()
+            .map(|root| root.join(game_path))
+            .find(|path| path.is_file());
+        let Some(base_path) = base_path else {
+            report.push(
+                game_path.clone(),
+                FileOutcome::Skipped,
+                "no base fighter/ dump found, skipping the personal diff honestly instead of guessing".into(),
+            );
+            report.warn(format!(
+                "{game_path} present but no base copy: personal diff skipped"
+            ));
+            continue;
+        };
+        match (prc::open(&base_path), prc::open(mod_path)) {
+            (Ok(base_tree), Ok(mod_tree)) => {
+                let (edits, unknown) =
+                    diff_personal(&base_tree, &mod_tree, fighter, options.labels);
+                for note in &unknown {
+                    report.warn(note.clone());
+                }
+                let n = edits.len();
+                if n > 0 {
+                    project
+                        .fighters
+                        .entry(fighter.clone())
+                        .or_default()
+                        .params
+                        .files
+                        .entry(game_path.clone())
+                        .or_default()
+                        .extend(edits);
+                }
+                report.push(
+                    game_path.clone(),
+                    if n == 0 && unknown.is_empty() {
+                        FileOutcome::Skipped
+                    } else {
+                        FileOutcome::Adopted
+                    },
+                    if n == 0 && unknown.is_empty() {
+                        "no differences from the base values".into()
+                    } else {
+                        format!(
+                            "adopted {n} personal value(s){}",
+                            if unknown.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {} unadoptable change(s) reported", unknown.len())
+                            }
+                        )
+                    },
+                );
+            }
+            (Err(error), _) => report.push(
+                game_path.clone(),
+                FileOutcome::Skipped,
+                format!("could not read the base personal file: {error:#}"),
+            ),
+            (_, Err(error)) => report.push(
+                game_path.clone(),
+                FileOutcome::Skipped,
+                format!("could not read the mod personal file: {error:?}"),
             ),
         }
     }
@@ -1329,6 +1401,56 @@ mod tests {
         prc::save(&dest, &root).unwrap();
     }
 
+    /// A small invented personal tree for mario: one flat leaf plus one
+    /// indexed group, mirroring the shape the gimmicks walker must handle.
+    fn personal_tree() -> prc::ParamStruct {
+        use prc::hash40::Hash40;
+        let hash = |name: &str| Hash40(hash40::hash40(name).0);
+        prc::ParamStruct(vec![
+            (hash("jump_rise_mul"), prc::ParamKind::Float(1.0)),
+            (
+                hash("param_special_n"),
+                prc::ParamKind::List(prc::ParamList(vec![prc::ParamKind::Struct(
+                    prc::ParamStruct(vec![(hash("fireball_speed"), prc::ParamKind::Float(2.0))]),
+                )])),
+            ),
+        ])
+    }
+
+    fn base_personal(dir: &Path) {
+        let path = dir.join("fighter/mario/param/vl.prc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        prc::save(&path, &personal_tree()).unwrap();
+    }
+
+    fn mod_personal(base_dir: &Path, mod_dir: &Path) {
+        let mut tree = prc::open(base_dir.join("fighter/mario/param/vl.prc")).unwrap();
+        {
+            use prc::ParamKind;
+            for (hash, value) in tree.0.iter_mut() {
+                if hash.0 == hash40::hash40("jump_rise_mul").0 {
+                    *value = ParamKind::Float(1.2);
+                }
+            }
+            let wanted = hash40::hash40("param_special_n").0;
+            let ParamKind::List(rows) = tree
+                .0
+                .iter_mut()
+                .find_map(|(h, v)| (h.0 == wanted).then_some(v))
+                .unwrap()
+            else {
+                panic!("the personal fixture changed shape");
+            };
+            let ParamKind::Struct(first) = &mut rows.0[0] else {
+                panic!("the personal fixture changed shape");
+            };
+            first.0[0].1 = ParamKind::Float(2.5);
+        }
+        let dest = mod_dir.join("fighter/mario/param/vl.prc");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        prc::save(&dest, &tree).unwrap();
+    }
+
     fn portrait_bntx() -> Vec<u8> {
         let mut img = image::RgbaImage::new(32, 32);
         for (x, y, px) in img.enumerate_pixels_mut() {
@@ -1341,11 +1463,12 @@ mod tests {
         crate::roster::ui_images::encode_ui_png(&png.into_inner(), false).unwrap()
     }
 
-    /// The acceptance fixture: db diff + xmsbt + portraits + params + source,
-    /// plus one of every reference-only / linked class.
+    /// The acceptance fixture: db diff + xmsbt + portraits + params + personal
+    /// + source, plus one of every reference-only / linked class.
     fn synthetic_mod(base_dir: &Path, mod_dir: &Path) {
         mod_chara_db(base_dir, mod_dir);
         mod_fighter_param(base_dir, mod_dir);
+        mod_personal(base_dir, mod_dir);
         // xmsbt: mario renamed (slot 0, simple) + link alt c02 (per-costume).
         let labels = vec![
             ("nam_chr0_00_mario".to_string(), "Jumpman".to_string()),
@@ -1458,6 +1581,13 @@ mod tests {
         let portrait =
             workspace_dest_for_game_path("ui/replace/chara/chara_1/chara_1_mario_00.bntx");
         assert_eq!(portrait.support, Ws::Supported);
+        // Personal files are adopted as editable diffs, not reference.
+        let personal = workspace_dest_for_game_path("fighter/mario/param/vl.prc");
+        assert_eq!(personal.support, Ws::Supported);
+        assert_eq!(personal.workspace, "modproject.json");
+        assert!(is_reference_only_binary("fighter/mario/param/vl.prc").is_none());
+        // …but a non-plain fighter name never routes to the diff pass.
+        assert!(is_reference_only_binary("fighter/mario/param/other.prc").is_some());
     }
 
     /// Acceptance: a synthetic mod (db diff + xmsbt + portraits + params +
@@ -1473,6 +1603,7 @@ mod tests {
         std::fs::create_dir_all(&mod_dir).unwrap();
         base_chara_db(&base_dir);
         base_fighter_param(&base_dir);
+        base_personal(&base_dir);
         synthetic_mod(&base_dir, &mod_dir);
 
         let labels = labels_for(&[
@@ -1480,6 +1611,9 @@ mod tests {
             "jump_squat_frame",
             "attack100_type",
             "fighter_kind",
+            "jump_rise_mul",
+            "param_special_n",
+            "fireball_speed",
         ]);
         let options = ImportOptions {
             known_fighters: &known(),
@@ -1539,6 +1673,18 @@ mod tests {
             Some(&ParamValue::Float(120.0)),
             "mario's weight edit must survive"
         );
+        // Personal diff adopted beside the shared-param diff, same map.
+        let personal = crate::gimmicks::params::personal_edits(&params, "mario");
+        assert_eq!(
+            personal.get("jump_rise_mul"),
+            Some(&ParamValue::Float(1.2)),
+            "mario's personal flat leaf must survive"
+        );
+        assert_eq!(
+            personal.get("param_special_n[0].fireball_speed"),
+            Some(&ParamValue::Float(2.5)),
+            "mario's personal indexed leaf must survive"
+        );
         // Portrait adopted to a PNG asset beside the project.
         let images = project
             .roster
@@ -1565,6 +1711,7 @@ mod tests {
         for needle in [
             css::CHARA_DB_PATH,
             traits::FIGHTER_PARAM_PATH,
+            "fighter/mario/param/vl.prc",
             crate::roster::names::XMSBT_PATH,
             "ui/replace/chara/chara_1/chara_1_mario_00.bntx",
             "effect/fighter/mario/ef_mario.eff",
@@ -1588,6 +1735,10 @@ mod tests {
         assert_eq!(outcome_of(css::CHARA_DB_PATH), Some(FileOutcome::Adopted));
         assert_eq!(
             outcome_of(traits::FIGHTER_PARAM_PATH),
+            Some(FileOutcome::Adopted)
+        );
+        assert_eq!(
+            outcome_of("fighter/mario/param/vl.prc"),
             Some(FileOutcome::Adopted)
         );
         assert_eq!(
@@ -1644,6 +1795,12 @@ mod tests {
             std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
             prc::save(&dest, &traits::test_file(&[("mario", 120.0, 3)])).unwrap();
         }
+        {
+            // A personal file with no base twin anywhere.
+            let dest = mod_dir.join("fighter/mario/param/vl.prc");
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            prc::save(&dest, &personal_tree()).unwrap();
+        }
         let labels = labels_for(&["weight", "jump_squat_frame", "fighter_kind"]);
         let options = ImportOptions {
             known_fighters: &known(),
@@ -1660,6 +1817,10 @@ mod tests {
         );
         assert_eq!(
             outcome(&report, traits::FIGHTER_PARAM_PATH),
+            Some(FileOutcome::Skipped)
+        );
+        assert_eq!(
+            outcome(&report, "fighter/mario/param/vl.prc"),
             Some(FileOutcome::Skipped)
         );
         assert!(

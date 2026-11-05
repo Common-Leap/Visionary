@@ -13,11 +13,20 @@ use std::process::Command;
 
 /// Try to auto-deploy in the background. Never blocks the UI and never panics.
 pub fn spawn_background_check() {
+    // Private validation sessions and manually managed deployments must not
+    // start a compiler or overwrite their selected plugin during UI startup.
+    if auto_deploy_disabled(std::env::var_os("VISIONARY_DISABLE_PLUGIN_AUTO_DEPLOY").as_deref()) {
+        return;
+    }
     std::thread::spawn(|| {
         if let Err(e) = check_and_deploy() {
             eprintln!("[visionary] Plugin auto-deploy skipped: {e}");
         }
     });
+}
+
+fn auto_deploy_disabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1" || value == "true" || value == "yes")
 }
 
 fn check_and_deploy() -> anyhow::Result<()> {
@@ -132,4 +141,21 @@ fn is_source_newer_than(deployed: &Path) -> anyhow::Result<bool> {
         }
     }
     Ok(newest.is_some_and(|t| t > deployed_mtime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_deploy_disabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn auto_deploy_can_be_explicitly_disabled_without_changing_default() {
+        assert!(!auto_deploy_disabled(None));
+        for value in ["", "0", "false", "no"] {
+            assert!(!auto_deploy_disabled(Some(OsStr::new(value))));
+        }
+        for value in ["1", "true", "yes"] {
+            assert!(auto_deploy_disabled(Some(OsStr::new(value))));
+        }
+    }
 }

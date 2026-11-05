@@ -3306,6 +3306,17 @@ unsafe fn inject_effect(
             continue;
         }
 
+        if inj
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !crate::slight::hitbox_viewer::guard_passes(boma, guard))
+        {
+            if let Some(mut latch) = latch {
+                latch.confirmed = true;
+                EFF_FIRED.lock().insert(key, latch);
+            }
+            continue;
+        }
         load_args(agent, &inj.args);
         let confirmed = {
             let _attempt = InjectionAttemptGuard::new(key, motion, inj.frame, rule_fingerprint);

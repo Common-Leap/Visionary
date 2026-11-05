@@ -11,8 +11,4 @@ pub fn install() {
 /// failing filesystem deletes per frame, which Linux absorbs and Windows does not.
 pub fn begin_fighter_frame() {}
 
-pub fn on_dodge_stance(_boid: u32) {
-    skyline::println!("[SLight] Dodge stance not implemented");
-}
-
 pub fn clear() {}

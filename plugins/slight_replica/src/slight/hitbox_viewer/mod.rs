@@ -33,6 +33,8 @@ use parking_lot::Mutex;
 use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
+mod node_steps;
+pub use node_steps::{passes as guard_passes, LiveGuard};
 mod rate_hooks;
 mod sound_hooks;
 
@@ -1025,10 +1027,6 @@ pub fn take_archive_replay(max: usize) -> Vec<String> {
     capture_archive::take_replay(max)
 }
 
-pub fn archive_replay_active() -> bool {
-    capture_archive::replay_active()
-}
-
 /// Claim the first playback of `(kind, motion)` for one battle object and return its run id.
 /// Existing claims are immutable: later performances and other instances are ignored.
 ///
@@ -1472,6 +1470,9 @@ pub struct InjectRule {
     /// Exact AREA_WIND family function. Omitted for attack/grab injections and old editors.
     #[serde(default)]
     pub command: Option<String>,
+    /// Condition from an If block, checked when the injection is due.
+    #[serde(default)]
+    pub guard: Option<node_steps::LiveGuard>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1866,6 +1867,36 @@ unsafe fn hook_set_air(lua_state: u64) {
 }
 
 /// Capture and sparsely suppress the measured argument-less direct kinetic clear point.
+/// Lets a move made from blocks stop the projectile its original script spawns.
+#[skyline::hook(replace = smash::app::lua_bind::ArticleModule::generate_article)]
+unsafe fn hook_generate_article(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    article: i32,
+    arg3: bool,
+    arg4: i32,
+) -> u32 {
+    if any_rules()
+        && !is_injecting()
+        && smash::app::utility::get_category(&mut *boma)
+            == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        if let Some((true, _)) = action_for(
+            node_steps::CAT_ARTICLE_GENERATE,
+            motion,
+            article as u64,
+            frame,
+        ) {
+            crate::slight::diag::note(format!(
+                "stopped original object {article} (motion {motion:#x} frame {frame:.1})"
+            ));
+            return u32::MAX;
+        }
+    }
+    original!()(boma, article, arg3, arg4)
+}
+
 #[skyline::hook(replace = smash::app::lua_bind::KineticModule::clear_speed_all)]
 unsafe fn hook_kinetic_clear_speed_all(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
     record_for_boma(boma, "KineticModule::clear_speed_all", &[]);
@@ -2708,6 +2739,11 @@ fn injection_fingerprint(
     for arg in &injection.args {
         hash = fnv(hash, arg.dedupe_bits());
     }
+    if let Some(guard) = &injection.guard {
+        for byte in format!("{guard:?}").bytes() {
+            hash = fnv(hash, byte as u64);
+        }
+    }
     hash
 }
 
@@ -2947,6 +2983,21 @@ macro_rules! attack_hook {
                 }
             }
             original!()(lua_state);
+            let id = match args.first() {
+                Some(LuaArg::Int(id)) if (0..=7).contains(id) => Some(*id as u8),
+                Some(LuaArg::Num(id))
+                    if id.is_finite() && id.fract() == 0.0 && (0.0..=7.0).contains(id) =>
+                {
+                    Some(*id as u8)
+                }
+                _ => None,
+            };
+            if let Some(id) = id {
+                crate::slight::gimmicks::status_runtime::apply_attack_damage(
+                    smash::app::sv_system::battle_object_module_accessor(lua_state),
+                    id,
+                );
+            }
         }
     };
 }
@@ -3704,6 +3755,35 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 .unwrap_or(false)
         };
         if due && !already {
+            // The If is asked once, when its block is due, like the script's own `if`.
+            if inj
+                .guard
+                .as_ref()
+                .is_some_and(|guard| !node_steps::passes(boma, guard))
+            {
+                FIRED.lock().insert(key, (motion, frame));
+                continue;
+            }
+            if category == node_steps::CAT_NODE_STEP {
+                let mut agent = smash::lib::L2CAgent::new(lua_state);
+                for arg in &inj.args {
+                    if !matches!(arg, LuaArg::Hash(_)) {
+                        let mut value = arg.to_l2c();
+                        agent.push_lua_stack(&mut value);
+                    }
+                }
+                let command = inj.command.as_deref().unwrap_or_default();
+                let done = {
+                    let _g = InjectGuard::new();
+                    node_steps::run(agent.lua_state_agent, boma, command, &inj.args)
+                };
+                agent.clear_lua_stack();
+                FIRED.lock().insert(key, (motion, frame));
+                crate::slight::diag::note(format!(
+                    "node step {command} done={done} (motion {motion:#x} frame {frame:.1})"
+                ));
+                continue;
+            }
             let lifecycle_command = match (category, inj.command.as_deref()) {
                 (CAT_GRAB, Some("GRAB_CLEAR_ALL")) => {
                     let _g = InjectGuard::new();
@@ -4109,6 +4189,7 @@ pub fn install() {
         hook_ft_start_adjust_motion_frame,
         hook_clr_speed,
         hook_set_air,
+        hook_generate_article,
         hook_kinetic_clear_speed_all,
         hook_kinetic_set_consider_ground_friction,
         hook_change_kinetic,

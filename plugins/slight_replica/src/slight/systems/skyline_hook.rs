@@ -44,20 +44,6 @@ pub fn install() {
     *installed = true;
 }
 
-/// Collision hit notify + damage queues, retained for callers that already own a validated
-/// collision context. The plugin does not detour game collision dispatch to call this function.
-pub fn notify_log_event_collision_hit(ctx: &CollisionContext) {
-    crate::slight::diag::note_collision();
-    record_hit(ctx.attacker_boid, ctx.defender_boid, ctx.tick);
-    crate::slight::systems::damage_manager::on_collision_hit(ctx);
-    if crate::slight::smash_utils::debug_logging_enabled() {
-        crate::slight::diag::note(format!(
-            "COLLISION attacker={} defender={} damage={:.2} id={} flags={}",
-            ctx.attacker_boid, ctx.defender_boid, ctx.damage, ctx.collision_id, ctx.flags
-        ));
-    }
-}
-
 /// Jorge @ 71000dfda8 — after-win attack log hook entry (SD debug path).
 pub fn handle_attack(param: u64) {
     if crate::slight::frame_context::is_after_win()
@@ -81,10 +67,6 @@ pub fn record_hit(attacker: u32, defender: u32, tick: u64) {
     while q.len() > 64 {
         q.pop_front();
     }
-}
-
-pub fn drain_hits() -> Vec<HitRecord> {
-    HITS.lock().drain(..).collect()
 }
 
 pub fn clear() {

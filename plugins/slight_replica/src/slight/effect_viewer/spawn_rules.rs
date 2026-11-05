@@ -19,6 +19,9 @@ pub struct SpawnInject {
     pub frame: f32,
     pub func: String,
     pub args: Vec<LuaArg>,
+    /// Condition from an If block, checked when this spawn is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<crate::slight::hitbox_viewer::LiveGuard>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

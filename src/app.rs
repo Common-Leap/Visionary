@@ -443,6 +443,8 @@ enum PrimaryEditorTab {
     MotionState,
     AudioFeedback,
     Effects,
+    Gimmicks,
+    Nodes,
 }
 
 impl PrimaryEditorTab {
@@ -453,6 +455,8 @@ impl PrimaryEditorTab {
             Self::MotionState => "Motion & state",
             Self::AudioFeedback => "Sound & feedback",
             Self::Effects => "Visual effects",
+            Self::Gimmicks => "Gimmicks",
+            Self::Nodes => "Move nodes",
         }
     }
 
@@ -471,6 +475,8 @@ impl PrimaryEditorTab {
                 "Sounds plus camera shake, controller rumble, and the supported animation controls from the move's sound_ and expression_ scripts."
             }
             Self::Effects => VISUAL_EFFECTS_DESCRIPTION,
+            Self::Nodes => "Timed move nodes and named custom triggers sharing character gimmick state. Import, edit and apply complete scripts without flattening source branches.",
+            Self::Gimmicks => "Character-wide personal values, reusable behavior controllers, meters, and live article controls. Adapts to the selected fighter and donor-backed custom character; no move selection is required.",
         }
     }
 }
@@ -479,6 +485,146 @@ const VISUAL_EFFECTS_DESCRIPTION: &str =
     "Particle spawns, trails, model or screen colour changes, and effect-control commands from the selected move's effect_ script.";
 const WORK_FLAGS_DESCRIPTION: &str =
     "Work flags are named on/off switches stored by the game for this fighter. Move and status scripts use them to remember or signal conditions such as enabling a combo or marking a move phase; the flag's authored name identifies its exact purpose.";
+
+/// Only the viewport's own response can authorize a pick. Raw pointer clicks also belong
+/// to floating inspectors, dialogs and popups drawn over the model.
+/// The plugin source a mod export compiles: the folder used last, the copy shipped beside
+/// the editor, or the repository the editor was built in. None asks the user.
+/// Name the plugin looks for in each mod folder at boot. **Must match the plugin's value.**
+const RULE_PACK_FILE: &str = "visionary_rules.jsonl";
+
+/// Whether this machine can compile an exported mod.
+fn rust_toolchain_available() -> bool {
+    std::env::var_os("VISIONARY_EXPORT_WITHOUT_RUST").is_none()
+        && std::process::Command::new("cargo")
+            .args(["skyline", "--version"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+}
+
+/// The plugin beside the editor in a release, or the local build in a checkout.
+fn find_prebuilt_plugin(exe: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    const CANDIDATES: [&str; 2] = [
+        "plugin/lib_effect_viewer.nro",
+        "plugins/slight_replica/target/aarch64-skyline-switch/release/lib_effect_viewer.nro",
+    ];
+    exe?.ancestors().find_map(|folder| {
+        CANDIDATES
+            .iter()
+            .map(|candidate| folder.join(candidate))
+            .find(|path| path.is_file())
+    })
+}
+
+fn find_plugin_source(
+    saved: Option<std::path::PathBuf>,
+    exe: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let beside_exe = exe
+        .iter()
+        .flat_map(|exe| exe.ancestors().skip(1))
+        .flat_map(|dir| {
+            [
+                dir.join("plugin-source"),
+                dir.join("plugins/slight_replica"),
+            ]
+        });
+    saved
+        .into_iter()
+        .chain(beside_exe)
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("src").is_dir())
+}
+
+fn viewport_pick_position(response: &egui::Response) -> Option<egui::Pos2> {
+    response
+        .clicked_by(egui::PointerButton::Primary)
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .filter(|position| response.rect.contains(*position))
+}
+
+#[cfg(test)]
+mod viewport_pick_tests {
+    use super::viewport_pick_position;
+
+    fn frame(
+        ctx: &egui::Context,
+        dialog: bool,
+        events: Vec<egui::Event>,
+    ) -> (Option<egui::Pos2>, egui::Rect, bool) {
+        let mut picked = None;
+        let mut button = egui::Rect::NOTHING;
+        let mut dialog_clicked = false;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                // Like the main editor, create a dialog before the central viewport.
+                if dialog {
+                    egui::Window::new("Status event")
+                        .fixed_pos(egui::pos2(250.0, 180.0))
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ui.ctx(), |ui| {
+                            let response = ui.button("Choose a status");
+                            button = response.rect;
+                            dialog_clicked = response.clicked();
+                        });
+                }
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let response = ui.allocate_rect(
+                        ui.available_rect_before_wrap(),
+                        egui::Sense::click_and_drag(),
+                    );
+                    picked = viewport_pick_position(&response);
+                });
+            },
+        );
+        (picked, button, dialog_clicked)
+    }
+
+    fn pointer(position: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn floating_dialog_click_does_not_pick_the_model_behind_it() {
+        let ctx = egui::Context::default();
+        frame(&ctx, true, vec![]);
+        let (_, button, _) = frame(&ctx, true, vec![]);
+        let position = button.center();
+        assert!(frame(&ctx, true, pointer(position, true)).0.is_none());
+        let (picked, _, clicked) = frame(&ctx, true, pointer(position, false));
+        assert!(clicked, "the dialog must receive its click");
+        assert!(picked.is_none(), "the viewport must not also receive it");
+    }
+
+    #[test]
+    fn unobstructed_primary_click_still_picks_the_viewport() {
+        let ctx = egui::Context::default();
+        frame(&ctx, false, vec![]);
+        let position = egui::pos2(400.0, 300.0);
+        assert!(frame(&ctx, false, pointer(position, true)).0.is_none());
+        assert_eq!(
+            frame(&ctx, false, pointer(position, false)).0,
+            Some(position)
+        );
+    }
+}
 
 /// Main-editor section names always carry a plain-language explanation on the name itself.
 /// Keeping that convention in helpers makes a bare, unexplained heading easy to spot in review.
@@ -521,6 +667,52 @@ fn editor_command_subsection_heading(
     editor_section_heading_with_badge(ui, title, description, badge_color, badge);
 }
 
+/// Run `rewrite` over an earlier rewrite's text, folding its report into the earlier one. The
+/// first error wins and stops the chain.
+fn then_rewrite(
+    outcome: anyhow::Result<(String, crate::acmd_src::SyncReport)>,
+    rewrite: impl FnOnce(&str) -> anyhow::Result<(String, crate::acmd_src::SyncReport)>,
+) -> anyhow::Result<(String, crate::acmd_src::SyncReport)> {
+    let (updated, mut report) = outcome?;
+    let (updated, step) = rewrite(&updated)?;
+    report.changed += step.changed;
+    report.files.extend(step.files);
+    report.skipped.extend(step.skipped);
+    Ok((updated, report))
+}
+
+/// What a point-family editor section shows and where its edits go — see
+/// [`VisionaryApp::draw_point_section`].
+struct PointSection<'a, C> {
+    title: &'a str,
+    description: &'a str,
+    color: Color32,
+    command: &'a str,
+    /// Names the family in the "edit staged" status line.
+    label: &'a str,
+    stmt: fn(&mut crate::data::AcmdScript, usize) -> Option<&mut C>,
+    push: fn(&mut VisionaryApp),
+}
+
+/// Two 0.1-step drag values on one row; whether either changed.
+fn drag_pair(ui: &mut Ui, a: &mut f32, b: &mut f32, [prefix_a, prefix_b]: [&str; 2]) -> bool {
+    let mut changed = ui
+        .add(egui::DragValue::new(a).speed(0.1).prefix(prefix_a))
+        .changed();
+    changed |= ui
+        .add(egui::DragValue::new(b).speed(0.1).prefix(prefix_b))
+        .changed();
+    changed
+}
+
+/// A single-line authored-token editor; whether it changed to a non-empty token.
+fn token_edit(ui: &mut Ui, token: &mut String, width: f32, hint: &str) -> bool {
+    let edit = egui::TextEdit::singleline(token)
+        .desired_width(width)
+        .hint_text(hint);
+    ui.add(edit).changed() && !token.trim().is_empty()
+}
+
 fn editor_collapsing(
     ui: &mut Ui,
     title: &str,
@@ -556,6 +748,8 @@ struct EditSnapshot {
     sound_script_edit: Option<Vec<u8>>,
     expression_script_edit: Option<Vec<u8>>,
     edit_record: Option<Vec<u8>>,
+    move_graph: Option<Vec<u8>>,
+    structured_effect_edit: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -900,81 +1094,6 @@ fn timeline_frame_at_fraction(fraction: f32, total: u32) -> u32 {
         return FIRST_GAME_FRAME;
     }
     ((fraction.clamp(0.0, 1.0) * total as f32).floor() as u32 + FIRST_GAME_FRAME).min(total)
-}
-
-const TIMELINE_ROW_HEIGHT: f32 = 12.0;
-
-/// Height of one row in the compact bands below the hitbox rows.
-fn timeline_thin_row() -> f32 {
-    (TIMELINE_ROW_HEIGHT * 0.45).max(3.0)
-}
-
-#[allow(clippy::too_many_arguments)] // Keep the timeline's explicit lane counts at this UI boundary.
-fn timeline_content_height_with_change_kinetic(
-    hitboxes: usize,
-    effects: usize,
-    hurtboxes: usize,
-    sounds: usize,
-    reverse_lr: usize,
-    speed_ex: usize,
-    speed: usize,
-    add_speed_no_limit: usize,
-    correct: usize,
-    ft_catch_stop: usize,
-    ft_start_adjust_motion_frame: usize,
-    clr_speed: usize,
-    set_air: usize,
-    change_kinetic: usize,
-    kinetic_energy: usize,
-    kinetic_add_speed: usize,
-    kinetic_clear_speed_all: usize,
-    kinetic_set_consider_ground_friction: usize,
-    motion_module_set_rate: usize,
-    motion_module_set_helper_calculation: usize,
-    motion_module_set_rate_partial: usize,
-    motion_module_set_frame_partial: usize,
-    work_flag: usize,
-    work_transition_term: usize,
-    work_module_inc_int: usize,
-    work_module_set: usize,
-) -> f32 {
-    let hitbox_band = hitboxes as f32 * TIMELINE_ROW_HEIGHT;
-    let thin = timeline_thin_row();
-    let band = |rows: usize| {
-        if rows == 0 {
-            0.0
-        } else {
-            4.0 + rows as f32 * thin
-        }
-    };
-    (24.0
-        + hitbox_band
-        + band(effects)
-        + band(hurtboxes)
-        + band(sounds)
-        + band(reverse_lr)
-        + band(speed_ex)
-        + band(speed)
-        + band(add_speed_no_limit)
-        + band(correct)
-        + band(ft_catch_stop)
-        + band(ft_start_adjust_motion_frame)
-        + band(clr_speed)
-        + band(set_air)
-        + band(change_kinetic)
-        + band(kinetic_energy)
-        + band(kinetic_add_speed)
-        + band(kinetic_clear_speed_all)
-        + band(kinetic_set_consider_ground_friction)
-        + band(motion_module_set_rate)
-        + band(motion_module_set_helper_calculation)
-        + band(motion_module_set_rate_partial)
-        + band(motion_module_set_frame_partial)
-        + band(work_flag)
-        + band(work_transition_term)
-        + band(work_module_inc_int)
-        + band(work_module_set))
-    .max(24.0)
 }
 
 /// Compatibility form for layout tests and callers that predate the direct kinetic lane.
@@ -1362,13 +1481,6 @@ fn timeline_frame_extent(
     )
 }
 
-fn timeline_scroll_area(viewport_height: f32) -> egui::ScrollArea {
-    egui::ScrollArea::vertical()
-        .id_salt("hitbox_timeline_scroll")
-        .auto_shrink([false, false])
-        .max_height(viewport_height.max(1.0))
-}
-
 const SCRUBBER_ROW_HEIGHT: f32 = 18.0;
 
 /// Height of the painted timeline itself. The bottom panel uses this to stop its resize handle
@@ -1401,16 +1513,6 @@ fn hitbox_selector_height(hitbox_count: usize, available_height: f32) -> f32 {
     content_height
         .min(HITBOX_SELECTOR_MAX_HEIGHT)
         .min(available_for_selector)
-}
-
-#[allow(dead_code)]
-fn hitbox_menu_scroll_area(viewport_height: f32) -> egui::ScrollArea {
-    let viewport_height = viewport_height.max(1.0);
-    egui::ScrollArea::vertical()
-        .id_salt("hitbox_menu_scroll")
-        .auto_shrink([false, false])
-        .min_scrolled_height(viewport_height)
-        .max_height(viewport_height)
 }
 
 /// AREA_WIND uses the gameplay plane's horizontal/vertical coordinates. Model space represents
@@ -2495,6 +2597,27 @@ fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
             crate::data::EffectControl::UnableArea { kind } => {
                 format!("UNABLE_AREA {kind}")
             }
+            crate::data::EffectControl::SetDisableRenderOffsetLast => {
+                "Disable last effect render offset".into()
+            }
+            crate::data::EffectControl::EnableSyncInitPosLast => {
+                "Sync last effect initial position".into()
+            }
+            crate::data::EffectControl::ReqScreen { preset_id } => {
+                format!("Screen effect · {preset_id}")
+            }
+            crate::data::EffectControl::OffKindWork { preset_id } => {
+                let label = crate::data::EffectOffKindWorkPreset::by_id(preset_id)
+                    .map(crate::move_nodes::view::native_effect_off_label)
+                    .unwrap_or_else(|| "Unsupported saved preset".into());
+                format!("Native effect off · {label}")
+            }
+            crate::data::EffectControl::SetDisableCameraDepthInfluence { value } => {
+                format!(
+                    "Camera depth influence · {}",
+                    if *value { "Disabled" } else { "Enabled" }
+                )
+            }
         };
     }
     // A colour command has no graphic, so the command itself is its name. Falling through to
@@ -2704,7 +2827,10 @@ impl LiveApplyReport {
     fn status_suffix(&self) -> String {
         let mut notes = Vec::new();
         if self.restored_moves > 0 {
-            notes.push(format!("{} move(s) restored live", self.restored_moves));
+            notes.push(format!(
+                "{} move(s) restored; supported edits sent live",
+                self.restored_moves
+            ));
         }
         if !self.missing_source.is_empty() {
             notes.push(format!(
@@ -2887,6 +3013,180 @@ impl SourceBuffer {
     }
 }
 
+/// Non-moveset managers and off-roster actors are hidden from the main source editor.
+/// Playable component sources (partners/forms) keep their exact directory identities.
+fn editor_source_is_excluded(name: &str) -> bool {
+    matches!(
+        name,
+        "common"
+            | "element"
+            | "ptrainer"
+            | "ptrainer_low"
+            | "miienemyf"
+            | "miienemyg"
+            | "miienemys"
+            | "koopag"
+            | "masterhand"
+            | "crazyhand"
+            | "crazy"
+    )
+}
+
+fn missing_acmd_content_error(
+    fighter: &str,
+    move_name: &str,
+    has_source_content: bool,
+) -> Option<String> {
+    (!has_source_content).then(|| format!("No ACMD statements found for {fighter}/{move_name}"))
+}
+
+fn source_preview_budget_error(
+    fighter: &str,
+    move_name: &str,
+    game: &crate::data::AcmdScript,
+    effect: &crate::data::EffectScript,
+    sound: &crate::data::AcmdScript,
+    expression: &crate::data::AcmdScript,
+) -> Option<String> {
+    [
+        ("Game", game.preview_budget_error()),
+        ("Effect", effect.preview_budget_error()),
+        ("Sound", sound.preview_budget_error()),
+        ("Expression", expression.preview_budget_error()),
+    ]
+    .into_iter()
+    .find_map(|(track, error)| {
+        error.map(|error| {
+            format!(
+                "{fighter}/{move_name}: {track} preview unavailable — {error}. Source is retained."
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+mod source_editor_discovery_tests {
+    use super::{
+        editor_source_is_excluded, missing_acmd_content_error, source_preview_budget_error,
+    };
+
+    #[test]
+    fn playable_components_keep_their_exact_source_identities() {
+        for (source, label) in [
+            ("master", "Byleth"),
+            ("popo", "Ice Climbers · Popo"),
+            ("nana", "Ice Climbers · Nana"),
+            ("pzenigame", "Squirtle"),
+            ("pfushigisou", "Ivysaur"),
+            ("plizardon", "Charizard"),
+        ] {
+            assert!(!editor_source_is_excluded(source), "{source}");
+            assert_eq!(crate::data::fighter_display_name(source), label);
+        }
+    }
+
+    #[test]
+    fn source_filter_excludes_only_exact_managers_and_off_roster_actors() {
+        for source in [
+            "common",
+            "element",
+            "ptrainer",
+            "ptrainer_low",
+            "miienemyf",
+            "miienemyg",
+            "miienemys",
+            "koopag",
+            "masterhand",
+            "crazyhand",
+            "crazy",
+        ] {
+            assert!(editor_source_is_excluded(source), "{source}");
+        }
+        for source in ["nanaex", "masterhand_custom", "ptrainer_custom", "mario"] {
+            assert!(!editor_source_is_excluded(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn valid_non_collision_tracks_are_not_load_errors() {
+        let sources = [
+            r#"unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
+                frame(agent.lua_state_agent, 3.0);
+            }"#,
+            r#"unsafe extern "C" fn sound_test(agent: &mut L2CAgentBase) {
+                if macros::is_excute(agent) {
+                    macros::PLAY_SE(agent, Hash40::new("se_common_swing_01"));
+                }
+            }"#,
+            r#"unsafe extern "C" fn expression_test(agent: &mut L2CAgentBase) {
+                if macros::is_excute(agent) {
+                    macros::slope(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+                }
+            }"#,
+            r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+                frame(agent.lua_state_agent, 1.0);
+            }"#,
+        ];
+        for source in sources {
+            let game = crate::acmd::parse_acmd_script(source);
+            let effect = crate::acmd::parse_effect_script(source);
+            let sound = crate::acmd::parse_sound_script(source);
+            let expression = crate::acmd::parse_expression_script(source);
+            assert!(game.to_hitboxes().is_empty());
+            let has_content = !game.stmts.is_empty()
+                || !effect.stmts.is_empty()
+                || !sound.stmts.is_empty()
+                || !expression.stmts.is_empty();
+            assert!(has_content, "fixture must parse: {source}");
+            assert_eq!(
+                missing_acmd_content_error("nana", "final_start", has_content),
+                None
+            );
+            assert_eq!(
+                source_preview_budget_error(
+                    "nana",
+                    "final_start",
+                    &game,
+                    &effect,
+                    &sound,
+                    &expression
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn over_budget_source_preview_names_the_track_without_claiming_no_content() {
+        let empty = crate::data::AcmdScript::default();
+        let huge = crate::data::AcmdScript {
+            stmts: vec![crate::data::AcmdStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: Vec::new(),
+            }],
+        };
+        let effect = crate::data::EffectScript::default();
+        let message =
+            source_preview_budget_error("cloud", "attack_11", &empty, &effect, &huge, &empty)
+                .unwrap();
+        assert!(message.starts_with("cloud/attack_11: Sound preview unavailable"));
+        assert!(message.contains("Source is retained"));
+        assert!(!message.contains("No ACMD"));
+        let before = serde_json::to_value(&huge).unwrap();
+        assert!(huge.to_sound_events().is_empty());
+        assert_eq!(serde_json::to_value(huge).unwrap(), before);
+    }
+
+    #[test]
+    fn empty_source_keeps_a_named_load_error() {
+        assert_eq!(
+            missing_acmd_content_error("nana", "final_start", false).as_deref(),
+            Some("No ACMD statements found for nana/final_start")
+        );
+    }
+}
+
 pub struct VisionaryApp {
     /// Keeps the Wayland shared-memory icon buffer alive for the root toplevel. winit 0.30
     /// handles X11 and Windows icons itself; Wayland compositors use the native icon protocol.
@@ -3002,6 +3302,18 @@ pub struct VisionaryApp {
     /// The Roster workspace: mod library, character select screen, new characters, traits.
     /// `app.rs` owns this one field and the menu entry; everything else is under `src/roster/`.
     roster: crate::roster::window::RosterWindow,
+    gimmicks_editor: crate::gimmicks::editor::GimmicksEditor,
+    node_editor: crate::move_nodes::view::NodeEditor,
+    node_workspace: bool,
+    node_preview: bool,
+    workspace_fighter_search: String,
+    workspace_move_search: String,
+    move_graphs: BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
+    node_effect_scripts: HashMap<String, crate::data::AcmdScript>,
+    node_live_cache: Option<(
+        String,
+        BTreeMap<String, crate::gimmicks::behavior::BehaviorGraph>,
+    )>,
     /// Fighters the user has forgotten from the sidebar. Their source files remain on disk;
     /// this is the persisted roster filter used by the right-click "Forget fighter" action.
     forgotten_fighters: BTreeSet<String>,
@@ -3009,7 +3321,8 @@ pub struct VisionaryApp {
     current_eff_path: Option<PathBuf>,
     /// Effs opened from outside the game data root (most-recent first), persisted.
     recent_effs: Vec<PathBuf>,
-    /// Background cargo-skyline build of an exported mod's source (status polled in update).
+    /// Background cargo-skyline build for a normal export or explicit gimmick package.
+    /// Only one build owns this slot at a time; status is polled in `update`.
     export_build: Option<std::sync::Arc<std::sync::Mutex<ExportBuildState>>>,
     /// Connection the pin-sync check last ran for (plugin client id).
     pin_sync_client: Option<u64>,
@@ -3278,12 +3591,77 @@ impl FrameProfiler {
     }
 }
 
+/// `fn $name(captures, pristine, index, event)`: the capture line behind one point family's
+/// event — see [`VisionaryApp::point_capture_for`]. `Call, arity` matches `Call::FUNC` and
+/// counts every earlier event on the frame; `Call, arity, by field` matches the event's own
+/// `func()` and counts only earlier events with the same `field`.
+macro_rules! point_capture_fns {
+    (@fn $name:ident, $call:ident, $arity:literal, $func:expr, $same:expr) => {
+        fn $name<'a>(
+            captures: &'a [crate::game_link::CaptureLine],
+            pristine: &[crate::data::PointEvent<crate::data::$call>],
+            index: usize,
+            event: &crate::data::PointEvent<crate::data::$call>,
+        ) -> Option<&'a crate::game_link::CaptureLine> {
+            Self::point_capture_for(captures, pristine, index, event, $arity, $func, $same)
+        }
+    };
+    ($($name:ident: $call:ident, $arity:literal;)*) => {$(
+        point_capture_fns!(@fn $name, $call, $arity, |_| crate::data::$call::FUNC, |_, _| true);
+    )*};
+    ($($name:ident: $call:ident, $arity:literal, by $field:ident;)*) => {$(
+        point_capture_fns!(@fn $name, $call, $arity, |call| call.func(), |a, b| a.$field == b.$field);
+    )*};
+}
+
+/// `fn $name(&mut self)`: rebuild one point family's live rules for the current move with
+/// `Self::$rules_for(motion, [&captures,] &pristine, &shown)` — see
+/// [`VisionaryApp::push_point_rules`]. Rows that take captures also name the replay-limit
+/// category, the status label, and what an unrepresentable point needs.
+macro_rules! point_rule_pushers {
+    ($($name:ident: $key:literal, $rules_for:ident, $pristine:ident, $events:ident,
+        $limit:literal, $label:literal, $need:literal;)*) => {$(
+        fn $name(&mut self) {
+            let limits = Some(($limit, $label, $need));
+            self.push_point_rules($key, limits, |app, motion| {
+                let captures = app.captures_for_selected_fighter(motion);
+                let shown = app.state.script.$events();
+                Self::$rules_for(motion, &captures, &app.state.point_originals.$pristine, &shown)
+            });
+        }
+    )*};
+    ($($name:ident: $key:literal, $rules_for:ident, $pristine:ident, $events:ident;)*) => {$(
+        fn $name(&mut self) {
+            self.push_point_rules($key, None, |app, motion| {
+                let shown = app.state.script.$events();
+                (Self::$rules_for(motion, &app.state.point_originals.$pristine, &shown), 0)
+            });
+        }
+    )*};
+}
+
 impl VisionaryApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         // Set dark theme with visible text
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         // Install image loaders — this also ensures font atlas is properly initialized
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // The proportional font has no arrows (→), which labels use throughout; borrow them from
+        // the bundled monospace font instead of drawing a missing-glyph box.
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(mono) = fonts
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .and_then(|f| f.first())
+            .cloned()
+        {
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push(mono);
+        }
+        cc.egui_ctx.set_fonts(fonts);
 
         // Before anything touches the SD card — `clear_stale_live_state` just below is the
         // first caller — publish the user's explicit emulator SD root, if they set one.
@@ -3354,6 +3732,15 @@ impl VisionaryApp {
             hurtbox_condition_edit_mode: "*DAMAGE_NO_REACTION_MODE_ALWAYS".into(),
             hurtbox_condition_edit_value: "0".into(),
             primary_tab: PrimaryEditorTab::Collisions,
+            gimmicks_editor: crate::gimmicks::editor::GimmicksEditor::default(),
+            node_editor: Default::default(),
+            node_workspace: false,
+            node_preview: true,
+            workspace_fighter_search: String::new(),
+            workspace_move_search: String::new(),
+            move_graphs: Default::default(),
+            node_effect_scripts: Default::default(),
+            node_live_cache: None,
             timeline_filters: load_timeline_filters(),
             selected_command: None,
             show_effect_advanced: false,
@@ -3628,30 +4015,13 @@ impl VisionaryApp {
     /// Rebuild the fighter list from the data root plus every mod root. Idempotent — called
     /// on data-root change and whenever the mod-root set changes.
     fn reindex_fighters(&mut self) {
-        // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
-        // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
+        // Source actors are independent of select-screen slots: partners and Pokémon forms
+        // have their own moves, models and parameters. Filter only exact manager/boss names;
+        // a custom source named e.g. "nanaex" or "masterhand_custom" is not an alias.
         // `element` is the Pyra/Mythra swap manager, not a playable moveset — the same role
         // `ptrainer` plays for the Pokémon trio. Its select-screen presence is the shared
         // Aegis cell the roster already collapses; listing it here produced a third,
         // unloadable entry next to the real Pyra (`eflame`) and Mythra (`elight`).
-        let skip = [
-            "common",
-            "element",
-            "ptrainer",
-            "ptrainer_low",
-            "pfushigisou",
-            "pzenigame",
-            "plizardon",
-            "nana",
-            "popo",
-            "miienemyf",
-            "miienemyg",
-            "miienemys",
-            "koopag",
-            "master",
-            "crazy",
-        ];
-
         let roots = self.all_roots();
         self.state.fighters.clear();
 
@@ -3675,7 +4045,7 @@ impl VisionaryApp {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                if skip.contains(&name.as_str())
+                if editor_source_is_excluded(&name)
                     || self.forgotten_fighters.contains(&name.to_ascii_lowercase())
                     || !seen.insert(name.clone())
                 {
@@ -3897,6 +4267,12 @@ impl VisionaryApp {
             .retain(|key, _| !fighter_key_matches(key, &fighter));
         self.move_source_cache
             .retain(|key, _| !fighter_key_matches(key, &fighter));
+        self.move_graphs
+            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+        self.node_effect_scripts
+            .retain(|key, _| !fighter_key_matches(key, &fighter));
+        self.node_live_cache = None;
+        self.node_editor.invalidate();
         if self
             .source_mismatch_prompt
             .as_ref()
@@ -3955,26 +4331,12 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let spawn: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let controls: Vec<crate::game_link::EffectControlRuleWire> =
+            self.live_effect_control_rule_union();
         self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let hitboxes: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&hitboxes);
         self.push_effect_aliases();
 
@@ -4289,7 +4651,9 @@ impl VisionaryApp {
         self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
         self.state.selected_effect_call = None;
         self.selected_command = None;
-        self.primary_tab = PrimaryEditorTab::Collisions;
+        if self.primary_tab != PrimaryEditorTab::Gimmicks {
+            self.primary_tab = PrimaryEditorTab::Collisions;
+        }
         self.show_add_hitbox = false;
         // The frame count is parsed here rather than when the list was built. Reading ~460
         // `.nuanmb` files up front is what the old six-substring family filter existed to avoid,
@@ -4809,17 +5173,31 @@ impl VisionaryApp {
         let has_hitbox_script =
             !self.state.hitboxes.is_empty() || !self.state.script.stmts.is_empty();
         if show_category("game") && has_hitbox_script {
-            let script = if self.state.script.stmts.is_empty() {
-                synthesize_script_from_hitboxes(&self.state.hitboxes)
-            } else {
-                rebuild_script_from_hitboxes(&self.state.script, &self.state.hitboxes)
-            };
+            let script = game_script_for_edits(&self.state.script, &self.state.hitboxes);
             let emitted = crate::acmd::preview_game_fn(&script, &script_move);
             crate::acmd_verify::verify_move(&move_name, &script, &emitted, &mut report);
             out.push_str(&emitted);
         }
 
-        if show_category("effect") && !self.state.effects.is_empty() {
+        if show_category("effect") {
+            crate::acmd_verify::verify_effect_preview_budget(
+                &move_name,
+                &self.state.effect_script,
+                &mut report,
+            );
+        }
+        let structured_effect = self
+            .current_move_key()
+            .and_then(|key| self.node_effect_scripts.get(&key));
+        if let Some(script) = structured_effect.filter(|_| show_category("effect")) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&crate::acmd::preview_effect_structure_fn(
+                script,
+                &script_move,
+            ));
+        } else if show_category("effect") && !self.state.effects.is_empty() {
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -5126,6 +5504,8 @@ impl VisionaryApp {
             if calls.is_empty() && !self.state.effects.is_empty() {
                 Some("Source has no readable effect spawns — showing the last version that did")
             } else {
+                self.state.source_effect_spawns =
+                    crate::move_nodes::live_steps::source_spawn_names(&effect_script);
                 self.state.effects_pristine = calls.clone();
                 self.state.effects = calls;
                 self.state.selected_effect_call = None;
@@ -5209,494 +5589,176 @@ impl VisionaryApp {
 
     /// Write the panels' current values into the open source buffer's text.
     fn mirror_panels_into_source_buffer(&mut self) {
+        use crate::acmd_src as src;
         let Some(buffer) = self.acmd_src_buffer.as_ref() else {
             return;
         };
         let label = format!("{}/{}", buffer.fighter, buffer.move_name);
-        let outcome = if buffer.is_game_script() {
-            match crate::acmd_src::rewrite_hitboxes(
+        let (label, state) = (label.as_str(), &self.state);
+        let mut outcome = if buffer.is_game_script() {
+            src::rewrite_hitboxes(
                 &buffer.text,
-                &label,
-                &self.state.hitboxes_pristine,
-                &self.state.hitboxes,
-            ) {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_reverse_lr(
-                        &updated,
-                        &label,
-                        &self.state.reverse_lr_pristine,
-                        &self.state.script.to_reverse_lr_events(),
-                    ) {
-                        Ok((updated, reverse_report)) => {
-                            report.changed += reverse_report.changed;
-                            report.files.extend(reverse_report.files);
-                            report.skipped.extend(reverse_report.skipped);
-                            match crate::acmd_src::rewrite_speed_ex(
-                                &updated,
-                                &label,
-                                &self.state.speed_ex_pristine,
-                                &self.state.script.to_speed_ex_events(),
-                            ) {
-                                Ok((updated, speed_report)) => {
-                                    report.changed += speed_report.changed;
-                                    report.files.extend(speed_report.files);
-                                    report.skipped.extend(speed_report.skipped);
-                                    match crate::acmd_src::rewrite_add_speed_no_limit(
-                                        &updated,
-                                        &label,
-                                        &self.state.add_speed_no_limit_pristine,
-                                        &self.state.script.to_add_speed_no_limit_events(),
-                                    ) {
-                                        Ok((updated, add_speed_report)) => {
-                                            report.changed += add_speed_report.changed;
-                                            report.files.extend(add_speed_report.files);
-                                            report.skipped.extend(add_speed_report.skipped);
-                                            match crate::acmd_src::rewrite_correct(
-                                                &updated,
-                                                &label,
-                                                &self.state.correct_pristine,
-                                                &self.state.script.to_correct_events(),
-                                            ) {
-                                                Ok((updated, correct_report)) => {
-                                                    report.changed += correct_report.changed;
-                                                    report.files.extend(correct_report.files);
-                                                    report.skipped.extend(correct_report.skipped);
-                                                    Ok((updated, report))
-                                                }
-                                                Err(error) => Err(error),
-                                            }
-                                        }
-                                        Err(error) => Err(error),
-                                    }
-                                }
-                                Err(error) => Err(error),
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
+                label,
+                &state.hitboxes_pristine,
+                &state.hitboxes,
+            )
         } else if buffer.is_effect_script() {
-            crate::acmd_src::rewrite_effect_calls(
-                &buffer.text,
-                &label,
-                &self.state.effects_pristine,
-                &self.state.effects,
-            )
+            src::rewrite_effect_calls(&buffer.text, label, &state.effects_pristine, &state.effects)
         } else if buffer.is_sound_script() {
-            crate::acmd_src::rewrite_sounds(
-                &buffer.text,
-                &label,
-                &self.state.sounds_pristine,
-                &self.state.sounds,
-            )
+            src::rewrite_sounds(&buffer.text, label, &state.sounds_pristine, &state.sounds)
         } else if buffer.is_expression_script() {
-            crate::acmd_src::rewrite_expressions(
-                &buffer.text,
-                &label,
-                &self.state.expressions_pristine,
-                &self.state.expressions,
-            )
+            let (pristine, shown) = (&state.expressions_pristine, &state.expressions);
+            src::rewrite_expressions(&buffer.text, label, pristine, shown)
         } else {
             Ok((buffer.text.clone(), Default::default()))
         };
-        let outcome = if buffer.is_expression_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_rate_partial(
-                        &updated,
-                        &label,
-                        &self
-                            .state
-                            .expression_motion_module_set_rate_partial_pristine,
-                        &self
-                            .state
-                            .expression_script
-                            .to_motion_module_set_rate_partial_events(),
-                    ) {
-                        Ok((updated, partial_rate_report)) => {
-                            report.changed += partial_rate_report.changed;
-                            report.files.extend(partial_rate_report.files);
-                            report.skipped.extend(partial_rate_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_expression_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_frame_partial(
-                        &updated,
-                        &label,
-                        &self
-                            .state
-                            .expression_motion_module_set_frame_partial_pristine,
-                        &self
-                            .state
-                            .expression_script
-                            .to_motion_module_set_frame_partial_events(),
-                    ) {
-                        Ok((updated, partial_frame_report)) => {
-                            report.changed += partial_frame_report.changed;
-                            report.files.extend(partial_frame_report.files);
-                            report.skipped.extend(partial_frame_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => match crate::acmd_src::rewrite_speed(
-                    &updated,
-                    &label,
-                    &self.state.speed_pristine,
-                    &self.state.script.to_speed_events(),
-                ) {
-                    Ok((updated, speed_report)) => {
-                        report.changed += speed_report.changed;
-                        report.files.extend(speed_report.files);
-                        report.skipped.extend(speed_report.skipped);
-                        match crate::acmd_src::rewrite_ft_catch_stop(
-                            &updated,
-                            &label,
-                            &self.state.ft_catch_stop_pristine,
-                            &self.state.script.to_ft_catch_stop_events(),
-                        ) {
-                            Ok((updated, ft_catch_stop_report)) => {
-                                report.changed += ft_catch_stop_report.changed;
-                                report.files.extend(ft_catch_stop_report.files);
-                                report.skipped.extend(ft_catch_stop_report.skipped);
-                                match crate::acmd_src::rewrite_ft_start_adjust_motion_frame(
-                                    &updated,
-                                    &label,
-                                    &self.state.ft_start_adjust_motion_frame_pristine,
-                                    &self.state.script.to_ft_start_adjust_motion_frame_events(),
-                                ) {
-                                    Ok((updated, ft_start_report)) => {
-                                        report.changed += ft_start_report.changed;
-                                        report.files.extend(ft_start_report.files);
-                                        report.skipped.extend(ft_start_report.skipped);
-                                        match crate::acmd_src::rewrite_clr_speed(
-                                            &updated,
-                                            &label,
-                                            &self.state.clr_speed_pristine,
-                                            &self.state.script.to_clr_speed_events(),
-                                        ) {
-                                            Ok((updated, clr_speed_report)) => {
-                                                report.changed += clr_speed_report.changed;
-                                                report.files.extend(clr_speed_report.files);
-                                                report.skipped.extend(clr_speed_report.skipped);
-                                                match crate::acmd_src::rewrite_set_air(
-                                                    &updated,
-                                                    &label,
-                                                    &self.state.set_air_pristine,
-                                                    &self.state.script.to_set_air_events(),
-                                                ) {
-                                                    Ok((updated, set_air_report)) => {
-                                                        report.changed += set_air_report.changed;
-                                                        report.files.extend(set_air_report.files);
-                                                        report
-                                                            .skipped
-                                                            .extend(set_air_report.skipped);
-                                                        match crate::acmd_src::rewrite_change_kinetic(
-                                                            &updated,
-                                                            &label,
-                                                            &self.state.change_kinetic_pristine,
-                                                            &self.state.script.to_change_kinetic_events(),
-                                                        ) {
-                                                            Ok((updated, change_kinetic_report)) => {
-                                                                report.changed += change_kinetic_report.changed;
-                                                                report.files.extend(change_kinetic_report.files);
-                                                                report.skipped.extend(change_kinetic_report.skipped);
-                                                                match crate::acmd_src::rewrite_kinetic_add_speed(
-                                                                    &updated,
-                                                                    &label,
-                                                                    &self.state.kinetic_add_speed_pristine,
-                                                                    &self.state.script.to_kinetic_add_speed_events(),
-                                                                ) {
-                                                                    Ok((updated, kinetic_add_speed_report)) => {
-                                                                        report.changed += kinetic_add_speed_report.changed;
-                                                                        report.files.extend(kinetic_add_speed_report.files);
-                                                                        report.skipped.extend(kinetic_add_speed_report.skipped);
-                                                                        match crate::acmd_src::rewrite_kinetic_clear_speed_all(
-                                                                            &updated,
-                                                                            &label,
-                                                                            &self.state.kinetic_clear_speed_all_pristine,
-                                                                            &self.state.script.to_kinetic_clear_speed_all_events(),
-                                                                        ) {
-                                                                            Ok((updated, kinetic_clear_speed_all_report)) => {
-                                                                                report.changed += kinetic_clear_speed_all_report.changed;
-                                                                                report.files.extend(kinetic_clear_speed_all_report.files);
-                                                                                report.skipped.extend(kinetic_clear_speed_all_report.skipped);
-                                                                                match crate::acmd_src::rewrite_kinetic_set_consider_ground_friction(
-                                                                                    &updated,
-                                                                                    &label,
-                                                                                    &self.state.kinetic_set_consider_ground_friction_pristine,
-                                                                                    &self.state.script.to_kinetic_set_consider_ground_friction_events(),
-                                                                                ) {
-                                                                                    Ok((updated, friction_report)) => {
-                                                                                        report.changed += friction_report.changed;
-                                                                                        report.files.extend(friction_report.files);
-                                                                                        report.skipped.extend(friction_report.skipped);
-                                                                                        Ok((updated, report))
-                                                                                    }
-                                                                                    Err(error) => Err(error),
-                                                                                }
-                                                                            }
-                                                                            Err(error) => Err(error),
-                                                                        }
-                                                                    }
-                                                                    Err(error) => Err(error),
-                                                                }
-                                                            }
-                                                            Err(error) => Err(error),
-                                                        }
-                                                    }
-                                                    Err(error) => Err(error),
-                                                }
-                                            }
-                                            Err(error) => Err(error),
-                                        }
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_kinetic_energy(
-                        &updated,
-                        &label,
-                        &self.state.kinetic_energy_pristine,
-                        &self.state.script.to_kinetic_energy_events(),
-                    ) {
-                        Ok((updated, kinetic_energy_report)) => {
-                            report.changed += kinetic_energy_report.changed;
-                            report.files.extend(kinetic_energy_report.files);
-                            report.skipped.extend(kinetic_energy_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_rate(
-                        &updated,
-                        &label,
-                        &self.state.motion_module_set_rate_pristine,
-                        &self.state.script.to_motion_module_set_rate_events(),
-                    ) {
-                        Ok((updated, motion_module_rate_report)) => {
-                            report.changed += motion_module_rate_report.changed;
-                            report.files.extend(motion_module_rate_report.files);
-                            report.skipped.extend(motion_module_rate_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_helper_calculation(
-                        &updated,
-                        &label,
-                        &self.state.motion_module_set_helper_calculation_pristine,
-                        &self
-                            .state
-                            .script
-                            .to_motion_module_set_helper_calculation_events(),
-                    ) {
-                        Ok((updated, helper_report)) => {
-                            report.changed += helper_report.changed;
-                            report.files.extend(helper_report.files);
-                            report.skipped.extend(helper_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_rate_partial(
-                        &updated,
-                        &label,
-                        &self.state.motion_module_set_rate_partial_pristine,
-                        &self.state.script.to_motion_module_set_rate_partial_events(),
-                    ) {
-                        Ok((updated, partial_rate_report)) => {
-                            report.changed += partial_rate_report.changed;
-                            report.files.extend(partial_rate_report.files);
-                            report.skipped.extend(partial_rate_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_motion_module_set_frame_partial(
-                        &updated,
-                        &label,
-                        &self.state.motion_module_set_frame_partial_pristine,
-                        &self
-                            .state
-                            .script
-                            .to_motion_module_set_frame_partial_events(),
-                    ) {
-                        Ok((updated, partial_frame_report)) => {
-                            report.changed += partial_frame_report.changed;
-                            report.files.extend(partial_frame_report.files);
-                            report.skipped.extend(partial_frame_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_work_flags(
-                        &updated,
-                        &label,
-                        &self.state.work_flag_pristine,
-                        &self.state.script.to_work_flag_events(),
-                    ) {
-                        Ok((updated, work_flag_report)) => {
-                            report.changed += work_flag_report.changed;
-                            report.files.extend(work_flag_report.files);
-                            report.skipped.extend(work_flag_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_work_transition_terms(
-                        &updated,
-                        &label,
-                        &self.state.work_transition_term_pristine,
-                        &self.state.script.to_work_transition_term_events(),
-                    ) {
-                        Ok((updated, transition_term_report)) => {
-                            report.changed += transition_term_report.changed;
-                            report.files.extend(transition_term_report.files);
-                            report.skipped.extend(transition_term_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_work_module_inc_int(
-                        &updated,
-                        &label,
-                        &self.state.work_module_inc_int_pristine,
-                        &self.state.script.to_work_module_inc_int_events(),
-                    ) {
-                        Ok((updated, inc_int_report)) => {
-                            report.changed += inc_int_report.changed;
-                            report.files.extend(inc_int_report.files);
-                            report.skipped.extend(inc_int_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
-        let outcome = if buffer.is_game_script() {
-            match outcome {
-                Ok((updated, mut report)) => {
-                    match crate::acmd_src::rewrite_work_module_sets(
-                        &updated,
-                        &label,
-                        &self.state.work_module_set_pristine,
-                        &self.state.script.to_work_module_set_events(),
-                    ) {
-                        Ok((updated, work_module_set_report)) => {
-                            report.changed += work_module_set_report.changed;
-                            report.files.extend(work_module_set_report.files);
-                            report.skipped.extend(work_module_set_report.skipped);
-                            Ok((updated, report))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            outcome
-        };
+        // One point family's rewrite over the text so far, in this exact order.
+        macro_rules! step {
+            ($rewrite:ident, expression_motion_module_set_rate_partial_pristine, $script:ident.$events:ident) => {
+                outcome = then_rewrite(outcome, |text| {
+                    src::$rewrite(
+                        text,
+                        label,
+                        &state.expression_motion_module_set_rate_partial_pristine,
+                        &state.$script.$events(),
+                    )
+                });
+            };
+            ($rewrite:ident, expression_motion_module_set_frame_partial_pristine, $script:ident.$events:ident) => {
+                outcome = then_rewrite(outcome, |text| {
+                    src::$rewrite(
+                        text,
+                        label,
+                        &state.expression_motion_module_set_frame_partial_pristine,
+                        &state.$script.$events(),
+                    )
+                });
+            };
+            ($rewrite:ident, $pristine:ident, $script:ident.$events:ident) => {
+                outcome = then_rewrite(outcome, |text| {
+                    src::$rewrite(
+                        text,
+                        label,
+                        &state.point_originals.$pristine,
+                        &state.$script.$events(),
+                    )
+                });
+            };
+        }
+        if buffer.is_game_script() {
+            step!(
+                rewrite_reverse_lr,
+                reverse_lr_pristine,
+                script.to_reverse_lr_events
+            );
+            step!(
+                rewrite_speed_ex,
+                speed_ex_pristine,
+                script.to_speed_ex_events
+            );
+            step!(
+                rewrite_add_speed_no_limit,
+                add_speed_no_limit_pristine,
+                script.to_add_speed_no_limit_events
+            );
+            step!(rewrite_correct, correct_pristine, script.to_correct_events);
+        }
+        if buffer.is_expression_script() {
+            step!(
+                rewrite_motion_module_set_rate_partial,
+                expression_motion_module_set_rate_partial_pristine,
+                expression_script.to_motion_module_set_rate_partial_events
+            );
+            step!(
+                rewrite_motion_module_set_frame_partial,
+                expression_motion_module_set_frame_partial_pristine,
+                expression_script.to_motion_module_set_frame_partial_events
+            );
+        }
+        if buffer.is_game_script() {
+            step!(rewrite_speed, speed_pristine, script.to_speed_events);
+            step!(
+                rewrite_ft_catch_stop,
+                ft_catch_stop_pristine,
+                script.to_ft_catch_stop_events
+            );
+            step!(
+                rewrite_ft_start_adjust_motion_frame,
+                ft_start_adjust_motion_frame_pristine,
+                script.to_ft_start_adjust_motion_frame_events
+            );
+            step!(
+                rewrite_clr_speed,
+                clr_speed_pristine,
+                script.to_clr_speed_events
+            );
+            step!(rewrite_set_air, set_air_pristine, script.to_set_air_events);
+            step!(
+                rewrite_change_kinetic,
+                change_kinetic_pristine,
+                script.to_change_kinetic_events
+            );
+            step!(
+                rewrite_kinetic_add_speed,
+                kinetic_add_speed_pristine,
+                script.to_kinetic_add_speed_events
+            );
+            step!(
+                rewrite_kinetic_clear_speed_all,
+                kinetic_clear_speed_all_pristine,
+                script.to_kinetic_clear_speed_all_events
+            );
+            step!(
+                rewrite_kinetic_set_consider_ground_friction,
+                kinetic_set_consider_ground_friction_pristine,
+                script.to_kinetic_set_consider_ground_friction_events
+            );
+            step!(
+                rewrite_kinetic_energy,
+                kinetic_energy_pristine,
+                script.to_kinetic_energy_events
+            );
+            step!(
+                rewrite_motion_module_set_rate,
+                motion_module_set_rate_pristine,
+                script.to_motion_module_set_rate_events
+            );
+            step!(
+                rewrite_motion_module_set_helper_calculation,
+                motion_module_set_helper_calculation_pristine,
+                script.to_motion_module_set_helper_calculation_events
+            );
+            step!(
+                rewrite_motion_module_set_rate_partial,
+                motion_module_set_rate_partial_pristine,
+                script.to_motion_module_set_rate_partial_events
+            );
+            step!(
+                rewrite_motion_module_set_frame_partial,
+                motion_module_set_frame_partial_pristine,
+                script.to_motion_module_set_frame_partial_events
+            );
+            step!(
+                rewrite_work_flags,
+                work_flag_pristine,
+                script.to_work_flag_events
+            );
+            step!(
+                rewrite_work_transition_terms,
+                work_transition_term_pristine,
+                script.to_work_transition_term_events
+            );
+            step!(
+                rewrite_work_module_inc_int,
+                work_module_inc_int_pristine,
+                script.to_work_module_inc_int_events
+            );
+            step!(
+                rewrite_work_module_sets,
+                work_module_set_pristine,
+                script.to_work_module_set_events
+            );
+        }
         let Some(buffer) = self.acmd_src_buffer.as_mut() else {
             return;
         };
@@ -5776,6 +5838,19 @@ impl VisionaryApp {
         let Some(mut index) = self.acmd_src.as_ref().cloned() else {
             return;
         };
+        // Fold one family's source sync into this pass's totals; an error becomes a note.
+        macro_rules! sync {
+            ($sync:ident($($arg:expr),+)) => {
+                match crate::acmd_src::$sync(&index, &fighter, &move_name, $($arg),+) {
+                    Ok(report) => {
+                        changed += report.changed;
+                        files.extend(report.files);
+                        notes.extend(report.skipped);
+                    }
+                    Err(e) => notes.push(e.to_string()),
+                }
+            };
+        }
 
         // A previous sync may already have added an effect call or rewritten a hitbox in the
         // user's file. Re-read those two source lists for matching, but keep the editor's pristine
@@ -5813,20 +5888,7 @@ impl VisionaryApp {
         {
             ran = true;
             if let Some(edited_effects) = source_effects.as_deref() {
-                match crate::acmd_src::sync_effect_calls(
-                    &index,
-                    &fighter,
-                    &move_name,
-                    &source_effects_pristine,
-                    edited_effects,
-                ) {
-                    Ok(report) => {
-                        changed += report.changed;
-                        files.extend(report.files);
-                        notes.extend(report.skipped);
-                    }
-                    Err(e) => notes.push(e.to_string()),
-                }
+                sync!(sync_effect_calls(&source_effects_pristine, edited_effects));
             }
             // An effect value can change the byte length of its function. Re-index before
             // the game passes, or a stale span truncates the game body when both live in
@@ -5840,429 +5902,172 @@ impl VisionaryApp {
             .is_some()
         {
             ran = true;
-            match crate::acmd_src::sync_hitboxes(
-                &index,
-                &fighter,
-                &move_name,
+            sync!(sync_hitboxes(
                 &source_hitboxes_pristine,
-                &self.state.hitboxes,
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                &self.state.hitboxes
+            ));
             // A value replacement can change the byte length of the function. Re-index before
             // the next family pass, or its stale function span can truncate the source body and
             // make a later family (especially structural REVERSE_LR) target the wrong bytes.
             refresh_acmd_index(&mut index, &mut notes);
             // Hurtboxes live in the same `game_` function as the hitboxes, but are matched by
             // their own sites and retuned through their own slots, so they get their own pass.
-            match crate::acmd_src::sync_hurtboxes(
-                &index,
-                &fighter,
-                &move_name,
+            sync!(sync_hurtboxes(
                 &self.state.hurtboxes_pristine,
-                &self.state.script.to_hurtboxes(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                &self.state.script.to_hurtboxes()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_hurtbox_conditions(
-                &index,
-                &fighter,
-                &move_name,
+            sync!(sync_hurtbox_conditions(
                 &self.state.hurtbox_conditions_pristine,
-                &self.state.script.to_hurtbox_conditions(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                &self.state.script.to_hurtbox_conditions()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
             // And post-hoc modifiers get a third pass, for the same reason again: they share the
             // function but are counted in their own numbering space and written through their
             // own slots.
-            match crate::acmd_src::sync_attack_mods(
-                &index,
-                &fighter,
-                &move_name,
+            sync!(sync_attack_mods(
                 &self.state.attack_mods_pristine,
-                &self.state.script.to_attack_mods(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                &self.state.script.to_attack_mods()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
             // And a fourth for the playback rate. It takes no pristine list: the value in the
             // user's file is its own baseline, because a rate edit can only change an argument —
             // it cannot renumber a call, retime one, or turn it into a different macro.
-            match crate::acmd_src::sync_motion_rates(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.script.motion_rate_sites(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_motion_rates(&self.state.script.motion_rate_sites()));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_reverse_lr(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.reverse_lr_pristine,
-                &self.state.script.to_reverse_lr_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_reverse_lr(
+                &self.state.point_originals.reverse_lr_pristine,
+                &self.state.script.to_reverse_lr_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_speed_ex(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.speed_ex_pristine,
-                &self.state.script.to_speed_ex_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_speed_ex(
+                &self.state.point_originals.speed_ex_pristine,
+                &self.state.script.to_speed_ex_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_speed(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.speed_pristine,
-                &self.state.script.to_speed_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_speed(
+                &self.state.point_originals.speed_pristine,
+                &self.state.script.to_speed_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_add_speed_no_limit(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.add_speed_no_limit_pristine,
-                &self.state.script.to_add_speed_no_limit_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_add_speed_no_limit(
+                &self.state.point_originals.add_speed_no_limit_pristine,
+                &self.state.script.to_add_speed_no_limit_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_correct(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.correct_pristine,
-                &self.state.script.to_correct_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_correct(
+                &self.state.point_originals.correct_pristine,
+                &self.state.script.to_correct_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_ft_catch_stop(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.ft_catch_stop_pristine,
-                &self.state.script.to_ft_catch_stop_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_ft_catch_stop(
+                &self.state.point_originals.ft_catch_stop_pristine,
+                &self.state.script.to_ft_catch_stop_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_ft_start_adjust_motion_frame(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.ft_start_adjust_motion_frame_pristine,
-                &self.state.script.to_ft_start_adjust_motion_frame_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_ft_start_adjust_motion_frame(
+                &self
+                    .state
+                    .point_originals
+                    .ft_start_adjust_motion_frame_pristine,
+                &self.state.script.to_ft_start_adjust_motion_frame_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_motion_module_set_rate(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.motion_module_set_rate_pristine,
-                &self.state.script.to_motion_module_set_rate_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_motion_module_set_rate(
+                &self.state.point_originals.motion_module_set_rate_pristine,
+                &self.state.script.to_motion_module_set_rate_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_motion_module_set_helper_calculation(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.motion_module_set_helper_calculation_pristine,
+            sync!(sync_motion_module_set_helper_calculation(
+                &self
+                    .state
+                    .point_originals
+                    .motion_module_set_helper_calculation_pristine,
                 &self
                     .state
                     .script
-                    .to_motion_module_set_helper_calculation_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                    .to_motion_module_set_helper_calculation_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_motion_module_set_rate_partial(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.motion_module_set_rate_partial_pristine,
-                &self.state.script.to_motion_module_set_rate_partial_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_motion_module_set_rate_partial(
+                &self
+                    .state
+                    .point_originals
+                    .motion_module_set_rate_partial_pristine,
+                &self.state.script.to_motion_module_set_rate_partial_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_motion_module_set_frame_partial(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.motion_module_set_frame_partial_pristine,
+            sync!(sync_motion_module_set_frame_partial(
+                &self
+                    .state
+                    .point_originals
+                    .motion_module_set_frame_partial_pristine,
                 &self
                     .state
                     .script
-                    .to_motion_module_set_frame_partial_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                    .to_motion_module_set_frame_partial_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_clr_speed(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.clr_speed_pristine,
-                &self.state.script.to_clr_speed_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_clr_speed(
+                &self.state.point_originals.clr_speed_pristine,
+                &self.state.script.to_clr_speed_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_set_air(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.set_air_pristine,
-                &self.state.script.to_set_air_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_set_air(
+                &self.state.point_originals.set_air_pristine,
+                &self.state.script.to_set_air_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_change_kinetic(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.change_kinetic_pristine,
-                &self.state.script.to_change_kinetic_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_change_kinetic(
+                &self.state.point_originals.change_kinetic_pristine,
+                &self.state.script.to_change_kinetic_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_kinetic_energy(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.kinetic_energy_pristine,
-                &self.state.script.to_kinetic_energy_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_kinetic_energy(
+                &self.state.point_originals.kinetic_energy_pristine,
+                &self.state.script.to_kinetic_energy_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_kinetic_add_speed(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.kinetic_add_speed_pristine,
-                &self.state.script.to_kinetic_add_speed_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_kinetic_add_speed(
+                &self.state.point_originals.kinetic_add_speed_pristine,
+                &self.state.script.to_kinetic_add_speed_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_work_flags(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.work_flag_pristine,
-                &self.state.script.to_work_flag_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_work_flags(
+                &self.state.point_originals.work_flag_pristine,
+                &self.state.script.to_work_flag_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_work_transition_terms(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.work_transition_term_pristine,
-                &self.state.script.to_work_transition_term_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_work_transition_terms(
+                &self.state.point_originals.work_transition_term_pristine,
+                &self.state.script.to_work_transition_term_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_work_module_inc_int(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.work_module_inc_int_pristine,
-                &self.state.script.to_work_module_inc_int_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_work_module_inc_int(
+                &self.state.point_originals.work_module_inc_int_pristine,
+                &self.state.script.to_work_module_inc_int_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_work_module_sets(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.work_module_set_pristine,
-                &self.state.script.to_work_module_set_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_work_module_sets(
+                &self.state.point_originals.work_module_set_pristine,
+                &self.state.script.to_work_module_set_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_kinetic_clear_speed_all(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.kinetic_clear_speed_all_pristine,
-                &self.state.script.to_kinetic_clear_speed_all_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+            sync!(sync_kinetic_clear_speed_all(
+                &self.state.point_originals.kinetic_clear_speed_all_pristine,
+                &self.state.script.to_kinetic_clear_speed_all_events()
+            ));
             refresh_acmd_index(&mut index, &mut notes);
-            match crate::acmd_src::sync_kinetic_set_consider_ground_friction(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.kinetic_set_consider_ground_friction_pristine,
+            sync!(sync_kinetic_set_consider_ground_friction(
+                &self
+                    .state
+                    .point_originals
+                    .kinetic_set_consider_ground_friction_pristine,
                 &self
                     .state
                     .script
-                    .to_kinetic_set_consider_ground_friction_events(),
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
-                }
-                Err(e) => notes.push(e.to_string()),
-            }
+                    .to_kinetic_set_consider_ground_friction_events()
+            ));
             // The last game pass above has no later game family to protect, but sound
             // and expression live in their own functions that can share the file. Without
             // this, a game write that changes the byte length leaves their spans stale
@@ -6283,20 +6088,7 @@ impl VisionaryApp {
         {
             ran = true;
             if self.state.sounds != self.state.sounds_pristine {
-                match crate::acmd_src::sync_sounds(
-                    &index,
-                    &fighter,
-                    &move_name,
-                    &self.state.sounds_pristine,
-                    &self.state.sounds,
-                ) {
-                    Ok(report) => {
-                        changed += report.changed;
-                        files.extend(report.files);
-                        notes.extend(report.skipped);
-                    }
-                    Err(e) => notes.push(e.to_string()),
-                }
+                sync!(sync_sounds(&self.state.sounds_pristine, &self.state.sounds));
                 refresh_acmd_index(&mut index, &mut notes);
             }
         }
@@ -6309,20 +6101,10 @@ impl VisionaryApp {
         {
             ran = true;
             if self.state.expressions != self.state.expressions_pristine {
-                match crate::acmd_src::sync_expressions(
-                    &index,
-                    &fighter,
-                    &move_name,
+                sync!(sync_expressions(
                     &self.state.expressions_pristine,
-                    &self.state.expressions,
-                ) {
-                    Ok(report) => {
-                        changed += report.changed;
-                        files.extend(report.files);
-                        notes.extend(report.skipped);
-                    }
-                    Err(e) => notes.push(e.to_string()),
-                }
+                    &self.state.expressions
+                ));
                 refresh_acmd_index(&mut index, &mut notes);
             }
             if self
@@ -6333,25 +6115,15 @@ impl VisionaryApp {
                     .state
                     .expression_motion_module_set_rate_partial_pristine
             {
-                match crate::acmd_src::sync_expression_motion_module_set_rate_partial(
-                    &index,
-                    &fighter,
-                    &move_name,
+                sync!(sync_expression_motion_module_set_rate_partial(
                     &self
                         .state
                         .expression_motion_module_set_rate_partial_pristine,
                     &self
                         .state
                         .expression_script
-                        .to_motion_module_set_rate_partial_events(),
-                ) {
-                    Ok(report) => {
-                        changed += report.changed;
-                        files.extend(report.files);
-                        notes.extend(report.skipped);
-                    }
-                    Err(e) => notes.push(e.to_string()),
-                }
+                        .to_motion_module_set_rate_partial_events()
+                ));
             }
             if self
                 .state
@@ -6362,25 +6134,15 @@ impl VisionaryApp {
                     .expression_motion_module_set_frame_partial_pristine
             {
                 refresh_acmd_index(&mut index, &mut notes);
-                match crate::acmd_src::sync_expression_motion_module_set_frame_partial(
-                    &index,
-                    &fighter,
-                    &move_name,
+                sync!(sync_expression_motion_module_set_frame_partial(
                     &self
                         .state
                         .expression_motion_module_set_frame_partial_pristine,
                     &self
                         .state
                         .expression_script
-                        .to_motion_module_set_frame_partial_events(),
-                ) {
-                    Ok(report) => {
-                        changed += report.changed;
-                        files.extend(report.files);
-                        notes.extend(report.skipped);
-                    }
-                    Err(e) => notes.push(e.to_string()),
-                }
+                        .to_motion_module_set_frame_partial_events()
+                ));
             }
         }
 
@@ -6421,39 +6183,7 @@ impl VisionaryApp {
             || state.script.to_hurtboxes() != state.hurtboxes_pristine
             || state.script.to_hurtbox_conditions() != state.hurtbox_conditions_pristine
             || state.script.to_attack_mods() != state.attack_mods_pristine
-            || state.script.to_reverse_lr_events() != state.reverse_lr_pristine
-            || state.script.to_speed_ex_events() != state.speed_ex_pristine
-            || state.script.to_speed_events() != state.speed_pristine
-            || state.script.to_add_speed_no_limit_events() != state.add_speed_no_limit_pristine
-            || state.script.to_correct_events() != state.correct_pristine
-            || state.script.to_ft_catch_stop_events() != state.ft_catch_stop_pristine
-            || state.script.to_ft_start_adjust_motion_frame_events()
-                != state.ft_start_adjust_motion_frame_pristine
-            || state.script.to_motion_module_set_rate_events()
-                != state.motion_module_set_rate_pristine
-            || state
-                .script
-                .to_motion_module_set_helper_calculation_events()
-                != state.motion_module_set_helper_calculation_pristine
-            || state.script.to_motion_module_set_rate_partial_events()
-                != state.motion_module_set_rate_partial_pristine
-            || state.script.to_motion_module_set_frame_partial_events()
-                != state.motion_module_set_frame_partial_pristine
-            || state.script.to_clr_speed_events() != state.clr_speed_pristine
-            || state.script.to_set_air_events() != state.set_air_pristine
-            || state.script.to_change_kinetic_events() != state.change_kinetic_pristine
-            || state.script.to_kinetic_energy_events() != state.kinetic_energy_pristine
-            || state.script.to_kinetic_add_speed_events() != state.kinetic_add_speed_pristine
-            || state.script.to_work_flag_events() != state.work_flag_pristine
-            || state.script.to_work_transition_term_events() != state.work_transition_term_pristine
-            || state.script.to_work_module_inc_int_events() != state.work_module_inc_int_pristine
-            || state.script.to_work_module_set_events() != state.work_module_set_pristine
-            || state.script.to_kinetic_clear_speed_all_events()
-                != state.kinetic_clear_speed_all_pristine
-            || state
-                .script
-                .to_kinetic_set_consider_ground_friction_events()
-                != state.kinetic_set_consider_ground_friction_pristine
+            || state.point_events_edited()
         {
             edited.push("game_");
         }
@@ -6716,6 +6446,14 @@ impl VisionaryApp {
                 let sound_script = crate::acmd::parse_sound_script(&body);
                 let expression_script = crate::acmd::parse_expression_script(&body);
 
+                let preview_error = source_preview_budget_error(
+                    fighter_name,
+                    move_name,
+                    &script,
+                    &effect_script,
+                    &sound_script,
+                    &expression_script,
+                );
                 let mut hitboxes = script.to_hitboxes();
                 // A move with effects but no hitboxes is a real script, not a failed load.
                 // Throwing its effects away used to make a linked source project that only
@@ -6729,6 +6467,9 @@ impl VisionaryApp {
                     || !effect_script.stmts.is_empty()
                     || !sound_script.stmts.is_empty()
                     || !expression_script.stmts.is_empty();
+                self.acmd_error =
+                    missing_acmd_content_error(fighter_name, move_name, has_any_source_category)
+                        .or(preview_error);
                 self.state.sound_script = sound_script;
                 self.state.loaded_body = body.clone();
                 self.apply_saved_sound_edits_to_current();
@@ -6745,23 +6486,10 @@ impl VisionaryApp {
                     && script.stmts.is_empty()
                     && !has_any_source_category
                 {
-                    self.acmd_error = Some(format!(
-                        "No hitboxes found for {}/{}",
-                        fighter_name, move_name
-                    ));
                     self.state.effect_script = crate::data::EffectScript::default();
                     self.record_dropped_effect_lines();
                     self.state.effects = Vec::new();
                 } else {
-                    if effects_only {
-                        self.acmd_error = Some(format!(
-                            "{fighter_name}/{move_name} has effect spawns but no hitboxes"
-                        ));
-                    } else if hitboxes.is_empty() {
-                        self.acmd_error = Some(format!(
-                            "{fighter_name}/{move_name} has no attack hitboxes; non-collision ACMD is still loaded"
-                        ));
-                    }
                     self.normalize_hitbox_bones(&mut hitboxes);
                     self.state.hitboxes_pristine = hitboxes.clone();
                     self.state.acmd_source = source_label.into();
@@ -6844,6 +6572,17 @@ impl VisionaryApp {
                                 &self.state.script.to_work_module_set_events(),
                             ));
 
+                    self.acmd_error = source_preview_budget_error(
+                        fighter_name,
+                        move_name,
+                        &self.state.script,
+                        &self.state.effect_script,
+                        &self.state.sound_script,
+                        &self.state.expression_script,
+                    )
+                    .or_else(|| {
+                        missing_acmd_content_error(fighter_name, move_name, has_any_source_category)
+                    });
                     self.jump_to_earliest_active_frame();
                 }
             }
@@ -6879,26 +6618,7 @@ impl VisionaryApp {
                     .expression_motion_module_set_rate_partial_pristine = Vec::new();
                 self.state
                     .expression_motion_module_set_frame_partial_pristine = Vec::new();
-                self.state.speed_ex_pristine = Vec::new();
-                self.state.speed_pristine = Vec::new();
-                self.state.add_speed_no_limit_pristine = Vec::new();
-                self.state.correct_pristine = Vec::new();
-                self.state.ft_catch_stop_pristine = Vec::new();
-                self.state.ft_start_adjust_motion_frame_pristine = Vec::new();
-                self.state.motion_module_set_rate_pristine = Vec::new();
-                self.state.motion_module_set_rate_partial_pristine = Vec::new();
-                self.state.motion_module_set_frame_partial_pristine = Vec::new();
-                self.state.clr_speed_pristine = Vec::new();
-                self.state.set_air_pristine = Vec::new();
-                self.state.change_kinetic_pristine = Vec::new();
-                self.state.kinetic_energy_pristine = Vec::new();
-                self.state.kinetic_add_speed_pristine = Vec::new();
-                self.state.work_flag_pristine = Vec::new();
-                self.state.work_transition_term_pristine = Vec::new();
-                self.state.work_module_inc_int_pristine = Vec::new();
-                self.state.work_module_set_pristine = Vec::new();
-                self.state.kinetic_clear_speed_all_pristine = Vec::new();
-                self.state.kinetic_set_consider_ground_friction_pristine = Vec::new();
+                self.state.clear_point_originals();
                 self.state.loaded_body = String::new();
             }
         }
@@ -7134,7 +6854,7 @@ impl VisionaryApp {
                             .color(egui::Color32::GRAY),
                     );
                     if ui
-                        .small_button("Link Source Project…")
+                        .small_button("Link Source Project")
                         .on_hover_text(
                             "Point at the root of the Rust project that builds your ACMD \
                                  plugin — the folder holding Cargo.toml",
@@ -7493,6 +7213,20 @@ impl VisionaryApp {
         // silently omits one kind makes those edits impossible to find or undo.
         for (fighter, params) in &self.roster.params {
             if !params.is_empty() {
+                fighters
+                    .entry(fighter.clone())
+                    .or_insert_with(|| crate::data::fighter_display_name(fighter));
+            }
+        }
+        for (fighter, behavior) in &self.roster.behaviors {
+            if !behavior.is_empty() {
+                fighters
+                    .entry(fighter.clone())
+                    .or_insert_with(|| crate::data::fighter_display_name(fighter));
+            }
+        }
+        for (fighter, meters) in &self.roster.meters {
+            if !meters.is_empty() {
                 fighters
                     .entry(fighter.clone())
                     .or_insert_with(|| crate::data::fighter_display_name(fighter));
@@ -8105,12 +7839,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
+            let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
             self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
         }
@@ -8130,12 +7859,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self
-                .hitbox_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
+            let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
             self.state.status = format!("Restored all {f} hitboxes to their source data.");
         }
@@ -8259,6 +7983,10 @@ impl VisionaryApp {
     /// Snapshot the current hitboxes/script into the edit log for the active fighter+move —
     /// but only when they actually DIFFER from the pristine load (the log is an edit tree,
     /// not a browsing history).
+    fn current_point_events_edited(state: &AppState) -> bool {
+        state.point_events_edited()
+    }
+
     fn commit_current_edits(&mut self) {
         let fighter = match self
             .state
@@ -8285,48 +8013,7 @@ impl VisionaryApp {
         let hurtbox_states_edited = self.state.script.to_hurtboxes()
             != self.state.hurtboxes_pristine
             || self.state.script.to_hurtbox_conditions() != self.state.hurtbox_conditions_pristine;
-        let script_points_edited = self.state.script.to_reverse_lr_events()
-            != self.state.reverse_lr_pristine
-            || self.state.script.to_speed_ex_events() != self.state.speed_ex_pristine
-            || self.state.script.to_speed_events() != self.state.speed_pristine
-            || self.state.script.to_add_speed_no_limit_events()
-                != self.state.add_speed_no_limit_pristine
-            || self.state.script.to_correct_events() != self.state.correct_pristine
-            || self.state.script.to_ft_catch_stop_events() != self.state.ft_catch_stop_pristine
-            || self.state.script.to_ft_start_adjust_motion_frame_events()
-                != self.state.ft_start_adjust_motion_frame_pristine
-            || self.state.script.to_motion_module_set_rate_events()
-                != self.state.motion_module_set_rate_pristine
-            || self
-                .state
-                .script
-                .to_motion_module_set_helper_calculation_events()
-                != self.state.motion_module_set_helper_calculation_pristine
-            || self.state.script.to_motion_module_set_rate_partial_events()
-                != self.state.motion_module_set_rate_partial_pristine
-            || self
-                .state
-                .script
-                .to_motion_module_set_frame_partial_events()
-                != self.state.motion_module_set_frame_partial_pristine
-            || self.state.script.to_clr_speed_events() != self.state.clr_speed_pristine
-            || self.state.script.to_set_air_events() != self.state.set_air_pristine
-            || self.state.script.to_change_kinetic_events() != self.state.change_kinetic_pristine
-            || self.state.script.to_kinetic_add_speed_events()
-                != self.state.kinetic_add_speed_pristine
-            || self.state.script.to_work_flag_events() != self.state.work_flag_pristine
-            || self.state.script.to_work_transition_term_events()
-                != self.state.work_transition_term_pristine
-            || self.state.script.to_work_module_inc_int_events()
-                != self.state.work_module_inc_int_pristine
-            || self.state.script.to_work_module_set_events() != self.state.work_module_set_pristine
-            || self.state.script.to_kinetic_clear_speed_all_events()
-                != self.state.kinetic_clear_speed_all_pristine
-            || self
-                .state
-                .script
-                .to_kinetic_set_consider_ground_friction_events()
-                != self.state.kinetic_set_consider_ground_friction_pristine;
+        let script_points_edited = Self::current_point_events_edited(&self.state);
         if self.state.hitboxes == self.state.hitboxes_pristine
             && !hurtbox_states_edited
             && !script_points_edited
@@ -8336,11 +8023,7 @@ impl VisionaryApp {
         }
         // Capture-sourced moves have no base script text — synthesize one from the hitboxes
         // so the export path works the same as for GitHub-fetched scripts.
-        let script = if self.state.script.stmts.is_empty() {
-            synthesize_script_from_hitboxes(&self.state.hitboxes)
-        } else {
-            rebuild_script_from_hitboxes(&self.state.script, &self.state.hitboxes)
-        };
+        let script = game_script_for_edits(&self.state.script, &self.state.hitboxes);
         // When the Roster window has a character you added set as the edit target, this move
         // belongs to that costume rather than to the fighter as a whole. The export then gates
         // it, so the donor's other costumes keep their own version of the move. A multi-skin
@@ -8398,7 +8081,7 @@ impl VisionaryApp {
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
             if ui
-                .button("Open Data Root…")
+                .button("Open Data Root")
                 .on_hover_text("Choose the folder containing extracted fighter files")
                 .clicked()
             {
@@ -8626,7 +8309,8 @@ impl VisionaryApp {
                             } else {
                                 format_move_name(&m.name)
                             };
-                            let item_response = ui.selectable_label(selected, &label);
+                            let item_response =
+                                ui.selectable_label(selected, &label).on_hover_text(&m.name);
                             if center_selected_move && selected {
                                 item_response.scroll_to_me(Some(egui::Align::Center));
                             }
@@ -8656,6 +8340,1100 @@ impl VisionaryApp {
             });
     }
 
+    /// The 3D character preview with its hitbox overlays, shared by both editor layouts.
+    fn draw_viewport(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        let rect = ui.available_rect_before_wrap();
+
+        if self.current_model_dir.is_some() {
+            let w = rect.width();
+            let h = rect.height();
+
+            // Allocate the full rect as interactive so we can capture mouse input
+            let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+            // Camera controls — apply to render state
+            if let Some(wgpu_state) = frame.wgpu_render_state() {
+                let mut renderer = wgpu_state.renderer.write();
+                if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                    // Left drag: pan in camera plane (left/right + up/down)
+                    if response.dragged_by(egui::PointerButton::Primary) {
+                        let delta = response.drag_delta();
+                        rs.camera.pan(delta.x, delta.y);
+                        ctx.request_repaint();
+                    }
+                    // Middle drag or right drag: pan (disabled for now)
+                    // Scroll: zoom
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 && response.hovered() {
+                        rs.camera.zoom(scroll * 0.05);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+
+            // Paint the animated character. Circle overlays are drawn below by egui.
+            let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
+            let callback = egui_wgpu::Callback::new_paint_callback(
+                rect,
+                ViewportCallback {
+                    width: w,
+                    height: h,
+                    animation_frame,
+                    anim_path: self.current_anim_path.clone(),
+                    default_anim_path: self.current_default_eyelid_path.clone(),
+                    skel_path: self.current_skel_path.clone(),
+                },
+            );
+            ui.painter().add(callback);
+
+            // Draw hitbox spheres as projected 2D circles
+            let frame_num = self.state.current_frame;
+            if let Some(wgpu_state) = frame.wgpu_render_state() {
+                let renderer = wgpu_state.renderer.read();
+                if let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() {
+                    // The WGPU model callback runs after egui builds these overlays, so
+                    // `last_frame` is one paint behind. Evaluate the requested frame
+                    // directly to keep moving bones/root motion and grabboxes synchronized.
+                    let t = self.perf.start();
+                    let bone_matrices = rs.bone_world_matrices_at(animation_frame);
+                    self.perf.end("bone_matrices", t);
+                    // Keep a positions map for debug display
+                    let bone_positions: std::collections::HashMap<String, glam::Vec3> =
+                        bone_matrices
+                            .iter()
+                            .map(|(k, m)| (k.clone(), m.col(3).truncate()))
+                            .collect();
+
+                    if self.show_debug {
+                        let mut names: Vec<&String> = bone_positions.keys().collect();
+                        names.sort();
+                        for (i, name) in names.iter().take(30).enumerate() {
+                            ui.painter().text(
+                                rect.left_top() + egui::vec2(4.0, 4.0 + i as f32 * 12.0),
+                                egui::Align2::LEFT_TOP,
+                                name.as_str(),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::YELLOW,
+                            );
+                        }
+                        for (i, hb) in self.state.hitboxes.iter().enumerate().take(5) {
+                            let found = bone_matrices.contains_key(&hb.bone_name)
+                                || bone_matrices.contains_key(&hb.bone_name.to_lowercase());
+                            ui.painter().text(
+                                rect.right_top() + egui::vec2(-220.0, 4.0 + i as f32 * 12.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("{:?} found:{}", hb.bone_name, found),
+                                egui::FontId::monospace(9.0),
+                                egui::Color32::LIGHT_BLUE,
+                            );
+                        }
+                        for (name, pos) in &bone_positions {
+                            if let Some(sp) = rs.world_to_screen(*pos, rect) {
+                                ui.painter().circle_filled(
+                                    sp,
+                                    3.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 255, 0, 150),
+                                );
+                                ui.painter().text(
+                                    sp + egui::vec2(4.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    name,
+                                    egui::FontId::monospace(8.0),
+                                    egui::Color32::from_rgb(0, 220, 0),
+                                );
+                            }
+                        }
+                    }
+
+                    // Parameter-defined hurtboxes sit underneath editable collision geometry,
+                    // so attacks, grabs, wind areas, and effect markers remain easy to select.
+                    if self.show_hurtboxes
+                        && self.hurtbox_volumes.iter().any(|volume| {
+                            matches!(volume.shape, crate::data::HurtboxShape::Capsule)
+                        })
+                    {
+                        let events = self.state.script.to_hurtbox_events();
+                        let condition_events = self.state.script.to_hurtbox_condition_events();
+                        let condition =
+                            crate::data::effective_hurtbox_condition(&condition_events, frame_num);
+                        for (volume_index, status) in hurtbox_render_descriptors(
+                            &self.hurtbox_volumes,
+                            &events,
+                            frame_num,
+                            true,
+                        ) {
+                            let volume = &self.hurtbox_volumes[volume_index];
+                            let (stroke_color, fill) = hurtbox_palette(status);
+                            let Some(bone_mat) = bone_matrices
+                                .get(&volume.bone_name)
+                                .or_else(|| {
+                                    bone_matrices.get(&volume.bone_name.to_ascii_lowercase())
+                                })
+                                .copied()
+                            else {
+                                // The loader already counted unresolved parameter bones; a
+                                // second guard keeps a partial renderer map from drawing at
+                                // identity if a model changes underneath the session.
+                                continue;
+                            };
+                            let [world_start, world_end] =
+                                hurtbox_world_endpoints(volume, bone_mat);
+                            let world_radius = hurtbox_world_radius(volume, bone_mat);
+                            let selected = self.selected_hurtbox == Some(volume_index);
+                            if selected {
+                                let _ = draw_projected_capsule(
+                                    ui.painter(),
+                                    rs,
+                                    rect,
+                                    ProjectedCapsule {
+                                        world_start,
+                                        world_end: Some(world_end),
+                                        world_radius: world_radius + 0.04,
+                                        stroke: egui::Stroke::new(2.5, Color32::WHITE),
+                                        fill: Color32::TRANSPARENT,
+                                    },
+                                );
+                            }
+                            if let Some(condition_color) = hurtbox_condition_palette(&condition) {
+                                // Armor is a second, fighter-wide layer. Draw it first so
+                                // the status fill and its cyan/amber distinction remain
+                                // readable underneath the special-condition outline.
+                                let _ = draw_projected_capsule(
+                                    ui.painter(),
+                                    rs,
+                                    rect,
+                                    ProjectedCapsule {
+                                        world_start,
+                                        world_end: Some(world_end),
+                                        world_radius: world_radius + 0.015,
+                                        stroke: egui::Stroke::new(2.75, condition_color),
+                                        fill: Color32::TRANSPARENT,
+                                    },
+                                );
+                            }
+                            let _ = draw_projected_capsule(
+                                ui.painter(),
+                                rs,
+                                rect,
+                                ProjectedCapsule {
+                                    world_start,
+                                    world_end: Some(world_end),
+                                    world_radius,
+                                    stroke: egui::Stroke::new(1.25, stroke_color),
+                                    fill,
+                                },
+                            );
+                            if selected {
+                                if let Some(label_pos) =
+                                    rs.world_to_screen((world_start + world_end) * 0.5, rect)
+                                {
+                                    ui.painter().text(
+                                        label_pos + egui::vec2(5.0, -5.0),
+                                        egui::Align2::LEFT_BOTTOM,
+                                        format!("HIT_NO #{} · {}", volume.index, status.label()),
+                                        egui::FontId::monospace(10.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    for (hitbox_index, hb) in self.state.hitboxes.iter().enumerate() {
+                        // `ATTACK_ABS` has no volume and no bone to hang one on. Its size
+                        // and offsets are zero because the call has no such arguments, so
+                        // drawing it would put a dot at the model's origin that looks like
+                        // a hitbox the script does not have.
+                        if hb.category == crate::data::CAT_ABS
+                            || hb.category == crate::data::CAT_ATTACK_FP
+                        {
+                            continue;
+                        }
+                        let active = hb.active_frames_empty()
+                            || (frame_num >= hb.active_start && frame_num <= hb.active_end);
+                        if !active {
+                            continue;
+                        }
+
+                        let color = hitbox_display_color(hb);
+                        let selected = hitbox_is_selected(self.selected_hitbox, hitbox_index);
+                        let (stroke, fill) = hitbox_viewport_style(color, selected);
+
+                        // Wind areas are defined in the fighter's 2D object space. Render
+                        // their real circle/AABB footprint rather than reusing the 3D ATTACK
+                        // sphere placeholder.
+                        if let Some(wind) = hb
+                            .wind
+                            .as_ref()
+                            .filter(|wind| hb.category == 2 && wind.is_valid())
+                        {
+                            let root = bone_matrices
+                                .get("top")
+                                .or_else(|| bone_matrices.get("Top"))
+                                .copied()
+                                .unwrap_or(glam::Mat4::IDENTITY);
+                            let root = glam::Mat4::from_translation(root.col(3).truncate());
+                            let [x, y] = wind.offset();
+                            let center = wind_area_world_point(root, x, y);
+
+                            if wind.is_radial() {
+                                if let Some(screen_center) = rs.world_to_screen(center, rect) {
+                                    let screen_radius = rs
+                                        .world_radius_to_screen(center, wind.radius(), rect)
+                                        .unwrap_or(wind.radius() * 4.0)
+                                        .max(4.0);
+                                    ui.painter()
+                                        .circle(screen_center, screen_radius, fill, stroke);
+                                    ui.painter().line_segment(
+                                        [
+                                            screen_center - egui::vec2(screen_radius, 0.0),
+                                            screen_center + egui::vec2(screen_radius, 0.0),
+                                        ],
+                                        egui::Stroke::new(1.0, color.gamma_multiply(0.65)),
+                                    );
+                                    ui.painter().line_segment(
+                                        [
+                                            screen_center - egui::vec2(0.0, screen_radius),
+                                            screen_center + egui::vec2(0.0, screen_radius),
+                                        ],
+                                        egui::Stroke::new(1.0, color.gamma_multiply(0.65)),
+                                    );
+                                    ui.painter().text(
+                                        screen_center + egui::vec2(screen_radius + 3.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        format!("WIND #{} RAD", wind.id()),
+                                        egui::FontId::monospace(11.0),
+                                        color,
+                                    );
+                                }
+                            } else {
+                                let [width, height] = wind.dimensions();
+                                let half = glam::Vec2::new(width * 0.5, height * 0.5);
+                                let corners = [
+                                    glam::Vec2::new(-half.x, -half.y),
+                                    glam::Vec2::new(half.x, -half.y),
+                                    glam::Vec2::new(half.x, half.y),
+                                    glam::Vec2::new(-half.x, half.y),
+                                ];
+                                let screen_corners: Option<Vec<egui::Pos2>> = corners
+                                    .iter()
+                                    .map(|corner| {
+                                        let point =
+                                            wind_area_world_point(root, x + corner.x, y + corner.y);
+                                        rs.world_to_screen(point, rect)
+                                    })
+                                    .collect();
+                                if let Some(screen_corners) = screen_corners {
+                                    ui.painter().add(egui::Shape::convex_polygon(
+                                        screen_corners,
+                                        fill,
+                                        stroke,
+                                    ));
+                                }
+                                if let Some(screen_center) = rs.world_to_screen(center, rect) {
+                                    let angle = wind.args[2].to_radians();
+                                    let length = width.min(height).max(1.0) * 0.35;
+                                    let arrow_end = wind_area_world_point(
+                                        root,
+                                        x + angle.cos() * length,
+                                        y + angle.sin() * length,
+                                    );
+                                    if let Some(screen_end) = rs.world_to_screen(arrow_end, rect) {
+                                        ui.painter().arrow(
+                                            screen_center,
+                                            screen_end - screen_center,
+                                            stroke,
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        screen_center + egui::vec2(4.0, -4.0),
+                                        egui::Align2::LEFT_BOTTOM,
+                                        format!("WIND #{} RECT", wind.id()),
+                                        egui::FontId::monospace(11.0),
+                                        color,
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Get bone world matrix — offsets are in bone local space.
+                        // For system/root bones (top, Trans, Rot, throw) the offsets
+                        // are effectively in world space, so we only use translation.
+                        let bone_mat = bone_matrices
+                            .get(&hb.bone_name)
+                            .or_else(|| bone_matrices.get(&hb.bone_name.to_lowercase()))
+                            .copied()
+                            .unwrap_or(glam::Mat4::IDENTITY);
+
+                        let bone_mat = if is_system_bone(&hb.bone_name) {
+                            // Keep only the translation — offsets are world-space
+                            glam::Mat4::from_translation(bone_mat.col(3).truncate())
+                        } else {
+                            bone_mat
+                        };
+
+                        // Transform offset from bone local space to world space
+                        let offset = glam::Vec3::new(hb.offset_x, hb.offset_y, hb.offset_z);
+                        let world_pos = bone_mat.transform_point3(offset);
+
+                        let capsule_world_end = hb.capsule_end.map(|[ex, ey, ez]| {
+                            bone_mat.transform_point3(glam::Vec3::new(ex, ey, ez))
+                        });
+                        let launch_center = capsule_world_end
+                            .map(|world_end| (world_pos + world_end) * 0.5)
+                            .unwrap_or(world_pos);
+
+                        let label_pos = draw_projected_capsule(
+                            ui.painter(),
+                            rs,
+                            rect,
+                            ProjectedCapsule {
+                                world_start: world_pos,
+                                world_end: capsule_world_end,
+                                world_radius: hb.size,
+                                stroke,
+                                fill,
+                            },
+                        );
+                        if let Some(label_pos) = label_pos {
+                            let label_radius = rs
+                                .world_radius_to_screen(world_pos, hb.size, rect)
+                                .unwrap_or(hb.size * 4.0)
+                                .max(4.0);
+                            ui.painter().text(
+                                label_pos + egui::vec2(label_radius + 2.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                format!("#{} {:.0}", hb.id, hb.damage),
+                                egui::FontId::monospace(11.0),
+                                color,
+                            );
+                        }
+
+                        if hb.category == 0 {
+                            let (direction, _) = hitbox_launch_direction(hb.angle);
+                            let launch_end = launch_center + direction * hb.size;
+                            if let (Some(screen_center), Some(screen_end)) = (
+                                rs.world_to_screen(launch_center, rect),
+                                rs.world_to_screen(launch_end, rect),
+                            ) {
+                                ui.painter().line_segment(
+                                    [screen_center, screen_end],
+                                    egui::Stroke::new(2.0, lighten_hitbox_color(color)),
+                                );
+                            }
+                        }
+                    }
+
+                    // A viewport click should be able to enter the same inspector as a
+                    // timeline click.  The draw loop above deliberately stays paint-only;
+                    // this small second pass uses the same bone convention to hit-test the
+                    // visible center of each active collision without changing export data.
+                    let click_pos = viewport_pick_position(&response);
+                    let mut best_hitbox_pick: Option<(usize, f32)> = None;
+                    if let Some(cp) = click_pos {
+                        for (i, hb) in self.state.hitboxes.iter().enumerate() {
+                            if hb.category == crate::data::CAT_ABS
+                                || hb.category == crate::data::CAT_ATTACK_FP
+                            {
+                                continue;
+                            }
+                            let active = hb.active_frames_empty()
+                                || (frame_num >= hb.active_start && frame_num <= hb.active_end);
+                            if !active {
+                                continue;
+                            }
+                            let (world_pos, world_radius) = if let Some(wind) = hb
+                                .wind
+                                .as_ref()
+                                .filter(|wind| hb.category == 2 && wind.is_valid())
+                            {
+                                let root = bone_matrices
+                                    .get("top")
+                                    .or_else(|| bone_matrices.get("Top"))
+                                    .copied()
+                                    .unwrap_or(glam::Mat4::IDENTITY);
+                                let root = glam::Mat4::from_translation(root.col(3).truncate());
+                                let [x, y] = wind.offset();
+                                let center = wind_area_world_point(root, x, y);
+                                let radius = if wind.is_radial() {
+                                    wind.radius()
+                                } else {
+                                    let [width, height] = wind.dimensions();
+                                    (width * width + height * height).sqrt() * 0.5
+                                };
+                                (center, radius.max(1.0))
+                            } else {
+                                let Some(bone_mat) = bone_matrices
+                                    .get(&hb.bone_name)
+                                    .or_else(|| bone_matrices.get(&hb.bone_name.to_lowercase()))
+                                    .copied()
+                                else {
+                                    continue;
+                                };
+                                let bone_mat = if is_system_bone(&hb.bone_name) {
+                                    glam::Mat4::from_translation(bone_mat.col(3).truncate())
+                                } else {
+                                    bone_mat
+                                };
+                                let start = bone_mat.transform_point3(glam::Vec3::new(
+                                    hb.offset_x,
+                                    hb.offset_y,
+                                    hb.offset_z,
+                                ));
+                                let center = hb
+                                    .capsule_end
+                                    .map(|[x, y, z]| {
+                                        (start
+                                            + bone_mat.transform_point3(glam::Vec3::new(x, y, z)))
+                                            * 0.5
+                                    })
+                                    .unwrap_or(start);
+                                (center, hb.size.max(0.5))
+                            };
+                            let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
+                                continue;
+                            };
+                            let radius = rs
+                                .world_radius_to_screen(world_pos, world_radius, rect)
+                                .unwrap_or(world_radius * 4.0)
+                                .clamp(8.0, 140.0);
+                            let distance = cp.distance(screen_pos);
+                            if distance <= radius
+                                && best_hitbox_pick
+                                    .map(|(_, best)| distance < best)
+                                    .unwrap_or(true)
+                            {
+                                best_hitbox_pick = Some((i, distance));
+                            }
+                        }
+                    }
+
+                    // A hurtbox click is intentionally lower priority than effect and
+                    // editable collision picks, because those overlays are drawn above the
+                    // parameter geometry and must remain easy to select.
+                    let mut best_hurtbox_pick: Option<(usize, f32)> = None;
+                    if let Some(cp) = click_pos {
+                        if self.show_hurtboxes {
+                            let events = self.state.script.to_hurtbox_events();
+                            for (volume_index, _status) in hurtbox_render_descriptors(
+                                &self.hurtbox_volumes,
+                                &events,
+                                frame_num,
+                                true,
+                            ) {
+                                let volume = &self.hurtbox_volumes[volume_index];
+                                let Some(bone_mat) = bone_matrices
+                                    .get(&volume.bone_name)
+                                    .or_else(|| {
+                                        bone_matrices.get(&volume.bone_name.to_ascii_lowercase())
+                                    })
+                                    .copied()
+                                else {
+                                    continue;
+                                };
+                                let [start, end] = hurtbox_world_endpoints(volume, bone_mat);
+                                let center = (start + end) * 0.5;
+                                let Some(screen_pos) = rs.world_to_screen(center, rect) else {
+                                    continue;
+                                };
+                                let radius = rs
+                                    .world_radius_to_screen(
+                                        center,
+                                        hurtbox_world_radius(volume, bone_mat),
+                                        rect,
+                                    )
+                                    .unwrap_or(volume.radius * 4.0)
+                                    .clamp(8.0, 140.0);
+                                let distance = cp.distance(screen_pos);
+                                if distance <= radius
+                                    && best_hurtbox_pick
+                                        .map(|(_, best)| distance < best)
+                                        .unwrap_or(true)
+                                {
+                                    best_hurtbox_pick = Some((volume_index, distance));
+                                }
+                            }
+                        }
+                    }
+
+                    // Effect spawn markers: blue circles at bone position + script offset.
+                    let mut best_pick: Option<(usize, f32)> = None;
+                    for (i, ec) in self.state.effects.iter().enumerate() {
+                        if is_null_effect_sentinel(ec) {
+                            continue;
+                        }
+                        if ec.disabled {
+                            continue;
+                        }
+                        let active = frame_num >= ec.active_start && frame_num <= ec.active_end;
+                        if !active && self.state.selected_effect_call != Some(i) {
+                            continue;
+                        }
+                        // Same bone conventions as hitboxes; skip unresolvable bones
+                        // (FOOT_/LANDING_ synthetic targets have no skeleton match).
+                        let Some(bone_mat) = bone_matrices
+                            .get(&ec.bone_name)
+                            .or_else(|| bone_matrices.get(&ec.bone_name.to_lowercase()))
+                            .copied()
+                        else {
+                            continue;
+                        };
+                        let bone_mat = if is_system_bone(&ec.bone_name) {
+                            glam::Mat4::from_translation(bone_mat.col(3).truncate())
+                        } else {
+                            bone_mat
+                        };
+                        let world_pos = bone_mat.transform_point3(glam::Vec3::from(ec.offset));
+                        let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
+                            continue;
+                        };
+                        let radius = rs
+                            .world_radius_to_screen(world_pos, ec.scale.max(0.4), rect)
+                            .unwrap_or(ec.scale * 4.0)
+                            .clamp(5.0, 120.0);
+
+                        let selected = self.state.selected_effect_call == Some(i);
+                        let blue = if selected {
+                            egui::Color32::from_rgb(120, 190, 255)
+                        } else {
+                            egui::Color32::from_rgb(60, 130, 235)
+                        };
+                        let fill = egui::Color32::from_rgba_unmultiplied(
+                            blue.r(),
+                            blue.g(),
+                            blue.b(),
+                            if selected { 55 } else { 28 },
+                        );
+                        let stroke_w = if selected { 2.5 } else { 1.5 };
+                        ui.painter().circle(
+                            screen_pos,
+                            radius,
+                            fill,
+                            egui::Stroke::new(stroke_w, blue),
+                        );
+                        // Crosshair dot at the exact spawn point
+                        ui.painter().circle_filled(screen_pos, 2.0, blue);
+                        ui.painter().text(
+                            screen_pos + egui::vec2(radius + 3.0, -radius * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            &ec.effect_name,
+                            egui::FontId::monospace(9.0),
+                            blue,
+                        );
+
+                        if let Some(cp) = click_pos {
+                            let d = cp.distance(screen_pos);
+                            if d <= radius.max(12.0)
+                                && best_pick.map(|(_, bd)| d < bd).unwrap_or(true)
+                            {
+                                best_pick = Some((i, d));
+                            }
+                        }
+                    }
+                    if let Some((i, _)) = best_pick {
+                        self.state.selected_effect_call = Some(i);
+                        self.primary_tab = PrimaryEditorTab::Effects;
+                    } else if let Some((i, _)) = best_hitbox_pick {
+                        self.selected_hitbox = Some(i);
+                        self.state.selected_effect_call = None;
+                        self.primary_tab = PrimaryEditorTab::Collisions;
+                    } else if let Some((i, _)) = best_hurtbox_pick {
+                        self.selected_hurtbox = Some(i);
+                        self.selected_hitbox = None;
+                        self.state.selected_effect_call = None;
+                        self.primary_tab = PrimaryEditorTab::Hurtboxes;
+                    }
+                }
+            }
+        } else {
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Open a data root directory to begin").color(Color32::GRAY));
+            });
+        }
+    }
+
+    fn draw_node_workspace(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        let mut fighter_choice = self.state.selected_fighter;
+        let mut move_choice = None;
+        // Escape closes an open dropdown or menu first; only a bare Escape leaves the workspace.
+        let escape = !ui.ctx().text_edit_focused()
+            && !egui::Popup::is_any_open(ui.ctx())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        ui.horizontal(|ui| {
+            if ui.button("← Back").clicked() || escape {
+                self.node_workspace = false;
+            }
+            ui.separator();
+            egui::ComboBox::from_id_salt("workspace_character")
+                .width(160.0)
+                .selected_text(
+                    self.state
+                        .selected_fighter
+                        .and_then(|index| self.state.fighters.get(index))
+                        .map_or("Character", |fighter| fighter.display_name.as_str()),
+                )
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.workspace_fighter_search)
+                            .hint_text("Find character"),
+                    )
+                    .request_focus();
+                    let query = self.workspace_fighter_search.to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .max_height(440.0)
+                        .show(ui, |ui| {
+                            for (index, fighter) in self.state.fighters.iter().enumerate() {
+                                if fighter.display_name.to_lowercase().contains(&query)
+                                    && ui
+                                        .selectable_value(
+                                            &mut fighter_choice,
+                                            Some(index),
+                                            &fighter.display_name,
+                                        )
+                                        .clicked()
+                                {
+                                    self.workspace_fighter_search.clear();
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            egui::ComboBox::from_id_salt("workspace_move")
+                .width(220.0)
+                .selected_text(
+                    self.state
+                        .selected_move
+                        .as_ref()
+                        .map_or("Choose move…", |entry| entry.name.as_str()),
+                )
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.workspace_move_search)
+                            .hint_text("Find move…"),
+                    )
+                    .request_focus();
+                    let query = self.workspace_move_search.to_ascii_lowercase();
+                    // Names that start with the query come first; unnamed moves are bare
+                    // hashes and go last.
+                    let mut matches: Vec<_> = self
+                        .move_list
+                        .iter()
+                        .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
+                        .collect();
+                    matches.sort_by_key(|entry| {
+                        (
+                            entry.name.starts_with("0x"),
+                            !entry.name.to_ascii_lowercase().starts_with(&query),
+                        )
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .show(ui, |ui| {
+                            for entry in matches {
+                                if ui
+                                    .selectable_label(
+                                        self.state
+                                            .selected_move
+                                            .as_ref()
+                                            .is_some_and(|selected| selected.name == entry.name),
+                                        &entry.name,
+                                    )
+                                    .clicked()
+                                {
+                                    move_choice = Some(entry.clone());
+                                    self.workspace_move_search.clear();
+                                    ui.close();
+                                }
+                            }
+                        });
+                });
+            if ui
+                .small_button(if self.state.playing { "Pause" } else { "Play" })
+                .clicked()
+            {
+                self.state.playing = !self.state.playing;
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.state.current_frame)
+                    .range(1..=self.state.total_frames.max(1))
+                    .prefix("Frame "),
+            );
+            ui.toggle_value(&mut self.node_preview, "3D")
+                .on_hover_text("Show the character beside the graph");
+            ui.menu_button("Live values", |ui| self.draw_live_trigger_values(ui))
+                .response
+                .on_hover_text("Trigger variables the running game accepted for this character");
+            ui.menu_button("More", |ui| {
+                if ui.button("Open Gimmicks").clicked() {
+                    self.node_workspace = false;
+                    self.primary_tab = PrimaryEditorTab::Gimmicks;
+                    ui.close();
+                }
+                if ui.button("Save project  Ctrl+S").clicked() {
+                    self.save_project_silent();
+                    ui.close();
+                }
+            });
+            ui.separator();
+            let rest = egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            );
+            self.node_editor.set_toolbar_rect(rest);
+        });
+        if fighter_choice != self.state.selected_fighter {
+            if let Some(index) = fighter_choice {
+                self.select_fighter(index);
+            }
+        }
+        if let Some(entry) = move_choice {
+            self.select_move(entry);
+        }
+        if self.state.selected_move.is_none() && !self.move_list.is_empty() {
+            let entry = self
+                .move_list
+                .iter()
+                .find(|entry| entry.name == "attack_11")
+                .unwrap_or(&self.move_list[0])
+                .clone();
+            self.select_move(entry);
+        }
+        ui.separator();
+        if self.node_preview {
+            egui::Panel::right("node_workspace_preview")
+                .default_size(340.0)
+                .min_size(160.0)
+                .resizable(true)
+                .show_inside(ui, |ui| self.draw_viewport(ui, frame));
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| self.draw_move_nodes(ui));
+    }
+
+    fn draw_live_trigger_values(&self, ui: &mut Ui) {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+        else {
+            return;
+        };
+        let Some(snapshot) = self.game_link.gimmick_live_snapshot() else {
+            ui.weak("Connect a compatible game plugin to see accepted trigger values.");
+            return;
+        };
+        let definitions = move_node_live_definitions(
+            &self
+                .roster
+                .behaviors
+                .get(&fighter.name)
+                .cloned()
+                .unwrap_or_default(),
+            &self
+                .move_graphs
+                .get(&fighter.name)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let mut found = false;
+        for row in snapshot.behavior.iter().filter(|row| {
+            row.get("fighter").and_then(serde_json::Value::as_str) == Some(fighter.name.as_str())
+                && row
+                    .get("chart_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|id| id == "main")
+        }) {
+            found = true;
+            let player = row
+                .get("entry_id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                + 1;
+            if let Some(values) = row.get("vars").and_then(serde_json::Value::as_object) {
+                ui.label(format!("Player {player}"));
+                for (name, value) in values
+                    .iter()
+                    .filter(|(name, _)| definitions.contains_key(name.as_str()))
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        let (label, kind) = &definitions[name];
+                        ui.label(label).on_hover_text(name);
+                        let timer = *kind == crate::gimmicks::behavior::VarType::Timer;
+                        ui.monospace(move_node_live_value(value, timer));
+                    });
+                }
+            }
+        }
+        if !found {
+            ui.weak("Waiting for this character's accepted live program and fighter.");
+        }
+    }
+
+    fn draw_move_nodes(&mut self, ui: &mut Ui) {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        else {
+            ui.weak("Choose a character in the bar above to edit its moves and controllers.");
+            return;
+        };
+        let Some(move_entry) = self.state.selected_move.clone() else {
+            ui.weak("Select a move to author nodes.");
+            return;
+        };
+        if self.fetching_acmd {
+            ui.weak("Loading move scripts…");
+            return;
+        }
+        let base = self
+            .roster
+            .behaviors
+            .get(&fighter.name)
+            .cloned()
+            .unwrap_or_default();
+        let siblings = self
+            .move_graphs
+            .get(&fighter.name)
+            .cloned()
+            .unwrap_or_default();
+        self.restore_node_effects_to_current();
+        let key = Self::move_key(&fighter.name, &move_entry.name);
+        let current_effects = if !self.node_effect_scripts.contains_key(&key)
+            && (self.state.effect_call_full.contains_key(&key)
+                || self.state.effect_call_edits.contains_key(&key))
+        {
+            crate::acmd::parse_effect_script(&crate::acmd::preview_effect_fn(
+                &self.state.effects,
+                &move_entry.name,
+                &[],
+                &self
+                    .state
+                    .effect_frame_residue
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default(),
+            ))
+        } else {
+            self.state.effect_script.clone()
+        };
+        self.node_editor.set_joint_options(&self.bone_names);
+        let controller_charts = self
+            .roster
+            .controller_charts
+            .get(&fighter.name)
+            .cloned()
+            .unwrap_or_default();
+        self.node_editor
+            .set_controller_charts(&fighter.name, &base, &controller_charts);
+        self.node_editor
+            .set_playhead(self.state.current_frame as f32, self.state.playing);
+        self.node_editor.set_source_script(
+            &fighter.name,
+            &move_entry.name,
+            &self.state.source_script,
+            &self.state.expression_script,
+        );
+        let graph = self.node_editor.workspace_ui(
+            ui,
+            &fighter.name,
+            &move_entry.name,
+            siblings.get(&move_entry.name),
+            [
+                &self.state.script,
+                &self.state.sound_script,
+                &self.state.expression_script,
+            ],
+            &current_effects,
+            &base,
+            &siblings,
+            &self
+                .roster
+                .behavior_layouts
+                .get(&fighter.name)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        if let Some(frame) = self.node_editor.take_scrub() {
+            self.state.current_frame =
+                (frame.round() as u32).clamp(1, self.state.total_frames.max(1));
+            self.state.playing = false;
+        }
+        let Some(graph) = graph else { return };
+        let character = self.node_editor.applied_character();
+        let base = character.as_ref().map_or(&base, |(main, _, _)| main);
+        let controller_charts = character
+            .as_ref()
+            .map_or(&controller_charts, |(_, charts, _)| charts);
+        let mut candidate_recipes = siblings.clone();
+        candidate_recipes.insert(move_entry.name.clone(), graph.clone());
+        // Recheck every affected recipe at the commit boundary. Removing a receiver can
+        // invalidate an emitter in a sibling move; no store changes on any rejection.
+        let mut compiled = match crate::move_nodes::project::compile_recipes_with_controllers(
+            &fighter.name,
+            base,
+            controller_charts,
+            &candidate_recipes,
+        ) {
+            Ok(compiled) => compiled,
+            Err(errors) => {
+                self.state.status = errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return;
+            }
+        };
+        let tracks = compiled.tracks.remove(&move_entry.name).unwrap_or_default();
+        let key = Self::move_key(&fighter.name, &move_entry.name);
+        for (track, script) in tracks {
+            match track {
+                crate::move_nodes::model::Track::Game => {
+                    // Never rebaseline native/live provenance when applying an authored edit.
+                    self.state.hitboxes = script.to_hitboxes();
+                    self.state.script = script.clone();
+                    self.state.edit_log.save_scoped_multi(
+                        &fighter.name,
+                        &fighter.display_name,
+                        &move_entry.name,
+                        script,
+                        self.state.hitboxes_pristine.clone(),
+                        self.state.hitboxes.clone(),
+                        &self.roster.slot_scopes_for(&fighter.name),
+                    );
+                }
+                crate::move_nodes::model::Track::Sound => {
+                    self.state.sounds = script.to_sound_events();
+                    self.state.sound_script = script.clone();
+                    self.state.sound_script_edits.insert(key.clone(), script);
+                }
+                crate::move_nodes::model::Track::Expression => {
+                    self.state.expressions = script.to_expression_events();
+                    self.state.expression_script = script.clone();
+                    self.state
+                        .expression_script_edits
+                        .insert(key.clone(), script);
+                }
+                crate::move_nodes::model::Track::Effect => {
+                    self.state.effect_script = crate::acmd::parse_effect_script(
+                        &crate::acmd::preview_effect_structure_fn(&script, &move_entry.name),
+                    );
+                    self.state.effects = self.state.effect_script.to_effect_calls();
+                    self.node_effect_scripts.insert(key.clone(), script);
+                    // Explicit Apply replaces the legacy source of this track, atomically.
+                    self.state.effect_call_edits.remove(&key);
+                    self.state.effect_call_full.remove(&key);
+                    self.state.effect_frame_residue.remove(&key);
+                    self.state.effect_dropped_lines.remove(&key);
+                }
+            }
+        }
+        if let Some((main, charts, layout)) = character {
+            self.roster.behaviors.insert(fighter.name.clone(), main);
+            self.roster
+                .controller_charts
+                .insert(fighter.name.clone(), charts);
+            self.roster
+                .behavior_layouts
+                .insert(fighter.name.clone(), layout);
+        }
+        let recipes = self.move_graphs.entry(fighter.name).or_default();
+        recipes.insert(move_entry.name, graph);
+        self.node_live_cache = None;
+        // Set first, so a limit the live rules report stays on screen.
+        self.state.status = "Move updated.".into();
+        self.refresh_current_live_rules();
+    }
+
+    fn sync_node_behaviors(&mut self) {
+        if self.move_graphs.is_empty()
+            && self
+                .roster
+                .controller_charts
+                .values()
+                .all(BTreeMap::is_empty)
+        {
+            self.gimmicks_editor.set_recipe_errors(BTreeMap::new());
+            self.gimmicks_editor.sync_live(
+                &self.roster.params,
+                &self.roster.behaviors,
+                &self.game_link,
+            );
+            return;
+        }
+        let Ok(revision) = serde_json::to_string(&(
+            &self.roster.behaviors,
+            &self.move_graphs,
+            &self.roster.controller_charts,
+        )) else {
+            return;
+        };
+        if self
+            .node_live_cache
+            .as_ref()
+            .is_none_or(|(key, _)| *key != revision)
+        {
+            let mut effective = self.roster.behaviors.clone();
+            let mut errors = Vec::new();
+            let mut recipe_errors = BTreeMap::new();
+            for (fighter, graphs) in &self.move_graphs {
+                let base = self
+                    .roster
+                    .behaviors
+                    .get(fighter)
+                    .cloned()
+                    .unwrap_or_default();
+                let charts = self
+                    .roster
+                    .controller_charts
+                    .get(fighter)
+                    .cloned()
+                    .unwrap_or_default();
+                match crate::move_nodes::project::compile_recipes_with_controllers(
+                    fighter, &base, &charts, graphs,
+                ) {
+                    Ok(compiled) => {
+                        effective.insert(fighter.clone(), compiled.behavior);
+                    }
+                    Err(rejected) => {
+                        // Fail closed for this fighter rather than retaining stale live actions.
+                        effective.remove(fighter);
+                        let reason = rejected
+                            .into_iter()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        recipe_errors.insert(fighter.clone(), reason.clone());
+                        errors.push(format!("{fighter}: {reason}"));
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                self.state.status = format!("Move trigger preview refused: {}", errors.join("; "));
+            }
+            self.gimmicks_editor.set_recipe_errors(recipe_errors);
+            self.node_live_cache = Some((revision, effective));
+        }
+        if let Some((_, effective)) = &self.node_live_cache {
+            self.gimmicks_editor.sync_live_controllers(
+                &self.roster.params,
+                effective,
+                &self.roster.controller_charts,
+                &self.game_link,
+            );
+        }
+    }
+
     fn draw_right_panel(&mut self, ui: &mut Ui) {
         ui.horizontal_wrapped(|ui| {
             for tab in [
@@ -8664,6 +9442,8 @@ impl VisionaryApp {
                 PrimaryEditorTab::MotionState,
                 PrimaryEditorTab::AudioFeedback,
                 PrimaryEditorTab::Effects,
+                PrimaryEditorTab::Gimmicks,
+                PrimaryEditorTab::Nodes,
             ] {
                 if ui
                     .selectable_label(self.primary_tab == tab, tab.title())
@@ -8671,14 +9451,65 @@ impl VisionaryApp {
                     .clicked()
                 {
                     self.primary_tab = tab;
+                    if tab == PrimaryEditorTab::Nodes {
+                        self.node_workspace = true;
+                        self.node_editor.refresh_character();
+                    }
                     self.show_add_hitbox = false;
                 }
             }
         });
 
+        if self.primary_tab == PrimaryEditorTab::Nodes {
+            if ui.button("Open Move nodes").clicked() {
+                self.node_workspace = true;
+            }
+            return;
+        }
+
+        if self.primary_tab == PrimaryEditorTab::Gimmicks {
+            let Some(fighter) = self
+                .state
+                .selected_fighter
+                .and_then(|index| self.state.fighters.get(index))
+            else {
+                ui.weak("Select a character to edit gimmicks");
+                return;
+            };
+            let context = self.gimmicks_editor.character_context(
+                ui,
+                &fighter.name,
+                &fighter.display_name,
+                &self.roster.project.authored,
+                &self.roster.slot_scopes_for(&fighter.name),
+            );
+            let roots = self.roster.gimmick_roots(self.state.data_root.as_ref());
+            self.gimmicks_editor.ui(
+                ui,
+                &context,
+                crate::gimmicks::editor::EditorData {
+                    roots: &roots,
+                    labels: &self.state.labels,
+                    params: &mut self.roster.params,
+                    behaviors: &mut self.roster.behaviors,
+                    behavior_layouts: &mut self.roster.behavior_layouts,
+                    controller_charts: &mut self.roster.controller_charts,
+                    meters: &mut self.roster.meters,
+                    link: &self.game_link,
+                    recipes: self.move_graphs.get(&context.fighter),
+                },
+            );
+            if std::mem::take(&mut self.gimmicks_editor.open_workspace) {
+                self.primary_tab = PrimaryEditorTab::Nodes;
+                self.node_workspace = true;
+                self.node_editor.refresh_character();
+            }
+            return;
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(self.state.selected_move.is_some(), |ui| {
-                ui.menu_button("Move…", |ui| {
+                ui.menu_button("Move", |ui| {
                     let btn_text = if self.fetching_acmd {
                         "Loading…"
                     } else if self.state.acmd_source.is_empty() {
@@ -8938,7 +9769,7 @@ impl VisionaryApp {
                         if self.state.hitboxes.is_empty() && self.state.selected_move.is_some() {
                             let fetched = !self.state.acmd_source.is_empty();
                             if !fetched {
-                                ui.weak("Nothing loaded yet — press Fetch ACMD.");
+                                ui.weak("Nothing loaded yet — use Move › Reload source.");
                             } else {
                                 ui.weak("This move has no hitboxes.");
                                 let mut has = Vec::new();
@@ -8949,7 +9780,7 @@ impl VisionaryApp {
                                     has.push(format!("{} effect(s)", self.state.effects.len()));
                                 }
                                 if has.is_empty() {
-                                    ui.weak("It has no effects or sounds either.");
+                                    ui.weak("Use Move nodes or the other tabs to edit non-collision logic.");
                                 } else {
                                     ui.weak(format!(
                                         "It does have {} — see below.",
@@ -9309,10 +10140,17 @@ impl VisionaryApp {
                                             "SDI Mult",
                                         );
                                         lr_check_combo(ui, &mut hb.lr_check, "fp_lr_check");
-                                        ui.add(
-                                            egui::DragValue::new(&mut hb.ground_or_air)
-                                                .prefix("Rehit: "),
-                                        );
+                                        let mut situation = crate::param_labels::const_name(
+                                            crate::param_labels::SITUATION_MASK,
+                                            i64::from(hb.ground_or_air),
+                                        ).map_or_else(|| hb.ground_or_air.to_string(), str::to_owned);
+                                        situation_mask_combo(ui, &mut situation, "fp_situation");
+                                        if let Some(value) = crate::param_labels::const_value(
+                                            crate::param_labels::SITUATION_MASK,
+                                            &situation,
+                                        ) {
+                                            hb.ground_or_air = value as i32;
+                                        }
                                         ui.checkbox(&mut hb.is_clang, "Clang");
                                         ui.checkbox(&mut hb.is_reflectable, "Reflectable");
                                         ui.checkbox(&mut hb.is_absorbable, "Absorbable");
@@ -9552,7 +10390,7 @@ impl VisionaryApp {
                                     editor_collapsing(
                                         ui,
                                         "Hit behavior",
-                                        "How the attack interacts after contact: hitlag, SDI, rehit timing, facing checks, clanging, reflection, absorption, shields, and finish-camera behavior.",
+                                        "Hitlag, SDI, rehit timing, facing and setoff checks, reflection, absorption, shield damage, weight, and contact flags.",
                                         |ui| {
                                         wide_slider_f32(
                                             ui,
@@ -9570,11 +10408,11 @@ impl VisionaryApp {
                                             ui,
                                             &mut hb.hitbox_attr,
                                             -10.0..=10.0,
-                                            "Hitbox Attr",
+                                            "Trip",
                                         );
                                         ui.add(
                                             egui::DragValue::new(&mut hb.is_add_attack)
-                                                .prefix("Add Attack: "),
+                                                .prefix("Shield damage: "),
                                         );
                                         ui.add(
                                             egui::DragValue::new(&mut hb.ground_or_air)
@@ -9584,13 +10422,15 @@ impl VisionaryApp {
                                         setoff_combo(ui, &mut hb.setoff_kind, "setoff_kind");
                                         lr_check_combo(ui, &mut hb.lr_check, "lr_check");
 
-                                        ui.checkbox(&mut hb.is_clang, "Clang");
-                                        ui.checkbox(&mut hb.is_mtk, "MTK (intangible)");
-                                        ui.checkbox(&mut hb.is_shield_disable, "Shield Disable");
-                                        ui.checkbox(&mut hb.is_reflectable, "Reflectable");
-                                        ui.checkbox(&mut hb.is_absorbable, "Absorbable");
-                                        ui.checkbox(&mut hb.is_landing_attack, "Landing Attack");
-                                        ui.checkbox(&mut hb.no_finish_camera, "No Finish Camera");
+                                        // The serialized names remain compatible with older projects;
+                                        // labels follow the pinned ordinary ATTACK parameter layout.
+                                        ui.checkbox(&mut hb.is_clang, "Set weight");
+                                        ui.checkbox(&mut hb.is_mtk, "Reflectable");
+                                        ui.checkbox(&mut hb.is_shield_disable, "Absorbable");
+                                        ui.checkbox(&mut hb.is_reflectable, "Flinchless");
+                                        ui.checkbox(&mut hb.is_absorbable, "Disable hitlag");
+                                        ui.checkbox(&mut hb.is_landing_attack, "Direct");
+                                        ui.checkbox(&mut hb.no_finish_camera, "Friendly fire");
                                         },
                                     );
                                     editor_collapsing(
@@ -10088,17 +10928,11 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if structural {
             self.state.status = if structural_live_supported {
-                "Sound structural edit staged for export, source sync, and live suppress/inject rules."
-                    .into()
+                "Move updated.".into()
             } else {
                 "Sound structural edit staged for export/source sync; its symbolic or malformed tail is not safe to replay live, so the original sound remains active.".into()
             };
@@ -10268,6 +11102,7 @@ impl VisionaryApp {
                     frame: Self::script_to_motion_frame(event.frame),
                     args,
                     command: Some(event.call.func.clone()),
+                    guard: None,
                 }),
                 func: Some(event.call.func.clone()),
             });
@@ -10564,18 +11399,15 @@ impl VisionaryApp {
             if matched_old[index] {
                 continue;
             }
-            let donor = Self::expression_capture_for(captures, pristine, index, event)?;
-            if !Self::expression_capture_is_unique(captures, event, donor) {
-                return None;
-            }
+            // With no capture to name one call, the rule covers this command on this frame.
+            let donor = Self::expression_capture_for(captures, pristine, index, event)
+                .filter(|donor| Self::expression_capture_is_unique(captures, event, donor));
             let (frame_start, frame_end) = Self::rule_frame_window(event.frame);
             rules.push(crate::game_link::HitboxRuleWire {
                 motion,
                 category: crate::game_link::CAT_EXPRESSION,
-                hitbox_id: Some(crate::game_link::expression_key(
-                    event.call.func(),
-                    &donor.args,
-                )),
+                hitbox_id: donor
+                    .map(|donor| crate::game_link::expression_key(event.call.func(), &donor.args)),
                 suppress: true,
                 frame_start,
                 frame_end,
@@ -10602,6 +11434,7 @@ impl VisionaryApp {
                     frame: Self::script_to_motion_frame(event.frame),
                     args,
                     command: Some(event.call.func().into()),
+                    guard: None,
                 }),
                 func: Some(event.call.func().into()),
             });
@@ -10724,7 +11557,10 @@ impl VisionaryApp {
                 &captures,
                 expression_partial_pristine,
                 &expression_partial_shown,
-                &self.state.motion_module_set_rate_partial_pristine,
+                &self
+                    .state
+                    .point_originals
+                    .motion_module_set_rate_partial_pristine,
             );
         let partial_key = format!("{mv_key}#expression_motion_module_set_rate_partial");
         if partial_rules.is_empty() {
@@ -10745,7 +11581,10 @@ impl VisionaryApp {
                 &captures,
                 expression_frame_pristine,
                 &expression_frame_shown,
-                &self.state.motion_module_set_frame_partial_pristine,
+                &self
+                    .state
+                    .point_originals
+                    .motion_module_set_frame_partial_pristine,
             );
         let frame_key = format!("{mv_key}#expression_motion_module_set_frame_partial");
         if frame_rules.is_empty() {
@@ -10753,12 +11592,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
@@ -10772,7 +11606,7 @@ impl VisionaryApp {
             }
             self.state.status = if structural {
                 format!(
-                    "Expression structural edit staged for export/source sync, but live replay needs measured identities and typed arguments for {unrepresentable} call(s)"
+                    "Saved. {unrepresentable} rumble or camera block(s) will update live after you perform the move in game once."
                 )
             } else {
                 format!(
@@ -11422,59 +12256,80 @@ impl VisionaryApp {
     }
 
     /// Editable x/y velocity points from the verified `SET_SPEED` family.
-    fn draw_speed_section(&mut self, ui: &mut Ui) {
-        let events = self.state.script.to_speed_events();
+    /// One point family's editor section: a heading, then one row per event with an
+    /// active-frame marker and `row`'s widgets over a copy of the call. When `row` reports an
+    /// edit worth keeping, the copy replaces the call at that site, the status line says it is
+    /// staged, and `push` resends the family's live rules.
+    fn draw_point_section<C: Clone>(
+        &mut self,
+        ui: &mut Ui,
+        events: Vec<crate::data::PointEvent<C>>,
+        section: PointSection<'_, C>,
+        mut row: impl FnMut(&mut Ui, &crate::data::PointEvent<C>, &mut C) -> bool,
+    ) {
         if events.is_empty() {
             return;
         }
 
         ui.separator();
+        let color = section.color;
         editor_command_subsection_heading(
             ui,
-            "Set velocity",
-            "SET_SPEED replaces the fighter's x/y velocity at this point. X and y are editable; moving or replacing the source call remains a structural edit.",
-            egui::Color32::from_rgb(245, 170, 110),
-            "SET_SPEED",
+            section.title,
+            section.description,
+            color,
+            section.command,
         );
 
-        let mut edit: Option<(usize, f32, f32)> = None;
+        let mut edit = None;
         for event in &events {
             let active = event.frame == self.state.current_frame;
-            let mut x = event.call.speed_x;
-            let mut y = event.call.speed_y;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if active {
-                        egui::Color32::from_rgb(245, 170, 110)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    },
-                    if active { "◆" } else { "◇" },
-                );
-                ui.label(format!("f{}", event.frame));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut x).speed(0.1).prefix("x "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut y).speed(0.1).prefix("y "))
-                    .changed();
-            });
-            if changed {
-                edit = Some((event.site, x, y));
+            let mut call = event.call.clone();
+            let keep = ui
+                .horizontal(|ui| {
+                    ui.colored_label(
+                        if active {
+                            color
+                        } else {
+                            egui::Color32::from_gray(140)
+                        },
+                        if active { "◆" } else { "◇" },
+                    );
+                    row(ui, event, &mut call)
+                })
+                .inner;
+            if keep {
+                edit = Some((event.site, call));
             }
         }
 
-        if let Some((site, speed_x, speed_y)) = edit {
-            if let Some(call) = self.state.script.set_speed_stmt_mut(site) {
-                call.speed_x = speed_x;
-                call.speed_y = speed_y;
-                self.state.status =
-                    "SET_SPEED edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_speed_rules();
+        if let Some((site, call)) = edit {
+            if let Some(target) = (section.stmt)(&mut self.state.script, site) {
+                *target = call;
+                self.state.status = format!(
+                    "{} edit staged — export or sync it into the linked source project.",
+                    section.label
+                );
+                (section.push)(self);
             }
         }
+    }
+
+    fn draw_speed_section(&mut self, ui: &mut Ui) {
+        let events = self.state.script.to_speed_events();
+        let section = PointSection {
+            title: "Set velocity",
+            description: "SET_SPEED replaces the fighter's x/y velocity at this point. X and y are editable; moving or replacing the source call remains a structural edit.",
+            color: egui::Color32::from_rgb(245, 170, 110),
+            command: "SET_SPEED",
+            label: "SET_SPEED",
+            stmt: crate::data::AcmdScript::set_speed_stmt_mut,
+            push: Self::push_speed_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "])
+        });
     }
 
     /// Editable x/y velocity points from the verified `SET_SPEED_EX` family.
@@ -11484,399 +12339,135 @@ impl VisionaryApp {
     /// carried by the parsed game statement, so the same edit reaches export and source sync.
     fn draw_speed_ex_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_speed_ex_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Set kinetic-reserve velocity",
-            "SET_SPEED_EX replaces x/y velocity in one named kinetic-energy reserve. A reserve is one engine movement component; its authored name stays visible while x and y are editable.",
-            egui::Color32::from_rgb(110, 190, 255),
-            "SET_SPEED_EX",
-        );
-
-        let mut edit: Option<(usize, f32, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut x = event.call.speed_x;
-            let mut y = event.call.speed_y;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if active {
-                        egui::Color32::from_rgb(110, 190, 255)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    },
-                    if active { "◆" } else { "◇" },
-                );
-                ui.label(format!("f{}", event.frame));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut x).speed(0.1).prefix("x "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut y).speed(0.1).prefix("y "))
-                    .changed();
-                ui.colored_label(
-                    egui::Color32::from_gray(150),
-                    format!("kind {}", event.call.kinetic_kind),
-                );
-            });
-            if changed {
-                edit = Some((event.site, x, y));
-            }
-        }
-
-        if let Some((site, speed_x, speed_y)) = edit {
-            if let Some(call) = self.state.script.speed_ex_stmt_mut(site) {
-                call.speed_x = speed_x;
-                call.speed_y = speed_y;
-                self.state.status =
-                    "SET_SPEED_EX edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_speed_ex_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Set kinetic-reserve velocity",
+            description: "SET_SPEED_EX replaces x/y velocity in one named kinetic-energy reserve. A reserve is one engine movement component; its authored name stays visible while x and y are editable.",
+            color: egui::Color32::from_rgb(110, 190, 255),
+            command: "SET_SPEED_EX",
+            label: "SET_SPEED_EX",
+            stmt: crate::data::AcmdScript::speed_ex_stmt_mut,
+            push: Self::push_speed_ex_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            let changed = drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "]);
+            ui.colored_label(
+                egui::Color32::from_gray(150),
+                format!("kind {}", event.call.kinetic_kind),
+            );
+            changed
+        });
     }
 
     /// Editable x/y velocity additions from the measured `ADD_SPEED_NO_LIMIT` family.
     fn draw_add_speed_no_limit_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_add_speed_no_limit_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Add unrestricted velocity",
-            "ADD_SPEED_NO_LIMIT adds x/y velocity without the ordinary speed limit at this point. X and y are editable; the call's placement remains structural.",
-            egui::Color32::from_rgb(90, 220, 180),
-            "ADD_SPEED_NO_LIMIT",
-        );
-
-        let mut edit: Option<(usize, f32, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut x = event.call.speed_x;
-            let mut y = event.call.speed_y;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if active {
-                        egui::Color32::from_rgb(90, 220, 180)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    },
-                    if active { "◆" } else { "◇" },
-                );
-                ui.label(format!("f{}", event.frame));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut x).speed(0.1).prefix("x "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut y).speed(0.1).prefix("y "))
-                    .changed();
-            });
-            if changed {
-                edit = Some((event.site, x, y));
-            }
-        }
-
-        if let Some((site, speed_x, speed_y)) = edit {
-            if let Some(call) = self.state.script.add_speed_no_limit_stmt_mut(site) {
-                call.speed_x = speed_x;
-                call.speed_y = speed_y;
-                self.state.status = "ADD_SPEED_NO_LIMIT edit staged — export or sync it into the linked source project.".into();
-                self.push_add_speed_no_limit_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Add unrestricted velocity",
+            description: "ADD_SPEED_NO_LIMIT adds x/y velocity without the ordinary speed limit at this point. X and y are editable; the call's placement remains structural.",
+            color: egui::Color32::from_rgb(90, 220, 180),
+            command: "ADD_SPEED_NO_LIMIT",
+            label: "ADD_SPEED_NO_LIMIT",
+            stmt: crate::data::AcmdScript::add_speed_no_limit_stmt_mut,
+            push: Self::push_add_speed_no_limit_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "])
+        });
     }
 
     /// Editable correction-kind tokens from the measured `CORRECT` family.
     fn draw_correct_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_correct_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Ground correction mode",
-            "CORRECT selects how the fighter is aligned or corrected against ground and air geometry at this point. The exact named mode stays as authored source text.",
-            egui::Color32::from_rgb(255, 205, 120),
-            "CORRECT",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut kind = event.call.kind.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(255, 205, 120)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut kind)
-                            .desired_width(260.0)
-                            .hint_text("*GROUND_CORRECT_KIND_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !kind.trim().is_empty() {
-                edit = Some((event.site, kind));
-            }
-        }
-
-        if let Some((site, kind)) = edit {
-            if let Some(call) = self.state.script.correct_stmt_mut(site) {
-                call.kind = kind;
-                self.state.status =
-                    "CORRECT edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_correct_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Ground correction mode",
+            description: "CORRECT selects how the fighter is aligned or corrected against ground and air geometry at this point. The exact named mode stays as authored source text.",
+            color: egui::Color32::from_rgb(255, 205, 120),
+            command: "CORRECT",
+            label: "CORRECT",
+            stmt: crate::data::AcmdScript::correct_stmt_mut,
+            push: Self::push_correct_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            token_edit(ui, &mut call.kind, 260.0, "*GROUND_CORRECT_KIND_…")
+        });
     }
 
     /// Editable numeric payloads from the measured `FT_CATCH_STOP` family.
     fn draw_ft_catch_stop_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_ft_catch_stop_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Catch stop",
-            "FT_CATCH_STOP is the engine's two-value catch-stop command. The exact gameplay role of each value is not decoded, so they stay honestly labeled arg1 and arg2 instead of receiving guessed names.",
-            egui::Color32::from_rgb(220, 155, 245),
-            "FT_CATCH_STOP",
-        );
-
-        let mut edit: Option<(usize, f32, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut arg1 = event.call.arg1;
-            let mut arg2 = event.call.arg2;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if active {
-                        egui::Color32::from_rgb(220, 155, 245)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    },
-                    if active { "◆" } else { "◇" },
-                );
-                ui.label(format!("f{}", event.frame));
-                changed |= ui
-                    .add(egui::DragValue::new(&mut arg1).speed(0.1).prefix("arg1 "))
-                    .changed();
-                changed |= ui
-                    .add(egui::DragValue::new(&mut arg2).speed(0.1).prefix("arg2 "))
-                    .changed();
-            });
-            if changed {
-                edit = Some((event.site, arg1, arg2));
-            }
-        }
-
-        if let Some((site, arg1, arg2)) = edit {
-            if let Some(call) = self.state.script.ft_catch_stop_stmt_mut(site) {
-                call.arg1 = arg1;
-                call.arg2 = arg2;
-                self.state.status =
-                    "FT_CATCH_STOP edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_ft_catch_stop_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Catch stop",
+            description: "FT_CATCH_STOP is the engine's two-value catch-stop command. The exact gameplay role of each value is not decoded, so they stay honestly labeled arg1 and arg2 instead of receiving guessed names.",
+            color: egui::Color32::from_rgb(220, 155, 245),
+            command: "FT_CATCH_STOP",
+            label: "FT_CATCH_STOP",
+            stmt: crate::data::AcmdScript::ft_catch_stop_stmt_mut,
+            push: Self::push_ft_catch_stop_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            drag_pair(ui, &mut call.arg1, &mut call.arg2, ["arg1 ", "arg2 "])
+        });
     }
 
     /// Editable numeric payloads from the measured motion-frame adjustment family.
     fn draw_ft_start_adjust_motion_frame_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_ft_start_adjust_motion_frame_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Motion-frame adjustment",
-            "FT_START_ADJUST_MOTION_FRAME_arg1 carries one measured numeric value. Its more specific gameplay meaning is not decoded, so the editor preserves the native name and avoids inventing a misleading label.",
-            egui::Color32::from_rgb(130, 220, 245),
-            "FT_START_ADJUST_MOTION_FRAME_arg1",
-        );
-
-        let mut edit: Option<(usize, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut value = event.call.value;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    if active {
-                        egui::Color32::from_rgb(130, 220, 245)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    },
-                    if active { "◆" } else { "◇" },
-                );
-                ui.label(format!("f{}", event.frame));
-                changed = ui
-                    .add(
-                        egui::DragValue::new(&mut value)
-                            .speed(0.05)
-                            .prefix("value "),
-                    )
-                    .changed();
-            });
-            if changed {
-                edit = Some((event.site, value));
-            }
-        }
-
-        if let Some((site, value)) = edit {
-            if let Some(call) = self
-                .state
-                .script
-                .ft_start_adjust_motion_frame_stmt_mut(site)
-            {
-                call.value = value;
-                self.state.status = "FT_START_ADJUST_MOTION_FRAME_arg1 edit staged — export or sync it into the linked source project.".into();
-                self.push_ft_start_adjust_motion_frame_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Motion-frame adjustment",
+            description: "FT_START_ADJUST_MOTION_FRAME_arg1 carries one measured numeric value. Its more specific gameplay meaning is not decoded, so the editor preserves the native name and avoids inventing a misleading label.",
+            color: egui::Color32::from_rgb(130, 220, 245),
+            command: "FT_START_ADJUST_MOTION_FRAME_arg1",
+            label: "FT_START_ADJUST_MOTION_FRAME_arg1",
+            stmt: crate::data::AcmdScript::ft_start_adjust_motion_frame_stmt_mut,
+            push: Self::push_ft_start_adjust_motion_frame_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            let value = egui::DragValue::new(&mut call.value).speed(0.05);
+            ui.add(value.prefix("value ")).changed()
+        });
     }
 
     /// Editable numeric values from direct `MotionModule::set_rate` point calls.
     fn draw_motion_module_set_rate_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_motion_module_set_rate_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Animation playback rate",
-            "MotionModule::set_rate directly sets the animation's playback rate at this conditional script point. Only the numeric value is edited; its frame and execution condition remain intact.",
-            egui::Color32::from_rgb(170, 205, 255),
-            "MotionModule::set_rate",
-        );
-
-        let mut edit: Option<(usize, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut rate = event.call.rate;
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(170, 205, 255)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    ui.add(
-                        egui::DragValue::new(&mut rate)
-                            .speed(0.05)
-                            .range(0.0..=100.0)
-                            .prefix("rate "),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed {
-                edit = Some((event.site, rate));
-            }
-        }
-
-        if let Some((site, rate)) = edit {
-            if let Some(call) = self.state.script.motion_module_set_rate_stmt_mut(site) {
-                call.rate = rate;
-                self.state.status =
-                    "MotionModule::set_rate edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_motion_module_set_rate_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Animation playback rate",
+            description: "MotionModule::set_rate directly sets the animation's playback rate at this conditional script point. Only the numeric value is edited; its frame and execution condition remain intact.",
+            color: egui::Color32::from_rgb(170, 205, 255),
+            command: "MotionModule::set_rate",
+            label: "MotionModule::set_rate",
+            stmt: crate::data::AcmdScript::motion_module_set_rate_stmt_mut,
+            push: Self::push_motion_module_set_rate_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            let rate = egui::DragValue::new(&mut call.rate).speed(0.05);
+            ui.add(rate.range(0.0..=100.0).prefix("rate ")).changed()
+        });
     }
 
     /// Editable numeric rates from direct `MotionModule::set_rate_partial` point calls.
     fn draw_motion_module_set_rate_partial_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_motion_module_set_rate_partial_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Partial animation playback rate",
-            "MotionModule::set_rate_partial changes only one named animation part. The numeric rate is editable; the authored part name, frame, and execution context stay intact.",
-            egui::Color32::from_rgb(170, 220, 190),
-            "MotionModule::set_rate_partial",
-        );
-
-        let mut edit: Option<(usize, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut rate = event.call.rate;
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(170, 220, 190)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{} {}", event.frame, event.call.part_kind));
-                    ui.add(
-                        egui::DragValue::new(&mut rate)
-                            .speed(0.05)
-                            .range(0.0..=100.0)
-                            .prefix("rate "),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed {
-                edit = Some((event.site, rate));
-            }
-        }
-
-        if let Some((site, rate)) = edit {
-            if let Some(call) = self
-                .state
-                .script
-                .motion_module_set_rate_partial_stmt_mut(site)
-            {
-                call.rate = rate;
-                self.state.status =
-                    "MotionModule::set_rate_partial edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_motion_module_set_rate_partial_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Partial animation playback rate",
+            description: "MotionModule::set_rate_partial changes only one named animation part. The numeric rate is editable; the authored part name, frame, and execution context stay intact.",
+            color: egui::Color32::from_rgb(170, 220, 190),
+            command: "MotionModule::set_rate_partial",
+            label: "MotionModule::set_rate_partial",
+            stmt: crate::data::AcmdScript::motion_module_set_rate_partial_stmt_mut,
+            push: Self::push_motion_module_set_rate_partial_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{} {}", event.frame, event.call.part_kind));
+            let rate = egui::DragValue::new(&mut call.rate).speed(0.05);
+            ui.add(rate.range(0.0..=100.0).prefix("rate ")).changed()
+        });
     }
 
     /// Editable seek frames and sync flags from direct `MotionModule::set_frame_partial` calls.
@@ -11967,53 +12558,19 @@ impl VisionaryApp {
             .state
             .script
             .to_motion_module_set_helper_calculation_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Helper animation calculation",
-            "MotionModule::set_helper_calculation turns the engine's helper-animation calculation on or off at this conditional script point. Its exact visible effect depends on the move; only the proven boolean is editable.",
-            egui::Color32::from_rgb(180, 225, 190),
-            "MotionModule::set_helper_calculation",
-        );
-
-        let mut edit: Option<(usize, bool)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut enabled = event.call.enabled;
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(180, 225, 190)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    ui.checkbox(&mut enabled, "enabled").changed()
-                })
-                .inner;
-            if changed {
-                edit = Some((event.site, enabled));
-            }
-        }
-
-        if let Some((site, enabled)) = edit {
-            if let Some(call) = self
-                .state
-                .script
-                .motion_module_set_helper_calculation_stmt_mut(site)
-            {
-                call.enabled = enabled;
-                self.state.status = "MotionModule::set_helper_calculation edit staged — export or sync it into the linked source project.".into();
-                self.push_motion_module_set_helper_calculation_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Helper animation calculation",
+            description: "MotionModule::set_helper_calculation turns the engine's helper-animation calculation on or off at this conditional script point. Its exact visible effect depends on the move; only the proven boolean is editable.",
+            color: egui::Color32::from_rgb(180, 225, 190),
+            command: "MotionModule::set_helper_calculation",
+            label: "MotionModule::set_helper_calculation",
+            stmt: crate::data::AcmdScript::motion_module_set_helper_calculation_stmt_mut,
+            push: Self::push_motion_module_set_helper_calculation_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            ui.checkbox(&mut call.enabled, "enabled").changed()
+        });
     }
 
     /// Editable authored kinetic-ID tokens from the measured `CLR_SPEED` family.
@@ -12023,56 +12580,24 @@ impl VisionaryApp {
     /// replacement through the plugin; structural placement stays in export/source sync.
     fn draw_clr_speed_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_clr_speed_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Clear one kinetic velocity",
-            "CLR_SPEED clears the velocity stored in one named kinetic-energy reserve, which is one engine movement component. The authored reserve name stays as source text.",
-            egui::Color32::from_rgb(245, 125, 175),
-            "CLR_SPEED",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut kind = event.call.kinetic_kind.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(245, 125, 175)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut kind)
-                            .desired_width(280.0)
-                            .hint_text("*FIGHTER_KINETIC_ENERGY_ID_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !kind.trim().is_empty() {
-                edit = Some((event.site, kind));
-            }
-        }
-
-        if let Some((site, kinetic_kind)) = edit {
-            if let Some(call) = self.state.script.clr_speed_stmt_mut(site) {
-                call.kinetic_kind = kinetic_kind;
-                self.state.status =
-                    "CLR_SPEED edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_clr_speed_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Clear one kinetic velocity",
+            description: "CLR_SPEED clears the velocity stored in one named kinetic-energy reserve, which is one engine movement component. The authored reserve name stays as source text.",
+            color: egui::Color32::from_rgb(245, 125, 175),
+            command: "CLR_SPEED",
+            label: "CLR_SPEED",
+            stmt: crate::data::AcmdScript::clr_speed_stmt_mut,
+            push: Self::push_clr_speed_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            token_edit(
+                ui,
+                &mut call.kinetic_kind,
+                280.0,
+                "*FIGHTER_KINETIC_ENERGY_ID_…",
+            )
+        });
     }
 
     /// Editable authored kinetic-type tokens from the measured direct lua-bind call.
@@ -12082,58 +12607,23 @@ impl VisionaryApp {
     /// source/export preserves the named constant the project author chose.
     fn draw_change_kinetic_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_change_kinetic_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Movement mode",
-            "KineticModule::change_kinetic selects the fighter's engine movement mode, which determines the set of movement rules and energies currently in use. The authored mode name stays as source text.",
-            egui::Color32::from_rgb(255, 190, 120),
-            "KineticModule::change_kinetic",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut kinetic_type = event.call.kinetic_type.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(255, 190, 120)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut kinetic_type)
-                            .desired_width(280.0)
-                            .hint_text("*FIGHTER_KINETIC_TYPE_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !kinetic_type.trim().is_empty() {
-                edit = Some((event.site, kinetic_type));
-            }
-        }
-
-        if let Some((site, kinetic_type)) = edit {
-            if let Some(call) = self.state.script.change_kinetic_stmt_mut(site) {
-                call.kinetic_type = kinetic_type;
-                self.state.status =
-                    "change_kinetic edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_change_kinetic_rules();
-                self.push_kinetic_energy_rules();
-                self.push_kinetic_add_speed_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Movement mode",
+            description: "KineticModule::change_kinetic selects the fighter's engine movement mode, which determines the set of movement rules and energies currently in use. The authored mode name stays as source text.",
+            color: egui::Color32::from_rgb(255, 190, 120),
+            command: "KineticModule::change_kinetic",
+            label: "change_kinetic",
+            stmt: crate::data::AcmdScript::change_kinetic_stmt_mut,
+            push: |app| {
+                app.push_change_kinetic_rules();
+                app.push_kinetic_energy_rules();
+                app.push_kinetic_add_speed_rules();
+            },
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            token_edit(ui, &mut call.kinetic_type, 280.0, "*FIGHTER_KINETIC_TYPE_…")
+        });
     }
 
     /// Editable authored energy-ID tokens from the measured direct kinetic-energy calls.
@@ -12141,62 +12631,21 @@ impl VisionaryApp {
     /// structural so source write-back never guesses a different primitive.
     fn draw_kinetic_energy_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_kinetic_energy_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Movement component state",
-            "Enables, disables, suspends, or resumes one kinetic energy: an engine movement component such as gravity, player control, or animation-driven motion. The authored component name stays as source text.",
-            egui::Color32::from_rgb(205, 160, 255),
-            "KineticModule energy",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut kinetic_energy_id = event.call.kinetic_energy_id.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(205, 160, 255)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!(
-                        "f{} {}",
-                        event.frame,
-                        event.call.func().trim_start_matches("KineticModule::")
-                    ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut kinetic_energy_id)
-                            .desired_width(280.0)
-                            .hint_text("*FIGHTER_KINETIC_ENERGY_ID_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed {
-                edit = Some((event.site, kinetic_energy_id));
-            }
-        }
-
-        if let Some((site, kinetic_energy_id)) = edit {
-            if let Some(call) = self.state.script.kinetic_energy_stmt_mut(site) {
-                if !kinetic_energy_id.trim().is_empty() {
-                    call.kinetic_energy_id = kinetic_energy_id;
-                    self.state.status =
-                        "KineticModule energy edit staged — export or sync it into the linked source project."
-                            .into();
-                    self.push_kinetic_energy_rules();
-                }
-            }
-        }
+        let section = PointSection {
+            title: "Movement component state",
+            description: "Enables, disables, suspends, or resumes one kinetic energy: an engine movement component such as gravity, player control, or animation-driven motion. The authored component name stays as source text.",
+            color: egui::Color32::from_rgb(205, 160, 255),
+            command: "KineticModule energy",
+            label: "KineticModule energy",
+            stmt: crate::data::AcmdScript::kinetic_energy_stmt_mut,
+            push: Self::push_kinetic_energy_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            let func = event.call.func().trim_start_matches("KineticModule::");
+            ui.label(format!("f{} {func}", event.frame));
+            let hint = "*FIGHTER_KINETIC_ENERGY_ID_…";
+            token_edit(ui, &mut call.kinetic_energy_id, 280.0, hint)
+        });
     }
 
     /// Editable x/y components from the measured direct `KineticModule::add_speed` vector.
@@ -12204,59 +12653,21 @@ impl VisionaryApp {
     /// rather than exposed as an editable field that would be silently discarded on export.
     fn draw_kinetic_add_speed_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_kinetic_add_speed_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Add kinetic velocity",
-            "KineticModule::add_speed adds the shown x/y vector directly to movement velocity. The supported source form has z = 0.0; the receiver and frame stay unchanged.",
-            egui::Color32::from_rgb(120, 190, 255),
-            "KineticModule::add_speed",
-        );
-
-        let mut edit: Option<(usize, f32, f32)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut x = event.call.speed_x;
-            let mut y = event.call.speed_y;
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(120, 190, 255)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{}", event.frame));
-                    let mut changed = ui
-                        .add(egui::DragValue::new(&mut x).speed(0.1).prefix("x "))
-                        .changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut y).speed(0.1).prefix("y "))
-                        .changed();
-                    ui.colored_label(egui::Color32::from_gray(150), "z 0.0");
-                    changed
-                })
-                .inner;
-            if changed {
-                edit = Some((event.site, x, y));
-            }
-        }
-
-        if let Some((site, speed_x, speed_y)) = edit {
-            if let Some(call) = self.state.script.kinetic_add_speed_stmt_mut(site) {
-                call.speed_x = speed_x;
-                call.speed_y = speed_y;
-                self.state.status =
-                    "KineticModule::add_speed edit staged — export or sync it into the linked source project.".into();
-                self.push_kinetic_add_speed_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Add kinetic velocity",
+            description: "KineticModule::add_speed adds the shown x/y vector directly to movement velocity. The supported source form has z = 0.0; the receiver and frame stay unchanged.",
+            color: egui::Color32::from_rgb(120, 190, 255),
+            command: "KineticModule::add_speed",
+            label: "KineticModule::add_speed",
+            stmt: crate::data::AcmdScript::kinetic_add_speed_stmt_mut,
+            push: Self::push_kinetic_add_speed_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{}", event.frame));
+            let changed = drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "]);
+            ui.colored_label(egui::Color32::from_gray(150), "z 0.0");
+            changed
+        });
     }
 
     /// Structural `KineticModule::clear_speed_all` point editing. The measured call has no
@@ -12582,60 +12993,21 @@ impl VisionaryApp {
     /// the flag value; changing the operation or frame remains an export/source concern.
     fn draw_work_flag_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_work_flag_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Work flags",
-            WORK_FLAGS_DESCRIPTION,
-            egui::Color32::from_rgb(235, 190, 120),
-            "WorkModule::on_flag / off_flag",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut flag = event.call.flag.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(235, 190, 120)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!(
-                        "f{} {}",
-                        event.frame,
-                        event.call.func().trim_start_matches("WorkModule::")
-                    ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut flag)
-                            .desired_width(280.0)
-                            .hint_text("*FIGHTER_STATUS_WORK_ID_FLAG_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !flag.trim().is_empty() {
-                edit = Some((event.site, flag));
-            }
-        }
-
-        if let Some((site, flag)) = edit {
-            if let Some(call) = self.state.script.work_flag_stmt_mut(site) {
-                call.flag = flag;
-                self.state.status =
-                    "WorkModule flag edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_work_flag_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Work flags",
+            description: WORK_FLAGS_DESCRIPTION,
+            color: egui::Color32::from_rgb(235, 190, 120),
+            command: "WorkModule::on_flag / off_flag",
+            label: "WorkModule flag",
+            stmt: crate::data::AcmdScript::work_flag_stmt_mut,
+            push: Self::push_work_flag_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            let func = event.call.func().trim_start_matches("WorkModule::");
+            ui.label(format!("f{} {func}", event.frame));
+            let hint = "*FIGHTER_STATUS_WORK_ID_FLAG_…";
+            token_edit(ui, &mut call.flag, 280.0, hint)
+        });
     }
 
     /// Editable authored transition-term tokens from the measured direct WorkModule family.
@@ -12645,58 +13017,21 @@ impl VisionaryApp {
     /// the term value; changing the operation or frame remains an export/source concern.
     fn draw_work_transition_term_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_work_transition_term_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Allowed state transitions",
-            "Transition terms are named state changes the engine may consider, such as a particular cancel or movement transition. These commands enable or disable one term or a related group at this point.",
-            egui::Color32::from_rgb(205, 170, 235),
-            "WorkModule transition term / group",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut transition_term = event.call.transition_term.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(205, 170, 235)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!(
-                        "f{} {}",
-                        event.frame,
-                        event.call.func().trim_start_matches("WorkModule::")
-                    ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut transition_term)
-                            .desired_width(300.0)
-                            .hint_text("*FIGHTER_STATUS_TRANSITION_TERM_ID_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !transition_term.trim().is_empty() {
-                edit = Some((event.site, transition_term));
-            }
-        }
-
-        if let Some((site, transition_term)) = edit {
-            if let Some(call) = self.state.script.work_transition_term_stmt_mut(site) {
-                call.transition_term = transition_term;
-                self.state.status = "WorkModule transition-term edit staged — export or sync it into the linked source project.".into();
-                self.push_work_transition_term_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Allowed state transitions",
+            description: "Transition terms are named state changes the engine may consider, such as a particular cancel or movement transition. These commands enable or disable one term or a related group at this point.",
+            color: egui::Color32::from_rgb(205, 170, 235),
+            command: "WorkModule transition term / group",
+            label: "WorkModule transition-term",
+            stmt: crate::data::AcmdScript::work_transition_term_stmt_mut,
+            push: Self::push_work_transition_term_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            let func = event.call.func().trim_start_matches("WorkModule::");
+            ui.label(format!("f{} {func}", event.frame));
+            let hint = "*FIGHTER_STATUS_TRANSITION_TERM_ID_…";
+            token_edit(ui, &mut call.transition_term, 300.0, hint)
+        });
     }
 
     /// Editable authored slot tokens from the measured direct `WorkModule::inc_int` family.
@@ -12704,56 +13039,19 @@ impl VisionaryApp {
     /// matching capture.
     fn draw_work_module_inc_int_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_work_module_inc_int_events();
-        if events.is_empty() {
-            return;
-        }
-
-        ui.separator();
-        editor_command_subsection_heading(
-            ui,
-            "Increment stored counter",
-            "WorkModule::inc_int adds one to a named integer stored by the game for this fighter. Scripts use these slots for counters and other move or status state; the authored slot name identifies the exact value.",
-            egui::Color32::from_rgb(220, 190, 140),
-            "WorkModule::inc_int",
-        );
-
-        let mut edit: Option<(usize, String)> = None;
-        for event in &events {
-            let active = event.frame == self.state.current_frame;
-            let mut slot = event.call.slot.clone();
-            let changed = ui
-                .horizontal(|ui| {
-                    ui.colored_label(
-                        if active {
-                            egui::Color32::from_rgb(220, 190, 140)
-                        } else {
-                            egui::Color32::from_gray(140)
-                        },
-                        if active { "◆" } else { "◇" },
-                    );
-                    ui.label(format!("f{} inc_int", event.frame));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut slot)
-                            .desired_width(280.0)
-                            .hint_text("*FIGHTER_STATUS_WORK_INT_…"),
-                    )
-                    .changed()
-                })
-                .inner;
-            if changed && !slot.trim().is_empty() {
-                edit = Some((event.site, slot));
-            }
-        }
-
-        if let Some((site, slot)) = edit {
-            if let Some(call) = self.state.script.work_module_inc_int_stmt_mut(site) {
-                call.slot = slot;
-                self.state.status =
-                    "WorkModule::inc_int edit staged — export or sync it into the linked source project."
-                        .into();
-                self.push_work_module_inc_int_rules();
-            }
-        }
+        let section = PointSection {
+            title: "Increment stored counter",
+            description: "WorkModule::inc_int adds one to a named integer stored by the game for this fighter. Scripts use these slots for counters and other move or status state; the authored slot name identifies the exact value.",
+            color: egui::Color32::from_rgb(220, 190, 140),
+            command: "WorkModule::inc_int",
+            label: "WorkModule::inc_int",
+            stmt: crate::data::AcmdScript::work_module_inc_int_stmt_mut,
+            push: Self::push_work_module_inc_int_rules,
+        };
+        self.draw_point_section(ui, events, section, |ui, event, call| {
+            ui.label(format!("f{} inc_int", event.frame));
+            token_edit(ui, &mut call.slot, 280.0, "*FIGHTER_STATUS_WORK_INT_…")
+        });
     }
 
     /// Editable authored value and slot tokens from the measured direct WorkModule setter
@@ -13392,7 +13690,7 @@ impl VisionaryApp {
 
         if states.is_empty() && conditions.is_empty() && pris.is_empty() {
             if self.state.acmd_source.is_empty() {
-                ui.weak("No hurtbox commands loaded yet — press Fetch ACMD above.");
+                ui.weak("No hurtbox commands loaded yet — use Move › Reload source.");
             } else {
                 ui.weak(
                     "This move has no HIT_NODE, HIT_NO, WHOLE_HIT, or damage-reaction commands.",
@@ -13624,7 +13922,44 @@ impl VisionaryApp {
         }
     }
 
+    /// Work-resolved spawns cannot be safely edited through the flat legacy call list:
+    /// its residue travels with an unrelated spawn and could be deleted or retimed.
+    fn effect_source_requires_nodes(script: &crate::data::EffectScript) -> bool {
+        use crate::data::{EffectMacro, EffectStmt};
+        fn contains(stmts: &[EffectStmt]) -> bool {
+            stmts.iter().any(|stmt| match stmt {
+                EffectStmt::Excute(commands) => commands.iter().any(|command| match command {
+                    EffectMacro::EffectFollowWork { .. } => true,
+                    EffectMacro::Raw(source) => source.contains("macros::EFFECT_FOLLOW_WORK("),
+                    _ => false,
+                }),
+                EffectStmt::Loop { body, .. } | EffectStmt::Cond { body, .. } => contains(body),
+                EffectStmt::Raw(source) => source.contains("macros::EFFECT_FOLLOW_WORK("),
+                _ => false,
+            })
+        }
+        contains(&script.stmts)
+    }
+
     fn draw_effects_panel(&mut self, ui: &mut Ui) {
+        let native_work_source = Self::effect_source_requires_nodes(&self.state.effect_script);
+        if native_work_source
+            || self
+                .current_move_key()
+                .is_some_and(|key| self.node_effect_scripts.contains_key(&key))
+        {
+            ui.label(if native_work_source {
+                "Native effects use Move nodes."
+            } else {
+                "This move's effects use structured nodes."
+            });
+            ui.weak("Edit the Effect track to keep native slots, command order and branches intact. Apply saves the recipe; plugin export/reload runs it.");
+            if ui.button("Open effect nodes").clicked() {
+                self.primary_tab = PrimaryEditorTab::Nodes;
+                self.node_workspace = true;
+            }
+            return;
+        }
         let current = self.state.current_frame;
 
         // The tab this is drawn under already carries the "Visual effects" heading and its
@@ -13917,6 +14252,11 @@ impl VisionaryApp {
                 );
                 let pristine = self.state.effects_pristine.get(i).cloned();
                 let bone_names = self.bone_names.clone();
+                let fighter_name = self
+                    .state
+                    .selected_fighter
+                    .and_then(|index| self.state.fighters.get(index))
+                    .map(|fighter| fighter.name.clone());
                 let mut changed = false;
                 // Discrete swaps (effect name / bone) need a preview rebuild; numeric drags don't.
                 let mut respawn_needed = false;
@@ -14379,6 +14719,33 @@ impl VisionaryApp {
                                                         .desired_width(180.0),
                                                 )
                                                 .changed();
+                                            ui.label("");
+                                            ui.end_row();
+                                        }
+                                        crate::data::EffectControl::SetDisableRenderOffsetLast
+                                        | crate::data::EffectControl::EnableSyncInitPosLast => {
+                                            ui.label("Target");
+                                            ui.label("Last spawned effect").on_hover_text(
+                                                "Ordered native effect control with no editable arguments. Complete source export and game reload are required; flat live injection is not supported.",
+                                            );
+                                            ui.label("");
+                                            ui.end_row();
+                                        }
+                                        crate::data::EffectControl::ReqScreen { preset_id } => {
+                                            ui.label("Screen graphic");
+                                            changed |= crate::move_nodes::view::screen_effect_preset_ui(ui, preset_id);
+                                            ui.label("").on_hover_text("Complete native preset; source export/reload and available graphic resources required.");
+                                            ui.end_row();
+                                        }
+                                        crate::data::EffectControl::OffKindWork { preset_id } => {
+                                            ui.label("Native effect off");
+                                            changed |= crate::move_nodes::view::native_effect_off_preset_ui(ui, fighter_name.as_deref(), preset_id);
+                                            ui.label("");
+                                            ui.end_row();
+                                        }
+                                        crate::data::EffectControl::SetDisableCameraDepthInfluence { value } => {
+                                            ui.label("Camera depth influence");
+                                            changed |= crate::move_nodes::view::camera_depth_influence_ui(ui, value);
                                             ui.label("");
                                             ui.end_row();
                                         }
@@ -15617,6 +15984,15 @@ impl VisionaryApp {
             sound_script_edit,
             expression_script_edit,
             edit_record,
+            structured_effect_edit: self.node_effect_scripts.get(key).map(Self::json_bytes),
+            move_graph: key
+                .split_once('/')
+                .and_then(|(fighter, move_name)| {
+                    self.move_graphs
+                        .get(fighter)
+                        .and_then(|graphs| graphs.get(move_name))
+                })
+                .map(Self::json_bytes),
         }
     }
 
@@ -15655,6 +16031,19 @@ impl VisionaryApp {
         self.state.expressions = self.state.expression_script.to_expression_events();
 
         if let Some((fighter, move_name)) = key.split_once('/') {
+            if let Some(graph) = snapshot.move_graph.as_deref().and_then(Self::decode_json) {
+                self.move_graphs
+                    .entry(fighter.to_string())
+                    .or_default()
+                    .insert(move_name.to_string(), graph);
+            } else if let Some(graphs) = self.move_graphs.get_mut(fighter) {
+                graphs.remove(move_name);
+                if graphs.is_empty() {
+                    self.move_graphs.remove(fighter);
+                }
+            }
+            self.node_editor.invalidate();
+            self.node_live_cache = None;
             if let Some(bytes) = &snapshot.edit_record {
                 if let Some(record) = Self::decode_json(bytes) {
                     self.state
@@ -15685,6 +16074,11 @@ impl VisionaryApp {
             &mut self.state.effect_call_edits,
             key,
             snapshot.effect_call_edits.as_deref(),
+        );
+        Self::restore_map_entry(
+            &mut self.node_effect_scripts,
+            key,
+            snapshot.structured_effect_edit.as_deref(),
         );
         Self::restore_map_entry(
             &mut self.state.effect_call_full,
@@ -15761,6 +16155,37 @@ impl VisionaryApp {
         self.push_kinetic_clear_speed_all_rules();
         self.push_kinetic_set_consider_ground_friction_rules();
         self.push_effect_rules();
+        self.push_node_step_rules();
+    }
+
+    /// Sends the blocks of a node-built move that the game's script does not already perform.
+    fn push_node_step_rules(&mut self) {
+        let Some(key) = self.current_move_key() else {
+            return;
+        };
+        let Some(motion) = self.current_motion_hash() else {
+            return;
+        };
+        let store_key = format!("{key}#node_steps");
+        let rules = key.split_once('/').and_then(|(fighter, move_name)| {
+            let graph = self.move_graphs.get(fighter)?.get(move_name)?;
+            Some(crate::move_nodes::live_steps::rules(
+                fighter,
+                motion,
+                &self.state.source_script,
+                graph,
+            ))
+        });
+        match rules {
+            Some(rules) if !rules.is_empty() => {
+                self.hitbox_rules_store.insert(store_key, rules);
+            }
+            _ => {
+                self.hitbox_rules_store.remove(&store_key);
+            }
+        }
+        self.game_link
+            .send_hitbox_rules(&self.live_hitbox_rule_union());
     }
 
     fn note_live_replay_capture_limit(&mut self, category: &str) {
@@ -15896,6 +16321,9 @@ impl VisionaryApp {
         self.state.script = context.game;
         self.state.hitboxes_pristine = context.hitboxes_pristine;
         self.state.hitboxes = context.hitboxes;
+        self.state.source_effect_spawns = crate::move_nodes::live_steps::source_spawn_names(
+            &crate::acmd::parse_effect_script(&context.source.body),
+        );
         self.state.effects_pristine = context.effects_pristine;
         self.state.effects = context.effects;
         self.state.sound_script = context.sound;
@@ -15914,28 +16342,92 @@ impl VisionaryApp {
             .to_motion_module_set_rate_partial_events();
     }
 
-    /// Publish the complete flattened ACMD live-rule union currently staged in the keyed stores.
+    /// Withhold source-only node tracks at the final publication boundary, including watcher
+    /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
+    fn live_hitbox_rule_union(&self) -> Vec<crate::game_link::HitboxRuleWire> {
+        self.hitbox_rules_store
+            .iter()
+            .filter(|(key, _)| {
+                crate::move_nodes::live_support::allows_flat_live_rules(&self.move_graphs, key)
+            })
+            .flat_map(|(key, rules)| {
+                // A call added inside an If only fires when the If passes.
+                let (fighter, move_name) = key
+                    .split('#')
+                    .next()
+                    .and_then(|key| key.split_once('/'))
+                    .unzip();
+                let guards = fighter
+                    .zip(move_name)
+                    .and_then(|(fighter, name)| {
+                        Some(crate::move_nodes::live_steps::guards(
+                            fighter,
+                            self.move_graphs.get(fighter)?.get(name)?,
+                        ))
+                    })
+                    .unwrap_or_default();
+                rules.iter().cloned().map(move |mut rule| {
+                    if let Some(inject) =
+                        rule.inject.as_mut().filter(|inject| inject.guard.is_none())
+                    {
+                        inject.guard = guards
+                            .iter()
+                            .find(|(frame, _)| *frame == inject.frame)
+                            .map(|(_, guard)| guard.clone());
+                    }
+                    rule
+                })
+            })
+            .collect()
+    }
+
+    fn allows_flat_effect_rules(&self, key: &str) -> bool {
+        crate::move_nodes::live_support::allows_flat_effect_rules(&self.move_graphs, key)
+    }
+
+    fn live_effect_rule_union(&self) -> Vec<crate::game_link::SpawnRuleWire> {
+        self.effect_rules_store
+            .iter()
+            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .flat_map(|(key, rules)| {
+                // An effect added inside an If only fires when the If passes.
+                let guards = key
+                    .split_once('/')
+                    .and_then(|(fighter, name)| {
+                        Some(crate::move_nodes::live_steps::effect_guards(
+                            fighter,
+                            self.move_graphs.get(fighter)?.get(name)?,
+                        ))
+                    })
+                    .unwrap_or_default();
+                rules.iter().cloned().map(move |mut rule| {
+                    if let Some(inject) = rule.inject.as_mut() {
+                        inject.guard = guards
+                            .iter()
+                            .find(|(frame, _)| *frame == inject.frame)
+                            .map(|(_, guard)| guard.clone());
+                    }
+                    rule
+                })
+            })
+            .collect()
+    }
+
+    fn live_effect_control_rule_union(&self) -> Vec<crate::game_link::EffectControlRuleWire> {
+        self.effect_control_rules_store
+            .iter()
+            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .flat_map(|(_, rules)| rules.iter().cloned())
+            .collect()
+    }
+
+    /// Publish the complete safe ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let hitboxes: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let effects: Vec<_> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        let controls: Vec<_> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
+        let effects: Vec<_> = self.live_effect_rule_union();
+        let controls: Vec<_> = self.live_effect_control_rule_union();
         self.game_link.send_hitbox_rules(&hitboxes);
         self.game_link.send_spawn_rules(&effects);
         self.game_link.send_effect_control_rules(&controls);
@@ -15954,6 +16446,7 @@ impl VisionaryApp {
         keys.extend(self.move_source_cache.keys().cloned());
         keys.extend(self.state.effect_call_edits.keys().cloned());
         keys.extend(self.state.effect_call_full.keys().cloned());
+        keys.extend(self.node_effect_scripts.keys().cloned());
         keys.extend(self.state.sound_script_edits.keys().cloned());
         keys.extend(self.state.expression_script_edits.keys().cloned());
         keys.extend(
@@ -16173,15 +16666,20 @@ impl VisionaryApp {
             || !Self::edited_prefixes(&self.state).is_empty()
             || self.state.effect_call_edits.contains_key(&key)
             || self.state.effect_call_full.contains_key(&key)
+            || self.node_effect_scripts.contains_key(&key)
             || self.state.sound_script_edits.contains_key(&key)
             || self.state.expression_script_edits.contains_key(&key)
             || key.split_once('/').is_some_and(|(fighter, move_name)| {
-                self.state
-                    .edit_log
-                    .entries
+                self.move_graphs
                     .get(fighter)
-                    .and_then(|moves| moves.get(move_name))
-                    .is_some()
+                    .is_some_and(|graphs| graphs.contains_key(move_name))
+                    || self
+                        .state
+                        .edit_log
+                        .entries
+                        .get(fighter)
+                        .and_then(|moves| moves.get(move_name))
+                        .is_some()
             })
     }
 
@@ -16207,7 +16705,16 @@ impl VisionaryApp {
         self.state.effect_frame_residue.remove(&key);
         self.state.sound_script_edits.remove(&key);
         self.state.expression_script_edits.remove(&key);
+        self.node_effect_scripts.remove(&key);
         if let Some((fighter, move_name)) = key.split_once('/') {
+            if let Some(graphs) = self.move_graphs.get_mut(fighter) {
+                graphs.remove(move_name);
+                if graphs.is_empty() {
+                    self.move_graphs.remove(fighter);
+                }
+            }
+            self.node_editor.invalidate();
+            self.node_live_cache = None;
             self.state
                 .edit_log
                 .entries
@@ -16236,6 +16743,8 @@ impl VisionaryApp {
             self.state.hitboxes = hitboxes;
             self.state.set_script(script);
             self.state.effect_script = crate::acmd::parse_effect_script(&body);
+            self.state.source_effect_spawns =
+                crate::move_nodes::live_steps::source_spawn_names(&self.state.effect_script);
             self.state.effects_pristine = self.state.effect_script.to_effect_calls();
             self.state.effects = self.state.effects_pristine.clone();
             self.state.sound_script = crate::acmd::parse_sound_script(&body);
@@ -16355,6 +16864,11 @@ impl VisionaryApp {
         let Some(mv) = self.current_move_key() else {
             return;
         };
+        if self.node_effect_scripts.contains_key(&mv) {
+            self.state.effect_frame_residue.remove(&mv);
+            self.state.effect_dropped_lines.remove(&mv);
+            return;
+        }
         let script = std::mem::take(&mut self.state.effect_script);
         Self::record_effect_script_notes(&script, &mv, &mut self.state);
         self.state.effect_script = script;
@@ -16381,6 +16895,12 @@ impl VisionaryApp {
         mv: &str,
         state: &mut crate::data::AppState,
     ) {
+        if let Some(error) = script.preview_budget_error() {
+            // No derived empty residue may replace a previous source witness after refusal.
+            state.status =
+                format!("{mv}: Effect preview unavailable — {error}. Source is retained.");
+            return;
+        }
         let lost = crate::acmd::unexportable_effect_lines(script);
         if lost.is_empty() {
             state.effect_dropped_lines.remove(mv);
@@ -16396,6 +16916,9 @@ impl VisionaryApp {
     }
 
     fn apply_effect_call_edits_to_current(&mut self) {
+        if self.restore_node_effects_to_current() {
+            return;
+        }
         for call in &mut self.state.effects_pristine {
             call.normalize_timing();
         }
@@ -16415,6 +16938,21 @@ impl VisionaryApp {
             return;
         };
         self.state.effects = materialize_effect_calls(&self.state.effects_pristine, Some(edits));
+    }
+
+    fn restore_node_effects_to_current(&mut self) -> bool {
+        let Some(key) = self.current_move_key() else {
+            return false;
+        };
+        let Some(script) = self.node_effect_scripts.get(&key) else {
+            return false;
+        };
+        let move_name = key.split_once('/').map(|(_, name)| name).unwrap_or("move");
+        self.state.effect_script = crate::acmd::parse_effect_script(
+            &crate::acmd::preview_effect_structure_fn(script, move_name),
+        );
+        self.state.effects = self.state.effect_script.to_effect_calls();
+        true
     }
 
     /// Repair legacy one-shot ranges in every persisted effect snapshot before it is saved or
@@ -16469,41 +17007,8 @@ impl VisionaryApp {
         if self.state.hitboxes_pristine.is_empty() && !record.hitboxes_pristine.is_empty() {
             self.state.hitboxes_pristine = record.hitboxes_pristine;
         }
-        let source_reverse = self.state.script.to_reverse_lr_events();
-        let source_hurtboxes = self.state.script.to_hurtboxes();
-        let source_hurtbox_conditions = self.state.script.to_hurtbox_conditions();
-        let source_speed_ex = self.state.script.to_speed_ex_events();
-        let source_speed = self.state.script.to_speed_events();
-        let source_add_speed_no_limit = self.state.script.to_add_speed_no_limit_events();
-        let source_correct = self.state.script.to_correct_events();
-        let source_ft_catch_stop = self.state.script.to_ft_catch_stop_events();
-        let source_ft_start_adjust_motion_frame =
-            self.state.script.to_ft_start_adjust_motion_frame_events();
-        let source_motion_module_set_rate = self.state.script.to_motion_module_set_rate_events();
-        let source_motion_module_set_helper_calculation = self
-            .state
-            .script
-            .to_motion_module_set_helper_calculation_events();
-        let source_motion_module_set_rate_partial =
-            self.state.script.to_motion_module_set_rate_partial_events();
-        let source_motion_module_set_frame_partial = self
-            .state
-            .script
-            .to_motion_module_set_frame_partial_events();
-        let source_clr_speed = self.state.script.to_clr_speed_events();
-        let source_set_air = self.state.script.to_set_air_events();
-        let source_change_kinetic = self.state.script.to_change_kinetic_events();
-        let source_kinetic_energy = self.state.script.to_kinetic_energy_events();
-        let source_kinetic_add_speed = self.state.script.to_kinetic_add_speed_events();
-        let source_work_flags = self.state.script.to_work_flag_events();
-        let source_work_transition_terms = self.state.script.to_work_transition_term_events();
-        let source_work_module_inc_ints = self.state.script.to_work_module_inc_int_events();
-        let source_work_module_sets = self.state.script.to_work_module_set_events();
-        let source_kinetic_clear_speed_all = self.state.script.to_kinetic_clear_speed_all_events();
-        let source_kinetic_set_consider_ground_friction = self
-            .state
-            .script
-            .to_kinetic_set_consider_ground_friction_events();
+        let source_script = self.state.script.clone();
+        let point_originals = crate::data::PointOriginals::snapshot(&source_script);
         let had_source_script = !self.state.script.stmts.is_empty();
         self.state.set_script(record.script);
         // A saved record is the edited script, not the live/source baseline. Preserve the
@@ -16513,34 +17018,10 @@ impl VisionaryApp {
             // The saved record is the edited script, but the source script remains the live
             // baseline. Preserve its hurtbox spans so newly authored HIT_NO ranges can be
             // represented as live injections instead of being mistaken for pristine calls.
-            self.state.hurtboxes_pristine = source_hurtboxes;
-            self.state.hurtbox_conditions_pristine = source_hurtbox_conditions;
-            self.state.reverse_lr_pristine = source_reverse;
-            self.state.speed_ex_pristine = source_speed_ex;
-            self.state.speed_pristine = source_speed;
-            self.state.add_speed_no_limit_pristine = source_add_speed_no_limit;
-            self.state.correct_pristine = source_correct;
-            self.state.ft_catch_stop_pristine = source_ft_catch_stop;
-            self.state.ft_start_adjust_motion_frame_pristine = source_ft_start_adjust_motion_frame;
-            self.state.motion_module_set_rate_pristine = source_motion_module_set_rate;
-            self.state.motion_module_set_helper_calculation_pristine =
-                source_motion_module_set_helper_calculation;
-            self.state.motion_module_set_rate_partial_pristine =
-                source_motion_module_set_rate_partial;
-            self.state.motion_module_set_frame_partial_pristine =
-                source_motion_module_set_frame_partial;
-            self.state.clr_speed_pristine = source_clr_speed;
-            self.state.set_air_pristine = source_set_air;
-            self.state.change_kinetic_pristine = source_change_kinetic;
-            self.state.kinetic_energy_pristine = source_kinetic_energy;
-            self.state.kinetic_add_speed_pristine = source_kinetic_add_speed;
-            self.state.work_flag_pristine = source_work_flags;
-            self.state.work_transition_term_pristine = source_work_transition_terms;
-            self.state.work_module_inc_int_pristine = source_work_module_inc_ints;
-            self.state.work_module_set_pristine = source_work_module_sets;
-            self.state.kinetic_clear_speed_all_pristine = source_kinetic_clear_speed_all;
-            self.state.kinetic_set_consider_ground_friction_pristine =
-                source_kinetic_set_consider_ground_friction;
+            self.state.hurtboxes_pristine = source_script.to_hurtboxes();
+            self.state.hurtbox_conditions_pristine = source_script.to_hurtbox_conditions();
+            point_originals.restore(&mut self.state);
+            self.state.source_script = source_script.clone();
         }
         self.state.hitboxes = record.hitboxes;
         true
@@ -16587,6 +17068,57 @@ impl VisionaryApp {
         for (fighter, params) in &self.roster.params {
             if !params.is_empty() {
                 project.fighters.entry(fighter.clone()).or_default().params = params.clone();
+            }
+        }
+        for (fighter, behavior) in &self.roster.behaviors {
+            if !behavior.is_empty() {
+                project
+                    .fighters
+                    .entry(fighter.clone())
+                    .or_default()
+                    .behavior = behavior.clone();
+            }
+        }
+        for (fighter, layout) in &self.roster.behavior_layouts {
+            if !layout.is_empty() {
+                project
+                    .fighters
+                    .entry(fighter.clone())
+                    .or_default()
+                    .behavior_layout = layout.clone();
+            }
+        }
+        for (fighter, charts) in &self.roster.controller_charts {
+            if !charts.is_empty() {
+                project
+                    .fighters
+                    .entry(fighter.clone())
+                    .or_default()
+                    .controller_charts = charts.clone();
+            }
+        }
+        for (fighter, meters) in &self.roster.meters {
+            if !meters.is_empty() {
+                project.fighters.entry(fighter.clone()).or_default().meters = meters.clone();
+            }
+        }
+        for (fighter, graphs) in &self.move_graphs {
+            if !graphs.is_empty() {
+                project
+                    .fighters
+                    .entry(fighter.clone())
+                    .or_default()
+                    .move_graphs = graphs.clone();
+            }
+        }
+        for (key, script) in &self.node_effect_scripts {
+            if let Some((fighter, move_name)) = key.split_once('/') {
+                project
+                    .fighters
+                    .entry(fighter.to_string())
+                    .or_default()
+                    .effect_scripts
+                    .insert(move_name.to_string(), script.clone());
             }
         }
         for (fighter, moves) in &self.state.edit_log.entries {
@@ -16739,6 +17271,191 @@ impl VisionaryApp {
                 .insert(move_name.to_string(), warning.clone());
         }
         project
+    }
+
+    /// Export constrained behavior into an explicitly selected, contract-marked plugin tree.
+    /// The adapter boundary owns every path, marker, symlink, and atomic-write check; this UI
+    /// supplies no arbitrary output filename and never searches the user's disk for plugins.
+    fn export_gimmick_adapter(&mut self) {
+        let project = self.build_project();
+        if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
+            self.state.status = format!("Gimmick adapter refused: {error}");
+            return;
+        }
+        let project = match crate::move_nodes::project::expand(&project) {
+            Ok(project) => project,
+            Err(errors) => {
+                self.state.status = format!(
+                    "Move nodes refused: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                return;
+            }
+        };
+        let graphs = project
+            .fighters
+            .iter()
+            .map(|(fighter, edits)| (fighter.clone(), edits.behavior.clone()))
+            .collect();
+        let meters = project
+            .fighters
+            .into_iter()
+            .filter_map(|(fighter, edits)| {
+                (!edits.meters.is_empty()).then_some((fighter, edits.meters))
+            })
+            .collect();
+        let artifact = match crate::gimmicks::adapter::render_with_meters(&graphs, &meters) {
+            Ok(artifact) if !artifact.fighters.is_empty() => artifact,
+            Ok(_) => {
+                self.state.status = "No enabled gimmick behavior or meters to export.".into();
+                return;
+            }
+            Err(errors) => {
+                self.state.status = format!(
+                    "Gimmick adapter refused: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                return;
+            }
+        };
+        let mut dialog = rfd::FileDialog::new().set_title("Select compatible plugin source…");
+        if let Some(parent) = self.project_path.as_ref().and_then(|path| path.parent()) {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(plugin_root) = dialog.pick_folder() else {
+            return;
+        };
+        match crate::gimmicks::adapter::export_to_plugin(&plugin_root, &artifact) {
+            Ok(export) if export.changed => {
+                self.state.status = format!(
+                    "Exported gimmick adapter for {} fighter(s) to {}",
+                    artifact.fighters.len(),
+                    export.destination.display()
+                );
+            }
+            Ok(export) => {
+                self.state.status = format!(
+                    "Gimmick adapter is already current at {}",
+                    export.destination.display()
+                );
+            }
+            Err(error) => {
+                self.state.status = format!("Gimmick adapter refused: {error}");
+            }
+        }
+    }
+
+    /// Build only the managed gimmick runtime in the selected `slight_replica` source tree.
+    /// Normal mod export owns the combined ACMD + gimmick path; this advanced command is useful
+    /// when testing the runtime by itself and deliberately clears the managed ACMD slot.
+    fn build_gimmick_plugin(&mut self) {
+        if self.export_build.is_some() {
+            self.state.status = "Wait for the current plugin build to finish.".into();
+            return;
+        }
+        let project = self.build_project();
+        if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
+            self.state.status = format!("Gimmick plugin refused: {error}");
+            return;
+        }
+        let project = match crate::move_nodes::project::expand(&project) {
+            Ok(project) => project,
+            Err(errors) => {
+                self.state.status = format!(
+                    "Move nodes refused: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                return;
+            }
+        };
+        let graphs = project
+            .fighters
+            .iter()
+            .map(|(fighter, edits)| (fighter.clone(), edits.behavior.clone()))
+            .collect();
+        let meters = project
+            .fighters
+            .into_iter()
+            .filter_map(|(fighter, edits)| {
+                (!edits.meters.is_empty()).then_some((fighter, edits.meters))
+            })
+            .collect();
+        let artifact = match crate::gimmicks::adapter::render_with_meters(&graphs, &meters) {
+            Ok(artifact) if !artifact.fighters.is_empty() => artifact,
+            Ok(_) => {
+                self.state.status = "No enabled gimmick behavior or meters to build.".into();
+                return;
+            }
+            Err(errors) => {
+                self.state.status = format!(
+                    "Gimmick plugin refused: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                return;
+            }
+        };
+
+        let Some(plugin_root) = rfd::FileDialog::new()
+            .set_title("Select compatible plugin source…")
+            .pick_folder()
+        else {
+            return;
+        };
+        let mut package_dialog =
+            rfd::FileDialog::new().set_title("Select existing target mod folder…");
+        if let Some(directory) = &self.export_dir {
+            package_dialog = package_dialog.set_directory(directory);
+        }
+        let Some(package_root) = package_dialog.pick_folder() else {
+            return;
+        };
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ExportBuildState {
+            done: false,
+            message: format!(
+                "building gimmick plugin for {} fighter(s)…",
+                artifact.fighters.len()
+            ),
+        }));
+        self.export_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let message = match crate::gimmicks::package::build_into_package(
+                &plugin_root,
+                &package_root,
+                &artifact,
+            ) {
+                Ok(packaged) => format!(
+                    "Gimmick plugin ready → {}{}",
+                    packaged.plugin_nro.display(),
+                    if packaged.adapter_changed {
+                        ""
+                    } else {
+                        " (adapter source was already current)"
+                    }
+                ),
+                Err(error) => format!("Gimmick plugin build refused: {error}"),
+            };
+            if let Ok(mut progress) = state.lock() {
+                progress.done = true;
+                progress.message = message;
+            }
+        });
     }
 
     fn export_project(&mut self) {
@@ -17109,6 +17826,15 @@ impl VisionaryApp {
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.roster.project = crate::mod_project::RosterMod::default();
         self.roster.params.clear();
+        self.roster.behaviors.clear();
+        self.roster.behavior_layouts.clear();
+        self.roster.controller_charts.clear();
+        self.move_graphs.clear();
+        self.node_effect_scripts.clear();
+        self.node_editor.invalidate();
+        self.node_live_cache = None;
+        self.roster.meters.clear();
+        self.gimmicks_editor.invalidate();
         self.edit_history.clear();
         self.game_link.end_project_batch();
         self.game_link.send_reset_pins();
@@ -17265,18 +17991,26 @@ impl VisionaryApp {
                     }
                 }
                 if ui
-                    .button("New project…")
+                    .button("New project")
                     .on_hover_text(
-                        "Pick a workspace folder — every edit lives there and autosaves",
+                        "Enter a workspace folder — every edit lives there and autosaves",
                     )
                     .clicked()
                 {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        chosen = Some(crate::project_hub::HubAction::New(folder));
+                    self.project_hub.new_workspace = Some(String::new());
+                }
+                if let Some(path) = &mut self.project_hub.new_workspace {
+                    ui.label("Workspace folder");
+                    ui.text_edit_singleline(path);
+                    if ui.add_enabled(!path.trim().is_empty(), egui::Button::new("Create project")).clicked() {
+                        chosen = Some(crate::project_hub::HubAction::New(std::path::PathBuf::from(path.trim())));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.project_hub.new_workspace = None;
                     }
                 }
                 if ui
-                    .button("Open project…")
+                    .button("Open project")
                     .on_hover_text("Open an editable project for further editing")
                     .clicked()
                 {
@@ -17288,7 +18022,7 @@ impl VisionaryApp {
                     }
                 }
                 if ui
-                    .button("Import mod…")
+                    .button("Import mod")
                     .on_hover_text(
                         "Import any mod folder as an editable project: roster, names, \
                          portraits, and values are adopted; compiled scripts stay reference-only",
@@ -17378,7 +18112,7 @@ impl VisionaryApp {
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Save…").clicked() {
+                    if ui.button("Save").clicked() {
                         decision = Some("save");
                     }
                     if ui.button("Discard").clicked() {
@@ -17474,7 +18208,7 @@ impl VisionaryApp {
                     if ui.button("Close").clicked() {
                         close = true;
                     }
-                    if ui.button("Project Hub…").clicked() {
+                    if ui.button("Project Hub").clicked() {
                         self.project_hub.show = true;
                     }
                 });
@@ -17738,13 +18472,13 @@ impl VisionaryApp {
                                 self.state.status = error.to_string();
                             }
                         }
-                        if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base game files…")).on_disabled_hover_text("Choose a base game folder from File, or wait for the current copy to finish.").clicked() {
+                        if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base game files")).on_disabled_hover_text("Choose a base game folder from File, or wait for the current copy to finish.").clicked() {
                             action = Some(WorkspaceAction::CopyBaseFiles);
                         }
                     });
                     ui.weak("Copy files into romfs/, edit them, then export your mod.");
                 } else {
-                    if ui.button("Open or create a project…").clicked() {
+                    if ui.button("Open or create a project").clicked() {
                         self.project_hub.show = true;
                     }
                 }
@@ -17811,22 +18545,22 @@ impl VisionaryApp {
                             if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base model")).on_hover_text("Copy the complete base game model and textures for this costume; keep existing edits").clicked() {
                                 action = Some(WorkspaceAction::CopyBaseModel);
                             }
-                            if ui.button("Model folder…").on_hover_text(
+                            if ui.button("Model folder").on_hover_text(
                                 "Copy a complete model folder into this project's selected fighter/costume",
                             ).clicked() {
                                 action = Some(WorkspaceAction::ImportModelFolder);
                             }
-                            if ui.button("Model files…").on_hover_text(
+                            if ui.button("Model files").on_hover_text(
                                 "Copy selected model, material, skeleton, helper, or texture files",
                             ).clicked() {
                                 action = Some(WorkspaceAction::ImportModelFiles);
                             }
-                            if ui.button("Animations…").on_hover_text(
+                            if ui.button("Animations").on_hover_text(
                                 "Copy one or more .nuanmb files into the selected motion folder",
                             ).clicked() {
                                 action = Some(WorkspaceAction::ImportAnimations);
                             }
-                            if ui.button("swing.prc…").on_hover_text(
+                            if ui.button("swing.prc").on_hover_text(
                                 "Copy a .prc file into the selected motion folder as swing.prc",
                             ).clicked() {
                                 action = Some(WorkspaceAction::ImportSwing);
@@ -17904,7 +18638,7 @@ impl VisionaryApp {
                     });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Project Hub…").clicked() {
+                    if ui.button("Project Hub").clicked() {
                         self.project_hub.show = true;
                     }
                 });
@@ -18099,6 +18833,31 @@ impl VisionaryApp {
         self.export_mod(true);
     }
 
+    /// Writes the live rules and the prebuilt plugin into a mod folder.
+    fn write_rule_pack(&mut self, dest: &std::path::Path) -> anyhow::Result<()> {
+        let plugin = find_prebuilt_plugin(std::env::current_exe().ok())
+            .ok_or_else(|| anyhow::anyhow!("the plugin that ships with Visionary is missing"))?;
+        std::fs::create_dir_all(dest)?;
+        std::fs::copy(plugin, dest.join("plugin.nro"))?;
+        let mut messages = vec![
+            serde_json::json!({ "hitbox_rules": self.live_hitbox_rule_union() }).to_string(),
+            serde_json::json!({ "spawn_rules": self.live_effect_rule_union() }).to_string(),
+            serde_json::json!({ "effect_control_rules": self.live_effect_control_rule_union() })
+                .to_string(),
+        ];
+        messages.extend(
+            self.gimmicks_editor
+                .pack_messages(
+                    &self.roster.params,
+                    &self.roster.behaviors,
+                    &self.roster.controller_charts,
+                )
+                .map_err(anyhow::Error::msg)?,
+        );
+        std::fs::write(dest.join(RULE_PACK_FILE), messages.join("\n"))?;
+        Ok(())
+    }
+
     fn export_mod(&mut self, developer: bool) {
         if self.workspace_copy_rx.is_some() {
             self.state.status =
@@ -18106,6 +18865,12 @@ impl VisionaryApp {
             return;
         }
         let project = self.build_project();
+        if developer {
+            if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
+                self.state.status = format!("Export refused: {error}");
+                return;
+            }
+        }
         // The manual workspace overlay is a first-class export even when there are no serialized
         // ACMD/EFF edits. This is the common model/animation iteration case.
         let has_workspace_overlay = self
@@ -18117,6 +18882,84 @@ impl VisionaryApp {
             self.state.status = "No edits to export yet.".into();
             return;
         }
+        let mut combined_runtime = None;
+        let mut planned_source = None;
+        let mut planned_warnings = Vec::new();
+        let mut planned_has_source = false;
+        let mut rule_pack = false;
+        if !developer {
+            let has_gimmicks = project.fighters.values().any(|fighter| {
+                !fighter.behavior.is_empty()
+                    || !fighter.controller_charts.is_empty()
+                    || fighter.meters.iter().any(|binding| binding.enabled)
+            });
+            let legacy_plan = if has_gimmicks {
+                None
+            } else {
+                match crate::mod_export::plan_normal_export(&project, None) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        self.state.status = format!("Export failed: {error}");
+                        return;
+                    }
+                }
+            };
+            let needs_runtime = has_gimmicks
+                || legacy_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.has_acmd_source);
+            // No Rust here: the mod carries the rules the editor sends live, and the shipped
+            // plugin replays them at boot. What the user tested is what ships.
+            rule_pack = needs_runtime
+                && (!rust_toolchain_available()
+                    || find_plugin_source(
+                        load_config_path("combined_plugin_root"),
+                        std::env::current_exe().ok(),
+                    )
+                    .is_none());
+            let plan = if rule_pack {
+                crate::mod_export::NormalExportPlan {
+                    generated_source: None,
+                    gimmick_runtime: None,
+                    warnings: Vec::new(),
+                    has_acmd_source: false,
+                }
+            } else if needs_runtime {
+                let plugin_root = match find_plugin_source(
+                    load_config_path("combined_plugin_root"),
+                    std::env::current_exe().ok(),
+                ) {
+                    Some(found) => found,
+                    None => {
+                        let mut runtime_dialog = rfd::FileDialog::new()
+                            .set_title("Select Visionary slight_replica source");
+                        if let Some(parent) = self.project_path.as_ref().and_then(|p| p.parent()) {
+                            runtime_dialog = runtime_dialog.set_directory(parent);
+                        }
+                        let Some(picked) = runtime_dialog.pick_folder() else {
+                            return;
+                        };
+                        picked
+                    }
+                };
+                let plan = match crate::mod_export::plan_normal_export(&project, Some(&plugin_root))
+                {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        self.state.status = format!("Combined plugin refused: {error}");
+                        return;
+                    }
+                };
+                save_config_path("combined_plugin_root", &plugin_root);
+                plan
+            } else {
+                legacy_plan.expect("a source-free non-gimmick export has a legacy plan")
+            };
+            planned_source = plan.generated_source;
+            planned_warnings = plan.warnings;
+            planned_has_source = plan.has_acmd_source;
+            combined_runtime = plan.gimmick_runtime;
+        }
         let plugin_name = crate::mod_export::plugin_name(&project);
         let title = if developer {
             "Export developer files into folder…"
@@ -18127,7 +18970,10 @@ impl VisionaryApp {
         if let Some(dir) = &self.export_dir {
             dialog = dialog.set_directory(dir);
         }
-        let Some(parent) = dialog.pick_folder() else {
+        let chosen = std::env::var_os("VISIONARY_EXPORT_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dialog.pick_folder());
+        let Some(parent) = chosen else {
             return;
         };
         self.export_dir = Some(parent.clone());
@@ -18165,7 +19011,18 @@ impl VisionaryApp {
                     .join(&plugin_name)
             },
         };
-        let outcome = match run_export(&project, &inputs) {
+        let outcome = match if developer {
+            run_export(&project, &inputs)
+        } else {
+            run_export_preverified(
+                &project,
+                &inputs,
+                planned_source,
+                planned_has_source,
+                combined_runtime.as_ref(),
+                planned_warnings,
+            )
+        } {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.state.status = format!("Export failed: {error}");
@@ -18179,6 +19036,12 @@ impl VisionaryApp {
             built_source_root,
             has_source,
         } = outcome;
+
+        if rule_pack {
+            if let Err(error) = self.write_rule_pack(&dest) {
+                errors.push(format!("mod rules: {error}"));
+            }
+        }
 
         // `run_export` has no generated source to create the destination for an overlay-only
         // project. Create it after verification succeeds, preserving the all-or-nothing refusal
@@ -18321,8 +19184,11 @@ impl VisionaryApp {
 
         // 3. Mod-folder exports compile the generated plugin in the background and keep the NRO
         // inside that ARCropolis mod. Developer exports intentionally stop at editable source.
+        let has_combined_runtime = combined_runtime.is_some();
         if !developer && errors.is_empty() {
-            if let Some(src_root) = built_source_root {
+            if let Some(runtime) = combined_runtime {
+                self.spawn_combined_export_build(dest.clone(), runtime, warnings.clone());
+            } else if let Some(src_root) = built_source_root {
                 let nro = dest.join("plugin.nro");
                 self.spawn_export_build(dest.clone(), src_root, plugin_name, nro, warnings.clone());
             }
@@ -18340,7 +19206,7 @@ impl VisionaryApp {
                 "{result} at {} — {}{}",
                 dest.display(),
                 report.join(" · "),
-                if has_source && !developer {
+                if (has_source || has_combined_runtime) && !developer {
                     " · building plugin…"
                 } else {
                     ""
@@ -18353,6 +19219,30 @@ impl VisionaryApp {
                 report.join(" · ")
             )
         };
+    }
+
+    fn spawn_combined_export_build(
+        &mut self,
+        dest: std::path::PathBuf,
+        runtime: crate::mod_export::SelectedGimmickRuntime,
+        warnings: Vec<String>,
+    ) {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ExportBuildState {
+            done: false,
+            message: "building one combined ACMD + gimmick plugin…".into(),
+        }));
+        self.export_build = Some(state.clone());
+        std::thread::spawn(move || {
+            let base = match runtime.build_into_package(&dest) {
+                Ok(packaged) => format!("Mod folder ready → {}", packaged.plugin_nro.display()),
+                Err(error) => format!("Combined plugin build FAILED: {error}"),
+            };
+            let message = export_build_done_message(&base, &warnings);
+            if let Ok(mut progress) = state.lock() {
+                progress.done = true;
+                progress.message = message;
+            }
+        });
     }
 
     /// Run `cargo skyline build --release` on generated source in a background thread.
@@ -18440,6 +19330,33 @@ impl VisionaryApp {
             return;
         }
 
+        let stored_move_graphs = project
+            .fighters
+            .iter()
+            .filter(|(_, fm)| !fm.move_graphs.is_empty())
+            .map(|(fighter, fm)| (fighter.clone(), fm.move_graphs.clone()))
+            .collect();
+        let stored_behaviors = project
+            .fighters
+            .iter()
+            .filter(|(_, fm)| !fm.behavior.is_empty())
+            .map(|(fighter, fm)| (fighter.clone(), fm.behavior.clone()))
+            .collect();
+        project = match crate::move_nodes::project::expand(&project) {
+            Ok(project) => project,
+            Err(errors) => {
+                self.state.status = format!(
+                    "Project load failed: {}",
+                    errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+                return;
+            }
+        };
+
         // Loading is replacement, not an undocumented merge. Clear the previous project's
         // runtime rules/carrier first, then replace every local edit store so saving immediately
         // after a load reproduces exactly the file that was opened. The project barrier covers
@@ -18463,6 +19380,7 @@ impl VisionaryApp {
         self.move_source_cache.clear();
         self.source_mismatch_prompt = None;
         self.rebuilding_project_live = false;
+        self.node_effect_scripts.clear();
         self.replay_live_fallback_key = None;
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
@@ -18483,6 +19401,29 @@ impl VisionaryApp {
             .filter(|(_, fm)| !fm.params.is_empty())
             .map(|(fighter, fm)| (fighter.clone(), fm.params.clone()))
             .collect();
+        self.roster.behaviors = stored_behaviors;
+        self.roster.behavior_layouts = project
+            .fighters
+            .iter()
+            .filter(|(_, fighter)| !fighter.behavior_layout.is_empty())
+            .map(|(fighter, data)| (fighter.clone(), data.behavior_layout.clone()))
+            .collect();
+        self.roster.controller_charts = project
+            .fighters
+            .iter()
+            .filter(|(_, fighter)| !fighter.controller_charts.is_empty())
+            .map(|(fighter, data)| (fighter.clone(), data.controller_charts.clone()))
+            .collect();
+        self.roster.meters = project
+            .fighters
+            .iter()
+            .filter(|(_, fm)| !fm.meters.is_empty())
+            .map(|(fighter, fm)| (fighter.clone(), fm.meters.clone()))
+            .collect();
+        self.move_graphs = stored_move_graphs;
+        self.node_editor.invalidate();
+        self.node_live_cache = None;
+        self.gimmicks_editor.invalidate();
         let mut n_acmd = 0;
         let mut n_calls = 0;
         let mut n_eff = 0;
@@ -18565,6 +19506,10 @@ impl VisionaryApp {
             for (mv, script) in fm.expression_scripts {
                 self.state
                     .expression_script_edits
+                    .insert(format!("{fighter}/{mv}"), script);
+            }
+            for (mv, script) in fm.effect_scripts {
+                self.node_effect_scripts
                     .insert(format!("{fighter}/{mv}"), script);
             }
             for (mv, warning) in fm.capture_branch_warnings {
@@ -19141,6 +20086,7 @@ impl VisionaryApp {
                     frame: Self::script_to_motion_frame(event.frame),
                     args: Vec::new(),
                     command: Some("REVERSE_LR".into()),
+                    guard: None,
                 }),
                 func: None,
             });
@@ -19148,32 +20094,84 @@ impl VisionaryApp {
         rules
     }
 
-    /// Send the current structural facing edits to the plugin.
-    fn push_reverse_lr_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let rules = Self::reverse_lr_rules_for(
-            motion,
-            &self.state.reverse_lr_pristine,
-            &self.state.script.to_reverse_lr_events(),
-        );
-        let key = format!("{mv_key}#reverse_lr");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
+    point_rule_pushers! {
+        push_speed_rules: "speed", speed_rules_for,
+            speed_pristine, to_speed_events,
+            "SET_SPEED", "SET_SPEED",
+            "a live capture and an unambiguous frame";
+        push_speed_ex_rules: "speed_ex", speed_ex_rules_for,
+            speed_ex_pristine, to_speed_ex_events,
+            "SET_SPEED_EX", "SET_SPEED_EX",
+            "a numeric live capture or an unambiguous frame";
+        push_add_speed_no_limit_rules: "add_speed_no_limit", add_speed_no_limit_rules_for,
+            add_speed_no_limit_pristine, to_add_speed_no_limit_events,
+            "ADD_SPEED_NO_LIMIT", "ADD_SPEED_NO_LIMIT",
+            "a live capture and an unambiguous frame";
+        push_correct_rules: "correct", correct_rules_for,
+            correct_pristine, to_correct_events,
+            "CORRECT", "CORRECT",
+            "a numeric live capture and numeric replacement kind";
+        push_ft_catch_stop_rules: "ft_catch_stop", ft_catch_stop_rules_for,
+            ft_catch_stop_pristine, to_ft_catch_stop_events,
+            "FT_CATCH_STOP", "FT_CATCH_STOP",
+            "a numeric live capture and a unique argument pair";
+        push_ft_start_adjust_motion_frame_rules: "ft_start_adjust_motion_frame", ft_start_adjust_motion_frame_rules_for,
+            ft_start_adjust_motion_frame_pristine, to_ft_start_adjust_motion_frame_events,
+            "FT_START_ADJUST_MOTION_FRAME_arg1", "FT_START_ADJUST_MOTION_FRAME_arg1",
+            "a numeric live capture and a unique value";
+        push_motion_module_set_rate_rules: "motion_module_set_rate", motion_module_set_rate_rules_for,
+            motion_module_set_rate_pristine, to_motion_module_set_rate_events,
+            "MotionModule::set_rate", "MotionModule::set_rate",
+            "a numeric live capture, a unique same-frame rate, and a positive live replacement";
+        push_motion_module_set_helper_calculation_rules: "motion_module_set_helper_calculation", motion_module_set_helper_calculation_rules_for,
+            motion_module_set_helper_calculation_pristine, to_motion_module_set_helper_calculation_events,
+            "MotionModule::set_helper_calculation", "MotionModule::set_helper_calculation",
+            "a boolean live capture and a unique same-frame value";
+        push_clr_speed_rules: "clr_speed", clr_speed_rules_for,
+            clr_speed_pristine, to_clr_speed_events,
+            "CLR_SPEED", "CLR_SPEED",
+            "a numeric live capture, a numeric replacement, and a unique frame/key";
+        push_change_kinetic_rules: "change_kinetic", change_kinetic_rules_for,
+            change_kinetic_pristine, to_change_kinetic_events,
+            "change_kinetic", "change_kinetic",
+            "a numeric live capture, a numeric replacement, and a unique frame/key";
+        push_kinetic_energy_rules: "kinetic_energy", kinetic_energy_rules_for,
+            kinetic_energy_pristine, to_kinetic_energy_events,
+            "KineticModule energy", "KineticModule energy",
+            "a numeric live capture, a numeric replacement, and a unique frame/key";
+        push_kinetic_add_speed_rules: "kinetic_add_speed", kinetic_add_speed_rules_for,
+            kinetic_add_speed_pristine, to_kinetic_add_speed_events,
+            "KineticModule::add_speed", "KineticModule::add_speed",
+            "a unique zero-z live capture and unchanged frame";
+        push_work_module_inc_int_rules: "work_module_inc_int", work_module_inc_int_rules_for,
+            work_module_inc_int_pristine, to_work_module_inc_int_events,
+            "WorkModule::inc_int", "WorkModule::inc_int",
+            "a numeric slot capture, a numeric replacement, and a unique same-frame slot key";
+        push_work_flag_rules: "work_flag", work_flag_rules_for,
+            work_flag_pristine, to_work_flag_events,
+            "WorkModule flag", "WorkModule flag",
+            "a numeric live capture, a numeric replacement, and a unique same-frame operation/flag key";
+        push_work_transition_term_rules: "work_transition_term", work_transition_term_rules_for,
+            work_transition_term_pristine, to_work_transition_term_events,
+            "WorkModule transition term", "WorkModule transition-term",
+            "a numeric live capture, a numeric replacement, and a unique same-frame operation/term key";
+        push_work_module_set_rules: "work_module_set", work_module_set_rules_for,
+            work_module_set_pristine, to_work_module_set_events,
+            "WorkModule value", "WorkModule value",
+            "a numeric live capture, a numeric value and slot replacement, and a unique same-frame operation/value/slot key";
+        push_kinetic_set_consider_ground_friction_rules: "kinetic_set_consider_ground_friction", kinetic_set_consider_ground_friction_rules_for,
+            kinetic_set_consider_ground_friction_pristine, to_kinetic_set_consider_ground_friction_events,
+            "set_consider_ground_friction", "set_consider_ground_friction",
+            "a numeric live capture/attribute for live rules";
+    }
+
+    point_rule_pushers! {
+        push_reverse_lr_rules: "reverse_lr", reverse_lr_rules_for,
+            reverse_lr_pristine, to_reverse_lr_events;
+        push_set_air_rules: "set_air", set_air_rules_for,
+            set_air_pristine, to_set_air_events;
+        push_kinetic_clear_speed_all_rules: "kinetic_clear_speed_all", kinetic_clear_speed_all_rules_for,
+            kinetic_clear_speed_all_pristine, to_kinetic_clear_speed_all_events;
     }
 
     /// The authoritative `motion_list.bin` hash for a visible move (what
@@ -19949,389 +20947,6 @@ impl VisionaryApp {
         live_capture_branch_warning(&fighter.name, &move_name.name, &body)
     }
 
-    /// ATTACK capture args (positional, editor conventions) → display Hitbox.
-    ///
-    /// The attribute slots are plain lua numbers on the wire; they are DECODED here into the
-    /// same symbolic names the property dropdowns offer, so a fetched hitbox shows its live
-    /// value as the selected entry. A number with no known name is kept verbatim (and the
-    /// dropdown offers it) rather than being dropped.
-    /// `func` is the captured macro name, carried so an `ATTACK_IGNORE_THROW` hit does not
-    /// come back from the game as a plain `ATTACK` and export as one. The lua stack always
-    /// holds the full 36 arguments — the macro pushes nils for the absent capsule options —
-    /// so unlike the source parser this path needs no shift.
-    fn hitbox_from_capture(
-        func: &str,
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-        bone_rev: &HashMap<u64, String>,
-        labels: &HashMap<u64, String>,
-    ) -> Option<crate::data::Hitbox> {
-        if args.len() < 17 {
-            return None;
-        }
-        let f32_at = |i: usize| args.get(i).and_then(|a| a.as_f32());
-        let i64_at = |i: usize| args.get(i).and_then(|a| a.as_i64());
-        let const_at = |i: usize, table: crate::param_labels::ConstTable| {
-            i64_at(i)
-                .map(|v| {
-                    crate::param_labels::const_name(table, v)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| v.to_string())
-                })
-                .unwrap_or_default()
-        };
-        // Lua scripts do not consistently push flag slots as Bool. Some use Int/Num, and the
-        // plugin deliberately preserves that source type when rewriting. Decode all scalar
-        // representations here so an integer-backed true flag does not arrive in the editor as
-        // false and get written back incorrectly on the next edit.
-        let bool_at = |i: usize| i64_at(i).is_some_and(|v| v != 0);
-        let bone_hash = args.get(2).and_then(|a| a.as_hash())?;
-        let bone_name = bone_rev
-            .get(&bone_hash)
-            .cloned()
-            .unwrap_or_else(|| format!("{bone_hash:#x}"));
-        let capsule_end = match (f32_at(12), f32_at(13), f32_at(14)) {
-            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
-            _ => None,
-        };
-        let start = Self::motion_to_script_frame(frame);
-        Some(crate::data::Hitbox {
-            func: func.to_string(),
-            id: i64_at(0)? as u32,
-            part: i64_at(1).unwrap_or(0) as u32,
-            bone_name,
-            damage: f32_at(3).unwrap_or(0.0),
-            angle: i64_at(4).unwrap_or(0) as i32,
-            kb_scaling: i64_at(5).unwrap_or(0) as i32,
-            fkb: i64_at(6).unwrap_or(0) as i32,
-            kb_base: i64_at(7).unwrap_or(0) as i32,
-            size: f32_at(8).unwrap_or(1.0),
-            offset_x: f32_at(9).unwrap_or(0.0),
-            offset_y: f32_at(10).unwrap_or(0.0),
-            offset_z: f32_at(11).unwrap_or(0.0),
-            capsule_end,
-            hitlag_mult: f32_at(15).unwrap_or(1.0),
-            sdi_mult: f32_at(16).unwrap_or(1.0),
-            setoff_kind: const_at(17, crate::param_labels::SETOFF_KIND),
-            lr_check: const_at(18, crate::param_labels::LR_CHECK),
-            is_clang: bool_at(19),
-            is_add_attack: i64_at(20).unwrap_or(0) as i32,
-            hitbox_attr: f32_at(21).unwrap_or(0.0),
-            ground_or_air: i64_at(22).unwrap_or(0) as i32,
-            is_mtk: bool_at(23),
-            is_shield_disable: bool_at(24),
-            is_reflectable: bool_at(25),
-            is_absorbable: bool_at(26),
-            is_landing_attack: bool_at(27),
-            situation_mask: const_at(28, crate::param_labels::SITUATION_MASK),
-            category_mask: const_at(29, crate::param_labels::CATEGORY_MASK),
-            part_mask: const_at(30, crate::param_labels::PART_MASK),
-            no_finish_camera: bool_at(31),
-            collision_attr: args
-                .get(32)
-                .and_then(|a| a.as_hash())
-                .map(|h| crate::param_labels::decode_collision_attr(h, labels))
-                .unwrap_or_default(),
-            sound_level: const_at(33, crate::param_labels::SOUND_LEVEL),
-            sound_attr: const_at(34, crate::param_labels::SOUND_ATTR),
-            attack_region: const_at(35, crate::param_labels::ATTACK_REGION),
-            active_start: start,
-            // Open until a clear (or another hitbox with this id) ends it.
-            active_end: u32::MAX,
-            hitbox_type: 0,
-            category: 0,
-            wind: None,
-            catch: None,
-            abs: None,
-            search: None,
-            fp: None,
-        })
-    }
-
-    /// `ATTACK_FP` capture args → display Hitbox. This is deliberately separate from the
-    /// ordinary ATTACK reader: the family has 41 slots, no capsule triple, and several fields
-    /// whose meaning is not established. The complete typed payload stays in `fp`; only the
-    /// proven shared hit properties are decoded into editor controls.
-    fn hitbox_from_capture_fp(
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-        bone_rev: &HashMap<u64, String>,
-        labels: &HashMap<u64, String>,
-    ) -> Option<crate::data::Hitbox> {
-        use crate::data::{AttackFpArg, AttackFpCall};
-        if args.len() < crate::data::ATTACK_FP_ARGC {
-            return None;
-        }
-        let fp_args = args
-            .iter()
-            .take(crate::data::ATTACK_FP_ARGC)
-            .map(|arg| match arg {
-                crate::game_link::LuaArgWire::Hash(value) => AttackFpArg::Hash(*value),
-                crate::game_link::LuaArgWire::Num(value) => AttackFpArg::Num(*value),
-                crate::game_link::LuaArgWire::Int(value) => AttackFpArg::Int(*value),
-                crate::game_link::LuaArgWire::Bool(value) => AttackFpArg::Bool(*value),
-                crate::game_link::LuaArgWire::Nil => AttackFpArg::Nil,
-            })
-            .collect();
-        let call = AttackFpCall { args: fp_args };
-        let mut hitbox = call.to_hitbox(Self::motion_to_script_frame(frame));
-        let i64_at = |slot: usize| args.get(slot).and_then(|arg| arg.as_i64());
-        let f32_at = |slot: usize| args.get(slot).and_then(|arg| arg.as_f32());
-        let bool_at = |slot: usize| i64_at(slot).is_some_and(|value| value != 0);
-        let const_at = |slot: usize, table: crate::param_labels::ConstTable| {
-            i64_at(slot)
-                .map(|value| {
-                    crate::param_labels::const_name(table, value)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string())
-                })
-                .unwrap_or_default()
-        };
-
-        if let Some(hash) = args.get(2).and_then(|arg| arg.as_hash()) {
-            hitbox.bone_name = bone_rev
-                .get(&hash)
-                .cloned()
-                .unwrap_or_else(|| format!("{hash:#x}"));
-        }
-        hitbox.collision_attr = args
-            .get(12)
-            .and_then(|arg| arg.as_hash())
-            .and_then(|hash| labels.get(&hash).cloned())
-            .or_else(|| {
-                args.get(12)
-                    .and_then(|arg| arg.as_hash())
-                    .map(|hash| format!("{hash:#x}"))
-            })
-            .unwrap_or_default();
-        hitbox.lr_check = const_at(34, crate::param_labels::LR_CHECK);
-        hitbox.sound_level = const_at(19, crate::param_labels::SOUND_LEVEL);
-        hitbox.sound_attr = const_at(20, crate::param_labels::SOUND_ATTR);
-        hitbox.attack_region = const_at(23, crate::param_labels::ATTACK_REGION);
-        hitbox.is_clang = bool_at(16);
-        hitbox.ground_or_air = i64_at(21).unwrap_or(0) as i32;
-        hitbox.is_reflectable = bool_at(29);
-        hitbox.is_absorbable = bool_at(30);
-        hitbox.hitlag_mult = f32_at(14).unwrap_or(1.0);
-        hitbox.sdi_mult = f32_at(15).unwrap_or(1.0);
-        Some(hitbox)
-    }
-
-    /// CATCH (grabbox) capture → display Hitbox with category=1 (grab).
-    /// Arg layout: 0 id, 1 bone(h), 2 size, 3 x, 4 y, 5 z, 6 x2, 7 y2, 8 z2, 9 status, 10 situation.
-    /// Rebuild an `ATTACK_ABS` row from a captured call, through this family's own slots.
-    ///
-    /// The kind arrives as a raw lua number and there is no closed table to decode it against —
-    /// fighter-specific kinds exist — so an unknown value is kept as the number it was. The
-    /// emitter writes a bare number back without a `*`, so that still compiles.
-    fn hitbox_from_capture_abs(
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-    ) -> Option<crate::data::Hitbox> {
-        if args.len() < 16 {
-            return None;
-        }
-        let int = |i: usize| args.get(i).and_then(|a| a.as_i64()).unwrap_or(0);
-        let float = |i: usize| args.get(i).and_then(|a| a.as_f32()).unwrap_or(0.0);
-        let konst = |i: usize, table: crate::param_labels::ConstTable| {
-            crate::param_labels::const_name(table, int(i))
-                .map(str::to_string)
-                .unwrap_or_else(|| int(i).to_string())
-        };
-        let call = crate::data::AttackAbsCall {
-            // Deliberately NOT decoded to a name, and this is not laziness. `lua_const` has 93
-            // `..._ATTACK_ABSOLUTE_KIND_*` constants sharing one namespace with heavy value
-            // collisions: `FIGHTER_ATTACK_ABSOLUTE_KIND_THROW` is `0x0` and so is
-            // `FIGHTER_DOLLY_ATTACK_ABSOLUTE_KIND_FINAL` and most other fighters' finals.
-            // A captured `0` therefore has no recoverable name, and picking the first match
-            // would relabel Terry's final smash as a generic throw. The number is kept, which
-            // `const_expr` writes back bare — no `*` — so it still compiles and still means
-            // exactly what the game did.
-            kind: int(0).to_string(),
-            id: int(1).max(0) as u32,
-            damage: float(2),
-            angle: int(3) as i32,
-            kb_scaling: int(4) as i32,
-            fkb: int(5) as i32,
-            kb_base: int(6) as i32,
-            hitlag_mult: float(7),
-            lr_check: konst(9, crate::param_labels::LR_CHECK),
-            collision_attr: args
-                .get(12)
-                .and_then(|a| a.as_hash())
-                .map(|h| format!("{h:#x}"))
-                .unwrap_or_default(),
-            sound_level: konst(13, crate::param_labels::SOUND_LEVEL),
-            sound_attr: konst(14, crate::param_labels::SOUND_ATTR),
-            attack_region: konst(15, crate::param_labels::ATTACK_REGION),
-            unknowns: (
-                float(8),
-                float(10),
-                args.get(11).and_then(|a| a.as_i64()).unwrap_or(1) != 0,
-            ),
-        };
-        Some(call.to_hitbox(Self::motion_to_script_frame(frame)))
-    }
-
-    fn hitbox_from_capture_grab(
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-        bone_rev: &HashMap<u64, String>,
-    ) -> Option<crate::data::Hitbox> {
-        if args.len() < 6 {
-            return None;
-        }
-        let f32_at = |i: usize| args.get(i).and_then(|a| a.as_f32());
-        let i64_at = |i: usize| args.get(i).and_then(|a| a.as_i64());
-        let bone_hash = args.get(1).and_then(|a| a.as_hash())?;
-        let bone_name = bone_rev
-            .get(&bone_hash)
-            .cloned()
-            .unwrap_or_else(|| format!("{bone_hash:#x}"));
-        let capsule_end = match (f32_at(6), f32_at(7), f32_at(8)) {
-            (Some(x), Some(y), Some(z)) => Some([x, y, z]),
-            _ => None,
-        };
-        let start = Self::motion_to_script_frame(frame);
-        // Slots 9 and 10 are the grab's status kind and situation mask. Nothing in the editor
-        // exposes them, but keeping them means an export writes the values the game actually
-        // used rather than the plugin's stand-ins. They have no const table, so they ride
-        // along as the bare integers they arrived as — which is what `CATCH` takes.
-        let catch = crate::data::CatchExtras {
-            status: i64_at(9)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| crate::data::CATCH_DEFAULT_STATUS.to_string()),
-            situation: i64_at(10)
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| crate::data::CATCH_DEFAULT_SITUATION.to_string()),
-        };
-        Some(crate::data::Hitbox {
-            id: i64_at(0).unwrap_or(0) as u32,
-            bone_name,
-            size: f32_at(2).unwrap_or(2.0),
-            offset_x: f32_at(3).unwrap_or(0.0),
-            offset_y: f32_at(4).unwrap_or(0.0),
-            offset_z: f32_at(5).unwrap_or(0.0),
-            capsule_end,
-            catch: Some(catch),
-            // Grabboxes deal no damage/knockback — zero the attack-only fields.
-            damage: 0.0,
-            angle: 0,
-            kb_scaling: 0,
-            fkb: 0,
-            kb_base: 0,
-            active_start: start,
-            // Open until a clear (or another hitbox with this id) ends it.
-            active_end: u32::MAX,
-            category: 1,
-            ..Default::default()
-        })
-    }
-
-    /// `SEARCH` capture → a detection box, through this family's own slots.
-    ///
-    /// The live stack carries whatever the running script pushed, so a vanilla call arrives with
-    /// the 14-argument shape and everything after the geometry sits three slots earlier.
-    ///
-    /// The signal here is the **argument count**, not the shape of the value — which is the
-    /// difference from the parser. In source text a capsule slot is visibly a coordinate and the
-    /// argument after an omitted capsule is visibly a `*CONST`; on the wire both are just
-    /// numbers, and the tail's leading masks read as perfectly good floats. Testing the value
-    /// gave a 14-argument call a capsule of `[2.0, 1.0, 60.0]` — its own collision kind, hit
-    /// status and undocumented int, bent into geometry.
-    fn hitbox_from_capture_search(
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-        bone_rev: &HashMap<u64, String>,
-    ) -> Option<crate::data::Hitbox> {
-        use crate::param_labels as pl;
-        if args.len() < 8 {
-            return None;
-        }
-        let f32_at = |i: usize| args.get(i).and_then(|a| a.as_f32());
-        let i64_at = |i: usize| args.get(i).and_then(|a| a.as_i64());
-        let bone_hash = args.get(2).and_then(|a| a.as_hash())?;
-        let bone_name = bone_rev
-            .get(&bone_hash)
-            .cloned()
-            .unwrap_or_else(|| format!("{bone_hash:#x}"));
-        // 17 slots means the capsule triple is present; 14 means it was never pushed.
-        let has_capsule_slots = args.len() >= 17;
-        let capsule_end = match (f32_at(7), f32_at(8), f32_at(9)) {
-            (Some(x), Some(y), Some(z)) if has_capsule_slots => Some([x, y, z]),
-            _ => None,
-        };
-        let tail = if has_capsule_slots { 10 } else { 7 };
-        let konst = |i: usize, table: pl::ConstTable, default: &str| {
-            i64_at(i)
-                .and_then(|v| pl::const_name(table, v))
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| default.to_string())
-        };
-        Some(crate::data::Hitbox {
-            id: i64_at(0).unwrap_or(0) as u32,
-            part: i64_at(1).unwrap_or(0) as u32,
-            bone_name,
-            size: f32_at(3).unwrap_or(2.0),
-            offset_x: f32_at(4).unwrap_or(0.0),
-            offset_y: f32_at(5).unwrap_or(0.0),
-            offset_z: f32_at(6).unwrap_or(0.0),
-            capsule_end,
-            situation_mask: konst(tail + 3, pl::SITUATION_MASK, "COLLISION_SITUATION_MASK_GA"),
-            category_mask: konst(tail + 4, pl::CATEGORY_MASK, "COLLISION_CATEGORY_MASK_ALL"),
-            part_mask: konst(tail + 5, pl::PART_MASK, "COLLISION_PART_MASK_ALL"),
-            search: Some(crate::data::SearchExtras {
-                collision_kind: konst(
-                    tail,
-                    pl::COLLISION_KIND_MASK,
-                    crate::data::SEARCH_DEFAULT_COLLISION_KIND,
-                ),
-                hit_status: konst(
-                    tail + 1,
-                    pl::HIT_STATUS_MASK,
-                    crate::data::SEARCH_DEFAULT_HIT_STATUS,
-                ),
-                unk: i64_at(tail + 2).unwrap_or(0),
-                unk2: i64_at(tail + 6).is_some_and(|v| v != 0),
-            }),
-            // A detection box deals nothing — zero the attack-only fields.
-            damage: 0.0,
-            angle: 0,
-            kb_scaling: 0,
-            fkb: 0,
-            kb_base: 0,
-            active_start: Self::motion_to_script_frame(frame),
-            // Nothing ends a search volume, so it stays open.
-            active_end: u32::MAX,
-            category: crate::data::CAT_SEARCH,
-            ..Default::default()
-        })
-    }
-
-    /// AREA_WIND capture → its exact 2D rectangle/radial payload.
-    fn hitbox_from_capture_wind(
-        command: &str,
-        args: &[crate::game_link::LuaArgWire],
-        frame: f32,
-    ) -> Option<crate::data::Hitbox> {
-        let expected = match command {
-            "AREA_WIND_2ND_RAD" => 8,
-            "AREA_WIND_2ND_RAD_arg9" => 9,
-            "AREA_WIND_2ND" => 9,
-            "AREA_WIND_2ND_arg10" => 10,
-            _ => return None,
-        };
-        if args.len() != expected {
-            return None;
-        }
-        let values: Option<Vec<f32>> = args.iter().map(|arg| arg.as_f32()).collect();
-        let wind = crate::data::WindboxData {
-            command: command.into(),
-            args: values?,
-        };
-        Some(wind.to_hitbox(Self::motion_to_script_frame(frame)))
-    }
-
     /// EFFECT-family capture → EffectCall (arc layout: gfx, joint, pos xyz, rot zr/yr/xr, size).
     fn effect_call_from_capture(
         func: &str,
@@ -20670,7 +21285,9 @@ impl VisionaryApp {
                 // and shares none of the layout — sixteen arguments against thirty-six, in a
                 // different order — so falling through would read a throw's sound attribute as
                 // a hitbox offset and produce a plausible, wrong collision.
-                if let Some(hb) = Self::hitbox_from_capture_abs(&line.args, line.frame) {
+                if let Some(hb) =
+                    crate::capture_hitbox::hitbox_from_capture_abs(&line.args, line.frame)
+                {
                     // Identity is (id, kind): every vanilla call writes id 0, and a throw
                     // issues two in one block that differ only by kind.
                     let kind = hb.abs.as_ref().map(|a| a.kind.clone());
@@ -20683,9 +21300,12 @@ impl VisionaryApp {
                     }
                 }
             } else if line.func == "ATTACK_FP" {
-                if let Some(hb) =
-                    Self::hitbox_from_capture_fp(&line.args, line.frame, bone_rev, attr_labels)
-                {
+                if let Some(hb) = crate::capture_hitbox::hitbox_from_capture_fp(
+                    &line.args,
+                    line.frame,
+                    bone_rev,
+                    attr_labels,
+                ) {
                     if !hitboxes.iter().any(|h| {
                         h.category == crate::data::CAT_ATTACK_FP
                             && h.id == hb.id
@@ -20703,7 +21323,7 @@ impl VisionaryApp {
                     }
                 }
             } else if line.func == "ATTACK" || line.func == "ATTACK_IGNORE_THROW" {
-                if let Some(hb) = Self::hitbox_from_capture(
+                if let Some(hb) = crate::capture_hitbox::hitbox_from_capture(
                     &line.func,
                     &line.args,
                     line.frame,
@@ -20727,7 +21347,9 @@ impl VisionaryApp {
                     }
                 }
             } else if line.func == "CATCH" {
-                if let Some(hb) = Self::hitbox_from_capture_grab(&line.args, line.frame, bone_rev) {
+                if let Some(hb) = crate::capture_hitbox::hitbox_from_capture_grab(
+                    &line.args, line.frame, bone_rev,
+                ) {
                     if !hitboxes.iter().any(|h| {
                         h.category == 1 && h.id == hb.id && h.active_start == hb.active_start
                     }) {
@@ -20737,8 +21359,9 @@ impl VisionaryApp {
             // Name equality, not a prefix: `SET_SEARCH_SIZE_EXIST` is a different function with
             // two arguments, and reading it through the box layout would invent a collision.
             } else if line.func == "SEARCH" {
-                if let Some(hb) = Self::hitbox_from_capture_search(&line.args, line.frame, bone_rev)
-                {
+                if let Some(hb) = crate::capture_hitbox::hitbox_from_capture_search(
+                    &line.args, line.frame, bone_rev,
+                ) {
                     if !hitboxes.iter().any(|h| {
                         h.category == crate::data::CAT_SEARCH
                             && h.id == hb.id
@@ -20748,9 +21371,11 @@ impl VisionaryApp {
                     }
                 }
             } else if line.func.starts_with("AREA_WIND") {
-                if let Some(hb) =
-                    Self::hitbox_from_capture_wind(line.func.as_str(), &line.args, line.frame)
-                {
+                if let Some(hb) = crate::capture_hitbox::hitbox_from_capture_wind(
+                    line.func.as_str(),
+                    &line.args,
+                    line.frame,
+                ) {
                     if !hitboxes.iter().any(|h| {
                         h.category == 2 && h.id == hb.id && h.active_start == hb.active_start
                     }) {
@@ -21194,6 +21819,7 @@ impl VisionaryApp {
                 {
                     Some(ExcuteStmt::WorkTransitionTerm(
                         crate::data::WorkTransitionTermCall {
+                            receiver: Default::default(),
                             action: match line.func.as_str() {
                                 "WorkModule::enable_transition_term" => {
                                     crate::data::WorkTransitionTermAction::Enable
@@ -21716,6 +22342,7 @@ impl VisionaryApp {
                 frame: Self::script_to_motion_frame(edited.active_start),
                 args,
                 command: edited.wind.as_ref().map(|wind| wind.command.clone()),
+                guard: None,
             }),
             func: None,
         });
@@ -21785,6 +22412,18 @@ impl VisionaryApp {
 
         let pristine = self.state.hitboxes_pristine.clone();
         let current = self.state.hitboxes.clone();
+        // A hit the user moved into an If is suppressed and re-sent with its condition.
+        let newly_guarded = self
+            .current_move_key()
+            .and_then(|key| {
+                let (fighter, name) = key.split_once('/')?;
+                Some(crate::move_nodes::live_steps::newly_guarded_frames(
+                    fighter,
+                    self.move_graphs.get(fighter)?.get(name)?,
+                    &self.state.source_script,
+                ))
+            })
+            .unwrap_or_default();
         let mut cur_used = vec![false; current.len()];
         let mut pri_used = vec![false; pristine.len()];
         let mut rules: Vec<crate::game_link::HitboxRuleWire> = Vec::new();
@@ -21797,6 +22436,7 @@ impl VisionaryApp {
                     && h.category == p.category
                     && h.id == p.id
                     && h.active_start == p.active_start
+                    && !newly_guarded.contains(&h.active_start)
             }) {
                 cur_used[ci] = true;
                 pri_used[pi] = true;
@@ -21872,6 +22512,7 @@ impl VisionaryApp {
                             frame: Self::script_to_motion_frame(h.active_start),
                             args,
                             command,
+                            guard: None,
                         }),
                         func: None,
                     });
@@ -21898,16 +22539,11 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if missing_donor {
             self.state.status =
-                "Added/retimed hitbox needs live capture args — perform the move in game once."
+                "This hitbox could not be sent live: perform the move in game once, then try again."
                     .into();
         }
     }
@@ -21967,6 +22603,7 @@ impl VisionaryApp {
                 frame: Self::script_to_motion_frame(state.active_start),
                 args,
                 command: Some(state.target.macro_name().to_string()),
+                guard: None,
             }),
             func: Some(state.target.macro_name().to_string()),
         })
@@ -21988,6 +22625,7 @@ impl VisionaryApp {
                 frame: Self::script_to_motion_frame(state.active_start),
                 args: vec![crate::game_link::LuaArgWire::Int(state.pri)],
                 command: Some("COL_PRI".into()),
+                guard: None,
             }),
             func: Some("COL_PRI".into()),
         }
@@ -22129,6 +22767,7 @@ impl VisionaryApp {
                         crate::game_link::LuaArgWire::Num(value),
                     ],
                     command: Some("DAMAGE_NO_REACTION".into()),
+                    guard: None,
                 }),
                 func: Some("DAMAGE_NO_REACTION".into()),
             })
@@ -22299,12 +22938,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
     }
 
@@ -22368,12 +23002,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
@@ -22385,24 +23014,163 @@ impl VisionaryApp {
         };
     }
 
-    fn speed_capture_for<'a>(
+    /// The captured line behind `event` (the entry of `pristine` at `index`): the n-th capture
+    /// of its function with `arity` arguments on its frame, n counting the earlier pristine
+    /// events on that frame that `same` groups with it.
+    fn point_capture_for<'a, C>(
         captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::SetSpeedEvent],
+        pristine: &[crate::data::PointEvent<C>],
         index: usize,
-        event: &crate::data::SetSpeedEvent,
+        event: &crate::data::PointEvent<C>,
+        arity: usize,
+        func: fn(&C) -> &'static str,
+        same: fn(&C, &C) -> bool,
     ) -> Option<&'a crate::game_link::CaptureLine> {
         let occurrence = pristine[..index]
             .iter()
-            .filter(|other| other.frame == event.frame)
+            .filter(|other| other.frame == event.frame && same(&other.call, &event.call))
             .count();
+        let func = func(&event.call);
         captures
             .iter()
             .filter(|line| {
-                line.func == crate::data::SetSpeedCall::FUNC
+                line.func == func
                     && Self::motion_to_script_frame(line.frame) == event.frame
+                    && line.args.len() == arity
             })
-            .filter(|line| line.args.len() == 2)
             .nth(occurrence)
+    }
+
+    /// The changed events a point family's live-rule builder has to handle, as
+    /// `(index, pristine, shown)`, plus how many changes are already unrepresentable live:
+    /// retimed events, or every added/removed one (then nothing is returned to handle).
+    #[allow(clippy::type_complexity)]
+    fn point_changes<'a, C: PartialEq>(
+        pristine: &'a [crate::data::PointEvent<C>],
+        shown: &'a [crate::data::PointEvent<C>],
+    ) -> (
+        Vec<(
+            usize,
+            &'a crate::data::PointEvent<C>,
+            &'a crate::data::PointEvent<C>,
+        )>,
+        usize,
+    ) {
+        if pristine.len() != shown.len() {
+            return (Vec::new(), pristine.len().abs_diff(shown.len()));
+        }
+        let mut retimed = 0;
+        let changes = pristine
+            .iter()
+            .zip(shown)
+            .enumerate()
+            .filter(|(_, (was, now))| was != now)
+            .filter(|(_, (was, now))| {
+                let same_frame = was.frame == now.frame;
+                retimed += usize::from(!same_frame);
+                same_frame
+            })
+            .map(|(index, (was, now))| (index, was, now))
+            .collect();
+        (changes, retimed)
+    }
+
+    /// Store one point family's live rules for the current move under `{move}#{key}` and resend
+    /// the rule union. With `limits = (category, label, need)`, points the live path cannot
+    /// represent are noted as a replay limit and explained in the status bar.
+    fn push_point_rules(
+        &mut self,
+        key: &str,
+        limits: Option<(&str, &str, &str)>,
+        build: impl FnOnce(&Self, u64) -> (Vec<crate::game_link::HitboxRuleWire>, usize),
+    ) {
+        let Some(mv_key) = self.current_move_key() else {
+            return;
+        };
+        let Some(motion) = self.current_motion_hash() else {
+            return;
+        };
+        let (rules, unrepresentable) = build(self, motion);
+        let key = format!("{mv_key}#{key}");
+        if rules.is_empty() {
+            self.hitbox_rules_store.remove(&key);
+        } else {
+            self.hitbox_rules_store.insert(key, rules);
+        }
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        self.game_link.send_hitbox_rules(&all);
+        if let Some((category, label, need)) = limits.filter(|_| unrepresentable > 0) {
+            self.note_live_replay_capture_limit(category);
+            self.state.status =
+                format!("{label} edit staged, but {unrepresentable} point(s) need {need}");
+        }
+    }
+
+    point_capture_fns! {
+        speed_capture_for: SetSpeedCall, 2;
+        speed_ex_capture_for: SetSpeedExCall, 3;
+        add_speed_no_limit_capture_for: AddSpeedNoLimitCall, 2;
+        correct_capture_for: CorrectCall, 1;
+        ft_catch_stop_capture_for: FtCatchStopCall, 2;
+        ft_start_adjust_motion_frame_capture_for: FtStartAdjustMotionFrameCall, 1;
+        motion_module_set_rate_capture_for: MotionModuleSetRateCall, 1;
+        motion_module_set_helper_calculation_capture_for: MotionModuleSetHelperCalculationCall, 1;
+        clr_speed_capture_for: ClrSpeedCall, 1;
+        change_kinetic_capture_for: ChangeKineticCall, 1;
+        kinetic_add_speed_capture_for: KineticAddSpeedCall, 3;
+        work_module_inc_int_capture_for: WorkModuleIncIntCall, 1;
+        kinetic_set_consider_ground_friction_capture_for: KineticSetConsiderGroundFrictionCall, 2;
+    }
+
+    point_capture_fns! {
+        kinetic_energy_capture_for: KineticEnergyCall, 1, by action;
+        work_flag_capture_for: WorkFlagCall, 1, by action;
+        work_transition_term_capture_for: WorkTransitionTermCall, 1, by action;
+        work_module_set_capture_for: WorkModuleSetCall, 2, by kind;
+    }
+
+    /// Build independent point edits, counting each rejected edit once.
+    fn build_point_rules<C: PartialEq>(
+        pristine: &[crate::data::PointEvent<C>],
+        shown: &[crate::data::PointEvent<C>],
+        mut build: impl FnMut(
+            usize,
+            &crate::data::PointEvent<C>,
+            &crate::data::PointEvent<C>,
+        ) -> Option<crate::game_link::HitboxRuleWire>,
+    ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
+        let (changes, mut unrepresentable) = Self::point_changes(pristine, shown);
+        let rules = changes
+            .into_iter()
+            .filter_map(|(index, was, now)| {
+                let rule = build(index, was, now);
+                unrepresentable += usize::from(rule.is_none());
+                rule
+            })
+            .collect();
+        (rules, unrepresentable)
+    }
+
+    fn point_override_rule(
+        motion: u64,
+        category: u8,
+        hitbox_id: Option<u64>,
+        frame: u32,
+        func: String,
+        overrides: crate::game_link::HbOverridesWire,
+    ) -> crate::game_link::HitboxRuleWire {
+        let (frame_start, frame_end) = Self::rule_frame_window(frame);
+        crate::game_link::HitboxRuleWire {
+            motion,
+            category,
+            hitbox_id,
+            suppress: false,
+            frame_start,
+            frame_end,
+            overrides: Some(overrides),
+            inject: None,
+            func: Some(func),
+        }
     }
 
     fn speed_rules_for(
@@ -22411,24 +23179,9 @@ impl VisionaryApp {
         pristine: &[crate::data::SetSpeedEvent],
         shown: &[crate::data::SetSpeedEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::speed_capture_for(captures, pristine, index, was) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::speed_capture_for(captures, pristine, index, was)?;
             // SET_SPEED carries no id or kind. A frame-only rule is safe only when it names one
             // source call at that frame; otherwise it would silently retune the first call.
             if pristine
@@ -22438,86 +23191,21 @@ impl VisionaryApp {
                 != 1
                 || donor.args.len() != 2
             {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_SPEED,
-                hitbox_id: None,
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                crate::game_link::CAT_SPEED,
+                None,
+                was.frame,
+                crate::data::SetSpeedCall::FUNC.into(),
+                HbOverridesWire {
                     speed_x: (was.call.speed_x != now.call.speed_x).then_some(now.call.speed_x),
                     speed_y: (was.call.speed_y != now.call.speed_y).then_some(now.call.speed_y),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::SetSpeedCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send changed direct `SET_SPEED` velocity values to the plugin.
-    fn push_speed_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::speed_rules_for(
-            motion,
-            &captures,
-            &self.state.speed_pristine,
-            &self.state.script.to_speed_events(),
-        );
-        let key = format!("{mv_key}#speed");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("SET_SPEED");
-            self.state.status = format!(
-                "SET_SPEED edit staged, but {unrepresentable} point(s) need a live capture and an unambiguous frame"
-            );
-        }
-    }
-
-    /// Find the captured `SET_SPEED_EX` line corresponding to one source event. Calls at the
-    /// same frame are matched by their occurrence, while the plugin's kinetic-kind argument
-    /// provides the final live key when it is numeric.
-    fn speed_ex_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::SetSpeedExEvent],
-        index: usize,
-        event: &crate::data::SetSpeedExEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::SetSpeedExCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 3)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn speed_ex_rules_for(
@@ -22526,24 +23214,12 @@ impl VisionaryApp {
         pristine: &[crate::data::SetSpeedExEvent],
         shown: &[crate::data::SetSpeedExEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            if was.call.kinetic_kind != now.call.kinetic_kind {
+                return None;
             }
-            if was.frame != now.frame || was.call.kinetic_kind != now.call.kinetic_kind {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::speed_ex_capture_for(captures, pristine, index, was) else {
-                unrepresentable += 1;
-                continue;
-            };
+            let donor = Self::speed_ex_capture_for(captures, pristine, index, was)?;
             let kind = donor
                 .args
                 .get(2)
@@ -22558,83 +23234,21 @@ impl VisionaryApp {
                     .count()
                     != 1
             {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_SPEED_EX,
-                hitbox_id: kind,
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                crate::game_link::CAT_SPEED_EX,
+                kind,
+                was.frame,
+                crate::data::SetSpeedExCall::FUNC.into(),
+                HbOverridesWire {
                     speed_x: (was.call.speed_x != now.call.speed_x).then_some(now.call.speed_x),
                     speed_y: (was.call.speed_y != now.call.speed_y).then_some(now.call.speed_y),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::SetSpeedExCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send changed `SET_SPEED_EX` velocity values to the plugin.
-    fn push_speed_ex_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::speed_ex_rules_for(
-            motion,
-            &captures,
-            &self.state.speed_ex_pristine,
-            &self.state.script.to_speed_ex_events(),
-        );
-        let key = format!("{mv_key}#speed_ex");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("SET_SPEED_EX");
-            self.state.status = format!(
-                "SET_SPEED_EX edit staged, but {unrepresentable} point(s) need a numeric live capture or an unambiguous frame"
-            );
-        }
-    }
-
-    fn add_speed_no_limit_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::AddSpeedNoLimitEvent],
-        index: usize,
-        event: &crate::data::AddSpeedNoLimitEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::AddSpeedNoLimitCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 2)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn add_speed_no_limit_rules_for(
@@ -22643,25 +23257,9 @@ impl VisionaryApp {
         pristine: &[crate::data::AddSpeedNoLimitEvent],
         shown: &[crate::data::AddSpeedNoLimitEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::add_speed_no_limit_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::add_speed_no_limit_capture_for(captures, pristine, index, was)?;
             // This family has no argument that identifies one of two calls at the same frame.
             // Do not let a frame-only rule retune the first one and silently leave the second.
             if pristine
@@ -22670,86 +23268,24 @@ impl VisionaryApp {
                 .count()
                 != 1
             {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
             if donor.args.len() != 2 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_ADD_SPEED_NO_LIMIT,
-                hitbox_id: None,
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                crate::game_link::CAT_ADD_SPEED_NO_LIMIT,
+                None,
+                was.frame,
+                crate::data::AddSpeedNoLimitCall::FUNC.into(),
+                HbOverridesWire {
                     speed_x: (was.call.speed_x != now.call.speed_x).then_some(now.call.speed_x),
                     speed_y: (was.call.speed_y != now.call.speed_y).then_some(now.call.speed_y),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::AddSpeedNoLimitCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_add_speed_no_limit_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::add_speed_no_limit_rules_for(
-            motion,
-            &captures,
-            &self.state.add_speed_no_limit_pristine,
-            &self.state.script.to_add_speed_no_limit_events(),
-        );
-        let key = format!("{mv_key}#add_speed_no_limit");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("ADD_SPEED_NO_LIMIT");
-            self.state.status = format!(
-                "ADD_SPEED_NO_LIMIT edit staged, but {unrepresentable} point(s) need a live capture and an unambiguous frame"
-            );
-        }
-    }
-
-    fn correct_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::CorrectEvent],
-        index: usize,
-        event: &crate::data::CorrectEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::CorrectCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn correct_rules_for(
@@ -22758,33 +23294,14 @@ impl VisionaryApp {
         pristine: &[crate::data::CorrectEvent],
         shown: &[crate::data::CorrectEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::correct_capture_for(captures, pristine, index, was) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(kind) = donor.args.first().and_then(|arg| arg.as_i64()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::correct_capture_for(captures, pristine, index, was)?;
+            let kind = donor.args.first().and_then(|arg| arg.as_i64())?;
             let Some(replacement) = now.call.kind.trim().parse::<i64>().ok() else {
                 // Named constants are source-owned until a capture/label mapping can prove
                 // their numeric value. Export and source sync still handle them exactly.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let same_frame: Vec<_> = pristine
                 .iter()
@@ -22798,82 +23315,21 @@ impl VisionaryApp {
                     .filter(|event| event.call.kind.trim().parse::<i64>().ok() == Some(kind))
                     .count();
                 if same_kind != 1 {
-                    unrepresentable += 1;
-                    continue;
+                    return None;
                 }
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_CORRECT,
-                hitbox_id: Some(kind as u64),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                crate::game_link::CAT_CORRECT,
+                Some(kind as u64),
+                was.frame,
+                crate::data::CorrectCall::FUNC.into(),
+                HbOverridesWire {
                     correct_kind: Some(replacement),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::CorrectCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_correct_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::correct_rules_for(
-            motion,
-            &captures,
-            &self.state.correct_pristine,
-            &self.state.script.to_correct_events(),
-        );
-        let key = format!("{mv_key}#correct");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("CORRECT");
-            self.state.status = format!(
-                "CORRECT edit staged, but {unrepresentable} point(s) need a numeric live capture and numeric replacement kind"
-            );
-        }
-    }
-
-    fn ft_catch_stop_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::FtCatchStopEvent],
-        index: usize,
-        event: &crate::data::FtCatchStopEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::FtCatchStopCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 2)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn ft_catch_stop_rules_for(
@@ -22882,33 +23338,11 @@ impl VisionaryApp {
         pristine: &[crate::data::FtCatchStopEvent],
         shown: &[crate::data::FtCatchStopEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::ft_catch_stop_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(arg1) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(arg2) = donor.args.get(1).and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::ft_catch_stop_capture_for(captures, pristine, index, was)?;
+            let arg1 = donor.args.first().and_then(|arg| arg.as_f32())?;
+            let arg2 = donor.args.get(1).and_then(|arg| arg.as_f32())?;
             let duplicate_key = pristine
                 .iter()
                 .enumerate()
@@ -22922,86 +23356,24 @@ impl VisionaryApp {
             if duplicate_key != 0 {
                 // The runtime key is the numeric pair. Identical pairs on the same frame cannot
                 // be separated by this value-only hook, so leave both to export/source sync.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_FT_CATCH_STOP,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_FT_CATCH_STOP,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::FtCatchStopCall::FUNC,
                     &[arg1, arg2],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::FtCatchStopCall::FUNC.into(),
+                HbOverridesWire {
                     ft_catch_stop_arg1: (was.call.arg1 != now.call.arg1).then_some(now.call.arg1),
                     ft_catch_stop_arg2: (was.call.arg2 != now.call.arg2).then_some(now.call.arg2),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::FtCatchStopCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send changed `FT_CATCH_STOP` numeric arguments to the plugin.
-    fn push_ft_catch_stop_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::ft_catch_stop_rules_for(
-            motion,
-            &captures,
-            &self.state.ft_catch_stop_pristine,
-            &self.state.script.to_ft_catch_stop_events(),
-        );
-        let key = format!("{mv_key}#ft_catch_stop");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("FT_CATCH_STOP");
-            self.state.status = format!(
-                "FT_CATCH_STOP edit staged, but {unrepresentable} point(s) need a numeric live capture and a unique argument pair"
-            );
-        }
-    }
-
-    fn ft_start_adjust_motion_frame_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::FtStartAdjustMotionFrameEvent],
-        index: usize,
-        event: &crate::data::FtStartAdjustMotionFrameEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::FtStartAdjustMotionFrameCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn ft_start_adjust_motion_frame_rules_for(
@@ -23010,30 +23382,11 @@ impl VisionaryApp {
         pristine: &[crate::data::FtStartAdjustMotionFrameEvent],
         shown: &[crate::data::FtStartAdjustMotionFrameEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) =
-                Self::ft_start_adjust_motion_frame_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor =
+                Self::ft_start_adjust_motion_frame_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_f32())?;
             let duplicate_key = pristine
                 .iter()
                 .enumerate()
@@ -23044,86 +23397,24 @@ impl VisionaryApp {
             if duplicate_key != 0 {
                 // The runtime key is the pristine numeric value. Identical values on one frame
                 // cannot be separated by this value-only hook.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_FT_START_ADJUST_MOTION_FRAME,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_FT_START_ADJUST_MOTION_FRAME,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::FtStartAdjustMotionFrameCall::FUNC,
                     &[value],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::FtStartAdjustMotionFrameCall::FUNC.into(),
+                HbOverridesWire {
                     ft_start_adjust_motion_frame_value: (was.call.value != now.call.value)
                         .then_some(now.call.value),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::FtStartAdjustMotionFrameCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send changed motion-frame adjustment values to the plugin.
-    fn push_ft_start_adjust_motion_frame_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::ft_start_adjust_motion_frame_rules_for(
-            motion,
-            &captures,
-            &self.state.ft_start_adjust_motion_frame_pristine,
-            &self.state.script.to_ft_start_adjust_motion_frame_events(),
-        );
-        let key = format!("{mv_key}#ft_start_adjust_motion_frame");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("FT_START_ADJUST_MOTION_FRAME_arg1");
-            self.state.status = format!(
-                "FT_START_ADJUST_MOTION_FRAME_arg1 edit staged, but {unrepresentable} point(s) need a numeric live capture and a unique value"
-            );
-        }
-    }
-
-    fn motion_module_set_rate_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::MotionModuleSetRateEvent],
-        index: usize,
-        event: &crate::data::MotionModuleSetRateEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::MotionModuleSetRateCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn motion_module_set_rate_rules_for(
@@ -23132,35 +23423,17 @@ impl VisionaryApp {
         pristine: &[crate::data::MotionModuleSetRateEvent],
         shown: &[crate::data::MotionModuleSetRateEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            if !now.call.rate.is_finite() || now.call.rate <= 0.0 {
+                return None;
             }
-            if was.frame != now.frame || !now.call.rate.is_finite() || now.call.rate <= 0.0 {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) =
-                Self::motion_module_set_rate_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+            let donor = Self::motion_module_set_rate_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_f32())?;
             if !value.is_finite() || value < 0.0 {
                 // The source parser deliberately leaves malformed negative stack artifacts raw;
                 // do not manufacture a live key for one if a capture happens to report it.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
             let duplicate_key = pristine
                 .iter()
@@ -23175,84 +23448,23 @@ impl VisionaryApp {
                 // The direct hook has only the numeric pristine rate as its key. Same-frame
                 // duplicate setters are therefore source/export-only until another identity
                 // field is measured.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_MOTION_MODULE_SET_RATE,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_MOTION_MODULE_SET_RATE,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::MotionModuleSetRateCall::FUNC,
                     &[value],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::MotionModuleSetRateCall::FUNC.into(),
+                HbOverridesWire {
                     motion_module_rate: Some(now.call.rate),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::MotionModuleSetRateCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_motion_module_set_rate_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::motion_module_set_rate_rules_for(
-            motion,
-            &captures,
-            &self.state.motion_module_set_rate_pristine,
-            &self.state.script.to_motion_module_set_rate_events(),
-        );
-        let key = format!("{mv_key}#motion_module_set_rate");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("MotionModule::set_rate");
-            self.state.status = format!(
-                "MotionModule::set_rate edit staged, but {unrepresentable} point(s) need a numeric live capture, a unique same-frame rate, and a positive live replacement"
-            );
-        }
-    }
-
-    fn motion_module_set_helper_calculation_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::MotionModuleSetHelperCalculationEvent],
-        index: usize,
-        event: &crate::data::MotionModuleSetHelperCalculationEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::MotionModuleSetHelperCalculationCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn motion_module_set_helper_calculation_rules_for(
@@ -23261,33 +23473,15 @@ impl VisionaryApp {
         pristine: &[crate::data::MotionModuleSetHelperCalculationEvent],
         shown: &[crate::data::MotionModuleSetHelperCalculationEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire, LuaArgWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::motion_module_set_helper_calculation_capture_for(
+        use crate::game_link::{HbOverridesWire, LuaArgWire};
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::motion_module_set_helper_calculation_capture_for(
                 captures, pristine, index, was,
-            ) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| match arg {
+            )?;
+            let value = donor.args.first().and_then(|arg| match arg {
                 LuaArgWire::Bool(value) => Some(*value),
                 _ => None,
-            }) else {
-                unrepresentable += 1;
-                continue;
-            };
+            })?;
             let duplicate_key = pristine
                 .iter()
                 .enumerate()
@@ -23298,67 +23492,23 @@ impl VisionaryApp {
             if duplicate_key != 0 {
                 // The direct hook has only the pristine boolean as its key. Same-frame duplicate
                 // toggles cannot be separated by this value-only hook.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_MOTION_MODULE_SET_HELPER_CALCULATION,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_MOTION_MODULE_SET_HELPER_CALCULATION,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::MotionModuleSetHelperCalculationCall::FUNC,
                     &[if value { 1.0 } else { 0.0 }],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::MotionModuleSetHelperCalculationCall::FUNC.into(),
+                HbOverridesWire {
                     motion_module_helper_calculation: Some(now.call.enabled),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::MotionModuleSetHelperCalculationCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_motion_module_set_helper_calculation_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::motion_module_set_helper_calculation_rules_for(
-            motion,
-            &captures,
-            &self.state.motion_module_set_helper_calculation_pristine,
-            &self
-                .state
-                .script
-                .to_motion_module_set_helper_calculation_events(),
-        );
-        let key = format!("{mv_key}#motion_module_set_helper_calculation");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("MotionModule::set_helper_calculation");
-            self.state.status = format!(
-                "MotionModule::set_helper_calculation edit staged, but {unrepresentable} point(s) need a boolean live capture and a unique same-frame value"
-            );
-        }
+                },
+            ))
+        })
     }
 
     fn motion_module_set_frame_partial_capture_by_occurrence<'a>(
@@ -23641,7 +23791,10 @@ impl VisionaryApp {
         let (rules, unrepresentable) = Self::motion_module_set_frame_partial_rules_for_category(
             motion,
             &captures,
-            &self.state.motion_module_set_frame_partial_pristine,
+            &self
+                .state
+                .point_originals
+                .motion_module_set_frame_partial_pristine,
             &self
                 .state
                 .script
@@ -23654,12 +23807,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
@@ -23691,7 +23839,10 @@ impl VisionaryApp {
             &captures,
             expression_pristine,
             &expression_shown,
-            &self.state.motion_module_set_frame_partial_pristine,
+            &self
+                .state
+                .point_originals
+                .motion_module_set_frame_partial_pristine,
         );
         let key = format!("{mv_key}#expression_motion_module_set_frame_partial");
         if rules.is_empty() {
@@ -23699,12 +23850,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
@@ -24002,7 +24148,10 @@ impl VisionaryApp {
         let (rules, unrepresentable) = Self::motion_module_set_rate_partial_rules_for_category(
             motion,
             &captures,
-            &self.state.motion_module_set_rate_partial_pristine,
+            &self
+                .state
+                .point_originals
+                .motion_module_set_rate_partial_pristine,
             &self.state.script.to_motion_module_set_rate_partial_events(),
             &expression_pristine,
         );
@@ -24012,12 +24161,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
@@ -24049,7 +24193,10 @@ impl VisionaryApp {
             &captures,
             expression_pristine,
             &expression_shown,
-            &self.state.motion_module_set_rate_partial_pristine,
+            &self
+                .state
+                .point_originals
+                .motion_module_set_rate_partial_pristine,
         );
         let key = format!("{mv_key}#expression_motion_module_set_rate_partial");
         if rules.is_empty() {
@@ -24057,12 +24204,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
@@ -24072,59 +24214,20 @@ impl VisionaryApp {
         }
     }
 
-    fn clr_speed_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::ClrSpeedEvent],
-        index: usize,
-        event: &crate::data::ClrSpeedEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::ClrSpeedCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
-    }
-
     fn clr_speed_rules_for(
         motion: u64,
         captures: &[crate::game_link::CaptureLine],
         pristine: &[crate::data::ClrSpeedEvent],
         shown: &[crate::data::ClrSpeedEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::clr_speed_capture_for(captures, pristine, index, was) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::clr_speed_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_f32())?;
             let Some(replacement) = now.call.kinetic_kind.trim().parse::<i64>().ok() else {
                 // Named source constants are preserved for export/source sync until a numeric
                 // live capture can prove the replacement value.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let duplicate_key = pristine
                 .iter()
@@ -24136,86 +24239,23 @@ impl VisionaryApp {
                 })
                 .count();
             if duplicate_key != 0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_CLR_SPEED,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_CLR_SPEED,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::ClrSpeedCall::FUNC,
                     &[value],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::ClrSpeedCall::FUNC.into(),
+                HbOverridesWire {
                     clr_speed_kinetic_kind: Some(replacement),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::ClrSpeedCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send numeric `CLR_SPEED` replacements to the plugin. Named replacements remain an
-    /// explicit source/export-only edit because the capture is the only proof of their runtime ID.
-    fn push_clr_speed_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::clr_speed_rules_for(
-            motion,
-            &captures,
-            &self.state.clr_speed_pristine,
-            &self.state.script.to_clr_speed_events(),
-        );
-        let key = format!("{mv_key}#clr_speed");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("CLR_SPEED");
-            self.state.status = format!(
-                "CLR_SPEED edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric replacement, and a unique frame/key"
-            );
-        }
-    }
-
-    fn change_kinetic_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::ChangeKineticEvent],
-        index: usize,
-        event: &crate::data::ChangeKineticEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::ChangeKineticCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn change_kinetic_rules_for(
@@ -24224,34 +24264,14 @@ impl VisionaryApp {
         pristine: &[crate::data::ChangeKineticEvent],
         shown: &[crate::data::ChangeKineticEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::change_kinetic_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::change_kinetic_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_f32())?;
             let Some(replacement) = now.call.kinetic_type.trim().parse::<i64>().ok() else {
                 // Named source constants remain source/export-owned until a capture or a known
                 // label table can prove their runtime integer.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let duplicate_key = pristine
                 .iter()
@@ -24263,86 +24283,23 @@ impl VisionaryApp {
                 })
                 .count();
             if duplicate_key != 0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_CHANGE_KINETIC,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_CHANGE_KINETIC,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::ChangeKineticCall::FUNC,
                     &[value],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::ChangeKineticCall::FUNC.into(),
+                HbOverridesWire {
                     change_kinetic_type: Some(replacement),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::ChangeKineticCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send numeric `KineticModule::change_kinetic` replacements to the plugin. Named tokens
-    /// remain an explicit source/export-only edit because capture is the proof of the live ID.
-    fn push_change_kinetic_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::change_kinetic_rules_for(
-            motion,
-            &captures,
-            &self.state.change_kinetic_pristine,
-            &self.state.script.to_change_kinetic_events(),
-        );
-        let key = format!("{mv_key}#change_kinetic");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("change_kinetic");
-            self.state.status = format!(
-                "change_kinetic edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric replacement, and a unique frame/key"
-            );
-        }
-    }
-
-    fn kinetic_energy_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::KineticEnergyEvent],
-        index: usize,
-        event: &crate::data::KineticEnergyEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame && other.call.action == event.call.action)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == event.call.func()
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn kinetic_energy_rules_for(
@@ -24352,33 +24309,16 @@ impl VisionaryApp {
         shown: &[crate::data::KineticEnergyEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
         use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            if was.call.action != now.call.action {
+                return None;
             }
-            if was.frame != now.frame || was.call.action != now.call.action {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::kinetic_energy_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+            let donor = Self::kinetic_energy_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_f32())?;
             let Some(replacement) = now.call.kinetic_energy_id.trim().parse::<i64>().ok() else {
                 // Named source constants remain source/export-owned until a capture or known
                 // label table can prove their runtime integer.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let duplicate_key = pristine
                 .iter()
@@ -24392,8 +24332,7 @@ impl VisionaryApp {
                 })
                 .count();
             if duplicate_key != 0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
             let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
             let category = match was.call.action {
@@ -24410,7 +24349,7 @@ impl VisionaryApp {
                     crate::game_link::CAT_KINETIC_UNABLE_ENERGY
                 }
             };
-            rules.push(HitboxRuleWire {
+            Some(HitboxRuleWire {
                 motion,
                 category,
                 hitbox_id: Some(crate::game_link::numeric_point_key(
@@ -24426,66 +24365,8 @@ impl VisionaryApp {
                 }),
                 inject: None,
                 func: Some(was.call.func().into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send numeric replacements for direct kinetic-energy suspend/resume calls. Named source
-    /// constants remain source/export-owned when capture cannot prove their runtime ID.
-    fn push_kinetic_energy_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::kinetic_energy_rules_for(
-            motion,
-            &captures,
-            &self.state.kinetic_energy_pristine,
-            &self.state.script.to_kinetic_energy_events(),
-        );
-        let key = format!("{mv_key}#kinetic_energy");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("KineticModule energy");
-            self.state.status = format!(
-                "KineticModule energy edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric replacement, and a unique frame/key"
-            );
-        }
-    }
-
-    fn kinetic_add_speed_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::KineticAddSpeedEvent],
-        index: usize,
-        event: &crate::data::KineticAddSpeedEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::KineticAddSpeedCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
             })
-            .filter(|line| line.args.len() == 3)
-            .nth(occurrence)
+        })
     }
 
     fn kinetic_add_speed_rules_for(
@@ -24494,40 +24375,14 @@ impl VisionaryApp {
         pristine: &[crate::data::KineticAddSpeedEvent],
         shown: &[crate::data::KineticAddSpeedEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::kinetic_add_speed_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(speed_x) = donor.args.first().and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(speed_y) = donor.args.get(1).and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(speed_z) = donor.args.get(2).and_then(|arg| arg.as_f32()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::kinetic_add_speed_capture_for(captures, pristine, index, was)?;
+            let speed_x = donor.args.first().and_then(|arg| arg.as_f32())?;
+            let speed_y = donor.args.get(1).and_then(|arg| arg.as_f32())?;
+            let speed_z = donor.args.get(2).and_then(|arg| arg.as_f32())?;
             if !speed_z.is_finite() || speed_z != 0.0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
             let duplicate_key = pristine
                 .iter()
@@ -24540,88 +24395,24 @@ impl VisionaryApp {
                 })
                 .count();
             if duplicate_key != 0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_KINETIC_ADD_SPEED,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_KINETIC_ADD_SPEED,
+                Some(crate::game_link::numeric_point_key(
                     crate::data::KineticAddSpeedCall::FUNC,
                     &[speed_x, speed_y, speed_z],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::KineticAddSpeedCall::FUNC.into(),
+                HbOverridesWire {
                     speed_x: Some(now.call.speed_x),
                     speed_y: Some(now.call.speed_y),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::KineticAddSpeedCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    /// Send sparse x/y replacements for direct `KineticModule::add_speed` calls. The runtime
-    /// key includes the captured z component, while source/export remains limited to the
-    /// measured zero-z shape.
-    fn push_kinetic_add_speed_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::kinetic_add_speed_rules_for(
-            motion,
-            &captures,
-            &self.state.kinetic_add_speed_pristine,
-            &self.state.script.to_kinetic_add_speed_events(),
-        );
-        let key = format!("{mv_key}#kinetic_add_speed");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("KineticModule::add_speed");
-            self.state.status = format!(
-                "KineticModule::add_speed edit staged, but {unrepresentable} point(s) need a unique zero-z live capture and unchanged frame"
-            );
-        }
-    }
-
-    fn work_module_inc_int_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::WorkModuleIncIntEvent],
-        index: usize,
-        event: &crate::data::WorkModuleIncIntEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::WorkModuleIncIntCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn work_module_inc_int_rules_for(
@@ -24630,36 +24421,15 @@ impl VisionaryApp {
         pristine: &[crate::data::WorkModuleIncIntEvent],
         shown: &[crate::data::WorkModuleIncIntEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::work_module_inc_int_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(captured_slot) = donor.args.first().and_then(|arg| arg.as_i64()) else {
-                unrepresentable += 1;
-                continue;
-            };
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            let donor = Self::work_module_inc_int_capture_for(captures, pristine, index, was)?;
+            let captured_slot = donor.args.first().and_then(|arg| arg.as_i64())?;
             let Ok(replacement_slot) = now.call.slot.trim().parse::<i64>() else {
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             if i32::try_from(replacement_slot).is_err() {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
             let duplicate_key = pristine
                 .iter()
@@ -24677,84 +24447,23 @@ impl VisionaryApp {
                 .filter(|slot| *slot == captured_slot)
                 .count();
             if duplicate_key != 0 {
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_WORK_MODULE_INC_INT,
-                hitbox_id: Some(crate::game_link::integer_point_key(
+                crate::game_link::CAT_WORK_MODULE_INC_INT,
+                Some(crate::game_link::integer_point_key(
                     crate::data::WorkModuleIncIntCall::FUNC,
                     &[captured_slot],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                crate::data::WorkModuleIncIntCall::FUNC.into(),
+                HbOverridesWire {
                     work_module_inc_int_slot: Some(replacement_slot),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(crate::data::WorkModuleIncIntCall::FUNC.into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_work_module_inc_int_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::work_module_inc_int_rules_for(
-            motion,
-            &captures,
-            &self.state.work_module_inc_int_pristine,
-            &self.state.script.to_work_module_inc_int_events(),
-        );
-        let key = format!("{mv_key}#work_module_inc_int");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("WorkModule::inc_int");
-            self.state.status = format!(
-                "WorkModule::inc_int edit staged, but {unrepresentable} point(s) need a numeric slot capture, a numeric replacement, and a unique same-frame slot key"
-            );
-        }
-    }
-
-    fn work_flag_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::WorkFlagEvent],
-        index: usize,
-        event: &crate::data::WorkFlagEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame && other.call.action == event.call.action)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == event.call.func()
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn work_flag_rules_for(
@@ -24763,33 +24472,17 @@ impl VisionaryApp {
         pristine: &[crate::data::WorkFlagEvent],
         shown: &[crate::data::WorkFlagEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            if was.call.action != now.call.action {
+                return None;
             }
-            if was.frame != now.frame || was.call.action != now.call.action {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) = Self::work_flag_capture_for(captures, pristine, index, was) else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_i64()) else {
-                unrepresentable += 1;
-                continue;
-            };
+            let donor = Self::work_flag_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_i64())?;
             let Some(replacement) = now.call.flag.trim().parse::<i64>().ok() else {
                 // Named source constants remain source/export-owned until a capture or known
                 // label table proves their runtime integer.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let duplicate_key = pristine
                 .iter()
@@ -24809,84 +24502,23 @@ impl VisionaryApp {
             if duplicate_key != 0 {
                 // The direct hook's identity is operation + numeric flag + frame. Same-frame
                 // duplicates with the same identity cannot be separated by sparse rules.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_WORK_FLAG,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_WORK_FLAG,
+                Some(crate::game_link::numeric_point_key(
                     was.call.func(),
                     &[value as f32],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                was.call.func().into(),
+                HbOverridesWire {
                     work_flag: Some(replacement),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(was.call.func().into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_work_flag_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::work_flag_rules_for(
-            motion,
-            &captures,
-            &self.state.work_flag_pristine,
-            &self.state.script.to_work_flag_events(),
-        );
-        let key = format!("{mv_key}#work_flag");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("WorkModule flag");
-            self.state.status = format!(
-                "WorkModule flag edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric replacement, and a unique same-frame operation/flag key"
-            );
-        }
-    }
-
-    fn work_transition_term_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::WorkTransitionTermEvent],
-        index: usize,
-        event: &crate::data::WorkTransitionTermEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame && other.call.action == event.call.action)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == event.call.func()
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 1)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn work_transition_term_rules_for(
@@ -24895,35 +24527,17 @@ impl VisionaryApp {
         pristine: &[crate::data::WorkTransitionTermEvent],
         shown: &[crate::data::WorkTransitionTermEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
-        use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
-        let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
+        use crate::game_link::HbOverridesWire;
+        Self::build_point_rules(pristine, shown, |index, was, now| {
+            if was.call.action != now.call.action {
+                return None;
             }
-            if was.frame != now.frame || was.call.action != now.call.action {
-                unrepresentable += 1;
-                continue;
-            }
-            let Some(donor) =
-                Self::work_transition_term_capture_for(captures, pristine, index, was)
-            else {
-                unrepresentable += 1;
-                continue;
-            };
-            let Some(value) = donor.args.first().and_then(|arg| arg.as_i64()) else {
-                unrepresentable += 1;
-                continue;
-            };
+            let donor = Self::work_transition_term_capture_for(captures, pristine, index, was)?;
+            let value = donor.args.first().and_then(|arg| arg.as_i64())?;
             let Some(replacement) = now.call.transition_term.trim().parse::<i64>().ok() else {
                 // Named source constants remain source/export-owned until a capture or known
                 // label table proves their runtime integer.
-                unrepresentable += 1;
-                continue;
+                return None;
             };
             let duplicate_key = pristine
                 .iter()
@@ -24948,84 +24562,23 @@ impl VisionaryApp {
                 // The direct hook's identity is operation + numeric transition term + frame.
                 // Same-frame duplicates with the same identity cannot be separated by sparse
                 // rules.
-                unrepresentable += 1;
-                continue;
+                return None;
             }
-            let (frame_start, frame_end) = Self::rule_frame_window(was.frame);
-            rules.push(HitboxRuleWire {
+            Some(Self::point_override_rule(
                 motion,
-                category: crate::game_link::CAT_WORK_TRANSITION_TERM,
-                hitbox_id: Some(crate::game_link::numeric_point_key(
+                crate::game_link::CAT_WORK_TRANSITION_TERM,
+                Some(crate::game_link::numeric_point_key(
                     was.call.func(),
                     &[value as f32],
                 )),
-                suppress: false,
-                frame_start,
-                frame_end,
-                overrides: Some(HbOverridesWire {
+                was.frame,
+                was.call.func().into(),
+                HbOverridesWire {
                     work_transition_term: Some(replacement),
                     ..Default::default()
-                }),
-                inject: None,
-                func: Some(was.call.func().into()),
-            });
-        }
-        (rules, unrepresentable)
-    }
-
-    fn push_work_transition_term_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::work_transition_term_rules_for(
-            motion,
-            &captures,
-            &self.state.work_transition_term_pristine,
-            &self.state.script.to_work_transition_term_events(),
-        );
-        let key = format!("{mv_key}#work_transition_term");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("WorkModule transition term");
-            self.state.status = format!(
-                "WorkModule transition-term edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric replacement, and a unique same-frame operation/term key"
-            );
-        }
-    }
-
-    fn work_module_set_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::WorkModuleSetEvent],
-        index: usize,
-        event: &crate::data::WorkModuleSetEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame && other.call.kind == event.call.kind)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == event.call.func()
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-            })
-            .filter(|line| line.args.len() == 2)
-            .nth(occurrence)
+                },
+            ))
+        })
     }
 
     fn work_module_set_rules_for(
@@ -25035,16 +24588,10 @@ impl VisionaryApp {
         shown: &[crate::data::WorkModuleSetEvent],
     ) -> (Vec<crate::game_link::HitboxRuleWire>, usize) {
         use crate::game_link::{HbOverridesWire, HitboxRuleWire};
-        if pristine.len() != shown.len() {
-            return (Vec::new(), pristine.len().abs_diff(shown.len()));
-        }
+        let (changes, mut unrepresentable) = Self::point_changes(pristine, shown);
         let mut rules = Vec::new();
-        let mut unrepresentable = 0;
-        for (index, (was, now)) in pristine.iter().zip(shown).enumerate() {
-            if was == now {
-                continue;
-            }
-            if was.frame != now.frame || was.call.kind != now.call.kind {
+        for (index, was, now) in changes {
+            if was.call.kind != now.call.kind {
                 unrepresentable += 1;
                 continue;
             }
@@ -25215,41 +24762,6 @@ impl VisionaryApp {
         (rules, unrepresentable)
     }
 
-    fn push_work_module_set_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::work_module_set_rules_for(
-            motion,
-            &captures,
-            &self.state.work_module_set_pristine,
-            &self.state.script.to_work_module_set_events(),
-        );
-        let key = format!("{mv_key}#work_module_set");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("WorkModule value");
-            self.state.status = format!(
-                "WorkModule value edit staged, but {unrepresentable} point(s) need a numeric live capture, a numeric value and slot replacement, and a unique same-frame operation/value/slot key"
-            );
-        }
-    }
-
     fn set_air_rules_for(
         motion: u64,
         pristine: &[crate::data::SetAirEvent],
@@ -25319,39 +24831,12 @@ impl VisionaryApp {
                     frame: Self::script_to_motion_frame(event.frame),
                     args: Vec::new(),
                     command: Some("SET_AIR".into()),
+                    guard: None,
                 }),
                 func: Some("SET_AIR".into()),
             });
         }
         rules
-    }
-
-    /// Send structural `SET_AIR` suppression/injection rules to the plugin.
-    fn push_set_air_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let rules = Self::set_air_rules_for(
-            motion,
-            &self.state.set_air_pristine,
-            &self.state.script.to_set_air_events(),
-        );
-        let key = format!("{mv_key}#set_air");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
     }
 
     fn kinetic_clear_speed_all_rules_for(
@@ -25423,59 +24908,12 @@ impl VisionaryApp {
                     frame: Self::script_to_motion_frame(event.frame),
                     args: Vec::new(),
                     command: Some(crate::data::KineticClearSpeedAllCall::FUNC.into()),
+                    guard: None,
                 }),
                 func: Some(crate::data::KineticClearSpeedAllCall::FUNC.into()),
             });
         }
         rules
-    }
-
-    /// Send structural direct kinetic clear suppression/injection rules to the plugin.
-    fn push_kinetic_clear_speed_all_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let rules = Self::kinetic_clear_speed_all_rules_for(
-            motion,
-            &self.state.kinetic_clear_speed_all_pristine,
-            &self.state.script.to_kinetic_clear_speed_all_events(),
-        );
-        let key = format!("{mv_key}#kinetic_clear_speed_all");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-    }
-
-    fn kinetic_set_consider_ground_friction_capture_for<'a>(
-        captures: &'a [crate::game_link::CaptureLine],
-        pristine: &[crate::data::KineticSetConsiderGroundFrictionEvent],
-        index: usize,
-        event: &crate::data::KineticSetConsiderGroundFrictionEvent,
-    ) -> Option<&'a crate::game_link::CaptureLine> {
-        let occurrence = pristine[..index]
-            .iter()
-            .filter(|other| other.frame == event.frame)
-            .count();
-        captures
-            .iter()
-            .filter(|line| {
-                line.func == crate::data::KineticSetConsiderGroundFrictionCall::FUNC
-                    && Self::motion_to_script_frame(line.frame) == event.frame
-                    && line.args.len() == 2
-            })
-            .nth(occurrence)
     }
 
     fn kinetic_set_consider_ground_friction_key(
@@ -25650,50 +25088,12 @@ impl VisionaryApp {
                         LuaArgWire::Int(attribute),
                     ],
                     command: Some(func.into()),
+                    guard: None,
                 }),
                 func: Some(func.into()),
             });
         }
         (rules, unrepresentable)
-    }
-
-    /// Send sparse direct ground-friction overrides and structural rules to the plugin.
-    fn push_kinetic_set_consider_ground_friction_rules(&mut self) {
-        let Some(mv_key) = self.current_move_key() else {
-            return;
-        };
-        let Some(motion) = self.current_motion_hash() else {
-            return;
-        };
-        let captures = self.captures_for_selected_fighter(motion);
-        let (rules, unrepresentable) = Self::kinetic_set_consider_ground_friction_rules_for(
-            motion,
-            &captures,
-            &self.state.kinetic_set_consider_ground_friction_pristine,
-            &self
-                .state
-                .script
-                .to_kinetic_set_consider_ground_friction_events(),
-        );
-        let key = format!("{mv_key}#kinetic_set_consider_ground_friction");
-        if rules.is_empty() {
-            self.hitbox_rules_store.remove(&key);
-        } else {
-            self.hitbox_rules_store.insert(key, rules);
-        }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        self.game_link.send_hitbox_rules(&all);
-        if unrepresentable > 0 {
-            self.note_live_replay_capture_limit("set_consider_ground_friction");
-            self.state.status = format!(
-                "set_consider_ground_friction edit staged, but {unrepresentable} point(s) need a numeric live capture/attribute for live rules"
-            );
-        }
     }
 
     /// Send the post-hoc hitbox modifiers the editor has changed to the running game.
@@ -25753,12 +25153,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
     }
 
@@ -25923,6 +25318,7 @@ impl VisionaryApp {
                             frame: Self::script_to_motion_frame(edited.active_start),
                             args,
                             command,
+                            guard: None,
                         }),
                         func: None,
                     });
@@ -25949,12 +25345,7 @@ impl VisionaryApp {
                 self.hitbox_rules_store.insert(key, rules);
             }
         }
-        let all: Vec<_> = self
-            .hitbox_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         incomplete
     }
@@ -26129,7 +25520,11 @@ impl VisionaryApp {
         donor: Option<&crate::game_link::CaptureLine>,
     ) -> Option<Vec<crate::game_link::LuaArgWire>> {
         use crate::game_link::LuaArgWire as A;
-        let mut args = donor.filter(|d| d.args.len() >= 36)?.args.clone();
+        // A brand-new hitbox has no donor. Every slot below is set from the editor's values, so
+        // the only thing a donor adds here is each slot's Lua type, which ATTACK's signature fixes.
+        let mut args = donor
+            .filter(|d| d.args.len() >= 36)
+            .map_or_else(Self::attack_arg_types, |d| d.args.clone());
         args[0] = A::Int(h.id as i64);
         args[1] = A::Int(h.part as i64);
         args[2] = A::Hash(hash40::hash40(&h.bone_name.to_lowercase()).0);
@@ -26205,6 +25600,21 @@ impl VisionaryApp {
             }
         }
         Some(args)
+    }
+
+    /// The 36 `ATTACK` slots with the Lua type each one takes.
+    fn attack_arg_types() -> Vec<crate::game_link::LuaArgWire> {
+        use crate::game_link::LuaArgWire as A;
+        let mut args = vec![A::Num(0.0); 36];
+        for slot in [0, 1, 4, 5, 6, 7, 17, 18, 22, 28, 29, 30, 33, 34, 35] {
+            args[slot] = A::Int(0);
+        }
+        for slot in [19, 23, 24, 25, 26, 27, 31] {
+            args[slot] = A::Bool(false);
+        }
+        args[2] = A::Hash(0);
+        args[32] = A::Hash(0);
+        args
     }
 
     /// Full 41-slot `ATTACK_FP` vector for injection. A captured FP donor supplies every
@@ -26390,6 +25800,7 @@ impl VisionaryApp {
             frame: Self::script_to_motion_frame(h.active_end.saturating_add(1)),
             args,
             command: Some(command.into()),
+            guard: None,
         })
     }
 
@@ -27307,19 +26718,10 @@ impl VisionaryApp {
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<crate::game_link::SpawnRuleWire> = self
-                .effect_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
+            let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
             self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                .effect_control_rules_store
-                .values()
-                .flatten()
-                .cloned()
-                .collect();
+            let all_controls: Vec<crate::game_link::EffectControlRuleWire> =
+                self.live_effect_control_rule_union();
             self.game_link.send_effect_control_rules(&all_controls);
         }
     }
@@ -29119,12 +28521,7 @@ impl VisionaryApp {
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&all);
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
@@ -29248,6 +28645,14 @@ impl VisionaryApp {
         let Some(mv_key) = self.current_move_key() else {
             return LiveReplayLimits::default();
         };
+        if !self.allows_flat_effect_rules(&mv_key) {
+            // The flat spawn protocol cannot represent a full conditional control tree.
+            // Withdraw old rules rather than turn authored branches into unconditional effects.
+            self.effect_rules_store.remove(&mv_key);
+            self.effect_control_rules_store.remove(&mv_key);
+            self.publish_live_rule_union();
+            return LiveReplayLimits::default();
+        }
         let motion = self.current_motion_hash();
         let mut effects = self.state.effects.clone();
         for effect in &mut effects {
@@ -29260,6 +28665,18 @@ impl VisionaryApp {
             .cloned()
             .map(crate::data::EffectCall::normalized_timing)
             .collect();
+        // A spawn the user removed stays in the list as disabled, which suppresses it live.
+        let kept = effects.len();
+        effects.extend(
+            pristines
+                .iter()
+                .skip(effects.len())
+                .cloned()
+                .map(|mut removed| {
+                    removed.disabled = true;
+                    removed
+                }),
+        );
         let mut rules: Vec<crate::game_link::SpawnRuleWire> = Vec::new();
         let mut missing_capture = false;
         let mut unsupported_work_int = false;
@@ -29432,13 +28849,19 @@ impl VisionaryApp {
                 continue;
             }
             if ec.disabled {
+                // Script frames drift from motion frames under an animation-speed call. With no
+                // spawn of this effect left in the move, stop it wherever it comes.
+                let gone = i >= kept
+                    && !effects[..kept]
+                        .iter()
+                        .any(|other| other.effect_name == ec.effect_name);
                 rules.push(crate::game_link::SpawnRuleWire {
                     eff_hash: orig_hash,
                     suppress: true,
                     stop_func: None,
                     motion,
-                    frame_start: window.0,
-                    frame_end: window.1,
+                    frame_start: if gone { None } else { window.0 },
+                    frame_end: if gone { None } else { window.1 },
                     pos: None,
                     rot: None,
                     scale: None,
@@ -29667,6 +29090,44 @@ impl VisionaryApp {
         }
         let (control_rules, missing_control_capture, unsupported_control) =
             self.build_effect_control_rules(&effects, &pristines, motion);
+        // Spawns inside the game's own `if`s never reach the flat list above. A move that no
+        // longer has one anywhere stops it for the whole motion.
+        if let Some(graph) = mv_key
+            .split_once('/')
+            .and_then(|(fighter, name)| self.move_graphs.get(fighter)?.get(name))
+        {
+            for name in crate::move_nodes::live_steps::removed_spawns(
+                graph,
+                &self.state.source_effect_spawns,
+            ) {
+                let eff_hash = effect_name_hash(&name);
+                if !rules.iter().any(|rule| {
+                    rule.eff_hash == eff_hash && rule.suppress && rule.frame_start.is_none()
+                }) {
+                    rules.push(crate::game_link::SpawnRuleWire {
+                        eff_hash,
+                        suppress: true,
+                        stop_func: None,
+                        motion,
+                        frame_start: None,
+                        frame_end: None,
+                        pos: None,
+                        rot: None,
+                        scale: None,
+                        rate: None,
+                        camera_offset: None,
+                        tint: None,
+                        particle_tint: None,
+                        alpha: None,
+                        scale_w: None,
+                        color: None,
+                        transition: None,
+                        inject: None,
+                        color_inject: None,
+                    });
+                }
+            }
+        }
         if rules.is_empty() {
             self.effect_rules_store.remove(&mv_key);
         } else {
@@ -29678,19 +29139,10 @@ impl VisionaryApp {
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<crate::game_link::SpawnRuleWire> = self
-            .effect_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<crate::game_link::EffectControlRuleWire> = self
-            .effect_control_rules_store
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
+        let all_controls: Vec<crate::game_link::EffectControlRuleWire> =
+            self.live_effect_control_rule_union();
         self.game_link.send_effect_control_rules(&all_controls);
         if unsupported_flip_axis {
             self.state.status =
@@ -29880,6 +29332,26 @@ impl VisionaryApp {
         let captures = motion
             .map(|motion| self.captures_for_selected_fighter(motion))
             .unwrap_or_default();
+        Self::build_effect_control_rules_from_captures(effects, pristines, motion, &captures)
+    }
+
+    fn effect_control_requires_source_export(control: &crate::data::EffectControl) -> bool {
+        matches!(
+            control,
+            crate::data::EffectControl::OffKindWork { .. }
+                | crate::data::EffectControl::ReqScreen { .. }
+                | crate::data::EffectControl::SetDisableCameraDepthInfluence { .. }
+                | crate::data::EffectControl::SetDisableRenderOffsetLast
+                | crate::data::EffectControl::EnableSyncInitPosLast
+        )
+    }
+
+    fn build_effect_control_rules_from_captures(
+        effects: &[crate::data::EffectCall],
+        pristines: &[crate::data::EffectCall],
+        motion: Option<u64>,
+        captures: &[crate::game_link::CaptureLine],
+    ) -> (Vec<crate::game_link::EffectControlRuleWire>, bool, bool) {
         let mut rules = Vec::new();
         let mut missing_capture = false;
         let mut unsupported_value = false;
@@ -29888,6 +29360,19 @@ impl VisionaryApp {
             let Some(now) = now_call.control.as_ref() else {
                 continue;
             };
+            let original = pristines.get(index);
+            if Self::effect_control_requires_source_export(now)
+                || original
+                    .and_then(|call| call.control.as_ref())
+                    .is_some_and(Self::effect_control_requires_source_export)
+            {
+                unsupported_value |= original.is_none_or(|was_call| {
+                    was_call.control.as_ref() != Some(now)
+                        || was_call.active_start != now_call.active_start
+                        || was_call.disabled != now_call.disabled
+                });
+                continue;
+            }
             let Some(was_call) = pristines.get(index) else {
                 missing_capture = true;
                 continue;
@@ -29904,7 +29389,7 @@ impl VisionaryApp {
             let occurrence =
                 Self::effect_control_occurrence(pristines, index, func, was_call.active_start);
             let Some(donor) = Self::effect_control_capture_args(
-                &captures,
+                captures,
                 func,
                 was_call.active_start,
                 occurrence,
@@ -30072,6 +29557,7 @@ impl VisionaryApp {
                 frame: Self::script_to_motion_frame(ec.active_start),
                 func: command.to_string(),
                 args,
+                guard: None,
             });
         }
         let spawns = captures
@@ -30094,12 +29580,8 @@ impl VisionaryApp {
                         .find(|c| crate::acmd::effect_spawn_layout(&c.func).is_some())
                 }),
         };
-        // A REPLACEMENT still refuses without its donor. The call it replaces exists in the
-        // script, so its captured arguments are knowable, and inventing them instead would make
-        // the live preview differ from what the export writes.
-        if donor_hash.is_some() && donor.is_none() {
-            return None;
-        }
+        // With no donor the command's measured layout supplies the call, for a replacement too:
+        // a block's values are all the editor's own, and a move built from blocks has no capture.
         let (func, args) = build_effect_spawn_args(
             ec,
             donor.map(|donor| (donor.func.as_str(), donor.args.as_slice())),
@@ -30112,6 +29594,7 @@ impl VisionaryApp {
             frame: Self::script_to_motion_frame(ec.active_start),
             func,
             args,
+            guard: None,
         })
     }
 
@@ -30216,6 +29699,7 @@ impl VisionaryApp {
             frame: Self::script_to_motion_frame(ec.active_start),
             func: ec.spawn_func.clone(),
             args,
+            guard: None,
         })
     }
 
@@ -30265,6 +29749,7 @@ impl VisionaryApp {
                 args: vec![A::Num(
                     ec.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT),
                 )],
+                guard: None,
             };
         }
         // The retimed kill must be the SAME call at a different frame. Sending a fixed pair
@@ -30280,6 +29765,7 @@ impl VisionaryApp {
                 A::Bool(ec.off_fade.unwrap_or(default_fade)),
                 A::Bool(ec.off_detach.unwrap_or(default_detach)),
             ],
+            guard: None,
         }
     }
 
@@ -30930,1103 +30416,6 @@ impl VisionaryApp {
                 }
             });
     }
-
-    #[allow(dead_code)]
-    fn draw_scrubber_legacy(&mut self, ui: &mut Ui) {
-        let total = self
-            .state
-            .total_frames
-            .max(timeline_frame_extent_with_change_kinetic(
-                &self.state.hitboxes,
-                &self.state.effects,
-                &self.state.sounds,
-                &self.state.expressions,
-                &self.state.script.to_reverse_lr_events(),
-                &self.state.script.to_speed_ex_events(),
-                &self.state.script.to_speed_events(),
-                &self.state.script.to_add_speed_no_limit_events(),
-                &self.state.script.to_correct_events(),
-                &self.state.script.to_ft_catch_stop_events(),
-                &self.state.script.to_ft_start_adjust_motion_frame_events(),
-                &self.state.script.to_clr_speed_events(),
-                &self.state.script.to_set_air_events(),
-                &self.state.script.to_change_kinetic_events(),
-                &self.state.script.to_kinetic_energy_events(),
-                &self.state.script.to_kinetic_add_speed_events(),
-                &self.state.script.to_kinetic_clear_speed_all_events(),
-                &self
-                    .state
-                    .script
-                    .to_kinetic_set_consider_ground_friction_events(),
-                &self.state.script.to_motion_module_set_rate_events(),
-                &self
-                    .state
-                    .script
-                    .to_motion_module_set_helper_calculation_events(),
-                &self.state.script.to_motion_module_set_rate_partial_events(),
-                &self
-                    .state
-                    .script
-                    .to_motion_module_set_frame_partial_events(),
-                &self.state.script.to_work_flag_events(),
-                &self.state.script.to_work_transition_term_events(),
-                &self.state.script.to_work_module_inc_int_events(),
-                &self.state.script.to_work_module_set_events(),
-            ));
-        if total == 0 {
-            return;
-        }
-
-        let current = self.state.current_frame.clamp(FIRST_GAME_FRAME, total);
-
-        // Playback controls
-        ui.horizontal(|ui| {
-            let play_label = if self.state.playing { "⏸" } else { "▶" };
-            if ui.button(play_label).clicked() {
-                self.state.playing = !self.state.playing;
-            }
-            if ui.button("|◀").clicked() {
-                self.state.current_frame = FIRST_GAME_FRAME;
-                self.state.playing = false;
-            }
-            ui.label(format!("Frame {} / {}", current, total));
-        });
-
-        // The existing bottom panel remains the only size control. Dense moves use compact rows
-        // and scroll vertically inside it instead of growing the panel over the editor.
-        let n_fx = self.state.effects.len();
-        let row_height = TIMELINE_ROW_HEIGHT;
-        let bar_height = (row_height - 2.0).max(3.0);
-        let effect_height = (row_height * 0.45).max(3.0);
-        let hb_band = self.state.hitboxes.len() as f32 * row_height;
-        // Only the non-default states get a row, matching what the band actually draws.
-        let (hurt_states, _) = self.state.script.to_hurtboxes();
-        let hurt_states: Vec<_> = hurt_states
-            .into_iter()
-            .filter(|s| s.status != "HIT_STATUS_NORMAL")
-            .collect();
-        let reverse_lr = self.state.script.to_reverse_lr_events();
-        let speed_ex = self.state.script.to_speed_ex_events();
-        let speed = self.state.script.to_speed_events();
-        let add_speed_no_limit = self.state.script.to_add_speed_no_limit_events();
-        let correct = self.state.script.to_correct_events();
-        let ft_catch_stop = self.state.script.to_ft_catch_stop_events();
-        let ft_start_adjust_motion_frame =
-            self.state.script.to_ft_start_adjust_motion_frame_events();
-        let clr_speed = self.state.script.to_clr_speed_events();
-        let set_air = self.state.script.to_set_air_events();
-        let change_kinetic = self.state.script.to_change_kinetic_events();
-        let kinetic_energy = self.state.script.to_kinetic_energy_events();
-        let kinetic_add_speed = self.state.script.to_kinetic_add_speed_events();
-        let kinetic_clear_speed_all = self.state.script.to_kinetic_clear_speed_all_events();
-        let kinetic_set_consider_ground_friction = self
-            .state
-            .script
-            .to_kinetic_set_consider_ground_friction_events();
-        let motion_module_set_rate = self.state.script.to_motion_module_set_rate_events();
-        let motion_module_set_helper_calculation = self
-            .state
-            .script
-            .to_motion_module_set_helper_calculation_events();
-        let motion_module_set_rate_partial =
-            self.state.script.to_motion_module_set_rate_partial_events();
-        let motion_module_set_frame_partial = self
-            .state
-            .script
-            .to_motion_module_set_frame_partial_events();
-        let work_flags = self.state.script.to_work_flag_events();
-        let work_transition_terms = self.state.script.to_work_transition_term_events();
-        let work_module_inc_ints = self.state.script.to_work_module_inc_int_events();
-        let work_module_sets = self.state.script.to_work_module_set_events();
-        let timeline_height = timeline_content_height_with_change_kinetic(
-            self.state.hitboxes.len(),
-            n_fx,
-            hurt_states.len(),
-            self.state.sounds.len(),
-            reverse_lr.len(),
-            speed_ex.len(),
-            speed.len(),
-            add_speed_no_limit.len(),
-            correct.len(),
-            ft_catch_stop.len(),
-            ft_start_adjust_motion_frame.len(),
-            clr_speed.len(),
-            set_air.len(),
-            change_kinetic.len(),
-            kinetic_energy.len(),
-            kinetic_add_speed.len(),
-            kinetic_clear_speed_all.len(),
-            kinetic_set_consider_ground_friction.len(),
-            motion_module_set_rate.len(),
-            motion_module_set_helper_calculation.len(),
-            motion_module_set_rate_partial.len(),
-            motion_module_set_frame_partial.len(),
-            work_flags.len(),
-            work_transition_terms.len(),
-            work_module_inc_ints.len(),
-            work_module_sets.len(),
-        );
-        let timeline_width = ui.available_width().max(1.0);
-        let viewport_height = ui.available_height().max(1.0);
-
-        timeline_scroll_area(viewport_height).show(ui, |ui| {
-            let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(timeline_width, timeline_height),
-                egui::Sense::click_and_drag(),
-            );
-
-            let painter = ui.painter_at(rect);
-            let w = rect.width();
-
-            // Background
-            painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(20, 20, 30));
-
-            let frame_start_to_x =
-                |f: u32| -> f32 { rect.left() + timeline_frame_start_fraction(f, total) * w };
-            let frame_end_to_x =
-                |f: u32| -> f32 { rect.left() + timeline_frame_end_fraction(f, total) * w };
-
-            // Hitbox bars
-            for (row, hb) in self.state.hitboxes.iter().enumerate() {
-                let y_top = rect.top() + 24.0 + row as f32 * row_height;
-                let y_bot = y_top + bar_height;
-                let color = hitbox_display_color(hb);
-                let is_selected = hitbox_is_selected(self.selected_hitbox, row);
-
-                let start_x = frame_start_to_x(hb.active_start);
-                let end_x = if hb.active_end == 9999 {
-                    rect.right()
-                } else {
-                    frame_end_to_x(hb.active_end).min(rect.right())
-                };
-
-                if end_x > start_x {
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(start_x, y_top),
-                        egui::pos2(end_x, y_bot),
-                    );
-                    let alpha = if is_selected { 230 } else { 180 };
-                    painter.rect_filled(
-                        bar_rect,
-                        2.0,
-                        egui::Color32::from_rgba_unmultiplied(
-                            color.r(),
-                            color.g(),
-                            color.b(),
-                            alpha,
-                        ),
-                    );
-                    if is_selected {
-                        painter.rect_stroke(
-                            bar_rect,
-                            2.0,
-                            egui::Stroke::new(1.5, egui::Color32::WHITE),
-                            egui::StrokeKind::Outside,
-                        );
-                    }
-                    // Label inside bar if wide enough
-                    let bar_w = end_x - start_x;
-                    if bar_w > 30.0 && row_height >= 9.0 {
-                        painter.text(
-                            egui::pos2(start_x + 3.0, y_top + bar_height * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            format!("#{} {}", hb.id, hb.bone_name),
-                            egui::FontId::monospace(10.0),
-                            egui::Color32::WHITE,
-                        );
-                    }
-                }
-            }
-
-            // Frame tick marks use the same one-based game-frame labels as ACMD and the game UI.
-            for f in FIRST_GAME_FRAME..=total {
-                if f != FIRST_GAME_FRAME && f % 5 != 0 {
-                    continue;
-                }
-                let x = frame_start_to_x(f);
-                let is_ten = f == FIRST_GAME_FRAME || f % 10 == 0;
-                let tick_h = if is_ten { 8.0 } else { 4.0 };
-                painter.line_segment(
-                    [
-                        egui::pos2(x, rect.top()),
-                        egui::pos2(x, rect.top() + tick_h),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
-                );
-                if is_ten {
-                    painter.text(
-                        egui::pos2(x + 2.0, rect.top() + 10.0),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{}", f),
-                        egui::FontId::monospace(9.0),
-                        egui::Color32::from_gray(120),
-                    );
-                }
-            }
-
-            // Effect spawn bars — a compact band below the hitbox rows showing each spawn's
-            // start→end (one-shots get a short fixed window; follow effects extend to the end).
-            let fx_band_top = rect.top() + 24.0 + hb_band + 2.0;
-            for (row, e) in self.state.effects.iter().enumerate() {
-                let y_top = fx_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let end_frame = if e.follows_bone {
-                    if e.active_end >= total {
-                        total
-                    } else {
-                        e.active_end
-                    }
-                } else {
-                    e.active_end
-                        .max(e.active_start.saturating_add(12))
-                        .min(total)
-                };
-                let start_x = frame_start_to_x(e.active_start.min(total));
-                let end_x = frame_end_to_x(end_frame)
-                    .max(start_x + 3.0)
-                    .min(rect.right());
-                let base = if is_null_effect_sentinel(e) {
-                    egui::Color32::from_rgb(125, 125, 125)
-                } else if e.disabled {
-                    egui::Color32::from_rgb(110, 110, 110)
-                } else if e.follows_bone {
-                    egui::Color32::from_rgb(255, 165, 0)
-                } else {
-                    egui::Color32::from_rgb(255, 220, 0)
-                };
-                let selected = self.state.selected_effect_call == Some(row);
-                let alpha = if selected { 235 } else { 170 };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha),
-                );
-                if selected {
-                    painter.rect_stroke(
-                        egui::Rect::from_min_max(
-                            egui::pos2(start_x, y_top),
-                            egui::pos2(end_x, y_bot),
-                        ),
-                        1.0,
-                        egui::Stroke::new(1.0, egui::Color32::WHITE),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-            }
-
-            // Hurtbox states — their own band below the effects, because they are neither a
-            // collision nor a spawn. Only the non-default ones are drawn: a move that toggles
-            // four bones writes eight calls, and the four that say "back to normal" describe
-            // the absence of the thing this lane exists to show.
-            let hurt_band_top = fx_band_top
-                + if n_fx == 0 {
-                    0.0
-                } else {
-                    n_fx as f32 * effect_height + 2.0
-                };
-            for (row, state) in hurt_states
-                .iter()
-                .filter(|s| s.status != "HIT_STATUS_NORMAL")
-                .enumerate()
-            {
-                let y_top = hurt_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(state.active_start.min(total));
-                let end_x = frame_end_to_x(state.active_end.min(total))
-                    .max(start_x + 3.0)
-                    .min(rect.right());
-                // Fully gone reads as more than partly gone, so `OFF` is the strongest colour.
-                let base = hurtbox_timeline_color(crate::data::HurtboxStatus::from_acmd_value(
-                    &state.status,
-                ));
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 190),
-                );
-            }
-
-            // Sounds — the bottom band, one row per call. Drawn as a tick at its frame rather
-            // than a bar, because a sound has no length this editor can know: the script says
-            // when it starts and nothing in ACMD says when it stops.
-            let sound_band_top = hurt_band_top
-                + if hurt_states.is_empty() {
-                    0.0
-                } else {
-                    hurt_states.len() as f32 * effect_height + 2.0
-                };
-            for (row, sound) in self.state.sounds.iter().enumerate() {
-                let y_top = sound_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(sound.frame.min(total));
-                let end_x = frame_end_to_x(sound.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                // `STOP_SE` silences rather than plays, so it reads as the quieter colour.
-                let base = if sound.call.func.starts_with("STOP") {
-                    egui::Color32::from_rgb(120, 140, 160)
-                } else {
-                    egui::Color32::from_rgb(150, 210, 150)
-                };
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 210),
-                );
-                // The name to the right of the tick, where there is room for it. A tick alone
-                // says a sound happens; the name is the part a modder is actually matching a
-                // hitbox against.
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        sound.call.sounds.join(" / "),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(150, 210, 150, 200),
-                    );
-                }
-            }
-
-            // Facing reversals are point events too. They get their own compact lane because
-            // they change model orientation rather than collision geometry, and hiding them in
-            // the sound lane would make a movement edit look like an audio event.
-            let reverse_band_top = sound_band_top
-                + if self.state.sounds.is_empty() {
-                    0.0
-                } else {
-                    self.state.sounds.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in reverse_lr.iter().enumerate() {
-                let y_top = reverse_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(190, 150, 245, 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        "REVERSE_LR",
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(190, 150, 245, 210),
-                    );
-                }
-            }
-
-            // Kinetic velocity points get their own lane rather than being folded into facing
-            // reversals: both are movement commands, but only this lane carries editable x/y
-            // payloads.
-            let speed_band_top = reverse_band_top
-                + if reverse_lr.is_empty() {
-                    0.0
-                } else {
-                    reverse_lr.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in speed_ex.iter().enumerate() {
-                let y_top = speed_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(110, 190, 255);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "SET_SPEED_EX ({:.2}, {:.2})",
-                            event.call.speed_x, event.call.speed_y
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            // Direct velocity points use the same x/y display treatment but stay in their own
-            // lane so they cannot be mistaken for reserve-specific SET_SPEED_EX edits.
-            let set_speed_band_top = speed_band_top
-                + if speed_ex.is_empty() {
-                    0.0
-                } else {
-                    speed_ex.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in speed.iter().enumerate() {
-                let y_top = set_speed_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(245, 170, 110);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "SET_SPEED ({:.2}, {:.2})",
-                            event.call.speed_x, event.call.speed_y
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            // Unbounded velocity additions get a separate lane so their x/y payload is not
-            // confused with SET_SPEED_EX's reserve-specific velocity.
-            let add_speed_band_top = set_speed_band_top
-                + if speed.is_empty() {
-                    0.0
-                } else {
-                    speed.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in add_speed_no_limit.iter().enumerate() {
-                let y_top = add_speed_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(90, 220, 180);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "ADD_SPEED_NO_LIMIT ({:.2}, {:.2})",
-                            event.call.speed_x, event.call.speed_y
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let correct_band_top = add_speed_band_top
-                + if add_speed_no_limit.is_empty() {
-                    0.0
-                } else {
-                    add_speed_no_limit.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in correct.iter().enumerate() {
-                let y_top = correct_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(255, 205, 120);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("CORRECT {}", event.call.kind),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let ft_catch_stop_band_top = correct_band_top
-                + if correct.is_empty() {
-                    0.0
-                } else {
-                    correct.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in ft_catch_stop.iter().enumerate() {
-                let y_top = ft_catch_stop_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(220, 155, 245);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "FT_CATCH_STOP ({:.2}, {:.2})",
-                            event.call.arg1, event.call.arg2
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let ft_start_adjust_motion_frame_band_top = ft_catch_stop_band_top
-                + if ft_catch_stop.is_empty() {
-                    0.0
-                } else {
-                    ft_catch_stop.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in ft_start_adjust_motion_frame.iter().enumerate() {
-                let y_top = ft_start_adjust_motion_frame_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(130, 220, 245);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "FT_START_ADJUST_MOTION_FRAME_arg1 ({:.2})",
-                            event.call.value
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let clr_speed_band_top = ft_start_adjust_motion_frame_band_top
-                + if ft_start_adjust_motion_frame.is_empty() {
-                    0.0
-                } else {
-                    ft_start_adjust_motion_frame.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in clr_speed.iter().enumerate() {
-                let y_top = clr_speed_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(245, 125, 175);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("CLR_SPEED {}", event.call.kinetic_kind),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let set_air_band_top = clr_speed_band_top
-                + if clr_speed.is_empty() {
-                    0.0
-                } else {
-                    clr_speed.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in set_air.iter().enumerate() {
-                let y_top = set_air_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(170, 200, 255);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        "SET_AIR",
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let change_kinetic_band_top = set_air_band_top
-                + if set_air.is_empty() {
-                    0.0
-                } else {
-                    set_air.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in change_kinetic.iter().enumerate() {
-                let y_top = change_kinetic_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(255, 190, 120);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("change_kinetic {}", event.call.kinetic_type),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let kinetic_energy_band_top = change_kinetic_band_top
-                + if change_kinetic.is_empty() {
-                    0.0
-                } else {
-                    change_kinetic.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in kinetic_energy.iter().enumerate() {
-                let y_top = kinetic_energy_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(205, 160, 255);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{} {}", event.call.func(), event.call.kinetic_energy_id),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let kinetic_add_speed_band_top = kinetic_energy_band_top
-                + if kinetic_energy.is_empty() {
-                    0.0
-                } else {
-                    kinetic_energy.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in kinetic_add_speed.iter().enumerate() {
-                let y_top = kinetic_add_speed_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(120, 190, 255);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "KineticModule::add_speed ({:.2}, {:.2}, z 0.0)",
-                            event.call.speed_x, event.call.speed_y
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let kinetic_clear_speed_all_band_top = kinetic_add_speed_band_top
-                + if kinetic_add_speed.is_empty() {
-                    0.0
-                } else {
-                    kinetic_add_speed.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in kinetic_clear_speed_all.iter().enumerate() {
-                let y_top = kinetic_clear_speed_all_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(150, 220, 180);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        "KineticModule::clear_speed_all",
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let kinetic_set_consider_ground_friction_band_top = kinetic_clear_speed_all_band_top
-                + if kinetic_clear_speed_all.is_empty() {
-                    0.0
-                } else {
-                    kinetic_clear_speed_all.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in kinetic_set_consider_ground_friction.iter().enumerate() {
-                let y_top =
-                    kinetic_set_consider_ground_friction_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(235, 205, 120);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "set_consider_ground_friction {} {}",
-                            event.call.consider_ground_friction,
-                            event.call.kinetic_energy_attribute
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let motion_module_set_rate_band_top = kinetic_set_consider_ground_friction_band_top
-                + if kinetic_set_consider_ground_friction.is_empty() {
-                    0.0
-                } else {
-                    kinetic_set_consider_ground_friction.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in motion_module_set_rate.iter().enumerate() {
-                let y_top = motion_module_set_rate_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(170, 205, 255);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("MotionModule::set_rate {:.2}", event.call.rate),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let motion_module_set_helper_calculation_band_top = motion_module_set_rate_band_top
-                + if motion_module_set_rate.is_empty() {
-                    0.0
-                } else {
-                    motion_module_set_rate.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in motion_module_set_helper_calculation.iter().enumerate() {
-                let y_top =
-                    motion_module_set_helper_calculation_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(190, 230, 170);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "MotionModule::set_helper_calculation {}",
-                            event.call.enabled
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let motion_module_set_rate_partial_band_top =
-                motion_module_set_helper_calculation_band_top
-                    + if motion_module_set_helper_calculation.is_empty() {
-                        0.0
-                    } else {
-                        motion_module_set_helper_calculation.len() as f32 * effect_height + 2.0
-                    };
-            for (row, event) in motion_module_set_rate_partial.iter().enumerate() {
-                let y_top = motion_module_set_rate_partial_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(170, 220, 190);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "MotionModule::set_rate_partial {} {:.2}",
-                            event.call.part_kind, event.call.rate
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let work_flag_band_top = motion_module_set_rate_partial_band_top
-                + if motion_module_set_rate_partial.is_empty() {
-                    0.0
-                } else {
-                    motion_module_set_rate_partial.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in work_flags.iter().enumerate() {
-                let y_top = work_flag_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(235, 190, 120);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{} {}", event.call.func(), event.call.flag),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let work_transition_term_band_top = work_flag_band_top
-                + if work_flags.is_empty() {
-                    0.0
-                } else {
-                    work_flags.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in work_transition_terms.iter().enumerate() {
-                let y_top = work_transition_term_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(205, 170, 235);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{} {}", event.call.func(), event.call.transition_term),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let work_module_inc_int_band_top = work_transition_term_band_top
-                + if work_transition_terms.is_empty() {
-                    0.0
-                } else {
-                    work_transition_terms.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in work_module_inc_ints.iter().enumerate() {
-                let y_top = work_module_inc_int_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(220, 190, 140);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!("WorkModule::inc_int {}", event.call.slot),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            let work_module_set_band_top = work_module_inc_int_band_top
-                + if work_module_inc_ints.is_empty() {
-                    0.0
-                } else {
-                    work_module_inc_ints.len() as f32 * effect_height + 2.0
-                };
-            for (row, event) in work_module_sets.iter().enumerate() {
-                let y_top = work_module_set_band_top + row as f32 * effect_height;
-                let y_bot = y_top + (effect_height - 1.0).max(2.0);
-                let start_x = frame_start_to_x(event.frame.min(total));
-                let end_x = frame_end_to_x(event.frame.min(total))
-                    .max(start_x + 2.0)
-                    .min(rect.right());
-                let color = egui::Color32::from_rgb(150, 215, 205);
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(start_x, y_top), egui::pos2(end_x, y_bot)),
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                );
-                if effect_height >= 4.0 {
-                    painter.text(
-                        egui::pos2(end_x + 3.0, (y_top + y_bot) * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        format!(
-                            "{} {} {}",
-                            event.call.func(),
-                            event.call.value,
-                            event.call.slot
-                        ),
-                        egui::FontId::monospace(8.0),
-                        egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 215),
-                    );
-                }
-            }
-
-            // Playhead
-            let px = frame_start_to_x(current);
-            painter.line_segment(
-                [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
-            );
-            // Playhead triangle
-            painter.add(egui::Shape::convex_polygon(
-                vec![
-                    egui::pos2(px, rect.top()),
-                    egui::pos2(px - 5.0, rect.top() - 7.0),
-                    egui::pos2(px + 5.0, rect.top() - 7.0),
-                ],
-                egui::Color32::WHITE,
-                egui::Stroke::NONE,
-            ));
-
-            // Click/drag to scrub — but clicks on hitbox bars select that hitbox instead
-            if response.dragged() || response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    // Only attempt hitbox selection on a clean click (not a drag)
-                    let clicked_hitbox = if response.clicked() {
-                        let bar_area_top = rect.top() + 24.0;
-                        if pos.y >= bar_area_top {
-                            let row = ((pos.y - bar_area_top) / row_height) as usize;
-                            if row < self.state.hitboxes.len() {
-                                let hb = &self.state.hitboxes[row];
-                                let start_x = frame_start_to_x(hb.active_start);
-                                let end_x = if hb.active_end == 9999 {
-                                    rect.right()
-                                } else {
-                                    frame_end_to_x(hb.active_end).min(rect.right())
-                                };
-                                if pos.x >= start_x && pos.x <= end_x {
-                                    Some(row)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(row) = clicked_hitbox {
-                        self.selected_hitbox = if self.selected_hitbox == Some(row) {
-                            None
-                        } else {
-                            Some(row)
-                        };
-                        self.primary_tab = PrimaryEditorTab::Collisions;
-                    } else {
-                        // Scrub the playhead
-                        let t = ((pos.x - rect.left()) / w).clamp(0.0, 1.0);
-                        self.state.current_frame = timeline_frame_at_fraction(t, total);
-                        self.state.playing = false;
-                    }
-                }
-            }
-        });
-    }
 }
 
 impl eframe::App for VisionaryApp {
@@ -32042,7 +30431,10 @@ impl eframe::App for VisionaryApp {
         self.game_link.ensure_started();
         // Poll background move list loader
         if let Some(rx) = &self.move_list_receiver {
-            if let Ok(moves) = rx.try_recv() {
+            if let Ok(mut moves) = rx.try_recv() {
+                // The worker holds a label snapshot from when it started. Labels may have
+                // arrived while it was scanning, so resolve against the current map too.
+                crate::data::resolve_move_entry_names(&mut moves, &self.state.labels);
                 let count = moves.len();
                 if let Some(kind) = self.current_fighter_kind() {
                     self.capture_motion_names.extend(
@@ -32198,18 +30590,31 @@ impl eframe::App for VisionaryApp {
         // History is captured only after background loading and playback have settled.  This
         // keeps navigation and animation state out of the edit stack while still covering every
         // main-window editor, the Visual effects tab included.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
+        if !self.node_workspace
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
+        {
             self.apply_history_action(HistoryAction::Undo);
             self.history_suppress_frame = true;
-        } else if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
-                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
-        }) {
+        } else if !self.node_workspace
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
+            })
+        {
             self.apply_history_action(HistoryAction::Redo);
             self.history_suppress_frame = true;
         }
         // One current project holds every edit: they autosave to its file.
         self.begin_history_frame();
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            if self.project_path.is_some() {
+                self.save_project_silent();
+            } else {
+                self.state.status =
+                    "Use File → Save As… to give this project an autosave location.".into();
+            }
+        }
 
         // Edit log window
         if self.show_edit_log {
@@ -32247,32 +30652,36 @@ impl eframe::App for VisionaryApp {
                 egui::containers::menu::MenuButton::new("File")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
-                    if ui.button("Project Hub…").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
+                    if ui.button("Project Hub").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
                         self.project_hub.show = true;
                         ui.close();
                     }
-                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
+                    if ui.add_enabled(self.project_path.is_some(), egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .on_hover_text("Flush applied edits and layouts to the current project. Unapplied controller and move drafts remain drafts.").clicked() {
+                        self.save_project_silent();
+                        ui.close();
+                    }
+                    if ui.button("Save As").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
                         self.save_project_as();
                         ui.close();
                     }
-                    if ui.button("Open Project…").clicked() {
+                    if ui.button("Open Project").clicked() {
                         self.load_project();
                         ui.close();
                     }
-                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there and autosaves").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.request_hub_action(crate::project_hub::HubAction::New(folder));
-                        }
+                    if ui.button("New Project").on_hover_text("Enter a workspace folder — every edit lives there and autosaves").clicked() {
+                        self.project_hub.show = true;
+                        self.project_hub.new_workspace = Some(String::new());
                         ui.close();
                     }
-                    if ui.button("Import Mod as Project…").on_hover_text("Adopt a compiled mod folder as an editable project").clicked() {
+                    if ui.button("Import Mod as Project").on_hover_text("Adopt a compiled mod folder as an editable project").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             self.request_hub_action(crate::project_hub::HubAction::ImportMod(folder));
                         }
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Choose base game folder…").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
+                    if ui.button("Choose base game folder").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.set_data_root(path);
                         }
@@ -32280,7 +30689,7 @@ impl eframe::App for VisionaryApp {
                     }
                     // ── Modded characters + extra skins ──────────────────────────────
                     if ui
-                        .button("Mod Library…")
+                        .button("Mod Library")
                         .on_hover_text(
                             "Import compiled mods — folders or .zip/.7z archives, many at \
                              once — and set which one wins when two provide the same file. \
@@ -32305,7 +30714,7 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Open Effect File…")
+                    if ui.button("Open Effect File")
                         .on_hover_text("Load any .eff from disk (even outside the game data root) into the preview and donor pool")
                         .clicked()
                     {
@@ -32338,6 +30747,11 @@ impl eframe::App for VisionaryApp {
                 egui::containers::menu::MenuButton::new("Windows")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
+                    if ui.selectable_label(self.primary_tab == PrimaryEditorTab::Gimmicks, "Gimmicks").on_hover_text("Edit the selected character's parameters, reusable behavior, meters, and live article controls in the main editor").clicked() {
+                        self.primary_tab = PrimaryEditorTab::Gimmicks;
+                        self.node_workspace = false;
+                        ui.close();
+                    }
                     ui.checkbox(&mut self.roster.open, "Roster")
                         .on_hover_text(
                             "Mod library, character select screen, new characters, and \
@@ -32386,7 +30800,7 @@ impl eframe::App for VisionaryApp {
                 egui::containers::menu::MenuButton::new("Project")
                     .config(menu_config)
                     .ui(ui, |ui| {
-                    if ui.button("Project files…").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
+                    if ui.button("Project files").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
                         self.show_workspace = true;
                         ui.close();
                     }
@@ -32409,7 +30823,7 @@ impl eframe::App for VisionaryApp {
                         );
                     }
                     ui.separator();
-                    if ui.button("Export Project…")
+                    if ui.button("Export Project")
                         .on_hover_text("Export an editable modproject.json and its assets separately from installable mod and developer files")
                         .clicked()
                     {
@@ -32441,19 +30855,62 @@ impl eframe::App for VisionaryApp {
                     if ui
                         .add_enabled(
                             self.export_build.is_none(),
-                            egui::Button::new("Export Mod Folder…"),
+                            egui::Button::new("Export Mod Folder"),
                         )
-                        .on_hover_text("Export one complete ARCropolis mod folder, including effects and a built ACMD plugin at plugin.nro")
+                        .on_hover_text("Export one complete ARCropolis mod folder, including effects and one slight_replica plugin.nro containing both ACMD and gimmick behavior")
                         .clicked()
                     {
                         self.export_full_mod();
                         ui.close();
                     }
-                    if ui.button("Export Developer Files…")
+                    if ui.button("Export Developer Files")
                         .on_hover_text("Export rebuilt effect files and editable ACMD Rust source in separate folders")
                         .clicked()
                     {
                         self.export_developer_files();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.roster.behaviors.values().any(|graph| !graph.is_empty())
+                                || self
+                                    .roster
+                                    .meters
+                                    .values()
+                                    .flatten()
+                                    .any(|binding| binding.enabled),
+                            egui::Button::new("Export Gimmick Adapter"),
+                        )
+                        .on_hover_text(
+                            "Write saved gimmick behavior and enabled meters into the managed slot of an explicitly selected compatible slight_replica source tree",
+                        )
+                        .clicked()
+                    {
+                        self.export_gimmick_adapter();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.export_build.is_none()
+                                && (self
+                                    .roster
+                                    .behaviors
+                                    .values()
+                                    .any(|graph| !graph.is_empty())
+                                    || self
+                                        .roster
+                                        .meters
+                                        .values()
+                                        .flatten()
+                                        .any(|binding| binding.enabled)),
+                            egui::Button::new("Build Gimmick Runtime Only"),
+                        )
+                        .on_hover_text(
+                            "Advanced: build the managed gimmick runtime by itself in one compatible slight_replica plugin; normal Mod Folder export combines it with ACMD",
+                        )
+                        .clicked()
+                    {
+                        self.build_gimmick_plugin();
                         ui.close();
                     }
                     ui.separator();
@@ -32674,11 +31131,25 @@ impl eframe::App for VisionaryApp {
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
         self.roster.authored_moves = self.roster.replaced_moves(&self.state.edit_log);
+        // ArcExplorer's export folder is a valid source of base fighter files.
+        // Keep it separate from the primary data root so that root retains
+        // precedence while partial extractions can fill missing paths.
+        let roster_export_root = self
+            .export_dir
+            .clone()
+            .filter(|root| root.join("fighter").is_dir())
+            .or_else(|| {
+                let root = self.eff_editor.export_root().to_path_buf();
+                root.join("fighter").is_dir().then_some(root)
+            });
+        self.roster.set_export_root(roster_export_root);
+        self.roster.set_parameter_labels(&self.state.labels);
         self.roster.show(
             &ctx,
             &self.state.fighters,
             self.state.data_root.as_ref(),
             &self.state.labels,
+            &self.game_link,
         );
         // Deploy stages from in-memory state, so flush the project alongside
         // it — `build_project` carries the roster edits (order, names, new
@@ -32917,6 +31388,25 @@ impl eframe::App for VisionaryApp {
                             self.state.labels.insert(*h, l.clone());
                         }
                         self.downloaded_labels = labels;
+                        // A cached/downloaded label map can arrive after the motion list.
+                        // Refresh placeholders in place without reloading or discarding edits.
+                        crate::data::resolve_move_entry_names(
+                            &mut self.move_list,
+                            &self.state.labels,
+                        );
+                        if let Some(entry) = self.state.selected_move.as_mut() {
+                            crate::data::resolve_move_entry_names(
+                                std::slice::from_mut(entry),
+                                &self.state.labels,
+                            );
+                        }
+                        if let Some(kind) = self.current_fighter_kind() {
+                            self.capture_motion_names.extend(
+                                self.move_list
+                                    .iter()
+                                    .map(|entry| ((kind, entry.hash), entry.name.clone())),
+                            );
+                        }
                     }
                     Ok(crate::param_labels::Msg::Status(s)) => self.state.status = s,
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -32949,33 +31439,13 @@ impl eframe::App for VisionaryApp {
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<crate::game_link::SpawnRuleWire> = self
-                    .effect_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !spawn.is_empty() {
-                    self.game_link.send_spawn_rules(&spawn);
-                }
-                let controls: Vec<crate::game_link::EffectControlRuleWire> = self
-                    .effect_control_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !controls.is_empty() {
-                    self.game_link.send_effect_control_rules(&controls);
-                }
-                let hit: Vec<crate::game_link::HitboxRuleWire> = self
-                    .hitbox_rules_store
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect();
-                if !hit.is_empty() {
-                    self.game_link.send_hitbox_rules(&hit);
-                }
+                let spawn: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+                self.game_link.send_spawn_rules(&spawn);
+                let controls: Vec<crate::game_link::EffectControlRuleWire> =
+                    self.live_effect_control_rule_union();
+                self.game_link.send_effect_control_rules(&controls);
+                let hit: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+                self.game_link.send_hitbox_rules(&hit);
                 self.push_effect_aliases();
                 self.live_overrides.resend_tweaks(&self.game_link);
             }
@@ -33015,7 +31485,7 @@ impl eframe::App for VisionaryApp {
         self.perf.end("poll_use_scan", t);
         self.draw_redirect_prompt(&ctx);
 
-        // Background mod-export build progress.
+        // Background normal-export or gimmick-package build progress.
         if let Some(state) = &self.export_build {
             let finished = state.lock().ok().map(|s| (s.done, s.message.clone()));
             match finished {
@@ -33136,683 +31606,53 @@ impl eframe::App for VisionaryApp {
             self.preview_transplant_result(&fighter);
         }
 
-        // Left panel
-        let t = self.perf.start();
-        egui::Panel::left("left_panel_layout_v2")
-            .default_size(240.0)
-            .min_size(72.0)
-            .resizable(true)
-            .show_inside(ui, |ui| {
-                // Panel frames measure the Ui passed directly to them. Keep overflowing labels
-                // and scroll contents in an unallocated child so their intrinsic width cannot
-                // enlarge the frame after the user drags the sidebar narrower.
-                show_fixed_panel_contents(ui, "left_panel_content", |ui| {
-                    self.draw_left_panel(ui);
+        if self.node_workspace {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_node_workspace(ui, frame));
+            self.commit_current_edits();
+        } else {
+            // Left panel
+            let t = self.perf.start();
+            egui::Panel::left("left_panel_layout_v2")
+                .default_size(240.0)
+                .min_size(72.0)
+                .resizable(true)
+                .show_inside(ui, |ui| {
+                    // Panel frames measure the Ui passed directly to them. Keep overflowing labels
+                    // and scroll contents in an unallocated child so their intrinsic width cannot
+                    // enlarge the frame after the user drags the sidebar narrower.
+                    show_fixed_panel_contents(ui, "left_panel_content", |ui| {
+                        self.draw_left_panel(ui);
+                    });
                 });
-            });
-        self.perf.end("left_panel", t);
+            self.perf.end("left_panel", t);
 
-        // Right panel — every editing surface, visual effects included, lives in here.
-        let t = self.perf.start();
-        egui::Panel::right("right_panel_layout_v2")
-            .default_size(400.0)
-            .min_size(72.0)
-            .resizable(true)
-            .show_inside(ui, |ui| {
-                // The toolbar above the editor is intentionally a single horizontal row.
-                // Keep its overflowing buttons inside an unallocated child so the row can be
-                // clipped at a compact sidebar width instead of enlarging the Panel frame.
-                show_fixed_panel_contents(ui, "right_panel_content", |ui| {
-                    self.draw_right_panel(ui);
+            // Right panel — every editing surface, visual effects included, lives in here.
+            let t = self.perf.start();
+            egui::Panel::right("right_panel_layout_v2")
+                .default_size(400.0)
+                .min_size(72.0)
+                .resizable(true)
+                .show_inside(ui, |ui| {
+                    // The toolbar above the editor is intentionally a single horizontal row.
+                    // Keep its overflowing buttons inside an unallocated child so the row can be
+                    // clipped at a compact sidebar width instead of enlarging the Panel frame.
+                    show_fixed_panel_contents(ui, "right_panel_content", |ui| {
+                        self.draw_right_panel(ui);
+                    });
                 });
-            });
-        self.perf.end("right_panel", t);
+            self.perf.end("right_panel", t);
 
-        // Commit any edits made this frame to the log
-        let t = self.perf.start();
-        self.commit_current_edits();
-        self.perf.end("commit_edits", t);
+            // Commit any edits made this frame to the log
+            let t = self.perf.start();
+            self.commit_current_edits();
+            self.perf.end("commit_edits", t);
 
-        // Central viewport
-        let t_central = self.perf.start();
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            let rect = ui.available_rect_before_wrap();
+            // Central viewport
+            let t_central = self.perf.start();
+            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_viewport(ui, frame));
+            self.perf.end("central_viewport", t_central);
+        }
 
-            if self.current_model_dir.is_some() {
-                let w = rect.width();
-                let h = rect.height();
-
-                // Allocate the full rect as interactive so we can capture mouse input
-                let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-
-                // Camera controls — apply to render state
-                if let Some(wgpu_state) = frame.wgpu_render_state() {
-                    let mut renderer = wgpu_state.renderer.write();
-                    if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
-                        // Left drag: pan in camera plane (left/right + up/down)
-                        if response.dragged_by(egui::PointerButton::Primary) {
-                            let delta = response.drag_delta();
-                            rs.camera.pan(delta.x, delta.y);
-                            ctx.request_repaint();
-                        }
-                        // Middle drag or right drag: pan (disabled for now)
-                        // Scroll: zoom
-                        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                        if scroll != 0.0 && response.hovered() {
-                            rs.camera.zoom(scroll * 0.05);
-                            ctx.request_repaint();
-                        }
-                    }
-                }
-
-                // Paint the animated character. Circle overlays are drawn below by egui.
-                let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-                let callback = egui_wgpu::Callback::new_paint_callback(
-                    rect,
-                    ViewportCallback {
-                        width: w,
-                        height: h,
-                        animation_frame,
-                        anim_path: self.current_anim_path.clone(),
-                        default_anim_path: self.current_default_eyelid_path.clone(),
-                        skel_path: self.current_skel_path.clone(),
-                    },
-                );
-                ui.painter().add(callback);
-
-                // Draw hitbox spheres as projected 2D circles
-                let frame_num = self.state.current_frame;
-                if let Some(wgpu_state) = frame.wgpu_render_state() {
-                    let renderer = wgpu_state.renderer.read();
-                    if let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() {
-                        // The WGPU model callback runs after egui builds these overlays, so
-                        // `last_frame` is one paint behind. Evaluate the requested frame
-                        // directly to keep moving bones/root motion and grabboxes synchronized.
-                        let t = self.perf.start();
-                        let bone_matrices = rs.bone_world_matrices_at(animation_frame);
-                        self.perf.end("bone_matrices", t);
-                        // Keep a positions map for debug display
-                        let bone_positions: std::collections::HashMap<String, glam::Vec3> =
-                            bone_matrices
-                                .iter()
-                                .map(|(k, m)| (k.clone(), m.col(3).truncate()))
-                                .collect();
-
-                        if self.show_debug {
-                            let mut names: Vec<&String> = bone_positions.keys().collect();
-                            names.sort();
-                            for (i, name) in names.iter().take(30).enumerate() {
-                                ui.painter().text(
-                                    rect.left_top() + egui::vec2(4.0, 4.0 + i as f32 * 12.0),
-                                    egui::Align2::LEFT_TOP,
-                                    name.as_str(),
-                                    egui::FontId::monospace(9.0),
-                                    egui::Color32::YELLOW,
-                                );
-                            }
-                            for (i, hb) in self.state.hitboxes.iter().enumerate().take(5) {
-                                let found = bone_matrices.contains_key(&hb.bone_name)
-                                    || bone_matrices.contains_key(&hb.bone_name.to_lowercase());
-                                ui.painter().text(
-                                    rect.right_top() + egui::vec2(-220.0, 4.0 + i as f32 * 12.0),
-                                    egui::Align2::LEFT_TOP,
-                                    format!("{:?} found:{}", hb.bone_name, found),
-                                    egui::FontId::monospace(9.0),
-                                    egui::Color32::LIGHT_BLUE,
-                                );
-                            }
-                            for (name, pos) in &bone_positions {
-                                if let Some(sp) = rs.world_to_screen(*pos, rect) {
-                                    ui.painter().circle_filled(
-                                        sp,
-                                        3.0,
-                                        egui::Color32::from_rgba_unmultiplied(0, 255, 0, 150),
-                                    );
-                                    ui.painter().text(
-                                        sp + egui::vec2(4.0, 0.0),
-                                        egui::Align2::LEFT_CENTER,
-                                        name,
-                                        egui::FontId::monospace(8.0),
-                                        egui::Color32::from_rgb(0, 220, 0),
-                                    );
-                                }
-                            }
-                        }
-
-                        // Parameter-defined hurtboxes sit underneath editable collision geometry,
-                        // so attacks, grabs, wind areas, and effect markers remain easy to select.
-                        if self.show_hurtboxes
-                            && self.hurtbox_volumes.iter().any(|volume| {
-                                matches!(volume.shape, crate::data::HurtboxShape::Capsule)
-                            })
-                        {
-                            let events = self.state.script.to_hurtbox_events();
-                            let condition_events = self.state.script.to_hurtbox_condition_events();
-                            let condition = crate::data::effective_hurtbox_condition(
-                                &condition_events,
-                                frame_num,
-                            );
-                            for (volume_index, status) in hurtbox_render_descriptors(
-                                &self.hurtbox_volumes,
-                                &events,
-                                frame_num,
-                                true,
-                            ) {
-                                let volume = &self.hurtbox_volumes[volume_index];
-                                let (stroke_color, fill) = hurtbox_palette(status);
-                                let Some(bone_mat) = bone_matrices
-                                    .get(&volume.bone_name)
-                                    .or_else(|| {
-                                        bone_matrices.get(&volume.bone_name.to_ascii_lowercase())
-                                    })
-                                    .copied()
-                                else {
-                                    // The loader already counted unresolved parameter bones; a
-                                    // second guard keeps a partial renderer map from drawing at
-                                    // identity if a model changes underneath the session.
-                                    continue;
-                                };
-                                let [world_start, world_end] =
-                                    hurtbox_world_endpoints(volume, bone_mat);
-                                let world_radius = hurtbox_world_radius(volume, bone_mat);
-                                let selected = self.selected_hurtbox == Some(volume_index);
-                                if selected {
-                                    let _ = draw_projected_capsule(
-                                        ui.painter(),
-                                        rs,
-                                        rect,
-                                        ProjectedCapsule {
-                                            world_start,
-                                            world_end: Some(world_end),
-                                            world_radius: world_radius + 0.04,
-                                            stroke: egui::Stroke::new(2.5, Color32::WHITE),
-                                            fill: Color32::TRANSPARENT,
-                                        },
-                                    );
-                                }
-                                if let Some(condition_color) = hurtbox_condition_palette(&condition)
-                                {
-                                    // Armor is a second, fighter-wide layer. Draw it first so
-                                    // the status fill and its cyan/amber distinction remain
-                                    // readable underneath the special-condition outline.
-                                    let _ = draw_projected_capsule(
-                                        ui.painter(),
-                                        rs,
-                                        rect,
-                                        ProjectedCapsule {
-                                            world_start,
-                                            world_end: Some(world_end),
-                                            world_radius: world_radius + 0.015,
-                                            stroke: egui::Stroke::new(2.75, condition_color),
-                                            fill: Color32::TRANSPARENT,
-                                        },
-                                    );
-                                }
-                                let _ = draw_projected_capsule(
-                                    ui.painter(),
-                                    rs,
-                                    rect,
-                                    ProjectedCapsule {
-                                        world_start,
-                                        world_end: Some(world_end),
-                                        world_radius,
-                                        stroke: egui::Stroke::new(1.25, stroke_color),
-                                        fill,
-                                    },
-                                );
-                                if selected {
-                                    if let Some(label_pos) =
-                                        rs.world_to_screen((world_start + world_end) * 0.5, rect)
-                                    {
-                                        ui.painter().text(
-                                            label_pos + egui::vec2(5.0, -5.0),
-                                            egui::Align2::LEFT_BOTTOM,
-                                            format!(
-                                                "HIT_NO #{} · {}",
-                                                volume.index,
-                                                status.label()
-                                            ),
-                                            egui::FontId::monospace(10.0),
-                                            Color32::WHITE,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        for (hitbox_index, hb) in self.state.hitboxes.iter().enumerate() {
-                            // `ATTACK_ABS` has no volume and no bone to hang one on. Its size
-                            // and offsets are zero because the call has no such arguments, so
-                            // drawing it would put a dot at the model's origin that looks like
-                            // a hitbox the script does not have.
-                            if hb.category == crate::data::CAT_ABS
-                                || hb.category == crate::data::CAT_ATTACK_FP
-                            {
-                                continue;
-                            }
-                            let active = hb.active_frames_empty()
-                                || (frame_num >= hb.active_start && frame_num <= hb.active_end);
-                            if !active {
-                                continue;
-                            }
-
-                            let color = hitbox_display_color(hb);
-                            let selected = hitbox_is_selected(self.selected_hitbox, hitbox_index);
-                            let (stroke, fill) = hitbox_viewport_style(color, selected);
-
-                            // Wind areas are defined in the fighter's 2D object space. Render
-                            // their real circle/AABB footprint rather than reusing the 3D ATTACK
-                            // sphere placeholder.
-                            if let Some(wind) = hb
-                                .wind
-                                .as_ref()
-                                .filter(|wind| hb.category == 2 && wind.is_valid())
-                            {
-                                let root = bone_matrices
-                                    .get("top")
-                                    .or_else(|| bone_matrices.get("Top"))
-                                    .copied()
-                                    .unwrap_or(glam::Mat4::IDENTITY);
-                                let root = glam::Mat4::from_translation(root.col(3).truncate());
-                                let [x, y] = wind.offset();
-                                let center = wind_area_world_point(root, x, y);
-
-                                if wind.is_radial() {
-                                    if let Some(screen_center) = rs.world_to_screen(center, rect) {
-                                        let screen_radius = rs
-                                            .world_radius_to_screen(center, wind.radius(), rect)
-                                            .unwrap_or(wind.radius() * 4.0)
-                                            .max(4.0);
-                                        ui.painter().circle(
-                                            screen_center,
-                                            screen_radius,
-                                            fill,
-                                            stroke,
-                                        );
-                                        ui.painter().line_segment(
-                                            [
-                                                screen_center - egui::vec2(screen_radius, 0.0),
-                                                screen_center + egui::vec2(screen_radius, 0.0),
-                                            ],
-                                            egui::Stroke::new(1.0, color.gamma_multiply(0.65)),
-                                        );
-                                        ui.painter().line_segment(
-                                            [
-                                                screen_center - egui::vec2(0.0, screen_radius),
-                                                screen_center + egui::vec2(0.0, screen_radius),
-                                            ],
-                                            egui::Stroke::new(1.0, color.gamma_multiply(0.65)),
-                                        );
-                                        ui.painter().text(
-                                            screen_center + egui::vec2(screen_radius + 3.0, 0.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            format!("WIND #{} RAD", wind.id()),
-                                            egui::FontId::monospace(11.0),
-                                            color,
-                                        );
-                                    }
-                                } else {
-                                    let [width, height] = wind.dimensions();
-                                    let half = glam::Vec2::new(width * 0.5, height * 0.5);
-                                    let corners = [
-                                        glam::Vec2::new(-half.x, -half.y),
-                                        glam::Vec2::new(half.x, -half.y),
-                                        glam::Vec2::new(half.x, half.y),
-                                        glam::Vec2::new(-half.x, half.y),
-                                    ];
-                                    let screen_corners: Option<Vec<egui::Pos2>> = corners
-                                        .iter()
-                                        .map(|corner| {
-                                            let point = wind_area_world_point(
-                                                root,
-                                                x + corner.x,
-                                                y + corner.y,
-                                            );
-                                            rs.world_to_screen(point, rect)
-                                        })
-                                        .collect();
-                                    if let Some(screen_corners) = screen_corners {
-                                        ui.painter().add(egui::Shape::convex_polygon(
-                                            screen_corners,
-                                            fill,
-                                            stroke,
-                                        ));
-                                    }
-                                    if let Some(screen_center) = rs.world_to_screen(center, rect) {
-                                        let angle = wind.args[2].to_radians();
-                                        let length = width.min(height).max(1.0) * 0.35;
-                                        let arrow_end = wind_area_world_point(
-                                            root,
-                                            x + angle.cos() * length,
-                                            y + angle.sin() * length,
-                                        );
-                                        if let Some(screen_end) =
-                                            rs.world_to_screen(arrow_end, rect)
-                                        {
-                                            ui.painter().arrow(
-                                                screen_center,
-                                                screen_end - screen_center,
-                                                stroke,
-                                            );
-                                        }
-                                        ui.painter().text(
-                                            screen_center + egui::vec2(4.0, -4.0),
-                                            egui::Align2::LEFT_BOTTOM,
-                                            format!("WIND #{} RECT", wind.id()),
-                                            egui::FontId::monospace(11.0),
-                                            color,
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Get bone world matrix — offsets are in bone local space.
-                            // For system/root bones (top, Trans, Rot, throw) the offsets
-                            // are effectively in world space, so we only use translation.
-                            let bone_mat = bone_matrices
-                                .get(&hb.bone_name)
-                                .or_else(|| bone_matrices.get(&hb.bone_name.to_lowercase()))
-                                .copied()
-                                .unwrap_or(glam::Mat4::IDENTITY);
-
-                            let bone_mat = if is_system_bone(&hb.bone_name) {
-                                // Keep only the translation — offsets are world-space
-                                glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                            } else {
-                                bone_mat
-                            };
-
-                            // Transform offset from bone local space to world space
-                            let offset = glam::Vec3::new(hb.offset_x, hb.offset_y, hb.offset_z);
-                            let world_pos = bone_mat.transform_point3(offset);
-
-                            let capsule_world_end = hb.capsule_end.map(|[ex, ey, ez]| {
-                                bone_mat.transform_point3(glam::Vec3::new(ex, ey, ez))
-                            });
-                            let launch_center = capsule_world_end
-                                .map(|world_end| (world_pos + world_end) * 0.5)
-                                .unwrap_or(world_pos);
-
-                            let label_pos = draw_projected_capsule(
-                                ui.painter(),
-                                rs,
-                                rect,
-                                ProjectedCapsule {
-                                    world_start: world_pos,
-                                    world_end: capsule_world_end,
-                                    world_radius: hb.size,
-                                    stroke,
-                                    fill,
-                                },
-                            );
-                            if let Some(label_pos) = label_pos {
-                                let label_radius = rs
-                                    .world_radius_to_screen(world_pos, hb.size, rect)
-                                    .unwrap_or(hb.size * 4.0)
-                                    .max(4.0);
-                                ui.painter().text(
-                                    label_pos + egui::vec2(label_radius + 2.0, 0.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    format!("#{} {:.0}", hb.id, hb.damage),
-                                    egui::FontId::monospace(11.0),
-                                    color,
-                                );
-                            }
-
-                            if hb.category == 0 {
-                                let (direction, _) = hitbox_launch_direction(hb.angle);
-                                let launch_end = launch_center + direction * hb.size;
-                                if let (Some(screen_center), Some(screen_end)) = (
-                                    rs.world_to_screen(launch_center, rect),
-                                    rs.world_to_screen(launch_end, rect),
-                                ) {
-                                    ui.painter().line_segment(
-                                        [screen_center, screen_end],
-                                        egui::Stroke::new(2.0, lighten_hitbox_color(color)),
-                                    );
-                                }
-                            }
-                        }
-
-                        // A viewport click should be able to enter the same inspector as a
-                        // timeline click.  The draw loop above deliberately stays paint-only;
-                        // this small second pass uses the same bone convention to hit-test the
-                        // visible center of each active collision without changing export data.
-                        let click_pos = ui.input(|i| {
-                            i.pointer
-                                .interact_pos()
-                                .filter(|p| i.pointer.primary_clicked() && rect.contains(*p))
-                        });
-                        let mut best_hitbox_pick: Option<(usize, f32)> = None;
-                        if let Some(cp) = click_pos {
-                            for (i, hb) in self.state.hitboxes.iter().enumerate() {
-                                if hb.category == crate::data::CAT_ABS
-                                    || hb.category == crate::data::CAT_ATTACK_FP
-                                {
-                                    continue;
-                                }
-                                let active = hb.active_frames_empty()
-                                    || (frame_num >= hb.active_start && frame_num <= hb.active_end);
-                                if !active {
-                                    continue;
-                                }
-                                let (world_pos, world_radius) = if let Some(wind) = hb
-                                    .wind
-                                    .as_ref()
-                                    .filter(|wind| hb.category == 2 && wind.is_valid())
-                                {
-                                    let root = bone_matrices
-                                        .get("top")
-                                        .or_else(|| bone_matrices.get("Top"))
-                                        .copied()
-                                        .unwrap_or(glam::Mat4::IDENTITY);
-                                    let root = glam::Mat4::from_translation(root.col(3).truncate());
-                                    let [x, y] = wind.offset();
-                                    let center = wind_area_world_point(root, x, y);
-                                    let radius = if wind.is_radial() {
-                                        wind.radius()
-                                    } else {
-                                        let [width, height] = wind.dimensions();
-                                        (width * width + height * height).sqrt() * 0.5
-                                    };
-                                    (center, radius.max(1.0))
-                                } else {
-                                    let Some(bone_mat) = bone_matrices
-                                        .get(&hb.bone_name)
-                                        .or_else(|| bone_matrices.get(&hb.bone_name.to_lowercase()))
-                                        .copied()
-                                    else {
-                                        continue;
-                                    };
-                                    let bone_mat = if is_system_bone(&hb.bone_name) {
-                                        glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                                    } else {
-                                        bone_mat
-                                    };
-                                    let start = bone_mat.transform_point3(glam::Vec3::new(
-                                        hb.offset_x,
-                                        hb.offset_y,
-                                        hb.offset_z,
-                                    ));
-                                    let center = hb
-                                        .capsule_end
-                                        .map(|[x, y, z]| {
-                                            (start
-                                                + bone_mat
-                                                    .transform_point3(glam::Vec3::new(x, y, z)))
-                                                * 0.5
-                                        })
-                                        .unwrap_or(start);
-                                    (center, hb.size.max(0.5))
-                                };
-                                let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
-                                    continue;
-                                };
-                                let radius = rs
-                                    .world_radius_to_screen(world_pos, world_radius, rect)
-                                    .unwrap_or(world_radius * 4.0)
-                                    .clamp(8.0, 140.0);
-                                let distance = cp.distance(screen_pos);
-                                if distance <= radius
-                                    && best_hitbox_pick
-                                        .map(|(_, best)| distance < best)
-                                        .unwrap_or(true)
-                                {
-                                    best_hitbox_pick = Some((i, distance));
-                                }
-                            }
-                        }
-
-                        // A hurtbox click is intentionally lower priority than effect and
-                        // editable collision picks, because those overlays are drawn above the
-                        // parameter geometry and must remain easy to select.
-                        let mut best_hurtbox_pick: Option<(usize, f32)> = None;
-                        if let Some(cp) = click_pos {
-                            if self.show_hurtboxes {
-                                let events = self.state.script.to_hurtbox_events();
-                                for (volume_index, _status) in hurtbox_render_descriptors(
-                                    &self.hurtbox_volumes,
-                                    &events,
-                                    frame_num,
-                                    true,
-                                ) {
-                                    let volume = &self.hurtbox_volumes[volume_index];
-                                    let Some(bone_mat) = bone_matrices
-                                        .get(&volume.bone_name)
-                                        .or_else(|| {
-                                            bone_matrices
-                                                .get(&volume.bone_name.to_ascii_lowercase())
-                                        })
-                                        .copied()
-                                    else {
-                                        continue;
-                                    };
-                                    let [start, end] = hurtbox_world_endpoints(volume, bone_mat);
-                                    let center = (start + end) * 0.5;
-                                    let Some(screen_pos) = rs.world_to_screen(center, rect) else {
-                                        continue;
-                                    };
-                                    let radius = rs
-                                        .world_radius_to_screen(
-                                            center,
-                                            hurtbox_world_radius(volume, bone_mat),
-                                            rect,
-                                        )
-                                        .unwrap_or(volume.radius * 4.0)
-                                        .clamp(8.0, 140.0);
-                                    let distance = cp.distance(screen_pos);
-                                    if distance <= radius
-                                        && best_hurtbox_pick
-                                            .map(|(_, best)| distance < best)
-                                            .unwrap_or(true)
-                                    {
-                                        best_hurtbox_pick = Some((volume_index, distance));
-                                    }
-                                }
-                            }
-                        }
-
-                        // Effect spawn markers: blue circles at bone position + script offset.
-                        let mut best_pick: Option<(usize, f32)> = None;
-                        for (i, ec) in self.state.effects.iter().enumerate() {
-                            if is_null_effect_sentinel(ec) {
-                                continue;
-                            }
-                            if ec.disabled {
-                                continue;
-                            }
-                            let active = frame_num >= ec.active_start && frame_num <= ec.active_end;
-                            if !active && self.state.selected_effect_call != Some(i) {
-                                continue;
-                            }
-                            // Same bone conventions as hitboxes; skip unresolvable bones
-                            // (FOOT_/LANDING_ synthetic targets have no skeleton match).
-                            let Some(bone_mat) = bone_matrices
-                                .get(&ec.bone_name)
-                                .or_else(|| bone_matrices.get(&ec.bone_name.to_lowercase()))
-                                .copied()
-                            else {
-                                continue;
-                            };
-                            let bone_mat = if is_system_bone(&ec.bone_name) {
-                                glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                            } else {
-                                bone_mat
-                            };
-                            let world_pos = bone_mat.transform_point3(glam::Vec3::from(ec.offset));
-                            let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
-                                continue;
-                            };
-                            let radius = rs
-                                .world_radius_to_screen(world_pos, ec.scale.max(0.4), rect)
-                                .unwrap_or(ec.scale * 4.0)
-                                .clamp(5.0, 120.0);
-
-                            let selected = self.state.selected_effect_call == Some(i);
-                            let blue = if selected {
-                                egui::Color32::from_rgb(120, 190, 255)
-                            } else {
-                                egui::Color32::from_rgb(60, 130, 235)
-                            };
-                            let fill = egui::Color32::from_rgba_unmultiplied(
-                                blue.r(),
-                                blue.g(),
-                                blue.b(),
-                                if selected { 55 } else { 28 },
-                            );
-                            let stroke_w = if selected { 2.5 } else { 1.5 };
-                            ui.painter().circle(
-                                screen_pos,
-                                radius,
-                                fill,
-                                egui::Stroke::new(stroke_w, blue),
-                            );
-                            // Crosshair dot at the exact spawn point
-                            ui.painter().circle_filled(screen_pos, 2.0, blue);
-                            ui.painter().text(
-                                screen_pos + egui::vec2(radius + 3.0, -radius * 0.5),
-                                egui::Align2::LEFT_CENTER,
-                                &ec.effect_name,
-                                egui::FontId::monospace(9.0),
-                                blue,
-                            );
-
-                            if let Some(cp) = click_pos {
-                                let d = cp.distance(screen_pos);
-                                if d <= radius.max(12.0)
-                                    && best_pick.map(|(_, bd)| d < bd).unwrap_or(true)
-                                {
-                                    best_pick = Some((i, d));
-                                }
-                            }
-                        }
-                        if let Some((i, _)) = best_pick {
-                            self.state.selected_effect_call = Some(i);
-                            self.primary_tab = PrimaryEditorTab::Effects;
-                        } else if let Some((i, _)) = best_hitbox_pick {
-                            self.selected_hitbox = Some(i);
-                            self.state.selected_effect_call = None;
-                            self.primary_tab = PrimaryEditorTab::Collisions;
-                        } else if let Some((i, _)) = best_hurtbox_pick {
-                            self.selected_hurtbox = Some(i);
-                            self.selected_hitbox = None;
-                            self.state.selected_effect_call = None;
-                            self.primary_tab = PrimaryEditorTab::Hurtboxes;
-                        }
-                    }
-                }
-            } else {
-                ui.painter()
-                    .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Open a data root directory to begin").color(Color32::GRAY),
-                    );
-                });
-            }
-        });
-        self.perf.end("central_viewport", t_central);
         if self.perf.enabled {
             // Profiling wants a continuous frame stream to average over; normal runs stay
             // reactive (this is exactly the "repaint on a timer" cost we do NOT want by default).
@@ -33821,6 +31661,7 @@ impl eframe::App for VisionaryApp {
         // Every handler for this frame has run, so the project state is final: publish at most
         // one donor/carrier snapshot rather than the transient sequence the handlers produce.
         self.flush_effect_aliases();
+        self.sync_node_behaviors();
         // Same reason: the source window and the editor panels have both had their turn, so
         // a value changed in either one is reconciled against the other before the next frame.
         self.reconcile_source_buffer(&ctx);
@@ -34285,6 +32126,84 @@ fn find_nuanmb(
     None
 }
 
+fn move_node_live_definitions(
+    base: &crate::gimmicks::behavior::BehaviorGraph,
+    _graphs: &BTreeMap<String, crate::move_nodes::model::MoveGraph>,
+) -> BTreeMap<String, (String, crate::gimmicks::behavior::VarType)> {
+    let definitions: BTreeMap<_, _> = base
+        .vars
+        .iter()
+        .map(|var| (var.name.clone(), (var.name.replace('_', " "), var.kind)))
+        .collect();
+    definitions
+}
+
+fn move_node_live_value(value: &serde_json::Value, timer: bool) -> String {
+    if let Some(value) = value.get("Int").and_then(serde_json::Value::as_i64) {
+        if timer {
+            format!("{value} ticks remaining")
+        } else {
+            value.to_string()
+        }
+    } else if let Some(value) = value.get("Float").and_then(serde_json::Value::as_f64) {
+        format!("{value:.3}")
+    } else if let Some(value) = value.get("Flag").and_then(serde_json::Value::as_bool) {
+        if value { "On" } else { "Off" }.to_string()
+    } else {
+        "Unavailable".to_string()
+    }
+}
+
+#[cfg(test)]
+mod move_node_live_value_tests {
+    use super::move_node_live_value;
+
+    #[test]
+    fn live_values_hide_wire_encoding_and_explain_timer_units() {
+        assert_eq!(
+            move_node_live_value(&serde_json::json!({"Int": 33}), true),
+            "33 ticks remaining"
+        );
+        assert_eq!(
+            move_node_live_value(&serde_json::json!({"Int": 49}), false),
+            "49"
+        );
+        assert_eq!(
+            move_node_live_value(&serde_json::json!({"Float": 0.5}), false),
+            "0.500"
+        );
+        assert_eq!(
+            move_node_live_value(&serde_json::json!({"Flag": true}), false),
+            "On"
+        );
+        assert_eq!(
+            move_node_live_value(&serde_json::json!({"other": 12}), false),
+            "Unavailable"
+        );
+    }
+}
+
+/// Materialize collision edits without rewriting an unchanged authored statement tree.
+fn game_script_for_edits(
+    original: &crate::data::AcmdScript,
+    hitboxes: &[crate::data::Hitbox],
+) -> crate::data::AcmdScript {
+    if original.preview_budget_error().is_some() {
+        // A refused preview is not an empty collision-edit request. Retain its source;
+        // export verification supplies the explicit blocker before anything is written.
+        return original.clone();
+    }
+    if original.stmts.is_empty() {
+        synthesize_script_from_hitboxes(hitboxes)
+    } else if original.to_hitboxes() == hitboxes {
+        // Saving/previewing an unchanged collision surface must not flatten a node-authored
+        // control tree. Its exact statement structure is also checked against the recipe.
+        original.clone()
+    } else {
+        rebuild_script_from_hitboxes(original, hitboxes)
+    }
+}
+
 /// Rebuild an ACMD script from the complete edited collision list while retaining every
 /// non-collision statement from the source script.
 ///
@@ -34332,7 +32251,8 @@ fn rebuild_script_from_hitboxes(
                 // in a `game_` script was `Raw` and survived here by accident. No vanilla
                 // script writes one — all 610 corpus calls are in `sound_` functions — but a
                 // user's may, and dragging a hitbox must not silence their move.
-                ExcuteStmt::HitStatus { .. }
+                ExcuteStmt::NativeCall(_)
+                | ExcuteStmt::HitStatus { .. }
                 | ExcuteStmt::HitResetAll
                 | ExcuteStmt::DamageNoReaction(_)
                 | ExcuteStmt::ColPri(_)
@@ -34340,6 +32260,43 @@ fn rebuild_script_from_hitboxes(
                 | ExcuteStmt::AttackMod { .. }
                 | ExcuteStmt::Sound(_)
                 | ExcuteStmt::Expression(_)
+                | ExcuteStmt::Slope(_)
+                | ExcuteStmt::ItemVisibility { .. }
+                | ExcuteStmt::ShootItemBullet
+                | ExcuteStmt::StartInfoFlashEye
+                | ExcuteStmt::CameraZoomOut
+                | ExcuteStmt::StartCutIn
+                | ExcuteStmt::CaptureCutCommon
+                | ExcuteStmt::ArticleLifecycle(_)
+                | ExcuteStmt::GimmickEvent { .. }
+                | ExcuteStmt::GimmickChartEvent { .. }
+                | ExcuteStmt::GimmickChartEventValues { .. }
+                | ExcuteStmt::JostleSetStatus { .. }
+                | ExcuteStmt::FixedJostleArea(_)
+                | ExcuteStmt::VisibilitySetInt64 { .. }
+                | ExcuteStmt::VisibilitySetWhole { .. }
+                | ExcuteStmt::VisibilitySetDefaultInt64 { .. }
+                | ExcuteStmt::AttackModuleSetAll { .. }
+                | ExcuteStmt::AttackModuleSetIndexed { .. }
+                | ExcuteStmt::AttackModuleSetHeightAll { .. }
+                | ExcuteStmt::AttackModuleSetFinalFinishCutIn { .. }
+                | ExcuteStmt::AttackModuleInitAttackPos { .. }
+                | ExcuteStmt::AttackModuleSetAttackReferenceJointId { .. }
+                | ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll { .. }
+                | ExcuteStmt::AttackModuleSetDamageShakeScale(_)
+                | ExcuteStmt::AttackModuleSetNoUniqEffectAll(_)
+                | ExcuteStmt::AttackModuleSetTargetCategory(_)
+                | ExcuteStmt::AttackModuleSetSize(_)
+                | ExcuteStmt::HitModuleSetStatusAllNormal
+                | ExcuteStmt::AttackModuleSetVecTargetPos(_)
+                | ExcuteStmt::OptionalHitFeedback(_)
+                | ExcuteStmt::CheckFinishCamera(_)
+                | ExcuteStmt::CheckFinalStartCamera(_)
+                | ExcuteStmt::FinalFearFace(_)
+                | ExcuteStmt::AttackModuleAddReactionFrame { .. }
+                | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
+                | ExcuteStmt::AttackAbsApplyThrow
+                | ExcuteStmt::GrabRebound { .. }
                 | ExcuteStmt::ReverseLr
                 | ExcuteStmt::SetSpeedEx(_)
                 | ExcuteStmt::SetSpeed(_)
@@ -34360,8 +32317,11 @@ fn rebuild_script_from_hitboxes(
                 | ExcuteStmt::WorkTransitionTerm(_)
                 | ExcuteStmt::WorkModuleIncInt(_)
                 | ExcuteStmt::WorkModuleSet(_)
+                | ExcuteStmt::SlowWhole(_)
+                | ExcuteStmt::SlowOpponent(_)
                 | ExcuteStmt::KineticClearSpeedAll
                 | ExcuteStmt::KineticSetConsiderGroundFriction(_)
+                | ExcuteStmt::Effect(_)
                 | ExcuteStmt::Raw(_) => true,
             })
             .cloned()
@@ -34386,7 +32346,12 @@ fn rebuild_script_from_hitboxes(
                     header: header.clone(),
                     body: retain_inside_raw_block(body),
                 }),
-                AcmdStmt::Loop { count, body } => Some(AcmdStmt::Loop {
+                AcmdStmt::Loop {
+                    count,
+                    body,
+                    motion_loop,
+                } => Some(AcmdStmt::Loop {
+                    motion_loop: *motion_loop,
                     count: *count,
                     body: retain_inside_raw_block(body),
                 }),
@@ -34400,6 +32365,8 @@ fn rebuild_script_from_hitboxes(
                         .map(|kept| AcmdStmt::Bare(Box::new(kept)))
                 }
                 AcmdStmt::Frame(_)
+                | AcmdStmt::NativeExecuteFrame(_)
+                | AcmdStmt::NativeMotionLoopSync
                 | AcmdStmt::Wait(_)
                 | AcmdStmt::WaitLoopClear
                 | AcmdStmt::MotionRate(_)
@@ -34425,7 +32392,7 @@ fn rebuild_script_from_hitboxes(
                         out.push((frame, AcmdStmt::Excute(retained)));
                     }
                 }
-                AcmdStmt::Loop { count, body } => {
+                AcmdStmt::Loop { count, body, .. } => {
                     for _ in 0..*count {
                         frame = retain_non_collisions(body, frame, out);
                     }
@@ -34452,7 +32419,11 @@ fn rebuild_script_from_hitboxes(
                 // A rate call is a timing statement, not a collision, so it survives a rebuild
                 // like any other. It does not move the frame clock: it changes how fast motion
                 // frames become game frames, and this walk counts motion frames.
-                AcmdStmt::WaitLoopClear | AcmdStmt::MotionRate(_) | AcmdStmt::Raw(_) => {
+                AcmdStmt::NativeExecuteFrame(_)
+                | AcmdStmt::NativeMotionLoopSync
+                | AcmdStmt::WaitLoopClear
+                | AcmdStmt::MotionRate(_)
+                | AcmdStmt::Raw(_) => {
                     out.push((frame, stmt.clone()));
                 }
             }
@@ -35657,6 +33628,38 @@ fn format_move_name(name: &str) -> String {
         name
     };
 
+    match stripped.replace('_', "").as_str() {
+        "attacks4s" => return "Forward smash".into(),
+        "attacks4" => return "Forward smash".into(),
+        "attackhi4" => return "Up smash".into(),
+        "attacklw4" => return "Down smash".into(),
+        "attacks3s" => return "Forward tilt".into(),
+        "attacks3" => return "Forward tilt".into(),
+        "attackhi3" => return "Up tilt".into(),
+        "attacklw3" => return "Down tilt".into(),
+        "attackairn" => return "Neutral air".into(),
+        "attackairf" => return "Forward air".into(),
+        "attackairb" => return "Back air".into(),
+        "attackairhi" => return "Up air".into(),
+        "attackairlw" => return "Down air".into(),
+        "attackdash" => return "Dash attack".into(),
+        "attack11" => return "Jab 1".into(),
+        "attack12" => return "Jab 2".into(),
+        "attack13" => return "Jab 3".into(),
+        "catch" => return "Grab".into(),
+        "catchdash" => return "Dash grab".into(),
+        "catchturn" => return "Pivot grab".into(),
+        "throwf" => return "Forward throw".into(),
+        "throwb" => return "Back throw".into(),
+        "throwhi" => return "Up throw".into(),
+        "throwlw" => return "Down throw".into(),
+        "specialn" => return "Neutral special".into(),
+        "specials" => return "Side special".into(),
+        "specialhi" => return "Up special".into(),
+        "speciallw" => return "Down special".into(),
+        _ => {}
+    }
+
     stripped
         .replace('_', " ")
         .split_whitespace()
@@ -35669,6 +33672,14 @@ fn format_move_name(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[test]
+fn move_labels_use_familiar_names_and_preserve_unknown_fallbacks() {
+    assert_eq!(format_move_name("attack_s4_s"), "Forward smash");
+    assert_eq!(format_move_name("attackairhi"), "Up air");
+    assert_eq!(format_move_name("attack_11"), "Jab 1");
+    assert_eq!(format_move_name("custom_motion"), "Custom Motion");
 }
 
 // ── Mod project writer ────────────────────────────────────────────────────────
@@ -35765,7 +33776,8 @@ fn fetch_move_index(fighter: &str) -> anyhow::Result<Vec<String>> {
         Ok(b) => b,
         Err(_) => {
             let url = format!(
-                "https://api.github.com/repos/WuBoytH/SSBU-Dumped-Scripts/contents/smashline/lua2cpp_{fighter}/{fighter}"
+                "https://api.github.com/repos/WuBoytH/SSBU-Dumped-Scripts/contents/smashline/lua2cpp_{fighter}/{fighter}?ref={}",
+                crate::acmd::DUMP_REV
             );
             let b = crate::acmd::http_client()
                 .get(&url)
@@ -35893,6 +33905,46 @@ fn run_export(
     project: &crate::mod_project::ModProjectFile,
     inputs: &ExportInputs,
 ) -> Result<ExportOutcome, String> {
+    let generated_source =
+        crate::mod_export::source_project(project).map_err(|error| error.to_string())?;
+    let has_source = generated_source.is_some();
+    let warnings = generated_source
+        .as_ref()
+        .map(|generated| generated.warnings.clone())
+        .unwrap_or_default();
+    run_export_preverified(
+        project,
+        inputs,
+        generated_source,
+        has_source,
+        None,
+        warnings,
+    )
+}
+
+/// Materialize an export after [`crate::mod_export::plan_normal_export`] has
+/// already verified its one-plugin runtime plan. A combined plan has no
+/// standalone source tree to write, but `has_source` remains true so the
+/// package descriptor and progress reporting reflect its embedded ACMD.
+fn run_export_preverified(
+    project: &crate::mod_project::ModProjectFile,
+    inputs: &ExportInputs,
+    generated_source: Option<crate::mod_export::GeneratedSource>,
+    has_source: bool,
+    runtime: Option<&crate::mod_export::SelectedGimmickRuntime>,
+    warnings: Vec<String>,
+) -> Result<ExportOutcome, String> {
+    match (inputs.developer, runtime) {
+        (true, Some(_)) => {
+            return Err("Developer source exports cannot embed a selected runtime.".into())
+        }
+        (false, Some(runtime)) => runtime
+            .validate_for_project(project)
+            .map_err(|error| error.to_string())?,
+        (_, None) => crate::mod_export::refuse_uninstalled_controller_charts(project)
+            .map_err(|error| error.to_string())?,
+    }
+    let has_runtime = runtime.is_some();
     let ExportInputs {
         dest,
         developer,
@@ -35903,19 +33955,6 @@ fn run_export(
         source_root,
     } = inputs;
     let developer = *developer;
-
-    // 0. Verify first, while a refusal still costs nothing. Nothing below this line may move
-    //    above it.
-    let generated_source =
-        crate::mod_export::source_project(project).map_err(|error| error.to_string())?;
-    let has_source = generated_source.is_some();
-    // Derived once, here, rather than assigned from inside the branch below. Three separate
-    // places have to say the same thing about a dropped line, and the failure mode this
-    // whole line of work keeps running into is one of them quietly holding an empty list.
-    let warnings: Vec<String> = generated_source
-        .as_ref()
-        .map(|generated| generated.warnings.clone())
-        .unwrap_or_default();
 
     // A project with only a manual workspace overlay has no generated EFF/source directory to
     // create `dest` for. Verification has completed above, so creating it here still leaves a
@@ -36052,12 +34091,20 @@ fn run_export(
             }
             Err(e) => errors.push(format!("smashline source: {e}")),
         }
+    } else if has_source {
+        report.push(
+            "ACMD source: verified and embedded in the selected combined slight_replica runtime"
+                .into(),
+        );
+        report.extend(warnings.iter().map(|warning| format!("  ⚠ {warning}")));
+    } else if has_runtime {
+        report.push("ACMD source: no script edits — combined runtime slot cleared".into());
     } else {
         report.push("source: no hitbox/spawn edits — skipped".into());
     }
 
     // info.toml sits beside rebuilt EFF files so Arcropolis can load that folder directly.
-    if has_eff || has_source {
+    if has_eff || has_source || has_runtime {
         let _ = std::fs::create_dir_all(&mod_dir);
         let display_name =
             serde_json::to_string(project_name).unwrap_or_else(|_| "\"Visionary mod\"".into());
@@ -37336,7 +35383,7 @@ mod live_effect_capture_tests {
     }
 
     #[test]
-    fn an_expression_removal_without_a_measured_donor_stays_live_safe() {
+    fn an_expression_removal_without_a_capture_suppresses_that_command_on_its_frame() {
         let pristine = vec![crate::data::ExpressionEvent {
             frame: 5,
             site: 0,
@@ -37345,8 +35392,9 @@ mod live_effect_capture_tests {
         let (rules, unrepresentable) =
             VisionaryApp::expression_rules_for(hash40::hash40("throw_hi").0, &[], &pristine, &[]);
 
-        assert_eq!(unrepresentable, 1);
-        assert!(rules.is_empty());
+        assert_eq!(unrepresentable, 0);
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].suppress && rules[0].hitbox_id.is_none());
     }
 
     // ── D1f: sound capture and live rules ────────────────────────────────────
@@ -38175,13 +36223,19 @@ mod live_effect_capture_tests {
             state.attack_mods_pristine.is_empty(),
             "attack_mods_pristine"
         );
-        assert!(state.reverse_lr_pristine.is_empty(), "reverse_lr_pristine");
         assert!(
-            state.ft_catch_stop_pristine.is_empty(),
+            state.point_originals.reverse_lr_pristine.is_empty(),
+            "reverse_lr_pristine"
+        );
+        assert!(
+            state.point_originals.ft_catch_stop_pristine.is_empty(),
             "ft_catch_stop_pristine"
         );
         assert!(
-            state.ft_start_adjust_motion_frame_pristine.is_empty(),
+            state
+                .point_originals
+                .ft_start_adjust_motion_frame_pristine
+                .is_empty(),
             "ft_start_adjust_motion_frame_pristine"
         );
         assert!(state.acmd_source.is_empty(), "acmd_source");
@@ -38568,7 +36622,7 @@ mod live_effect_capture_tests {
             ("short", short, None),
             ("long", long, Some([0.0, 7.0, 13.0])),
         ] {
-            let hb = VisionaryApp::hitbox_from_capture_search(&args, 1.0, &bone_rev)
+            let hb = crate::capture_hitbox::hitbox_from_capture_search(&args, 1.0, &bone_rev)
                 .unwrap_or_else(|| panic!("{label} form did not parse"));
             assert_eq!(hb.category, crate::data::CAT_SEARCH, "{label}");
             assert_eq!(hb.id, 3, "{label}");
@@ -39817,6 +37871,50 @@ mod live_effect_capture_tests {
     }
 
     #[test]
+    fn failed_fetch_point_reset_clears_previously_omitted_families() {
+        let mut state = AppState::default();
+        state
+            .point_originals
+            .reverse_lr_pristine
+            .push(crate::data::ReverseLrEvent { frame: 0, site: 0 });
+        state
+            .point_originals
+            .motion_module_set_helper_calculation_pristine
+            .push(crate::data::PointEvent {
+                frame: 0,
+                site: 0,
+                call: crate::data::MotionModuleSetHelperCalculationCall { enabled: true },
+            });
+        state.clear_point_originals();
+        assert!(state.point_originals.reverse_lr_pristine.is_empty());
+        assert!(state
+            .point_originals
+            .motion_module_set_helper_calculation_pristine
+            .is_empty());
+    }
+
+    #[test]
+    fn kinetic_energy_only_edit_is_detected_for_commit() {
+        let state = AppState {
+            script: VisionaryApp::script_from_captures(
+                &[CaptureLine {
+                    kind: 6,
+                    motion: hash40::hash40("special_hi").0,
+                    frame: 0.0,
+                    func: "KineticModule::suspend_energy".into(),
+                    args: vec![crate::game_link::LuaArgWire::Int(2)],
+                    run: 1,
+                    common: false,
+                }],
+                &HashMap::new(),
+            ),
+            ..AppState::default()
+        };
+        assert_eq!(state.script.to_kinetic_energy_events().len(), 1);
+        assert!(VisionaryApp::current_point_events_edited(&state));
+    }
+
+    #[test]
     fn captured_kinetic_energy_becomes_editable_suspend_and_resume_calls() {
         let motion = hash40::hash40("attack_air_lw").0;
         let captures = vec![
@@ -40555,7 +38653,7 @@ mod live_effect_capture_tests {
     /// arguments are knowable and inventing them would make the live preview disagree with the
     /// export. Without its donor it still refuses.
     #[test]
-    fn a_retime_without_its_donor_still_refuses_to_inject() {
+    fn a_retime_without_its_donor_builds_from_the_measured_layout() {
         let effect = hash40::hash40("sys_attack_line").0;
         let bones = HashMap::from([(hash40::hash40("top").0, "top".to_string())]);
         let effects = HashMap::from([(effect, "sys_attack_line".to_string())]);
@@ -40569,8 +38667,8 @@ mod live_effect_capture_tests {
 
         assert!(
             VisionaryApp::build_effect_inject_from_captures(&retimed, &[], Some(effect), 0)
-                .is_none(),
-            "a replacement must not be synthesized from nothing"
+                .is_some(),
+            "a move built from blocks has no capture to wait for"
         );
     }
 
@@ -40884,6 +38982,7 @@ mod live_effect_capture_tests {
                 crate::data::WorkTransitionTermEvent {
                     frame: 1,
                     call: crate::data::WorkTransitionTermCall {
+                        receiver: Default::default(),
                         action: crate::data::WorkTransitionTermAction::Enable,
                         transition_term: "7".into(),
                     },
@@ -40892,6 +38991,7 @@ mod live_effect_capture_tests {
                 crate::data::WorkTransitionTermEvent {
                     frame: 4,
                     call: crate::data::WorkTransitionTermCall {
+                        receiver: Default::default(),
                         action: crate::data::WorkTransitionTermAction::Unable,
                         transition_term: "8".into(),
                     },
@@ -40900,6 +39000,7 @@ mod live_effect_capture_tests {
                 crate::data::WorkTransitionTermEvent {
                     frame: 7,
                     call: crate::data::WorkTransitionTermCall {
+                        receiver: Default::default(),
                         action: crate::data::WorkTransitionTermAction::EnableGroup,
                         transition_term: "9".into(),
                     },
@@ -40908,6 +39009,7 @@ mod live_effect_capture_tests {
                 crate::data::WorkTransitionTermEvent {
                     frame: 10,
                     call: crate::data::WorkTransitionTermCall {
+                        receiver: Default::default(),
                         action: crate::data::WorkTransitionTermAction::UnableGroupEx,
                         transition_term: "10".into(),
                     },
@@ -42708,7 +40810,7 @@ mod live_effect_capture_tests {
         args[26] = A::Num(1.0);
         args[27] = A::Bool(true);
         args[31] = A::Int(1);
-        let hb = VisionaryApp::hitbox_from_capture(
+        let hb = crate::capture_hitbox::hitbox_from_capture(
             "ATTACK",
             &args,
             0.0,
@@ -42877,6 +40979,597 @@ mod live_effect_capture_tests {
     /// `game_` script writes a sound at all, so the corpus oracles cannot reach this — but a
     /// user's can, and the line is lifted from `kirby/WalkMiddle` rather than invented.
     #[test]
+    fn slope_alignment_survives_an_ordinary_hitbox_edit() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt, SlopeCall, SlopeStatus};
+        let mut hitbox = Hitbox {
+            active_start: 3,
+            ..Default::default()
+        };
+        let slope = ExcuteStmt::Slope(SlopeCall::Interpolate {
+            status: SlopeStatus::Top,
+            frames: 6,
+            trailing_flag: Some(true),
+        });
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                    slope.clone(),
+                ]),
+            ],
+        };
+        hitbox.damage = 9.0;
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[hitbox]);
+        let retained: Vec<_> = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| matches!(command, ExcuteStmt::Slope(_)))
+            .collect();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            serde_json::to_value(retained[0]).unwrap(),
+            serde_json::to_value(slope).unwrap()
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+    }
+
+    #[test]
+    fn native_indexed_and_article_motion_commands_survive_hitbox_rebuild() {
+        use crate::data::{
+            AcmdScript, AcmdStmt, ArticleLifecycleCall, AttackHeightAllKind,
+            AttackModuleSetIndexedKind, ExcuteStmt,
+        };
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let commands = vec![
+            ExcuteStmt::GrabRebound { enabled: false },
+            ExcuteStmt::AttackModuleInitAttackPos { id: 0 },
+            ExcuteStmt::AttackModuleSetAttackReferenceJointId {
+                kind: crate::data::AttackReferenceJointKind::TopYZX,
+            },
+            ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll {
+                arg2: true,
+                arg3: false,
+            },
+            ExcuteStmt::AttackModuleSetHeightAll {
+                height: AttackHeightAllKind::High,
+                arg3: false,
+            },
+            ExcuteStmt::AttackModuleSetFinalFinishCutIn {
+                id: 1,
+                arg3: true,
+                arg4: false,
+                arg5: -1.0,
+                arg6: false,
+            },
+            ExcuteStmt::AttackModuleSetIndexed {
+                kind: AttackModuleSetIndexedKind::NoFinishCamera,
+                id: 2,
+                arg3: true,
+                arg4: false,
+            },
+            ExcuteStmt::AttackModuleSetIndexed {
+                kind: AttackModuleSetIndexedKind::ForceReaction,
+                id: 3,
+                arg3: true,
+                arg4: false,
+            },
+            ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion {
+                symbol: "FIGHTER_KIRBY_GENERATE_ARTICLE_FINALCUTTER".into(),
+                motion: "special_hi3".into(),
+            }),
+        ];
+        let mut original_commands = commands.clone();
+        original_commands.push(ExcuteStmt::Attack(hitbox.to_attack_call()));
+        let original = AcmdScript {
+            stmts: vec![AcmdStmt::Frame(3.0), AcmdStmt::Excute(original_commands)],
+        };
+        let mut changed = hitbox;
+        changed.damage = 9.0;
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[changed]);
+        let retained: Vec<_> = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ExcuteStmt::GrabRebound { .. }
+                        | ExcuteStmt::AttackModuleSetHeightAll { .. }
+                        | ExcuteStmt::AttackModuleSetFinalFinishCutIn { .. }
+                        | ExcuteStmt::AttackModuleInitAttackPos { .. }
+                        | ExcuteStmt::AttackModuleSetAttackReferenceJointId { .. }
+                        | ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll { .. }
+                        | ExcuteStmt::AttackModuleSetIndexed { .. }
+                        | ExcuteStmt::ArticleLifecycle(_)
+                )
+            })
+            .collect();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value(&commands).unwrap()
+        );
+        assert!(matches!(rebuilt.stmts.first(), Some(AcmdStmt::Frame(3.0))));
+        assert_eq!(rebuilt.to_hitboxes().len(), 1);
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        for method in [
+            "GrabModule::set_rebound(",
+            "AttackModule::set_no_finish_camera(",
+            "AttackModule::set_force_reaction(",
+            "ArticleModule::change_motion(",
+        ] {
+            assert_eq!(
+                source.matches(method).count(),
+                1,
+                "{method} duplicated or lost"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_slowdown_survives_collision_rebuild_in_source_order() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt, SlowOpponentCall, SlowWholeCall};
+        let original_hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let set = ExcuteStmt::SlowWhole(SlowWholeCall::Set {
+            multiplier: 20,
+            frames: 30,
+        });
+        let clear = ExcuteStmt::SlowWhole(SlowWholeCall::Clear);
+        let opponent = ExcuteStmt::SlowOpponent(SlowOpponentCall {
+            slow_mul: 13.0,
+            slow_time: 60.0,
+        });
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    set.clone(),
+                    opponent.clone(),
+                    ExcuteStmt::Attack(original_hitbox.to_attack_call()),
+                ]),
+                AcmdStmt::Frame(8.0),
+                AcmdStmt::Excute(vec![clear.clone()]),
+            ],
+        };
+        let changed = Hitbox {
+            damage: 9.0,
+            ..original_hitbox
+        };
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[changed]);
+        let retained = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ExcuteStmt::SlowWhole(_) | ExcuteStmt::SlowOpponent(_)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value([&set, &opponent, &clear]).unwrap()
+        );
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        assert_eq!(source.matches("SlowModule::set_whole(").count(), 1);
+        assert_eq!(source.matches("SlowModule::clear_whole(").count(), 1);
+        assert_eq!(source.matches("macros::SLOW_OPPONENT(").count(), 1);
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+    }
+
+    #[test]
+    fn item_firing_survives_collision_edit_without_duplication() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::ShootItemBullet,
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        assert_eq!(
+            source.matches("macros::SHOOT_ITEM_BULLET(agent);").count(),
+            1
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+        assert!(
+            source.find("SHOOT_ITEM_BULLET").unwrap() < source.find("macros::ATTACK(").unwrap()
+        );
+    }
+
+    #[test]
+    fn eye_flash_survives_collision_edit_once_at_original_position() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::StartInfoFlashEye,
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        assert_eq!(
+            source
+                .matches("macros::START_INFO_FLASH_EYE(agent);")
+                .count(),
+            1
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+        assert!(
+            source.find("START_INFO_FLASH_EYE").unwrap() < source.find("macros::ATTACK(").unwrap()
+        );
+    }
+
+    #[test]
+    fn camera_zoom_out_survives_collision_edit_once_at_original_position() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::CameraZoomOut,
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        assert_eq!(source.matches("macros::CAM_ZOOM_OUT(agent);").count(), 1);
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+        assert!(source.find("CAM_ZOOM_OUT").unwrap() < source.find("macros::ATTACK(").unwrap());
+    }
+
+    #[test]
+    fn capture_and_cutin_helpers_survive_hitbox_rebuild_with_their_original_guards() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Bare(Box::new(ExcuteStmt::CaptureCutCommon)),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::StartCutIn,
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        assert!(matches!(rebuilt.stmts[1], AcmdStmt::Bare(ref command)
+            if matches!(command.as_ref(), ExcuteStmt::CaptureCutCommon)));
+        let source = crate::acmd::preview_game_fn(&rebuilt, "test");
+        assert_eq!(
+            source
+                .matches("macros::game_CaptureCutCommon(agent);")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("macros::FT_START_CUTIN(agent);").count(), 1);
+        assert!(
+            source.find("macros::game_CaptureCutCommon").unwrap()
+                < source.find("macros::FT_START_CUTIN").unwrap()
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+    }
+
+    #[test]
+    fn typed_chart_payload_survives_hitbox_rebuild_without_reordering_or_duplication() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let event = ExcuteStmt::GimmickChartEventValues {
+            chart_id: "right".into(),
+            name: "pulse".into(),
+            arguments: vec![crate::gimmicks::event_payload::Argument {
+                field: "amount".into(),
+                value: crate::gimmicks::behavior::ConstValue::Int(3),
+            }],
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    event.clone(),
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        let retained = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| matches!(command, ExcuteStmt::GimmickChartEventValues { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            serde_json::to_value(retained[0]).unwrap(),
+            serde_json::to_value(event).unwrap()
+        );
+        let source = crate::acmd::preview_game_fn(&rebuilt, "attack11");
+        assert_eq!(
+            source
+                .matches("dispatch_named_chart_values_from_module")
+                .count(),
+            1
+        );
+        assert!(
+            source
+                .find("dispatch_named_chart_values_from_module")
+                .unwrap()
+                < source.find("macros::ATTACK(").unwrap()
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+    }
+
+    #[test]
+    fn body_visibility_named_pairs_survive_hitbox_rebuild_in_order() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let commands = [
+            ExcuteStmt::VisibilitySetInt64 {
+                group: "sword".into(),
+                status: "sword_l".into(),
+            },
+            ExcuteStmt::VisibilitySetInt64 {
+                group: "sword".into(),
+                status: "sword_r".into(),
+            },
+        ];
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    commands[0].clone(),
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                    commands[1].clone(),
+                ]),
+            ],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 9.0,
+                ..hitbox
+            }],
+        );
+        let retained = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| matches!(command, ExcuteStmt::VisibilitySetInt64 { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value(commands).unwrap()
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 9.0);
+    }
+
+    #[test]
+    fn jostle_and_visibility_survive_hitbox_rebuild_in_source_order() {
+        use crate::data::{AcmdScript, AcmdStmt, AttackModuleSetAllKind, ExcuteStmt};
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            damage: 4.0,
+            ..Default::default()
+        };
+        let jostle = ExcuteStmt::JostleSetStatus { enabled: true };
+        let visibility = ExcuteStmt::VisibilitySetInt64 {
+            group: "body".into(),
+            status: "body_normal".into(),
+        };
+        let whole_visibility = ExcuteStmt::VisibilitySetWhole { visible: false };
+        let default_visibility = ExcuteStmt::VisibilitySetDefaultInt64 {
+            group: "panel".into(),
+        };
+        let no_dead_all = ExcuteStmt::AttackModuleSetAll {
+            kind: AttackModuleSetAllKind::NoDeadAll,
+            arg2: true,
+            arg3: false,
+        };
+        let catch_only_all = ExcuteStmt::AttackModuleSetAll {
+            kind: AttackModuleSetAllKind::CatchOnlyAll,
+            arg2: true,
+            arg3: false,
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    jostle.clone(),
+                    visibility.clone(),
+                    whole_visibility.clone(),
+                    default_visibility.clone(),
+                    no_dead_all.clone(),
+                    catch_only_all.clone(),
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+
+        let mut edited = hitbox;
+        edited.damage = 9.0;
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[edited]);
+        let emitted = crate::acmd::preview_game_fn(&rebuilt, "test");
+
+        assert!(matches!(rebuilt.stmts.first(), Some(AcmdStmt::Frame(3.0))));
+        let retained = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ExcuteStmt::JostleSetStatus { .. }
+                        | ExcuteStmt::VisibilitySetInt64 { .. }
+                        | ExcuteStmt::VisibilitySetWhole { .. }
+                        | ExcuteStmt::VisibilitySetDefaultInt64 { .. }
+                        | ExcuteStmt::AttackModuleSetAll { .. }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value(vec![
+                jostle,
+                visibility,
+                whole_visibility,
+                default_visibility,
+                no_dead_all,
+                catch_only_all
+            ])
+            .unwrap()
+        );
+        assert_eq!(emitted.matches("JostleModule::set_status(").count(), 1);
+        assert_eq!(emitted.matches("VisibilityModule::set_int64(").count(), 1);
+        assert_eq!(emitted.matches("VisibilityModule::set_whole(").count(), 1);
+        assert_eq!(
+            emitted
+                .matches("VisibilityModule::set_default_int64(")
+                .count(),
+            1
+        );
+        assert_eq!(emitted.matches("AttackModule::set_no_dead_all(").count(), 1);
+        assert_eq!(
+            emitted.matches("AttackModule::set_catch_only_all(").count(),
+            1
+        );
+        assert_eq!(emitted.matches("macros::ATTACK(").count(), 1);
+        let jostle_at = emitted
+            .find("JostleModule::set_status(agent.module_accessor, true);")
+            .expect("the enabled jostle payload should survive");
+        let visibility_at = emitted
+            .find(
+                "VisibilityModule::set_int64(agent.module_accessor, hash40(\"body\") as i64, hash40(\"body_normal\") as i64);",
+            )
+            .expect("the exact visibility symbols should survive");
+        let no_dead_all_at = emitted
+            .find("AttackModule::set_no_dead_all(agent.module_accessor, true, false);")
+            .expect("the exact no-dead-all boolean payload should survive");
+        let catch_only_all_at = emitted
+            .find("AttackModule::set_catch_only_all(agent.module_accessor, true, false);")
+            .expect("the exact catch-only-all boolean payload should survive");
+        let attack_at = emitted
+            .find("macros::ATTACK(")
+            .expect("the edited hitbox should be rebuilt");
+        assert!(
+            jostle_at < visibility_at
+                && visibility_at < no_dead_all_at
+                && no_dead_all_at < catch_only_all_at
+                && catch_only_all_at < attack_at,
+            "{emitted}"
+        );
+        assert!(emitted.contains("frame(agent.lua_state_agent, 3.0);"));
+        assert!(
+            emitted.contains(", 9.0, "),
+            "the edit should still reach output:\n{emitted}"
+        );
+    }
+
+    #[test]
     fn a_bare_sound_survives_a_hitbox_rebuild() {
         const BARE: &str = "macros::PLAY_SE(agent, Hash40::new(\"se_kirby_step_left_m\"));";
         let source = format!(
@@ -43016,6 +41709,33 @@ mod live_effect_capture_tests {
         VisionaryApp::record_effect_script_notes(&clean, "dolly/test", &mut state);
         assert!(!state.effect_dropped_lines.contains_key("dolly/test"));
         assert!(!state.effect_frame_residue.contains_key("dolly/test"));
+    }
+
+    #[test]
+    fn refused_effect_projection_keeps_existing_source_notes() {
+        let mut state = crate::data::AppState::default();
+        state
+            .effect_dropped_lines
+            .insert("cloud/test".into(), vec!["existing_native_line();".into()]);
+        state.effect_frame_residue.insert(
+            "cloud/test".into(),
+            std::collections::BTreeMap::from([(3, vec!["existing_frame_line();".into()])]),
+        );
+        let dropped = state.effect_dropped_lines.clone();
+        let residue = state.effect_frame_residue.clone();
+        let script = crate::data::EffectScript {
+            stmts: vec![crate::data::EffectStmt::Loop {
+                motion_loop: crate::data::MotionLoop::No,
+                count: usize::MAX,
+                body: Vec::new(),
+            }],
+        };
+        VisionaryApp::record_effect_script_notes(&script, "cloud/test", &mut state);
+        assert_eq!(state.effect_dropped_lines, dropped);
+        assert_eq!(state.effect_frame_residue, residue);
+        assert!(state
+            .status
+            .contains("cloud/test: Effect preview unavailable"));
     }
 
     #[test]
@@ -43250,6 +41970,223 @@ mod live_effect_capture_tests {
     }
 
     #[test]
+    fn rebuilding_hitboxes_keeps_native_reaction_frame_adjustments() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            active_end: 4,
+            ..Default::default()
+        };
+        let reaction = ExcuteStmt::AttackModuleAddReactionFrame {
+            id: 0,
+            frames: -10.0,
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    reaction.clone(),
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let edited = Hitbox {
+            damage: 14.0,
+            ..hitbox
+        };
+
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[edited]);
+        let retained_reactions = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ExcuteStmt::AttackModuleAddReactionFrame { id: 0, frames }
+                        if *frames == -10.0
+                )
+            })
+            .count();
+        assert_eq!(retained_reactions, 1);
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 14.0);
+
+        let source = crate::acmd::preview_game_fn(&rebuilt, "reaction_frame");
+        assert!(source.contains(
+            "AttackModule::set_add_reaction_frame(agent.module_accessor, 0, -10.0, false);"
+        ));
+        assert_eq!(
+            serde_json::to_value(rebuilt).unwrap(),
+            serde_json::to_value(crate::acmd::parse_acmd_script(&source)).unwrap(),
+            "hitbox edits must not alter the retained reaction-frame call"
+        );
+    }
+
+    #[test]
+    fn rebuilding_hitboxes_retains_all_closed_attack_modifiers_exactly_once() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            active_end: 4,
+            ..Default::default()
+        };
+        let modifiers: Vec<_> = crate::data::AttackModuleDamageShakeScale::ALL
+            .into_iter()
+            .map(ExcuteStmt::AttackModuleSetDamageShakeScale)
+            .chain(
+                crate::data::AttackModuleNoUniqEffectAllPair::ALL
+                    .into_iter()
+                    .map(ExcuteStmt::AttackModuleSetNoUniqEffectAll),
+            )
+            .chain(
+                crate::data::AttackModuleTargetCategoryId::ALL
+                    .into_iter()
+                    .map(ExcuteStmt::AttackModuleSetTargetCategory),
+            )
+            .chain(
+                crate::data::AttackModuleSizePreset::ALL
+                    .into_iter()
+                    .map(ExcuteStmt::AttackModuleSetSize),
+            )
+            .chain(std::iter::once(ExcuteStmt::HitModuleSetStatusAllNormal))
+            .chain(
+                crate::data::AttackModuleVecTargetPosPreset::ALL
+                    .into_iter()
+                    .map(ExcuteStmt::AttackModuleSetVecTargetPos),
+            )
+            .chain(std::iter::once(ExcuteStmt::OptionalHitFeedback(
+                crate::data::OptionalHitFeedbackCall {
+                    kind: crate::data::OptionalHitFeedbackKind::Effect,
+                    arg2: 1,
+                    hash: crate::data::Hash40Literal::Name("custom_hit_effect".into()),
+                },
+            )))
+            .chain(std::iter::once(ExcuteStmt::CheckFinishCamera(
+                crate::data::FinishCameraCall {
+                    arg1: "14".into(),
+                    arg2: "1".into(),
+                },
+            )))
+            .chain(std::iter::once(ExcuteStmt::CheckFinalStartCamera(
+                crate::data::FinalStartCameraCall {
+                    args: ["0", "1", "20", "0", "0", "0"].map(str::to_owned),
+                },
+            )))
+            .chain(std::iter::once(ExcuteStmt::FinalFearFace(
+                crate::data::FinalFearFaceCall {
+                    argument: "60".into(),
+                },
+            )))
+            .collect();
+        let mut commands = modifiers.clone();
+        commands.push(ExcuteStmt::Attack(hitbox.to_attack_call()));
+        let original = AcmdScript {
+            stmts: vec![AcmdStmt::Frame(3.0), AcmdStmt::Excute(commands)],
+        };
+        let rebuilt = rebuild_script_from_hitboxes(
+            &original,
+            &[Hitbox {
+                damage: 14.0,
+                ..hitbox
+            }],
+        );
+        let retained: Vec<_> = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| {
+                if let AcmdStmt::Excute(commands) = statement {
+                    Some(commands)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .filter(|command| {
+                matches!(
+                    command,
+                    ExcuteStmt::AttackModuleSetDamageShakeScale(_)
+                        | ExcuteStmt::AttackModuleSetNoUniqEffectAll(_)
+                        | ExcuteStmt::AttackModuleSetTargetCategory(_)
+                        | ExcuteStmt::AttackModuleSetSize(_)
+                        | ExcuteStmt::HitModuleSetStatusAllNormal
+                        | ExcuteStmt::AttackModuleSetVecTargetPos(_)
+                        | ExcuteStmt::OptionalHitFeedback(_)
+                        | ExcuteStmt::CheckFinishCamera(_)
+                        | ExcuteStmt::CheckFinalStartCamera(_)
+                        | ExcuteStmt::FinalFearFace(_)
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap(),
+            serde_json::to_value(modifiers).unwrap()
+        );
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 14.0);
+        let source = crate::acmd::preview_game_fn(&rebuilt, "attack11");
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(crate::acmd::parse_acmd_script(&source)).unwrap()
+        );
+    }
+
+    #[test]
+    fn rebuilding_hitboxes_retains_the_bundled_throw_application() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
+
+        let hitbox = Hitbox {
+            id: 0,
+            active_start: 3,
+            active_end: 4,
+            ..Default::default()
+        };
+        let original = AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(3.0),
+                AcmdStmt::Excute(vec![
+                    ExcuteStmt::AttackAbsApplyThrow,
+                    ExcuteStmt::Attack(hitbox.to_attack_call()),
+                ]),
+            ],
+        };
+        let edited = Hitbox {
+            damage: 14.0,
+            ..hitbox
+        };
+
+        let rebuilt = rebuild_script_from_hitboxes(&original, &[edited]);
+        let retained_bundles = rebuilt
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands),
+                _ => None,
+            })
+            .flatten()
+            .filter(|command| matches!(command, ExcuteStmt::AttackAbsApplyThrow))
+            .count();
+        assert_eq!(retained_bundles, 1);
+        assert_eq!(rebuilt.to_hitboxes()[0].damage, 14.0);
+
+        let preview = crate::acmd::preview_game_fn(&rebuilt, "throw_f");
+        assert!(preview.contains(
+            "let target = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_OBJECT);"
+        ));
+        assert_eq!(
+            serde_json::to_value(rebuilt).unwrap(),
+            serde_json::to_value(crate::acmd::parse_acmd_script(&preview)).unwrap(),
+            "hitbox rebuild must not drop or duplicate the scoped target bundle"
+        );
+    }
+
+    #[test]
     fn acmd_export_inserts_added_collisions_at_their_edited_frames() {
         use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt};
         let original_hitbox = Hitbox {
@@ -43316,7 +42253,7 @@ mod live_effect_capture_tests {
     /// A partial/old capture cannot safely seed all 36 ATTACK slots. It must be rejected rather
     /// than indexing past the captured vector while building an injected hitbox.
     #[test]
-    fn attack_injection_requires_the_complete_argument_vector() {
+    fn a_new_attack_is_complete_without_a_donor_and_ignores_a_short_one() {
         let donor = CaptureLine {
             kind: 6,
             motion: 1,
@@ -43326,7 +42263,15 @@ mod live_effect_capture_tests {
             run: 1,
             common: false,
         };
-        assert!(VisionaryApp::build_attack_args(&Hitbox::default(), Some(&donor)).is_none());
+        for donor in [None, Some(&donor)] {
+            let args = VisionaryApp::build_attack_args(&Hitbox::default(), donor).unwrap();
+            assert_eq!(args.len(), 36);
+            // The masks decide what the hit can touch, and a zero mask hits nothing.
+            for slot in [28, 29, 30] {
+                assert_ne!(args[slot], A::Int(0), "slot {slot}");
+            }
+            assert_ne!(args[32], A::Hash(0));
+        }
     }
 
     #[test]
@@ -44180,6 +43125,141 @@ mod blocked_export_writes_nothing_tests {
         }
     }
 
+    #[test]
+    fn uninstalled_charts_refuse_both_materializers_before_any_destination_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = ModProjectFile::default();
+        project
+            .fighters
+            .entry("mario".into())
+            .or_default()
+            .controller_charts
+            .insert(
+                "extra".into(),
+                crate::mod_project::ControllerChart::default(),
+            );
+        for developer in [false, true] {
+            let dest = dir
+                .path()
+                .join(if developer { "developer" } else { "normal" });
+            let mut input = inputs(&dest, &dir.path().join("missing-source"));
+            input.developer = developer;
+            for preverified in [false, true] {
+                let result = if preverified {
+                    run_export_preverified(&project, &input, None, false, None, Vec::new())
+                } else {
+                    run_export(&project, &input)
+                };
+                assert!(result.unwrap_err().contains("mario/extra"));
+                assert!(!dest.exists());
+            }
+            std::fs::create_dir(&dest).unwrap();
+            std::fs::write(dest.join("sentinel"), b"unchanged").unwrap();
+            assert!(
+                run_export_preverified(&project, &input, None, false, None, Vec::new()).is_err()
+            );
+            assert_eq!(std::fs::read(dest.join("sentinel")).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
+        }
+    }
+
+    fn selected_chart_project() -> (ModProjectFile, crate::mod_export::SelectedGimmickRuntime) {
+        let mut project = ModProjectFile::default();
+        project
+            .fighters
+            .entry("mario".into())
+            .or_default()
+            .controller_charts
+            .insert(
+                "timer".into(),
+                crate::mod_project::ControllerChart {
+                    graph: crate::gimmicks::templates::Preset::Timer.graph(),
+                    ..Default::default()
+                },
+            );
+        let plugin =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/slight_replica");
+        let runtime = crate::mod_export::plan_normal_export(&project, Some(&plugin))
+            .unwrap()
+            .gimmick_runtime
+            .unwrap();
+        (project, runtime)
+    }
+
+    #[test]
+    fn changed_chart_cannot_use_a_previously_selected_runtime_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut project, runtime) = selected_chart_project();
+        project
+            .fighters
+            .get_mut("mario")
+            .unwrap()
+            .controller_charts
+            .get_mut("timer")
+            .unwrap()
+            .graph
+            .vars[0]
+            .initial = crate::gimmicks::behavior::ConstValue::Int(47);
+        let dest = dir.path().join("stale-plan");
+        let source = dir.path().join("source");
+        let result = run_export_preverified(
+            &project,
+            &inputs(&dest, &source),
+            None,
+            false,
+            Some(&runtime),
+            Vec::new(),
+        );
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn matching_selected_chart_plan_materializes_without_a_second_source_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, runtime) = selected_chart_project();
+        let dest = dir.path().join("matching-plan");
+        let source = dir.path().join("source");
+        let outcome = run_export_preverified(
+            &project,
+            &inputs(&dest, &source),
+            None,
+            false,
+            Some(&runtime),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome.built_source_root.is_none());
+        assert!(dest.join("info.toml").is_file());
+        assert!(dest.join("README.md").is_file());
+        assert!(
+            !dest.join("plugin.nro").exists(),
+            "the selected package builder publishes the one NRO later"
+        );
+        assert!(
+            !source.exists(),
+            "a combined plan must not write a standalone source plugin"
+        );
+    }
+
+    #[test]
+    fn developer_materializer_refuses_even_a_valid_selected_chart_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, runtime) = selected_chart_project();
+        let dest = dir.path().join("developer");
+        let source = dir.path().join("source");
+        let mut input = inputs(&dest, &source);
+        input.developer = true;
+        assert!(
+            run_export_preverified(&project, &input, None, false, Some(&runtime), Vec::new())
+                .is_err()
+        );
+        assert!(!dest.exists());
+        assert!(!source.exists());
+    }
+
     fn fighter_with(script: AcmdScript) -> FighterMod {
         let mut fm = FighterMod::default();
         fm.acmd.insert(
@@ -44361,6 +43441,48 @@ mod blocked_export_writes_nothing_tests {
 mod effect_control_rule_tests {
     use super::VisionaryApp;
     use crate::data::EffectControl;
+
+    #[test]
+    fn native_work_effect_sources_require_the_structured_editor_even_when_preserved() {
+        use crate::data::{EffectFollowWorkPreset, EffectMacro, EffectScript, EffectStmt};
+        for preset in EffectFollowWorkPreset::all() {
+            let command = EffectMacro::EffectFollowWork {
+                work_symbol: preset.work_symbol.into(),
+                bone_name: "top".into(),
+                offset: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                unk8: true,
+            };
+            let source = crate::acmd::preview_effect_macro(&command);
+            for stmts in [
+                vec![EffectStmt::Excute(vec![command])],
+                vec![EffectStmt::Excute(vec![EffectMacro::Raw(source.clone())])],
+                vec![EffectStmt::Cond {
+                    header: "if unknown_native_guard(agent) {".into(),
+                    body: vec![EffectStmt::Raw(source.clone())],
+                }],
+                vec![EffectStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 2,
+                    body: vec![EffectStmt::Raw(source)],
+                }],
+            ] {
+                let script = EffectScript { stmts };
+                let before = serde_json::to_value(&script).unwrap();
+                assert!(VisionaryApp::effect_source_requires_nodes(&script));
+                assert_eq!(serde_json::to_value(&script).unwrap(), before);
+            }
+        }
+        assert!(!VisionaryApp::effect_source_requires_nodes(&EffectScript {
+            stmts: vec![EffectStmt::Excute(vec![EffectMacro::LastEffectSetRate {
+                rate: 1.0
+            }])],
+        }));
+        assert!(!VisionaryApp::effect_source_requires_nodes(
+            &EffectScript::default()
+        ));
+    }
     use crate::game_link::{CaptureLine, LuaArgWire as A};
 
     fn capture(func: &str, frame: f32, args: Vec<A>) -> CaptureLine {
@@ -44390,6 +43512,138 @@ mod effect_control_rule_tests {
             VisionaryApp::effect_control_injection_args(&was, &now, &donor),
             Some(vec![A::Hash(hash40::hash40("sys_fire").0), A::Int(-1)])
         );
+    }
+
+    #[test]
+    fn native_last_effect_controls_do_not_gain_flat_live_injection() {
+        for control in [
+            EffectControl::SetDisableRenderOffsetLast,
+            EffectControl::EnableSyncInitPosLast,
+            EffectControl::ReqScreen {
+                preset_id: "bg_mario_final".into(),
+            },
+            EffectControl::SetDisableCameraDepthInfluence { value: true },
+            EffectControl::SetDisableCameraDepthInfluence { value: false },
+        ]
+        .into_iter()
+        .chain(
+            crate::data::EffectOffKindWorkPreset::all()
+                .iter()
+                .map(|preset| EffectControl::OffKindWork {
+                    preset_id: preset.id.into(),
+                }),
+        ) {
+            assert!(VisionaryApp::effect_control_injection_args(&control, &control, &[]).is_none());
+            assert!(
+                VisionaryApp::effect_control_injection_args(&control, &control, &[A::Int(0)])
+                    .is_none()
+            );
+            assert!(VisionaryApp::control_call_from_capture(
+                control.command_name(),
+                &[],
+                3.0,
+                &Default::default()
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn source_only_controls_never_gain_live_suppression_or_retiming() {
+        use crate::data::{EffectMacro, EffectScript, EffectStmt};
+        let controls = [
+            EffectControl::SetDisableRenderOffsetLast,
+            EffectControl::EnableSyncInitPosLast,
+            EffectControl::ReqScreen {
+                preset_id: "bg_mario_final".into(),
+            },
+            EffectControl::SetDisableCameraDepthInfluence { value: true },
+        ]
+        .into_iter()
+        .chain(
+            crate::data::EffectOffKindWorkPreset::all()
+                .iter()
+                .map(|preset| EffectControl::OffKindWork {
+                    preset_id: preset.id.into(),
+                }),
+        );
+        for control in controls {
+            let original = EffectScript {
+                stmts: vec![EffectStmt::Excute(vec![EffectMacro::Control(
+                    control.clone(),
+                )])],
+            }
+            .to_effect_calls();
+            assert_eq!(original.len(), 1);
+            let donor = [capture(
+                control.command_name(),
+                VisionaryApp::script_to_motion_frame(original[0].active_start),
+                vec![A::Int(0x1234)],
+            )];
+            let (rules, missing, unsupported) =
+                VisionaryApp::build_effect_control_rules_from_captures(
+                    &original,
+                    &original,
+                    Some(0),
+                    &donor,
+                );
+            assert!(rules.is_empty());
+            assert!(!missing && !unsupported);
+            for change in 0..3 {
+                let mut edited = original.clone();
+                match change {
+                    0 => edited[0].disabled = true,
+                    1 => edited[0].active_start += 5,
+                    _ => {
+                        edited[0].control = Some(EffectControl::DetachKind {
+                            effect_name: "sys_smoke".into(),
+                            unk: 0,
+                        })
+                    }
+                }
+                let (rules, missing, unsupported) =
+                    VisionaryApp::build_effect_control_rules_from_captures(
+                        &edited,
+                        &original,
+                        Some(0),
+                        &donor,
+                    );
+                assert!(
+                    rules.is_empty(),
+                    "source-only control gained a flat rule: {control:?}, change {change}"
+                );
+                assert!(!missing && unsupported);
+            }
+        }
+        let original = EffectScript {
+            stmts: vec![EffectStmt::Excute(vec![EffectMacro::Control(
+                EffectControl::DetachKind {
+                    effect_name: "sys_smoke".into(),
+                    unk: 0,
+                },
+            )])],
+        }
+        .to_effect_calls();
+        let mut disabled = original.clone();
+        disabled[0].disabled = true;
+        let donor = [capture(
+            "EFFECT_DETACH_KIND",
+            VisionaryApp::script_to_motion_frame(original[0].active_start),
+            vec![A::Hash(hash40::hash40("sys_smoke").0), A::Int(0)],
+        )];
+        let (rules, missing, unsupported) = VisionaryApp::build_effect_control_rules_from_captures(
+            &disabled,
+            &original,
+            Some(0),
+            &donor,
+        );
+        assert_eq!(
+            rules.len(),
+            1,
+            "existing captured detach suppression must remain available"
+        );
+        assert!(rules[0].suppress && rules[0].inject.is_none());
+        assert!(!missing && !unsupported);
     }
 
     #[test]
@@ -44540,6 +43794,97 @@ mod effect_flip_axis_tests {
 }
 
 #[cfg(test)]
+mod game_script_save_tests {
+    use super::*;
+    use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt, Hitbox};
+
+    fn source() -> AcmdScript {
+        AcmdScript {
+            stmts: vec![
+                AcmdStmt::Frame(2.0),
+                AcmdStmt::Excute(vec![ExcuteStmt::Attack(Hitbox::default().to_attack_call())]),
+                AcmdStmt::Wait(2.0),
+                AcmdStmt::Excute(vec![ExcuteStmt::ClearAll]),
+                AcmdStmt::Frame(5.0),
+                AcmdStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count: 2,
+                    body: vec![AcmdStmt::Wait(1.0)],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn unchanged_node_script_survives_project_materialization_and_json_roundtrip() {
+        use crate::move_nodes::{model::MoveGraph, model::Track, timeline};
+        let original = source();
+        let graph = MoveGraph {
+            tracks: vec![timeline::import(Track::Game, &original)],
+            ..MoveGraph::default()
+        };
+        let compiled = timeline::compile("mario", "attack12", &graph)
+            .unwrap()
+            .remove(0)
+            .1;
+        let hitboxes = compiled.to_hitboxes();
+        let saved = game_script_for_edits(&compiled, &hitboxes);
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&compiled).unwrap()
+        );
+        let mut log = crate::data::EditLog::default();
+        log.save_scoped_multi(
+            "mario",
+            "Mario",
+            "attack12",
+            saved,
+            hitboxes.clone(),
+            hitboxes,
+            &[2, 3],
+        );
+        let mut project = crate::mod_project::ModProjectFile::default();
+        let fighter = project.fighters.entry("mario".into()).or_default();
+        fighter.acmd = log.entries.remove("mario").unwrap();
+        fighter.move_graphs.insert("attack12".into(), graph);
+        let loaded = serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
+        let expanded = crate::move_nodes::project::expand(&loaded).unwrap();
+        let record = &expanded.fighters["mario"].acmd["attack12"];
+        assert_eq!(record.slot_scope, Some(2));
+        assert_eq!(record.slot_scopes, vec![3]);
+        assert_eq!(
+            serde_json::to_value(&record.script).unwrap(),
+            serde_json::to_value(&compiled).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_collisions_still_materialize_the_edit() {
+        let original = source();
+        let mut hitboxes = original.to_hitboxes();
+        assert_eq!(hitboxes.len(), 1);
+        hitboxes[0].damage = 19.0;
+        let edited = game_script_for_edits(&original, &hitboxes);
+        assert_eq!(edited.to_hitboxes(), hitboxes);
+        assert_ne!(
+            serde_json::to_value(edited).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_only_collisions_still_get_a_script() {
+        let hitboxes = vec![Hitbox {
+            active_start: 3,
+            active_end: 5,
+            ..Hitbox::default()
+        }];
+        let saved = game_script_for_edits(&AcmdScript::default(), &hitboxes);
+        assert_eq!(saved.to_hitboxes(), hitboxes);
+    }
+}
+
+#[cfg(test)]
 mod live_motion_hash_tests {
     use super::*;
 
@@ -44594,6 +43939,27 @@ mod donor_capture_tests {
     /// donor pool forever, so an effect call added afterwards never found a donor and no live
     /// rule was sent. Performing the move again in game has to be able to supply one.
     #[test]
+    fn plugin_source_prefers_the_saved_folder_then_the_shipped_copy() {
+        let root = std::env::temp_dir().join(format!("vis-plugin-src-{}", std::process::id()));
+        let make = |dir: &std::path::Path| {
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        };
+        let (saved, shipped) = (root.join("saved"), root.join("app/plugin-source"));
+        let exe = Some(root.join("app/Visionary"));
+        assert_eq!(find_plugin_source(None, exe.clone()), None);
+        make(&shipped);
+        assert_eq!(find_plugin_source(None, exe.clone()), Some(shipped.clone()));
+        assert_eq!(
+            find_plugin_source(Some(saved.clone()), exe.clone()),
+            Some(shipped)
+        );
+        make(&saved);
+        assert_eq!(find_plugin_source(Some(saved.clone()), exe), Some(saved));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_fresh_performance_outranks_the_stored_snapshot_while_editing() {
         let chosen = select_donor_captures(
             false,
@@ -44634,4 +44000,100 @@ mod donor_capture_tests {
             "replay must not borrow another move's live run"
         );
     }
+}
+
+#[cfg(test)]
+const TIMELINE_ROW_HEIGHT: f32 = 12.0;
+
+#[cfg(test)]
+/// Height of one row in the compact bands below the hitbox rows.
+fn timeline_thin_row() -> f32 {
+    (TIMELINE_ROW_HEIGHT * 0.45).max(3.0)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // Keep the timeline's explicit lane counts at this UI boundary.
+fn timeline_content_height_with_change_kinetic(
+    hitboxes: usize,
+    effects: usize,
+    hurtboxes: usize,
+    sounds: usize,
+    reverse_lr: usize,
+    speed_ex: usize,
+    speed: usize,
+    add_speed_no_limit: usize,
+    correct: usize,
+    ft_catch_stop: usize,
+    ft_start_adjust_motion_frame: usize,
+    clr_speed: usize,
+    set_air: usize,
+    change_kinetic: usize,
+    kinetic_energy: usize,
+    kinetic_add_speed: usize,
+    kinetic_clear_speed_all: usize,
+    kinetic_set_consider_ground_friction: usize,
+    motion_module_set_rate: usize,
+    motion_module_set_helper_calculation: usize,
+    motion_module_set_rate_partial: usize,
+    motion_module_set_frame_partial: usize,
+    work_flag: usize,
+    work_transition_term: usize,
+    work_module_inc_int: usize,
+    work_module_set: usize,
+) -> f32 {
+    let hitbox_band = hitboxes as f32 * TIMELINE_ROW_HEIGHT;
+    let thin = timeline_thin_row();
+    let band = |rows: usize| {
+        if rows == 0 {
+            0.0
+        } else {
+            4.0 + rows as f32 * thin
+        }
+    };
+    (24.0
+        + hitbox_band
+        + band(effects)
+        + band(hurtboxes)
+        + band(sounds)
+        + band(reverse_lr)
+        + band(speed_ex)
+        + band(speed)
+        + band(add_speed_no_limit)
+        + band(correct)
+        + band(ft_catch_stop)
+        + band(ft_start_adjust_motion_frame)
+        + band(clr_speed)
+        + band(set_air)
+        + band(change_kinetic)
+        + band(kinetic_energy)
+        + band(kinetic_add_speed)
+        + band(kinetic_clear_speed_all)
+        + band(kinetic_set_consider_ground_friction)
+        + band(motion_module_set_rate)
+        + band(motion_module_set_helper_calculation)
+        + band(motion_module_set_rate_partial)
+        + band(motion_module_set_frame_partial)
+        + band(work_flag)
+        + band(work_transition_term)
+        + band(work_module_inc_int)
+        + band(work_module_set))
+    .max(24.0)
+}
+
+#[cfg(test)]
+fn timeline_scroll_area(viewport_height: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .id_salt("hitbox_timeline_scroll")
+        .auto_shrink([false, false])
+        .max_height(viewport_height.max(1.0))
+}
+
+#[cfg(test)]
+fn hitbox_menu_scroll_area(viewport_height: f32) -> egui::ScrollArea {
+    let viewport_height = viewport_height.max(1.0);
+    egui::ScrollArea::vertical()
+        .id_salt("hitbox_menu_scroll")
+        .auto_shrink([false, false])
+        .min_scrolled_height(viewport_height)
+        .max_height(viewport_height)
 }

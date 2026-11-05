@@ -92,12 +92,6 @@ pub fn tick_rainbow(data: &mut EffectData, dt: f32) {
     }
 }
 
-pub fn set_movement(data: &mut EffectData, movement: RainbowMovement) {
-    data.rainbow.movement_state = movement as i32 as f32;
-    let (from, _) = movement.endpoints();
-    data.rainbow.color = from;
-}
-
 pub fn tick_tracked_effects() {
     let ids: Vec<u64> = crate::slight::effect_viewer::tracker::EFFECT_TRACKER
         .lock()

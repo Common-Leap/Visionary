@@ -17,11 +17,13 @@ skyline = { version = "0.6", features = ["std"] }
 skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git" }
 smash-arc = { git = "https://github.com/jam1garner/smash-arc", features = ["smash-runtime", "rust-zstd"] }
 smashline = { git = "https://github.com/HDR-Development/smashline" }
+smash_script = { git = "https://github.com/WuBoytH/smash-script", rev = "24c5b69b79c7d7b041c3993ecd766ceccf950c2b" }
 nnsdk = { git = "https://github.com/ultimate-research/nnsdk-rs" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 parking_lot = "0.12"
 regex-automata = "0.4"
+sha2 = { version = "0.11", default-features = false }
 
 [profile.dev]
 panic = "abort"

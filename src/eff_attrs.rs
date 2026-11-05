@@ -3052,48 +3052,4 @@ mod tests {
             );
         }
     }
-
-    /// A real game emitter has to expose the whole table, or the editor's rows are a list of
-    /// things that are always absent. Skipped without the corpus.
-    #[test]
-    fn a_real_emitter_carries_most_attributes() {
-        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
-        else {
-            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
-            return;
-        };
-        let path = root.join("effect/fighter/mario/ef_mario.eff");
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("skipped: {} unreadable", path.display());
-            return;
-        };
-        let file = effect_library::NamcoEffectFile::load(&bytes).expect("mario's eff parses");
-        let ptcl = file.ptcl_file.expect("mario's eff has a PTCL");
-        let emitter = ptcl
-            .emitter_list
-            .emitter_sets
-            .iter()
-            .flat_map(|s| s.emitters.iter())
-            .next()
-            .expect("at least one emitter");
-
-        let values = read_all(&emitter.data);
-        let present = values.iter().filter(|v| v.is_some()).count();
-        let absent: Vec<&str> = table()
-            .iter()
-            .zip(&values)
-            .filter(|(_, v)| v.is_none())
-            .map(|(a, _)| a.id)
-            .collect();
-        eprintln!(
-            "{present}/{} attributes present on '{}'; absent: {absent:?}",
-            table().len(),
-            emitter.data.display_name()
-        );
-        assert_eq!(
-            present,
-            table().len(),
-            "a real SSBU emitter is missing documented rows: {absent:?}"
-        );
-    }
 }

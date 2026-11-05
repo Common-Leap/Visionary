@@ -139,13 +139,6 @@ pub fn resolve_script_move_name(fighter: &str, move_name: &str) -> String {
     }
 }
 
-/// Fetch and parse hitboxes for a fighter+move from GitHub.
-#[allow(dead_code)]
-pub fn fetch_acmd_script(fighter: &str, move_name: &str) -> anyhow::Result<AcmdScript> {
-    let body = fetch_script_body(fighter, move_name)?;
-    Ok(parse_acmd_script(&body))
-}
-
 /// Worker threads used for fighter-wide script scans (and the connection-pool size).
 /// GitHub's raw host serves this happily; more stops helping once the pipe is saturated.
 pub const SCRIPT_FETCH_THREADS: usize = 8;
@@ -283,32 +276,9 @@ pub(crate) fn cached_script_body_at(path: &std::path::Path) -> Option<String> {
         .map(|raw| script_source_from_body(&raw))
 }
 
-/// Fetch the raw script body text for a fighter+move from GitHub.
-///
-/// A move with no upstream script is an ordinary outcome, not an error, and is reported as an
-/// empty body. **`send()?` does not fail on a 404** — the request succeeded, and it is the
-/// status that says the file is missing, so this has to be checked explicitly.
-///
-/// Tries [`move_script_aliases`] in order, so `attack_s3_s` finds `AttackS3.txt`
-/// when `AttackS3S.txt` 404s, while Ryu/Ken's real `AttackS3S.txt` still wins
-/// for them because it is tried first.
-pub fn fetch_script_body(fighter: &str, move_name: &str) -> anyhow::Result<String> {
-    for alias in move_script_aliases(move_name) {
-        let pascal = move_name_to_pascal(&alias);
-        let url = format!(
-            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
-        );
-        let response = HTTP.get(&url).send()?;
-        if !response.status().is_success() {
-            continue;
-        }
-        let body = script_source_from_body(&response.text()?);
-        if !body.is_empty() {
-            return Ok(body);
-        }
-    }
-    Ok(String::new())
-}
+/// The dump commit the move names and corpus were built against. Upstream reorganised its
+/// folders (and renamed `*Cancel` scripts) afterwards, so `main` no longer has these paths.
+pub const DUMP_REV: &str = "59004685238a3f6f93bae905d3a4e079701c40b4";
 
 /// Disk-cached [`fetch_script_body`]: bodies (**including misses**, stored as an empty file) are
 /// kept under `{app_storage_root}/script-cache/{fighter}/`, so fighter-wide scans (the
@@ -332,7 +302,7 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
         // path cannot disagree: what goes on disk is exactly what a later read gives back.
         let pascal = move_name_to_pascal(&alias);
         let url = format!(
-            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
+            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/{DUMP_REV}/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
         );
         let response = HTTP.get(&url).send()?;
         let body = if !response.status().is_success() {
@@ -371,14 +341,297 @@ pub fn parse_acmd_script(source: &str) -> AcmdScript {
     } else {
         &lines[..]
     };
-    let (stmts, _) = parse_stmts(body_lines, 0);
-    AcmdScript { stmts }
+    if let Some(preserved) = preserve_combined_execute_else(source, body_lines) {
+        return preserved;
+    }
+    let (stmts, _) = parse_stmts(body_lines, 0, ParseDomain::Game, true);
+    AcmdScript {
+        stmts: recover_dumped_motion_loop(stmts),
+    }
+}
+
+/// Re-roll a motion loop the script dump flattened.
+///
+/// The game runs looped scripts as `loop { body; wait }`, where the wait is `wait_loop_clear`
+/// or `wait_loop_sync_mot` (Lua: stafy's `sound_Walk`, kireihana's `game` script). The dump
+/// drops the `loop` and starts the body at the wait: Steve's run effect reads
+/// `wait_loop_sync_mot; frame(14) … frame(29) …`, which HDR writes back as
+/// `loop { frame(14) … frame(29) …; wait_loop_sync_mot }`, and a rapid jab reads
+/// `hit; wait_loop_clear; frame(2) hit … frame(10)`, whose leading hit is the body's tail (Fox,
+/// Buddy, Zelda… end on a bare `frame(N)` that only makes sense with it after; HDR's Buddy jab is
+/// exactly the re-rolled order). Left flat, the script runs once and the move stops hitting, or
+/// the run stops kicking up dust, after the first cycle. Applied only to a single root wait of
+/// either kind whose re-rolled body still has non-decreasing `frame` calls; anything else stays
+/// as written.
+struct Reroll<T> {
+    /// Which wait a root statement is, if any.
+    wait: fn(&T) -> Option<crate::data::MotionLoop>,
+    /// A statement that would make the rotation unsafe: a block holding a wait, an existing
+    /// motion loop, or an unparsed line that may carry timing.
+    blocks: fn(&T) -> bool,
+    frame: fn(&T) -> Option<f32>,
+}
+
+impl<T> Reroll<T> {
+    fn apply(&self, stmts: Vec<T>) -> Result<(Vec<T>, crate::data::MotionLoop), Vec<T>> {
+        let waits: Vec<(usize, crate::data::MotionLoop)> = stmts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, stmt)| (self.wait)(stmt).map(|kind| (index, kind)))
+            .collect();
+        let [(at, kind)] = waits.as_slice() else {
+            return Err(stmts);
+        };
+        let (at, kind) = (*at, *kind);
+        if stmts.iter().any(self.blocks) {
+            return Err(stmts);
+        }
+        let mut rest = stmts;
+        let tail = rest.split_off(at + 1);
+        let wait = rest.pop().expect("the wait is at `at`");
+        let mut body = tail;
+        body.extend(rest);
+        let mut last = f32::NEG_INFINITY;
+        for stmt in &body {
+            if let Some(frame) = (self.frame)(stmt) {
+                if frame < last {
+                    // Not a rotation of one ordered body; restore the source order.
+                    let split = body.len() - at;
+                    let mut original = body.split_off(split);
+                    original.push(wait);
+                    original.extend(body);
+                    return Err(original);
+                }
+                last = frame;
+            }
+        }
+        Ok((body, kind))
+    }
+}
+
+fn recover_dumped_motion_loop(stmts: Vec<AcmdStmt>) -> Vec<AcmdStmt> {
+    fn holds_wait(stmts: &[AcmdStmt]) -> bool {
+        stmts.iter().any(|stmt| match stmt {
+            AcmdStmt::WaitLoopClear | AcmdStmt::NativeMotionLoopSync => true,
+            AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => holds_wait(body),
+            _ => false,
+        })
+    }
+    let reroll = Reroll {
+        wait: |stmt: &AcmdStmt| match stmt {
+            AcmdStmt::WaitLoopClear => Some(crate::data::MotionLoop::Clear),
+            AcmdStmt::NativeMotionLoopSync => Some(crate::data::MotionLoop::SyncMotion),
+            _ => None,
+        },
+        blocks: |stmt: &AcmdStmt| match stmt {
+            AcmdStmt::Loop {
+                body, motion_loop, ..
+            } => motion_loop.is_loop() || holds_wait(body),
+            AcmdStmt::RawBlock { body, .. } => holds_wait(body),
+            AcmdStmt::Raw(line) => line.contains("frame(") || line.contains("wait_loop"),
+            _ => false,
+        },
+        frame: |stmt: &AcmdStmt| match stmt {
+            AcmdStmt::Frame(frame) | AcmdStmt::NativeExecuteFrame(frame) => Some(*frame),
+            _ => None,
+        },
+    };
+    match reroll.apply(stmts) {
+        Ok((body, motion_loop)) => vec![AcmdStmt::Loop {
+            count: 1,
+            body,
+            motion_loop,
+        }],
+        Err(stmts) => stmts,
+    }
+}
+
+fn recover_dumped_effect_motion_loop(stmts: Vec<EffectStmt>) -> Vec<EffectStmt> {
+    fn holds_wait(stmts: &[EffectStmt]) -> bool {
+        stmts.iter().any(|stmt| match stmt {
+            EffectStmt::NativeMotionLoopSync => true,
+            EffectStmt::Loop { body, .. } | EffectStmt::Cond { body, .. } => holds_wait(body),
+            EffectStmt::Raw(line) => line.contains("wait_loop"),
+            _ => false,
+        })
+    }
+    let reroll = Reroll {
+        wait: |stmt: &EffectStmt| {
+            matches!(stmt, EffectStmt::NativeMotionLoopSync)
+                .then_some(crate::data::MotionLoop::SyncMotion)
+        },
+        blocks: |stmt: &EffectStmt| match stmt {
+            EffectStmt::Loop {
+                body, motion_loop, ..
+            } => motion_loop.is_loop() || holds_wait(body),
+            EffectStmt::Cond { body, .. } => holds_wait(body),
+            EffectStmt::Raw(line) => line.contains("frame(") || line.contains("wait_loop"),
+            _ => false,
+        },
+        frame: |stmt: &EffectStmt| match stmt {
+            EffectStmt::Frame(frame) | EffectStmt::NativeExecuteFrame(frame) => Some(*frame),
+            _ => None,
+        },
+    };
+    match reroll.apply(stmts) {
+        Ok((body, motion_loop)) => vec![EffectStmt::Loop {
+            count: 1,
+            body,
+            motion_loop,
+        }],
+        Err(stmts) => stmts,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParseDomain {
+    Game,
+    Sound,
+    Expression,
 }
 
 /// Parse statements from a slice of lines starting at `pos`.
 /// Returns (statements, lines_consumed).
-fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
+fn parse_stmts(
+    lines: &[&str],
+    pos: usize,
+    domain: ParseDomain,
+    native_attack_all_allowed: bool,
+) -> (Vec<AcmdStmt>, usize) {
+    parse_stmts_with_fear_face_guard(
+        lines,
+        pos,
+        domain,
+        native_attack_all_allowed,
+        domain == ParseDomain::Game,
+        false,
+        RootStatementPermissions {
+            visibility: matches!(domain, ParseDomain::Game | ParseDomain::Expression),
+            motion_loop_sync: true,
+        },
+    )
+}
+
+#[derive(Default)]
+struct RootStatementPermissions {
+    visibility: bool,
+    motion_loop_sync: bool,
+}
+
+const FINAL_FEAR_FACE_READ_ONLY_GUARD: &str =
+    "if !WorkModule::is_flag(agent.module_accessor, *FIGHTER_INSTANCE_WORK_ID_FLAG_DISABLE_FINAL_START_CAMERA) {";
+
+/// Parse the one measured read-only camera condition as a narrow exception for its child command.
+/// This permission is not inherited by further runtime blocks, loops, or sibling/else bodies.
+fn parse_stmts_with_fear_face_guard(
+    lines: &[&str],
+    mut pos: usize,
+    domain: ParseDomain,
+    native_attack_all_allowed: bool,
+    named_event_scope_allowed: bool,
+    fear_face_read_only_guard: bool,
+    root_permissions: RootStatementPermissions,
+) -> (Vec<AcmdStmt>, usize) {
     let mut stmts = Vec::new();
+    let root_visibility_allowed = root_permissions.visibility;
+    let root_motion_loop_sync = root_permissions.motion_loop_sync;
+    let native_motion_sync_heads = if root_permissions.motion_loop_sync
+        && lines.iter().any(|line| line.contains("wait_loop_sync_mot"))
+    {
+        native_timing_source_lines(lines, "wait_loop_sync_mot")
+    } else {
+        Default::default()
+    };
+    let visibility_execute_heads = if root_visibility_allowed
+        && lines
+            .iter()
+            .any(|line| line.contains("VisibilityModule::set_int64("))
+    {
+        unattributed_source_branch_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let closed_root_execute_heads = if root_visibility_allowed
+        && lines.iter().any(|line| {
+            line.contains("VisibilityModule::set_whole(")
+                || line.contains("macros::SHOOT_ITEM_BULLET(")
+                || line.contains("macros::START_INFO_FLASH_EYE(")
+                || line.contains("macros::CAM_ZOOM_OUT(")
+                || line.contains("macros::FT_START_CUTIN(")
+                || line.contains("AttackModule::set_attack_reference_joint_id(")
+                || line.contains("VisibilityModule::set_default_int64(")
+                || line.contains("ArticleModule::generate_article_enable(")
+                || line.contains("ArticleModule::change_status(")
+                || line.contains("ArticleModule::change_status_exist(")
+                || line.contains("ArticleModule::change_motion(")
+        }) {
+        unattributed_plain_execute_without_else_heads(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let capture_cut_common_bare_heads = if domain == ParseDomain::Game
+        && root_visibility_allowed
+        && lines
+            .iter()
+            .any(|line| line.contains("macros::game_CaptureCutCommon("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let native_execute_frame_heads = if root_visibility_allowed
+        && matches!(domain, ParseDomain::Game | ParseDomain::Expression)
+        && lines.iter().any(|line| line.contains("execute"))
+    {
+        native_execute_frame_source_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Resolve attributes and comments with Rust's statement boundaries, not proximity to
+    // the previous physical line. A blank/comment/multiline attribute cannot grant authority.
+    let fear_face_guard_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("FIGHTER_INSTANCE_WORK_ID_FLAG_DISABLE_FINAL_START_CAMERA"))
+    {
+        unattributed_source_branch_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Named-event parsing has its own source permission. Unlike the broad legacy native family
+    // flag, this is restricted to an unattached, plain Game Execute at this scope; recursive
+    // condition/loop walks receive `native_attack_all_allowed = false` and leave the call Raw for
+    // the fighter-aware timeline importer to consider separately.
+    let has_named_event_source = lines.iter().any(|line| {
+        line.contains("dispatch_named_from_module")
+            || line.contains("dispatch_named_chart_from_module")
+            || line.contains("dispatch_named_chart_values_from_module")
+    });
+    let named_event_execute_heads =
+        if domain == ParseDomain::Game && named_event_scope_allowed && has_named_event_source {
+            unattributed_plain_execute_heads(lines)
+        } else {
+            std::collections::BTreeSet::new()
+        };
+    // Loop attributes change whether the statement runs. Keep them attached to the loop as
+    // immutable source on every track, not only when a named-event source happens to be present.
+    let clean_loop_heads = if lines
+        .iter()
+        .any(|line| line.trim_start().starts_with("for "))
+    {
+        unattributed_source_loop_heads(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+
+    let native_call_heads = if lines
+        .iter()
+        .any(|line| crate::move_nodes::native_calls::contains_supported_call(line))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        Default::default()
+    };
 
     while pos < lines.len() {
         let (logical_line, lines_consumed) = logical_line_at(lines, pos);
@@ -391,24 +644,123 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
         }
 
         // for _ in 0..N { ... }
-        if let Some(count) = parse_for_loop_header(line) {
-            // Find the matching closing brace
-            let body_start = pos + lines_consumed;
-            let (body_lines_end, _) = find_block_end(lines, pos);
-            let body_slice = &lines[body_start..body_lines_end];
-            let (body, _) = parse_stmts(body_slice, 0);
-            stmts.push(AcmdStmt::Loop { count, body });
-            pos = body_lines_end + 1;
-            continue;
+        if clean_loop_heads.contains(&pos) {
+            if let Some(count) = parse_for_loop_header(line) {
+                // Find the matching closing brace
+                let body_start = pos + lines_consumed;
+                let Some((body_start, body_lines_end)) =
+                    complete_block_body(lines, pos, body_start)
+                else {
+                    stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
+                    pos = lines.len();
+                    break;
+                };
+                let body_slice = &lines[body_start..body_lines_end];
+                let (body, _) = parse_stmts_with_fear_face_guard(
+                    body_slice,
+                    0,
+                    domain,
+                    false,
+                    false,
+                    false,
+                    RootStatementPermissions::default(),
+                );
+                let event_repeat_is_clean = clean_loop_heads.contains(&pos)
+                    && line == format!("for _ in 0..{count} {{").as_str();
+                if body_slice.iter().any(|source_line| {
+                    source_line.contains("dispatch_named_from_module")
+                        || source_line.contains("dispatch_named_chart_from_module")
+                        || source_line.contains("dispatch_named_chart_values_from_module")
+                }) && !event_repeat_is_clean
+                {
+                    // Only an exact, clean canonical event-bearing loop is editable here.
+                    // V88 aligns its numeric ceiling with the existing node Repeat limit of
+                    // 100; this does not grant helper/call/native authority or relax the
+                    // donor/Game/whole-parent/Execute/call source gates.
+                    stmts.push(AcmdStmt::RawBlock {
+                        header: line.to_owned(),
+                        body,
+                    });
+                } else {
+                    stmts.push(AcmdStmt::Loop {
+                        motion_loop: crate::data::MotionLoop::No,
+                        count,
+                        body,
+                    });
+                }
+                pos = body_lines_end + 1;
+                continue;
+            }
         }
 
         // if macros::is_excute(agent) { ... }
-        if line.contains("is_excute") {
+        if is_plain_excute_header(line) {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let excute_stmts = parse_excute_block(&lines[body_start..body_end]);
-            stmts.push(AcmdStmt::Excute(excute_stmts));
+            let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
+                stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
+                pos = lines.len();
+                break;
+            };
+            let excute_stmts = parse_excute_block_with_fear_face_guard(
+                &lines[body_start..body_end],
+                domain,
+                native_attack_all_allowed,
+                fear_face_read_only_guard,
+                visibility_execute_heads.contains(&pos),
+                closed_root_execute_heads.contains(&pos),
+                named_event_execute_heads.contains(&pos),
+            );
+            // A separate-line alternate belongs to this Execute, even in decompiler dumps
+            // where indentation suggests an outer WorkModule guard. Keep that ownership.
+            if separate_else_follows(lines, body_end)
+                && plain_command_body(&lines[body_start..body_end])
+                && !excute_stmts
+                    .iter()
+                    .any(|command| matches!(command, ExcuteStmt::Raw(_)))
+            {
+                stmts.push(AcmdStmt::RawBlock {
+                    header: "if macros::is_excute(agent) {".into(),
+                    body: excute_stmts
+                        .into_iter()
+                        .map(|command| AcmdStmt::Bare(Box::new(command)))
+                        .collect(),
+                });
+            } else {
+                stmts.push(AcmdStmt::Excute(excute_stmts));
+            }
             pos = body_end + 1;
+            continue;
+        }
+
+        if native_motion_sync_heads.contains(&pos) {
+            if domain != ParseDomain::Game && parse_native_motion_loop_sync_call(line) {
+                stmts.push(AcmdStmt::NativeMotionLoopSync);
+            } else {
+                // Keep unsupported/adjacent calls intact before the legacy frame scanner.
+                stmts.push(AcmdStmt::Raw(line.to_owned()));
+            }
+            pos += lines_consumed;
+            continue;
+        }
+
+        if native_execute_frame_heads.contains(&pos) {
+            if let Some(frame) = parse_native_execute_frame_call(line) {
+                stmts.push(AcmdStmt::NativeExecuteFrame(frame));
+            } else {
+                // Do not let another call on the same physical line enter the legacy
+                // frame/wait scanner and erase this unrecognized native statement.
+                stmts.push(AcmdStmt::Raw(line.to_owned()));
+            }
+            pos += lines_consumed;
+            continue;
+        }
+
+        // Unsupported, shadowed or nested sync calls must not be consumed by a
+        // frame/wait found later on the same physical line. Preserve their line
+        // without granting any native parsing authority.
+        if line.contains("wait_loop_sync_mot") && !opens_block(line) {
+            stmts.push(AcmdStmt::Raw(line.to_owned()));
+            pos += lines_consumed;
             continue;
         }
 
@@ -421,9 +773,14 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
             }
         }
 
-        // wait_loop_clear
+        // wait_loop_clear, in one of its exact spellings. Anything else that mentions it is
+        // kept verbatim rather than retyped.
         if line.contains("wait_loop_clear") {
-            stmts.push(AcmdStmt::WaitLoopClear);
+            stmts.push(if is_wait_loop_clear_statement(line) {
+                AcmdStmt::WaitLoopClear
+            } else {
+                AcmdStmt::Raw(line.to_owned())
+            });
             pos += lines_consumed;
             continue;
         }
@@ -445,6 +802,25 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
             continue;
         }
 
+        // A measured expression script has one bare `slope!` presentation call. Type its
+        // closed syntax for faithful inspection/round-trip, but timeline validation still keeps
+        // this bare placement preserved rather than making it an editable command.
+        if let Some(stmt @ ExcuteStmt::Slope(_)) = parse_slope_call(line) {
+            stmts.push(AcmdStmt::Bare(Box::new(stmt)));
+            pos += lines_consumed;
+            continue;
+        }
+
+        // This helper carries its own Execute guard. Keep only its direct root Game bare form;
+        // recognizing it in an Execute or nested block would change its source semantics.
+        if domain == ParseDomain::Game && capture_cut_common_bare_heads.contains(&pos) {
+            if let Some(stmt) = parse_capture_cut_common_call(line) {
+                stmts.push(AcmdStmt::Bare(Box::new(stmt)));
+                pos += lines_consumed;
+                continue;
+            }
+        }
+
         // wait(lua_state, N)
         if line.contains("wait(") {
             if let Some(w) = parse_wait_call(line) {
@@ -454,27 +830,119 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
             }
         }
 
-        // The direct `SET_SPEED` export uses this local helper because the vendored
-        // `smash-script` crate has no safe wrapper for the linked primitive. It is an emitter
-        // implementation detail, not a source statement; skipping the whole nested function
-        // keeps parse -> export -> parse -> export from duplicating the helper definition.
-        if (line.contains("fn visionary_set_speed(")
-            || line.contains("fn visionary_clr_speed(")
-            || line.contains("fn visionary_set_air("))
-            && line.ends_with('{')
-        {
-            let (body_end, _) = find_block_end(lines, pos);
+        // Generated movement helpers are nested in the ACMD function. Skip their exact
+        // emitted attributes and bodies as one emitter detail; a same-named user helper or
+        // unrelated attribute is retained unless the entire known helper body matches.
+        if let Some(body_end) = generated_movement_helper_end(lines, pos) {
             pos = body_end + 1;
             continue;
         }
 
-        // Any other line that opens a block — a runtime branch, its `else`, a `for` whose
-        // count could not be read. The body is walked, so a `frame()` or a hitbox inside a
-        // branch is still seen; the brace is kept, so the function still closes.
-        if line.ends_with('{') {
+        if native_call_heads.contains(&pos) {
+            if let Some(call) = crate::move_nodes::native_calls::parse(line)
+                .or_else(|| crate::move_nodes::native_calls::parse_source_line(line))
+            {
+                stmts.push(AcmdStmt::Bare(Box::new(ExcuteStmt::NativeCall(call))));
+                pos += lines_consumed;
+                continue;
+            }
+        }
+
+        // `loop { ...; wait_loop_clear }` — the native scheduler loop rapid jabs run under
+        // (HDR writes Attack100 this way). Typed only when the body ends with the yield; any
+        // other `loop` falls through and stays a preserved block.
+        // The loop is the whole script, so its body is read with the function root's
+        // permissions; only a root `loop` qualifies.
+        if line == "loop {" && root_motion_loop_sync {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let (body, _) = parse_stmts(&lines[body_start..body_end], 0);
+            if let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) {
+                if combined_else_header(lines[body_end]).is_none() {
+                    let all_lines = &lines[body_start..body_end];
+                    let sync_body = sync_motion_loop_body(all_lines);
+                    let (mut body, _) = parse_stmts_with_fear_face_guard(
+                        sync_body.unwrap_or(all_lines),
+                        0,
+                        domain,
+                        native_attack_all_allowed,
+                        named_event_scope_allowed,
+                        false,
+                        RootStatementPermissions {
+                            visibility: root_visibility_allowed,
+                            motion_loop_sync: true,
+                        },
+                    );
+                    let waits = body
+                        .iter()
+                        .filter(|stmt| {
+                            matches!(
+                                stmt,
+                                AcmdStmt::WaitLoopClear | AcmdStmt::NativeMotionLoopSync
+                            )
+                        })
+                        .count();
+                    let kind = match (sync_body, body.last()) {
+                        (Some(_), _) if waits == 0 => Some(crate::data::MotionLoop::SyncMotion),
+                        (None, Some(AcmdStmt::WaitLoopClear)) if waits == 1 => {
+                            Some(crate::data::MotionLoop::Clear)
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        if kind == crate::data::MotionLoop::Clear {
+                            body.pop();
+                        }
+                        stmts.push(AcmdStmt::Loop {
+                            count: 1,
+                            body,
+                            motion_loop: kind,
+                        });
+                        pos = body_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Any other line that opens a block — a runtime branch, its `else`, or a `for` whose
+        // exact count could not be proven. Detect the brace outside trailing comments/literals
+        // so an unsupported loop header plus comment still owns its complete body.
+        if opens_block(line) {
+            let body_start = pos + lines_consumed;
+            let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
+                stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
+                pos = lines.len();
+                break;
+            };
+            let else_body_range = if let Some(else_header) = combined_else_header(lines[body_end]) {
+                let else_body_start = body_end + 1;
+                match complete_combined_else_body(lines, body_end, else_body_start) {
+                    Some(else_body_end) => Some((else_header, else_body_start, else_body_end)),
+                    None => {
+                        // Do not emit the completed first arm and then flatten an incomplete
+                        // sibling. Retain the complete combined construct as source instead.
+                        stmts.push(AcmdStmt::Raw(raw_block_tail(lines, pos)));
+                        pos = lines.len();
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            // A Rust attribute immediately attached to the branch can affect whether the
+            // guarded statement exists at all. Do not split that attributed source construct
+            // into an editable condition plus typed native child.
+            let is_measured_fear_face_guard = domain == ParseDomain::Game
+                && fear_face_guard_heads.contains(&pos)
+                && line == FINAL_FEAR_FACE_READ_ONLY_GUARD;
+            let (body, _) = parse_stmts_with_fear_face_guard(
+                &lines[body_start..body_end],
+                0,
+                domain,
+                false,
+                false,
+                is_measured_fear_face_guard,
+                RootStatementPermissions::default(),
+            );
             stmts.push(AcmdStmt::RawBlock {
                 header: line.to_string(),
                 body,
@@ -483,10 +951,16 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
             // one physical line (`} else {`). `find_block_end` stops at the first closing brace,
             // so parse that sibling block here rather than feeding the combined line back into
             // the recursive walker (which would otherwise produce an inverted slice).
-            if let Some(else_header) = combined_else_header(lines[body_end]) {
-                let else_body_start = body_end + 1;
-                let (else_body_end, _) = find_else_block_end(lines, body_end);
-                let (else_body, _) = parse_stmts(&lines[else_body_start..else_body_end], 0);
+            if let Some((else_header, else_body_start, else_body_end)) = else_body_range {
+                let (else_body, _) = parse_stmts_with_fear_face_guard(
+                    &lines[else_body_start..else_body_end],
+                    0,
+                    domain,
+                    false,
+                    false,
+                    false,
+                    RootStatementPermissions::default(),
+                );
                 stmts.push(AcmdStmt::RawBlock {
                     header: else_header,
                     body: else_body,
@@ -536,14 +1010,474 @@ fn parse_stmts(lines: &[&str], mut pos: usize) -> (Vec<AcmdStmt>, usize) {
     (stmts, pos)
 }
 
+fn is_plain_excute_header(line: &str) -> bool {
+    matches!(
+        line,
+        "if macros::is_excute(agent) {" | "if is_excute(agent) {"
+    )
+}
+
+/// Only direct, unattributed command statements may be lifted out of the command-list
+/// parser. Nested control flow and malformed dump syntax retain their original witness.
+fn plain_command_body(lines: &[&str]) -> bool {
+    let Ok(block) =
+        syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", native_statement_syntax(lines)))
+    else {
+        return false;
+    };
+    let direct = direct_native_statement_lines(lines);
+    // Two statements on one physical line cannot share a command-parser slot.
+    block.stmts.len() == direct.len()
+        && logical_lines_with_origins(lines)
+            .iter()
+            .all(|(index, line)| line.trim().is_empty() || direct.contains(index))
+}
+
+fn separate_else_follows(lines: &[&str], close: usize) -> bool {
+    lines
+        .get(close + 1..)
+        .and_then(|tail| tail.iter().find(|line| !line.trim().is_empty()))
+        .is_some_and(|line| line.trim() == "else {")
+}
+
+/// The line walker cannot split `} else {` after a plain Execute guard. Preserve the whole
+/// function body as one immutable witness rather than dropping or flattening its alternate arm.
+/// Separate-line Else blocks retain their established structured import path.
+fn preserve_combined_execute_else(source: &str, body_lines: &[&str]) -> Option<AcmdScript> {
+    combined_execute_else_body(source, body_lines).map(|body| AcmdScript {
+        stmts: vec![AcmdStmt::Raw(body)],
+    })
+}
+
+fn combined_execute_else_body(source: &str, body_lines: &[&str]) -> Option<String> {
+    use syn::visit::Visit;
+    if !body_lines
+        .iter()
+        .any(|line| line.contains('}') && line.contains("else"))
+    {
+        return None;
+    }
+    let function = syn::parse_str::<syn::ItemFn>(source).ok()?;
+    struct Finder<'a> {
+        lines: Vec<&'a str>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
+            if let Some((alternate, _)) = &branch.else_branch {
+                let plain = self
+                    .lines
+                    .get(branch.if_token.span.start().line.saturating_sub(1))
+                    .is_some_and(|line| is_plain_excute_header(line.trim()));
+                if plain
+                    && alternate.span.start().line
+                        == branch.then_branch.brace_token.span.close().end().line
+                {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_if(self, branch);
+        }
+    }
+    let mut finder = Finder {
+        lines: source.lines().collect(),
+        found: false,
+    };
+    finder.visit_block(&function.block);
+    finder
+        .found
+        .then(|| body_lines.join("\n").trim().to_owned())
+}
+
+/// Direct, unattached `if macros::is_excute(agent)` / `if is_excute(agent)` statements in a
+/// source block. This permission is intentionally separate from native write and visibility
+/// permissions.
+pub(crate) fn unattributed_plain_execute_heads(
+    lines: &[&str],
+) -> std::collections::BTreeSet<usize> {
+    unattributed_source_branch_lines(lines)
+        .into_iter()
+        .filter(|index| {
+            lines
+                .get(*index)
+                .is_some_and(|line| is_plain_excute_header(line.trim()))
+        })
+        .collect()
+}
+
+/// Direct, unattributed root Execute branches with no alternate arm. Visibility whole-body
+/// authoring uses this stricter permission so `else`, expression attributes, or a lookalike
+/// condition cannot authorize a source-only native setter.
+fn unattributed_plain_execute_without_else_heads(
+    lines: &[&str],
+) -> std::collections::BTreeSet<usize> {
+    use syn::spanned::Spanned;
+    let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", lines.join("\n"))) else {
+        return std::collections::BTreeSet::new();
+    };
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| {
+            let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement else {
+                return None;
+            };
+            if !branch.attrs.is_empty() || branch.else_branch.is_some() {
+                return None;
+            }
+            let syn::Expr::Call(call) = branch.cond.as_ref() else {
+                return None;
+            };
+            let syn::Expr::Path(path) = call.func.as_ref() else {
+                return None;
+            };
+            let function = path.qself.is_none()
+                && path.attrs.is_empty()
+                && ((path.path.is_ident("is_excute"))
+                    || path.path.segments.len() == 2
+                        && path.path.segments[0].ident == "macros"
+                        && path.path.segments[1].ident == "is_excute");
+            let agent = call.args.len() == 1
+                && matches!(call.args.first(), Some(syn::Expr::Path(agent))
+                    if agent.attrs.is_empty() && agent.path.is_ident("agent"));
+            if call.attrs.is_empty() && function && agent {
+                let index = branch.span().start().line.checked_sub(2)?;
+                lines
+                    .get(index)
+                    .is_some_and(|line| is_plain_excute_header(line.trim()))
+                    .then_some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Direct, unattached source `for` statements. The timeline uses these heads only when deciding
+/// whether to promote a nested named-event receiver; it does not grant permission to any native
+/// call family.
+pub(crate) fn unattributed_source_loop_heads(lines: &[&str]) -> std::collections::BTreeSet<usize> {
+    use syn::spanned::Spanned;
+    let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", lines.join("\n"))) else {
+        return std::collections::BTreeSet::new();
+    };
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| {
+            if let syn::Stmt::Expr(syn::Expr::ForLoop(loop_expr), _) = statement {
+                if loop_expr.attrs.is_empty() {
+                    return loop_expr.span().start().line.checked_sub(2);
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+const ATTACK_ABS_APPLY_THROW_SOURCE: [&str; 4] = [
+    "let target = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_OBJECT);",
+    "let target_group = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_GROUP);",
+    "let target_no = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_NO);",
+    "macros::ATK_HIT_ABS(agent, *FIGHTER_ATTACK_ABSOLUTE_KIND_THROW, Hash40::new(\"throw\"), target, target_group, target_no);",
+];
+
 /// Parse the contents of an is_excute block.
-fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
+#[cfg(test)]
+fn parse_excute_block(
+    lines: &[&str],
+    domain: ParseDomain,
+    native_attack_all_allowed: bool,
+) -> Vec<ExcuteStmt> {
+    parse_excute_block_with_fear_face_guard(
+        lines,
+        domain,
+        native_attack_all_allowed,
+        false,
+        matches!(domain, ParseDomain::Game | ParseDomain::Expression),
+        matches!(domain, ParseDomain::Game | ParseDomain::Expression),
+        domain == ParseDomain::Game,
+    )
+}
+
+fn parse_excute_block_with_fear_face_guard(
+    lines: &[&str],
+    domain: ParseDomain,
+    native_attack_all_allowed: bool,
+    fear_face_read_only_guard: bool,
+    root_visibility_allowed: bool,
+    closed_root_native_allowed: bool,
+    named_event_allowed: bool,
+) -> Vec<ExcuteStmt> {
     let mut stmts = Vec::new();
-    for logical_line in logical_lines(lines) {
+    let visibility_heads = if root_visibility_allowed {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let closed_root_statement_heads = if closed_root_native_allowed {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // CHECK_FINISH_CAMERA is independent of native hitbox support. Admit only exact root
+    // statements from the direct Game Execute context and only literal tuples in the corpus
+    // catalog; nested/attributed/Sound/Expression forms remain source text.
+    let finish_camera_heads = if domain == ParseDomain::Game
+        && native_attack_all_allowed
+        && lines
+            .iter()
+            .any(|line| line.contains("macros::CHECK_FINISH_CAMERA("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // CHECK_VALID_FINAL_START_CAMERA is admitted only at the same root-direct Game Execute
+    // boundary as CHECK_FINISH_CAMERA. Its six payload tokens are an indivisible measured tuple.
+    let final_start_camera_heads = if domain == ParseDomain::Game
+        && native_attack_all_allowed
+        && lines
+            .iter()
+            .any(|line| line.contains("macros::CHECK_VALID_FINAL_START_CAMERA("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Fear-face may occur directly inside the exact read-only camera-flag branch. Unlike the
+    // broader root permission, this does not admit commands under any other nested control.
+    let final_fear_face_heads = if domain == ParseDomain::Game
+        && (native_attack_all_allowed || fear_face_read_only_guard)
+        && lines
+            .iter()
+            .any(|line| line.contains("macros::FT_SET_FINAL_FEAR_FACE("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let native_heads = if domain == ParseDomain::Game
+        && native_attack_all_allowed
+        && lines.iter().any(|line| {
+            line.contains("AttackModule::set_add_reaction_frame(")
+                || line.contains("AttackModule::set_add_reaction_frame_revised(")
+                || line.contains("macros::ATK_HIT_ABS(")
+        }) {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Height selection has no root-only authority: the same complete SDK call appears in
+    // measured bounded loops. Admit direct Game Execute statements independently of the
+    // legacy root permission, retaining the enclosing branch/repeat in the timeline.
+    let attack_height_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_attack_height_all("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Article partial motion is admitted independently of the legacy native-attack context
+    // flag, but only for direct Game statements whose complete line matches one of the twelve
+    // closed owner/clip/timing tuples. Other native families retain their existing permission.
+    let article_partial_motion_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("ArticleModule::add_motion_partial("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // These two measured AttackModule calls have their own closed source permissions. They do
+    // not depend on `native_attack_all_allowed`, which belongs to unrelated legacy families.
+    let damage_shake_scale_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_damage_shake_scale("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let no_uniq_effect_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_no_uniq_effect_all("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Target-category calls have an independent, closed source permission. Only direct Game
+    // execute statements are considered; this does not enable other AttackModule families.
+    let target_category_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_target_category("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // These exact source-only families have independent permissions: admitting either one does
+    // not turn on the unrelated native AttackModule parser families.
+    let set_size_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_size("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // Vector-target positions are admitted only from direct Game Execute statements and from
+    // the exact closed Vector2f source table. This does not enable either Edge's different API
+    // or unrelated AttackModule calls.
+    let vec_target_pos_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("AttackModule::set_vec_target_pos("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let hit_status_all_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("HitModule::set_status_all("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    // SLOW_OPPONENT is an independent source-only Game command. It is admitted only when
+    // syn identifies the complete call as a direct statement in this Execute body.
+    let slow_opponent_heads = if domain == ParseDomain::Game
+        && lines
+            .iter()
+            .any(|line| line.contains("macros::SLOW_OPPONENT("))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let named_event_calls = if domain == ParseDomain::Game && named_event_allowed {
+        unattributed_gimmick_event_calls(lines)
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    // Optional hit feedback has its own independent native permission. Only an unattributed,
+    // direct source statement in the top-level Game Execute context is eligible; recursive
+    // branch/loop parsing passes `native_attack_all_allowed = false` and therefore stays Raw.
+    let optional_hit_feedback_heads = if domain == ParseDomain::Game
+        && native_attack_all_allowed
+        && lines.iter().any(|line| {
+            line.contains("AttackModule::set_optional_hit_effect(")
+                || line.contains("AttackModule::set_optional_hit_sound(")
+        }) {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let native_call_heads = if lines
+        .iter()
+        .any(|line| crate::move_nodes::native_calls::contains_supported_call(line))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        Default::default()
+    };
+    let mut logical_lines = logical_lines_with_origins(lines).into_iter();
+    while let Some((start_line, logical_line)) = logical_lines.next() {
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        let direct_native_allowed = native_heads.contains(&start_line);
+        if domain == ParseDomain::Game && slow_opponent_heads.contains(&start_line) {
+            if let Some(stmt) = parse_slow_opponent_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && optional_hit_feedback_heads.contains(&start_line) {
+            if let Some(stmt) = parse_optional_hit_feedback_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && finish_camera_heads.contains(&start_line) {
+            if let Some(stmt) = parse_finish_camera_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && final_start_camera_heads.contains(&start_line) {
+            if let Some(stmt) = parse_final_start_camera_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && final_fear_face_heads.contains(&start_line) {
+            if let Some(stmt) = parse_final_fear_face_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if direct_native_allowed && line == ATTACK_ABS_APPLY_THROW_SOURCE[0] {
+            let matches_bundle = logical_lines.as_slice().get(..3).is_some_and(|next_lines| {
+                ATTACK_ABS_APPLY_THROW_SOURCE[1..]
+                    .iter()
+                    .zip(next_lines)
+                    .all(|(expected, (_, actual))| actual.trim() == *expected)
+            });
+            if matches_bundle {
+                logical_lines.nth(2);
+                stmts.push(ExcuteStmt::AttackAbsApplyThrow);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && damage_shake_scale_heads.contains(&start_line) {
+            if let Some(stmt) = parse_attack_module_set_damage_shake_scale(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && no_uniq_effect_heads.contains(&start_line) {
+            if let Some(stmt) = parse_attack_module_set_no_uniq_effect_all(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && target_category_heads.contains(&start_line) {
+            if let Some(stmt) = parse_attack_module_set_target_category(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && set_size_heads.contains(&start_line) {
+            if let Some(stmt) = parse_attack_module_set_size(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && vec_target_pos_heads.contains(&start_line) {
+            if let Some(stmt) = parse_attack_module_set_vec_target_pos(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && hit_status_all_heads.contains(&start_line) {
+            if let Some(stmt) = parse_hit_module_set_status_all(line) {
+                stmts.push(stmt);
+                continue;
+            }
         }
         // `ATTACK_FP` starts with `ATTACK` but has a different fixed 41-slot layout. Keep its
         // complete-name dispatch ahead of the ordinary family so a future addition to
@@ -606,17 +1540,283 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
                 continue;
             }
         }
+        let attack_all = (domain == ParseDomain::Game && native_attack_all_allowed)
+            .then(|| parse_attack_module_set_all_call(line))
+            .flatten();
+        if let Some(stmt) = attack_all {
+            stmts.push(stmt);
+            continue;
+        }
+        let indexed_attack = (domain == ParseDomain::Game
+            && native_attack_all_allowed
+            && (line.contains("AttackModule::set_no_finish_camera(")
+                || line.contains("AttackModule::set_force_reaction(")))
+        .then(|| parse_attack_module_set_indexed_call(line))
+        .flatten();
+        if let Some(stmt) = indexed_attack {
+            stmts.push(stmt);
+            continue;
+        }
+        let attack_height = attack_height_heads
+            .contains(&start_line)
+            .then(|| parse_attack_module_set_height_all_call(line))
+            .flatten();
+        if let Some(stmt) = attack_height {
+            stmts.push(stmt);
+            continue;
+        }
+        let final_finish_cut_in = (domain == ParseDomain::Game
+            && native_attack_all_allowed
+            && line.contains("AttackModule::set_final_finish_cut_in("))
+        .then(|| parse_attack_module_set_final_finish_cut_in_call(line))
+        .flatten();
+        if let Some(stmt) = final_finish_cut_in {
+            stmts.push(stmt);
+            continue;
+        }
+        let init_attack_pos = (domain == ParseDomain::Game
+            && native_attack_all_allowed
+            && line.contains("AttackModule::init_attack_pos("))
+        .then(|| parse_attack_module_init_attack_pos_call(line))
+        .flatten();
+        if let Some(stmt) = init_attack_pos {
+            stmts.push(stmt);
+            continue;
+        }
+        let attack_reference_choices = if line
+            .contains("AttackModule::set_attack_reference_joint_id(")
+        {
+            match domain {
+                ParseDomain::Game if native_attack_all_allowed => {
+                    Some(&crate::data::AttackReferenceJointKind::GAME_CHOICES[..])
+                }
+                ParseDomain::Expression if closed_root_statement_heads.contains(&start_line) => {
+                    Some(&crate::data::AttackReferenceJointKind::EXPRESSION_CHOICES[..])
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let attack_reference = attack_reference_choices.and_then(|choices| {
+            parse_attack_module_set_attack_reference_joint_id_call(line, choices)
+        });
+        if let Some(stmt) = attack_reference {
+            stmts.push(stmt);
+            continue;
+        }
+        let no_damage_fly_smoke = (domain == ParseDomain::Game
+            && native_attack_all_allowed
+            && line.contains("AttackModule::set_no_damage_fly_smoke_all("))
+        .then(|| parse_attack_module_set_no_damage_fly_smoke_all_call(line))
+        .flatten();
+        if let Some(stmt) = no_damage_fly_smoke {
+            stmts.push(stmt);
+            continue;
+        }
+        let add_reaction_frame = (domain == ParseDomain::Game
+            && direct_native_allowed
+            && (line.contains("AttackModule::set_add_reaction_frame(")
+                || line.contains("AttackModule::set_add_reaction_frame_revised(")))
+        .then(|| parse_attack_module_add_reaction_frame_call(line))
+        .flatten();
+        if let Some(stmt) = add_reaction_frame {
+            stmts.push(stmt);
+            continue;
+        }
+        let grab_rebound = (domain == ParseDomain::Game
+            && native_attack_all_allowed
+            && line.contains("GrabModule::set_rebound("))
+        .then(|| parse_grab_rebound_call(line))
+        .flatten();
+        if let Some(stmt) = grab_rebound {
+            stmts.push(stmt);
+            continue;
+        }
         if let Some(stmt) = parse_hurtbox_call(line) {
             stmts.push(stmt);
             continue;
+        }
+        if line.contains("ItemModule::set_have_item_visibility(") {
+            if let Some(stmt) = parse_item_visibility_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        // An item-fire action is admitted only as a direct root Game Execute statement.
+        if domain == ParseDomain::Game
+            && closed_root_statement_heads.contains(&start_line)
+            && line.contains("macros::SHOOT_ITEM_BULLET(")
+        {
+            if let Some(stmt) = parse_shoot_item_bullet_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        // This pinned no-payload macro is source-only and admitted only on a direct statement
+        // in an unattributed root Game or Expression Execute block. It is not a color value or
+        // a general permission for other macros in either track.
+        if matches!(domain, ParseDomain::Game | ParseDomain::Expression)
+            && closed_root_statement_heads.contains(&start_line)
+            && line.contains("macros::START_INFO_FLASH_EYE(")
+        {
+            if let Some(stmt) = parse_start_info_flash_eye_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        // FT_START_CUTIN has no payload and is source-only at a direct root Game Execute site.
+        if domain == ParseDomain::Game
+            && closed_root_statement_heads.contains(&start_line)
+            && line.contains("macros::FT_START_CUTIN(")
+        {
+            if let Some(stmt) = parse_start_cut_in_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        // Camera zoom-out is admitted only as a direct, unattributed root Game Execute call.
+        if domain == ParseDomain::Game
+            && closed_root_statement_heads.contains(&start_line)
+            && line.contains("macros::CAM_ZOOM_OUT(")
+        {
+            if let Some(stmt) = parse_camera_zoom_out_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("JostleModule::set_status(") {
+            if let Some(stmt) = parse_jostle_set_status_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game
+            && line.contains("FighterAreaModuleImpl::enable_fix_jostle_area")
+        {
+            if let Some(stmt) = parse_fixed_jostle_area_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("VisibilityModule::set_int64(") {
+            if let Some(stmt @ ExcuteStmt::VisibilitySetInt64 { .. }) =
+                parse_visibility_set_int64_call(line).filter(|command| match command {
+                    ExcuteStmt::VisibilitySetInt64 { group, status } => {
+                        crate::data::body_visibility_catalog::is_legacy_pair(group, status)
+                            || visibility_heads.contains(&start_line)
+                    }
+                    _ => false,
+                })
+            {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("VisibilityModule::set_whole(")
+            && closed_root_statement_heads.contains(&start_line)
+        {
+            if let Some(stmt) = parse_visibility_set_whole_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("VisibilityModule::set_default_int64(")
+            && closed_root_statement_heads.contains(&start_line)
+        {
+            if let Some(stmt) = parse_visibility_set_default_int64_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("ArticleModule::generate_article_enable(")
+            && closed_root_statement_heads.contains(&start_line)
+        {
+            if let Some(stmt) = parse_enabled_article_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if matches!(domain, ParseDomain::Game | ParseDomain::Expression)
+            && closed_root_statement_heads.contains(&start_line)
+        {
+            if let Some(stmt) = parse_article_status_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if line.contains("ArticleModule::generate_article(")
+            || line.contains("ArticleModule::remove_exist(")
+        {
+            if let Some(stmt) = parse_article_lifecycle_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        if domain == ParseDomain::Game && article_partial_motion_heads.contains(&start_line) {
+            if let Some(preset) = crate::data::ArticlePartialMotionPreset::from_source_line(line) {
+                stmts.push(ExcuteStmt::ArticleLifecycle(
+                    crate::data::ArticleLifecycleCall::AddMotionPartial { preset },
+                ));
+                continue;
+            }
+        }
+        let article_motion_allowed = match domain {
+            ParseDomain::Game => native_attack_all_allowed,
+            ParseDomain::Expression => closed_root_statement_heads.contains(&start_line),
+            ParseDomain::Sound => false,
+        };
+        if article_motion_allowed && line.contains("ArticleModule::change_motion(") {
+            if let Some(stmt) = parse_article_change_motion_call(line, domain) {
+                stmts.push(stmt);
+                continue;
+            }
+        }
+        let article_native_allowed = match domain {
+            ParseDomain::Game => native_attack_all_allowed,
+            ParseDomain::Expression => true,
+            ParseDomain::Sound => false,
+        };
+        if article_native_allowed
+            && (line.contains("ArticleModule::set_visibility_whole(")
+                || line.contains("ArticleModule::shoot(")
+                || line.contains("ArticleModule::shoot_exist("))
+        {
+            if let Some(stmt) = parse_article_native_call(line) {
+                let expression_shoot = domain == ParseDomain::Expression
+                    && matches!(
+                        &stmt,
+                        ExcuteStmt::ArticleLifecycle(
+                            crate::data::ArticleLifecycleCall::Shoot { .. }
+                        )
+                    );
+                if !expression_shoot {
+                    stmts.push(stmt);
+                    continue;
+                }
+            }
+        }
+        if let Some(stmt) = named_event_calls.get(&start_line) {
+            stmts.push(stmt.clone());
+            continue;
+        }
+        if line.contains("slope!(") {
+            if let Some(stmt) = parse_slope_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
         }
         if let Some(stmt) = parse_damage_no_reaction_call(line) {
             stmts.push(stmt);
             continue;
         }
-        if let Some(stmt) = parse_attack_mod_call(line) {
-            stmts.push(stmt);
-            continue;
+        if !line.starts_with("ATK_SET_SHIELD_SETOFF_MUL2(")
+            || native_call_heads.contains(&start_line)
+        {
+            if let Some(stmt) = parse_attack_mod_call(line) {
+                stmts.push(stmt);
+                continue;
+            }
         }
         if let Some(stmt) = parse_set_speed_ex_call(line) {
             stmts.push(stmt);
@@ -698,6 +1898,10 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
             stmts.push(stmt);
             continue;
         }
+        if let Some(stmt) = parse_slow_module_whole_call(line) {
+            stmts.push(stmt);
+            continue;
+        }
         if let Some(stmt) = parse_correct_call(line) {
             stmts.push(stmt);
             continue;
@@ -724,30 +1928,172 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
             stmts.push(ExcuteStmt::ClearAll);
             continue;
         }
+        if native_call_heads.contains(&start_line) {
+            if let Some(call) = crate::move_nodes::native_calls::parse(line)
+                .or_else(|| crate::move_nodes::native_calls::parse_source_line(line))
+            {
+                stmts.push(ExcuteStmt::NativeCall(call));
+                continue;
+            }
+        }
         stmts.push(ExcuteStmt::Raw(line.to_string()));
     }
     stmts
 }
 
 /// Find the line index of the closing `}` that matches the opening `{` on `lines[start]`.
-/// Returns (closing_line_index, depth_at_end).
-fn find_block_end(lines: &[&str], start: usize) -> (usize, i32) {
-    let mut depth = 0i32;
-    for (i, line) in lines[start..].iter().enumerate() {
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return (start + i, 0);
-                    }
-                }
-                _ => {}
-            }
+/// Comments and Rust literals do not affect depth. Returns (closing_line_index, depth_at_end).
+pub(crate) fn find_block_end(lines: &[&str], start: usize) -> (usize, i32) {
+    find_lexical_block_end(lines, start, 0)
+}
+
+/// Return the body range only when its opening brace has a matching close and the close does
+/// not precede the first body line. A truncated corpus fragment is kept as raw source by each
+/// parser instead of being sliced, recursively interpreted, or given a synthetic closing brace.
+fn complete_block_body(lines: &[&str], opener: usize, body_start: usize) -> Option<(usize, usize)> {
+    if opener >= lines.len() || body_start > lines.len() {
+        return None;
+    }
+    let (body_end, depth_at_end) = find_block_end(lines, opener);
+    (depth_at_end == 0 && body_end < lines.len() && body_end >= body_start)
+        .then_some((body_start, body_end))
+}
+
+fn raw_block_tail(lines: &[&str], start: usize) -> String {
+    lines.get(start..).unwrap_or_default().join("\n")
+}
+
+fn complete_combined_else_body(
+    lines: &[&str],
+    combined_line: usize,
+    body_start: usize,
+) -> Option<usize> {
+    if combined_line >= lines.len() || body_start > lines.len() {
+        return None;
+    }
+    let (body_end, depth_at_end) = find_else_block_end(lines, combined_line);
+    (depth_at_end == 0 && body_end < lines.len() && body_end >= body_start).then_some(body_end)
+}
+
+fn find_lexical_block_end(lines: &[&str], start: usize, mut depth: i32) -> (usize, i32) {
+    let source = lines[start..].join("\n");
+    let bytes = source.as_bytes();
+    let mut line_index = start;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if let Some(next) = crate::acmd_src::skip_rust_literal_or_comment(&source, cursor) {
+            line_index += bytes[cursor..next]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = next;
+            continue;
         }
+        match bytes[cursor] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (line_index, 0);
+                }
+            }
+            b'\n' => line_index += 1,
+            _ => {}
+        }
+        cursor += 1;
     }
     (lines.len().saturating_sub(1), depth)
+}
+
+/// Return the closing brace for one of the exact movement-helper definitions emitted above.
+///
+/// The generated `#[inline]` and `#[allow(dead_code)]` attributes precede the function header,
+/// so testing only the header leaves two `Raw` statements in the imported script. We consume
+/// those attributes only when they are immediately followed by a recognized helper whose full
+/// body matches our emitter. This keeps unrelated attributes and user-written opaque code in
+/// the ACMD function instead of broadly discarding anything near a helper-like name.
+fn generated_movement_helper_end(lines: &[&str], start: usize) -> Option<usize> {
+    let mut signature_index = start;
+    if lines.get(start)?.trim() == "#[inline]" {
+        if lines.get(start + 1)?.trim() != "#[allow(dead_code)]" {
+            return None;
+        }
+        signature_index += 2;
+    }
+
+    let signature = lines.get(signature_index)?.trim();
+    let expected_body: &[&str] = if signature
+        == "unsafe fn visionary_set_speed(agent: &mut L2CAgentBase, speed_x: f32, speed_y: f32) {"
+    {
+        &[
+            "agent.clear_lua_stack();",
+            "lua_args!(agent, speed_x, speed_y);",
+            "smash::app::sv_animcmd::SET_SPEED(agent.lua_state_agent);",
+            "agent.clear_lua_stack();",
+        ]
+    } else if signature
+        == "unsafe fn visionary_clr_speed(agent: &mut L2CAgentBase, kinetic_kind: i32) {"
+    {
+        &[
+            "agent.clear_lua_stack();",
+            "lua_args!(agent, kinetic_kind);",
+            "smash::app::sv_kinetic_energy::clear_speed(agent.lua_state_agent);",
+            "agent.clear_lua_stack();",
+        ]
+    } else if signature == "unsafe fn visionary_set_air(agent: &mut L2CAgentBase) {" {
+        &[
+            "agent.clear_lua_stack();",
+            "smash::app::sv_animcmd::SET_AIR(agent.lua_state_agent);",
+            "agent.clear_lua_stack();",
+        ]
+    } else {
+        return None;
+    };
+
+    let (body_end, depth_at_end) = find_block_end(lines, signature_index);
+    if depth_at_end != 0 || body_end <= signature_index {
+        return None;
+    }
+    let body = lines[signature_index + 1..body_end]
+        .iter()
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
+    (body.as_slice() == expected_body).then_some(body_end)
+}
+
+/// Return the end of an exact generated effect helper definition, including its attributes.
+fn generated_effect_helper_end(lines: &[&str], start: usize) -> Option<usize> {
+    let mut signature_index = start;
+    if lines.get(start)?.trim() == "#[inline]" {
+        if lines.get(start + 1)?.trim() != "#[allow(dead_code)]" {
+            return None;
+        }
+        signature_index += 2;
+    }
+    let signature = lines.get(signature_index)?.trim();
+    let expected = match signature {
+        "unsafe fn visionary_last_effect_set_work_int(agent: &mut L2CAgentBase, work: i32) {" => {
+            emit_last_effect_set_work_int_helper("")
+        }
+        "unsafe fn visionary_last_effect_set_scale_w(agent: &mut L2CAgentBase, values: &[f32]) {" => {
+            emit_last_effect_set_scale_w_helper("")
+        }
+        _ => return None,
+    };
+    let (body_end, depth_at_end) = find_block_end(lines, signature_index);
+    if depth_at_end != 0 || body_end <= signature_index {
+        return None;
+    }
+    let actual = lines[start..=body_end]
+        .iter()
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .skip(2usize.saturating_sub(signature_index - start))
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
+    (actual == expected).then_some(body_end)
 }
 
 /// Return the branch opener after a closing brace on the same physical line.
@@ -762,22 +2108,7 @@ fn combined_else_header(line: &str) -> Option<String> {
 
 /// Find the closing brace for an `else` whose opening `{` shares a line with the prior `}`.
 fn find_else_block_end(lines: &[&str], combined_line: usize) -> (usize, i32) {
-    let mut depth = 1i32;
-    for (i, line) in lines.iter().enumerate().skip(combined_line + 1) {
-        for ch in line.chars() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return (i, 0);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    (lines.len().saturating_sub(1), depth)
+    find_lexical_block_end(lines, combined_line + 1, 1)
 }
 
 /// Return the source line at `start`, joined with following lines while its parentheses are
@@ -802,16 +2133,88 @@ fn logical_line_at(lines: &[&str], start: usize) -> (String, usize) {
     (logical, consumed)
 }
 
-/// Join every parenthesized continuation in a block, preserving statement order.
-fn logical_lines(lines: &[&str]) -> Vec<String> {
+/// Original physical line indices keep context checks separate from joined call text.
+fn logical_lines_with_origins(lines: &[&str]) -> Vec<(usize, String)> {
     let mut result = Vec::new();
     let mut pos = 0;
     while pos < lines.len() {
         let (line, consumed) = logical_line_at(lines, pos);
-        result.push(line);
+        result.push((pos, line));
         pos += consumed;
     }
     result
+}
+
+/// Join every parenthesized continuation in a block, preserving statement order.
+/// Only independently parsed, unattributed root statements can introduce the new native
+/// commands. Strings, comments, nested bodies and malformed syntax never become command
+/// context merely because their physical lines resemble a call or contain closing braces.
+// Normalize only SDK-reviewed screen-fill statements for syntax classification.
+// The original source lines remain available to every preservation pass.
+fn native_statement_syntax(lines: &[&str]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            if line
+                .trim_start()
+                .starts_with("macros::FILL_SCREEN_MODEL_COLOR(")
+            {
+                if let Some(call) = crate::move_nodes::native_calls::parse(line) {
+                    return call.source();
+                }
+            }
+            (*line).to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn direct_native_statement_lines(lines: &[&str]) -> std::collections::BTreeSet<usize> {
+    use syn::spanned::Spanned;
+    let Ok(block) =
+        syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", native_statement_syntax(lines)))
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| {
+            let eligible = match statement {
+                syn::Stmt::Local(local) => local.attrs.is_empty(),
+                syn::Stmt::Expr(syn::Expr::Call(call), _) => call.attrs.is_empty(),
+                syn::Stmt::Macro(call) => call.attrs.is_empty(),
+                _ => false,
+            };
+            // The synthetic opening brace occupies line1; body line0 begins on line2.
+            if eligible {
+                statement.span().start().line.checked_sub(2)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn unattributed_source_branch_lines(
+    lines: &[&str],
+) -> std::collections::BTreeSet<usize> {
+    use syn::spanned::Spanned;
+    let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", lines.join("\n"))) else {
+        return std::collections::BTreeSet::new();
+    };
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| {
+            if let syn::Stmt::Expr(syn::Expr::If(branch), _) = statement {
+                if branch.attrs.is_empty() {
+                    return branch.span().start().line.checked_sub(2);
+                }
+            }
+            None
+        })
+        .collect()
 }
 
 /// Count parentheses that participate in Rust syntax, ignoring strings and comments.
@@ -957,44 +2360,59 @@ fn holds_acmd_function(source: &str) -> bool {
 
 /// Extract one category's function body from a source that may hold all four.
 pub(crate) fn extract_function(source: &str, prefix: &str) -> Option<String> {
-    let mut result = String::new();
-    let mut in_fn = false;
-    let mut depth: i32 = 0;
-    let mut found = false;
-
-    for line in source.lines() {
-        if !in_fn && is_function_header(line.trim(), prefix) {
-            in_fn = true;
-            found = true;
-        }
-        if in_fn {
-            result.push_str(line);
-            result.push('\n');
-            for ch in line.chars() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                    }
-                    _ => {}
-                }
-            }
-            if depth == 0 {
-                break;
-            }
-        }
-    }
-    if found {
-        Some(result)
-    } else {
-        None
-    }
+    let lines = source.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| is_function_header(line.trim(), prefix))?;
+    let (end, _) = find_block_end(&lines, start);
+    Some(format!("{}\n", lines[start..=end].join("\n")))
 }
 
 /// Parse the contents of an is_excute block from an effect_ script.
-fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
+fn parse_work_follow_number(token: &str) -> Option<f32> {
+    let token = token.trim();
+    let digits = token
+        .strip_prefix('-')
+        .or_else(|| token.strip_prefix('+'))
+        .unwrap_or(token);
+    if digits.is_empty()
+        || !digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        || digits.bytes().filter(|byte| *byte == b'.').count() > 1
+        || !digits.bytes().any(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let value = token.parse::<f32>().ok()?;
+    (value.is_finite() && value.abs() <= 10_000.0).then_some(value)
+}
+
+fn parse_excute_block_effects(lines: &[&str], allow_native_controls: bool) -> Vec<EffectMacro> {
     let mut macros = Vec::new();
-    for logical_line in logical_lines(lines) {
+    let has_native_effect_control = lines.iter().any(|line| {
+        line.contains("EffectModule::set_disable_render_offset_last(")
+            || line.contains("EffectModule::enable_sync_init_pos_last(")
+            || line.contains("EffectModule::req_screen(")
+            || line.contains("ColorBlendModule::set_disable_camera_depth_influence(")
+            || line.contains("macros::EFFECT_OFF_KIND_WORK(")
+            || line.contains("macros::EFFECT_FOLLOW_WORK(")
+    });
+    let native_heads = if allow_native_controls && has_native_effect_control {
+        direct_native_statement_lines(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let native_call_heads = if allow_native_controls
+        && lines
+            .iter()
+            .any(|line| crate::move_nodes::native_calls::contains_supported_call(line))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        Default::default()
+    };
+    for (start_line, logical_line) in logical_lines_with_origins(lines) {
         let line = logical_line.as_str();
         let line = line.trim();
         if line.is_empty() {
@@ -1010,6 +2428,83 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             Some(tokenize_args(&after[..end]))
         };
 
+        // Native controls have per-family closed argument contracts below. The two-argument
+        // sync spelling in some dumps is intentionally not typed; the pinned binding accepts
+        // only the one-argument form. Extra arguments, wrappers, alternate receivers, and
+        // attributed/nested statements remain Raw. Bare calls are not routed here by the outer
+        // parser and remain bare.
+        if native_heads.contains(&start_line)
+            && lines
+                .get(start_line)
+                .is_some_and(|source_line| source_line.trim() == line)
+        {
+            let native_args = |name: &str| -> Option<Vec<String>> {
+                let prefix = format!("EffectModule::{name}(");
+                let args = line.strip_prefix(&prefix)?.strip_suffix(");")?;
+                Some(tokenize_args(args))
+            };
+            if let Some(args) = native_args("set_disable_render_offset_last") {
+                if line == "EffectModule::set_disable_render_offset_last(agent.module_accessor);"
+                    && args.len() == 1
+                    && args[0] == "agent.module_accessor"
+                {
+                    macros.push(EffectMacro::Control(
+                        crate::data::EffectControl::SetDisableRenderOffsetLast,
+                    ));
+                    continue;
+                }
+            }
+            if let Some(args) = native_args("enable_sync_init_pos_last") {
+                if line == "EffectModule::enable_sync_init_pos_last(agent.module_accessor);"
+                    && args.len() == 1
+                    && args[0] == "agent.module_accessor"
+                {
+                    macros.push(EffectMacro::Control(
+                        crate::data::EffectControl::EnableSyncInitPosLast,
+                    ));
+                    continue;
+                }
+            }
+            if let Some(args) = native_args("req_screen") {
+                if args.len() == 5 && args[0] == "agent.module_accessor" {
+                    let name = extract_hash40_string(&args[1]);
+                    let flags = [args[2] == "true", args[3] == "true", args[4] == "true"];
+                    let bools_are_literal = args[2..]
+                        .iter()
+                        .all(|flag| flag == "true" || flag == "false");
+                    if bools_are_literal {
+                        if let Some(preset) = name.as_deref().and_then(|name| {
+                            crate::data::EffectReqScreenPreset::from_source_parts(name, flags)
+                        }) {
+                            macros.push(EffectMacro::Control(
+                                crate::data::EffectControl::ReqScreen {
+                                    preset_id: preset.id.to_string(),
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let Some(args) = line
+                .strip_prefix("ColorBlendModule::set_disable_camera_depth_influence(")
+                .and_then(|args| args.strip_suffix(");"))
+                .map(tokenize_args)
+            {
+                if args.len() == 2
+                    && args[0] == "agent.module_accessor"
+                    && (args[1] == "true" || args[1] == "false")
+                {
+                    macros.push(EffectMacro::Control(
+                        crate::data::EffectControl::SetDisableCameraDepthInfluence {
+                            value: args[1] == "true",
+                        },
+                    ));
+                    continue;
+                }
+            }
+        }
+
         // All of these spawn families begin with the same editable payload: agent,
         // graphic[, flipped graphic], joint, position xyz, rotation xyz, scale. Their
         // remaining alpha/attribute/random/contact arguments do not alter the timeline
@@ -1019,12 +2514,12 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             if let Some(t) = try_extract(&prefix) {
                 let off = usize::from(flip);
                 if t.len() > 9 + off {
-                    let effect_name =
-                        extract_hash40_string(&t[1]).unwrap_or_else(|| t[1].trim().to_string());
+                    let effect_name = extract_effect_hash40_name(&t[1])
+                        .unwrap_or_else(|| t[1].trim().to_string());
                     let effect_name_alt = flip.then(|| {
-                        extract_hash40_string(&t[2]).unwrap_or_else(|| t[2].trim().to_string())
+                        extract_effect_hash40_name(&t[2]).unwrap_or_else(|| t[2].trim().to_string())
                     });
-                    let bone_name = extract_hash40_string(&t[2 + off])
+                    let bone_name = extract_effect_hash40_name(&t[2 + off])
                         .unwrap_or_else(|| t[2 + off].trim().to_string());
                     let num = |i: usize, default: f32| {
                         t.get(i)
@@ -1064,8 +2559,8 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             if let Some(t) = try_extract("macros::EFFECT_DETACH_KIND(") {
                 if t.len() == 3 {
                     if let Ok(unk) = t[2].trim().parse::<i64>() {
-                        let effect_name =
-                            extract_hash40_string(&t[1]).unwrap_or_else(|| t[1].trim().to_string());
+                        let effect_name = extract_effect_hash40_name(&t[1])
+                            .unwrap_or_else(|| t[1].trim().to_string());
                         macros.push(EffectMacro::Control(
                             crate::data::EffectControl::DetachKind { effect_name, unk },
                         ));
@@ -1086,6 +2581,90 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
                             },
                         ));
                         continue;
+                    }
+                }
+            }
+        }
+
+        // Unlike the general Work-control family, off-kind admission is closed to exact
+        // owner/slot/flag tuples observed in native fighter sources. Keep malformed spellings
+        // and expressions as Raw so no values are guessed or normalized.
+        if native_heads.contains(&start_line)
+            && lines
+                .get(start_line)
+                .is_some_and(|source_line| source_line.trim() == line)
+        {
+            if let Some(args) = line
+                .strip_prefix("macros::EFFECT_FOLLOW_WORK(")
+                .and_then(|args| args.strip_suffix(");"))
+                .map(tokenize_args)
+            {
+                if args.len() == 11 && args[0] == "agent" {
+                    let symbol = args[1].strip_prefix('*').unwrap_or("");
+                    let bone = extract_hash40_string(&args[2]);
+                    let nums = args[3..10]
+                        .iter()
+                        .map(|token| parse_work_follow_number(token))
+                        .collect::<Option<Vec<_>>>();
+                    let literal_bool = matches!(args[10].as_str(), "true" | "false");
+                    if args[1] == format!("*{symbol}")
+                        && crate::data::EffectFollowWorkPreset::by_work_symbol(symbol).is_some()
+                        && bone.as_ref().is_some_and(|bone| {
+                            !bone.is_empty()
+                                && bone.len() <= 128
+                                && bone
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        })
+                        && nums.as_ref().is_some_and(|values| {
+                            values.iter().all(|value| value.abs() <= 10_000.0)
+                        })
+                        && literal_bool
+                    {
+                        let values = nums.unwrap();
+                        macros.push(EffectMacro::EffectFollowWork {
+                            work_symbol: symbol.to_owned(),
+                            bone_name: bone.unwrap(),
+                            offset: [values[0], values[1], values[2]],
+                            rotation: [values[5], values[4], values[3]],
+                            scale: values[6],
+                            unk8: args[10] == "true",
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(args) = line
+                .strip_prefix("macros::EFFECT_OFF_KIND_WORK(")
+                .and_then(|args| args.strip_suffix(");"))
+                .map(tokenize_args)
+            {
+                if args.len() == 4 && args[0] == "agent" {
+                    let symbol = args[1].strip_prefix('*').unwrap_or("");
+                    let flags_are_literal = args[2..]
+                        .iter()
+                        .all(|flag| flag == "true" || flag == "false");
+                    if !symbol.is_empty() && flags_are_literal {
+                        let flags = [args[2] == "true", args[3] == "true"];
+                        if let Some(preset) = crate::data::EffectOffKindWorkPreset::all()
+                            .iter()
+                            .find(|preset| preset.work_symbol == symbol)
+                            .and_then(|preset| {
+                                crate::data::EffectOffKindWorkPreset::from_source_parts(
+                                    preset.fighter,
+                                    symbol,
+                                    flags,
+                                )
+                            })
+                        {
+                            macros.push(EffectMacro::Control(
+                                crate::data::EffectControl::OffKindWork {
+                                    preset_id: preset.id.to_string(),
+                                },
+                            ));
+                            continue;
+                        }
                     }
                 }
             }
@@ -1119,8 +2698,8 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
         if line.contains("macros::EFFECT_OFF_KIND(") {
             if let Some(t) = try_extract("macros::EFFECT_OFF_KIND(") {
                 if t.len() > 1 {
-                    let effect_name =
-                        extract_hash40_string(&t[1]).unwrap_or_else(|| t[1].trim().to_string());
+                    let effect_name = extract_effect_hash40_name(&t[1])
+                        .unwrap_or_else(|| t[1].trim().to_string());
                     // Modelled only when BOTH booleans are literals. Reading one and defaulting
                     // the other would write a call the script does not contain while looking
                     // like it preserved the author's value; a call that is not modelled falls
@@ -1151,7 +2730,7 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             };
             if let Some(t) = try_extract(prefix) {
                 let read = |i: usize| {
-                    extract_hash40_string(t.get(i).map(|s| s.as_str()).unwrap_or(""))
+                    extract_effect_hash40_name(t.get(i).map(|s| s.as_str()).unwrap_or(""))
                         .unwrap_or_else(|| {
                             t.get(i).map(|s| s.trim().to_string()).unwrap_or_default()
                         })
@@ -1200,7 +2779,8 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             let slot = |i: usize| {
                 site.arg(line, i)
                     .map(|value| {
-                        extract_hash40_string(value).unwrap_or_else(|| value.trim().to_string())
+                        extract_effect_hash40_name(value)
+                            .unwrap_or_else(|| value.trim().to_string())
                     })
                     .unwrap_or_default()
             };
@@ -1390,6 +2970,14 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
             }
         }
 
+        if native_call_heads.contains(&start_line) {
+            if let Some(call) = crate::move_nodes::native_calls::parse(line)
+                .or_else(|| crate::move_nodes::native_calls::parse_source_line(line))
+            {
+                macros.push(EffectMacro::NativeCall(call));
+                continue;
+            }
+        }
         macros.push(EffectMacro::Raw(line.to_string()));
     }
     macros
@@ -1412,10 +3000,43 @@ fn color_macro_layout(line: &str) -> Option<(&'static str, bool, bool)> {
 ///
 /// Counted rather than tested with `ends_with('{')` because the dumps write costume checks as
 /// `if(0x2508e0(*FIGHTER_INSTANCE_WORK_ID_INT_COLOR, 3)){` — no space before the brace, and a
-/// closing paren in between. No effect line puts a brace inside a string literal, so counting
-/// characters is safe here.
+/// closing paren in between. Only lexical braces participate; comments and literals may contain
+/// arbitrary brace text without introducing a control-flow region.
+/// The source line every exported `wait_loop_clear` is written as: smash-script's macro, which
+/// clears the Lua stack, calls `sv_animcmd::wait_loop_clear` and pops its result.
+pub(crate) const WAIT_LOOP_CLEAR_SOURCE: &str = "macros::wait_loop_clear(agent);";
+
+/// The exact statement spellings of the native `wait_loop_clear`: the dump's macro and its
+/// argument-less decompiled form, HDR's imported macro, and the raw `sv_animcmd` call.
+fn is_wait_loop_clear_statement(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "macros::wait_loop_clear(agent);"
+            | "wait_loop_clear(agent);"
+            | "wait_loop_clear();"
+            | "wait_loop_clear(agent.lua_state_agent);"
+            | "sv_animcmd::wait_loop_clear(agent.lua_state_agent);"
+            | "smash::app::sv_animcmd::wait_loop_clear(agent.lua_state_agent);"
+    )
+}
+
 fn opens_block(line: &str) -> bool {
-    line.chars().filter(|c| *c == '{').count() > line.chars().filter(|c| *c == '}').count()
+    let bytes = line.as_bytes();
+    let mut cursor = 0;
+    let mut depth = 0i32;
+    while cursor < bytes.len() {
+        if let Some(next) = crate::acmd_src::skip_rust_literal_or_comment(line, cursor) {
+            cursor = next;
+            continue;
+        }
+        match bytes[cursor] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    depth > 0
 }
 
 /// Parse statements from an effect_ function body, producing `EffectStmt`.
@@ -1426,45 +3047,140 @@ fn opens_block(line: &str) -> bool {
 /// header is captured as an opaque [`EffectStmt::Cond`] header exactly like an `if` — no attempt
 /// is made to pair it with anything. Anything that tried would be reasoning about a structure
 /// the input does not actually have, and would be wrong on real fighters.
-fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize) {
+fn parse_effect_stmts(
+    lines: &[&str],
+    mut pos: usize,
+    at_function_root: bool,
+) -> (Vec<EffectStmt>, usize) {
     let mut stmts = Vec::new();
+    let mut generated_helper_prolog = at_function_root;
+    let native_motion_sync_heads =
+        if at_function_root && lines.iter().any(|line| line.contains("wait_loop_sync_mot")) {
+            native_timing_source_lines(lines, "wait_loop_sync_mot")
+        } else {
+            Default::default()
+        };
+    let native_execute_frame_heads =
+        if at_function_root && lines.iter().any(|line| line.contains("execute")) {
+            native_execute_frame_source_lines(lines)
+        } else {
+            std::collections::BTreeSet::new()
+        };
+    let clean_loop_heads = if lines
+        .iter()
+        .any(|line| line.trim_start().starts_with("for "))
+    {
+        unattributed_source_loop_heads(lines)
+    } else {
+        std::collections::BTreeSet::new()
+    };
 
+    let native_call_heads = if lines
+        .iter()
+        .any(|line| crate::move_nodes::native_calls::contains_supported_call(line))
+    {
+        direct_native_statement_lines(lines)
+    } else {
+        Default::default()
+    };
     while pos < lines.len() {
         let (logical_line, lines_consumed) = logical_line_at(lines, pos);
         let line = logical_line.trim();
 
-        if line.is_empty() || line == "}" {
+        if line.is_empty() {
             pos += 1;
             continue;
         }
 
-        if let Some(count) = parse_for_loop_header(line) {
-            let body_start = pos + lines_consumed;
-            let (body_lines_end, _) = find_block_end(lines, pos);
-            let body_slice = &lines[body_start..body_lines_end];
-            let (body, _) = parse_effect_stmts(body_slice, 0);
-            stmts.push(EffectStmt::Loop { count, body });
-            pos = body_lines_end + 1;
+        // Exported linked-primitive helpers form a small prolog immediately after the effect
+        // function header. Keep eligibility across blank lines and exact generated helpers so
+        // both helpers can be consumed, then close it permanently on any other source content.
+        // This keeps comments and even multiline attributes attached to user-written items.
+        if generated_helper_prolog {
+            if let Some(body_end) = generated_effect_helper_end(lines, pos) {
+                pos = body_end + 1;
+                continue;
+            }
+        }
+        generated_helper_prolog = false;
+
+        if line == "}" {
+            pos += 1;
             continue;
         }
 
-        // Generated effect exports may contain the linked-primitive helper immediately inside
-        // the function. It is emitter scaffolding, not a runtime ACMD branch, so skip its whole
-        // nested definition before the generic block parser can turn it into a conditional.
-        if (line.contains("fn visionary_last_effect_set_work_int(")
-            || line.contains("fn visionary_last_effect_set_scale_w("))
-            && line.ends_with('{')
-        {
-            let (body_end, _) = find_block_end(lines, pos);
-            pos = body_end + 1;
-            continue;
+        // `loop { ...; wait_loop_sync_mot }`, the effect side of the motion loops read in
+        // `parse_stmts_with_fear_face_guard`. Root only; the body is read as the root it replaces.
+        if line == "loop {" && at_function_root {
+            let body_start = pos + lines_consumed;
+            if let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) {
+                if let Some(body_lines) = sync_motion_loop_body(&lines[body_start..body_end]) {
+                    let (body, _) = parse_effect_stmts(body_lines, 0, true);
+                    if !body
+                        .iter()
+                        .any(|stmt| matches!(stmt, EffectStmt::NativeMotionLoopSync))
+                    {
+                        stmts.push(EffectStmt::Loop {
+                            count: 1,
+                            body,
+                            motion_loop: crate::data::MotionLoop::SyncMotion,
+                        });
+                        pos = body_end + 1;
+                        continue;
+                    }
+                }
+            }
         }
 
-        if line.contains("is_excute") {
+        if clean_loop_heads.contains(&pos) {
+            if let Some(count) = parse_for_loop_header(line) {
+                let body_start = pos + lines_consumed;
+                let Some((body_start, body_lines_end)) =
+                    complete_block_body(lines, pos, body_start)
+                else {
+                    stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
+                    pos = lines.len();
+                    break;
+                };
+                let body_slice = &lines[body_start..body_lines_end];
+                let (body, _) = parse_effect_stmts(body_slice, 0, false);
+                stmts.push(EffectStmt::Loop {
+                    motion_loop: crate::data::MotionLoop::No,
+                    count,
+                    body,
+                });
+                pos = body_lines_end + 1;
+                continue;
+            }
+        }
+
+        if is_plain_excute_header(line) {
             let body_start = pos + lines_consumed;
-            let (body_end, _) = find_block_end(lines, pos);
-            let effect_macros = parse_excute_block_effects(&lines[body_start..body_end]);
-            stmts.push(EffectStmt::Excute(effect_macros));
+            let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
+                stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
+                pos = lines.len();
+                break;
+            };
+            let effect_macros = parse_excute_block_effects(
+                &lines[body_start..body_end],
+                line.trim() == "if macros::is_excute(agent) {",
+            );
+            if is_plain_excute_header(line)
+                && separate_else_follows(lines, body_end)
+                && plain_command_body(&lines[body_start..body_end])
+                // Work-selected effects retain their existing transform-only mixed witness.
+                && !effect_macros.iter().any(|command| matches!(command, EffectMacro::EffectFollowWork { .. } | EffectMacro::Raw(_)))
+            {
+                stmts.push(EffectStmt::Cond {
+                    header: "if macros::is_excute(agent) {".into(),
+                    body: effect_macros
+                        .into_iter()
+                        .map(|command| EffectStmt::BareEffect(Box::new(command)))
+                        .collect(),
+                });
+            } else {
+                stmts.push(EffectStmt::Excute(effect_macros));
+            }
             pos = body_end + 1;
             continue;
         }
@@ -1477,13 +3193,67 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
         // dropped line and — worse — parsed the body as siblings of the conditional. Both arms
         // of an `if`/`else` then resolved as unconditional spawns at the same frame.
         if opens_block(line) {
-            let (body_end, _) = find_block_end(lines, pos);
-            let (body, _) = parse_effect_stmts(&lines[pos + lines_consumed..body_end], 0);
+            let body_start = pos + lines_consumed;
+            let Some((body_start, body_end)) = complete_block_body(lines, pos, body_start) else {
+                stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
+                pos = lines.len();
+                break;
+            };
+            let else_body_range = if let Some(else_header) = combined_else_header(lines[body_end]) {
+                let else_body_start = body_end + 1;
+                match complete_combined_else_body(lines, body_end, else_body_start) {
+                    Some(else_body_end) => Some((else_header, else_body_start, else_body_end)),
+                    None => {
+                        stmts.push(EffectStmt::Raw(raw_block_tail(lines, pos)));
+                        pos = lines.len();
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let (body, _) = parse_effect_stmts(&lines[body_start..body_end], 0, false);
             stmts.push(EffectStmt::Cond {
                 header: line.to_string(),
                 body,
             });
-            pos = body_end + 1;
+            if let Some((else_header, else_body_start, else_body_end)) = else_body_range {
+                let (else_body, _) =
+                    parse_effect_stmts(&lines[else_body_start..else_body_end], 0, false);
+                stmts.push(EffectStmt::Cond {
+                    header: else_header,
+                    body: else_body,
+                });
+                pos = else_body_end + 1;
+            } else {
+                pos = body_end + 1;
+            }
+            continue;
+        }
+
+        if native_motion_sync_heads.contains(&pos) {
+            if parse_native_motion_loop_sync_call(line) {
+                stmts.push(EffectStmt::NativeMotionLoopSync);
+            } else {
+                stmts.push(EffectStmt::Raw(line.to_owned()));
+            }
+            pos += lines_consumed;
+            continue;
+        }
+
+        if native_execute_frame_heads.contains(&pos) {
+            if let Some(frame) = parse_native_execute_frame_call(line) {
+                stmts.push(EffectStmt::NativeExecuteFrame(frame));
+            } else {
+                stmts.push(EffectStmt::Raw(line.to_owned()));
+            }
+            pos += lines_consumed;
+            continue;
+        }
+
+        if line.contains("wait_loop_sync_mot") && !opens_block(line) {
+            stmts.push(EffectStmt::Raw(line.to_owned()));
+            pos += lines_consumed;
             continue;
         }
 
@@ -1533,7 +3303,7 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
             || line.contains("macros::UNABLE_AREA(")
             || color_macro_layout(line).is_some();
         if is_effect_macro {
-            let effect_macros = parse_excute_block_effects(&[line]);
+            let effect_macros = parse_excute_block_effects(&[line], false);
             if !effect_macros.is_empty() {
                 stmts.push(EffectStmt::Excute(effect_macros));
             }
@@ -1541,6 +3311,15 @@ fn parse_effect_stmts(lines: &[&str], mut pos: usize) -> (Vec<EffectStmt>, usize
             continue;
         }
 
+        if native_call_heads.contains(&pos) {
+            if let Some(call) = crate::move_nodes::native_calls::parse(line)
+                .or_else(|| crate::move_nodes::native_calls::parse_source_line(line))
+            {
+                stmts.push(EffectStmt::BareNativeCall(call));
+                pos += lines_consumed;
+                continue;
+            }
+        }
         if !line.is_empty() {
             stmts.push(EffectStmt::Raw(line.to_string()));
         }
@@ -1837,6 +3616,26 @@ pub fn effect_flip_axis_tail_index(name: &str) -> Option<usize> {
     })?
 }
 
+/// Closed native integer choices for one spawn layout. Attribute bits are not flip axes.
+pub fn effect_spawn_integer_tail_tokens(name: &str) -> &'static [&'static str] {
+    if name == "EFFECT_ATTR" {
+        &["0", "*EFFECT_SUB_ATTRIBUTE_NO_JOINT_SCALE"]
+    } else if effect_spawn_layout(name).is_some_and(|layout| layout.flip) {
+        &[
+            "0",
+            "*EF_FLIP_NONE",
+            "*EF_FLIP_XY",
+            "*EF_FLIP_YZ",
+            "*EF_FLIP_ZX",
+            "*EF_FLIP_AXIS_XY",
+            "*EF_FLIP_AXIS_YZ",
+            "*EF_FLIP_AXIS_ZX",
+        ]
+    } else {
+        &[]
+    }
+}
+
 /// Dumped effect spawn macros that share the common graphic/joint/transform prefix.
 /// Returns `(macro name, has second flipped graphic, follows bone)`.
 fn effect_spawn_macro_layout(line: &str) -> Option<(&'static str, bool, bool)> {
@@ -1844,6 +3643,112 @@ fn effect_spawn_macro_layout(line: &str) -> Option<(&'static str, bool, bool)> {
         .iter()
         .find(|layout| line.contains(&format!("macros::{}(", layout.name)))
         .map(|layout| (layout.name, layout.flip, layout.follows_bone))
+}
+
+// Independent literal shapes from the pinned fighter dump, not generated from the layout table.
+// These cross-fighter assets belong only to the synthetic source/build fixture, never gameplay.
+#[cfg(test)]
+pub(crate) const EFFECT_COMPATIBILITY_CORPUS_FIXTURE: &str = r#"
+unsafe extern "C" fn effect_compatibility(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW_FLIP_COLOR(agent, Hash40::new("sys_spin_wind"), Hash40::new("sys_spin_wind"), Hash40::new("rot"), 0, -3, 0, 180, -90, 0, 1.6, true, *EF_FLIP_YZ, 1, 1, 1);
+        macros::EFFECT_FOLLOW_FLIP_RND(agent, Hash40::new("sys_spin_wind"), Hash40::new("sys_spin_wind"), Hash40::new("rot"), 0, -8, -1.5, 0, 0, 0, 0.4, 1, 1, 1, 0, 90, 0, true, *EF_FLIP_YZ);
+        macros::EFFECT_FOLLOW_NO_SCALE(agent, Hash40::new("sys_catch"), Hash40::new("throw"), 0, 0, 0, 0, 0, 0, 1, true);
+        macros::EFFECT_FOLLOW_COLOR(agent, Hash40::new("sys_spin_wind"), Hash40::new("top"), -1.5, 18.5, 1.5, -20, 180, 20, 0.7, true, 0.3, 0.6, 0.2);
+        macros::EFFECT_FLW_POS_UNSYNC_VIS(agent, Hash40::new("eflame_change_end"), Hash40::new("waist"), 0, 0, 0, 0, 0, 0, 1, true);
+        macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new("edge_attack_speedline"), Hash40::new("swordl2"), -15, 0, 1.5, 90, 0, 180, 0.9, true);
+        macros::FOOT_EFFECT_FLIP(agent, Hash40::new("sys_whirlwind_l"), Hash40::new("sys_whirlwind_r"), Hash40::new("top"), 1, 0, 0, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, false, *EF_FLIP_NONE);
+        macros::DOWN_EFFECT(agent, Hash40::new("sys_down_smoke"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+        macros::EFFECT_ATTR(agent, Hash40::new("ness_psi_rush"), Hash40::new("haver"), -0.5, 2.6, 2.9, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true, *EFFECT_SUB_ATTRIBUTE_NO_JOINT_SCALE);
+    }
+}
+"#;
+
+/// Supply measured wrappers missing from the pinned script library, including the
+/// no-payload item-fire command and signed position/no-stop transforms. Keep the
+/// native source spelling and forward the reviewed arguments through the Lua stack.
+/// Only actually used wrappers are emitted; all other script macros retain their library owner.
+fn effect_source_compatibility_macros(source: &str) -> String {
+    const COMPAT_NAMES: &[&str] = &[
+        "EFFECT_FOLLOW_FLIP_COLOR",
+        "EFFECT_FOLLOW_FLIP_RND",
+        "EFFECT_FOLLOW_NO_SCALE",
+        "EFFECT_FOLLOW_COLOR",
+        "EFFECT_FLW_POS_UNSYNC_VIS",
+        "EFFECT_FLW_POS_NO_STOP",
+        "FOOT_EFFECT_FLIP",
+        "DOWN_EFFECT",
+        "EFFECT_ATTR",
+    ];
+    let used = crate::acmd_src::scan_macro_sites(source, 0..source.len())
+        .into_iter()
+        .map(|site| site.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    let layouts = COMPAT_NAMES
+        .iter()
+        .filter(|name| used.contains(**name))
+        .filter_map(|name| effect_spawn_layout(name))
+        .collect::<Vec<_>>();
+    // The pinned script crate has no wrapper for this measured source spelling.
+    let shoot_item_bullet_used = used.contains("SHOOT_ITEM_BULLET");
+    let native_wrappers = crate::move_nodes::native_calls::compatibility_wrappers(&used);
+    if layouts.is_empty() && !shoot_item_bullet_used && native_wrappers.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from(
+        "#[allow(non_snake_case, unused_imports, dead_code, clippy::too_many_arguments)]\nmod macros {\n    pub use smash_script::macros::*;\n    use smash::lua2cpp::L2CAgentBase;\n    use smash::phx::Hash40;\n",
+    );
+    for layout in layouts {
+        let mut parameters = vec!["agent: &mut L2CAgentBase".to_owned()];
+        let mut values = Vec::new();
+        let mut generic_types = Vec::new();
+        for hash in if layout.flip {
+            &['g', 'a', 'b'][..]
+        } else {
+            &['g', 'b'][..]
+        } {
+            parameters.push(format!("{hash}: Hash40"));
+            values.push(hash.to_string());
+        }
+        for index in 0..7 {
+            parameters.push(format!("n{index}: N{index}"));
+            generic_types.push(format!("N{index}: ToF32"));
+            values.push(format!("n{index}.to_f32()"));
+        }
+        for (index, (_, kind)) in layout.tail.iter().enumerate() {
+            match kind {
+                EffectSpawnTailKind::Number => {
+                    parameters.push(format!("t{index}: T{index}"));
+                    generic_types.push(format!("T{index}: ToF32"));
+                    values.push(format!("t{index}.to_f32()"));
+                }
+                EffectSpawnTailKind::Bool => {
+                    parameters.push(format!("t{index}: bool"));
+                    values.push(format!("t{index}"));
+                }
+                EffectSpawnTailKind::Integer => {
+                    parameters.push(format!("t{index}: i32"));
+                    values.push(format!("t{index}"));
+                }
+            }
+        }
+        output.push_str(&format!(
+            "    #[inline]\n    pub unsafe fn {}<{}>({}) {{\n        agent.clear_lua_stack();\n        smash_script::lua_args!(agent, {});\n        smash::app::sv_animcmd::{}(agent.lua_state_agent);\n        agent.clear_lua_stack();\n    }}\n",
+            layout.name,
+            generic_types.join(", "),
+            parameters.join(", "),
+            values.join(", "),
+            layout.name,
+        ));
+    }
+    if shoot_item_bullet_used {
+        output.push_str(
+            "    #[inline]\n    pub unsafe fn SHOOT_ITEM_BULLET(agent: &mut L2CAgentBase) {\n        agent.clear_lua_stack();\n        smash::app::sv_animcmd::SHOOT_ITEM_BULLET(agent.lua_state_agent);\n        agent.clear_lua_stack();\n    }\n",
+        );
+    }
+    output.push_str(&native_wrappers);
+    output.push_str("}\n\n");
+    output
 }
 
 /// Parse an effect_ script source into an `EffectScript` IR.
@@ -1859,8 +3764,36 @@ pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
     } else {
         &lines[..]
     };
-    let (stmts, _) = parse_effect_stmts(body_lines, 0);
-    EffectScript { stmts }
+    if let Some(body) = combined_execute_else_body(effect_fn, body_lines) {
+        return EffectScript {
+            stmts: vec![EffectStmt::Raw(body)],
+        };
+    }
+    let (stmts, _) = parse_effect_stmts(body_lines, 0, true);
+    EffectScript {
+        stmts: recover_dumped_effect_motion_loop(stmts),
+    }
+}
+
+/// The body of a `loop` that ends with the motion-sync wait, without that wait: either the
+/// bare call or HDR's (and this exporter's) `clear_lua_stack` / call / `pop_lua_stack(1)`.
+fn sync_motion_loop_body<'a, 'b>(body: &'a [&'b str]) -> Option<&'a [&'b str]> {
+    let mut end = body.len();
+    while end > 0 && body[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let trimmed = |index: usize| body[index].trim();
+    if end >= 3
+        && trimmed(end - 1) == "agent.pop_lua_stack(1);"
+        && parse_native_motion_loop_sync_call(trimmed(end - 2))
+        && trimmed(end - 3) == "agent.clear_lua_stack();"
+    {
+        return Some(&body[..end - 3]);
+    }
+    if end >= 1 && parse_native_motion_loop_sync_call(trimmed(end - 1)) {
+        return Some(&body[..end - 1]);
+    }
+    None
 }
 
 /// Parse the `sound_` function's timeline, with every command left as `Raw`.
@@ -1878,7 +3811,6 @@ pub fn parse_effect_script(source: &str) -> crate::data::EffectScript {
 /// generated-source pane is not that consumer — it promises what an export would write, and an
 /// export does not write sound scripts yet. This remains an intentionally narrow staging parser
 /// until sound editing has its own complete surface contract.
-#[allow(dead_code)]
 pub fn parse_sound_script(source: &str) -> AcmdScript {
     let Some(sound_fn) = extract_function(source, "sound_") else {
         return AcmdScript::default();
@@ -1889,8 +3821,13 @@ pub fn parse_sound_script(source: &str) -> AcmdScript {
     } else {
         &lines[..]
     };
-    let (stmts, _) = parse_stmts(body_lines, 0);
-    AcmdScript { stmts }
+    if let Some(preserved) = preserve_combined_execute_else(&sound_fn, body_lines) {
+        return preserved;
+    }
+    let (stmts, _) = parse_stmts(body_lines, 0, ParseDomain::Sound, false);
+    AcmdScript {
+        stmts: recover_dumped_motion_loop(stmts),
+    }
 }
 
 /// Parse the `expression_` function's measured camera/rumble calls.
@@ -1904,36 +3841,260 @@ pub fn parse_expression_script(source: &str) -> AcmdScript {
     } else {
         &lines[..]
     };
-    let (stmts, _) = parse_stmts(body_lines, 0);
-    AcmdScript { stmts }
-}
-
-/// Re-emit a `sound_` function body at the corpus's own indentation.
-///
-/// The inverse of [`parse_sound_script`] up to the function header and closing brace, which the
-/// caller owns. Fidelity over the corpus is asserted by
-/// `every_sound_script_in_the_corpus_survives_a_round_trip`.
-#[allow(dead_code)]
-pub fn emit_sound_body(script: &AcmdScript) -> String {
-    emit_stmts(&script.stmts, "    ")
-        .into_iter()
-        .map(|line| format!("{line}\n"))
-        .collect()
+    if let Some(preserved) = preserve_combined_execute_else(&expression_fn, body_lines) {
+        return preserved;
+    }
+    let (stmts, _) = parse_stmts(body_lines, 0, ParseDomain::Expression, false);
+    AcmdScript {
+        stmts: recover_dumped_motion_loop(stmts),
+    }
 }
 
 fn parse_for_loop_header(line: &str) -> Option<usize> {
     let line = line.trim();
-    if !line.starts_with("for ") || !line.contains("in 0..") {
+    // Parse a complete, attribute-free, half-open `for _ in 0..N {` header by asking Syn to
+    // parse it as a statement. Requiring the final `{` before adding our sentinel close rejects
+    // comments/trailing tokens and prevents salvaging a numeric prefix from another expression.
+    if !line.ends_with('{') || line.contains("//") || line.contains("/*") || line.contains("*/") {
         return None;
     }
-    let range_start = line.find("in 0..")? + 6;
-    let rest = &line[range_start..];
-    let rest = rest.strip_prefix('=').unwrap_or(rest);
-    let num_end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    let count: usize = rest[..num_end].parse().ok()?;
-    Some(count.min(20))
+    let block = syn::parse_str::<syn::Block>(&format!("{{\n{line}\n}}\n}}")).ok()?;
+    let [syn::Stmt::Expr(syn::Expr::ForLoop(loop_expr), _)] = block.stmts.as_slice() else {
+        return None;
+    };
+    if !loop_expr.attrs.is_empty() || !matches!(loop_expr.pat.as_ref(), syn::Pat::Wild(_)) {
+        return None;
+    }
+    let syn::Expr::Range(range) = loop_expr.expr.as_ref() else {
+        return None;
+    };
+    if !matches!(&range.limits, syn::RangeLimits::HalfOpen(_)) {
+        return None;
+    }
+    let (start, end) = range.start.as_deref().zip(range.end.as_deref())?;
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(start),
+        ..
+    }) = start
+    else {
+        return None;
+    };
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(end),
+        ..
+    }) = end
+    else {
+        return None;
+    };
+    if !start.suffix().is_empty()
+        || !end.suffix().is_empty()
+        || start.to_string() != "0"
+        || !end.to_string().bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let count = end.base10_parse::<usize>().ok()?;
+    // Zero is a known no-op in the source IR, not an authorable Repeat node. Retaining its
+    // exact count lets preview/site walks skip execution while still advancing source ordinals.
+    (0..=100).contains(&count).then_some(count)
+}
+
+fn is_native_execute_frame_path(function: &syn::Expr) -> bool {
+    is_native_timing_path(function, "execute")
+}
+
+fn is_native_timing_path(function: &syn::Expr, name: &str) -> bool {
+    let syn::Expr::Path(function) = function else {
+        return false;
+    };
+    if !function.attrs.is_empty()
+        || function.qself.is_some()
+        || function.path.leading_colon.is_some()
+        || function
+            .path
+            .segments
+            .iter()
+            .any(|part| !matches!(part.arguments, syn::PathArguments::None))
+    {
+        return false;
+    }
+    let path = function
+        .path
+        .segments
+        .iter()
+        .map(|part| part.ident.to_string())
+        .collect::<Vec<_>>();
+    path == [name] || path == ["sv_animcmd", name] || path == ["smash", "app", "sv_animcmd", name]
+}
+
+#[cfg(test)]
+#[path = "acmd_native_execute_frame_tests.rs"]
+mod native_execute_frame_tests;
+
+#[cfg(test)]
+#[path = "acmd_native_motion_sync_tests.rs"]
+mod native_motion_sync_tests;
+
+#[cfg(test)]
+#[path = "acmd_wait_loop_clear_tests.rs"]
+mod wait_loop_clear_tests;
+
+fn native_execute_frame_source_lines(lines: &[&str]) -> std::collections::BTreeSet<usize> {
+    native_timing_source_lines(lines, "execute")
+}
+
+fn native_timing_source_lines(lines: &[&str], name: &str) -> std::collections::BTreeSet<usize> {
+    use syn::spanned::Spanned;
+    let Ok(block) = syn::parse_str::<syn::Block>(&format!("{{\n{}\n}}", lines.join("\n"))) else {
+        return Default::default();
+    };
+    // Bare SDK names and the agent receiver must retain their native meaning.
+    // Inspect only bindings in this scope: a nested helper's agent parameter
+    // does not shadow the calling ACMD agent.
+    if native_timing_has_shadowing(&block, name) {
+        return Default::default();
+    }
+    block
+        .stmts
+        .iter()
+        .filter_map(|statement| {
+            let syn::Stmt::Expr(syn::Expr::Call(call), _) = statement else {
+                return None;
+            };
+            is_native_timing_path(&call.func, name)
+                .then(|| statement.span().start().line.checked_sub(2))
+                .flatten()
+        })
+        .collect()
+}
+
+fn native_timing_has_shadowing(block: &syn::Block, native_name: &str) -> bool {
+    use syn::visit::Visit;
+    fn relevant(name: &syn::Ident, native_name: &str) -> bool {
+        let name = name.to_string();
+        name == native_name || matches!(name.as_str(), "agent" | "sv_animcmd" | "smash")
+    }
+    fn imports(tree: &syn::UseTree, native_name: &str) -> bool {
+        match tree {
+            syn::UseTree::Name(name) => relevant(&name.ident, native_name),
+            syn::UseTree::Rename(name) => relevant(&name.rename, native_name),
+            syn::UseTree::Path(path) => imports(&path.tree, native_name),
+            syn::UseTree::Group(group) => group.items.iter().any(|tree| imports(tree, native_name)),
+            syn::UseTree::Glob(_) => true,
+        }
+    }
+    struct Bindings<'name> {
+        found: bool,
+        native_name: &'name str,
+    }
+    impl<'ast> Visit<'ast> for Bindings<'_> {
+        fn visit_pat_ident(&mut self, binding: &'ast syn::PatIdent) {
+            self.found |= relevant(&binding.ident, self.native_name);
+            syn::visit::visit_pat_ident(self, binding);
+        }
+    }
+    block.stmts.iter().any(|statement| match statement {
+        syn::Stmt::Local(local) => {
+            let mut bindings = Bindings {
+                found: false,
+                native_name,
+            };
+            bindings.visit_pat(&local.pat);
+            bindings.found
+        }
+        syn::Stmt::Item(item) => match item {
+            syn::Item::Fn(item) => relevant(&item.sig.ident, native_name),
+            syn::Item::Mod(item) => relevant(&item.ident, native_name),
+            syn::Item::Const(item) => relevant(&item.ident, native_name),
+            syn::Item::Static(item) => relevant(&item.ident, native_name),
+            syn::Item::Struct(item) => relevant(&item.ident, native_name),
+            syn::Item::Enum(item) => relevant(&item.ident, native_name),
+            syn::Item::Union(item) => relevant(&item.ident, native_name),
+            syn::Item::Type(item) => relevant(&item.ident, native_name),
+            syn::Item::Trait(item) => relevant(&item.ident, native_name),
+            syn::Item::Use(item) => imports(&item.tree, native_name),
+            // Foreign blocks can introduce a local function with the native name.
+            syn::Item::ForeignMod(_) => true,
+            syn::Item::ExternCrate(item) => item.rename.as_ref().map_or_else(
+                || relevant(&item.ident, native_name),
+                |(_, name)| relevant(name, native_name),
+            ),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+fn parse_native_execute_frame_call(line: &str) -> Option<f32> {
+    let syn::Stmt::Expr(syn::Expr::Call(call), Some(_)) = syn::parse_str(line).ok()? else {
+        return None;
+    };
+    if !call.attrs.is_empty() || call.args.len() != 2 || !is_native_execute_frame_path(&call.func) {
+        return None;
+    }
+    let syn::Expr::Field(receiver) = &call.args[0] else {
+        return None;
+    };
+    let syn::Expr::Path(agent) = receiver.base.as_ref() else {
+        return None;
+    };
+    if !receiver.attrs.is_empty()
+        || !agent.attrs.is_empty()
+        || agent.qself.is_some()
+        || !agent.path.is_ident("agent")
+        || !matches!(&receiver.member, syn::Member::Named(name) if name == "lua_state_agent")
+    {
+        return None;
+    }
+    let (literal, negative) = match &call.args[1] {
+        syn::Expr::Unary(unary)
+            if unary.attrs.is_empty() && matches!(unary.op, syn::UnOp::Neg(_)) =>
+        {
+            (unary.expr.as_ref(), true)
+        }
+        other => (other, false),
+    };
+    let syn::Expr::Lit(syn::ExprLit {
+        attrs,
+        lit: syn::Lit::Float(value),
+    }) = literal
+    else {
+        return None;
+    };
+    if !attrs.is_empty() || !matches!(value.suffix(), "" | "f32") {
+        return None;
+    }
+    let frame = value.base10_parse::<f32>().ok()? * if negative { -1.0 } else { 1.0 };
+    (frame.is_finite() && (0.0..=1_000_000.0).contains(&frame)).then_some(frame)
+}
+
+fn parse_native_motion_loop_sync_call(line: &str) -> bool {
+    let Ok(syn::Stmt::Expr(syn::Expr::Call(call), Some(_))) = syn::parse_str(line) else {
+        return false;
+    };
+    if !call.attrs.is_empty() || !is_native_timing_path(&call.func, "wait_loop_sync_mot") {
+        return false;
+    }
+    // Captured presentation scripts use the bare implicit-context spelling. Only
+    // that exact shorthand is normalized; qualified SDK calls must pass the fixed
+    // agent Lua state. No alternate receiver or guessed argument list is admitted.
+    if call.args.is_empty() {
+        return matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("wait_loop_sync_mot"));
+    }
+    if call.args.len() != 1 {
+        return false;
+    }
+    let syn::Expr::Field(receiver) = &call.args[0] else {
+        return false;
+    };
+    let syn::Expr::Path(agent) = receiver.base.as_ref() else {
+        return false;
+    };
+    receiver.attrs.is_empty()
+        && agent.attrs.is_empty()
+        && agent.qself.is_none()
+        && agent.path.is_ident("agent")
+        && matches!(&receiver.member, syn::Member::Named(name) if name == "lua_state_agent")
 }
 
 fn parse_frame_call(line: &str) -> Option<f32> {
@@ -2477,6 +4638,1206 @@ fn parse_hurtbox_call(line: &str) -> Option<ExcuteStmt> {
         return Some(ExcuteStmt::HitResetAll);
     }
     None
+}
+
+/// Parse only the measured `slope!` direct and interpolation calls.
+///
+/// Both the command and status constants are closed over `skyline-smash`'s pinned
+/// `lua_const.rs`; unfamiliar constants, argument counts, or receiver syntax remain `Raw`.
+fn parse_slope_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{SlopeCall, SlopeStatus, MAX_SLOPE_INTERPOLATION_FRAMES};
+
+    let line = line.trim();
+    let body = line.strip_prefix("slope!(")?.strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, command, status, rest @ ..] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent" {
+        return None;
+    }
+    let status = match status.as_str() {
+        "*SLOPE_STATUS_LR" => SlopeStatus::Lr,
+        "*SLOPE_STATUS_TOP" => SlopeStatus::Top,
+        "*SLOPE_STATUS_NONE" => SlopeStatus::None,
+        "*SLOPE_STATUS_L" => SlopeStatus::Left,
+        "*SLOPE_STATUS_R" => SlopeStatus::Right,
+        _ => return None,
+    };
+    match (command.as_str(), rest) {
+        ("*MA_MSC_CMD_SLOPE_SLOPE", []) => Some(ExcuteStmt::Slope(SlopeCall::Set { status })),
+        ("*MA_MSC_CMD_SLOPE_SLOPE_INTP", [frames])
+        | ("*MA_MSC_CMD_SLOPE_SLOPE_INTP", [frames, _]) => {
+            let parsed_frames = frames.parse::<i32>().ok()?;
+            if parsed_frames.to_string() != frames.as_str()
+                || !(0..=MAX_SLOPE_INTERPOLATION_FRAMES).contains(&parsed_frames)
+            {
+                return None;
+            }
+            let trailing_flag = match rest.get(1).map(String::as_str) {
+                None => None,
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                Some(_) => return None,
+            };
+            Some(ExcuteStmt::Slope(SlopeCall::Interpolate {
+                status,
+                frames: parsed_frames,
+                trailing_flag,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Parse the sole measured item-visibility setter shape. Any other receiver, slot, literal,
+/// argument count, or suffix remains `Raw` instead of opening a general ItemModule API.
+fn parse_item_visibility_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("ItemModule::set_have_item_visibility(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, visible, slot] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || slot != "0" {
+        return None;
+    }
+    let visible = match visible.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(ExcuteStmt::ItemVisibility { visible })
+}
+
+/// Parse only the measured no-payload item-bullet wrapper. Near misses remain Raw.
+fn parse_shoot_item_bullet_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("macros::SHOOT_ITEM_BULLET(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    (args.as_slice() == ["agent"]).then_some(ExcuteStmt::ShootItemBullet)
+}
+
+/// Parse only the exact pinned no-payload `START_INFO_FLASH_EYE` wrapper call.
+fn parse_start_info_flash_eye_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("macros::START_INFO_FLASH_EYE(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    (args.as_slice() == ["agent"]).then_some(ExcuteStmt::StartInfoFlashEye)
+}
+
+/// Parse only the exact pinned no-payload `CAM_ZOOM_OUT` wrapper call.
+fn parse_camera_zoom_out_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("macros::CAM_ZOOM_OUT(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    (args.as_slice() == ["agent"]).then_some(ExcuteStmt::CameraZoomOut)
+}
+
+/// Parse only the exact no-payload FT_START_CUTIN wrapper call.
+fn parse_start_cut_in_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("macros::FT_START_CUTIN(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    (args.as_slice() == ["agent"]).then_some(ExcuteStmt::StartCutIn)
+}
+
+/// Parse only the exact helper call whose wrapper owns its Execute guard.
+fn parse_capture_cut_common_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("macros::game_CaptureCutCommon(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    (args.as_slice() == ["agent"]).then_some(ExcuteStmt::CaptureCutCommon)
+}
+
+/// Parse only the observed, closed all-hitbox AttackModule boolean setters.
+fn parse_attack_module_set_all_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{AttackModuleSetAllKind, ExcuteStmt};
+
+    let line = line.trim();
+    let (prefix, kind) = if line.starts_with("AttackModule::set_no_dead_all(") {
+        (
+            "AttackModule::set_no_dead_all(",
+            AttackModuleSetAllKind::NoDeadAll,
+        )
+    } else if line.starts_with("AttackModule::set_catch_only_all(") {
+        (
+            "AttackModule::set_catch_only_all(",
+            AttackModuleSetAllKind::CatchOnlyAll,
+        )
+    } else {
+        return None;
+    };
+    let body = line.strip_prefix(prefix)?.strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, arg2, arg3] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let arg2 = match arg2.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    let arg3 = match arg3.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    match kind {
+        AttackModuleSetAllKind::NoDeadAll if arg2 => {}
+        AttackModuleSetAllKind::CatchOnlyAll if arg2 && !arg3 => {}
+        _ => return None,
+    }
+    Some(ExcuteStmt::AttackModuleSetAll { kind, arg2, arg3 })
+}
+
+/// Parse only the observed indexed AttackModule calls and their exact boolean tail.
+fn parse_attack_module_set_indexed_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{AttackModuleSetIndexedKind, ExcuteStmt};
+
+    let line = line.trim();
+    let (prefix, kind) = if line.starts_with("AttackModule::set_no_finish_camera(") {
+        (
+            "AttackModule::set_no_finish_camera(",
+            AttackModuleSetIndexedKind::NoFinishCamera,
+        )
+    } else if line.starts_with("AttackModule::set_force_reaction(") {
+        (
+            "AttackModule::set_force_reaction(",
+            AttackModuleSetIndexedKind::ForceReaction,
+        )
+    } else {
+        return None;
+    };
+    let body = line.strip_prefix(prefix)?.strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, id_token, arg3, arg4] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || arg3 != "true" || arg4 != "false" {
+        return None;
+    }
+    let id = id_token.parse::<i32>().ok()?;
+    if !(0..=3).contains(&id) || id.to_string() != id_token.as_str() {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetIndexed {
+        kind,
+        id,
+        arg3: true,
+        arg4: false,
+    })
+}
+
+/// Parse the closed AttackHeight selector and exact observed bool tail.
+fn parse_attack_module_set_height_all_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{AttackHeightAllKind, ExcuteStmt};
+
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::set_attack_height_all(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, height_token, arg3] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || arg3 != "false" {
+        return None;
+    }
+    let height = match height_token.as_str() {
+        "AttackHeight(*ATTACK_HEIGHT_HIGH)" => AttackHeightAllKind::High,
+        "AttackHeight(*ATTACK_HEIGHT_LOW)" => AttackHeightAllKind::Low,
+        _ => return None,
+    };
+    Some(ExcuteStmt::AttackModuleSetHeightAll {
+        height,
+        arg3: false,
+    })
+}
+
+/// Parse SDK-backed literal final-finish calls, retaining every native argument position.
+fn parse_attack_module_set_final_finish_cut_in_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::set_final_finish_cut_in(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, id_token, arg3, arg4, arg5, arg6] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let id = id_token.parse::<i32>().ok()?;
+    let timing = arg5.parse::<f32>().ok()?;
+    if id < 0 || id.to_string() != id_token.as_str() || !timing.is_finite() {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetFinalFinishCutIn {
+        id,
+        arg3: bool_token(arg3)?,
+        arg4: bool_token(arg4)?,
+        arg5: timing,
+        arg6: bool_token(arg6)?,
+    })
+}
+
+/// Parse only `AttackModule::init_attack_pos(agent.module_accessor, 0)`.
+fn parse_attack_module_init_attack_pos_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::init_attack_pos(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, id] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || id != "0" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleInitAttackPos { id: 0 })
+}
+
+/// Parse one exact tuple from the measured set_attack_reference_joint_id corpus.
+fn parse_attack_module_set_attack_reference_joint_id_call(
+    line: &str,
+    choices: &[crate::data::AttackReferenceJointKind],
+) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::set_attack_reference_joint_id(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, bone, axis3, axis4, axis5] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let bone = bone.strip_prefix("Hash40::new(\"")?.strip_suffix("\")")?;
+    fn axis(arg: &str) -> Option<&str> {
+        arg.strip_prefix("AttackDirectionAxis(*")?.strip_suffix(')')
+    }
+    let actual = (bone, axis(axis3)?, axis(axis4)?, axis(axis5)?);
+    let kind = choices
+        .iter()
+        .copied()
+        .find(|kind| kind.native_parts() == actual)?;
+    Some(ExcuteStmt::AttackModuleSetAttackReferenceJointId { kind })
+}
+
+/// Parse only the exact observed native positional boolean pair.
+fn parse_attack_module_set_no_damage_fly_smoke_all_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::set_no_damage_fly_smoke_all(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, arg2, arg3] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || arg2 != "true" || arg3 != "false" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll {
+        arg2: true,
+        arg3: false,
+    })
+}
+
+/// Parse one direct, measured floating-point spelling. Unsuffixed integer tokens are left raw:
+/// the pinned native binding takes `f32`, and converting an integer token would change source.
+fn parse_attack_module_set_damage_shake_scale(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("AttackModule::set_damage_shake_scale(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, token] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetDamageShakeScale(
+        crate::data::AttackModuleDamageShakeScale::from_source_token(token)?,
+    ))
+}
+
+/// Parse only the two measured positional boolean pairs; keep their names neutral.
+fn parse_attack_module_set_no_uniq_effect_all(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("AttackModule::set_no_uniq_effect_all(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, arg2, arg3] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetNoUniqEffectAll(
+        crate::data::AttackModuleNoUniqEffectAllPair::from_source_args(arg2, arg3)?,
+    ))
+}
+
+/// Parse only the exact measured receiver, attack IDs, and fixed NO_IF mask cast. The cast is
+/// retained because the pinned binding takes `u32`; alternate masks and token spellings remain
+/// source text rather than being normalized.
+fn parse_attack_module_set_target_category(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("AttackModule::set_target_category(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, attack_id, mask] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || mask != "*COLLISION_CATEGORY_MASK_NO_IF as u32" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetTargetCategory(
+        crate::data::AttackModuleTargetCategoryId::from_attack_id(match attack_id.as_str() {
+            "0" => 0,
+            "1" => 1,
+            "2" => 2,
+            _ => return None,
+        })?,
+    ))
+}
+
+/// Parse only the exact measured `AttackModule::set_size` receiver/ID/decimal tuples.
+/// The decimal token is matched lexically and never converted through `f32`.
+fn parse_attack_module_set_size(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("AttackModule::set_size(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, attack_id, size] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    Some(ExcuteStmt::AttackModuleSetSize(
+        crate::data::AttackModuleSizePreset::from_source_parts(attack_id, size)?,
+    ))
+}
+
+/// Parse only a complete measured Vector2f tuple for AttackModule's pinned source API.
+/// Vector3f spellings and every unmeasured token remain Raw rather than being converted.
+fn parse_attack_module_set_vec_target_pos(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("AttackModule::set_vec_target_pos(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args_balanced(body);
+    let [receiver, id, bone, vector, arg5, arg6] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || bone != "Hash40::new(\"top\")" || arg6 != "false" {
+        return None;
+    }
+    let vector = vector.strip_prefix("&Vector2f{")?.strip_suffix('}')?;
+    let fields = tokenize_args_balanced(vector);
+    let [x_field, y_field] = fields.as_slice() else {
+        return None;
+    };
+    let x = x_field.strip_prefix("x:")?.trim();
+    let y = y_field.strip_prefix("y:")?.trim();
+    Some(ExcuteStmt::AttackModuleSetVecTargetPos(
+        crate::data::AttackModuleVecTargetPosPreset::from_source_parts(id, x, y, arg5)?,
+    ))
+}
+
+/// Parse the one measured global HitModule reset tuple; other statuses and tails stay Raw.
+fn parse_hit_module_set_status_all(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("HitModule::set_status_all(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, status, tail] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor"
+        || status != "HitStatus(*HIT_STATUS_NORMAL)"
+        || tail != "0"
+    {
+        return None;
+    }
+    Some(ExcuteStmt::HitModuleSetStatusAllNormal)
+}
+
+/// Parse the two distinct measured reaction-frame APIs without exchanging their names.
+/// The receiver and final native flag are fixed and not exposed as editable fields.
+fn parse_attack_module_add_reaction_frame_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let (body, revised) =
+        if let Some(body) = line.strip_prefix("AttackModule::set_add_reaction_frame(") {
+            (body, false)
+        } else {
+            (
+                line.strip_prefix("AttackModule::set_add_reaction_frame_revised(")?,
+                true,
+            )
+        };
+    let body = body.strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, id_token, frames_token, tail] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || tail != "false" {
+        return None;
+    }
+    let id = id_token.parse::<u32>().ok()?;
+    if id > 8 || id.to_string() != id_token.as_str() {
+        return None;
+    }
+    let frames = parse_finite_float_literal(frames_token)?;
+    if num(frames).as_str() != frames_token.as_str() {
+        return None;
+    }
+    Some(if revised {
+        ExcuteStmt::AttackModuleAddReactionFrameRevised { id, frames }
+    } else {
+        ExcuteStmt::AttackModuleAddReactionFrame { id, frames }
+    })
+}
+
+fn parse_finite_float_literal(token: &str) -> Option<f32> {
+    let expression = syn::parse_str::<syn::Expr>(token).ok()?;
+    let (literal, negative) = match expression {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Float(literal),
+            ..
+        }) => (literal, false),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => match *expr {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Float(literal),
+                ..
+            }) => (literal, true),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !literal.suffix().is_empty() {
+        return None;
+    }
+    let value = literal.base10_parse::<f32>().ok()?;
+    let value = if negative { -value } else { value };
+    value.is_finite().then_some(value)
+}
+
+/// Parse only the exact observed GrabModule receiver and literal bool argument.
+fn parse_grab_rebound_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("GrabModule::set_rebound(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, enabled] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let enabled = match enabled.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(ExcuteStmt::GrabRebound { enabled })
+}
+
+/// Parse only the complete measured JostleModule setter shape.
+fn parse_jostle_set_status_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("JostleModule::set_status(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, enabled] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let enabled = match enabled.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(ExcuteStmt::JostleSetStatus { enabled })
+}
+
+/// Parse only the exact standalone direct Game forms with literal numeric arguments.
+/// Other method paths, receivers, arities, and trailing source remain preserved as Raw.
+fn parse_fixed_jostle_area_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let (body, xy_form) = if let Some(body) = line
+        .strip_prefix("FighterAreaModuleImpl::enable_fix_jostle_area_xy(")
+        .and_then(|body| body.strip_suffix(");"))
+    {
+        (body, true)
+    } else if let Some(body) = line
+        .strip_prefix("FighterAreaModuleImpl::enable_fix_jostle_area(")
+        .and_then(|body| body.strip_suffix(");"))
+    {
+        (body, false)
+    } else {
+        return None;
+    };
+
+    let args = tokenize_args(body);
+    let expected_len = if xy_form { 5 } else { 3 };
+    if args.len() != expected_len || args[0] != "agent.module_accessor" {
+        return None;
+    }
+    let values = args[1..]
+        .iter()
+        .map(|token| {
+            // Keep this exact literal surface closed even though syn can accept expression
+            // attributes or comments around a float. Neither is part of the measured calls.
+            if !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || b".-+eE".contains(&byte))
+            {
+                return None;
+            }
+            let value = parse_finite_float_literal(token)?;
+            (value.abs() <= crate::data::MAX_FIXED_JOSTLE_AREA_ARGUMENT).then_some(value)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if xy_form {
+        Some(ExcuteStmt::FixedJostleArea(
+            crate::data::FixedJostleAreaCall::EnableFixXy {
+                arg2: values[0],
+                arg3: values[1],
+                arg4: values[2],
+                arg5: values[3],
+            },
+        ))
+    } else {
+        Some(ExcuteStmt::FixedJostleArea(
+            crate::data::FixedJostleAreaCall::EnableFix {
+                arg2: values[0],
+                arg3: values[1],
+            },
+        ))
+    }
+}
+
+/// Parse the measured closed VisibilityModule hash-name setter shape. Both identifiers must be
+/// literal `hash40` strings with the explicit `as i64` casts used by the source corpus.
+fn parse_visibility_set_int64_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("VisibilityModule::set_int64(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, group, status] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let group = parse_hash40_i64_literal(group)?;
+    let status = parse_hash40_i64_literal(status)?;
+    if !crate::data::body_visibility_catalog::is_measured_pair(&group, &status) {
+        return None;
+    }
+    Some(ExcuteStmt::VisibilitySetInt64 { group, status })
+}
+
+/// Parse the SDK-backed `set_whole` bool form only as an exact direct source statement.
+fn parse_visibility_set_whole_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("VisibilityModule::set_whole(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, visible] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let visible = match visible.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return None,
+    };
+    Some(ExcuteStmt::VisibilitySetWhole { visible })
+}
+
+/// Parse only the canonical generated form for the authoring-only model-default group token.
+/// Original corpus `Hash40::new(...)` calls intentionally remain Raw and immutable.
+fn parse_visibility_set_default_int64_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("VisibilityModule::set_default_int64(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, group] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let group = parse_hash40_i64_literal(group)?;
+    if !crate::data::PINNED_DEFAULT_INT64_GROUP_COUNTS
+        .iter()
+        .any(|(_, measured_group, _)| *measured_group == group.as_str())
+    {
+        return None;
+    }
+    Some(ExcuteStmt::VisibilitySetDefaultInt64 { group })
+}
+
+fn parse_hash40_i64_literal(token: &str) -> Option<String> {
+    let name = token
+        .strip_prefix("hash40(\"")?
+        .strip_suffix("\") as i64")?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Parse only the measured fixed-argument ArticleModule generation/removal forms.
+///
+/// Registry ownership is intentionally checked later with the concrete fighter; this parser
+/// only recognizes the native syntax and a bare named `FIGHTER_*_GENERATE_ARTICLE_*` token.
+/// Unsupported receivers, expressions, targets, and argument values remain Raw.
+fn parse_article_status_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let (body, if_present) =
+        if let Some(body) = line.strip_prefix("ArticleModule::change_status_exist(") {
+            (body, true)
+        } else {
+            (line.strip_prefix("ArticleModule::change_status(")?, false)
+        };
+    let args = tokenize_args(body.strip_suffix(");")?);
+    let (receiver, article, status) = match (if_present, args.as_slice()) {
+        (true, [receiver, article, status]) => (receiver, article, status),
+        (false, [receiver, article, status, target])
+            if target == "ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)" =>
+        {
+            (receiver, article, status)
+        }
+        _ => return None,
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let article = article_symbol(article)?;
+    let status = status.strip_prefix('*')?;
+    if !crate::data::article_status_catalog::is_measured_call(&article, status, if_present) {
+        return None;
+    }
+    Some(ExcuteStmt::ArticleLifecycle(
+        crate::data::ArticleLifecycleCall::ChangeStatus {
+            symbol: article,
+            status: status.into(),
+            if_present,
+        },
+    ))
+}
+
+fn parse_enabled_article_call(line: &str) -> Option<ExcuteStmt> {
+    let args = tokenize_args(
+        line.trim()
+            .strip_prefix("ArticleModule::generate_article_enable(")?
+            .strip_suffix(");")?,
+    );
+    let [receiver, symbol, arg3, arg4] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || arg3 != "false" || arg4 != "-1" {
+        return None;
+    }
+    let symbol = article_symbol(symbol)?;
+    if !crate::data::PINNED_ENABLED_ARTICLE_COUNTS
+        .iter()
+        .any(|(_, measured_symbol, _)| *measured_symbol == symbol)
+    {
+        return None;
+    }
+    Some(ExcuteStmt::ArticleLifecycle(
+        crate::data::ArticleLifecycleCall::GenerateEnabled { symbol },
+    ))
+}
+
+fn parse_article_lifecycle_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::ArticleLifecycleCall;
+
+    let line = line.trim();
+    let (prefix, variant) = if line.starts_with("ArticleModule::generate_article(") {
+        ("ArticleModule::generate_article(", 0)
+    } else if line.starts_with("ArticleModule::remove_exist(") {
+        ("ArticleModule::remove_exist(", 1)
+    } else {
+        return None;
+    };
+    let body = line.strip_prefix(prefix)?.strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let symbol = match (variant, args.as_slice()) {
+        (0, [receiver, symbol, enabled, index])
+            if receiver == "agent.module_accessor" && enabled == "false" && index == "-1" =>
+        {
+            article_symbol(symbol)?
+        }
+        (1, [receiver, symbol, target])
+            if receiver == "agent.module_accessor"
+                && target == "ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)" =>
+        {
+            article_symbol(symbol)?
+        }
+        _ => return None,
+    };
+    let call = match variant {
+        0 => ArticleLifecycleCall::Generate { symbol },
+        1 => ArticleLifecycleCall::RemoveAll { symbol },
+        _ => unreachable!(),
+    };
+    Some(ExcuteStmt::ArticleLifecycle(call))
+}
+
+/// Parse a track's closed `ArticleModule::change_motion` source form.
+/// The caller retains the original Game gate and proves direct-root Expression placement.
+fn parse_article_change_motion_call(line: &str, domain: ParseDomain) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let body = line
+        .strip_prefix("ArticleModule::change_motion(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, symbol, motion, arg4, frame] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || arg4 != "false" || frame != "-1.0" {
+        return None;
+    }
+    let symbol = article_symbol(symbol)?;
+    let motion = match domain {
+        ParseDomain::Game => extract_hash40_string(motion)?,
+        ParseDomain::Expression => motion
+            .strip_prefix("Hash40::new(\"")?
+            .strip_suffix("\")")?
+            .to_owned(),
+        ParseDomain::Sound => return None,
+    };
+    let choices = match domain {
+        ParseDomain::Game => crate::data::measured_article_motions(&symbol),
+        ParseDomain::Expression => crate::data::measured_expression_article_motions(&symbol),
+        ParseDomain::Sound => return None,
+    };
+    if !choices.contains(&motion.as_str()) {
+        return None;
+    }
+    Some(ExcuteStmt::ArticleLifecycle(
+        crate::data::ArticleLifecycleCall::ChangeMotion { symbol, motion },
+    ))
+}
+
+/// Parse only the measured whole-article visibility and launch calls.
+///
+/// Game sources admit these only in directly replayable Execute blocks. The pinned corpus also
+/// contains whole-article visibility in Expression and one `shoot_exist` call there. These
+/// operations keep their exact receiver, article symbol, target and false tail; all other Rust
+/// expressions remain Raw for source preservation.
+fn parse_article_native_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{ArticleLifecycleCall, ArticleTarget};
+
+    let line = line.trim();
+    if let Some(body) = line
+        .strip_prefix("ArticleModule::set_visibility_whole(")
+        .and_then(|body| body.strip_suffix(");"))
+    {
+        let args = tokenize_args(body);
+        let [receiver, symbol, visible, target] = args.as_slice() else {
+            return None;
+        };
+        if receiver != "agent.module_accessor"
+            || target != "ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)"
+        {
+            return None;
+        }
+        let visible = match visible.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        return Some(ExcuteStmt::ArticleLifecycle(
+            ArticleLifecycleCall::SetVisibilityWhole {
+                symbol: article_symbol(symbol)?,
+                visible,
+            },
+        ));
+    }
+
+    let (body, shoot_exist) = if let Some(body) = line
+        .strip_prefix("ArticleModule::shoot(")
+        .and_then(|body| body.strip_suffix(");"))
+    {
+        (body, false)
+    } else if let Some(body) = line
+        .strip_prefix("ArticleModule::shoot_exist(")
+        .and_then(|body| body.strip_suffix(");"))
+    {
+        (body, true)
+    } else {
+        return None;
+    };
+    let args = tokenize_args(body);
+    let [receiver, symbol, target, tail] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" || tail != "false" {
+        return None;
+    }
+    let target = match target.as_str() {
+        "*ARTICLE_OPE_TARGET_ALL" | "ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)" => {
+            ArticleTarget::All
+        }
+        "*ARTICLE_OPE_TARGET_LAST" | "ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST)" => {
+            ArticleTarget::Last
+        }
+        _ => return None,
+    };
+    let symbol = article_symbol(symbol)?;
+    Some(ExcuteStmt::ArticleLifecycle(if shoot_exist {
+        ArticleLifecycleCall::ShootExist { symbol, target }
+    } else {
+        ArticleLifecycleCall::Shoot { symbol, target }
+    }))
+}
+
+fn article_symbol(token: &str) -> Option<String> {
+    let symbol = token.strip_prefix("*FIGHTER_")?;
+    if token.len() > crate::data::MAX_ARTICLE_SYMBOL_BYTES
+        || symbol.is_empty()
+        || !symbol
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    let symbol = format!("FIGHTER_{symbol}");
+    symbol.contains("_GENERATE_ARTICLE_").then_some(symbol)
+}
+
+/// Parse only the exact named-event receiver call generated by the slight bridge. This is
+/// source syntax, not a producer: unrecognized receivers, arguments, or Rust expressions stay
+/// Raw, and callers gate this parser to direct Game execute blocks.
+pub(crate) fn parse_gimmick_event_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("crate::slight::gimmicks::dispatch_named_from_module(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, name] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let name = syn::parse_str::<syn::LitStr>(name).ok()?.value();
+    if name.trim().is_empty()
+        || name.len() > crate::gimmicks::live_model::MAX_NAME_BYTES
+        || name.contains('\0')
+    {
+        return None;
+    }
+    Some(ExcuteStmt::GimmickEvent { name })
+}
+
+/// Parse only the exact chart-bearing, zero-payload event bridge. The chart ID
+/// is not normalized: padded, reserved-main, NUL-containing, or over-limit IDs
+/// remain source text and are rejected by project validation if authored as a
+/// typed command.
+pub(crate) fn parse_gimmick_chart_event_call(line: &str) -> Option<ExcuteStmt> {
+    let body = line
+        .trim()
+        .strip_prefix("crate::slight::gimmicks::dispatch_named_chart_from_module(")?
+        .strip_suffix(");")?;
+    let args = tokenize_args(body);
+    let [receiver, chart_id, name] = args.as_slice() else {
+        return None;
+    };
+    if receiver != "agent.module_accessor" {
+        return None;
+    }
+    let chart_id = syn::parse_str::<syn::LitStr>(chart_id).ok()?.value();
+    let name = syn::parse_str::<syn::LitStr>(name).ok()?.value();
+    if !valid_gimmick_chart_id(&chart_id)
+        || name.trim().is_empty()
+        || name.len() > crate::gimmicks::live_model::MAX_NAME_BYTES
+        || name.contains('\0')
+    {
+        return None;
+    }
+    Some(ExcuteStmt::GimmickChartEvent { chart_id, name })
+}
+
+/// Parse the exact constant-payload chart bridge. The syntax is deliberately closed: no aliases,
+/// computed values, casts, alternate receivers, or empty payloads are retained as typed source.
+pub(crate) fn parse_gimmick_chart_event_values_call(line: &str) -> Option<ExcuteStmt> {
+    let source = line.trim().strip_suffix(';')?;
+    let call = syn::parse_str::<syn::ExprCall>(source).ok()?;
+    parse_gimmick_chart_event_values_expr(&call)
+}
+
+/// AST entry point shared by source parsing and the adapter capability gate.
+pub(crate) fn parse_gimmick_chart_event_values_expr(call: &syn::ExprCall) -> Option<ExcuteStmt> {
+    use crate::gimmicks::behavior::ConstValue;
+    use crate::gimmicks::event_payload::{validate_argument_shape, Argument};
+    use syn::{Expr, ExprLit, ExprTuple, Lit};
+
+    fn exact_path(expr: &Expr, expected: &[&str]) -> bool {
+        let Expr::Path(path) = expr else { return false };
+        path.attrs.is_empty()
+            && path.qself.is_none()
+            && path.path.leading_colon.is_none()
+            && path.path.segments.len() == expected.len()
+            && path
+                .path
+                .segments
+                .iter()
+                .zip(expected)
+                .all(|(segment, expected)| {
+                    segment.ident == *expected
+                        && matches!(&segment.arguments, syn::PathArguments::None)
+                })
+    }
+
+    fn exact_receiver(expr: &Expr) -> bool {
+        let Expr::Field(field) = expr else {
+            return false;
+        };
+        field.attrs.is_empty()
+            && matches!(&field.member, syn::Member::Named(member) if member == "module_accessor")
+            && exact_path(&field.base, &["agent"])
+    }
+
+    fn signed_literal(expr: &Expr, float: bool) -> Option<(bool, &syn::Lit)> {
+        match expr {
+            Expr::Lit(ExprLit { attrs, lit })
+                if attrs.is_empty() && !float && matches!(lit, Lit::Int(_)) =>
+            {
+                Some((false, lit))
+            }
+            Expr::Lit(ExprLit { attrs, lit })
+                if attrs.is_empty() && float && matches!(lit, Lit::Float(_)) =>
+            {
+                Some((false, lit))
+            }
+            Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+                if !unary.attrs.is_empty() {
+                    return None;
+                }
+                let Expr::Lit(ExprLit { attrs, lit }) = unary.expr.as_ref() else {
+                    return None;
+                };
+                if attrs.is_empty()
+                    && ((!float && matches!(lit, Lit::Int(_)))
+                        || (float && matches!(lit, Lit::Float(_))))
+                {
+                    Some((true, lit))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_value(expr: &Expr) -> Option<ConstValue> {
+        use syn::Lit;
+        let Expr::Call(call) = expr else { return None };
+        if !call.attrs.is_empty() || call.args.len() != 1 {
+            return None;
+        }
+        let value = call.args.first()?;
+        if exact_path(
+            &call.func,
+            &["crate", "slight", "gimmicks", "ChartEventValue", "Int"],
+        ) {
+            let (negative, lit) = signed_literal(value, false)?;
+            let Lit::Int(integer) = lit else { return None };
+            if !matches!(integer.suffix(), "" | "i32") {
+                return None;
+            }
+            let magnitude = integer.base10_parse::<i64>().ok()?;
+            let signed = if negative {
+                magnitude.checked_neg()?
+            } else {
+                magnitude
+            };
+            let value = i32::try_from(signed).ok()?;
+            return Some(ConstValue::Int(value));
+        }
+        if exact_path(
+            &call.func,
+            &["crate", "slight", "gimmicks", "ChartEventValue", "Float"],
+        ) {
+            let (negative, lit) = signed_literal(value, true)?;
+            let Lit::Float(float) = lit else { return None };
+            if !matches!(float.suffix(), "" | "f32") {
+                return None;
+            }
+            let mut value = float.base10_parse::<f32>().ok()?;
+            if negative {
+                value = -value;
+            }
+            return value.is_finite().then_some(ConstValue::Float(value));
+        }
+        if exact_path(
+            &call.func,
+            &["crate", "slight", "gimmicks", "ChartEventValue", "Flag"],
+        ) {
+            let Expr::Lit(ExprLit {
+                attrs,
+                lit: Lit::Bool(value),
+            }) = value
+            else {
+                return None;
+            };
+            if !attrs.is_empty() {
+                return None;
+            }
+            return Some(ConstValue::Flag(value.value));
+        }
+        None
+    }
+
+    if !call.attrs.is_empty()
+        || !exact_path(
+            &call.func,
+            &[
+                "crate",
+                "slight",
+                "gimmicks",
+                "dispatch_named_chart_values_from_module",
+            ],
+        )
+    {
+        return None;
+    }
+    if call.args.len() != 4 {
+        return None;
+    }
+    let receiver = &call.args[0];
+    let chart_id = &call.args[1];
+    let name = &call.args[2];
+    let payload = &call.args[3];
+    if !exact_receiver(receiver) {
+        return None;
+    }
+    let literal_string = |expr: &Expr| match expr {
+        Expr::Lit(ExprLit {
+            attrs,
+            lit: Lit::Str(value),
+        }) if attrs.is_empty() => Some(value.value()),
+        _ => None,
+    };
+    let chart_id = literal_string(chart_id)?;
+    let name = literal_string(name)?;
+    if !valid_gimmick_chart_id(&chart_id)
+        || name.trim().is_empty()
+        || name.len() > crate::gimmicks::live_model::MAX_NAME_BYTES
+        || name.contains('\0')
+    {
+        return None;
+    }
+    let Expr::Reference(reference) = payload else {
+        return None;
+    };
+    if !reference.attrs.is_empty() || reference.mutability.is_some() {
+        return None;
+    }
+    let Expr::Array(array) = reference.expr.as_ref() else {
+        return None;
+    };
+    if !array.attrs.is_empty()
+        || array.elems.is_empty()
+        || array.elems.len() > crate::gimmicks::event_payload::MAX_FIELDS_PER_EVENT
+    {
+        return None;
+    }
+    let mut arguments = Vec::with_capacity(array.elems.len());
+    for element in &array.elems {
+        let Expr::Tuple(ExprTuple { attrs, elems, .. }) = element else {
+            return None;
+        };
+        if !attrs.is_empty() {
+            return None;
+        }
+        if elems.len() != 2 {
+            return None;
+        }
+        let field = &elems[0];
+        let value = &elems[1];
+        let field = literal_string(field)?;
+        let value = parse_value(value)?;
+        arguments.push(Argument { field, value });
+    }
+    validate_argument_shape("source", &name, &arguments).ok()?;
+    Some(ExcuteStmt::GimmickChartEventValues {
+        chart_id,
+        name,
+        arguments,
+    })
+}
+
+fn valid_gimmick_chart_id(chart_id: &str) -> bool {
+    !chart_id.trim().is_empty()
+        && chart_id != crate::gimmicks::controller_project::MAIN_CHART
+        && chart_id.len() <= crate::gimmicks::controller_protocol::MAX_CHART_ID_BYTES
+        && !chart_id.as_bytes().contains(&0)
+}
+
+/// Recognize exact named-event sends only at direct, unattributed statement boundaries in one
+/// Game Execute body. This is an event-specific parser helper; it grants no native write or
+/// other command-family permission.
+pub(crate) fn unattributed_gimmick_event_calls(
+    lines: &[&str],
+) -> std::collections::BTreeMap<usize, ExcuteStmt> {
+    direct_native_statement_lines(lines)
+        .into_iter()
+        .filter_map(|index| {
+            let (line, _) = logical_line_at(lines, index);
+            parse_gimmick_event_call(&line)
+                .or_else(|| parse_gimmick_chart_event_call(&line))
+                .or_else(|| parse_gimmick_chart_event_values_call(&line))
+                .map(|event| (index, event))
+        })
+        .collect()
 }
 
 /// Parse `ATK_POWER` / `ATK_SET_SHIELD_SETOFF_MUL`, or `None` if this is not one.
@@ -3112,11 +6473,15 @@ fn parse_work_flag_call(line: &str) -> Option<ExcuteStmt> {
 }
 
 /// Parse the measured direct WorkModule transition-term and transition-term-group shapes. The
-/// ordinary term pair accepts the standard/HDR receiver forms; the group pair is currently
-/// measured only with `agent.module_accessor`. Only a numeric or dereferenced identifier token
+/// ordinary term pair retains its exact `agent.module_accessor` or `boma` receiver; group calls
+/// are typed only with `agent.module_accessor`. Only a numeric or dereferenced identifier token
 /// is typed; other expressions and arities remain raw until their source/runtime identity is
 /// measured.
 fn parse_work_transition_term_call(line: &str) -> Option<ExcuteStmt> {
+    // This source-export slice deliberately admits one direct statement only. Unlike the
+    // permissive parsers around it, searching within the line would accidentally type calls
+    // embedded in expressions, comments, or a shadow-qualified `WorkModule` path.
+    let line = line.trim();
     for (func, action) in [
         (
             "WorkModule::enable_transition_term",
@@ -3136,28 +6501,38 @@ fn parse_work_transition_term_call(line: &str) -> Option<ExcuteStmt> {
         ),
     ] {
         let needle = format!("{func}(");
-        let Some(start) = line.find(&needle).map(|index| index + needle.len()) else {
+        let Some(args) = line
+            .strip_prefix(&needle)
+            .and_then(|tail| tail.strip_suffix(");"))
+        else {
             continue;
         };
-        let end = line[start..].rfind(')')? + start;
-        let tokens = tokenize_args(&line[start..end]);
+        // The closed arguments contain only the measured receiver and an integer/dereferenced
+        // identifier. Reject lexical constructs before tokenization so comments, strings,
+        // nested expressions, and malformed tails cannot be mistaken for a direct call.
+        if !args.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '.' | '*' | ',' | '-' | ' ' | '\t')
+        }) {
+            continue;
+        }
+        let tokens = tokenize_args(args);
         let [module_accessor, transition_term] = tokens.as_slice() else {
             continue;
         };
-        let receiver = module_accessor.trim();
-        let receiver_is_measured = match action {
-            crate::data::WorkTransitionTermAction::Enable
-            | crate::data::WorkTransitionTermAction::Unable => {
-                matches!(receiver, "agent.module_accessor" | "boma")
+        let receiver = match module_accessor.trim() {
+            "agent.module_accessor" => crate::data::WorkTransitionTermReceiver::AgentAccessor,
+            "boma"
+                if matches!(
+                    action,
+                    crate::data::WorkTransitionTermAction::Enable
+                        | crate::data::WorkTransitionTermAction::Unable
+                ) =>
+            {
+                crate::data::WorkTransitionTermReceiver::Boma
             }
-            crate::data::WorkTransitionTermAction::EnableGroup
-            | crate::data::WorkTransitionTermAction::UnableGroupEx => {
-                receiver == "agent.module_accessor"
-            }
+            _ => continue,
         };
-        if !receiver_is_measured {
-            continue;
-        }
         let transition_term = transition_term.trim();
         let valid_transition_term = transition_term.parse::<i64>().is_ok()
             || transition_term.strip_prefix('*').is_some_and(|name| {
@@ -3170,6 +6545,7 @@ fn parse_work_transition_term_call(line: &str) -> Option<ExcuteStmt> {
             return Some(ExcuteStmt::WorkTransitionTerm(
                 crate::data::WorkTransitionTermCall {
                     action,
+                    receiver,
                     transition_term: transition_term.to_string(),
                 },
             ));
@@ -3241,6 +6617,7 @@ fn valid_work_module_int64_value(value: &str) -> bool {
 /// `WorkModule::set_int(agent.module_accessor, value, slot)`, the equivalent HDR `boma`
 /// receiver, and the three-argument `set_int64` shape measured in the standard/HDR corpus.
 fn parse_work_module_set_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
     for (func, kind) in [
         ("WorkModule::set_int", crate::data::WorkModuleSetKind::Int),
         (
@@ -3253,11 +6630,16 @@ fn parse_work_module_set_call(line: &str) -> Option<ExcuteStmt> {
         ),
     ] {
         let needle = format!("{func}(");
-        let Some(start) = line.find(&needle).map(|index| index + needle.len()) else {
+        let Some(arguments) = line
+            .strip_prefix(&needle)
+            .and_then(|tail| tail.strip_suffix(");"))
+        else {
             continue;
         };
-        let end = line[start..].rfind(')')? + start;
-        let tokens = tokenize_args(&line[start..end]);
+        if arguments.trim_end().ends_with(',') {
+            continue;
+        }
+        let tokens = tokenize_args(arguments);
         let [module_accessor, value, slot] = tokens.as_slice() else {
             continue;
         };
@@ -3289,6 +6671,282 @@ fn parse_work_module_set_call(line: &str) -> Option<ExcuteStmt> {
         }
     }
     None
+}
+
+/// Parse only the pinned direct `agent.module_accessor` slowdown call shapes. Prefix/suffix
+/// checks keep nested, shadowed, appended, and otherwise decorated expressions as raw source.
+fn parse_slow_module_whole_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{ExcuteStmt, SlowWholeCall};
+
+    let line = line.trim();
+    let set_prefix = "SlowModule::set_whole(";
+    if let Some(arguments) = line
+        .strip_prefix(set_prefix)
+        .and_then(|tail| tail.strip_suffix(");"))
+    {
+        if arguments.trim_end().ends_with(',') {
+            return None;
+        }
+        let tokens = tokenize_args(arguments);
+        let [receiver, multiplier, frames] = tokens.as_slice() else {
+            return None;
+        };
+        if receiver.trim() != "agent.module_accessor" {
+            return None;
+        }
+        let multiplier_token = multiplier.trim();
+        let multiplier = multiplier_token.parse::<u8>().ok()?;
+        if multiplier_token != multiplier.to_string() {
+            return None;
+        }
+        let frames_token = frames.trim();
+        let frames = frames_token.parse::<i32>().ok()?;
+        if frames_token != frames.to_string() {
+            return None;
+        }
+        return Some(ExcuteStmt::SlowWhole(SlowWholeCall::Set {
+            multiplier,
+            frames,
+        }));
+    }
+
+    let clear_prefix = "SlowModule::clear_whole(";
+    let arguments = line
+        .strip_prefix(clear_prefix)
+        .and_then(|tail| tail.strip_suffix(");"))?;
+    if arguments.trim_end().ends_with(',') {
+        return None;
+    }
+    let tokens = tokenize_args(arguments);
+    let [receiver] = tokens.as_slice() else {
+        return None;
+    };
+    (receiver.trim() == "agent.module_accessor")
+        .then_some(ExcuteStmt::SlowWhole(SlowWholeCall::Clear))
+}
+
+/// Parse the closed wrapper call using its source-level f32 fields. Each bound is an observed
+/// corpus extremum, not a claimed native unit or semantic limit.
+fn parse_slow_opponent_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let arguments = line
+        .strip_prefix("macros::SLOW_OPPONENT(")?
+        .strip_suffix(");")?;
+    if arguments.trim_end().ends_with(',') {
+        return None;
+    }
+    let tokens = tokenize_args(arguments);
+    let [receiver, slow_mul, slow_time] = tokens.as_slice() else {
+        return None;
+    };
+    if receiver.trim() != "agent" {
+        return None;
+    }
+    let call = crate::data::SlowOpponentCall {
+        slow_mul: slow_mul.trim().parse::<f32>().ok()?,
+        slow_time: slow_time.trim().parse::<f32>().ok()?,
+    };
+    call.is_valid().then_some(ExcuteStmt::SlowOpponent(call))
+}
+
+/// Parse an exact, corpus-measured two-literal source tuple. Fighter ownership is checked by
+/// timeline admission, where the donor identity is available; generic ACMD parsing has no such
+/// context and therefore recognizes only membership in the global literal catalog.
+fn parse_finish_camera_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let arguments = line
+        .strip_prefix("macros::CHECK_FINISH_CAMERA(")?
+        .strip_suffix(");")?;
+    if arguments.trim_end().ends_with(',') {
+        return None;
+    }
+    let tokens = tokenize_args_balanced(arguments);
+    let [receiver, arg1, arg2] = tokens.as_slice() else {
+        return None;
+    };
+    if receiver.trim() != "agent" {
+        return None;
+    }
+    let call = crate::data::FinishCameraCall {
+        arg1: arg1.trim().to_owned(),
+        arg2: arg2.trim().to_owned(),
+    };
+    call.is_measured_tuple()
+        .then_some(ExcuteStmt::CheckFinishCamera(call))
+}
+
+/// Parse a single exact six-token tuple from the corpus-derived camera catalog. Donor identity
+/// is checked later by timeline admission; this generic parser has no fighter argument.
+fn parse_final_start_camera_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let arguments = line
+        .strip_prefix("macros::CHECK_VALID_FINAL_START_CAMERA(")?
+        .strip_suffix(");")?;
+    if arguments.trim_end().ends_with(',') {
+        return None;
+    }
+    let tokens = tokenize_args_balanced(arguments);
+    let [receiver, arg1, arg2, arg3, arg4, arg5, arg6] = tokens.as_slice() else {
+        return None;
+    };
+    if receiver.trim() != "agent" {
+        return None;
+    }
+    let call = crate::data::FinalStartCameraCall {
+        args: [
+            arg1.trim().to_owned(),
+            arg2.trim().to_owned(),
+            arg3.trim().to_owned(),
+            arg4.trim().to_owned(),
+            arg5.trim().to_owned(),
+            arg6.trim().to_owned(),
+        ],
+    };
+    call.is_measured_tuple()
+        .then_some(ExcuteStmt::CheckFinalStartCamera(call))
+}
+
+/// Parse one exact integer token from the closed fear-face source catalog. The pinned wrapper's
+/// `u64` argument is intentionally retained without assigning it a semantic label.
+fn parse_final_fear_face_call(line: &str) -> Option<ExcuteStmt> {
+    let line = line.trim();
+    let arguments = line
+        .strip_prefix("macros::FT_SET_FINAL_FEAR_FACE(")?
+        .strip_suffix(");")?;
+    if arguments.trim_end().ends_with(',') {
+        return None;
+    }
+    let tokens = tokenize_args_balanced(arguments);
+    let [receiver, argument] = tokens.as_slice() else {
+        return None;
+    };
+    if receiver.trim() != "agent" {
+        return None;
+    }
+    let call = crate::data::FinalFearFaceCall {
+        argument: argument.trim().to_owned(),
+    };
+    call.is_measured_token()
+        .then_some(ExcuteStmt::FinalFearFace(call))
+}
+
+/// Parse one direct source-only optional hit-feedback call with value-only Hash40 arguments.
+/// The integer remains `arg2`; this boundary does not infer its native semantic label.
+fn parse_optional_hit_feedback_call(line: &str) -> Option<ExcuteStmt> {
+    use crate::data::{ExcuteStmt, OptionalHitFeedbackCall, OptionalHitFeedbackKind};
+
+    let line = line.trim();
+    let (prefix, kind) = if line.starts_with("AttackModule::set_optional_hit_effect(") {
+        (
+            "AttackModule::set_optional_hit_effect(",
+            OptionalHitFeedbackKind::Effect,
+        )
+    } else if line.starts_with("AttackModule::set_optional_hit_sound(") {
+        (
+            "AttackModule::set_optional_hit_sound(",
+            OptionalHitFeedbackKind::Sound,
+        )
+    } else {
+        return None;
+    };
+    let arguments = line.strip_prefix(prefix)?.strip_suffix(");")?;
+    let tokens = tokenize_args_balanced(arguments);
+    let [receiver, arg2, hash] = tokens.as_slice() else {
+        return None;
+    };
+    if receiver.trim() != "agent.module_accessor" {
+        return None;
+    }
+    let arg2 = arg2.trim().parse::<i32>().ok()?;
+    let hash = parse_hash40_literal(hash)?;
+    let call = OptionalHitFeedbackCall { kind, arg2, hash };
+    call.is_valid()
+        .then_some(ExcuteStmt::OptionalHitFeedback(call))
+}
+
+/// Accept only `Hash40::new(<string literal>)` and `Hash40::new_raw(<hex integer literal>)`.
+/// No path, constructor, constant, or expression is retained as executable authored source.
+fn parse_hash40_literal(token: &str) -> Option<crate::data::Hash40Literal> {
+    let expression = syn::parse_str::<syn::Expr>(token.trim()).ok()?;
+    parse_hash40_literal_expr(expression)
+}
+
+fn parse_hash40_literal_expr(expression: syn::Expr) -> Option<crate::data::Hash40Literal> {
+    use crate::data::Hash40Literal;
+    use syn::{Expr, ExprCall, ExprLit, ExprPath, Lit};
+
+    let Expr::Call(ExprCall {
+        attrs, func, args, ..
+    }) = expression
+    else {
+        return None;
+    };
+    if !attrs.is_empty() {
+        return None;
+    }
+    let Expr::Path(ExprPath {
+        attrs,
+        qself: None,
+        path,
+        ..
+    }) = *func
+    else {
+        return None;
+    };
+    if !attrs.is_empty()
+        || path.leading_colon.is_some()
+        || path.segments.len() != 2
+        || path.segments[0].ident != "Hash40"
+        || path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, syn::PathArguments::None))
+    {
+        return None;
+    }
+    if args.len() != 1 {
+        return None;
+    }
+    let argument = args.first()?;
+    let value = match path.segments[1].ident.to_string().as_str() {
+        "new" => {
+            let Expr::Lit(ExprLit {
+                attrs,
+                lit: Lit::Str(value),
+                ..
+            }) = argument
+            else {
+                return None;
+            };
+            if !attrs.is_empty() {
+                return None;
+            }
+            Hash40Literal::Name(value.value())
+        }
+        "new_raw" => {
+            let Expr::Lit(ExprLit {
+                attrs,
+                lit: Lit::Int(value),
+                ..
+            }) = argument
+            else {
+                return None;
+            };
+            if !attrs.is_empty() {
+                return None;
+            }
+            if !value.suffix().is_empty() {
+                return None;
+            }
+            let source = value.to_string().replace('_', "");
+            let digits = source
+                .strip_prefix("0x")
+                .or_else(|| source.strip_prefix("0X"))?;
+            Hash40Literal::Raw(u64::from_str_radix(digits, 16).ok()?)
+        }
+        _ => return None,
+    };
+    value.is_valid().then_some(value)
 }
 
 fn parse_zero_z_vector(value: &str) -> Option<(f32, f32)> {
@@ -3351,6 +7009,13 @@ fn emit_expression(call: &crate::data::ExpressionCall, indent: &str) -> String {
 }
 
 fn parse_attack_mod_call(line: &str) -> Option<ExcuteStmt> {
+    let canonical;
+    let line = if line.trim_start().starts_with("ATK_SET_SHIELD_SETOFF_MUL2(") {
+        canonical = crate::move_nodes::native_calls::parse(line)?.source();
+        canonical.as_str()
+    } else {
+        line
+    };
     for kind in crate::data::AttackModKind::ALL {
         let needle = format!("macros::{}(", kind.macro_name());
         if !line.contains(&needle) {
@@ -3427,7 +7092,7 @@ fn strip_deref(s: &str) -> String {
 /// this build has never heard of still exports as the constant it wrote.
 pub fn emit_status(status: &str) -> String {
     let s = status.trim();
-    if s.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+    if s.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '*') {
         s.to_string()
     } else {
         format!("*{s}")
@@ -3516,7 +7181,7 @@ fn tokenize_args(s: &str) -> Vec<String> {
 /// Split arguments while treating Rust tuples/arrays/struct literals as one argument. The
 /// regular tokenizer above predates direct `Vector3f{...}` calls and intentionally remains
 /// unchanged for the macro grammar it serves.
-fn tokenize_args_balanced(s: &str) -> Vec<String> {
+pub(crate) fn tokenize_args_balanced(s: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut paren_depth = 0usize;
     let mut bracket_depth = 0usize;
@@ -3549,6 +7214,28 @@ fn extract_hash40_string(s: &str) -> Option<String> {
     let s = s.trim();
     let inner = s.strip_prefix("Hash40::new(\"")?.strip_suffix("\")")?;
     Some(inner.to_string())
+}
+
+/// Extract an effect Hash40 name while retaining the original token inside raw-hash wrappers.
+fn extract_effect_hash40_name(s: &str) -> Option<String> {
+    if let Some(name) = extract_hash40_string(s) {
+        return Some(name);
+    }
+    let s = s.trim();
+    // Keep the original raw value token rather than the wrapper expression. `hash_arg` writes
+    // numeric names as `Hash40::new_raw(...)`; returning that expression as the effect name on
+    // reparse makes the next export treat the wrapper itself as a name and changes the statement
+    // tree even though the hash payload is unchanged.
+    let raw = s
+        .strip_prefix("Hash40::new_raw(")?
+        .strip_suffix(')')?
+        .trim();
+    let digits = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))?
+        .replace('_', "");
+    u64::from_str_radix(&digits, 16).ok()?;
+    Some(raw.to_owned())
 }
 
 /// Read either spelling of a Hash40 expression used for a bone argument.
@@ -3814,10 +7501,18 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
             crate::data::ExcuteStmt::Attack(call) => emit_attack(call, indent),
             crate::data::ExcuteStmt::Catch(call) => emit_catch(call, indent),
             crate::data::ExcuteStmt::AttackAbs(call) => emit_attack_abs(call, indent),
+            crate::data::ExcuteStmt::AttackAbsApplyThrow => ATTACK_ABS_APPLY_THROW_SOURCE
+                .iter()
+                .map(|line| format!("{indent}{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             crate::data::ExcuteStmt::AttackFp(call) => emit_attack_fp(call, indent),
             crate::data::ExcuteStmt::Search(call) => emit_search(call, indent),
             crate::data::ExcuteStmt::GrabClearAll => {
                 format!("{indent}GrabModule::clear_all(agent.module_accessor);")
+            }
+            crate::data::ExcuteStmt::GrabRebound { enabled } => {
+                format!("{indent}GrabModule::set_rebound(agent.module_accessor, {enabled});")
             }
             crate::data::ExcuteStmt::Wind(wind) => format!(
                 "{indent}macros::{}(agent, {});",
@@ -3870,6 +7565,252 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
                 format!("{indent}macros::COL_PRI(agent, {pri});")
             }
             crate::data::ExcuteStmt::ColNormal => format!("{indent}macros::COL_NORMAL(agent);"),
+            crate::data::ExcuteStmt::Slope(call) => match call {
+                crate::data::SlopeCall::Set { status } => format!(
+                    "{indent}slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_{});",
+                    status.source_name()
+                ),
+                crate::data::SlopeCall::Interpolate {
+                    status,
+                    frames,
+                    trailing_flag,
+                } => match trailing_flag {
+                    Some(flag) => format!(
+                        "{indent}slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_{}, {frames}, {flag});",
+                        status.source_name()
+                    ),
+                    None => format!(
+                        "{indent}slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_{}, {frames});",
+                        status.source_name()
+                    ),
+                },
+            },
+            crate::data::ExcuteStmt::ItemVisibility { visible } => format!(
+                "{indent}ItemModule::set_have_item_visibility(agent.module_accessor, {visible}, 0);"
+            ),
+            crate::data::ExcuteStmt::Effect(command) => {
+                preview_effect_macro(command).lines().map(|line| format!("{indent}{line}")).collect::<Vec<_>>().join("\n")
+            },
+            crate::data::ExcuteStmt::NativeCall(call) => format!("{indent}{}", call.source()),
+            crate::data::ExcuteStmt::ShootItemBullet => {
+                format!("{indent}macros::SHOOT_ITEM_BULLET(agent);")
+            }
+            crate::data::ExcuteStmt::StartInfoFlashEye => {
+                format!("{indent}macros::START_INFO_FLASH_EYE(agent);")
+            }
+            crate::data::ExcuteStmt::CameraZoomOut => {
+                format!("{indent}macros::CAM_ZOOM_OUT(agent);")
+            }
+            crate::data::ExcuteStmt::StartCutIn => {
+                format!("{indent}macros::FT_START_CUTIN(agent);")
+            }
+            crate::data::ExcuteStmt::CaptureCutCommon => {
+                format!("{indent}macros::game_CaptureCutCommon(agent);")
+            }
+            crate::data::ExcuteStmt::JostleSetStatus { enabled } => format!(
+                "{indent}JostleModule::set_status(agent.module_accessor, {enabled});"
+            ),
+            crate::data::ExcuteStmt::FixedJostleArea(call) => match call {
+                crate::data::FixedJostleAreaCall::EnableFix { arg2, arg3 } => format!(
+                    "{indent}FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, {}, {});",
+                    num(*arg2),
+                    num(*arg3)
+                ),
+                crate::data::FixedJostleAreaCall::EnableFixXy {
+                    arg2,
+                    arg3,
+                    arg4,
+                    arg5,
+                } => format!(
+                    "{indent}FighterAreaModuleImpl::enable_fix_jostle_area_xy(agent.module_accessor, {}, {}, {}, {});",
+                    num(*arg2),
+                    num(*arg3),
+                    num(*arg4),
+                    num(*arg5)
+                ),
+            },
+            crate::data::ExcuteStmt::VisibilitySetInt64 { group, status } => format!(
+                "{indent}VisibilityModule::set_int64(agent.module_accessor, hash40(\"{group}\") as i64, hash40(\"{status}\") as i64);"
+            ),
+            crate::data::ExcuteStmt::VisibilitySetDefaultInt64 { group } => format!(
+                "{indent}VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"{group}\") as i64);"
+            ),
+            crate::data::ExcuteStmt::VisibilitySetWhole { visible } => format!(
+                "{indent}VisibilityModule::set_whole(agent.module_accessor, {visible});"
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetAll { kind, arg2, arg3 } => {
+                let function = match kind {
+                    crate::data::AttackModuleSetAllKind::NoDeadAll => "set_no_dead_all",
+                    crate::data::AttackModuleSetAllKind::CatchOnlyAll => "set_catch_only_all",
+                };
+                format!(
+                    "{indent}AttackModule::{function}(agent.module_accessor, {arg2}, {arg3});"
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleSetIndexed {
+                kind,
+                id,
+                arg3,
+                arg4,
+            } => {
+                let function = match kind {
+                    crate::data::AttackModuleSetIndexedKind::NoFinishCamera => {
+                        "set_no_finish_camera"
+                    }
+                    crate::data::AttackModuleSetIndexedKind::ForceReaction => {
+                        "set_force_reaction"
+                    }
+                };
+                format!(
+                    "{indent}AttackModule::{function}(agent.module_accessor, {id}, {arg3}, {arg4});"
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleSetHeightAll { height, arg3 } => {
+                let height = match height {
+                    crate::data::AttackHeightAllKind::High => "HIGH",
+                    crate::data::AttackHeightAllKind::Low => "LOW",
+                };
+                format!(
+                    "{indent}AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_{height}), {arg3});"
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleSetFinalFinishCutIn {
+                id,
+                arg3,
+                arg4,
+                arg5,
+                arg6,
+            } => format!(
+                "{indent}AttackModule::set_final_finish_cut_in(agent.module_accessor, {id}, {arg3}, {arg4}, {}, {arg6});",
+                num(*arg5)
+            ),
+            crate::data::ExcuteStmt::AttackModuleInitAttackPos { id } => format!(
+                "{indent}AttackModule::init_attack_pos(agent.module_accessor, {id});"
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetAttackReferenceJointId { kind } => {
+                let (bone, axis3, axis4, axis5) = kind.native_parts();
+                format!(
+                    "{indent}AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"{bone}\"), AttackDirectionAxis(*{axis3}), AttackDirectionAxis(*{axis4}), AttackDirectionAxis(*{axis5}));"
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll { arg2, arg3 } => format!(
+                "{indent}AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, {arg2}, {arg3});"
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetDamageShakeScale(scale) => format!(
+                "{indent}AttackModule::set_damage_shake_scale(agent.module_accessor, {});",
+                scale.source_token()
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetNoUniqEffectAll(pair) => {
+                let (arg2, arg3) = pair.source_args();
+                format!(
+                    "{indent}AttackModule::set_no_uniq_effect_all(agent.module_accessor, {arg2}, {arg3});"
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleSetTargetCategory(id) => format!(
+                "{indent}AttackModule::set_target_category(agent.module_accessor, {}, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+                id.attack_id()
+            ),
+            crate::data::ExcuteStmt::HitModuleSetStatusAllNormal => format!(
+                "{indent}HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);"
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetSize(preset) => format!(
+                "{indent}AttackModule::set_size(agent.module_accessor, {}, {});",
+                preset.attack_id(),
+                preset.size_token()
+            ),
+            crate::data::ExcuteStmt::AttackModuleSetVecTargetPos(preset) => {
+                format!("{indent}{}", preset.source_line())
+            }
+            crate::data::ExcuteStmt::OptionalHitFeedback(call) => {
+                let function = match call.kind {
+                    crate::data::OptionalHitFeedbackKind::Effect => "set_optional_hit_effect",
+                    crate::data::OptionalHitFeedbackKind::Sound => "set_optional_hit_sound",
+                };
+                format!(
+                    "{indent}AttackModule::{function}(agent.module_accessor, {}, {});",
+                    call.arg2,
+                    call.hash.source_expr()
+                )
+            }
+            crate::data::ExcuteStmt::AttackModuleAddReactionFrame { id, frames } => format!(
+                "{indent}AttackModule::set_add_reaction_frame(agent.module_accessor, {id}, {}, false);",
+                num(*frames)
+            ),
+            crate::data::ExcuteStmt::AttackModuleAddReactionFrameRevised { id, frames } => format!(
+                "{indent}AttackModule::set_add_reaction_frame_revised(agent.module_accessor, {id}, {}, false);",
+                num(*frames)
+            ),
+            crate::data::ExcuteStmt::ArticleLifecycle(call) => match call {
+                crate::data::ArticleLifecycleCall::Generate { symbol } => format!(
+                    "{indent}ArticleModule::generate_article(agent.module_accessor, *{symbol}, false, -1);"
+                ),
+                crate::data::ArticleLifecycleCall::GenerateEnabled { symbol } => format!(
+                    "{indent}ArticleModule::generate_article_enable(agent.module_accessor, *{symbol}, false, -1);"
+                ),
+                crate::data::ArticleLifecycleCall::ChangeStatus { symbol, status, if_present } => {
+                    if *if_present {
+                        format!("{indent}ArticleModule::change_status_exist(agent.module_accessor, *{symbol}, *{status});")
+                    } else {
+                        format!("{indent}ArticleModule::change_status(agent.module_accessor, *{symbol}, *{status}, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));")
+                    }
+                }
+                crate::data::ArticleLifecycleCall::RemoveAll { symbol } => format!(
+                    "{indent}ArticleModule::remove_exist(agent.module_accessor, *{symbol}, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));"
+                ),
+                crate::data::ArticleLifecycleCall::ChangeMotion { symbol, motion } => format!(
+                    "{indent}ArticleModule::change_motion(agent.module_accessor, *{symbol}, Hash40::new(\"{motion}\"), false, -1.0);"
+                ),
+                crate::data::ArticleLifecycleCall::SetVisibilityWhole { symbol, visible } => format!(
+                    "{indent}ArticleModule::set_visibility_whole(agent.module_accessor, *{symbol}, {visible}, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));"
+                ),
+                crate::data::ArticleLifecycleCall::Shoot { symbol, target } => format!(
+                    "{indent}ArticleModule::shoot(agent.module_accessor, *{symbol}, ArticleOperationTarget({}), false);",
+                    target.source_token()
+                ),
+                crate::data::ArticleLifecycleCall::ShootExist { symbol, target } => format!(
+                    "{indent}ArticleModule::shoot_exist(agent.module_accessor, *{symbol}, ArticleOperationTarget({}), false);",
+                    target.source_token()
+                ),
+                crate::data::ArticleLifecycleCall::AddMotionPartial { preset } => {
+                    format!("{indent}{}", preset.source_line())
+                }
+            },
+            crate::data::ExcuteStmt::GimmickEvent { name } => format!(
+                "{indent}crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, {name:?});"
+            ),
+            crate::data::ExcuteStmt::GimmickChartEvent { chart_id, name } => format!(
+                "{indent}crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, {chart_id:?}, {name:?});"
+            ),
+            crate::data::ExcuteStmt::GimmickChartEventValues { chart_id, name, arguments } => {
+                use crate::gimmicks::behavior::ConstValue;
+                let values = arguments
+                    .iter()
+                    .map(|argument| {
+                        let value = match argument.value {
+                            ConstValue::Int(value) => format!(
+                                "crate::slight::gimmicks::ChartEventValue::Int({value})"
+                            ),
+                            ConstValue::Float(value) => {
+                                let mut literal = format!("{value:?}");
+                                if !literal.chars().any(|character| matches!(character, '.' | 'e' | 'E')) {
+                                    literal.push_str(".0");
+                                }
+                                format!(
+                                    "crate::slight::gimmicks::ChartEventValue::Float({literal}f32)"
+                                )
+                            }
+                            ConstValue::Flag(value) => format!(
+                                "crate::slight::gimmicks::ChartEventValue::Flag({value})"
+                            ),
+                        };
+                        format!("({:?}, {value})", argument.field.as_str())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{indent}crate::slight::gimmicks::dispatch_named_chart_values_from_module(agent.module_accessor, {chart_id:?}, {name:?}, &[{values}]);"
+                )
+            }
             // Re-emitted as its own call at its own frame, never folded into the `ATTACK` it
             // retunes: the corpus writes it both in that call's own block and several frames
             // later, and only the separate line can express the second.
@@ -3883,6 +7824,23 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
             crate::data::ExcuteStmt::ReverseLr => {
                 format!("{indent}macros::REVERSE_LR(agent);")
             }
+            crate::data::ExcuteStmt::CheckFinishCamera(call) => format!(
+                "{indent}macros::CHECK_FINISH_CAMERA(agent, {}, {});",
+                call.arg1, call.arg2
+            ),
+            crate::data::ExcuteStmt::CheckFinalStartCamera(call) => format!(
+                "{indent}macros::CHECK_VALID_FINAL_START_CAMERA(agent, {}, {}, {}, {}, {}, {});",
+                call.args[0],
+                call.args[1],
+                call.args[2],
+                call.args[3],
+                call.args[4],
+                call.args[5]
+            ),
+            crate::data::ExcuteStmt::FinalFearFace(call) => format!(
+                "{indent}macros::FT_SET_FINAL_FEAR_FACE(agent, {});",
+                call.argument
+            ),
             crate::data::ExcuteStmt::SetSpeedEx(call) => format!(
                 "{indent}macros::SET_SPEED_EX(agent, {}, {}, {});",
                 num(call.speed_x),
@@ -3975,8 +7933,9 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
                 call.flag
             ),
             crate::data::ExcuteStmt::WorkTransitionTerm(call) => format!(
-                "{indent}{}(agent.module_accessor, {});",
+                "{indent}{}({}, {});",
                 call.func(),
+                call.receiver.token(),
                 call.transition_term
             ),
             crate::data::ExcuteStmt::WorkModuleIncInt(call) => format!(
@@ -3991,12 +7950,26 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
                 call.value,
                 call.slot
             ),
+            crate::data::ExcuteStmt::SlowWhole(crate::data::SlowWholeCall::Set {
+                multiplier,
+                frames,
+            }) => format!(
+                "{indent}SlowModule::set_whole(agent.module_accessor, {multiplier}, {frames});"
+            ),
+            crate::data::ExcuteStmt::SlowWhole(crate::data::SlowWholeCall::Clear) => {
+                format!("{indent}SlowModule::clear_whole(agent.module_accessor);")
+            }
+            crate::data::ExcuteStmt::SlowOpponent(call) => format!(
+                "{indent}macros::SLOW_OPPONENT(agent, {}, {});",
+                num(call.slow_mul),
+                num(call.slow_time)
+            ),
             crate::data::ExcuteStmt::Raw(line) => format!("{indent}{line}"),
         })
         .collect()
 }
 
-fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<String> {
+pub(crate) fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for stmt in stmts {
         match stmt {
@@ -4004,11 +7977,18 @@ fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<String> {
                 "{indent}frame(agent.lua_state_agent, {});",
                 num(*f)
             )),
+            crate::data::AcmdStmt::NativeExecuteFrame(frame) => lines.push(format!(
+                "{indent}smash::app::sv_animcmd::execute(agent.lua_state_agent, {});",
+                num(*frame)
+            )),
+            crate::data::AcmdStmt::NativeMotionLoopSync => lines.push(format!(
+                "{indent}smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);"
+            )),
             crate::data::AcmdStmt::Wait(w) => {
                 lines.push(format!("{indent}wait(agent.lua_state_agent, {});", num(*w)))
             }
             crate::data::AcmdStmt::WaitLoopClear => {
-                lines.push(format!("{indent}wait_loop_clear(agent.lua_state_agent);"))
+                lines.push(format!("{indent}{WAIT_LOOP_CLEAR_SOURCE}"))
             }
             crate::data::AcmdStmt::MotionRate(rate) => lines.push(format!(
                 "{indent}macros::FT_MOTION_RATE(agent, {});",
@@ -4019,7 +7999,33 @@ fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<String> {
                 lines.extend(emit_excute_stmts(inner, &format!("{indent}    ")));
                 lines.push(format!("{indent}}}"));
             }
-            crate::data::AcmdStmt::Loop { count, body } => {
+            crate::data::AcmdStmt::Loop {
+                body,
+                motion_loop: crate::data::MotionLoop::Clear,
+                ..
+            } => {
+                lines.push(format!("{indent}loop {{"));
+                lines.extend(emit_stmts(body, &format!("{indent}    ")));
+                lines.push(format!("{indent}    {WAIT_LOOP_CLEAR_SOURCE}"));
+                lines.push(format!("{indent}}}"));
+            }
+            // The raw call leaves its result on the Lua stack; in an endless loop that would
+            // grow every cycle, so it is wrapped the way HDR writes it.
+            crate::data::AcmdStmt::Loop {
+                body,
+                motion_loop: crate::data::MotionLoop::SyncMotion,
+                ..
+            } => {
+                lines.push(format!("{indent}loop {{"));
+                lines.extend(emit_stmts(body, &format!("{indent}    ")));
+                lines.push(format!("{indent}    agent.clear_lua_stack();"));
+                lines.push(format!(
+                    "{indent}    smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);"
+                ));
+                lines.push(format!("{indent}    agent.pop_lua_stack(1);"));
+                lines.push(format!("{indent}}}"));
+            }
+            crate::data::AcmdStmt::Loop { count, body, .. } => {
                 lines.push(format!("{indent}for _ in 0..{count} {{"));
                 lines.extend(emit_stmts(body, &format!("{indent}    ")));
                 lines.push(format!("{indent}}}"));
@@ -4312,8 +8318,8 @@ pub(crate) fn hash_arg(name: &str) -> String {
     format!("Hash40::new(\"{name}\")")
 }
 
-/// Emit a typed C4 point event. Controls are kept separate from the spawn path because none of
-/// them owns an effect lifetime or a transform.
+/// Emit a typed effect point event. Controls are kept separate from the spawn path because none
+/// of them owns an effect lifetime or a transform.
 fn emit_effect_control(control: &crate::data::EffectControl, indent: &str) -> String {
     use crate::data::EffectControl;
     let line = match control {
@@ -4325,12 +8331,39 @@ fn emit_effect_control(control: &crate::data::EffectControl, indent: &str) -> St
             "macros::EFFECT_DETACH_KIND_WORK(agent, {}, {unk});",
             const_expr(work)
         ),
+        EffectControl::OffKindWork { preset_id } => {
+            let Some(preset) = crate::data::EffectOffKindWorkPreset::by_id(preset_id) else {
+                return format!("{indent}compile_error!(\"invalid off-kind Work preset ID\");\n");
+            };
+            format!(
+                "macros::EFFECT_OFF_KIND_WORK(agent, *{}, {}, {});",
+                preset.work_symbol, preset.flags[0], preset.flags[1]
+            )
+        }
         EffectControl::EnableArea { kind } => {
             format!("macros::ENABLE_AREA(agent, {});", const_expr(kind))
         }
         EffectControl::UnableArea { kind } => {
             format!("macros::UNABLE_AREA(agent, {});", const_expr(kind))
         }
+        EffectControl::SetDisableRenderOffsetLast => {
+            "EffectModule::set_disable_render_offset_last(agent.module_accessor);".to_string()
+        }
+        EffectControl::EnableSyncInitPosLast => {
+            "EffectModule::enable_sync_init_pos_last(agent.module_accessor);".to_string()
+        }
+        EffectControl::ReqScreen { preset_id } => {
+            let Some(preset) = crate::data::EffectReqScreenPreset::by_id(preset_id) else {
+                return format!("{indent}compile_error!(\"invalid req_screen preset ID\");\n");
+            };
+            format!(
+                "EffectModule::req_screen(agent.module_accessor, Hash40::new(\"{}\"), {}, {}, {});",
+                preset.effect_name, preset.flags[0], preset.flags[1], preset.flags[2]
+            )
+        }
+        EffectControl::SetDisableCameraDepthInfluence { value } => format!(
+            "ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, {value});"
+        ),
     };
     format!("{indent}{line}\n")
 }
@@ -4541,7 +8574,7 @@ fn emit_spawn_stop(call: &crate::data::EffectCall, indent: &str) -> String {
         // every exported move with a sword trail was an unbuildable project.
         //
         // `attack_mod_num`, not `num`: the slot is `ToF32`-generic, so both `0` and `0.0`
-        // compile, and all four vanilla calls write the bare integer. See B3.
+        // compile, and measured source uses multiple bare integer values.
         let arg = call.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT);
         return format!(
             "{indent}macros::AFTER_IMAGE_OFF(agent, {});\n",
@@ -5071,6 +9104,105 @@ pub fn preview_excute_stmts(stmts: &[crate::data::ExcuteStmt]) -> Vec<String> {
     emit_excute_stmts(stmts, "")
 }
 
+/// Render one effect command through the established typed spawn/control owners.
+/// Callers validate authored payloads before turning this source into node output.
+pub fn preview_effect_macro(command: &crate::data::EffectMacro) -> String {
+    if let crate::data::EffectMacro::EffectFollowWork {
+        work_symbol,
+        bone_name,
+        offset,
+        rotation,
+        scale,
+        unk8,
+    } = command
+    {
+        return format!(
+            "macros::EFFECT_FOLLOW_WORK(agent, *{work_symbol}, Hash40::new(\"{bone_name}\"), {}, {}, {}, {}, {}, {}, {}, {unk8});",
+            offset[0], offset[1], offset[2], rotation[2], rotation[1], rotation[0], scale
+        );
+    }
+    let script = crate::data::EffectScript {
+        stmts: vec![crate::data::EffectStmt::Excute(vec![command.clone()])],
+    };
+    let (calls, residue) = script.to_effect_calls_and_residue();
+    let mut source = String::new();
+    for call in &calls {
+        source.push_str(&emit_spawn_call(call, ""));
+    }
+    for lines in residue.values() {
+        for line in lines {
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
+    strip_effect_execute_wrapper(&source).unwrap_or(source)
+}
+
+/// The singleton preview is embedded inside the timeline's own structured `Excute` node.
+/// Some residue renderers include that same block in their source, so remove only a verified
+/// outer `if macros::is_excute(agent)` while retaining its contents.
+fn strip_effect_execute_wrapper(source: &str) -> Option<String> {
+    let wrapped = format!(
+        "unsafe extern \"C\" fn __effect_preview(agent: &mut L2CAgentBase) {{\n{source}\n}}\n"
+    );
+    let file = syn::parse_file(&wrapped).ok()?;
+    let function = file.items.iter().find_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == "__effect_preview" => Some(function),
+        _ => None,
+    })?;
+    let [syn::Stmt::Expr(syn::Expr::If(branch), _)] = function.block.stmts.as_slice() else {
+        return None;
+    };
+    if branch.else_branch.is_some() || !is_excute_condition(&branch.cond) {
+        return None;
+    }
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.first()?.trim() != "if macros::is_excute(agent) {" || lines.last()?.trim() != "}" {
+        return None;
+    }
+    let body = &lines[1..lines.len() - 1];
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.join("\n").trim().to_owned())
+}
+
+fn is_excute_condition(condition: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = condition else {
+        return false;
+    };
+    let syn::Expr::Path(function) = call.func.as_ref() else {
+        return false;
+    };
+    let path = &function.path;
+    let argument_is_agent = call.args.len() == 1
+        && matches!(call.args.first(), Some(syn::Expr::Path(path)) if path.path.is_ident("agent"));
+    path.segments.len() == 2
+        && path.segments[0].ident == "macros"
+        && path.segments[1].ident == "is_excute"
+        && argument_is_agent
+}
+
+/// Emit a complete effects statement tree without flattening its control flow.
+pub fn preview_effect_structure_fn(script: &crate::data::AcmdScript, move_name: &str) -> String {
+    let fn_name = script_function_name("effect", move_name);
+    let mut source = format!("unsafe extern \"C\" fn {fn_name}(agent: &mut L2CAgentBase) {{\n");
+    if serde_json::to_string(script)
+        .is_ok_and(|json| json.contains("visionary_last_effect_set_scale_w"))
+    {
+        for line in emit_last_effect_set_scale_w_helper("    ") {
+            source.push_str(&line);
+            source.push('\n');
+        }
+    }
+    for line in emit_stmts(&script.stmts, "    ") {
+        source.push_str(&line);
+        source.push('\n');
+    }
+    source.push_str("}\n");
+    source
+}
+
 /// The exact `sound_*` function an export would write for this move.
 pub fn preview_sound_fn(script: &crate::data::AcmdScript, move_name: &str) -> String {
     emit_sound_move_fn(script, move_name).1
@@ -5151,16 +9283,40 @@ pub fn unexportable_effect_lines(script: &crate::data::EffectScript) -> Vec<Stri
         }
     }
     fn walk(stmts: &[EffectStmt], depth: usize, out: &mut Vec<String>) {
-        for stmt in stmts {
+        for (index, stmt) in stmts.iter().enumerate() {
             match stmt {
+                EffectStmt::BareNativeCall(call) => keep(&call.source(), out),
+                EffectStmt::BareEffect(command) => keep(&preview_effect_macro(command), out),
                 EffectStmt::Raw(line) => keep(line, out),
+                EffectStmt::NativeExecuteFrame(frame) => keep(
+                    &format!(
+                        "smash::app::sv_animcmd::execute(agent.lua_state_agent, {});",
+                        num(*frame)
+                    ),
+                    out,
+                ),
+                EffectStmt::NativeMotionLoopSync => keep(
+                    "smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);",
+                    out,
+                ),
                 // Not reported from the tree. Whether an untyped macro survives depends on
                 // whether a spawn shares its frame block, which only the resolving walk knows;
                 // reporting from here would name lines the export does write.
                 EffectStmt::Excute(_) => {}
-                EffectStmt::Loop { body, .. } => walk(body, depth, out),
+                EffectStmt::Loop {
+                    body, motion_loop, ..
+                } => {
+                    walk(body, depth, out);
+                    // The flat export writes one pass; the loop's wait does not survive it.
+                    if *motion_loop == crate::data::MotionLoop::SyncMotion {
+                        keep(
+                            "smash::app::sv_animcmd::wait_loop_sync_mot(agent.lua_state_agent);",
+                            out,
+                        );
+                    }
+                }
                 EffectStmt::Cond { header, body } => {
-                    if depth > 0 {
+                    if depth > 0 || crate::data::effect_execute_arm(stmts, index) {
                         keep(header, out);
                     }
                     walk(body, depth + 1, out);
@@ -5178,6 +9334,7 @@ pub fn unexportable_effect_lines(script: &crate::data::EffectScript) -> Vec<Stri
 ///
 /// `edits` — list of `(fighter_name, move_name, script)` tuples (all fighters combined).
 /// `plugin_name` — the Cargo package name, e.g. `"my_hitbox_mod"`.
+#[cfg(test)]
 pub fn build_mod_project(
     edits: &[(String, String, crate::data::AcmdScript)],
     plugin_name: &str,
@@ -5210,6 +9367,7 @@ pub type EffectExport = (
 /// reason: a `sound_` function the plugin installs replaces the fighter's own, so a partial one
 /// would delete every call it left out. Passing only *changed* moves is correct and passing
 /// only *changed calls* is not.
+#[cfg(test)]
 pub fn build_mod_project_full(
     edits: &[(String, String, crate::data::AcmdScript)],
     effect_edits: &[EffectExport],
@@ -5238,6 +9396,7 @@ pub fn build_mod_project_full(
 pub type SlotGates = std::collections::HashMap<(String, String), (Vec<u8>, String)>;
 
 /// Like [`build_mod_project_full`] with editable `expression_` scripts included.
+#[cfg(test)]
 pub fn build_mod_project_full_with_expression(
     edits: &[(String, String, crate::data::AcmdScript)],
     effect_edits: &[EffectExport],
@@ -5257,12 +9416,60 @@ pub fn build_mod_project_full_with_expression(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_category_source(
+    output: &mut String,
+    gates: &SlotGates,
+    fighter: &str,
+    move_name: &str,
+    category: &str,
+    registered_name: &str,
+    source: &str,
+) {
+    match gates.get(&(fighter.to_string(), format!("{category}:{move_name}"))) {
+        Some((slots, original)) => {
+            output.push_str(&crate::roster::scaffold::costume_gated_source_multi(
+                registered_name,
+                slots,
+                source,
+                original,
+            ))
+        }
+        None => output.push_str(source),
+    }
+}
+
 /// Like [`build_mod_project_full_with_expression`], with `game_` scripts that belong to one
 /// costume emitted behind a costume gate.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_mod_project_with_slot_gates(
     edits: &[(String, String, crate::data::AcmdScript)],
     effect_edits: &[EffectExport],
+    sound_edits: &[(String, String, crate::data::AcmdScript)],
+    expression_edits: &[(String, String, crate::data::AcmdScript)],
+    live_tweaks: &[crate::mod_project::LiveTweak],
+    plugin_name: &str,
+    slot_gates: &SlotGates,
+) -> ModProject {
+    build_mod_project_with_effect_structures(
+        edits,
+        effect_edits,
+        &[],
+        sound_edits,
+        expression_edits,
+        live_tweaks,
+        plugin_name,
+        slot_gates,
+    )
+}
+
+/// Render full effect control trees alongside the legacy flat effect editor.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mod_project_with_effect_structures(
+    edits: &[(String, String, crate::data::AcmdScript)],
+    effect_edits: &[EffectExport],
+    effect_scripts: &[(String, String, crate::data::AcmdScript)],
     sound_edits: &[(String, String, crate::data::AcmdScript)],
     expression_edits: &[(String, String, crate::data::AcmdScript)],
     live_tweaks: &[crate::mod_project::LiveTweak],
@@ -5303,6 +9510,15 @@ pub fn build_mod_project_with_slot_gates(
         by_fighter.entry(fighter.as_str()).or_default();
     }
     let mut sfx_by_fighter: HashMap<&str, Vec<(&str, &crate::data::AcmdScript)>> = HashMap::new();
+    let mut full_fx_by_fighter: HashMap<&str, Vec<(&str, &crate::data::AcmdScript)>> =
+        HashMap::new();
+    for (fighter, move_name, script) in effect_scripts {
+        full_fx_by_fighter
+            .entry(fighter.as_str())
+            .or_default()
+            .push((move_name.as_str(), script));
+        by_fighter.entry(fighter.as_str()).or_default();
+    }
     for (fighter, move_name, script) in sound_edits {
         sfx_by_fighter
             .entry(fighter.as_str())
@@ -5435,16 +9651,6 @@ pub fn install() {{
 
         // src/{fighter}/acmd.rs — all moves for this fighter in one file
         let mut acmd_src = String::new();
-        acmd_src.push_str("use {\n");
-        acmd_src.push_str("    smash::{\n");
-        acmd_src.push_str("        lua2cpp::*,\n");
-        acmd_src.push_str("        phx::*,\n");
-        acmd_src.push_str("        app::{sv_animcmd::*, lua_bind::*},\n");
-        acmd_src.push_str("        lib::lua_const::*\n");
-        acmd_src.push_str("    },\n");
-        acmd_src.push_str("    smashline::*,\n");
-        acmd_src.push_str("    smash_script::*\n");
-        acmd_src.push_str("};\n\n");
 
         let mut sorted_moves = moves.clone();
         sorted_moves.sort_by_key(|(m, _)| *m);
@@ -5496,20 +9702,56 @@ pub fn install() {{
             for (move_name, calls, residue) in &sorted_fx {
                 let script_move = resolve_script_move_name(fighter, move_name);
                 let (fn_name, fn_src) = emit_effect_move_fn(calls, &script_move, &tweaks, residue);
-                acmd_src.push_str(&fn_src);
+                append_category_source(
+                    &mut acmd_src,
+                    slot_gates,
+                    fighter,
+                    move_name,
+                    "effect",
+                    &fn_name,
+                    &fn_src,
+                );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
             }
         }
 
         // Sound scripts for this fighter.
+        if let Some(effect_moves) = full_fx_by_fighter.get(fighter) {
+            let mut sorted = effect_moves.clone();
+            sorted.sort_by_key(|(name, _)| *name);
+            for (move_name, script) in sorted {
+                let script_move = resolve_script_move_name(fighter, move_name);
+                let name = script_function_name("effect", &script_move);
+                append_category_source(
+                    &mut acmd_src,
+                    slot_gates,
+                    fighter,
+                    move_name,
+                    "effect",
+                    &name,
+                    &preview_effect_structure_fn(script, &script_move),
+                );
+                acmd_src.push('\n');
+                fn_entries.push((name.clone(), name));
+            }
+        }
+
         if let Some(sfx_moves) = sfx_by_fighter.get(fighter) {
             let mut sorted_sfx = sfx_moves.clone();
             sorted_sfx.sort_by_key(|(m, _)| *m);
             for (move_name, script) in &sorted_sfx {
                 let script_move = resolve_script_move_name(fighter, move_name);
                 let (fn_name, fn_src) = emit_sound_move_fn(script, &script_move);
-                acmd_src.push_str(&fn_src);
+                append_category_source(
+                    &mut acmd_src,
+                    slot_gates,
+                    fighter,
+                    move_name,
+                    "sound",
+                    &fn_name,
+                    &fn_src,
+                );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
             }
@@ -5522,7 +9764,15 @@ pub fn install() {{
             for (move_name, script) in &sorted_expression {
                 let script_move = resolve_script_move_name(fighter, move_name);
                 let (fn_name, fn_src) = emit_expression_move_fn(script, &script_move);
-                acmd_src.push_str(&fn_src);
+                append_category_source(
+                    &mut acmd_src,
+                    slot_gates,
+                    fighter,
+                    move_name,
+                    "expression",
+                    &fn_name,
+                    &fn_src,
+                );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
             }
@@ -5536,6 +9786,42 @@ pub fn install() {{
             ));
         }
         acmd_src.push_str("}\n");
+
+        let attack_height_used = acmd_src.contains("AttackHeight(");
+        let hit_status_used = acmd_src.contains("HitStatus(");
+        let attack_direction_axis_used = acmd_src.contains("AttackDirectionAxis(");
+        let mut app_imports = "sv_animcmd::*, lua_bind::*, ArticleOperationTarget".to_string();
+        if acmd_src.contains("singletons::") {
+            app_imports.push_str(", lua_bind");
+        }
+        if acmd_src.contains("FighterSpecializer_Demon::") {
+            app_imports.push_str(", FighterSpecializer_Demon");
+        }
+        if attack_direction_axis_used {
+            app_imports.push_str(", AttackDirectionAxis");
+        }
+        if attack_height_used {
+            app_imports.push_str(", AttackHeight");
+        }
+        if hit_status_used {
+            app_imports.push_str(", HitStatus");
+        }
+        let mut with_imports = String::new();
+        with_imports.push_str("use {\n");
+        with_imports.push_str("    smash::{\n");
+        with_imports.push_str("        hash40,\n");
+        with_imports.push_str("        lua2cpp::*,\n");
+        with_imports.push_str("        phx::*,\n");
+        with_imports.push_str(&format!("        app::{{{app_imports}}},\n"));
+        with_imports.push_str("        lib::lua_const::{self, *}\n");
+        with_imports.push_str("    },\n");
+        with_imports.push_str("    smashline::*,\n");
+        with_imports.push_str("    smash_script::*\n");
+        with_imports.push_str("};\n\n");
+        with_imports.push_str(&effect_source_compatibility_macros(&acmd_src));
+        with_imports.push_str(&crate::move_nodes::native_calls::support_source(&acmd_src));
+        with_imports.push_str(&acmd_src);
+        acmd_src = with_imports;
 
         files.push(GeneratedFile {
             rel_path: format!("src/{module}/acmd.rs"),
@@ -5725,9 +10011,22 @@ pause
     }
 }
 
+#[cfg(test)]
+/// Re-emit a `sound_` function body at the corpus's own indentation.
+///
+/// The inverse of [`parse_sound_script`] up to the function header and closing brace, which the
+/// caller owns. Fidelity over the corpus is asserted by
+/// `every_sound_script_in_the_corpus_survives_a_round_trip`.
+pub fn emit_sound_body(script: &AcmdScript) -> String {
+    emit_stmts(&script.stmts, "    ")
+        .into_iter()
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+#[cfg(test)]
 /// Convenience: export a single move as a standalone project.
 /// Returns the `src/{fighter}/acmd.rs` content only — use `build_mod_project` for a full project.
-#[allow(dead_code)]
 pub fn export_acmd_source(
     script: &crate::data::AcmdScript,
     fighter: &str,
@@ -5747,13 +10046,3243 @@ pub fn export_acmd_source(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::move_nodes::test_support::assert_json_eq;
 
-    /// The test with teeth for a newly modelled macro: **the typed thing comes out at all.**
-    ///
-    /// A round-trip oracle cannot show this. An unmodelled line is kept as `Raw` and emitted
-    /// verbatim, so it round-trips *perfectly* — every export test was green on
-    /// `FT_MOTION_RATE` both before and after it was given a parse arm. Green means "nothing
-    /// broke", never "the new family works".
+    #[test]
+    fn body_visibility_new_pairs_require_unattributed_root_execute_context() {
+        fn typed(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .filter(|c| matches!(c, ExcuteStmt::VisibilitySetInt64 { .. }))
+                        .count(),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => typed(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        const CALL: &str = "VisibilityModule::set_int64(agent.module_accessor, hash40(\"sword\") as i64, hash40(\"sword_l\") as i64);";
+        let root = format!("if macros::is_excute(agent) {{\n{CALL}\n}}");
+        for category in ["game", "expression"] {
+            let source = format!(
+                "unsafe extern \"C\" fn {category}_test(agent: &mut L2CAgentBase) {{\n{root}\n}}\n"
+            );
+            let parsed = if category == "game" {
+                parse_acmd_script(&source)
+            } else {
+                parse_expression_script(&source)
+            };
+            assert_eq!(typed(&parsed.stmts), 1);
+            for body in [
+                CALL.to_owned(),
+                format!("if runtime_condition() {{\n{root}\n}}"),
+                format!("for _ in 0..2 {{\n{root}\n}}"),
+                format!("#[cfg(any())]\n\n// still attributed\n{root}"),
+                format!("#[cfg(\nany()\n)]\n{root}"),
+                format!("if macros::is_excute(agent) {{\n#[cfg(any())]\n\n// still attributed\n{CALL}\n}}"),
+                root.replace("macros::is_excute(agent)", "!macros::is_excute(agent)"),
+            ] {
+                let source = format!("unsafe extern \"C\" fn {category}_test(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+                let parsed = if category == "game" { parse_acmd_script(&source) } else { parse_expression_script(&source) };
+                assert_eq!(typed(&parsed.stmts), 0, "{source}");
+                let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+                assert!(emitted.contains(CALL), "new non-root calls remain source");
+            }
+        }
+        let sound =
+            format!("unsafe extern \"C\" fn sound_test(agent: &mut L2CAgentBase) {{\n{root}\n}}\n");
+        assert_eq!(typed(&parse_sound_script(&sound).stmts), 0);
+        let unknown = CALL.replace("sword_l", "unknown_sword_state");
+        assert!(parse_visibility_set_int64_call(&unknown).is_none());
+        let source = format!("unsafe extern \"C\" fn game_test(agent: &mut L2CAgentBase) {{\nif macros::is_excute(agent) {{\n{unknown}\n}}\n}}\n");
+        let parsed = parse_acmd_script(&source);
+        assert!(
+            matches!(parsed.stmts.as_slice(), [AcmdStmt::Excute(commands)]
+            if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw == &unknown))
+        );
+    }
+
+    #[test]
+    fn whole_visibility_is_literal_only_at_clean_root_game_expression_execute() {
+        fn count(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .filter(|command| matches!(command, ExcuteStmt::VisibilitySetWhole { .. }))
+                        .count(),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => count(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        fn parse(category: &str, body: &str) -> AcmdScript {
+            let source = format!(
+                "unsafe extern \"C\" fn {category}_whole_visibility(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            );
+            match category {
+                "game" => parse_acmd_script(&source),
+                "expression" => parse_expression_script(&source),
+                "sound" => parse_sound_script(&source),
+                _ => unreachable!(),
+            }
+        }
+
+        for category in ["game", "expression"] {
+            for visible in [true, false] {
+                let call =
+                    format!("VisibilityModule::set_whole(agent.module_accessor, {visible});");
+                let parsed = parse(
+                    category,
+                    &format!("if macros::is_excute(agent) {{\n    {call}\n}}"),
+                );
+                assert!(
+                    matches!(parsed.stmts.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::VisibilitySetWhole { visible: actual }] if *actual == visible))
+                );
+                let emitted = emit_stmts(&parsed.stmts, "").join("\n");
+                assert_eq!(count(&parse(category, &emitted).stmts), 1);
+                assert!(emitted.contains(&call));
+            }
+        }
+
+        let independent_permission = [
+            "if macros::is_excute(agent) {",
+            "    VisibilityModule::set_whole(agent.module_accessor, true);",
+            "}",
+        ];
+        let (parsed, _) = parse_stmts_with_fear_face_guard(
+            &independent_permission,
+            0,
+            ParseDomain::Game,
+            false,
+            false,
+            false,
+            RootStatementPermissions {
+                visibility: true,
+                motion_loop_sync: false,
+            },
+        );
+        assert_eq!(
+            count(&parsed),
+            1,
+            "visibility permission is not native-attack permission"
+        );
+
+        let mixed_else_source = r#"unsafe extern "C" fn game_visibility_mixed_else(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        VisibilityModule::set_int64(agent.module_accessor, hash40("sword") as i64, hash40("sword_l") as i64);
+        VisibilityModule::set_whole(agent.module_accessor, true);
+    }
+    else {
+        wait(agent.lua_state_agent, 1.0);
+    }
+}
+"#;
+        let mixed_else = parse_acmd_script(mixed_else_source);
+        assert!(
+            matches!(mixed_else.stmts.first(), Some(AcmdStmt::Excute(commands))
+            if matches!(commands.as_slice(), [
+                ExcuteStmt::VisibilitySetInt64 { group, status },
+                ExcuteStmt::Raw(raw),
+            ] if group == "sword" && status == "sword_l"
+                && raw == "VisibilityModule::set_whole(agent.module_accessor, true);"))
+        );
+
+        let malformed = [
+            "VisibilityModule::set_whole(boma, true);",
+            "VisibilityModule::set_whole(agent.module_accessor, visible);",
+            "VisibilityModule::set_whole(agent.module_accessor);",
+            "VisibilityModule::set_whole(agent.module_accessor, true, false);",
+        ];
+        for call in malformed {
+            let parsed = parse(
+                "game",
+                &format!("if macros::is_excute(agent) {{\n    {call}\n}}"),
+            );
+            assert_eq!(count(&parsed.stmts), 0, "{call}");
+            let emitted = emit_stmts(&parsed.stmts, "").join("\n");
+            assert!(emitted.contains(call), "{call}");
+        }
+
+        let call = "VisibilityModule::set_whole(agent.module_accessor, true);";
+        for body in [
+            format!("if macros::is_excute(agent) {{\n    #[cfg(any())]\n    {call}\n}}"),
+            format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    #[cfg(\n        any()\n    )]\n    {call}\n}}"),
+            format!("if runtime_condition() {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("for _ in 0..2 {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            call.to_owned(),
+            "if macros::is_excute(agent) {\n    VisibilityModule::set_whole(alias.module_accessor, true);\n}".to_owned(),
+            "if macros::is_excute(agent) {\n    VisibilityModule::set_whole(agent.module_accessor as _, true);\n}".to_owned(),
+            "if macros::is_excute(agent) {\n    visibility::VisibilityModule::set_whole(agent.module_accessor, true);\n}".to_owned(),
+        ] {
+            assert_eq!(count(&parse("game", &body).stmts), 0, "{body}");
+        }
+        for category in ["sound", "effect"] {
+            let source = format!(
+                "unsafe extern \"C\" fn {category}_whole_visibility(agent: &mut L2CAgentBase) {{\nif macros::is_excute(agent) {{\n    {call}\n}}\n}}\n"
+            );
+            if category == "sound" {
+                assert_eq!(count(&parse_sound_script(&source).stmts), 0, "sound");
+            } else {
+                let effect = parse_effect_script(&source);
+                assert!(
+                    matches!(effect.stmts.as_slice(), [crate::data::EffectStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [crate::data::EffectMacro::Raw(raw)] if raw == call))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_default_visibility_parser_rejects_noncanonical_receivers_and_arguments() {
+        for call in [
+            "VisibilityModule::set_default_int64(agent.module_accessor, Hash40::new(\"panel\"));",
+            "VisibilityModule::set_default_int64(alias, hash40(\"panel\") as i64);",
+            "VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"panel\"));",
+            "VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"panel\") as u64);",
+            "VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"panel\") as i64, false);",
+            "VisibilityModule::set_default_int64(agent.module_accessor, hash40(group) as i64);",
+            "VisibilityModule::set_default_int64(agent.module_accessor, 0);",
+            "VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"unmeasured\") as i64);",
+        ] {
+            assert!(parse_visibility_set_default_int64_call(call).is_none(), "{call}");
+        }
+        for &(_, group, _) in crate::data::PINNED_DEFAULT_INT64_GROUP_COUNTS {
+            let call = format!("VisibilityModule::set_default_int64(agent.module_accessor, hash40(\"{group}\") as i64);");
+            assert!(matches!(parse_visibility_set_default_int64_call(&call),
+                Some(ExcuteStmt::VisibilitySetDefaultInt64 { group: actual }) if actual == group));
+        }
+    }
+
+    #[test]
+    fn enabled_generation_parser_is_exact_and_only_promotes_clean_root_execute() {
+        let canonical = "ArticleModule::generate_article_enable(agent.module_accessor, *FIGHTER_KOOPAJR_GENERATE_ARTICLE_HAMMER, false, -1);";
+        assert!(parse_enabled_article_call(canonical).is_some());
+        for call in [
+            canonical.replace("agent.module_accessor", "other"),
+            canonical.replace("false", "true"),
+            canonical.replace(", -1", ""),
+            canonical.replace("-1", "0"),
+            canonical.replace("HAMMER", "CANNONBALL"),
+            canonical.replace("*FIGHTER_KOOPAJR_GENERATE_ARTICLE_HAMMER", "0"),
+            canonical.replace("-1", "get_index()"),
+        ] {
+            assert!(parse_enabled_article_call(&call).is_none(), "{call}");
+        }
+        for body in [
+            canonical.into(),
+            format!("if runtime_condition() {{\n    if macros::is_excute(agent) {{\n        {canonical}\n    }}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    {canonical}\n}} else {{\n    wait(agent.lua_state_agent, 1.0);\n}}"),
+            format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n    {canonical}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    #[cfg(any())]\n    {canonical}\n}}"),
+            format!("for _ in 0..2 {{\n    if macros::is_excute(agent) {{\n        {canonical}\n    }}\n}}"),
+        ] {
+            let source = format!("unsafe extern \"C\" fn game_enabled(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+            let parsed = parse_acmd_script(&source);
+            fn typed(stmts: &[AcmdStmt]) -> usize {
+                stmts.iter().map(|stmt| match stmt {
+                    AcmdStmt::Excute(commands) => commands.iter().filter(|command| matches!(command,
+                        ExcuteStmt::ArticleLifecycle(crate::data::ArticleLifecycleCall::GenerateEnabled { .. }))).count(),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => typed(body),
+                    _ => 0,
+                }).sum()
+            }
+            assert_eq!(typed(&parsed.stmts), 0, "{source}");
+        }
+    }
+
+    #[test]
+    fn article_state_parser_is_exact_and_keeps_unsupported_scopes_as_source() {
+        let call = "ArticleModule::change_status(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_SWORD, *WEAPON_MASTER_SWORD_STATUS_KIND_EXTEND, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));";
+        assert!(parse_article_status_call(call).is_some());
+        for invalid in [
+            call.replace("agent.module_accessor", "alias"),
+            call.replace("ARTICLE_OPE_TARGET_ALL", "ARTICLE_OPE_TARGET_LAST"),
+            call.replace("WEAPON_MASTER_SWORD_STATUS_KIND_EXTEND", "0"),
+            call.replace("WEAPON_MASTER_SWORD", "WEAPON_JACK_WIREROPE"),
+            call.replace(", ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)", ""),
+        ] {
+            assert!(parse_article_status_call(&invalid).is_none(), "{invalid}");
+        }
+        fn typed(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .filter(|command| {
+                            matches!(
+                                command,
+                                ExcuteStmt::ArticleLifecycle(
+                                    crate::data::ArticleLifecycleCall::ChangeStatus { .. }
+                                )
+                            )
+                        })
+                        .count(),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => typed(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        for body in [call.into(), format!("if unknown() {{\nif macros::is_excute(agent) {{\n{call}\n}}\n}}"), format!("if macros::is_excute(agent) {{\n{call}\n}} else {{\nwait(agent.lua_state_agent, 1.0);\n}}"), format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n{call}\n}}"), format!("if macros::is_excute(agent) {{\n#[cfg(any())]\n{call}\n}}"), format!("for _ in 0..2 {{\nif macros::is_excute(agent) {{\n{call}\n}}\n}}" )] {
+            let source = format!("unsafe extern \"C\" fn game_state(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+            assert_eq!(typed(&parse_acmd_script(&source).stmts), 0, "{source}");
+        }
+        let source = format!("unsafe extern \"C\" fn sound_state(agent: &mut L2CAgentBase) {{\nif macros::is_excute(agent) {{\n{call}\n}}\n}}\n");
+        assert_eq!(typed(&parse_sound_script(&source).stmts), 0);
+    }
+
+    #[test]
+    fn body_visibility_legacy_pair_keeps_nested_source_compatibility() {
+        let source = r#"unsafe extern "C" fn expression_test(agent: &mut L2CAgentBase) {
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            VisibilityModule::set_int64(agent.module_accessor, hash40("body") as i64, hash40("body_normal") as i64);
+        }
+    }
+}
+"#;
+        let parsed = parse_expression_script(source);
+        let AcmdStmt::Loop { body, .. } = &parsed.stmts[0] else {
+            panic!("loop retained");
+        };
+        assert!(matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+            if matches!(commands.as_slice(), [ExcuteStmt::VisibilitySetInt64 { group, status }]
+                if group == "body" && status == "body_normal")));
+        let emitted = preview_expression_fn(&parsed, "test");
+        assert_json_eq!(&parsed, parse_expression_script(&emitted));
+    }
+
+    #[test]
+    fn slope_presentation_forms_are_typed_strict_and_roundtrip() {
+        let source = r#"unsafe extern "C" fn game_slope(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_TOP);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_NONE, 3);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_L, 6, true);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_R, 4, false);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_UNKNOWN);
+        slope!(other, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_LR, -1);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_LR, 601);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE_INTP, *SLOPE_STATUS_LR, 3, maybe);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR, 3);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block: {:#?}", parsed.stmts);
+        };
+        use crate::data::{ExcuteStmt, SlopeCall, SlopeStatus};
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Slope(_)))
+                .count(),
+            5
+        );
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::Slope(SlopeCall::Set {
+                status: SlopeStatus::Lr
+            }))
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(ExcuteStmt::Slope(SlopeCall::Interpolate {
+                status: SlopeStatus::None,
+                frames: 3,
+                trailing_flag: None,
+            }))
+        ));
+        assert!(matches!(
+            commands.get(3),
+            Some(ExcuteStmt::Slope(SlopeCall::Interpolate {
+                status: SlopeStatus::Left,
+                frames: 6,
+                trailing_flag: Some(true),
+            }))
+        ));
+        assert!(
+            commands
+                .iter()
+                .filter_map(|command| match command {
+                    ExcuteStmt::Raw(line) => Some(line),
+                    _ => None,
+                })
+                .count()
+                == 6
+        );
+        let emitted = preview_game_fn(&parsed, "slope");
+        let reparsed = parse_acmd_script(&emitted);
+        assert_json_eq!(reparsed, parsed);
+    }
+
+    #[test]
+    fn item_visibility_has_one_fixed_typed_shape() {
+        let source = r#"unsafe extern "C" fn game_item_visibility(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ItemModule::set_have_item_visibility(agent.module_accessor, false, 0);
+        ItemModule::set_have_item_visibility(agent.module_accessor, true, 0);
+        ItemModule::set_have_item_visibility(boma, false, 0);
+        ItemModule::set_have_item_visibility(agent.module_accessor, false, 1);
+        ItemModule::set_have_item_visibility(agent.module_accessor, 0, 0);
+        ItemModule::set_have_item_visibility(agent.module_accessor, visible, 0);
+        ItemModule::set_have_item_visibility(agent.module_accessor, false);
+        ItemModule::set_have_item_visibility(agent.module_accessor, false, 0, true);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block: {:#?}", parsed.stmts);
+        };
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::ItemVisibility { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            6
+        );
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::ItemVisibility { visible: false })
+        ));
+        let emitted = preview_game_fn(&parsed, "item_visibility");
+        assert!(emitted
+            .contains("ItemModule::set_have_item_visibility(agent.module_accessor, false, 0);"));
+        assert!(emitted
+            .contains("ItemModule::set_have_item_visibility(agent.module_accessor, true, 0);"));
+        assert!(emitted.contains("ItemModule::set_have_item_visibility(boma, false, 0);"));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn jostle_and_visibility_native_calls_use_closed_shapes() {
+        let source = r#"unsafe extern "C" fn game_native_calls(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        JostleModule::set_status(agent.module_accessor, false);
+        JostleModule::set_status(agent.module_accessor, true);
+        JostleModule::set_status(boma, false);
+        JostleModule::set_status(agent.module_accessor, enabled);
+        JostleModule::set_status(agent.module_accessor, false, true);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("body") as i64, hash40("body_normal") as i64);
+        VisibilityModule::set_int64(boma, hash40("body") as i64, hash40("body_normal") as i64);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("body"), hash40("body_normal") as i64);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("body") as i64, 7);
+        VisibilityModule::set_int64(agent.module_accessor, group, status);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("group") as i64, hash40("status") as i64);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("bad-name") as i64, hash40("body_normal") as i64);
+    }
+
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block: {:#?}", parsed.stmts);
+        };
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::JostleSetStatus { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::VisibilitySetInt64 { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            9
+        );
+        assert!(matches!(
+            commands.get(5),
+            Some(ExcuteStmt::VisibilitySetInt64 { group, status })
+                if group == "body" && status == "body_normal"
+        ));
+        let emitted = preview_game_fn(&parsed, "native_calls");
+        assert!(emitted.contains("JostleModule::set_status(agent.module_accessor, false);"));
+        assert!(emitted.contains(
+            "VisibilityModule::set_int64(agent.module_accessor, hash40(\"body\") as i64, hash40(\"body_normal\") as i64);"
+        ));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn fixed_jostle_area_unsupported_shapes_stay_raw() {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+
+        const SOURCE: &str = r#"unsafe extern "C" fn game_fixed_jostle_area_reject(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(boma, 1.0, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0 + 2.0, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, f32::NAN, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 10001.0, 2.0);
+        wrapper::FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0, 2.0);
+        use_area(FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0, 2.0));
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0, 2.0); trailing;
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0, 2.0); ();
+        FighterAreaModuleImpl::enable_fix_jostle_area_xy(agent.module_accessor, 1.0, 2.0, 3.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 4.5.0, 3.0, 6.5, 4.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0f32, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, #[cfg(false)] 1.0, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1e99, 2.0);
+        FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 1.0, 2.0); FighterAreaModuleImpl::enable_fix_jostle_area(agent.module_accessor, 3.0, 4.0);
+        FighterAreaModuleImpl::disable_fix_jostle_area(agent.module_accessor);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(SOURCE);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block")
+        };
+        assert_eq!(commands.len(), 17);
+        assert!(commands
+            .iter()
+            .all(|command| matches!(command, ExcuteStmt::Raw(_))));
+        assert!(matches!(
+            commands.get(10),
+            Some(ExcuteStmt::Raw(line)) if line.contains("4.5.0, 3.0, 6.5, 4.0")
+        ));
+    }
+
+    #[test]
+    fn attack_module_all_setters_parse_only_observed_game_execute_shapes() {
+        use crate::data::{AttackModuleSetAllKind, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_attack_module_setters(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_no_dead_all(agent.module_accessor, true, false);
+        AttackModule::set_no_dead_all(agent.module_accessor, true, true);
+        AttackModule::set_catch_only_all(agent.module_accessor, true, false);
+        AttackModule::set_no_dead_all(agent.module_accessor, false, false);
+        AttackModule::set_no_dead_all(agent.module_accessor, true);
+        AttackModule::set_no_dead_all(agent.module_accessor, enabled, false);
+        AttackModule::set_catch_only_all(agent.module_accessor, true, true);
+        AttackModule::set_catch_only_all(boma, true, false);
+        AttackModule::set_catch_only_all(agent.module_accessor, true, false, true);
+        AttackModule::set_no_dead_all(agent.module_accessor, true, false); trailing;
+        AttackModule::set_no_damage_orbit_all(agent.module_accessor, true, false);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::AttackModuleSetAll {
+                kind: AttackModuleSetAllKind::NoDeadAll,
+                arg2: true,
+                arg3: false,
+            })
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(ExcuteStmt::AttackModuleSetAll {
+                kind: AttackModuleSetAllKind::NoDeadAll,
+                arg2: true,
+                arg3: true,
+            })
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(ExcuteStmt::AttackModuleSetAll {
+                kind: AttackModuleSetAllKind::CatchOnlyAll,
+                arg2: true,
+                arg3: false,
+            })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            8
+        );
+        let emitted = preview_game_fn(&parsed, "attack_module_setters");
+        assert!(
+            emitted.contains("AttackModule::set_no_dead_all(agent.module_accessor, true, false);")
+        );
+        assert!(emitted
+            .contains("AttackModule::set_catch_only_all(agent.module_accessor, true, false);"));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+
+        let expression = r#"unsafe extern "C" fn expression_native_wrong_track(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_no_dead_all(agent.module_accessor, true, false);
+    }
+}
+"#;
+        let parsed_expression = parse_expression_script(expression);
+        assert!(matches!(
+            parsed_expression.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(line)]
+                    if line == "AttackModule::set_no_dead_all(agent.module_accessor, true, false);")
+        ));
+
+        let control_flow = r#"unsafe extern "C" fn game_native_opaque_branch(agent: &mut L2CAgentBase) {
+    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD) {
+        if macros::is_excute(agent) {
+            AttackModule::set_no_dead_all(agent.module_accessor, true, false);
+        }
+    }
+}
+"#;
+        let parsed_control_flow = parse_acmd_script(control_flow);
+        assert!(matches!(
+            parsed_control_flow.stmts.as_slice(),
+            [AcmdStmt::RawBlock { body, .. }]
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(line)]
+                        if line == "AttackModule::set_no_dead_all(agent.module_accessor, true, false);"))
+        ));
+        let looped = r#"unsafe extern "C" fn game_native_loop(agent: &mut L2CAgentBase) {
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            AttackModule::set_no_dead_all(agent.module_accessor, true, false);
+        }
+    }
+}
+"#;
+        let parsed_loop = parse_acmd_script(looped);
+        assert!(matches!(
+            parsed_loop.stmts.as_slice(),
+            [AcmdStmt::Loop { body, .. }]
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(line)]
+                        if line == "AttackModule::set_no_dead_all(agent.module_accessor, true, false);"))
+        ));
+    }
+
+    #[test]
+    fn indexed_attack_and_grab_rebound_calls_are_closed_game_execute_forms() {
+        use crate::data::{AttackModuleSetIndexedKind, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_indexed_native_calls(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_no_finish_camera(agent.module_accessor, 0, true, false);
+        AttackModule::set_no_finish_camera(agent.module_accessor, 3, true, false);
+        AttackModule::set_force_reaction(agent.module_accessor, 1, true, false);
+        AttackModule::set_force_reaction(agent.module_accessor, 2, true, false);
+        AttackModule::set_force_reaction(agent.module_accessor, 4, true, false);
+        AttackModule::set_no_finish_camera(agent.module_accessor, 01, true, false);
+        AttackModule::set_no_finish_camera(agent.module_accessor, 0, false, false);
+        AttackModule::set_no_finish_camera(agent.module_accessor, 0, true, true);
+        AttackModule::set_no_finish_camera(boma, 0, true, false);
+        AttackModule::set_no_finish_camera(agent.module_accessor, 0, true);
+        GrabModule::set_rebound(agent.module_accessor, true);
+        GrabModule::set_rebound(agent.module_accessor, false);
+        GrabModule::set_rebound(boma, true);
+        GrabModule::set_rebound(agent.module_accessor, enabled);
+        GrabModule::set_rebound(agent.module_accessor, false, true);
+    }
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            GrabModule::set_rebound(agent.module_accessor, true);
+            AttackModule::set_force_reaction(agent.module_accessor, 0, true, false);
+        }
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected Game execute block: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::AttackModuleSetIndexed {
+                kind: AttackModuleSetIndexedKind::NoFinishCamera,
+                id: 0,
+                arg3: true,
+                arg4: false,
+            })
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(ExcuteStmt::AttackModuleSetIndexed {
+                kind: AttackModuleSetIndexedKind::ForceReaction,
+                id: 1,
+                arg3: true,
+                arg4: false,
+            })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::AttackModuleSetIndexed { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::GrabRebound { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            8,
+            "unsupported IDs, tails, receivers, and argument counts must remain Raw"
+        );
+        assert!(commands.iter().any(|command| matches!(command,
+            ExcuteStmt::NativeCall(call) if call.callee == "AttackModule::set_force_reaction"
+        )));
+        assert!(
+            matches!(parsed.stmts.get(1), Some(AcmdStmt::Loop { body, .. })
+            if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(_), ExcuteStmt::NativeCall(call)] if call.callee == "AttackModule::set_force_reaction")))
+        );
+
+        let expression = r#"unsafe extern "C" fn expression_native_calls(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        GrabModule::set_rebound(agent.module_accessor, true);
+        AttackModule::set_force_reaction(agent.module_accessor, 0, true, false);
+    }
+}
+"#;
+        let parsed_expression = parse_expression_script(expression);
+        assert!(matches!(parsed_expression.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(_), ExcuteStmt::NativeCall(call)] if call.callee == "AttackModule::set_force_reaction")));
+
+        let emitted = preview_game_fn(&parsed, "indexed_native_calls");
+        assert!(emitted.contains(
+            "AttackModule::set_no_finish_camera(agent.module_accessor, 0, true, false);"
+        ));
+        assert!(emitted
+            .contains("AttackModule::set_force_reaction(agent.module_accessor, 1, true, false);"));
+        assert!(emitted.contains("GrabModule::set_rebound(agent.module_accessor, false);"));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed calls and every rejected native sibling must round-trip"
+        );
+    }
+
+    #[test]
+    fn corpus_final_finish_cut_ins_keep_flags_and_timing_in_the_existing_node() {
+        use crate::move_nodes::{
+            coverage,
+            model::{MoveGraph, NodeKind, Track},
+            timeline,
+        };
+        for (fighter, origin, line, expected) in [
+            (
+                "diddy", "diddy/FinalFinishBurst.txt",
+                "AttackModule::set_final_finish_cut_in(agent.module_accessor, 1, true, true, -1, false);",
+                (1, true, true, -1.0, false),
+            ),
+            (
+                "miifighter", "miifighter/FinalAttack.txt",
+                "AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, 91, false);",
+                (0, true, false, 91.0, false),
+            ),
+        ] {
+            let source = format!("unsafe extern \"C\" fn game_fixture(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}");
+            let parsed = parse_acmd_script(&source);
+            let AcmdStmt::Excute(commands) = &parsed.stmts[0] else { panic!("{origin}") };
+            let [ExcuteStmt::AttackModuleSetFinalFinishCutIn { id, arg3, arg4, arg5, arg6 }] = commands.as_slice() else { panic!("{origin}") };
+            assert_eq!((*id, *arg3, *arg4, *arg5, *arg6), expected, "{origin}");
+            let imported = timeline::import_for_fighter(fighter, Track::Game, &parsed);
+            assert_eq!(coverage::track_summary(&imported).editable_command_count, 1);
+            let graph = MoveGraph { tracks: vec![imported], ..Default::default() };
+            let mut restored: MoveGraph = serde_json::from_str(&serde_json::to_string(&graph).unwrap()).unwrap();
+            let compiled = timeline::compile(fighter, "fixture", &restored).unwrap();
+            assert_json_eq!(&compiled[0].1, &parsed);
+            let emitted = preview_game_fn(&compiled[0].1, "fixture");
+            syn::parse_file(&emitted).unwrap();
+            assert_json_eq!(parse_acmd_script(&emitted), &parsed);
+            // An edit is validated and emitted through the same dedicated command variant.
+            let NodeKind::Execute { commands } = &mut restored.tracks[0].nodes[0].kind else { panic!() };
+            let ExcuteStmt::AttackModuleSetFinalFinishCutIn { arg4, .. } = &mut commands[0] else { panic!() };
+            *arg4 = !*arg4;
+            let edited = timeline::compile(fighter, "fixture", &restored).unwrap();
+            assert_json_eq!(parse_acmd_script(&preview_game_fn(&edited[0].1, "fixture")), &edited[0].1);
+
+            for rejected in [
+                line.replace("agent.module_accessor", "other"),
+                line.replacen(");", ", true);", 1),
+                line.replacen("true", "dynamic_flag()", 1),
+                line.replacen("true", "0", 1),
+                format!("#[cfg(any())] {line}"),
+            ] {
+                let rejected_source = source.replace(line, &rejected);
+                let imported = timeline::import_for_fighter(fighter, Track::Game, &parse_acmd_script(&rejected_source));
+                assert_eq!(coverage::track_summary(&imported).editable_command_count, 0, "{origin}: {rejected}");
+            }
+            let nested = source.replace("    if macros::is_excute(agent) {", "    if unknown_condition() {\n    if macros::is_excute(agent) {").replace("\n}", "\n}\n}");
+            let imported = timeline::import_for_fighter(fighter, Track::Game, &parse_acmd_script(&nested));
+            assert_eq!(coverage::track_summary(&imported).editable_command_count, 0);
+            let wrong_track = source.replace("game_fixture", "expression_fixture");
+            let imported = timeline::import_for_fighter(fighter, Track::Expression, &parse_expression_script(&wrong_track));
+            assert_eq!(coverage::track_summary(&imported).editable_command_count, 0);
+        }
+    }
+
+    #[test]
+    fn attack_height_and_final_finish_calls_are_closed_game_execute_forms() {
+        use crate::data::{AttackHeightAllKind, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_attack_module_native_calls(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH), false);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_LOW), false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 3, true, false, -1.0, false);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_MIDDLE), false);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH), true);
+        AttackModule::set_attack_height_all(boma, AttackHeight(*ATTACK_HEIGHT_LOW), false);
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH));
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, -1, true, false, -1, false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 01, true, false, -1, false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, dynamic_flag(), false, -1, false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, dynamic_frame(), false);
+        AttackModule::set_final_finish_cut_in(boma, 0, true, false, -1, false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false, true);
+    }
+    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD) {
+        if macros::is_excute(agent) {
+            AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH), false);
+            AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false);
+        }
+    }
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_LOW), false);
+            AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false);
+        }
+    }
+    AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH), false);
+    AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false);
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected direct Game execute block: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands[0],
+            ExcuteStmt::AttackModuleSetHeightAll {
+                height: AttackHeightAllKind::High,
+                arg3: false,
+            }
+        ));
+        assert!(matches!(
+            commands[1],
+            ExcuteStmt::AttackModuleSetHeightAll {
+                height: AttackHeightAllKind::Low,
+                arg3: false,
+            }
+        ));
+        assert!(matches!(
+            commands[2],
+            ExcuteStmt::AttackModuleSetFinalFinishCutIn {
+                id: 0,
+                arg3: true,
+                arg4: false,
+                arg5: -1.0,
+                arg6: false,
+            }
+        ));
+        assert!(matches!(
+            commands[3],
+            ExcuteStmt::AttackModuleSetFinalFinishCutIn { id: 3, .. }
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            10,
+            "unmeasured selectors, receivers, IDs, tails, and arities stay Raw"
+        );
+        assert!(matches!(
+            &parsed.stmts[1],
+            AcmdStmt::RawBlock { body, .. }
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::AttackModuleSetHeightAll { .. }, ExcuteStmt::Raw(_)]))
+        ));
+        assert!(matches!(
+            &parsed.stmts[2],
+            AcmdStmt::Loop { body, .. }
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::AttackModuleSetHeightAll { .. }, ExcuteStmt::Raw(_)]))
+        ));
+        assert!(matches!(parsed.stmts.get(3), Some(AcmdStmt::Raw(_))));
+
+        let expression = r#"unsafe extern "C" fn expression_wrong_track(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_attack_height_all(agent.module_accessor, AttackHeight(*ATTACK_HEIGHT_HIGH), false);
+        AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1, false);
+    }
+}
+"#;
+        let parsed_expression = parse_expression_script(expression);
+        assert!(matches!(
+            parsed_expression.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(_), ExcuteStmt::Raw(_)])
+        ));
+
+        let emitted = preview_game_fn(&parsed, "attack_module_native_calls");
+        assert!(emitted.contains(
+            "AttackModule::set_final_finish_cut_in(agent.module_accessor, 0, true, false, -1.0, false);"
+        ));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed calls and rejected/native-neighbor source must round-trip"
+        );
+    }
+
+    #[test]
+    fn expression_reference_joint_catalog_is_closed_and_round_trips() {
+        use crate::data::{AttackReferenceJointKind, ExcuteStmt};
+        use std::collections::HashSet;
+
+        let unique_tuples = AttackReferenceJointKind::EXPRESSION_CHOICES
+            .iter()
+            .map(|kind| kind.native_parts())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            unique_tuples.len(),
+            AttackReferenceJointKind::EXPRESSION_CHOICES.len()
+        );
+
+        let source_calls = AttackReferenceJointKind::EXPRESSION_CHOICES
+            .iter()
+            .map(|kind| {
+                let (bone, axis3, axis4, axis5) = kind.native_parts();
+                format!(
+                    "AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"{bone}\"), AttackDirectionAxis(*{axis3}), AttackDirectionAxis(*{axis4}), AttackDirectionAxis(*{axis5}));"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n        ");
+        let source = format!(
+            "unsafe extern \"C\" fn expression_reference_catalog(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {source_calls}\n    }}\n}}\n"
+        );
+        let parsed = parse_expression_script(&source);
+        let [AcmdStmt::Excute(commands)] = parsed.stmts.as_slice() else {
+            panic!(
+                "expected one direct Expression Execute: {:#?}",
+                parsed.stmts
+            );
+        };
+        assert_eq!(
+            commands.len(),
+            AttackReferenceJointKind::EXPRESSION_CHOICES.len()
+        );
+        assert!(commands.iter().all(|command| matches!(
+            command,
+            ExcuteStmt::AttackModuleSetAttackReferenceJointId { .. }
+        )));
+        assert!(parsed.to_expression_events().is_empty());
+        let emitted = preview_expression_fn(&parsed, "reference_catalog");
+        assert_json_eq!(parse_expression_script(&emitted).stmts, parsed.stmts);
+
+        let game_source_calls = AttackReferenceJointKind::EXPRESSION_CHOICES
+            .iter()
+            .filter(|kind| !AttackReferenceJointKind::GAME_CHOICES.contains(kind))
+            .map(|kind| {
+                let (bone, axis3, axis4, axis5) = kind.native_parts();
+                format!(
+                    "AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"{bone}\"), AttackDirectionAxis(*{axis3}), AttackDirectionAxis(*{axis4}), AttackDirectionAxis(*{axis5}));"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n        ");
+        let game_source = format!(
+            "unsafe extern \"C\" fn game_reference_catalog(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {game_source_calls}\n    }}\n}}\n"
+        );
+        let game = parse_acmd_script(&game_source);
+        let [AcmdStmt::Excute(commands)] = game.stmts.as_slice() else {
+            panic!("expected one direct Game Execute: {:#?}", game.stmts);
+        };
+        assert_eq!(commands.len(), 81);
+        assert!(commands
+            .iter()
+            .all(|command| matches!(command, ExcuteStmt::Raw(_))));
+
+        let kind = AttackReferenceJointKind::EXPRESSION_CHOICES[3];
+        let (bone, axis3, axis4, axis5) = kind.native_parts();
+        let valid_call = format!(
+            "AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"{bone}\"), AttackDirectionAxis(*{axis3}), AttackDirectionAxis(*{axis4}), AttackDirectionAxis(*{axis5}));"
+        );
+        let expression_source = |body: &str| {
+            format!(
+            "unsafe extern \"C\" fn expression_reference_negative(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {body}\n    }}\n}}\n"
+        )
+        };
+        let assert_not_typed = |source: &str| {
+            let parsed = parse_expression_script(source);
+            let encoded = serde_json::to_string(&parsed).unwrap();
+            assert!(
+                !encoded.contains("AttackModuleSetAttackReferenceJointId"),
+                "{source}"
+            );
+        };
+        assert_not_typed(&expression_source(
+            &valid_call.replace("agent.module_accessor", "boma"),
+        ));
+        let wrong_arity_split = valid_call.rfind(", AttackDirectionAxis(*").unwrap();
+        let wrong_arity = format!("{});", &valid_call[..wrong_arity_split]);
+        assert_not_typed(&expression_source(&wrong_arity));
+        for (joint, a, b, c) in [
+            (
+                "rot",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+                "ATTACK_DIRECTION_Y",
+            ),
+            (
+                "top",
+                "ATTACK_DIRECTION_Y",
+                "ATTACK_DIRECTION_X",
+                "ATTACK_DIRECTION_Z",
+            ),
+        ] {
+            let unlisted = format!(
+                "AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"{joint}\"), AttackDirectionAxis(*{a}), AttackDirectionAxis(*{b}), AttackDirectionAxis(*{c}));"
+            );
+            assert_not_typed(&expression_source(&unlisted));
+        }
+        assert_not_typed(&expression_source(&format!("if true {{ {valid_call} }}")));
+        assert_not_typed(&expression_source(&format!(
+            "#[cfg(any())]\n        {valid_call}"
+        )));
+        assert_not_typed(&expression_source(&format!("wrapper!({valid_call});")));
+        let bare_expression = format!(
+            "unsafe extern \"C\" fn expression_reference_bare(agent: &mut L2CAgentBase) {{\n    {valid_call}\n}}\n"
+        );
+        assert_not_typed(&bare_expression);
+        let sound_source =
+            bare_expression.replace("expression_reference_bare", "sound_reference_bare");
+        assert!(!serde_json::to_string(&parse_sound_script(&sound_source))
+            .unwrap()
+            .contains("AttackModuleSetAttackReferenceJointId"));
+
+        let mixed_source = expression_source(&format!(
+            "unknown_before();\n        {valid_call}\n        unknown_after();"
+        ));
+        let mixed = parse_expression_script(&mixed_source);
+        let [AcmdStmt::Excute(commands)] = mixed.stmts.as_slice() else {
+            panic!("expected mixed Execute block: {:#?}", mixed.stmts);
+        };
+        assert!(matches!(
+            commands.as_slice(),
+            [ExcuteStmt::Raw(_), ExcuteStmt::AttackModuleSetAttackReferenceJointId { kind: found }, ExcuteStmt::Raw(_)]
+                if *found == kind
+        ));
+        let mixed_export = preview_expression_fn(&mixed, "reference_mixed");
+        assert_json_eq!(parse_expression_script(&mixed_export).stmts, mixed.stmts);
+    }
+
+    #[test]
+    fn attack_module_init_reference_and_smoke_calls_are_closed_game_forms() {
+        use crate::data::{AttackReferenceJointKind, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_attack_module_exact_calls(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_NONE), AttackDirectionAxis(*ATTACK_DIRECTION_NONE));
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("toer"), AttackDirectionAxis(*ATTACK_DIRECTION_Y_MINUS), AttackDirectionAxis(*ATTACK_DIRECTION_X), AttackDirectionAxis(*ATTACK_DIRECTION_Z));
+        AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false);
+        AttackModule::init_attack_pos(agent.module_accessor, 1);
+        AttackModule::init_attack_pos(boma, 0);
+        AttackModule::init_attack_pos(agent.module_accessor, 0, true);
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_X), AttackDirectionAxis(*ATTACK_DIRECTION_Z));
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new( "top" ), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis( *ATTACK_DIRECTION_Y ), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new_raw(0x0000000000000000), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_attack_reference_joint_id(boma, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, true);
+        AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, false, false);
+        AttackModule::set_no_damage_fly_smoke_all(boma, true, false);
+        AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false, true);
+    }
+    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD) {
+        if macros::is_excute(agent) {
+            AttackModule::init_attack_pos(agent.module_accessor, 0);
+            AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+            AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false);
+        }
+    }
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            AttackModule::init_attack_pos(agent.module_accessor, 0);
+            AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+            AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false);
+        }
+    }
+    AttackModule::init_attack_pos(agent.module_accessor, 0);
+    AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+    AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false);
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected direct Game execute block: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::AttackModuleInitAttackPos { id: 0 })
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(ExcuteStmt::AttackModuleSetAttackReferenceJointId {
+                kind: AttackReferenceJointKind::TopYZX,
+            })
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(ExcuteStmt::AttackModuleSetAttackReferenceJointId {
+                kind: AttackReferenceJointKind::TopYNoneNone,
+            })
+        ));
+        assert!(matches!(
+            commands.get(3),
+            Some(ExcuteStmt::AttackModuleSetAttackReferenceJointId {
+                kind: AttackReferenceJointKind::ToerYMinusXZ,
+            })
+        ));
+        assert!(matches!(
+            commands.get(4),
+            Some(ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll {
+                arg2: true,
+                arg3: false,
+            })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            12,
+            "unmeasured IDs, tuples, receivers, tails, and arities stay Raw"
+        );
+        for index in [1, 2] {
+            assert!(matches!(
+                &parsed.stmts[index],
+                AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. }
+                    if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                        if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_))))
+            ));
+        }
+        assert!(matches!(parsed.stmts.get(3), Some(AcmdStmt::Raw(_))));
+
+        let expression = r#"unsafe extern "C" fn expression_wrong_track(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Y), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_X));
+        AttackModule::set_no_damage_fly_smoke_all(agent.module_accessor, true, false);
+    }
+}
+"#;
+        let parsed_expression = parse_expression_script(expression);
+        assert!(matches!(
+            parsed_expression.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::Raw(_),
+                    ExcuteStmt::AttackModuleSetAttackReferenceJointId { kind: AttackReferenceJointKind::TopYZX },
+                    ExcuteStmt::Raw(_)
+                ])
+        ));
+
+        let emitted = preview_game_fn(&parsed, "attack_module_exact_calls");
+        assert!(emitted.contains(
+            "AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new(\"toer\"), AttackDirectionAxis(*ATTACK_DIRECTION_Y_MINUS), AttackDirectionAxis(*ATTACK_DIRECTION_X), AttackDirectionAxis(*ATTACK_DIRECTION_Z));"
+        ));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed calls and rejected/native-neighbor source must round-trip"
+        );
+    }
+
+    #[test]
+    fn revised_reaction_frames_retain_the_distinct_api_and_reject_unmeasured_forms() {
+        let source = r#"unsafe extern "C" fn game_revised(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 4, 3.0, false);
+        AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 8, -2.5, false);
+    }
+}"#;
+        let mut parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &mut parsed.stmts[0] else {
+            panic!("direct guard")
+        };
+        assert!(matches!(commands.as_slice(), [
+            ExcuteStmt::AttackModuleAddReactionFrameRevised { id: 0, frames: first },
+            ExcuteStmt::AttackModuleAddReactionFrame { id: 4, frames: second },
+            ExcuteStmt::AttackModuleAddReactionFrameRevised { id: 8, frames: third },
+        ] if *first == 11.0 && *second == 3.0 && *third == -2.5));
+        let ExcuteStmt::AttackModuleAddReactionFrameRevised { id, frames } = &mut commands[0]
+        else {
+            unreachable!()
+        };
+        *id = 2;
+        *frames = 12.5;
+        let emitted = preview_game_fn(&parsed, "revised");
+        assert!(emitted.contains(
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 2, 12.5, false);"
+        ));
+        assert!(emitted.contains(
+            "AttackModule::set_add_reaction_frame(agent.module_accessor, 4, 3.0, false);"
+        ));
+        syn::parse_file(&emitted).unwrap();
+        assert_json_eq!(&parsed, parse_acmd_script(&emitted));
+
+        for bad in [
+            "AttackModule::set_add_reaction_frame_revised(boma, 0, 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 9, 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, -1, 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 00, 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.00, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0f32, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, #[cfg(any())] 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0 + 1.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, f32::NAN, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 1e99, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0, true);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0, false, true);",
+            "AttackModule::set_add_reaction_frame_revised::<f32>(agent.module_accessor, 0, 11.0, false);",
+            "AttackModule::set_add_reaction_frame_revised(agent.module_accessor, 0, 11.0, false); helper();",
+        ] {
+            let body = format!("unsafe extern \"C\" fn game_bad(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}");
+            let parsed = parse_acmd_script(&body);
+            assert!(matches!(parsed.stmts.as_slice(), [AcmdStmt::Excute(commands)] if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_)))), "unmeasured form promoted: {bad}");
+        }
+        let effect = parse_effect_script(&source.replace("game_revised", "effect_revised"));
+        assert!(
+            matches!(effect.stmts.as_slice(), [crate::data::EffectStmt::Excute(commands)]
+            if commands.iter().all(|command| matches!(command, crate::data::EffectMacro::Raw(_))))
+        );
+        for header in ["sound_revised", "expression_revised"] {
+            let body = source.replace("game_revised", header);
+            let parsed = if header.starts_with("sound") {
+                parse_sound_script(&body)
+            } else {
+                parse_expression_script(&body)
+            };
+            assert!(
+                matches!(parsed.stmts.as_slice(), [AcmdStmt::Excute(commands)] if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_))))
+            );
+        }
+    }
+
+    #[test]
+    fn add_reaction_frame_is_a_closed_guarded_game_call() {
+        use crate::data::ExcuteStmt;
+
+        let source = r#"unsafe extern "C" fn game_reaction_frame(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 8, -10.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 00, 2.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 9, 2.0, false);
+        AttackModule::set_add_reaction_frame(boma, 0, 2.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, true);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.00, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0 + 1.0, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, f32::NAN, false);
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false, true);
+        if some_other_condition(agent) {
+            AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 3.0, false);
+        }
+    }
+    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD) {
+        if macros::is_excute(agent) {
+            AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);
+        }
+    }
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);
+        }
+    }
+    AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected a direct Game execute block: {:#?}", parsed.stmts);
+        };
+        // Ten direct calls plus the preserved nested header, call and closing brace.
+        assert_eq!(commands.len(), 13);
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::AttackModuleAddReactionFrame { id: 0, frames }) if *frames == 2.0
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(ExcuteStmt::AttackModuleAddReactionFrame { id: 8, frames }) if *frames == -10.0
+        ));
+        assert!(commands[2..]
+            .iter()
+            .all(|command| matches!(command, ExcuteStmt::Raw(_))));
+        assert!(matches!(
+            &parsed.stmts[1],
+            AcmdStmt::RawBlock { body, .. }
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(_)]))
+        ));
+        assert!(matches!(
+            &parsed.stmts[2],
+            AcmdStmt::Loop { body, .. }
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(_)]))
+        ));
+        assert!(matches!(parsed.stmts.get(3), Some(AcmdStmt::Raw(_))));
+
+        let expression = r#"unsafe extern "C" fn expression_wrong_track(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);
+    }
+}
+"#;
+        let wrong_track = parse_expression_script(expression);
+        assert!(matches!(
+            wrong_track.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(_)])
+        ));
+
+        for ambiguous_line in ["// comment brace }", "helper(\"literal } brace\");"] {
+            let guarded = format!(
+                "unsafe extern \"C\" fn game_reaction_frame(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {ambiguous_line}\n        AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);\n    }}\n}}\n"
+            );
+            let guarded = parse_acmd_script(&guarded);
+            assert!(
+                matches!(
+                    guarded.stmts.as_slice(),
+                    [AcmdStmt::Excute(commands)]
+                        if matches!(commands.as_slice(), [ExcuteStmt::Raw(_), ExcuteStmt::AttackModuleAddReactionFrame { id: 0, frames }]
+                            if *frames == 2.0)
+                ),
+                "literal braces must not move a genuine root command out of its native guard"
+            );
+            let emitted = preview_game_fn(&guarded, "reaction_frame_guard");
+            assert_json_eq!(
+                guarded,
+                parse_acmd_script(&emitted),
+                "literal braces and guarded commands must round-trip source"
+            );
+        }
+
+        let emitted = preview_game_fn(&parsed, "reaction_frame");
+        assert!(emitted.contains(
+            "AttackModule::set_add_reaction_frame(agent.module_accessor, 8, -10.0, false);"
+        ));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed calls and all rejected contexts/shapes should reparse identically"
+        );
+    }
+
+    #[test]
+    fn malformed_is_excute_dump_artifact_stays_raw_and_does_not_open_execute_block() {
+        let source = r#"unsafe extern "C" fn game_invalid_dump_artifact(agent: &mut L2CAgentBase) {
+    methodlib::L2CValue::operatorbool()const(is_excute);
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [
+                AcmdStmt::Raw(raw),
+                AcmdStmt::Frame(frame),
+                AcmdStmt::Excute(commands)
+            ] if raw == "methodlib::L2CValue::operatorbool()const(is_excute);"
+                && *frame == 1.0
+                && matches!(commands.as_slice(), [ExcuteStmt::AttackModuleInitAttackPos { id: 0 }])
+        ));
+
+        let emitted = preview_game_fn(&parsed, "invalid_dump_artifact");
+        assert!(emitted.contains("methodlib::L2CValue::operatorbool()const(is_excute);"));
+        assert!(
+            syn::parse_file(&emitted).is_err(),
+            "the invalid source line must not be normalized into executable Rust"
+        );
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn article_lifecycle_forms_are_fixed_symbolic_calls() {
+        use crate::data::{ArticleLifecycleCall, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_article(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, false, -1);
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, true, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_LAST, false);
+        ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, *ARTICLE_OPE_TARGET_LAST, false);
+        ArticleModule::generate_article(agent.module_accessor, 24, false, -1);
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, true, -1);
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, false, 0);
+        ArticleModule::generate_article(boma, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, false, -1);
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, ArticleOperationTarget(0));
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), true);
+        ArticleModule::generate_article(agent.module_accessor, ARTICLE_SYMBOL, false, -1);
+        ArticleModule::set_visibility_whole(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, 1, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, false, ArticleOperationTarget(0));
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_FIRST, false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, true);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(0), false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_OTHER), false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL)), false);
+        ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, *ARTICLE_OPE_TARGET_ALL, false, true);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false); panic!();
+        wrapper(ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false));
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected one execute block: {:#?}", parsed.stmts);
+        };
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::ArticleLifecycle(_)))
+                .count(),
+            7
+        );
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::Generate { symbol }))
+                if symbol == "FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER"
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::RemoveAll { symbol }))
+                if symbol == "FIGHTER_GANON_GENERATE_ARTICLE_SWORD"
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::SetVisibilityWhole { symbol, visible: false }))
+                if symbol == "FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS"
+        ));
+        assert!(matches!(
+            commands.get(3),
+            Some(ExcuteStmt::ArticleLifecycle(
+                ArticleLifecycleCall::SetVisibilityWhole { visible: true, .. }
+            ))
+        ));
+        assert!(matches!(
+            commands.get(4),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::Shoot { symbol, target: crate::data::ArticleTarget::All }))
+                if symbol == "FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA"
+        ));
+        assert!(matches!(
+            commands.get(5),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::Shoot {
+                target: crate::data::ArticleTarget::Last,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            commands.get(6),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ShootExist { symbol, target: crate::data::ArticleTarget::Last }))
+                if symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
+                .count(),
+            15
+        );
+        for (index, enabled, article_index, receiver) in [
+            (8, "true", "-1", None),
+            (9, "false", "0", None),
+            (10, "false", "-1", Some("boma")),
+        ] {
+            assert!(
+                matches!(commands.get(index), Some(ExcuteStmt::NativeCall(call))
+                if call.callee == "ArticleModule::generate_article"
+                    && call.arguments == ["*FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER", enabled, article_index]
+                    && call.receiver.as_deref() == receiver)
+            );
+        }
+        let emitted = preview_game_fn(&parsed, "article");
+        assert!(emitted.contains(
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, false, -1);"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_BARRELJETS, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);"
+        ));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn combined_execute_else_keeps_the_complete_original_body_on_all_acmd_tracks() {
+        for (category, parse, emit) in [
+            (
+                "game",
+                parse_acmd_script as fn(&str) -> AcmdScript,
+                preview_game_fn as fn(&AcmdScript, &str) -> String,
+            ),
+            ("expression", parse_expression_script, preview_expression_fn),
+            ("sound", parse_sound_script, preview_sound_fn),
+            (
+                "effect",
+                |source| AcmdScript {
+                    stmts: parse_effect_script(source)
+                        .stmts
+                        .iter()
+                        .map(crate::move_nodes::effects::effect_stmt_to_acmd)
+                        .collect(),
+                },
+                preview_effect_structure_fn,
+            ),
+        ] {
+            for (guard, alternate, prefix, suffix) in [
+                ("if macros::is_excute(agent) {", "} else {", "", ""),
+                (
+                    "if is_excute(agent) {",
+                    "} /* retained comment */ else {",
+                    "",
+                    "",
+                ),
+                (
+                    "if macros::is_excute(agent) {",
+                    "} else if unknown_condition() {",
+                    "if outer_condition() {\n",
+                    "\n}",
+                ),
+                (
+                    "if macros::is_excute(agent) {",
+                    "} else {",
+                    "for _ in 0..2 {\n",
+                    "\n}",
+                ),
+                (
+                    "if macros::is_excute(agent) {",
+                    "} else {",
+                    "#[cfg(any())]\n",
+                    "",
+                ),
+            ] {
+                let body = format!("frame(agent.lua_state_agent, 1.0);\n{prefix}{guard}\n    unknown_then();\n{alternate}\n    unknown_else();\n}}{suffix}\nwait(agent.lua_state_agent, 2.0);");
+                let source = format!("unsafe extern \"C\" fn {category}_else_witness(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+                syn::parse_file(&source).unwrap();
+                let parsed = parse(&source);
+                assert!(
+                    matches!(parsed.stmts.as_slice(), [AcmdStmt::Raw(raw)] if raw == &body),
+                    "{source}"
+                );
+                let emitted = emit(&parsed, "else_witness");
+                syn::parse_file(&emitted).unwrap();
+                let emitted_body = emitted
+                    .split_once('{')
+                    .unwrap()
+                    .1
+                    .rsplit_once('}')
+                    .unwrap()
+                    .0
+                    .trim();
+                assert_eq!(
+                    emitted_body, body,
+                    "complete original source, not only the already-parsed tree"
+                );
+                assert_json_eq!(&parsed, parse(&emitted));
+            }
+        }
+    }
+
+    #[test]
+    fn combined_execute_else_detection_ignores_literals_comments_and_other_conditions() {
+        for source in [
+            "unsafe fn game_else_witness(agent: &mut L2CAgentBase) {\n    // if macros::is_excute(agent) { } else { }\n    if macros::is_excute(agent) {\n        unknown();\n    }\n}\n",
+            "unsafe fn game_else_witness(agent: &mut L2CAgentBase) {\n    let text = r#\"if macros::is_excute(agent) { } else { }\"#;\n}\n",
+            "unsafe fn game_else_witness(agent: &mut L2CAgentBase) {\n    if other::is_excute(agent) {\n        one();\n    } else {\n        two();\n    }\n}\n",
+            "unsafe fn game_else_witness(agent: &mut L2CAgentBase) {\n    if macros::is_excute(agent) {\n        one();\n    }\n    else {\n        two();\n    }\n}\n",
+        ] {
+            let lines: Vec<_> = source.lines().collect();
+            assert!(preserve_combined_execute_else(source, &lines[1..lines.len()-1]).is_none());
+        }
+    }
+
+    #[test]
+    fn effect_execute_else_remains_one_immutable_witness_not_live_spawns() {
+        use crate::move_nodes::{effects, model, timeline};
+
+        let spawn = |name| {
+            format!("macros::EFFECT(agent, Hash40::new(\"{name}\"), Hash40::new(\"top\"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, true);")
+        };
+        let body = format!("frame(agent.lua_state_agent, 7.0);\nif macros::is_excute(agent) {{\n    {}\n}} else {{\n    {}\n}}\nwait(agent.lua_state_agent, 2.0);", spawn("then_effect"), spawn("else_effect"));
+        let source = format!(
+            "unsafe extern \"C\" fn effect_else_witness(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+        );
+        let parsed = parse_effect_script(&source);
+        assert!(matches!(parsed.stmts.as_slice(), [EffectStmt::Raw(raw)] if raw == &body));
+        let (calls, residue) = parsed.to_effect_calls_and_residue();
+        assert!(
+            calls.is_empty(),
+            "neither arm may become an unconditional live spawn"
+        );
+        assert!(residue.is_empty());
+        assert_eq!(unexportable_effect_lines(&parsed), vec![body.clone()]);
+
+        let graph = model::MoveGraph {
+            tracks: vec![effects::import_for_fighter("mario", &parsed)],
+            ..Default::default()
+        };
+        assert!(
+            matches!(graph.tracks[0].nodes.as_slice(), [model::MoveNode { kind: model::NodeKind::Preserved { statement: AcmdStmt::Raw(raw) }, .. }] if raw == &body)
+        );
+        let restored: model::MoveGraph =
+            serde_json::from_str(&serde_json::to_string(&graph).unwrap()).unwrap();
+        let compiled = timeline::compile("mario", "else_witness", &restored).unwrap();
+        let emitted = preview_effect_structure_fn(&compiled[0].1, "else_witness");
+        assert_eq!(
+            emitted
+                .split_once('{')
+                .unwrap()
+                .1
+                .rsplit_once('}')
+                .unwrap()
+                .0
+                .trim(),
+            body
+        );
+        syn::parse_file(&emitted).unwrap();
+        assert_json_eq!(parse_effect_script(&emitted), &parsed);
+
+        let mut forged = graph;
+        let model::NodeKind::Preserved {
+            statement: AcmdStmt::Raw(raw),
+        } = &mut forged.tracks[0].nodes[0].kind
+        else {
+            panic!("expected source witness")
+        };
+        *raw = raw.replace("else_effect", "changed_effect");
+        assert!(timeline::compile("mario", "else_witness", &forged).is_err());
+
+        let ordinary = format!("unsafe extern \"C\" fn effect_ordinary(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {}\n    }}\n}}\n", spawn("ordinary_effect"));
+        let ordinary = parse_effect_script(&ordinary);
+        assert_eq!(
+            ordinary.to_effect_calls().len(),
+            1,
+            "ordinary Execute remains editable"
+        );
+        assert!(matches!(ordinary.stmts.as_slice(), [EffectStmt::Excute(_)]));
+    }
+
+    #[test]
+    fn expression_article_motion_catalog_is_exact_track_scoped_and_roundtrips() {
+        use crate::data::{ArticleLifecycleCall, EXPRESSION_ARTICLE_MOTIONS};
+        let mut unique = std::collections::HashSet::new();
+        assert_eq!(EXPRESSION_ARTICLE_MOTIONS.len(), 19);
+        for &(symbol, motions) in EXPRESSION_ARTICLE_MOTIONS {
+            for &motion in motions {
+                assert!(unique.insert((symbol, motion)));
+                let call = format!("ArticleModule::change_motion(agent.module_accessor, *{symbol}, Hash40::new(\"{motion}\"), false, -1.0);");
+                let source = format!("unsafe extern \"C\" fn expression_article_motion(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n");
+                let parsed = parse_expression_script(&source);
+                assert!(
+                    matches!(parsed.stmts.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { symbol: found_symbol, motion: found_motion })]
+                        if found_symbol == symbol && found_motion == motion)),
+                    "{source}"
+                );
+                assert!(parsed.to_expression_events().is_empty());
+                let emitted = preview_expression_fn(&parsed, "article_motion");
+                syn::parse_file(&emitted).unwrap();
+                assert_json_eq!(&parsed, parse_expression_script(&emitted));
+                for other in [
+                    parse_acmd_script(
+                        &source.replace("expression_article_motion", "game_article_motion"),
+                    ),
+                    parse_sound_script(
+                        &source.replace("expression_article_motion", "sound_article_motion"),
+                    ),
+                ] {
+                    assert!(!serde_json::to_string(&other)
+                        .unwrap()
+                        .contains("ChangeMotion"));
+                }
+                let mixed_source = source.replace(
+                    &call,
+                    &format!("unknown_before();\n        {call}\n        unknown_after();"),
+                );
+                let mixed = parse_expression_script(&mixed_source);
+                assert!(
+                    matches!(mixed.stmts.as_slice(), [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(before), ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { .. }), ExcuteStmt::Raw(after)] if before == "unknown_before();" && after == "unknown_after();"))
+                );
+                assert_json_eq!(
+                    &mixed,
+                    parse_expression_script(&preview_expression_fn(&mixed, "article_motion"))
+                );
+            }
+        }
+        assert_eq!(unique.len(), 86);
+    }
+
+    #[test]
+    fn expression_article_motion_rejects_unmeasured_tokens_and_execution_contexts() {
+        let call = "ArticleModule::change_motion(agent.module_accessor, *FIGHTER_METAKNIGHT_GENERATE_ARTICLE_MANTLE, Hash40::new(\"guard\"), false, -1.0);";
+        let wrap = |body: &str| {
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {body}\n    }}\n}}\n")
+        };
+        let assert_preserved = |source: &str| {
+            let parsed = parse_expression_script(source);
+            assert!(
+                !serde_json::to_string(&parsed)
+                    .unwrap()
+                    .contains("ChangeMotion"),
+                "{source}"
+            );
+            assert_json_eq!(
+                &parsed,
+                parse_expression_script(&preview_expression_fn(&parsed, "motion_negative")),
+                "{source}"
+            );
+        };
+        for bad in [
+            call.replace("agent.module_accessor", "boma"),
+            call.replace("false", "true"),
+            call.replace("-1.0", "-1"),
+            call.replace("-1.0", "0.0"),
+            call.replace("false, -1.0", "false, -1.0, true"),
+            call.replace("*FIGHTER_", "FIGHTER_"),
+            call.replace("METAKNIGHT", "MARIO"),
+            call.replace("\"guard\"", "\"unmeasured_clip\""),
+            call.replace("\"guard\"", "\"win2\""),
+            call.replace("Hash40::new(\"guard\")", "Hash40::new_raw(0x1234)"),
+            call.replace("Hash40::new(\"guard\")", "wrapper(Hash40::new(\"guard\"))"),
+            call.replace("Hash40::new(\"guard\")", "Hash40::new( \"guard\" )"),
+            call.replace("change_motion(", "change_motion_from_no("),
+            format!("wrapper!({call});"),
+            format!("#[cfg(any())]\n        {call}"),
+            format!("if true {{\n            {call}\n        }}"),
+        ] {
+            assert_preserved(&wrap(&bad));
+        }
+        for source in [
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"),
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    for _ in 0..2 {{\n        if macros::is_excute(agent) {{\n            {call}\n        }}\n    }}\n}}\n"),
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    if true {{\n        if macros::is_excute(agent) {{\n            {call}\n        }}\n    }}\n}}\n"),
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    #[cfg(any())]\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"),
+            format!("unsafe extern \"C\" fn expression_motion_negative(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }} else {{\n        unknown_else();\n    }}\n}}\n"),
+        ] {
+            assert_preserved(&source);
+        }
+        assert!(crate::data::measured_expression_article_motions(
+            "FIGHTER_KIRBY_GENERATE_ARTICLE_STONE"
+        )
+        .is_empty());
+        assert!(crate::data::measured_article_motions(
+            "FIGHTER_METAKNIGHT_GENERATE_ARTICLE_MANTLE"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn article_change_motion_is_a_closed_game_execute_source_form() {
+        use crate::data::{ArticleLifecycleCall, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_article_motion(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw_to_ground"), false, -1.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("unmeasured_clip"), false, -1.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw"), true, -1.0);
+        ArticleModule::change_motion(boma, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw"), false, -1.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw"), false, 0.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_HAMMER, Hash40::new("special_lw"), false, -1.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new_raw(0x1234), false, -1.0);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw"), false, -1.0, true);
+    }
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new("special_lw"), false, -1.0);
+        }
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected Game execute block: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion {
+                symbol,
+                motion,
+            })) if symbol == "FIGHTER_KIRBY_GENERATE_ARTICLE_STONE" && motion == "special_lw_to_ground"
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { .. })
+                ))
+                .count(),
+            1,
+            "measured motions retain their specialized representation"
+        );
+        assert!(
+            matches!(parsed.stmts.get(1), Some(AcmdStmt::Loop { body, .. })
+            if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::NativeCall(call)]
+                    if call.callee == "ArticleModule::change_motion")))
+        );
+
+        let expression = parse_expression_script(
+            &source.replace("game_article_motion", "expression_article_motion"),
+        );
+        assert!(
+            matches!(expression.stmts.first(), Some(AcmdStmt::Excute(commands))
+            if matches!(commands.first(), Some(ExcuteStmt::NativeCall(call))
+                if call.callee == "ArticleModule::change_motion"))
+        );
+
+        let emitted = preview_game_fn(&parsed, "article_motion");
+        assert!(emitted.contains(
+            "ArticleModule::change_motion(agent.module_accessor, *FIGHTER_KIRBY_GENERATE_ARTICLE_STONE, Hash40::new(\"special_lw_to_ground\"), false, -1.0);"
+        ));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "the complete statement tree must round-trip"
+        );
+    }
+
+    #[test]
+    fn attack_module_shake_and_unique_effect_calls_use_closed_game_source_forms() {
+        use crate::data::{
+            AcmdStmt, AttackModuleDamageShakeScale, AttackModuleNoUniqEffectAllPair, ExcuteStmt,
+        };
+
+        let source = r#"unsafe extern "C" fn game_attack_module_closed(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.1);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.18);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.3);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.67);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 1.5);
+        AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, false);
+        AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, true);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0);
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 1);
+    }
+}"#;
+        let parsed = parse_acmd_script(source);
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("expected Game execute block")
+        };
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::PointOne),
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::PointEighteen),
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::PointThree),
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::PointFive),
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::PointSixtySeven),
+                ExcuteStmt::AttackModuleSetDamageShakeScale(AttackModuleDamageShakeScale::OnePointFive),
+                ExcuteStmt::AttackModuleSetNoUniqEffectAll(AttackModuleNoUniqEffectAllPair::TrueFalse),
+                ExcuteStmt::AttackModuleSetNoUniqEffectAll(AttackModuleNoUniqEffectAllPair::TrueTrue),
+                ExcuteStmt::Raw(zero),
+                ExcuteStmt::Raw(one),
+            ] if zero.contains("set_damage_shake_scale") && zero.ends_with(", 0);")
+                && one.contains("set_damage_shake_scale") && one.ends_with(", 1);")
+        ));
+        for scale in AttackModuleDamageShakeScale::ALL {
+            let value = serde_json::to_value(scale).unwrap();
+            assert_json_eq!(
+                serde_json::from_value::<AttackModuleDamageShakeScale>(value).unwrap(),
+                scale
+            );
+        }
+        for pair in AttackModuleNoUniqEffectAllPair::ALL {
+            let value = serde_json::to_value(pair).unwrap();
+            assert_json_eq!(
+                serde_json::from_value::<AttackModuleNoUniqEffectAllPair>(value).unwrap(),
+                pair
+            );
+        }
+
+        let emitted = preview_game_fn(&parsed, "attack_module_closed");
+        for scale in AttackModuleDamageShakeScale::ALL {
+            assert!(emitted.contains(&format!(
+                "AttackModule::set_damage_shake_scale(agent.module_accessor, {});",
+                scale.source_token()
+            )));
+        }
+        assert!(emitted
+            .contains("AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, false);"));
+        assert!(emitted
+            .contains("AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, true);"));
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed calls and the off-table integer source must round-trip"
+        );
+        syn::parse_file(&emitted).unwrap();
+
+        for bad in [
+            "AttackModule::set_damage_shake_scale(boma, 0.5);",
+            "AttackModule::set_damage_shake_scale(other.module_accessor, 0.5);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, 0.50);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5f32);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5 + 0.1);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, 0.25);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, f32::NAN);",
+            "AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5, false);",
+            "AttackModule::set_no_uniq_effect_all(boma, true, false);",
+            "AttackModule::set_no_uniq_effect_all(agent.module_accessor, false, false);",
+            "AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, false, true);",
+            "AttackModule::set_no_uniq_effect_all(agent.module_accessor, flag, false);",
+            "AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, false); helper();",
+        ] {
+            let bad_source = format!(
+                "unsafe extern \"C\" fn game_bad_attack_module(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}"
+            );
+            let rejected = parse_acmd_script(&bad_source);
+            assert!(
+                matches!(
+                    rejected.stmts.as_slice(),
+                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == bad)
+                ),
+                "unmeasured source was promoted: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn attack_module_closed_calls_require_direct_game_execute_heads() {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+
+        let source = r##"unsafe extern "C" fn game_attack_module_context(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);
+        AttackModule::set_no_uniq_effect_all(agent.module_accessor, true, false);
+        // AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);
+        let source_text = r#"AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);"#;
+        wrapper(AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5));
+        #[allow(unused)]
+        AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);
+    }
+    AttackModule::set_damage_shake_scale(agent.module_accessor, 0.5);
+}"##;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+                [AcmdStmt::Excute(commands), AcmdStmt::Raw(top)]
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::AttackModuleSetDamageShakeScale(_),
+                    ExcuteStmt::AttackModuleSetNoUniqEffectAll(_),
+                    ExcuteStmt::Raw(comment),
+                    ExcuteStmt::Raw(local),
+                    ExcuteStmt::Raw(wrapper),
+                    ExcuteStmt::Raw(attribute),
+                    ExcuteStmt::Raw(attributed_call),
+                ]
+                if comment.contains("// AttackModule::")
+                    && local.contains("let source_text")
+                    && wrapper.contains("wrapper(AttackModule::")
+                    && attribute.contains("#[allow(unused)]")
+                    && attributed_call.contains("AttackModule::set_damage_shake_scale"))
+                    && top.contains("AttackModule::set_damage_shake_scale")
+        ));
+
+        for (name, parse) in [
+            (
+                "expression_attack_module_context",
+                parse_expression_script as fn(&str) -> AcmdScript,
+            ),
+            (
+                "sound_attack_module_context",
+                parse_sound_script as fn(&str) -> AcmdScript,
+            ),
+        ] {
+            let other_track = parse(&source.replace("game_attack_module_context", name));
+            assert!(
+                matches!(
+                    other_track.stmts.first(),
+                    Some(AcmdStmt::Excute(commands)) if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_)))
+                ),
+                "native source-only calls became typed in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn hit_status_normal_and_attack_size_use_closed_game_source_tuples() {
+        use crate::data::{AcmdStmt, AttackModuleSizePreset, ExcuteStmt};
+
+        let source_calls = AttackModuleSizePreset::ALL
+            .into_iter()
+            .map(|preset| {
+                format!(
+                    "AttackModule::set_size(agent.module_accessor, {}, {});",
+                    preset.attack_id(),
+                    preset.size_token()
+                )
+            })
+            .chain(std::iter::once(
+                "HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);"
+                    .to_owned(),
+            ))
+            .collect::<Vec<_>>();
+        let source = format!(
+            "unsafe extern \"C\" fn game_closed_hit_module(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {}\n    }}\n}}",
+            source_calls.join("\n        ")
+        );
+        let parsed = parse_acmd_script(&source);
+        let expected = AttackModuleSizePreset::ALL
+            .into_iter()
+            .map(ExcuteStmt::AttackModuleSetSize)
+            .chain(std::iter::once(ExcuteStmt::HitModuleSetStatusAllNormal))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if serde_json::to_value(commands).unwrap()
+                    == serde_json::to_value(&expected).unwrap()
+        ));
+        for preset in AttackModuleSizePreset::ALL {
+            let json = serde_json::to_value(preset).unwrap();
+            assert_json_eq!(
+                serde_json::from_value::<AttackModuleSizePreset>(json).unwrap(),
+                preset
+            );
+        }
+        assert!(
+            serde_json::from_value::<AttackModuleSizePreset>(serde_json::json!("id_3_size_5"))
+                .is_err()
+        );
+
+        let emitted = preview_game_fn(&parsed, "closed_hit_module_roundtrip");
+        assert!(emitted.contains(
+            "HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);"
+        ));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+        syn::parse_file(&emitted).unwrap();
+
+        for bad in [
+            "AttackModule::set_size(boma, 0, 0.1);",
+            "AttackModule::set_size(agent.module_accessor, 3, 0.1);",
+            "AttackModule::set_size(agent.module_accessor, 1, 4.700);",
+            "AttackModule::set_size(agent.module_accessor, 1, 4.7f32);",
+            "AttackModule::set_size(agent.module_accessor, 1, 4.7 + 0.0);",
+            "AttackModule::set_size(agent.module_accessor, 1, 0.5);",
+            "AttackModule::set_size(agent.module_accessor, 1, 4.7, false);",
+            "HitModule::set_status_all(boma, HitStatus(*HIT_STATUS_NORMAL), 0);",
+            "HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_XLU), 0);",
+            "HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 1);",
+            "HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0, false);",
+        ] {
+            let bad_source = format!(
+                "unsafe extern \"C\" fn game_bad_hit_module(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}"
+            );
+            let rejected = parse_acmd_script(&bad_source);
+            assert!(matches!(
+                rejected.stmts.as_slice(),
+                [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == bad)
+            ), "unmeasured source was promoted: {bad}");
+        }
+
+        let contexts = r##"unsafe extern "C" fn game_hit_module_context(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        HitModule::set_status_all(agent.module_accessor, HitStatus(*HIT_STATUS_NORMAL), 0);
+        AttackModule::set_size(agent.module_accessor, 0, 0.1);
+        // AttackModule::set_size(agent.module_accessor, 0, 0.1);
+        let source_text = r#"AttackModule::set_size(agent.module_accessor, 0, 0.1);"#;
+        wrapper(AttackModule::set_size(agent.module_accessor, 0, 0.1));
+        #[allow(unused)]
+        AttackModule::set_size(agent.module_accessor, 0, 0.1);
+    }
+    AttackModule::set_size(agent.module_accessor, 0, 0.1);
+}"##;
+        let contextual = parse_acmd_script(contexts);
+        assert!(matches!(
+            contextual.stmts.as_slice(),
+            [AcmdStmt::Excute(commands), AcmdStmt::Raw(top)]
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::HitModuleSetStatusAllNormal,
+                    ExcuteStmt::AttackModuleSetSize(AttackModuleSizePreset::Id0Size0_1),
+                    ExcuteStmt::Raw(comment),
+                    ExcuteStmt::Raw(local),
+                    ExcuteStmt::Raw(wrapper),
+                    ExcuteStmt::Raw(attribute),
+                    ExcuteStmt::Raw(attributed),
+                ] if comment.contains("// AttackModule::")
+                    && local.contains("let source_text")
+                    && wrapper.contains("wrapper(AttackModule::")
+                    && attribute.contains("#[allow(unused)]")
+                    && attributed.contains("AttackModule::set_size"))
+                    && top.contains("AttackModule::set_size")
+        ));
+        for (name, parse) in [
+            (
+                "expression_hit_module_context",
+                parse_expression_script as fn(&str) -> AcmdScript,
+            ),
+            (
+                "sound_hit_module_context",
+                parse_sound_script as fn(&str) -> AcmdScript,
+            ),
+        ] {
+            let other_track = parse(&contexts.replace("game_hit_module_context", name));
+            assert!(
+                matches!(
+                    other_track.stmts.first(),
+                    Some(AcmdStmt::Excute(commands)) if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_)))
+                ),
+                "source-only native calls became typed in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_target_pos_parses_only_the_71_closed_vector2_tuples_and_serde_roundtrips() {
+        use crate::data::{AcmdStmt, AttackModuleVecTargetPosPreset, ExcuteStmt};
+
+        assert_eq!(AttackModuleVecTargetPosPreset::ALL.len(), 71);
+        let source_calls = AttackModuleVecTargetPosPreset::ALL
+            .into_iter()
+            .map(|preset| {
+                let (id, x, y, arg5) = preset.source_parts();
+                assert_eq!(
+                    AttackModuleVecTargetPosPreset::from_source_parts(id, x, y, arg5),
+                    Some(preset)
+                );
+                let encoded = serde_json::to_value(preset).unwrap();
+                let source_key = |token: &str| token.replace('-', "neg").replace('.', "_");
+                assert_eq!(
+                    encoded,
+                    serde_json::json!(format!(
+                        "id{id}_x{}_y{}_arg{arg5}",
+                        source_key(x),
+                        source_key(y)
+                    )),
+                    "the serialized preset ID must name its complete lexical tuple"
+                );
+                let decoded: AttackModuleVecTargetPosPreset =
+                    serde_json::from_value(encoded.clone()).unwrap();
+                assert_eq!(decoded, preset);
+                assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+                preset.source_line()
+            })
+            .collect::<Vec<_>>();
+        let source = format!(
+            "unsafe extern \"C\" fn game_vector_target_pos(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {}\n    }}\n}}",
+            source_calls.join("\n        ")
+        );
+        let parsed = parse_acmd_script(&source);
+        let expected = AttackModuleVecTargetPosPreset::ALL
+            .into_iter()
+            .map(ExcuteStmt::AttackModuleSetVecTargetPos)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if serde_json::to_value(commands).unwrap()
+                    == serde_json::to_value(&expected).unwrap()
+        ));
+
+        let emitted = preview_game_fn(&parsed, "vector_target_pos");
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "all exact source lexemes survive source export and parse-back"
+        );
+        assert!(
+            serde_json::from_value::<AttackModuleVecTargetPosPreset>(serde_json::json!(
+                "id0_x0_0_y8_0_arg0"
+            ))
+            .is_err(),
+            "serde accepts only stable IDs for measured complete tuples"
+        );
+    }
+
+    #[test]
+    fn vector_target_pos_keeps_invalid_shapes_and_contexts_raw() {
+        use crate::data::AttackModuleVecTargetPosPreset;
+
+        let valid = AttackModuleVecTargetPosPreset::ALL[0].source_line();
+        let (_, x, _, arg5) = AttackModuleVecTargetPosPreset::ALL[0].source_parts();
+        let invalid = [
+            valid.replace("&Vector2f", "&Vector3f"),
+            valid.replace("Hash40::new(\"top\")", "Hash40::new(\"waist\")"),
+            valid.replace(", false);", ", true);"),
+            valid.replace(&format!("x: {x}"), "x: 123.0"),
+            valid.replace(&format!(", {arg5}, false);"), ", 99, false);"),
+            valid.replace(", false);", ", false, 0);"),
+        ];
+        for line in invalid {
+            let source = format!(
+                "unsafe extern \"C\" fn game_vector_target_invalid(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(
+                !format!("{parsed:?}").contains("AttackModuleSetVecTargetPos"),
+                "unmeasured shape became typed: {line}"
+            );
+            let emitted = preview_game_fn(&parsed, "vector_target_invalid");
+            assert!(
+                emitted.contains(&line),
+                "unmeasured source was not preserved: {line}"
+            );
+        }
+
+        let direct = valid;
+        let contexts = [
+            format!(
+                "unsafe extern \"C\" fn game_vector_target_bare(agent: &mut L2CAgentBase) {{\n    {direct}\n}}"
+            ),
+            format!(
+                "unsafe extern \"C\" fn game_vector_target_nested(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        if true {{\n            {direct}\n        }}\n    }}\n}}"
+            ),
+            format!(
+                "unsafe extern \"C\" fn game_vector_target_wrapped(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        wrapper({direct})\n    }}\n}}"
+            ),
+            format!(
+                "unsafe extern \"C\" fn game_vector_target_attributed(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        #[allow(unused)]\n        {direct}\n    }}\n}}"
+            ),
+        ];
+        for source in contexts {
+            assert!(
+                !format!("{:?}", parse_acmd_script(&source))
+                    .contains("AttackModuleSetVecTargetPos"),
+                "non-direct or bare call became typed:\n{source}"
+            );
+        }
+
+        let expression = format!(
+            "unsafe extern \"C\" fn expression_vector_target(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {direct}\n    }}\n}}"
+        );
+        assert!(
+            !format!("{:?}", parse_expression_script(&expression))
+                .contains("AttackModuleSetVecTargetPos"),
+            "Game-only native call became typed on Expression"
+        );
+    }
+
+    #[test]
+    fn target_category_is_a_closed_direct_game_source_form() {
+        use crate::data::{AcmdStmt, AttackModuleTargetCategoryId, ExcuteStmt};
+
+        let source = r#"unsafe extern "C" fn game_target_category(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+        AttackModule::set_target_category(agent.module_accessor, 1, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+        AttackModule::set_target_category(agent.module_accessor, 2, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+    }
+}"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [
+                ExcuteStmt::AttackModuleSetTargetCategory(AttackModuleTargetCategoryId::Zero),
+                ExcuteStmt::AttackModuleSetTargetCategory(AttackModuleTargetCategoryId::One),
+                ExcuteStmt::AttackModuleSetTargetCategory(AttackModuleTargetCategoryId::Two),
+            ])
+        ));
+        for id in AttackModuleTargetCategoryId::ALL {
+            let value = serde_json::to_value(id).unwrap();
+            assert_json_eq!(
+                serde_json::from_value::<AttackModuleTargetCategoryId>(value).unwrap(),
+                id
+            );
+        }
+        assert!(
+            serde_json::from_value::<AttackModuleTargetCategoryId>(serde_json::json!("three"))
+                .is_err()
+        );
+
+        let emitted = preview_game_fn(&parsed, "target_category_roundtrip");
+        for id in 0..=2 {
+            assert!(emitted.contains(&format!(
+                "AttackModule::set_target_category(agent.module_accessor, {id}, *COLLISION_CATEGORY_MASK_NO_IF as u32);"
+            )));
+        }
+        syn::parse_file(&emitted).unwrap();
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+
+        for bad in [
+            "AttackModule::set_target_category(boma, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+            "AttackModule::set_target_category(other.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+            "AttackModule::set_target_category(agent.module_accessor, -1, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+            "AttackModule::set_target_category(agent.module_accessor, 3, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+            "AttackModule::set_target_category(agent.module_accessor, 00, *COLLISION_CATEGORY_MASK_NO_IF as u32);",
+            "AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF);",
+            "AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as i32);",
+            "AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32, true);",
+            "AttackModule::set_target_category(agent.module_accessor, 0, 42u32);",
+            "AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32); helper();",
+        ] {
+            let bad_source = format!(
+                "unsafe extern \"C\" fn game_bad_target_category(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}"
+            );
+            let rejected = parse_acmd_script(&bad_source);
+            assert!(matches!(
+                rejected.stmts.as_slice(),
+                [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == bad)
+            ), "unmeasured source was promoted: {bad}");
+        }
+
+        let contexts = r##"unsafe extern "C" fn game_target_category_context(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+        // AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+        let source_text = r#"AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);"#;
+        wrapper(AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32));
+        #[allow(unused)]
+        AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+    }
+    AttackModule::set_target_category(agent.module_accessor, 0, *COLLISION_CATEGORY_MASK_NO_IF as u32);
+}"##;
+        let context_parsed = parse_acmd_script(contexts);
+        assert!(matches!(
+            context_parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands), AcmdStmt::Raw(top)]
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::AttackModuleSetTargetCategory(_),
+                    ExcuteStmt::Raw(comment),
+                    ExcuteStmt::Raw(local),
+                    ExcuteStmt::Raw(wrapper),
+                    ExcuteStmt::Raw(attribute),
+                    ExcuteStmt::Raw(attributed_call),
+                ]
+                if comment.contains("// AttackModule::")
+                    && local.contains("let source_text")
+                    && wrapper.contains("wrapper(AttackModule::")
+                    && attribute.contains("#[allow(unused)]")
+                    && attributed_call.contains("AttackModule::set_target_category"))
+                    && top.contains("AttackModule::set_target_category")
+        ));
+        for (name, parse) in [
+            (
+                "expression_target_category",
+                parse_expression_script as fn(&str) -> AcmdScript,
+            ),
+            (
+                "sound_target_category",
+                parse_sound_script as fn(&str) -> AcmdScript,
+            ),
+        ] {
+            let other_track = parse(&contexts.replace("game_target_category_context", name));
+            assert!(
+                matches!(
+                    other_track.stmts.first(),
+                    Some(AcmdStmt::Excute(commands)) if commands.iter().all(|command| matches!(command, ExcuteStmt::Raw(_)))
+                ),
+                "native source-only calls became typed in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn article_add_motion_partial_accepts_only_the_twelve_closed_game_rows() {
+        use crate::data::{ArticleLifecycleCall, ArticlePartialMotionPreset, ExcuteStmt};
+
+        let mut source = String::from(
+            "unsafe extern \"C\" fn game_article_partial(agent: &mut L2CAgentBase) {\n    if macros::is_excute(agent) {\n",
+        );
+        for preset in ArticlePartialMotionPreset::ALL {
+            source.push_str("        ");
+            source.push_str(&preset.source_line());
+            source.push('\n');
+        }
+        source.push_str("    }\n}\n");
+
+        let parsed = parse_acmd_script(&source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)] if commands.len() == 12
+                && commands.iter().zip(ArticlePartialMotionPreset::ALL).all(|(command, preset)| {
+                    matches!(command, ExcuteStmt::ArticleLifecycle(
+                        ArticleLifecycleCall::AddMotionPartial { preset: actual }
+                    ) if *actual == preset)
+                })
+        ));
+        let emitted = preview_game_fn(&parsed, "article_partial");
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "closed tuples and exact timing lexemes round-trip"
+        );
+
+        for preset in ArticlePartialMotionPreset::ALL {
+            let call = ArticleLifecycleCall::AddMotionPartial { preset };
+            let encoded = serde_json::to_value(&call).unwrap();
+            let decoded: ArticleLifecycleCall = serde_json::from_value(encoded).unwrap();
+            assert_json_eq!(decoded, call);
+        }
+
+        // Each native position is intentionally closed: changing the receiver, either
+        // owner-bound symbol, motion, timing spelling/value, any tail field, or arity must
+        // leave the source opaque rather than create a near-match typed command.
+        let canonical = ArticlePartialMotionPreset::EflameOpen5.source_line();
+        let tail = ", false, false, 0.0, false, true, false);";
+        let mut mutations = vec![
+            canonical.replace("agent.module_accessor", "boma"),
+            canonical.replace(
+                "FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD",
+                "FIGHTER_ELIGHT_GENERATE_ARTICLE_ESWORD",
+            ),
+            canonical.replace(
+                "WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE",
+                "WEAPON_ELIGHT_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE",
+            ),
+            canonical.replace("Hash40::new(\"to_open\")", "Hash40::new(\"open\")"),
+            canonical.replace(", 5.0, 5.0,", ", 4.0, 5.0,"),
+            canonical.replace(", 5.0, 5.0,", ", 5.00, 5.0,"),
+            canonical.replace(tail, ", true, false, 0.0, false, true, false);"),
+            canonical.replace(tail, ", false, true, 0.0, false, true, false);"),
+            canonical.replace(tail, ", false, false, 0.1, false, true, false);"),
+            canonical.replace(tail, ", false, false, 0.0, true, true, false);"),
+            canonical.replace(tail, ", false, false, 0.0, false, false, false);"),
+            canonical.replace(tail, ", false, false, 0.0, false, true, true);"),
+            canonical.replace(");", ", false);"),
+        ];
+        mutations.dedup();
+        assert_eq!(mutations.len(), 13);
+        for mutation in mutations {
+            let source = format!(
+                "unsafe extern \"C\" fn game_article_partial_rejected(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {mutation}\n    }}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(
+                matches!(
+                    parsed.stmts.as_slice(),
+                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == mutation)
+                ),
+                "mutated native position became editable: {mutation}"
+            );
+            let emitted = preview_game_fn(&parsed, "article_partial_rejected");
+            assert_json_eq!(
+                parse_acmd_script(&emitted).stmts,
+                parsed.stmts,
+                "rejected tuple must remain byte-shaped opaque source"
+            );
+        }
+    }
+
+    #[test]
+    fn article_add_motion_partial_lexical_head_is_game_execute_only_and_lossless() {
+        use crate::data::{ArticleLifecycleCall, ArticlePartialMotionPreset, ExcuteStmt};
+
+        let canonical = ArticlePartialMotionPreset::EflameOpen5.source_line();
+        let mut game = String::from(
+            "unsafe extern \"C\" fn game_article_partial_context(agent: &mut L2CAgentBase) {\n",
+        );
+        game.push_str("    if macros::IS_EXIST_ARTICLE(agent, *FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD) {\n        if macros::is_excute(agent) {\n            ");
+        game.push_str(&canonical);
+        game.push_str("\n        }\n    }\n");
+        game.push_str(
+            "    if unreviewed_guard(agent) {\n        if macros::is_excute(agent) {\n            ",
+        );
+        game.push_str(&canonical);
+        game.push_str("\n        }\n    }\n");
+        game.push_str("    for _ in 0..2 {\n        if macros::is_excute(agent) {\n            ");
+        game.push_str(&canonical);
+        game.push_str("\n        }\n    }\n");
+        game.push_str("    if macros::is_excute(agent) {\n        // ");
+        game.push_str(&canonical);
+        game.push_str("\n        let preserved = r#\"");
+        game.push_str(&canonical);
+        game.push_str("\"#;\n        wrapper(");
+        game.push_str(canonical.trim_end_matches(';'));
+        game.push_str(");\n        #[allow(unused)]\n        ");
+        game.push_str(&canonical);
+        game.push_str("\n    }\n    ");
+        game.push_str(&canonical);
+        game.push_str("\n}\n");
+
+        let parsed = parse_acmd_script(&game);
+        let mut typed = 0usize;
+        let mut raw = 0usize;
+        fn count(stmts: &[AcmdStmt], typed: &mut usize, raw: &mut usize) {
+            for stmt in stmts {
+                match stmt {
+                    AcmdStmt::Excute(commands) => {
+                        for command in commands {
+                            match command {
+                                ExcuteStmt::ArticleLifecycle(
+                                    ArticleLifecycleCall::AddMotionPartial { .. },
+                                ) => *typed += 1,
+                                ExcuteStmt::Raw(source)
+                                    if source.contains("ArticleModule::add_motion_partial(") =>
+                                {
+                                    *raw += 1
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    AcmdStmt::Raw(source)
+                        if source.contains("ArticleModule::add_motion_partial(") =>
+                    {
+                        *raw += 1
+                    }
+                    AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
+                        count(body, typed, raw)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        count(&parsed.stmts, &mut typed, &mut raw);
+        assert_eq!(
+            typed, 3,
+            "guard, unknown wrapper, and finite loop are direct Game executes"
+        );
+        assert_eq!(
+            raw, 5,
+            "comment/string/nested/attributed/top-level source stays raw"
+        );
+        let emitted = preview_game_fn(&parsed, "article_partial_context");
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "typed rows inside opaque wrappers must preserve their exact row source"
+        );
+
+        let expression = parse_expression_script(&game.replace(
+            "game_article_partial_context",
+            "expression_article_partial_context",
+        ));
+        let sound = parse_sound_script(&game.replace(
+            "game_article_partial_context",
+            "sound_article_partial_context",
+        ));
+        fn contains_typed_partial_motion(stmts: &[AcmdStmt]) -> bool {
+            stmts.iter().any(|statement| match statement {
+                AcmdStmt::Excute(commands) => commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::AddMotionPartial { .. })
+                    )
+                }),
+                AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
+                    contains_typed_partial_motion(body)
+                }
+                _ => false,
+            })
+        }
+        assert!(!contains_typed_partial_motion(&expression.stmts));
+        assert!(!contains_typed_partial_motion(&sound.stmts));
+    }
+
+    #[test]
+    fn article_visibility_and_shoot_exist_are_measured_on_expression_track_only() {
+        use crate::data::{ArticleLifecycleCall, ArticleTarget, ExcuteStmt};
+
+        let expression = r#"unsafe extern "C" fn expression_article(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_ROBOT_GENERATE_ARTICLE_GYRO, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, *ARTICLE_OPE_TARGET_ALL, false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);
+    }
+}
+"#;
+        let parsed = parse_expression_script(expression);
+        assert!(
+            matches!(
+                parsed.stmts.as_slice(),
+                [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [
+                        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::SetVisibilityWhole {
+                            symbol,
+                            visible: false,
+                        }),
+                        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ShootExist {
+                            symbol: shot_symbol,
+                            target: ArticleTarget::All,
+                        }),
+                        ExcuteStmt::Raw(raw),
+                    ] if symbol == "FIGHTER_ROBOT_GENERATE_ARTICLE_GYRO"
+                        && shot_symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
+                        && raw.contains("ArticleModule::shoot("))
+            ),
+            "Expression ArticleModule::shoot is not an eligible operation and must remain Raw"
+        );
+        let emitted = preview_expression_fn(&parsed, "article");
+        assert!(emitted.contains(
+            "ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_ROBOT_GENERATE_ARTICLE_GYRO, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);"
+        ));
+        assert_json_eq!(parse_expression_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn article_shoot_target_native_and_newtype_forms_share_the_same_closed_ast() {
+        let bare = r#"unsafe extern "C" fn game_article_targets(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_LAST, false);
+        ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);
+        ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_LAST, false);
+    }
+}
+"#;
+        let wrapped = bare
+            .replace(
+                ", *ARTICLE_OPE_TARGET_ALL, false);",
+                ", ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);",
+            )
+            .replace(
+                ", *ARTICLE_OPE_TARGET_LAST, false);",
+                ", ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            );
+        let native_tree = parse_acmd_script(bare);
+        let generated_tree = parse_acmd_script(&wrapped);
+        assert_json_eq!(
+            &generated_tree.stmts,
+            &native_tree.stmts,
+            "both exact source and generated newtype spellings must map to the same closed targets"
+        );
+        let emitted = preview_game_fn(&native_tree, "article_targets");
+        assert!(emitted.contains(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);"
+        ));
+        assert!(emitted.contains(
+            "ArticleModule::shoot_exist(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);"
+        ));
+    }
+
+    #[test]
+    fn gimmick_event_call_is_exact_direct_game_execute_source() {
+        use crate::data::ExcuteStmt;
+
+        assert_eq!(
+            serde_json::to_value(ExcuteStmt::GimmickEvent {
+                name: "ready".into()
+            })
+            .unwrap(),
+            serde_json::json!({"GimmickEvent": {"name": "ready"}}),
+        );
+
+        let source = r#"unsafe extern "C" fn game_named_event(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "ready\\\"now");
+        crate::slight::gimmicks::dispatch_named_from_module(boma, "ready");
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, EVENT_NAME);
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "ready", true);
+    }
+    if is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "plain");
+    }
+    if !macros::is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "negated");
+    }
+    if macros::is_excute(agent) && condition(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "combined");
+    }
+    crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "bare");
+    for _ in 0..2 {
+        if macros::is_excute(agent) {
+            crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "looped");
+        }
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.first(),
+            Some(AcmdStmt::Excute(commands))
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::GimmickEvent { name },
+                    ExcuteStmt::Raw(_), ExcuteStmt::Raw(_), ExcuteStmt::Raw(_)
+                ] if name == "ready\\\"now")
+        ));
+        assert!(matches!(
+            parsed.stmts.get(1),
+            Some(AcmdStmt::Excute(commands))
+                if matches!(commands.as_slice(), [ExcuteStmt::GimmickEvent { name }] if name == "plain")
+        ));
+        for index in [2, 3] {
+            assert!(
+                matches!(
+                    parsed.stmts.get(index),
+                    Some(AcmdStmt::RawBlock { body, .. })
+                        if body.iter().any(|statement| matches!(statement,
+                            AcmdStmt::Raw(line) if line.contains("dispatch_named_from_module")))
+                ),
+                "non-plain execute guard {index} must remain opaque"
+            );
+        }
+        assert!(matches!(
+            parsed.stmts.get(4),
+            Some(AcmdStmt::Raw(line)) if line.contains("dispatch_named_from_module")
+        ));
+        assert!(matches!(
+            parsed.stmts.get(5),
+            Some(AcmdStmt::Loop { body, .. })
+                if matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(line)]
+                        if line.contains("dispatch_named_from_module")))
+        ));
+        for name in ["", "   ", "bad\0name"] {
+            let call = format!(
+                "crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, {name:?});"
+            );
+            assert!(parse_gimmick_event_call(&call).is_none());
+        }
+        let too_long = "x".repeat(crate::gimmicks::live_model::MAX_NAME_BYTES + 1);
+        let call = format!(
+            "crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, {too_long:?});"
+        );
+        assert!(parse_gimmick_event_call(&call).is_none());
+
+        let expression =
+            parse_expression_script(&source.replace("game_named_event", "expression_named_event"));
+        assert!(matches!(
+            expression.stmts.first(),
+            Some(AcmdStmt::Excute(commands))
+                if matches!(commands.first(), Some(ExcuteStmt::Raw(line))
+                    if line.contains("dispatch_named_from_module"))
+        ));
+
+        let emitted = preview_game_fn(&parsed, "named_event");
+        assert!(emitted.contains(&format!(
+            "crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, {:?});",
+            "ready\\\"now"
+        )));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+    }
+
+    #[test]
+    fn gimmick_chart_event_call_is_exact_and_keeps_legacy_source_separate() {
+        use crate::data::ExcuteStmt;
+
+        let source = r#"unsafe extern "C" fn game_chart_event(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, " charge ", "pulse\"now");
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::GimmickChartEvent { chart_id, name }]
+                    if chart_id == " charge " && name == "pulse\"now")
+        ));
+        let emitted = preview_game_fn(&parsed, "chart_event");
+        assert!(emitted.contains(
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, \" charge \", \"pulse\\\"now\");"
+        ));
+        assert_json_eq!(parse_acmd_script(&emitted).stmts, parsed.stmts);
+
+        let too_long_chart =
+            "x".repeat(crate::gimmicks::controller_protocol::MAX_CHART_ID_BYTES + 1);
+        for (chart, event) in [
+            ("", "pulse"),
+            ("  ", "pulse"),
+            ("main", "pulse"),
+            ("charge\0", "pulse"),
+            (too_long_chart.as_str(), "pulse"),
+            ("charge", ""),
+            ("charge", "bad\0event"),
+        ] {
+            let call = format!(
+                "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, {chart:?}, {event:?});"
+            );
+            assert!(
+                parse_gimmick_chart_event_call(&call).is_none(),
+                "accepted {call}"
+            );
+        }
+        for call in [
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(boma, \"charge\", \"pulse\");",
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, CHART, \"pulse\");",
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, \"charge\", EVENT);",
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, \"charge\");",
+            "crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, \"charge\", \"pulse\", false);",
+        ] {
+            assert!(parse_gimmick_chart_event_call(call).is_none(), "accepted {call}");
+        }
+
+        let expression =
+            parse_expression_script(&source.replace("game_chart_event", "expression_chart_event"));
+        assert!(matches!(
+            expression.stmts.first(),
+            Some(AcmdStmt::Excute(commands))
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)]
+                    if raw.contains("dispatch_named_chart_from_module"))
+        ));
+        let bare = parse_acmd_script(
+            "unsafe extern \"C\" fn game_chart_bare(agent: &mut L2CAgentBase) {\n    crate::slight::gimmicks::dispatch_named_chart_from_module(agent.module_accessor, \"charge\", \"pulse\");\n}\n",
+        );
+        assert!(matches!(
+            bare.stmts.as_slice(),
+            [AcmdStmt::Raw(raw)] if raw.contains("dispatch_named_chart_from_module")
+        ));
+    }
+
+    #[test]
+    fn gimmick_chart_event_values_roundtrip_is_constant_bounded_and_additive() {
+        use crate::data::ExcuteStmt;
+
+        let call = "crate::slight::gimmicks::dispatch_named_chart_values_from_module(agent.module_accessor, \"right\", \"pulse\", &[(\"amount\", crate::slight::gimmicks::ChartEventValue::Int(3)), (\"gain\", crate::slight::gimmicks::ChartEventValue::Float(0.5)), (\"on\", crate::slight::gimmicks::ChartEventValue::Flag(true))]);";
+        let parsed = parse_gimmick_chart_event_values_call(call).unwrap();
+        assert!(matches!(
+            &parsed,
+            ExcuteStmt::GimmickChartEventValues { chart_id, name, arguments }
+                if chart_id == "right" && name == "pulse" && arguments.len() == 3
+        ));
+        let emitted = emit_excute_stmts(std::slice::from_ref(&parsed), "    ").join("\n");
+        assert!(emitted.contains("ChartEventValue::Float(0.5f32)"));
+        assert_json_eq!(
+            parse_gimmick_chart_event_values_call(&emitted).unwrap(),
+            parsed
+        );
+
+        let legacy = ExcuteStmt::GimmickChartEvent {
+            chart_id: "right".into(),
+            name: "pulse".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"GimmickChartEvent":{"chart_id":"right","name":"pulse"}}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ExcuteStmt>(
+                r#"{"GimmickChartEvent":{"chart_id":"right","name":"pulse"}}"#
+            )
+            .unwrap(),
+            ExcuteStmt::GimmickChartEvent { .. }
+        ));
+
+        let eight = format!(
+            "crate::slight::gimmicks::dispatch_named_chart_values_from_module(agent.module_accessor, \"right\", \"pulse\", &[{}]);",
+            (0..8).map(|index| format!("(\"field{index}\", crate::slight::gimmicks::ChartEventValue::Int({}))", if index == 7 { "1000000" } else { "1" })).collect::<Vec<_>>().join(", ")
+        );
+        assert!(parse_gimmick_chart_event_values_call(&eight).is_some());
+        let signed = call
+            .replace("Int(3)", "Int(-3)")
+            .replace("Float(0.5)", "Float(-0.5)");
+        assert!(parse_gimmick_chart_event_values_call(&signed).is_some());
+        let too_long_name = "x".repeat(crate::gimmicks::live_model::MAX_NAME_BYTES + 1);
+        assert!(parse_gimmick_chart_event_values_call(
+            &call.replace("\"pulse\"", &format!("{too_long_name:?}"))
+        )
+        .is_none());
+        let empty = "crate::slight::gimmicks::dispatch_named_chart_values_from_module(agent.module_accessor, \"right\", \"pulse\", &[]);";
+        for invalid in [
+            call.replace("agent.module_accessor", "boma"),
+            call.replace(
+                "crate::slight::gimmicks::ChartEventValue::Int",
+                "alias::ChartEventValue::Int",
+            ),
+            call.replace("Int(3)", "Int(amount())"),
+            call.replace("Float(0.5)", "Float(1)"),
+            call.replace("Int(3)", "Int(3u32)"),
+            call.replace("Float(0.5)", "Float(0.5f64)"),
+            call.replace("Int(3)", "Int(3 as i32)"),
+            call.replace("Flag(true)", "Flag(ON)"),
+            call.replace("Int(3)", "Int()"),
+            call.replace(
+                "(\"on\", crate::slight::gimmicks::ChartEventValue::Flag(true))",
+                "(\"amount\", crate::slight::gimmicks::ChartEventValue::Flag(true))",
+            ),
+            call.replace("Float(0.5)", "Float(1000001.0)"),
+            call.replace("Int(3)", "Int(1000001)"),
+            call.replace("Float(0.5)", "Float(f32::INFINITY)"),
+            empty.to_owned(),
+            call.replace("\"amount\"", "\"bad\\0name\""),
+        ] {
+            assert!(
+                parse_gimmick_chart_event_values_call(&invalid).is_none(),
+                "accepted {invalid}"
+            );
+        }
+        let nine = format!(
+            "crate::slight::gimmicks::dispatch_named_chart_values_from_module(agent.module_accessor, \"right\", \"pulse\", &[{}]);",
+            (0..9).map(|index| format!("(\"field{index}\", crate::slight::gimmicks::ChartEventValue::Int(1))")).collect::<Vec<_>>().join(", ")
+        );
+        assert!(parse_gimmick_chart_event_values_call(&nine).is_none());
+        assert!(
+            parse_gimmick_chart_event_values_call(&format!("#[allow(unused)] {call}")).is_none()
+        );
+
+        let game = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_values(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(
+            matches!(game.stmts.as_slice(), [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::GimmickChartEventValues { .. }]))
+        );
+        let game_wire = serde_json::to_string(&game.stmts).unwrap();
+        assert!(game_wire.contains("GimmickChartEventValues"));
+
+        let attributed_execute = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_values_attr(agent: &mut L2CAgentBase) {{\n    #[cfg(any())]\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        let attributed_wire = serde_json::to_string(&attributed_execute.stmts).unwrap();
+        assert!(!attributed_wire.contains("GimmickChartEventValues"));
+        assert!(emit_stmts(&attributed_execute.stmts, "    ")
+            .join("\n")
+            .contains("dispatch_named_chart_values_from_module"));
+
+        let bare = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_values_bare(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&bare.stmts)
+            .unwrap()
+            .contains("GimmickChartEventValues"));
+        assert!(emit_stmts(&bare.stmts, "    ")
+            .join("\n")
+            .contains("dispatch_named_chart_values_from_module"));
+
+        let sound_source = format!(
+            "unsafe extern \"C\" fn sound_values(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        );
+        let sound = parse_sound_script(&sound_source);
+        assert!(!serde_json::to_string(&sound.stmts)
+            .unwrap()
+            .contains("GimmickChartEventValues"));
+        assert!(emit_sound_body(&sound).contains("dispatch_named_chart_values_from_module"));
+
+        let expression = parse_expression_script(&format!(
+            "unsafe extern \"C\" fn expression_values(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(
+            matches!(expression.stmts.first(), Some(AcmdStmt::Excute(commands)) if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.contains("dispatch_named_chart_values_from_module")))
+        );
+
+        let unsafe_parent = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_values_parent(agent: &mut L2CAgentBase) {{\n    unsafe {{\n        if macros::is_excute(agent) {{\n            {call}\n        }}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&unsafe_parent.stmts)
+            .unwrap()
+            .contains("GimmickChartEventValues"));
+        assert!(emit_stmts(&unsafe_parent.stmts, "    ")
+            .join("\n")
+            .contains("dispatch_named_chart_values_from_module"));
+
+        let imported_alias = call.replace(
+            "crate::slight::gimmicks::dispatch_named_chart_values_from_module",
+            "dispatch_values",
+        );
+        let import_scope = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_values_import(agent: &mut L2CAgentBase) {{\n    use crate::slight::gimmicks::dispatch_named_chart_values_from_module as dispatch_values;\n    if macros::is_excute(agent) {{\n        {imported_alias}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&import_scope.stmts)
+            .unwrap()
+            .contains("GimmickChartEventValues"));
+        assert!(emit_stmts(&import_scope.stmts, "    ")
+            .join("\n")
+            .contains("dispatch_values"));
+    }
+
+    #[test]
+    fn named_event_parser_rejects_execute_and_call_attributes() {
+        let source = r#"unsafe extern "C" fn game_named_event_attrs(agent: &mut L2CAgentBase) {
+    #[cfg(
+        any()
+    )] // trivia does not detach an Execute attribute
+    if macros::is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "guard_attr");
+    }
+    if macros::is_excute(agent) {
+        #[cfg(
+            any()
+        )] // trivia does not detach a call attribute
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "call_attr");
+        crate::slight::gimmicks::dispatch_named_from_module(agent.module_accessor, "plain");
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let typed_names = parsed
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                AcmdStmt::Excute(commands) => Some(commands.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|command| match command {
+                ExcuteStmt::GimmickEvent { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(typed_names, vec!["plain"]);
+        let rendered = emit_stmts(&parsed.stmts, "    ").join("\n");
+        assert!(rendered.contains("#[cfg("), "{rendered}");
+        assert!(rendered.contains("trivia does not detach an Execute attribute"));
+        assert!(rendered.contains("trivia does not detach a call attribute"));
+        assert!(
+            rendered.contains("dispatch_named_from_module(agent.module_accessor, \"guard_attr\")")
+        );
+        assert!(
+            rendered.contains("dispatch_named_from_module(agent.module_accessor, \"call_attr\")")
+        );
+        let emitted = preview_game_fn(&parsed, "named_event_attrs");
+        assert_json_eq!(
+            parse_acmd_script(&emitted).stmts,
+            parsed.stmts,
+            "root Execute/call attributes and the one plain typed send stay source-stable"
+        );
+    }
+
+    #[test]
+    fn named_event_multiline_calls_keep_direct_statement_attribute_boundaries() {
+        let parsed = parse_acmd_script(
+            r#"unsafe extern "C" fn game_multiline_events(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        crate::slight::gimmicks::dispatch_named_from_module(
+            agent.module_accessor,
+            "plain"
+        );
+        #[cfg(any())]
+        // A comment must not detach the call's attribute.
+        crate::slight::gimmicks::dispatch_named_from_module(
+            agent.module_accessor,
+            "attributed"
+        );
+    }
+}
+"#,
+        );
+        let AcmdStmt::Excute(commands) = &parsed.stmts[0] else {
+            panic!("direct Execute should remain intact");
+        };
+        let events = commands
+            .iter()
+            .filter_map(|command| match command {
+                ExcuteStmt::GimmickEvent { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, ["plain"]);
+        let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+        assert!(emitted.contains("#[cfg(any())]"));
+        assert!(emitted.contains("\"attributed\""));
+    }
+
+    #[test]
+    fn exact_repeat_parser_accepts_measured_counts_on_all_tracks_and_preserves_unknown_headers() {
+        fn acmd_loop_counts(stmts: &[AcmdStmt], out: &mut Vec<usize>) {
+            for stmt in stmts {
+                match stmt {
+                    AcmdStmt::Loop { count, body, .. } => {
+                        out.push(*count);
+                        acmd_loop_counts(body, out);
+                    }
+                    AcmdStmt::RawBlock { body, .. } => acmd_loop_counts(body, out),
+                    _ => {}
+                }
+            }
+        }
+        fn effect_loop_counts(stmts: &[crate::data::EffectStmt], out: &mut Vec<usize>) {
+            for stmt in stmts {
+                match stmt {
+                    crate::data::EffectStmt::Loop { count, body, .. } => {
+                        out.push(*count);
+                        effect_loop_counts(body, out);
+                    }
+                    crate::data::EffectStmt::Cond { body, .. } => effect_loop_counts(body, out),
+                    _ => {}
+                }
+            }
+        }
+        fn parse_acmd_track(track: &str, header: &str) -> Vec<usize> {
+            let source = format!(
+                "unsafe extern \"C\" fn {track}_repeat(agent: &mut L2CAgentBase) {{\n    {header}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+            );
+            let script = match track {
+                "game" => parse_acmd_script(&source),
+                "sound" => parse_sound_script(&source),
+                "expression" => parse_expression_script(&source),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::new();
+            acmd_loop_counts(&script.stmts, &mut out);
+            out
+        }
+
+        for count in [0usize, 1, 20, 22, 24, 31, 34, 47, 49, 100] {
+            let header = format!("for _ in 0..{count} {{");
+            for track in ["game", "sound", "expression"] {
+                assert_eq!(parse_acmd_track(track, &header), [count], "track {track}");
+            }
+            let effect_source = format!(
+                "unsafe extern \"C\" fn effect_repeat(agent: &mut L2CAgentBase) {{\n    {header}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+            );
+            let mut out = Vec::new();
+            effect_loop_counts(&parse_effect_script(&effect_source).stmts, &mut out);
+            assert_eq!(out, [count], "effect track");
+        }
+
+        let unsupported = [
+            "for _ in 0..=24 {",
+            "for index in 0..24 {",
+            "for (index, _) in 0..24 {",
+            "for _ in 1..25 {",
+            "for _ in 0..(24 + 1) {",
+            "for _ in 0..24 + 1 {",
+            "for _ in 0..24usize {",
+            "for _ in 0..101 {",
+            "for _ in 0..184467440737095516160000 {",
+            "for _ in (0..24).step_by(2) {",
+            "for /* header trivia */ _ in 0..24 {",
+            "for _ in 0..24 { // trailing header comment",
+        ];
+        for header in unsupported {
+            for track in ["game", "sound", "expression"] {
+                let source = format!(
+                    "unsafe extern \"C\" fn {track}_repeat(agent: &mut L2CAgentBase) {{\n    {header}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+                );
+                let parsed = match track {
+                    "game" => parse_acmd_script(&source),
+                    "sound" => parse_sound_script(&source),
+                    _ => parse_expression_script(&source),
+                };
+                let mut out = Vec::new();
+                acmd_loop_counts(&parsed.stmts, &mut out);
+                assert!(out.is_empty(), "{track}: {header}");
+                let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+                assert!(emitted.contains(header), "{track} lost header {header}");
+                assert!(emitted.contains("frame(agent.lua_state_agent, 1.0);"));
+            }
+            let effect_source = format!(
+                "unsafe extern \"C\" fn effect_repeat(agent: &mut L2CAgentBase) {{\n    {header}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+            );
+            let parsed = parse_effect_script(&effect_source);
+            let mut out = Vec::new();
+            effect_loop_counts(&parsed.stmts, &mut out);
+            assert!(out.is_empty(), "effect: {header}");
+            assert!(matches!(
+                parsed.stmts.first(),
+                Some(crate::data::EffectStmt::Cond { header: preserved, .. })
+                    if preserved == header
+            ));
+        }
+
+        let attributed =
+            "#[cfg(\n    any()\n)]\n// stays attached to the source loop\nfor _ in 0..24 {";
+        for track in ["game", "sound", "expression"] {
+            let source = format!(
+                "unsafe extern \"C\" fn {track}_repeat(agent: &mut L2CAgentBase) {{\n    {attributed}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+            );
+            let parsed = match track {
+                "game" => parse_acmd_script(&source),
+                "sound" => parse_sound_script(&source),
+                _ => parse_expression_script(&source),
+            };
+            let mut out = Vec::new();
+            acmd_loop_counts(&parsed.stmts, &mut out);
+            assert!(out.is_empty(), "{track} attributed loop became editable");
+            let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+            assert!(emitted.contains("#[cfg("), "{track} lost the attribute");
+            assert!(
+                emitted.contains("for _ in 0..24 {"),
+                "{track} lost the loop"
+            );
+        }
+        let effect_source = format!(
+            "unsafe extern \"C\" fn effect_repeat(agent: &mut L2CAgentBase) {{\n    {attributed}\n        frame(agent.lua_state_agent, 1.0);\n    }}\n}}\n"
+        );
+        let parsed = parse_effect_script(&effect_source);
+        let mut out = Vec::new();
+        effect_loop_counts(&parsed.stmts, &mut out);
+        assert!(out.is_empty(), "effect attributed loop became editable");
+        assert!(matches!(
+            parsed.stmts.iter().find(|stmt| matches!(
+                stmt,
+                crate::data::EffectStmt::Cond { header, .. } if header == "for _ in 0..24 {"
+            )),
+            Some(crate::data::EffectStmt::Cond { .. })
+        ));
+    }
+
+    #[test]
+    fn only_plain_positive_execute_guards_are_typed() {
+        let source = r#"unsafe extern "C" fn game_guards(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+    }
+    if is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+    }
+    if !is_excute(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+    }
+    if macros::is_excute(agent) && another_condition(agent) {
+        AttackModule::init_attack_pos(agent.module_accessor, 0);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [
+                AcmdStmt::Excute(_),
+                AcmdStmt::Excute(_),
+                AcmdStmt::RawBlock { header, .. },
+                AcmdStmt::RawBlock { header: combined, .. }
+            ] if header == "if !is_excute(agent) {"
+                && combined == "if macros::is_excute(agent) && another_condition(agent) {"
+        ));
+        assert!(matches!(
+            &parsed.stmts[2],
+            AcmdStmt::RawBlock { body, .. }
+                if !body.iter().any(|stmt| matches!(stmt, AcmdStmt::Excute(_)))
+        ));
+    }
+
     #[test]
     fn a_motion_rate_call_parses_to_a_typed_statement_and_not_to_raw() {
         let script = parse_acmd_script(
@@ -5775,8 +13304,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `REVERSE_LR` is a point statement: it has no editable payload, but it must still be
-    /// typed so the frame walk, live rule path, and source writer can all see the same event.
     #[test]
     fn a_reverse_lr_call_parses_to_a_typed_point_and_round_trips() {
         let source = r#"unsafe extern "C" fn game_throwf(agent: &mut L2CAgentBase) {
@@ -5813,21 +13340,326 @@ pub(crate) mod tests {
         );
     }
 
-    /// `FT_MOTION_RATE_RANGE` begins with `FT_MOTION_RATE`'s entire name and takes a different
-    /// argument list, so a prefix or `contains` match reads one as the other and writes back a
-    /// call the game does not have. This codebase has paid for that shape once already with
-    /// `ATTACK` / `ATTACK_ABS`.
-    ///
-    /// Both of these have **zero** corpus calls, so they stay `Raw` on purpose — there is no
-    /// sample to check a parse of them against. If one is ever modelled, this test should
-    /// change rather than be deleted.
-    ///
-    /// **The third line is synthetic and is the one with teeth.** Mutation showed that the two
-    /// real calls are rejected by their *argument count*, not by their name — replacing the
-    /// parenthesised match with a prefix match still passes on them, because `5.0, 10.0, 0.5`
-    /// fails to parse as one `f32`. That makes the real guard accidental. A two-argument macro
-    /// whose name merely starts with `FT_MOTION_RATE` isolates the name match itself, which is
-    /// what the parser actually relies on.
+    #[test]
+    fn shoot_item_bullet_near_misses_stay_raw() {
+        for bad in [
+            "macros::SHOOT_ITEM_BULLET();",
+            "macros::SHOOT_ITEM_BULLET(agent, 1);",
+            "macros::SHOOT_ITEM_BULLET(other);",
+            "macros::SHOOT_ITEM_BULLET(agent)",
+            "macros::SHOOT_ITEM_BULLET_CHARGE(agent);",
+            "other::SHOOT_ITEM_BULLET(agent);",
+        ] {
+            assert!(
+                parse_shoot_item_bullet_call(bad).is_none(),
+                "accepted {bad}"
+            );
+            let source = format!(
+                "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}"
+            );
+            assert!(matches!(
+                parse_acmd_script(&source).stmts.as_slice(),
+                [AcmdStmt::Excute(commands)]
+                    if matches!(commands.as_slice(), [ExcuteStmt::Raw(_)])
+            ));
+        }
+    }
+
+    #[test]
+    fn item_fire_scope_stays_root_game_execute_only() {
+        for body in [
+            "macros::SHOOT_ITEM_BULLET(agent);",
+            "if condition {\n    if macros::is_excute(agent) {\n        macros::SHOOT_ITEM_BULLET(agent);\n    }\n}",
+            "for _ in 0..2 {\n    if macros::is_excute(agent) {\n        macros::SHOOT_ITEM_BULLET(agent);\n    }\n}",
+            "#[cfg(any())]\nif macros::is_excute(agent) {\n    macros::SHOOT_ITEM_BULLET(agent);\n}",
+            "if macros::is_excute(agent) {\n    #[cfg(any())]\n    macros::SHOOT_ITEM_BULLET(agent);\n}",
+        ] {
+            let source = format!("unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+            let script = parse_acmd_script(&source);
+            assert!(!serde_json::to_string(&script).unwrap().contains("ShootItemBullet"));
+            assert!(!effect_source_compatibility_macros("// macros::SHOOT_ITEM_BULLET(agent);").contains("pub unsafe fn SHOOT_ITEM_BULLET"));
+        }
+        for (prefix, parse) in [
+            ("sound", parse_sound_script as fn(&str) -> AcmdScript),
+            (
+                "expression",
+                parse_expression_script as fn(&str) -> AcmdScript,
+            ),
+        ] {
+            let source = format!("unsafe extern \"C\" fn {prefix}_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        macros::SHOOT_ITEM_BULLET(agent);\n    }}\n}}\n");
+            let script = parse(&source);
+            assert!(!serde_json::to_string(&script)
+                .unwrap()
+                .contains("ShootItemBullet"));
+        }
+    }
+
+    #[test]
+    fn start_info_flash_eye_rejects_near_misses_and_keeps_their_source() {
+        for bad in [
+            "macros::START_INFO_FLASH_EYE();",
+            "macros::START_INFO_FLASH_EYE(agent, false);",
+            "macros::START_INFO_FLASH_EYE(other);",
+            "macros::START_INFO_FLASH_EYE(agent)",
+            "other::START_INFO_FLASH_EYE(agent);",
+            "macros::START_INFO_FLASH_EYE_EXTRA(agent);",
+        ] {
+            assert!(
+                parse_start_info_flash_eye_call(bad).is_none(),
+                "accepted {bad}"
+            );
+            let source = format!(
+                "unsafe extern \"C\" fn game_near_miss(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(!serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("StartInfoFlashEye"));
+            let emitted = preview_game_fn(&parsed, "near_miss");
+            assert!(emitted.contains(bad), "source spelling was lost: {bad}");
+        }
+    }
+
+    #[test]
+    fn start_info_flash_eye_stays_at_root_unattributed_game_or_expression_execute() {
+        let call = "macros::START_INFO_FLASH_EYE(agent);";
+        for body in [
+            call.to_owned(),
+            format!("if runtime_condition() {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("for _ in 0..2 {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    #[cfg(any())]\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    {call}\n}} else {{\n    wait(agent.lua_state_agent, 1.0);\n}}"),
+        ] {
+            let game = parse_acmd_script(&format!(
+                "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            ));
+            assert!(!serde_json::to_string(&game).unwrap().contains("StartInfoFlashEye"),
+                "typed a disallowed Game placement: {body}");
+            assert!(preview_game_fn(&game, "x").contains(call),
+                "disallowed Game source was not retained: {body}");
+            let expression = parse_expression_script(&format!(
+                "unsafe extern \"C\" fn expression_x(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            ));
+            assert!(!serde_json::to_string(&expression).unwrap().contains("StartInfoFlashEye"),
+                "typed a disallowed Expression placement: {body}");
+            assert!(preview_expression_fn(&expression, "x").contains(call),
+                "disallowed Expression source was not retained: {body}");
+        }
+
+        let sound = parse_sound_script(&format!(
+            "unsafe extern \"C\" fn sound_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&sound)
+            .unwrap()
+            .contains("StartInfoFlashEye"));
+    }
+
+    #[test]
+    fn camera_zoom_out_rejects_near_misses_and_preserves_their_source() {
+        for bad in [
+            "macros::CAM_ZOOM_OUT();",
+            "macros::CAM_ZOOM_OUT(agent, false);",
+            "macros::CAM_ZOOM_OUT(other);",
+            "macros::CAM_ZOOM_OUT(agent)",
+            "other::CAM_ZOOM_OUT(agent);",
+            "macros::CAM_ZOOM_OUT_FINAL(agent);",
+            "macros::CAM_ZOOM_IN(agent);",
+        ] {
+            assert!(parse_camera_zoom_out_call(bad).is_none(), "accepted {bad}");
+            let source = format!(
+                "unsafe extern \"C\" fn game_near_miss(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(!serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("CameraZoomOut"));
+            assert!(
+                preview_game_fn(&parsed, "near_miss").contains(bad),
+                "source spelling was lost: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_zoom_out_stays_at_root_unattributed_game_execute_only() {
+        let call = "macros::CAM_ZOOM_OUT(agent);";
+        for body in [
+            format!("if runtime_condition() {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("for _ in 0..2 {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    #[cfg(any())]\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    {call}\n}} else {{\n    wait(agent.lua_state_agent, 1.0);\n}}"),
+        ] {
+            let game = parse_acmd_script(&format!(
+                "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            ));
+            assert!(!serde_json::to_string(&game).unwrap().contains("CameraZoomOut"),
+                "typed a disallowed Game placement: {body}");
+            assert!(preview_game_fn(&game, "x").contains(call),
+                "disallowed Game source was not retained: {body}");
+        }
+
+        let bare = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_bare(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&bare)
+            .unwrap()
+            .contains("CameraZoomOut"));
+        assert!(preview_game_fn(&bare, "bare").contains(call));
+
+        let expression = parse_expression_script(&format!(
+            "unsafe extern \"C\" fn expression_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&expression)
+            .unwrap()
+            .contains("CameraZoomOut"));
+        assert!(preview_expression_fn(&expression, "other_track").contains(call));
+        let sound = parse_sound_script(&format!(
+            "unsafe extern \"C\" fn sound_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&sound)
+            .unwrap()
+            .contains("CameraZoomOut"));
+        assert!(preview_sound_fn(&sound, "other_track").contains(call));
+    }
+
+    fn typed_capture_cut_common_count(statements: &[AcmdStmt]) -> usize {
+        statements
+            .iter()
+            .map(|statement| match statement {
+                AcmdStmt::Excute(commands) => commands
+                    .iter()
+                    .filter(|command| matches!(command, ExcuteStmt::CaptureCutCommon))
+                    .count(),
+                AcmdStmt::Bare(command) => {
+                    if matches!(command.as_ref(), ExcuteStmt::CaptureCutCommon) {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
+                    typed_capture_cut_common_count(body)
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn start_cut_in_is_execute_only_and_rejects_near_misses_and_unsafe_contexts() {
+        let call = "macros::FT_START_CUTIN(agent);";
+        for bad in [
+            "macros::FT_START_CUTIN();",
+            "macros::FT_START_CUTIN(agent, false);",
+            "macros::FT_START_CUTIN(other);",
+            "macros::FT_START_CUTIN(agent)",
+            "other::FT_START_CUTIN(agent);",
+            "macros::FT_START_CUTIN_EXTRA(agent);",
+            "consume(macros::FT_START_CUTIN(agent));",
+        ] {
+            assert!(parse_start_cut_in_call(bad).is_none(), "accepted {bad}");
+            let source = format!(
+                "unsafe extern \"C\" fn game_bad(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bad}\n    }}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(!serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("StartCutIn"));
+            assert!(preview_game_fn(&parsed, "bad").contains(bad));
+        }
+
+        let bare = parse_acmd_script(&format!(
+            "unsafe extern \"C\" fn game_bare(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&bare).unwrap().contains("StartCutIn"));
+        assert!(preview_game_fn(&bare, "bare").contains(call));
+
+        for body in [
+            format!("if runtime_condition() {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("for _ in 0..2 {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}"),
+            format!("#[cfg(any())]\nif macros::is_excute(agent) {{\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    #[cfg(any())]\n    {call}\n}}"),
+            format!("if macros::is_excute(agent) {{\n    {call}\n    let broken = ;\n}}"),
+        ] {
+            let source = format!(
+                "unsafe extern \"C\" fn game_nested(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(!serde_json::to_string(&parsed).unwrap().contains("StartCutIn"));
+            assert!(preview_game_fn(&parsed, "nested").contains(call));
+        }
+
+        let expression = parse_expression_script(&format!(
+            "unsafe extern \"C\" fn expression_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&expression)
+            .unwrap()
+            .contains("StartCutIn"));
+        assert!(preview_expression_fn(&expression, "other_track").contains(call));
+        let sound = parse_sound_script(&format!(
+            "unsafe extern \"C\" fn sound_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {call}\n    }}\n}}\n"
+        ));
+        assert!(!serde_json::to_string(&sound)
+            .unwrap()
+            .contains("StartCutIn"));
+        assert!(preview_sound_fn(&sound, "other_track").contains(call));
+    }
+
+    #[test]
+    fn capture_cut_common_is_root_game_bare_only_and_keeps_other_placements_raw() {
+        let call = "macros::game_CaptureCutCommon(agent);";
+        for bad in [
+            "macros::game_CaptureCutCommon();",
+            "macros::game_CaptureCutCommon(agent, false);",
+            "macros::game_CaptureCutCommon(other);",
+            "macros::game_CaptureCutCommon(agent)",
+            "other::game_CaptureCutCommon(agent);",
+            "macros::game_CaptureCutCommonExtra(agent);",
+            "consume(macros::game_CaptureCutCommon(agent));",
+        ] {
+            assert!(
+                parse_capture_cut_common_call(bad).is_none(),
+                "accepted {bad}"
+            );
+            let parsed = parse_acmd_script(&format!(
+                "unsafe extern \"C\" fn game_bad(agent: &mut L2CAgentBase) {{\n    {bad}\n}}\n"
+            ));
+            assert_eq!(typed_capture_cut_common_count(&parsed.stmts), 0);
+            assert!(preview_game_fn(&parsed, "bad").contains(bad));
+        }
+
+        for body in [
+            format!("if macros::is_excute(agent) {{\n    {call}\n}}"),
+            format!("if runtime_condition() {{\n    {call}\n}}"),
+            format!("for _ in 0..2 {{\n    {call}\n}}"),
+            format!("#[cfg(any())]\n{call}"),
+            format!("{call}\nlet broken = ;"),
+        ] {
+            let parsed = parse_acmd_script(&format!(
+                "unsafe extern \"C\" fn game_nonroot(agent: &mut L2CAgentBase) {{\n{body}\n}}\n"
+            ));
+            assert_eq!(
+                typed_capture_cut_common_count(&parsed.stmts),
+                0,
+                "typed a disallowed root bare placement: {body}"
+            );
+            assert!(preview_game_fn(&parsed, "nonroot").contains(call));
+        }
+
+        let expression = parse_expression_script(&format!(
+            "unsafe extern \"C\" fn expression_x(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"
+        ));
+        assert_eq!(typed_capture_cut_common_count(&expression.stmts), 0);
+        assert!(preview_expression_fn(&expression, "other_track").contains(call));
+        let sound = parse_sound_script(&format!(
+            "unsafe extern \"C\" fn sound_x(agent: &mut L2CAgentBase) {{\n    {call}\n}}\n"
+        ));
+        assert_eq!(typed_capture_cut_common_count(&sound.stmts), 0);
+        assert!(preview_sound_fn(&sound, "other_track").contains(call));
+    }
+
     #[test]
     fn the_longer_rate_macros_are_not_read_as_a_motion_rate() {
         for line in [
@@ -5851,99 +13683,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every `FT_MOTION_RATE` in the corpus, parsed and written back.
-    ///
-    /// This is the round-trip half, and it is worth having *given* the test above: together
-    /// they say the call is now typed **and** that typing it did not change what is exported.
-    #[test]
-    fn every_corpus_motion_rate_call_survives_being_typed() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-        let mut seen = 0usize;
-        for (path, body) in &bodies {
-            for func in body.split_inclusive("\n}\n") {
-                let script = parse_acmd_script(func);
-                let rates: Vec<f32> = script
-                    .stmts
-                    .iter()
-                    .filter_map(|s| match s {
-                        crate::data::AcmdStmt::MotionRate(r) => Some(*r),
-                        _ => None,
-                    })
-                    .collect();
-                if rates.is_empty() {
-                    continue;
-                }
-                seen += rates.len();
-                let emitted = preview_game_fn(&script, "audit");
-                let reparsed: Vec<f32> = parse_acmd_script(&emitted)
-                    .stmts
-                    .iter()
-                    .filter_map(|s| match s {
-                        crate::data::AcmdStmt::MotionRate(r) => Some(*r),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(rates, reparsed, "{path} lost or changed a rate on export");
-            }
-        }
-        // Guard the oracle with what it claims to test: if the corpus stops containing rate
-        // calls, or the parse arm regresses, this test would otherwise pass having checked
-        // nothing at all.
-        assert!(
-            seen >= 17,
-            "expected at least the 17 known corpus rate calls, saw {seen}"
-        );
-    }
-
-    /// The seven measured corpus calls are all the exact zero-argument macro form. This keeps a
-    /// family-prefix or wrong-arity parser from appearing to work on a synthetic fixture while
-    /// silently leaving a real call as `Raw`.
-    #[test]
-    fn every_corpus_reverse_lr_call_is_typed_and_exported() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-        let mut written = 0usize;
-        let mut typed = 0usize;
-        for (path, body) in &bodies {
-            if extract_function(body, "game_").is_none() {
-                continue;
-            }
-            let all = body.matches("macros::REVERSE_LR(").count();
-            let exact = body.matches("macros::REVERSE_LR(agent);").count();
-            assert_eq!(
-                all, exact,
-                "{path} contains a REVERSE_LR shape outside the measured signature"
-            );
-            if exact == 0 {
-                continue;
-            }
-            written += exact;
-            let script = parse_acmd_script(body);
-            let events = script.to_reverse_lr_events();
-            typed += events.len();
-            assert_eq!(events.len(), exact, "{path} lost a typed REVERSE_LR event");
-            let emitted = preview_game_fn(&script, "reverse_lr_audit");
-            assert_eq!(
-                parse_acmd_script(&emitted).to_reverse_lr_events(),
-                events,
-                "{path} changed its REVERSE_LR points on export"
-            );
-        }
-        assert_eq!(written, 7, "the measured E1 corpus count changed");
-        assert_eq!(typed, written, "every measured call must be typed");
-    }
-
-    /// Three files in a long-lived script cache are the literal bytes `404: Not Found`, because
-    /// the fetch used to store whatever a request returned and a 404 is a *successful* request.
-    ///
-    /// Both halves matter and the negative one is worthless alone: "the error page is not read
-    /// as a script" passes just as well against a function that reads nothing at all, so the
-    /// same call is made with a real script body to show the path still carries one through.
     #[test]
     fn a_cached_error_page_is_not_read_as_a_script_but_a_real_one_still_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -5994,12 +13733,6 @@ pub(crate) mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
-    /// The regression this fix could easily have introduced, and the reason a miss normalises to
-    /// an empty body instead of to `None`.
-    ///
-    /// The fighter-wide scan reads `None` as "not cached yet" and queues the move for a network
-    /// fetch. If a known-missing move answered `None`, every scan would re-request all of them
-    /// forever — the exact cost the cache was built to avoid — and nothing would have failed.
     #[test]
     fn a_cached_miss_still_counts_as_fetched_so_a_scan_does_not_re_request_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -6016,13 +13749,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the bug actually cost, asserted at the surface where it did damage.
-    ///
-    /// `404: Not Found` is not a macro call, so the parser keeps it as [`AcmdStmt::Raw`] and
-    /// `emit_stmts` writes `Raw` lines straight back out. Exporting one of those three dolly
-    /// moves therefore emitted the words `404: Not Found` into a generated `.rs` file, which no
-    /// toolchain will build. This is the verbatim-escape-hatch trap: a `Raw` line is trusted to
-    /// be Rust, and here it was an error page.
     #[test]
     fn exporting_a_move_with_no_upstream_script_does_not_emit_the_error_page() {
         // Unnormalised, to show the export path really would have written it.
@@ -6041,9 +13767,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// `AttackModule::clear_all` used to end a hitbox the frame *before* it started when the
-    /// script had no `frame()` call ahead of it, so the timeline and the viewport drew nothing
-    /// at all for kirby's jab. The id-scoped clear already clamped; this one did not.
     #[test]
     fn a_collision_cleared_on_the_next_frame_is_out_for_that_frame() {
         // kirby/Attack100Sub: a hitbox with no `frame()` before it, cleared one frame later.
@@ -6067,7 +13790,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     }
 
     /// kirby/ThrowF, verbatim — two `ATTACK_ABS` in one block sharing id 0 and differing only
-    /// by kind, which is the case that makes id-based identity wrong for this family.
     const THROW_ABS: &str = r#"
 unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
@@ -6077,9 +13799,631 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
 }
 "#;
 
-    /// Two calls in one block with the same id are two separate rows, because the *kind* is
-    /// what tells them apart. Keying on id — which every corpus call writes as 0 — would end
-    /// the first the instant the second was read, and a throw would lose its throw half.
+    #[test]
+    fn throw_hit_application_types_only_the_closed_four_line_game_bundle() {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+
+        let bundle = ATTACK_ABS_APPLY_THROW_SOURCE.join("\n        ");
+        let source = format!(
+        "unsafe extern \"C\" fn game_throw(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {bundle}\n        AttackModule::clear_all(agent.module_accessor);\n    }}\n}}\n"
+    );
+        let parsed = parse_acmd_script(&source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [
+                    ExcuteStmt::AttackAbsApplyThrow,
+                    ExcuteStmt::ClearAll,
+                ])
+        ));
+        let emitted = preview_game_fn(&parsed, "throw");
+        let reparsed = parse_acmd_script(&emitted);
+        assert_json_eq!(
+            parsed,
+            reparsed,
+            "the bundle and later command must retain their order and scope"
+        );
+
+        let mut malformed = vec![
+        source.replace(
+            "FIGHTER_ATTACK_ABSOLUTE_KIND_THROW, Hash40::new(\"throw\")",
+            "FIGHTER_ATTACK_ABSOLUTE_KIND_THROW_MEWTWO, Hash40::new(\"throw\")",
+        ),
+        source.replace("Hash40::new(\"throw\")", "Hash40::new(\"catch\")"),
+        source.replace(
+            "target, target_group, target_no);",
+            "target, target_group, target_group);",
+        ),
+        source.replace(
+            "FIGHTER_STATUS_THROW_WORK_INT_TARGET_OBJECT",
+            "FIGHTER_DOLLY_STATUS_SUPER_SPECIAL2_WORK_INT_TARGET_OBJECT_ID",
+        ),
+        source.replace(
+            "agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_OBJECT",
+            "boma, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_OBJECT",
+        ),
+        source.replace(
+            "macros::ATK_HIT_ABS(agent, *FIGHTER_ATTACK_ABSOLUTE_KIND_THROW",
+            "macros::ATK_HIT_ABS(boma, *FIGHTER_ATTACK_ABSOLUTE_KIND_THROW",
+        ),
+        source.replace(
+            "target, target_group, target_no);",
+            "*FIGHTER_DOLLY_STATUS_SUPER_SPECIAL2_WORK_INT_TARGET_OBJECT_ID, *FIGHTER_DOLLY_STATUS_SUPER_SPECIAL2_WORK_INT_TARGET_HIT_GROUP, *FIGHTER_DOLLY_STATUS_SUPER_SPECIAL2_WORK_INT_TARGET_HIT_NO);",
+        ),
+        source.replace(
+            "target, target_group, target_no);",
+            "target, target_group, target_no, 0);",
+        ),
+        source.replace(
+            "let target_group = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_GROUP);\n        let target_no = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_NO);",
+            "let target_no = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_NO);\n        let target_group = WorkModule::get_int64(agent.module_accessor, *FIGHTER_STATUS_THROW_WORK_INT_TARGET_HIT_GROUP);",
+        ),
+        source.replace(
+            "let target_group = WorkModule::get_int64",
+            "unknown_interrupt(agent);\n        let target_group = WorkModule::get_int64",
+        ),
+        source.replace(
+            &format!("        {bundle}"),
+            &format!("        if branch(agent) {{\n            {}\n        }}", bundle.replace("\n        ", "\n            ")),
+        ),
+        format!(
+            "unsafe extern \"C\" fn game_bare(agent: &mut L2CAgentBase) {{\n    {}\n}}\n",
+            bundle.replace("\n        ", "\n    ")
+        ),
+    ];
+        for malformed_source in malformed.drain(..) {
+            let opaque = parse_acmd_script(&malformed_source);
+            assert!(opaque.stmts.iter().all(|statement| match statement {
+                AcmdStmt::Excute(commands) => commands
+                    .iter()
+                    .all(|command| !matches!(command, ExcuteStmt::AttackAbsApplyThrow)),
+                AcmdStmt::RawBlock { body, .. } => body.iter().all(|statement| match statement {
+                    AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .all(|command| !matches!(command, ExcuteStmt::AttackAbsApplyThrow)),
+                    _ => true,
+                }),
+                _ => true,
+            }));
+            let emitted = preview_game_fn(&opaque, "throw");
+            assert_json_eq!(
+                opaque,
+                parse_acmd_script(&emitted),
+                "nonmatching, interrupted, nested, and bare calls remain opaque"
+            );
+        }
+
+        for prefix in ["// comment brace }", "helper(\"literal } brace\");"] {
+            let guarded_source = source.replace(
+                &format!("        {bundle}"),
+                &format!("        {prefix}\n        {bundle}"),
+            );
+            let guarded = parse_acmd_script(&guarded_source);
+            assert!(
+                matches!(guarded.stmts.as_slice(), [AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::Raw(_), ExcuteStmt::AttackAbsApplyThrow, ExcuteStmt::ClearAll])),
+                "{guarded:#?}"
+            );
+            let emitted = preview_game_fn(&guarded, "throw");
+            syn::parse_file(&emitted).unwrap();
+            assert_json_eq!(&guarded, parse_acmd_script(&emitted));
+        }
+
+        let sound_source = source.replace("game_throw", "sound_throw");
+        let sound = parse_sound_script(&sound_source);
+        assert!(sound.stmts.iter().all(|statement| !matches!(
+            statement,
+            AcmdStmt::Excute(commands)
+                if commands.iter().any(|command| matches!(command, ExcuteStmt::AttackAbsApplyThrow))
+        )));
+    }
+
+    #[test]
+    fn lexical_block_boundaries_ignore_nested_comments_and_rust_literals() {
+        let lines = [
+            "if macros::is_excute(agent) {",
+            "    // a comment can contain a closing }",
+            "    /* outer } /* nested } */ { */",
+            "    let _unicode = '\\u{7b}';",
+            "    let _hex = '\\x7d';",
+            "    let _char = '界';",
+            "    let _raw = br###\"",
+            "        } if native_guard(agent) {",
+            "    \"###;",
+            "    helper(\"escaped \\\" and closing }\");",
+            "    if native_guard(agent) {",
+            "        helper();",
+            "    }",
+            "}",
+            "outside();",
+        ];
+        assert_eq!(find_block_end(&lines, 0), (13, 0));
+        assert_eq!(find_block_end(&lines, 10), (12, 0));
+        let source = format!("{{\n{}\n}}", lines.join("\n"));
+        syn::parse_str::<syn::Block>(&source).unwrap();
+        for literal in [
+            "let example = r#\"{\"#;",
+            "helper(\"}\");",
+            "/* { */",
+            "let brace = '\\u{7b}';",
+        ] {
+            assert!(
+                !opens_block(literal),
+                "literal is not a control opener: {literal}"
+            );
+        }
+        assert!(opens_block("if native_guard(r#\"}\"#) {"));
+    }
+
+    #[test]
+    fn new_native_commands_require_actual_unattributed_root_statements() {
+        let reaction =
+            "AttackModule::set_add_reaction_frame(agent.module_accessor, 0, 2.0, false);";
+        let body = [
+            "/*",
+            reaction,
+            "*/",
+            "let example = r#\"",
+            reaction,
+            "\"#;",
+            "#[cfg(any())]",
+            reaction,
+            "if branch(agent) { // a nested native call is not a root statement",
+            reaction,
+            "}",
+            reaction,
+        ];
+        let heads = direct_native_statement_lines(&body);
+        assert!(heads.contains(&11));
+        for opaque in [1, 4, 7, 9] {
+            assert!(
+                !heads.contains(&opaque),
+                "non-executable or guarded line {opaque}"
+            );
+        }
+        let parsed = parse_excute_block(&body, ParseDomain::Game, true);
+        assert_eq!(
+            parsed
+                .iter()
+                .filter(|command| matches!(
+                    command,
+                    ExcuteStmt::AttackModuleAddReactionFrame { .. }
+                ))
+                .count(),
+            1
+        );
+
+        for (prefix, suffix) in [("/*", "*/"), ("let example = r#\"", "\"#;")] {
+            let mut body = vec![prefix];
+            body.extend(ATTACK_ABS_APPLY_THROW_SOURCE);
+            body.push(suffix);
+            let parsed = parse_excute_block(&body, ParseDomain::Game, true);
+            assert!(parsed
+                .iter()
+                .all(|command| !matches!(command, ExcuteStmt::AttackAbsApplyThrow)));
+        }
+        let invalid = ["let invalid = ;", reaction];
+        assert!(direct_native_statement_lines(&invalid).is_empty());
+        let parsed = parse_excute_block(&invalid, ParseDomain::Game, true);
+        assert!(parsed
+            .iter()
+            .all(|command| !matches!(command, ExcuteStmt::AttackModuleAddReactionFrame { .. })));
+    }
+
+    #[test]
+    fn finish_camera_accepts_only_measured_direct_game_tuples() {
+        let valid = "macros::CHECK_FINISH_CAMERA(agent, 15, 5);";
+        let parsed = parse_excute_block(&[valid], ParseDomain::Game, true);
+        let [ExcuteStmt::CheckFinishCamera(call)] = parsed.as_slice() else {
+            panic!("expected the measured robot donor tuple, got {parsed:?}");
+        };
+        assert_eq!(call.arg1, "15");
+        assert_eq!(call.arg2, "5");
+        let json = serde_json::to_value(&parsed).unwrap();
+        let restored: Vec<ExcuteStmt> = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), json);
+        assert_eq!(
+            emit_excute_stmts(&parsed, "").join("\n"),
+            valid,
+            "the exact literal tokens and call spelling are preserved"
+        );
+
+        for malformed in [
+            "macros::CHECK_FINISH_CAMERA(boma, 15, 5);",
+            "macros::CHECK_FINISH_CAMERA(agent, 15);",
+            "macros::CHECK_FINISH_CAMERA(agent, 15, 5, 0);",
+            "macros::CHECK_FINISH_CAMERA(agent, 15, 5)",
+            "macros::CHECK_FINISH_CAMERA(agent, 999, 999);",
+            "macros::CHECK_FINISH_CAMERA(agent, 15, 5); extra(agent);",
+        ] {
+            let rejected = parse_excute_block(&[malformed], ParseDomain::Game, true);
+            assert!(
+                matches!(
+                    rejected.as_slice(),
+                    [ExcuteStmt::Raw(raw)] if raw.trim() == malformed
+                ),
+                "unmeasured syntax must remain raw: {malformed}"
+            );
+        }
+
+        let attributed = ["#[cfg(any())]", valid];
+        let rejected = parse_excute_block(&attributed, ParseDomain::Game, true);
+        assert!(rejected
+            .iter()
+            .all(|command| !matches!(command, ExcuteStmt::CheckFinishCamera(_))));
+
+        let nested = [
+            "if branch(agent) {",
+            "    macros::CHECK_FINISH_CAMERA(agent, 15, 5);",
+            "}",
+        ];
+        let rejected = parse_excute_block(&nested, ParseDomain::Game, true);
+        assert!(rejected
+            .iter()
+            .all(|command| !matches!(command, ExcuteStmt::CheckFinishCamera(_))));
+        for domain in [ParseDomain::Sound, ParseDomain::Expression] {
+            let rejected = parse_excute_block(&[valid], domain, true);
+            assert!(matches!(
+                rejected.as_slice(),
+                [ExcuteStmt::Raw(raw)] if raw.trim() == valid
+            ));
+        }
+        let nested_context = parse_excute_block(&[valid], ParseDomain::Game, false);
+        assert!(matches!(
+            nested_context.as_slice(),
+            [ExcuteStmt::Raw(raw)] if raw.trim() == valid
+        ));
+    }
+
+    #[test]
+    fn final_start_camera_accepts_only_closed_root_execute_tuples() {
+        use crate::data::FinalStartCameraCall;
+
+        let valid = "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 0);";
+        let parsed = parse_excute_block(&[valid], ParseDomain::Game, true);
+        let [ExcuteStmt::CheckFinalStartCamera(call)] = parsed.as_slice() else {
+            panic!("expected closed final-start-camera tuple, got {parsed:?}");
+        };
+        assert_eq!(
+            call.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["0", "7", "20", "0", "0", "0"]
+        );
+        let json = serde_json::to_value(&parsed).unwrap();
+        let restored: Vec<ExcuteStmt> = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), json);
+        assert_eq!(emit_excute_stmts(&parsed, "").join("\n"), valid);
+
+        let measured_fraction =
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 6.5, 20, 0, 0, 0);";
+        let fractional = parse_excute_block(&[measured_fraction], ParseDomain::Game, true);
+        assert!(matches!(
+            fractional.as_slice(),
+            [ExcuteStmt::CheckFinalStartCamera(call)] if call.args[1] == "6.5"
+        ));
+        let tuples = crate::data::FINAL_START_CAMERA_PRESETS
+            .iter()
+            .map(|preset| preset.args)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tuples.len(), 20);
+        for tuple in tuples {
+            let text = format!(
+                "macros::CHECK_VALID_FINAL_START_CAMERA(agent, {});",
+                tuple.join(", ")
+            );
+            let parsed = parse_excute_block(&[text.as_str()], ParseDomain::Game, true);
+            assert!(matches!(parsed.as_slice(),
+                [ExcuteStmt::CheckFinalStartCamera(call)] if call.args == tuple.map(str::to_owned)));
+            assert_eq!(emit_excute_stmts(&parsed, "").join("\n"), text);
+        }
+
+        for malformed in [
+            "macros::CHECK_VALID_FINAL_START_CAMERA(boma, 0, 7, 20, 0, 0, 0);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 0, 1);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 0)",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 1);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 6.4);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 6.50, 20, 0, 0, 0);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 6.5f32, 20, 0, 0, 0);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 0,);",
+            "macros::CHECK_VALID_FINAL_START_CAMERA(agent, 0, 7, 20, 0, 0, 0); extra(agent);",
+        ] {
+            let rejected = parse_excute_block(&[malformed], ParseDomain::Game, true);
+            assert!(
+                matches!(rejected.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == malformed),
+                "unmeasured or malformed source must remain raw: {malformed}"
+            );
+        }
+
+        let attributed = ["#[cfg(any())]", valid];
+        assert!(parse_excute_block(&attributed, ParseDomain::Game, true)
+            .iter()
+            .all(|command| !matches!(command, ExcuteStmt::CheckFinalStartCamera(_))));
+        let nested = ["if outer(agent) {", valid, "}"];
+        assert!(parse_excute_block(&nested, ParseDomain::Game, true)
+            .iter()
+            .all(|command| !matches!(command, ExcuteStmt::CheckFinalStartCamera(_))));
+        assert!(matches!(
+            parse_excute_block(&[valid], ParseDomain::Game, false).as_slice(),
+            [ExcuteStmt::Raw(_)]
+        ));
+        for domain in [ParseDomain::Sound, ParseDomain::Expression] {
+            assert!(matches!(
+                parse_excute_block(&[valid], domain, true).as_slice(),
+                [ExcuteStmt::Raw(_)]
+            ));
+        }
+
+        let bare_function = format!(
+            r#"unsafe extern "C" fn game_bare(agent: &mut L2CAgentBase) {{
+    {valid}
+}}
+"#
+        );
+        let bare_script = parse_acmd_script(&bare_function);
+        assert!(bare_script.stmts.iter().all(|stmt| match stmt {
+            crate::data::AcmdStmt::Excute(commands) => commands
+                .iter()
+                .all(|command| !matches!(command, ExcuteStmt::CheckFinalStartCamera(_))),
+            _ => true,
+        }));
+        assert!(preview_game_fn(&bare_script, "bare").contains(valid));
+
+        let unknown_token = FinalStartCameraCall {
+            args: ["0", "7", "20", "0", "0", "6.4"].map(str::to_owned),
+        };
+        assert!(!unknown_token.is_measured_tuple());
+        for invalid in [
+            serde_json::json!({"args": ["0", "7", "20", "0", "0"]}),
+            serde_json::json!({"args": ["0", "7", "20", "0", "0", "0"], "extra": true}),
+            serde_json::json!({"args": [0, "7", "20", "0", "0", "0"]}),
+        ] {
+            assert!(serde_json::from_value::<FinalStartCameraCall>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn final_fear_face_is_closed_and_only_admitted_in_game_execute_contexts() {
+        use crate::data::{FinalFearFaceCall, FinalFearFacePreset};
+
+        let valid = "macros::FT_SET_FINAL_FEAR_FACE(agent, 60);";
+        let parsed = parse_excute_block(&[valid], ParseDomain::Game, true);
+        let [ExcuteStmt::FinalFearFace(call)] = parsed.as_slice() else {
+            panic!("expected exact measured fear-face token, got {parsed:?}");
+        };
+        assert_eq!(call.argument, "60");
+        assert!(call.is_measured_token());
+        assert_eq!(emit_excute_stmts(&parsed, "").join("\n"), valid);
+        let encoded = serde_json::to_value(call).unwrap();
+        let restored: FinalFearFaceCall = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(&restored, call);
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+
+        let catalog = crate::data::FINAL_FEAR_FACE_PRESETS
+            .iter()
+            .map(|preset: &FinalFearFacePreset| (preset.fighter, preset.argument))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(catalog.len(), 94);
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|(fighter, _)| *fighter)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            90
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            13
+        );
+        for (fighter, argument) in catalog {
+            let source = format!("macros::FT_SET_FINAL_FEAR_FACE(agent, {argument});");
+            let parsed = parse_excute_block(&[source.as_str()], ParseDomain::Game, true);
+            assert!(
+                matches!(parsed.as_slice(), [ExcuteStmt::FinalFearFace(call)] if call.argument == argument)
+            );
+            assert_eq!(emit_excute_stmts(&parsed, "").join("\n"), source);
+            assert!(crate::data::FINAL_FEAR_FACE_PRESETS
+                .iter()
+                .any(|preset| preset.fighter == fighter && preset.argument == argument));
+        }
+
+        for malformed in [
+            "macros::FT_SET_FINAL_FEAR_FACE(boma, 60);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 60, 1);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 060);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 60.0);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 60,);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 999);",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 60)",
+            "macros::FT_SET_FINAL_FEAR_FACE(agent, 60); extra(agent);",
+        ] {
+            let rejected = parse_excute_block(&[malformed], ParseDomain::Game, true);
+            assert!(
+                matches!(rejected.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == malformed),
+                "noncanonical or unmeasured command must remain raw: {malformed}"
+            );
+        }
+        assert!(matches!(
+            parse_excute_block_with_fear_face_guard(
+                &[valid],
+                ParseDomain::Game,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .as_slice(),
+            [ExcuteStmt::Raw(_)]
+        ));
+        for domain in [ParseDomain::Sound, ParseDomain::Expression] {
+            assert!(matches!(
+                parse_excute_block_with_fear_face_guard(
+                    &[valid],
+                    domain,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false
+                )
+                .as_slice(),
+                [ExcuteStmt::Raw(_)]
+            ));
+        }
+        let attributed = ["#[cfg(any())]", valid];
+        assert!(parse_excute_block_with_fear_face_guard(
+            &attributed,
+            ParseDomain::Game,
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .iter()
+        .all(|command| !matches!(command, ExcuteStmt::FinalFearFace(_))));
+
+        for invalid in [
+            serde_json::json!({"argument": "60", "extra": true}),
+            serde_json::json!({"argument": 60}),
+        ] {
+            assert!(serde_json::from_value::<FinalFearFaceCall>(invalid).is_err());
+        }
+        assert!(!FinalFearFaceCall {
+            argument: "060".into()
+        }
+        .is_measured_token());
+        assert!(!FinalFearFaceCall {
+            argument: "999".into()
+        }
+        .is_measured_token());
+    }
+
+    #[test]
+    fn final_fear_face_read_only_guard_permission_is_non_transitive() {
+        fn typed_fear_face_count(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .filter(|command| matches!(command, ExcuteStmt::FinalFearFace(_)))
+                        .count(),
+                    AcmdStmt::RawBlock { body, .. } => typed_fear_face_count(body),
+                    AcmdStmt::Loop { body, .. } => typed_fear_face_count(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        let exact_guard_with_else_loop_and_sibling = r#"unsafe extern "C" fn game_finalstart(agent: &mut L2CAgentBase) {
+    if !WorkModule::is_flag(agent.module_accessor, *FIGHTER_INSTANCE_WORK_ID_FLAG_DISABLE_FINAL_START_CAMERA) {
+        if macros::is_excute(agent) {
+            macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+            macros::CHECK_FINISH_CAMERA(agent, 0, 0);
+        }
+        for _ in 0..1 {
+            if macros::is_excute(agent) {
+                macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+            }
+        }
+    } else {
+        if macros::is_excute(agent) {
+            macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+        }
+    }
+    if agent.is_some() {
+        if macros::is_excute(agent) {
+            macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+        }
+    }
+}
+"#;
+        let exact = parse_acmd_script(exact_guard_with_else_loop_and_sibling);
+        assert_eq!(
+            typed_fear_face_count(&exact.stmts),
+            1,
+            "only the immediate Execute under the exact Game guard receives the scoped exception"
+        );
+        let AcmdStmt::RawBlock { body, .. } = &exact.stmts[0] else {
+            panic!("expected exact guard block");
+        };
+        let [AcmdStmt::Excute(commands), ..] = body.as_slice() else {
+            panic!("expected immediate Execute child");
+        };
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [ExcuteStmt::FinalFearFace(_), ExcuteStmt::Raw(_)]
+            ),
+            "the read-only condition exception must not admit sibling native commands"
+        );
+        assert!(
+            serde_json::from_value::<AcmdScript>(serde_json::to_value(&exact).unwrap()).is_ok()
+        );
+
+        let attributed_guard = r#"unsafe extern "C" fn game_finalstart(agent: &mut L2CAgentBase) {
+    #[cfg(any())]
+    if !WorkModule::is_flag(agent.module_accessor, *FIGHTER_INSTANCE_WORK_ID_FLAG_DISABLE_FINAL_START_CAMERA) {
+        if macros::is_excute(agent) {
+            macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+        }
+    }
+}
+"#;
+        let attributed = parse_acmd_script(attributed_guard);
+        assert_eq!(
+            typed_fear_face_count(&attributed.stmts),
+            0,
+            "an attribute attached to the guard must not grant the read-only exception"
+        );
+        assert!(emit_stmts(&attributed.stmts, "    ")
+            .join("\n")
+            .contains("#[cfg(any())]"));
+        for prefix in [
+            "#[cfg(any())]\n\n    // attached despite this comment",
+            "#[cfg(\n        any()\n    )]",
+        ] {
+            let source = attributed_guard.replace("#[cfg(any())]", prefix);
+            let parsed = parse_acmd_script(&source);
+            assert_eq!(
+                typed_fear_face_count(&parsed.stmts),
+                0,
+                "attributes separated by trivia must not authorize a child: {prefix}"
+            );
+        }
+
+        let exact_guard_nested_under_unknown = r#"unsafe extern "C" fn game_finalstart(agent: &mut L2CAgentBase) {
+    if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(false, false)){
+        if !WorkModule::is_flag(agent.module_accessor, *FIGHTER_INSTANCE_WORK_ID_FLAG_DISABLE_FINAL_START_CAMERA) {
+            if macros::is_excute(agent) {
+                macros::FT_SET_FINAL_FEAR_FACE(agent, 60);
+            }
+        }
+    }
+}
+"#;
+        let nested = parse_acmd_script(exact_guard_nested_under_unknown);
+        assert_eq!(
+            typed_fear_face_count(&nested.stmts),
+            1,
+            "the exact guard can type its child without escaping the unknown outer block"
+        );
+        assert_eq!(
+            preview_game_fn(&nested, "finalstart")
+                .matches("FT_SET_FINAL_FEAR_FACE")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn two_absolute_hits_sharing_an_id_are_told_apart_by_their_kind() {
         let hitboxes = parse_acmd_script(THROW_ABS).to_hitboxes();
@@ -6124,8 +14468,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The kind slot takes fighter-specific constants — Terry's final smash has its own — so a
-    /// closed table would rewrite it into someone else's throw. Carried verbatim instead.
     #[test]
     fn a_fighter_specific_absolute_kind_survives_the_round_trip() {
         let source = r#"
@@ -6148,7 +14490,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     }
 
     /// dolly/SpecialAirHiCommand, verbatim and trimmed to the hurtbox lines — the knee and leg
-    /// intangibility on Terry's up special, which is the canonical use of this family.
     const HURT_INTANGIBLE: &str = r#"
 unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 9.0);
@@ -6217,9 +14558,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A hurtbox state is two independent lines in the script and one span on screen. Getting
-    /// the join wrong is the whole difference between "the knee is intangible frames 9-19" and
-    /// a pair of rows a modder has to diff by eye.
     #[test]
     fn a_hurtbox_state_spans_from_its_call_to_the_one_that_takes_it_back() {
         let (states, _) = parse_acmd_script(HURT_INTANGIBLE).to_hurtboxes();
@@ -6243,18 +14581,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     }
 
     /// A runtime `if` around a hurtbox call, with a second call after it.
-    ///
-    /// Composed rather than lifted, and that is defensible here in a way it would not be for a
-    /// macro signature: **both halves are corpus shapes, only their nesting is not.** The header
-    /// is one of the twenty-five distinct `RawBlock` openers the cache contains verbatim, and
-    /// `HIT_NODE` appears in it hundreds of times — what is being constructed is a composition,
-    /// not a guess about what the game accepts. Nothing here claims a layout the corpus could
-    /// have refuted.
-    ///
-    /// The measurement that makes this fixture necessary: **zero** hurtbox and **zero**
-    /// attack-modifier statements sit inside a `RawBlock` anywhere in the 460-file cache, against
-    /// 26 sounds in 16 files and 107 effect calls in 12. So the corpus oracles cannot reach this
-    /// path for these two families and never could, however long they run.
     const HURT_IN_RAW_BLOCK: &str = r#"unsafe extern "C" fn game_rawblockhurt(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 2.0);
     if WorkModule::is_flag(agent.module_accessor, *FIGHTER_STATUS_SQUAT_FLAG_REQUEST_SQUAT_SE) {
@@ -6269,19 +14595,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
 }
 "#;
 
-    /// The walk and the resolver have to agree about a hurtbox inside a runtime branch.
-    ///
-    /// [`eval_stmts`](crate::data) descends into an [`AcmdStmt::RawBlock`] deliberately — a
-    /// hitbox inside an `if` has always been shown unconditionally — so a `HIT_NODE` in there
-    /// takes a site. `hurt_stmt_mut` used not to descend, so it resolved sites against a
-    /// *shorter* sequence than the one that handed them out: the branch's own state resolved to
-    /// the call after the branch, and the last state resolved to nothing at all.
-    ///
-    /// Asserted on the resolved statement's **bone**, not on `is_some()`. Both sites resolve to
-    /// a real `HIT_NODE` with the bug present; what is wrong is *which one*, and a liveness
-    /// check cannot see that. Every state in the script is checked rather than just the
-    /// interesting one, because the failure is a shift — pinning only the branch's own call
-    /// would pass with the walk and the resolver both wrong by the same amount.
     #[test]
     fn a_hurtbox_inside_a_runtime_branch_resolves_to_its_own_call() {
         let mut script = parse_acmd_script(HURT_IN_RAW_BLOCK);
@@ -6315,16 +14628,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         }
     }
 
-    /// A zero-iteration `for` wrapping a runtime branch still steps both cursors over it.
-    ///
-    /// The counters are a *second* place the same disagreement lives, reachable only through a
-    /// zero-count loop — at one iteration or more the cursor arrives correctly on its own, which
-    /// is why the two tests above pass with the counter arms reverted. Verified by mutation, not
-    /// assumed: reverting either arm left all 397 other tests green.
-    ///
-    /// Both families in one test here, unlike the resolver pair above, because the assertion is
-    /// about a single shared property — the site the *trailing* call receives — and neither
-    /// family's number is meaningful without the other's cursor having advanced too.
     #[test]
     fn a_branch_inside_a_loop_that_never_runs_still_advances_both_cursors() {
         const EMPTY_LOOP_BRANCH: &str = r#"unsafe extern "C" fn game_emptyloopbranch(agent: &mut L2CAgentBase) {
@@ -6370,13 +14673,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The attack-modifier resolver, same defect and same fixture shape.
-    ///
-    /// Its own test rather than a second assertion in the one above, because the two families
-    /// keep independent numbering spaces on purpose — a shared counter would make every hurtbox
-    /// site shift the moment a script gained an `ATK_POWER` — so a fix to one is no evidence
-    /// about the other. They were in fact broken and fixed together, which is exactly the
-    /// coincidence that makes a shared test worthless later.
     #[test]
     fn an_attack_modifier_inside_a_runtime_branch_resolves_to_its_own_call() {
         const MOD_IN_RAW_BLOCK: &str = r#"unsafe extern "C" fn game_rawblockmod(agent: &mut L2CAgentBase) {
@@ -6413,24 +14709,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         }
     }
 
-    /// The round-trip the definition of done asks for: real vanilla text in, export, parse the
-    /// export, and the same spans come back. `*HIT_STATUS_XLU` in particular has to survive as
-    /// a symbol — writing the `2` it stands for compiles and stops matching the archive.
-    #[test]
-    fn the_hurtbox_family_round_trips_through_the_emitter() {
-        let script = parse_acmd_script(HURT_INTANGIBLE);
-        let exported = export_acmd_source(&script, "dolly", "special_air_hi_command");
-        assert!(
-            exported.contains(r#"macros::HIT_NODE(agent, Hash40::new("kneer"), *HIT_STATUS_XLU);"#),
-            "{exported}"
-        );
-        assert_eq!(
-            parse_acmd_script(&exported).to_hurtboxes(),
-            script.to_hurtboxes(),
-            "the export must resolve to the same spans as the source"
-        );
-    }
-
     #[test]
     fn raw_hurtbox_bone_hash_round_trips_without_a_skeleton_name() {
         let source = r#"
@@ -6456,12 +14734,6 @@ unsafe extern "C" fn game_specialairhi(agent: &mut L2CAgentBase) {
     }
 
     /// kirby/FinalStart and kirby/ThrownHi, trimmed to the hurtbox lines. Kirby's final smash
-    /// makes the whole body translucent for the cinematic; `ThrownHi` puts it back.
-    ///
-    /// The two are separate functions in the corpus and are spliced here because no vanilla
-    /// script contains both a set and a reset of the whole body — which is worth knowing, and is
-    /// why [`HurtTarget::Whole`](crate::data::HurtTarget::Whole) does not model the reach of the
-    /// call across the per-bone targets.
     const HURT_WHOLE_BODY: &str = r#"
 unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 1.0);
@@ -6475,33 +14747,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
 }
 "#;
 
-    /// `WHOLE_HIT` is a hurtbox state, not a hitbox one, and it is typed rather than carried.
-    ///
-    /// The corpus oracles cannot tell these apart on their own: an unparsed line survives an
-    /// export as `Raw`, byte for byte, so a `WHOLE_HIT` that this parser did not recognise would
-    /// round-trip just as cleanly as one it did. The assertion that matters is therefore that
-    /// spans come out at all — that is what puts the call on the timeline and in the panel.
-    #[test]
-    fn a_whole_body_hit_status_is_a_hurtbox_span_and_not_a_raw_line() {
-        let script = parse_acmd_script(HURT_WHOLE_BODY);
-        let (states, pris) = script.to_hurtboxes();
-        assert!(pris.is_empty(), "nothing here is a colour blend");
-        let [xlu, normal] = &states[..] else {
-            panic!("expected two whole-body states, got {}", states.len());
-        };
-        assert_eq!(xlu.target, crate::data::HurtTarget::Whole);
-        assert_eq!(xlu.status, "HIT_STATUS_XLU");
-        // Ends where the reset begins, exactly like a per-bone span: `Whole` is a third target
-        // and not a special case in the span walk.
-        assert_eq!((xlu.active_start, xlu.active_end), (1, 45));
-        assert_eq!(normal.target, crate::data::HurtTarget::Whole);
-        assert_eq!(normal.status, "HIT_STATUS_NORMAL");
-        assert_eq!((normal.active_start, normal.active_end), (46, 9999));
-    }
-
-    /// The status moves to the first slot because the target is the macro name. An emitter that
-    /// kept the two-argument layout would write `WHOLE_HIT(agent, Hash40::new(…), status)`,
-    /// which does not compile — but only against a fighter nobody had exported yet.
     #[test]
     fn a_whole_body_status_is_emitted_into_the_slot_the_target_vacated() {
         let script = parse_acmd_script(HURT_WHOLE_BODY);
@@ -6521,12 +14766,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// `WHOLE_HIT` must not be read as one of the targeted pair, whose status sits a slot later.
-    ///
-    /// Written the wrong way round, `HIT_NODE`'s parse would take `*HIT_STATUS_XLU` for a bone
-    /// and find no status at all. The arity check is what separates them, so this pins that a
-    /// call with the *other* family's argument count falls through to `Raw` rather than being
-    /// reinterpreted — the rule this function's doc comment states.
     #[test]
     fn a_whole_hit_written_with_the_targeted_arity_is_left_alone() {
         let two_args =
@@ -6546,11 +14785,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     }
 
     /// kirby/AttackLw4 and kirby/Attack100Sub, spliced: the two placements the corpus uses.
-    ///
-    /// `ATK_SET_SHIELD_SETOFF_MUL` sits in the same `is_excute` block as the `ATTACK` it
-    /// retunes, and `ATK_POWER` lands five frames later on hitboxes that are already out. Both
-    /// have to survive as their own calls at their own frames, which is the whole reason these
-    /// are separate statements rather than fields folded into the parent `ATTACK`.
     const ATTACK_MODS: &str = r#"
 unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
@@ -6564,11 +14798,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
 }
 "#;
 
-    /// The modifiers are typed, at their own frames, against the ids they name.
-    ///
-    /// Same caveat as the `WHOLE_HIT` test above: an unmodelled line exports verbatim as `Raw`
-    /// and round-trips perfectly, so the corpus oracles were green on these before the parse arm
-    /// existed. What has teeth is that they resolve at all — that is what reaches the panel.
     #[test]
     fn attack_modifiers_resolve_against_the_hitbox_id_they_name() {
         use crate::data::AttackModKind;
@@ -6588,17 +14817,11 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!([setoff.site, power_0.site, power_1.site], [0, 1, 2]);
     }
 
-    /// A modifier is not a collision, so it must not appear as one.
     #[test]
     fn an_attack_modifier_does_not_become_a_hitbox_of_its_own() {
         assert!(parse_acmd_script(ATTACK_MODS).to_hitboxes().is_empty());
     }
 
-    /// The value keeps the spelling the vanilla scripts use.
-    ///
-    /// All 11 corpus calls write a bare integer. These slots are `ToF32`-generic, so `7` and
-    /// `7.0` both compile — but exporting `7.0` over a `7` the user never touched is diff noise,
-    /// and `num` would do exactly that. A fractional value still has to keep its point.
     #[test]
     fn a_whole_modifier_value_is_emitted_as_the_integer_the_corpus_writes() {
         let script = parse_acmd_script(ATTACK_MODS);
@@ -6629,11 +14852,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The id slot is not the value slot, and a wrong-arity call is left alone.
-    ///
-    /// The corpus could not have settled the first: all 9 `ATK_SET_SHIELD_SETOFF_MUL` calls are
-    /// the identical `(agent, 0, 7)`. `macros.rs` declares `id: u64, val: ToF32`, so an
-    /// asymmetric call is the test that would fail if the slots were ever swapped.
     #[test]
     fn the_id_slot_is_read_as_the_id_and_a_wrong_arity_call_falls_through() {
         use crate::data::{AttackModKind, ExcuteStmt};
@@ -6655,9 +14873,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert!(parse_attack_mod_call(hit_abs).is_none());
     }
 
-    /// The other three members, which carry no bone: two that reset and one that takes a
-    /// number. `HIT_NO`'s group must not be read as a bone hash, and `COL_PRI` must not be
-    /// ended by `HIT_RESET_ALL` — they are different resets of different things.
     #[test]
     fn the_argument_less_members_and_the_numbered_ones_keep_their_own_families() {
         let source = r#"
@@ -6711,10 +14926,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         }
     }
 
-    /// A call whose argument count disagrees with its name is not a variant to interpret.
-    /// Every member has exactly one arity in the corpus and one in `macros.rs`, so a mismatch
-    /// means this parser is looking at something it does not understand — and `Raw` is how a
-    /// line survives an export unread.
     #[test]
     fn a_hurtbox_call_of_the_wrong_arity_is_left_alone_rather_than_padded() {
         for line in [
@@ -6741,12 +14952,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     }
 
     /// kirby/ThrowHi, verbatim — the only `ATTACK_IGNORE_THROW` in the vanilla corpus, and
-    /// the reason the capsule triple is detected rather than assumed.
-    ///
-    /// The archive writes this macro with 33 arguments where every `ATTACK` has 36: the
-    /// `x2`/`y2`/`z2` options are simply absent. Read against `ATTACK`'s table it parses,
-    /// and parses WRONG — hitlag lands in the capsule, `*ATTACK_LR_CHECK_POS` in hitlag,
-    /// and every property after that is off by three. Nothing about it looks broken.
     const IGNORE_THROW: &str = r#"macros::ATTACK_IGNORE_THROW(agent, 0, 0, Hash40::new("top"), 7.0, 65, 95, 0, 85, 9.5, 0.0, 6.5, 2.0, 1.0, 1.0, *ATTACK_SETOFF_KIND_OFF, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_KICK, *ATTACK_REGION_BODY);"#;
 
     #[test]
@@ -6781,8 +14986,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!(hb.attack_region, "ATTACK_REGION_BODY");
     }
 
-    /// An export must name the family member it read. Emitting one as the other builds fine
-    /// and silently changes whether the hitbox reaches a fighter already being thrown.
     #[test]
     fn an_attack_family_call_is_exported_under_its_own_macro() {
         let source = format!(
@@ -6809,6 +15012,116 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
             parsed.to_hitboxes(),
             "a capsule-less call must survive a round trip through the emitter"
         );
+    }
+
+    #[test]
+    fn ordinary_attack_and_ignore_throw_keep_their_native_property_slots() {
+        const FULL: &str = r#"macros::ATTACK(agent, 1, 2, Hash40::new("top"), 3.25, 45, 101, 7, 89, 4.5, 1.0, 2.0, 3.0, None, None, None, 1.25, 1.5, *ATTACK_SETOFF_KIND_THRU, *ATTACK_LR_CHECK_LEFT, true, 12, 0.35, 4, false, true, false, true, false, *COLLISION_SITUATION_MASK_G, *COLLISION_CATEGORY_MASK_FIGHTER, *COLLISION_PART_MASK_HEAD, true, Hash40::new("collision_attr_fire"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_CUTUP, *ATTACK_REGION_SWORD);"#;
+        const SHORT: &str = r#"macros::ATTACK_IGNORE_THROW(agent, 1, 2, Hash40::new("top"), 3.25, 45, 101, 7, 89, 4.5, 1.0, 2.0, 3.0, 1.25, 1.5, *ATTACK_SETOFF_KIND_THRU, *ATTACK_LR_CHECK_LEFT, true, 12, 0.35, 4, false, true, false, true, false, *COLLISION_SITUATION_MASK_G, *COLLISION_CATEGORY_MASK_FIGHTER, *COLLISION_PART_MASK_HEAD, true, Hash40::new("collision_attr_fire"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_CUTUP, *ATTACK_REGION_SWORD);"#;
+
+        for (func, line) in [("ATTACK", FULL), ("ATTACK_IGNORE_THROW", SHORT)] {
+            let source = format!(
+                "unsafe extern \"C\" fn game_test(agent: &mut L2CAgentBase) {{\n    \
+                 frame(agent.lua_state_agent, 8.0);\n    if macros::is_excute(agent) {{\n        \
+                 {line}\n    }}\n}}\n"
+            );
+            let parsed = parse_acmd_script(&source);
+            let hitboxes = parsed.to_hitboxes();
+            let [hb] = &hitboxes[..] else {
+                panic!("{func} should parse as one hitbox");
+            };
+            assert_eq!(hb.func, func);
+            assert_eq!((hb.id, hb.part, hb.damage, hb.angle), (1, 2, 3.25, 45));
+            assert_eq!(hb.capsule_end, None);
+            assert_eq!((hb.hitlag_mult, hb.sdi_mult), (1.25, 1.5));
+            assert_eq!(hb.setoff_kind, "ATTACK_SETOFF_KIND_THRU");
+            assert_eq!(hb.lr_check, "ATTACK_LR_CHECK_LEFT");
+            assert!(hb.is_clang);
+            assert_eq!(hb.is_add_attack, 12);
+            assert_eq!(hb.hitbox_attr, 0.35);
+            assert_eq!(hb.ground_or_air, 4);
+            assert!(!hb.is_mtk);
+            assert!(hb.is_shield_disable);
+            assert!(!hb.is_reflectable);
+            assert!(hb.is_absorbable);
+            assert!(!hb.is_landing_attack);
+            assert_eq!(hb.situation_mask, "COLLISION_SITUATION_MASK_G");
+            assert_eq!(hb.category_mask, "COLLISION_CATEGORY_MASK_FIGHTER");
+            assert_eq!(hb.part_mask, "COLLISION_PART_MASK_HEAD");
+            assert!(hb.no_finish_camera);
+            assert_eq!(hb.collision_attr, "collision_attr_fire");
+            assert_eq!(hb.sound_level, "ATTACK_SOUND_LEVEL_L");
+            assert_eq!(hb.sound_attr, "COLLISION_SOUND_ATTR_CUTUP");
+            assert_eq!(hb.attack_region, "ATTACK_REGION_SWORD");
+
+            let emitted = preview_game_fn(&parsed, "test");
+            let emitted_line = emitted
+                .lines()
+                .find(|line| line.contains(&format!("macros::{func}(")));
+            let emitted_line = emitted_line.unwrap_or_else(|| panic!("missing {func}: {emitted}"));
+            let open = emitted_line.find('(').unwrap();
+            let close = emitted_line.rfind(')').unwrap();
+            let args = tokenize_args(&emitted_line[open + 1..close]);
+            // The emitter normalizes both source spellings to the full 36-argument binding ABI.
+            assert_eq!(
+                args.len(),
+                37,
+                "agent plus 36 native parameters: {emitted_line}"
+            );
+            for (slot, expected) in [
+                (18, "*ATTACK_SETOFF_KIND_THRU"),
+                (19, "*ATTACK_LR_CHECK_LEFT"),
+                (20, "true"), // pinned parameter: set_weight
+                (21, "12"),   // shield_damage
+                (22, "0.35"), // trip
+                (23, "4"),    // rehit
+                (24, "false"),
+                (25, "true"),
+                (26, "false"),
+                (27, "true"),
+                (28, "false"),
+                (29, "*COLLISION_SITUATION_MASK_G"),
+                (30, "*COLLISION_CATEGORY_MASK_FIGHTER"),
+                (31, "*COLLISION_PART_MASK_HEAD"),
+                (32, "true"), // friendly_fire
+                (33, "Hash40::new(\"collision_attr_fire\")"),
+                (34, "*ATTACK_SOUND_LEVEL_L"),
+                (35, "*COLLISION_SOUND_ATTR_CUTUP"),
+                (36, "*ATTACK_REGION_SWORD"),
+            ] {
+                assert_eq!(
+                    args[slot], expected,
+                    "native argument slot {slot}: {emitted_line}"
+                );
+            }
+            assert!(
+                emitted_line.contains(&format!("macros::{func}(")),
+                "family changed: {emitted}"
+            );
+            let round_trip = parse_acmd_script(&emitted).to_hitboxes();
+            assert_eq!(round_trip.len(), 1);
+            let reparsed = &round_trip[0];
+            assert_eq!(reparsed.func, func);
+            assert_eq!(reparsed.is_clang, hb.is_clang);
+            assert_eq!(reparsed.setoff_kind, hb.setoff_kind);
+            assert_eq!(reparsed.lr_check, hb.lr_check);
+            assert_eq!(reparsed.is_add_attack, hb.is_add_attack);
+            assert_eq!(reparsed.hitbox_attr, hb.hitbox_attr);
+            assert_eq!(reparsed.ground_or_air, hb.ground_or_air);
+            assert_eq!(reparsed.is_mtk, hb.is_mtk);
+            assert_eq!(reparsed.is_shield_disable, hb.is_shield_disable);
+            assert_eq!(reparsed.is_reflectable, hb.is_reflectable);
+            assert_eq!(reparsed.is_absorbable, hb.is_absorbable);
+            assert_eq!(reparsed.is_landing_attack, hb.is_landing_attack);
+            assert_eq!(reparsed.situation_mask, hb.situation_mask);
+            assert_eq!(reparsed.category_mask, hb.category_mask);
+            assert_eq!(reparsed.part_mask, hb.part_mask);
+            assert_eq!(reparsed.no_finish_camera, hb.no_finish_camera);
+            assert_eq!(reparsed.collision_attr, hb.collision_attr);
+            assert_eq!(reparsed.sound_level, hb.sound_level);
+            assert_eq!(reparsed.sound_attr, hb.sound_attr);
+            assert_eq!(reparsed.attack_region, hb.attack_region);
+        }
     }
 
     #[test]
@@ -6864,8 +15177,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert!(emitted.contains("AreaModule::erase_wind(agent.module_accessor, 4);"));
     }
 
-    /// `macros::CATCH` was never parsed, so a grab box in a script — including one Visionary
-    /// had just exported — was invisible to the editor and could not be edited at all.
     #[test]
     fn catch_calls_round_trip_through_the_editor() {
         let src = r#"unsafe extern "C" fn game_catch(agent: &mut L2CAgentBase) {
@@ -6912,11 +15223,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A `SEARCH` is a detection box of its own family, in both of the shapes it is written in.
-    ///
-    /// Both fixtures are verbatim corpus lines: the short one from kirby/SpecialNStart, the long
-    /// one from kirby/BatSwing4. They differ in arity by exactly the three capsule slots, which
-    /// is what makes them worth asserting together — every argument after the capsule moves.
     #[test]
     fn search_boxes_parse_in_both_of_the_shapes_the_corpus_writes_them() {
         let src = r#"unsafe extern "C" fn game_search(agent: &mut L2CAgentBase) {
@@ -6975,11 +15281,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Three families open a box with id 0 in one block, and all three must survive.
-    ///
-    /// This is kirby/SpecialNStart, near enough verbatim: a `CATCH`, a `SEARCH` and an
-    /// `ATTACK_ABS` in a single `is_excute`, every one of them id 0. Matching on id alone
-    /// anywhere in the walk would close two of the three the moment the next one was read.
     #[test]
     fn a_search_a_grab_and_a_throw_hit_sharing_id_zero_do_not_close_each_other() {
         let src = r#"unsafe extern "C" fn game_specialnstart(agent: &mut L2CAgentBase) {
@@ -7024,12 +15325,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// `SET_SEARCH_SIZE_EXIST` is not a `SEARCH`, and must not be read through its layout.
-    ///
-    /// It re-sizes a box already out and takes two arguments; `SEARCH` takes seventeen. The
-    /// `macros::NAME(` form with the paren is what keeps them apart — the same guard that
-    /// stops `ATTACK_ABS` being read as an `ATTACK`. Reading one as the other is the silent
-    /// cross-family corruption this parser is built to refuse.
     #[test]
     fn the_search_size_modifier_is_not_parsed_as_a_search_box() {
         let src = r#"unsafe extern "C" fn game_search(agent: &mut L2CAgentBase) {
@@ -7051,17 +15346,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A grab written without the capsule slots keeps its own status and situation.
-    ///
-    /// The vanilla dumps come from Lua, which omits the three capsule arguments rather than
-    /// spelling them `None`, so `status` and `situation` sit at slots 7 and 8 instead of 10 and
-    /// 11. Reading them positionally ran off the end of the token list and silently substituted
-    /// the defaults — which turned all four of the corpus's short-form calls, every one of them
-    /// Kirby's inhale, from a swallow into an ordinary grab.
-    ///
-    /// The round-trip oracle cannot catch this class of bug on its own: it compares the export
-    /// against the *parsed* model, and a value lost on the way in agrees with itself on the way
-    /// out. So this asserts against the original text, not against a re-parse.
     #[test]
     fn a_grab_written_without_capsule_slots_keeps_its_status() {
         // Verbatim from kirby/SpecialNStart.
@@ -7095,7 +15379,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// An attack clear does not close a grab box, and a grab clear does not close an attack.
     #[test]
     fn attack_and_grab_clears_do_not_close_each_other() {
         let src = r#"unsafe extern "C" fn game_catch(agent: &mut L2CAgentBase) {
@@ -7143,6 +15426,7 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!(fp.category, crate::data::CAT_ATTACK_FP);
         assert_eq!(fp.func, "ATTACK_FP");
         assert_eq!((fp.id, fp.part, fp.damage, fp.angle), (2, 3, 9.5, 45));
+        assert_eq!(fp.ground_or_air, 0, "ATTACK_FP situation is slot 21");
         assert_eq!(fp.collision_attr, "0x123456");
         assert_eq!(fp.lr_check, "ATTACK_LR_CHECK_POS");
         assert_eq!(
@@ -7152,6 +15436,7 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         // Slot 31 is undocumented `rehit`; it must not disappear just because the editor only
         // exposes the established shared fields.
         assert_eq!(fp.fp.as_ref().unwrap().args[31].source(), "10");
+        assert_eq!(fp.fp.as_ref().unwrap().args[21].source(), "0");
 
         let emitted = preview_game_fn(&script, "fp");
         assert!(
@@ -7162,6 +15447,9 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!(round_trip.len(), 1);
         assert_eq!(round_trip[0].category, crate::data::CAT_ATTACK_FP);
         assert_eq!(round_trip[0].damage, fp.damage);
+        assert_eq!(round_trip[0].ground_or_air, 0);
+        assert_eq!(round_trip[0].fp.as_ref().unwrap().args[21].source(), "0");
+        assert_eq!(round_trip[0].fp.as_ref().unwrap().args[31].source(), "10");
         assert_eq!(round_trip[0].collision_attr, "0x123456");
         for slot in [
             2usize, 8, 9, 10, 11, 13, 17, 18, 22, 24, 25, 26, 27, 28, 31, 32, 33, 35, 36, 37, 38,
@@ -7173,45 +15461,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
                 "unmodeled ATTACK_FP slot {slot}"
             );
         }
-    }
-
-    #[test]
-    fn the_real_dumped_attack_fp_call_keeps_its_situation_mask() {
-        // SSBU-Dumped-Scripts/main/smashline/lua2cpp_demon/demon/AttackStep2fHitShield.txt
-        // contains the standard-tree ATTACK_FP oracle. Its ground-air slot is a symbolic
-        // situation mask, which is the case a purely numeric synthetic fixture misses.
-        let src = r#"unsafe extern "C" fn game_attackstep2fhitshield(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::ATTACK_FP(agent, 6, 1, Hash40::new("top"), 0, 361, 100, 65, 0, 12, 0, 10, 10, Hash40::new("collision_attr_normal"), 0, 0, 0, false, false, 0, *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_NONE, *COLLISION_SITUATION_MASK_G, true, *ATTACK_REGION_NONE, *COLLISION_CATEGORY_MASK_FIGHTER, false, *COLLISION_PART_MASK_ALL, false, false, false, false, 0, false, false, *ATTACK_LR_CHECK_POS, false, false, true, true, false, *COLLISION_SHAPE_TYPE_SPHERE);
-    }
-}
-"#;
-        let script = parse_acmd_script(src);
-        let boxes = script.to_hitboxes();
-        assert_eq!(boxes.len(), 1, "{boxes:#?}");
-        let fp = &boxes[0];
-        assert_eq!(fp.category, crate::data::CAT_ATTACK_FP);
-        assert_eq!((fp.id, fp.part, fp.ground_or_air), (6, 1, 1));
-        assert_eq!(fp.attack_region, "ATTACK_REGION_NONE");
-        assert_eq!(
-            fp.fp.as_ref().unwrap().args[21].source(),
-            "*COLLISION_SITUATION_MASK_G"
-        );
-
-        let emitted = preview_game_fn(&script, "attackstep2fhitshield");
-        assert!(emitted.contains("*COLLISION_SITUATION_MASK_G"), "{emitted}");
-        let round_trip = parse_acmd_script(&emitted).to_hitboxes();
-        assert_eq!(round_trip.len(), 1, "{round_trip:#?}");
-        assert_eq!(round_trip[0].ground_or_air, 1);
-        assert_eq!(
-            round_trip[0].fp.as_ref().unwrap().args[21].source(),
-            "*COLLISION_SITUATION_MASK_G"
-        );
-        assert_eq!(round_trip[0].fp.as_ref().unwrap().args[22].source(), "true");
-        assert_eq!(
-            round_trip[0].fp.as_ref().unwrap().args[40].source(),
-            "*COLLISION_SHAPE_TYPE_SPHERE"
-        );
     }
 
     #[test]
@@ -7241,6 +15490,7 @@ unsafe extern "C" fn expression_throwhi(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
         slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
         macros::FT_ATTACK_ABS_CAMERA_QUAKE(agent, *FIGHTER_ATTACK_ABSOLUTE_KIND_THROW, *CAMERA_QUAKE_KIND_NONE);
+        unknown_expression_extension(agent);
     }
     frame(agent.lua_state_agent, 6.0);
     if macros::is_excute(agent) {
@@ -7262,6 +15512,12 @@ unsafe extern "C" fn expression_throwhi(agent: &mut L2CAgentBase) {
         assert_eq!(events[2].call.func(), "QUAKE");
         assert_eq!(events[3].call.func(), "ControlModule::set_rumble");
         assert_eq!(events[4].frame, 7);
+        assert!(matches!(
+            script.stmts.first(),
+            Some(AcmdStmt::Excute(commands))
+                if matches!(commands.first(), Some(ExcuteStmt::Slope(_)))
+                    && matches!(commands.get(2), Some(ExcuteStmt::Raw(line)) if line == "unknown_expression_extension(agent);")
+        ));
 
         let emitted = preview_expression_fn(&script, "throw_hi");
         assert!(emitted.contains("slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);"));
@@ -7275,6 +15531,7 @@ unsafe extern "C" fn expression_throwhi(agent: &mut L2CAgentBase) {
             parse_expression_script(&emitted).to_expression_events(),
             events
         );
+        assert!(emitted.contains("unknown_expression_extension(agent);"));
     }
 
     #[test]
@@ -7292,79 +15549,7 @@ unsafe extern "C" fn expression_bad(agent: &mut L2CAgentBase) {
         assert!(emitted.contains("ControlModule::set_rumble(agent.module_accessor);"));
     }
 
-    /// Every measured expression call in the local script cache is typed and survives the same
-    /// parse/emit/read-back path as the fixture above. The cache is the evidence boundary for
-    /// D2: unknown expression lines remain raw, while these measured calls must never
-    /// silently fall through to raw text or disappear from an export.
-    #[test]
-    fn every_measured_expression_call_in_the_corpus_is_typed() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut expression_scripts = 0usize;
-        let mut written = [0usize; 4];
-        let mut typed = [0usize; 4];
-        let mut problems = Vec::new();
-        for (path, body) in &bodies {
-            let Some(interior) = function_interior(body, "expression_") else {
-                continue;
-            };
-            expression_scripts += 1;
-            let names = [
-                "RUMBLE_HIT",
-                "QUAKE",
-                "FT_ATTACK_ABS_CAMERA_QUAKE",
-                "ControlModule::set_rumble",
-            ];
-            for (index, name) in names.iter().enumerate() {
-                written[index] += if *name == "ControlModule::set_rumble" {
-                    interior.matches("ControlModule::set_rumble(").count()
-                } else {
-                    interior.matches(&format!("macros::{name}(")).count()
-                };
-            }
-
-            let script = parse_expression_script(body);
-            let events = script.to_expression_events();
-            for event in &events {
-                let Some(index) = names.iter().position(|name| *name == event.call.func()) else {
-                    continue;
-                };
-                typed[index] += 1;
-            }
-            let emitted = preview_expression_fn(&script, "corpus_audit");
-            if parse_expression_script(&emitted).to_expression_events() != events {
-                problems.push(format!("{path}: expression events changed on export"));
-            }
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} expression scripts changed on export:\n{}",
-            problems.len(),
-            problems.join("\n")
-        );
-        assert_eq!(
-            typed, written,
-            "the measured expression calls no longer all have typed events"
-        );
-        assert_eq!(
-            expression_scripts, 345,
-            "the local expression corpus changed; update the measured D2 scope deliberately"
-        );
-        assert_eq!(
-            written,
-            [75, 52, 2, 292],
-            "the measured expression macro counts changed; update D2 before expanding scope"
-        );
-    }
-
-    // ═══ Generated-source compile golden ════════════════════════════════════
-
     /// The inputs `sample_project` is built from, so a test can check the preview against
-    /// the very same edits the export consumed.
     type SampleEdits = (
         crate::data::AcmdScript,
         Vec<crate::data::EffectCall>,
@@ -7533,9 +15718,6 @@ unsafe extern "C" fn expression_bad(agent: &mut L2CAgentBase) {
         (script, fx, sfx, tweaks)
     }
 
-    /// Always materializes the generated project under the editor cache dir; with
-    /// VISIONARY_COMPILE_GOLDEN=1 it additionally runs cargo-skyline on it (slow, network)
-    /// to prove the codegen actually builds.
     #[test]
     fn generated_source_project_compiles() {
         let project = sample_project();
@@ -7597,19 +15779,10 @@ unsafe extern "C" fn expression_bad(agent: &mut L2CAgentBase) {
         );
     }
 
-    // ── Helper: wrap a body line in a minimal effect function ─────────────────
     fn wrap_effect_fn(body: &str) -> String {
         format!("unsafe extern \"C\" fn effect_test(agent: &mut L2CAgentBase) {{\n    {body}\n}}\n")
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task 1: Bug condition exploration tests
-    // These tests MUST FAIL on unfixed code — failure confirms the bug exists.
-    // They will PASS after the fix in task 3 is applied.
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Property 1: Bug Condition — bare EFFECT macro produces EffectCall
-    /// CRITICAL: MUST FAIL on unfixed code (bare EFFECT is treated as Raw and discarded).
     #[test]
     fn test_bug_condition_bare_effect_produces_effect_call() {
         let src = wrap_effect_fn(
@@ -7628,7 +15801,6 @@ unsafe extern "C" fn expression_bad(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Property 1b: bare EFFECT_FOLLOW produces EffectCall with follows_bone=true
     #[test]
     fn test_bug_condition_bare_effect_follow_follows_bone() {
         let src = wrap_effect_fn(
@@ -7647,9 +15819,6 @@ unsafe extern "C" fn expression_bad(agent: &mut L2CAgentBase) {
         assert_eq!(calls[0].effect_name, "follow_eff");
     }
 
-    /// Rustfmt's multiline layout is still one ACMD call. The attached issue-17 example uses
-    /// this form for `EFFECT_FOLLOW`; the importer must not discard the opening line and then
-    /// treat each argument as unrelated source.
     #[test]
     fn rustfmt_multiline_effect_calls_import_as_single_statements() {
         let src = r#"
@@ -7739,7 +15908,6 @@ if macros::is_excute(agent) {
         assert_eq!(landing.effect_name_alt.as_deref(), Some("smoke_r"));
     }
 
-    /// Property 1c: bare AFTER_IMAGE4_ON_arg29 produces EffectCall (AfterImage)
     #[test]
     fn test_bug_condition_bare_after_image_produces_effect_call() {
         // AFTER_IMAGE4_ON_arg29: args[1]=tex1, args[4]=bone
@@ -7755,12 +15923,6 @@ if macros::is_excute(agent) {
         assert_eq!(calls[0].effect_name, "sword_trail");
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task 2: Preservation tests
-    // These tests MUST PASS on unfixed code — they confirm baseline behavior.
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Preservation: is_excute-wrapped EFFECT still produces EffectCall
     #[test]
     fn test_preservation_is_excute_wrapped_effect_unchanged() {
         let src = r#"
@@ -7779,30 +15941,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(calls[0].effect_name, "wrapped_eff");
     }
 
-    /// Preservation: frame(...) advances the frame counter
-    #[test]
-    fn test_preservation_frame_call_advances_counter() {
-        let src = r#"
-unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
-    frame(agent.lua_state_agent, 10.0);
-    if macros::is_excute(agent) {
-        macros::EFFECT(agent, Hash40::new("late_eff"), Hash40::new("top"), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, true);
-    }
-}
-"#;
-        let script = parse_effect_script(src);
-        let calls = script.to_effect_calls();
-        assert!(
-            !calls.is_empty(),
-            "should produce EffectCall after frame(10)"
-        );
-        assert_eq!(
-            calls[0].active_start, 10,
-            "active_start should be 10 after frame(10)"
-        );
-    }
-
-    /// Preservation: non-EFFECT bare lines stay as Raw (no EffectCall produced)
     #[test]
     fn test_preservation_non_effect_bare_line_stays_raw() {
         let src = r#"
@@ -7819,7 +15957,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Preservation: for loop with is_excute still works
     #[test]
     fn test_preservation_for_loop_with_is_excute_unchanged() {
         let src = r#"
@@ -7845,9 +15982,508 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(calls[1].active_start, 8);
     }
 
-    // ═══ Spawn-macro fidelity ═══════════════════════════════════════════════
+    #[test]
+    fn native_last_effect_controls_type_only_exact_direct_one_argument_calls() {
+        use crate::data::{EffectControl, EffectMacro, EffectStmt};
 
-    /// The whole point of issue #4: an export must reissue the macro the script used.
+        let source = r#"unsafe extern "C" fn effect_native_control(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        EffectModule::set_disable_render_offset_last(agent.module_accessor);
+        EffectModule::enable_sync_init_pos_last(agent.module_accessor);
+        EffectModule::enable_sync_init_pos_last(agent.module_accessor, 0);
+        EffectModule::set_disable_render_offset_last(boma);
+        EffectModule::set_disable_render_offset_last(agent.module_accessor, 0);
+        EffectModule::set_disable_render_offset_last(agent.module_accessor );
+        if custom_effect_guard(agent) {
+            EffectModule::enable_sync_init_pos_last(agent.module_accessor);
+        }
+    }
+    EffectModule::set_disable_render_offset_last(agent.module_accessor);
+}
+"#;
+        let parsed = parse_effect_script(source);
+        let Some(EffectStmt::Excute(commands)) = parsed.stmts.first() else {
+            panic!("expected a single execute statement: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(EffectMacro::Control(
+                EffectControl::SetDisableRenderOffsetLast
+            ))
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(EffectMacro::Control(EffectControl::EnableSyncInitPosLast))
+        ));
+        for raw in [
+            "EffectModule::enable_sync_init_pos_last(agent.module_accessor, 0);",
+            "EffectModule::set_disable_render_offset_last(boma);",
+            "EffectModule::set_disable_render_offset_last(agent.module_accessor, 0);",
+            "EffectModule::set_disable_render_offset_last(agent.module_accessor );",
+            "if custom_effect_guard(agent) {",
+            "EffectModule::enable_sync_init_pos_last(agent.module_accessor);",
+            "}",
+        ] {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| matches!(command, EffectMacro::Raw(line) if line == raw)),
+                "unsupported/nested native syntax should remain raw: {raw:?}; {commands:#?}"
+            );
+        }
+        assert!(matches!(
+            parsed.stmts.get(1),
+            Some(EffectStmt::Raw(line))
+                if line == "EffectModule::set_disable_render_offset_last(agent.module_accessor);"
+        ));
+
+        let controls = parsed.to_effect_calls();
+        assert_eq!(controls.len(), 2);
+        assert!(matches!(
+            controls[0].control.as_ref(),
+            Some(EffectControl::SetDisableRenderOffsetLast)
+        ));
+        assert!(matches!(
+            controls[1].control.as_ref(),
+            Some(EffectControl::EnableSyncInitPosLast)
+        ));
+    }
+
+    #[test]
+    fn measured_native_screen_and_camera_controls_are_closed_and_contextual() {
+        use crate::data::{EffectControl, EffectMacro, EffectReqScreenPreset, EffectStmt};
+
+        assert_eq!(EffectReqScreenPreset::all().len(), 110);
+        let ids: std::collections::BTreeSet<_> = EffectReqScreenPreset::all()
+            .iter()
+            .map(|preset| preset.id)
+            .collect();
+        assert_eq!(ids.len(), 110);
+        assert_eq!(EffectReqScreenPreset::all()[0].id, "bg_bayonetta_final");
+        assert_eq!(EffectReqScreenPreset::all()[0].flags, [false; 3]);
+        assert_eq!(
+            EffectReqScreenPreset::from_source_parts("demon_ragedrive_bg", [true, false, false])
+                .map(|preset| preset.id),
+            Some("demon_ragedrive_bg")
+        );
+        assert!(EffectReqScreenPreset::from_source_parts(
+            "bg_bayonetta_final",
+            [true, false, false]
+        )
+        .is_none());
+        assert!(EffectReqScreenPreset::from_source_parts("arbitrary_effect", [false; 3]).is_none());
+        for preset in EffectReqScreenPreset::all() {
+            let command = EffectMacro::Control(EffectControl::ReqScreen {
+                preset_id: preset.id.to_string(),
+            });
+            let emitted = crate::move_nodes::effects::command_lines(&command).unwrap();
+            let source = format!(
+                "unsafe extern \"C\" fn effect_preset(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {}\n    }}\n}}\n",
+                emitted.join("\n")
+            );
+            let parsed = parse_effect_script(&source);
+            let Some(EffectStmt::Excute(commands)) = parsed.stmts.first() else {
+                panic!(
+                    "preset did not parse inside direct execute context: {}",
+                    preset.id
+                );
+            };
+            assert_json_eq!(
+                commands.first().unwrap(),
+                command,
+                "preset did not preserve stable ID/source tuple: {}",
+                preset.id
+            );
+        }
+
+        let source = r#"unsafe extern "C" fn effect_native_screen(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, false, false);
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("demon_ragedrive_bg"), true, false, false);
+        ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, true);
+        ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, false);
+        EffectModule::req_screen(agent.module_accessor, Hash40::new_raw(0x1234), false, false, false);
+        EffectModule::req_screen(agent.module_accessor, Hash40::new_raw(Hash40::new("bg_demon_final_after_l)")), false, false, false);
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, false);
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, true, false);
+        ColorBlendModule::set_disable_camera_depth_influence(boma, true);
+        ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, enabled);
+        #[cfg(target_os = "horizon")]
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, false, false);
+        if custom_effect_guard(agent) {
+            ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, true);
+        }
+    }
+
+    EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, false, false);
+}
+"#;
+        let parsed = parse_effect_script(source);
+        let Some(EffectStmt::Excute(commands)) = parsed.stmts.first() else {
+            panic!("expected execute node: {:#?}", parsed.stmts);
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(EffectMacro::Control(EffectControl::ReqScreen { preset_id }))
+                if preset_id == "bg_bayonetta_final"
+        ));
+        assert!(matches!(
+            commands.get(1),
+            Some(EffectMacro::Control(EffectControl::ReqScreen { preset_id }))
+                if preset_id == "demon_ragedrive_bg"
+        ));
+        assert!(matches!(
+            commands.get(2),
+            Some(EffectMacro::Control(
+                EffectControl::SetDisableCameraDepthInfluence { value: true }
+            ))
+        ));
+        assert!(matches!(
+            commands.get(3),
+            Some(EffectMacro::Control(
+                EffectControl::SetDisableCameraDepthInfluence { value: false }
+            ))
+        ));
+        for raw in [
+            "EffectModule::req_screen(agent.module_accessor, Hash40::new_raw(0x1234), false, false, false);",
+            "EffectModule::req_screen(agent.module_accessor, Hash40::new_raw(Hash40::new(\"bg_demon_final_after_l)\")), false, false, false);",
+            "EffectModule::req_screen(agent.module_accessor, Hash40::new(\"bg_bayonetta_final\"), false, false);",
+            "EffectModule::req_screen(agent.module_accessor, Hash40::new(\"bg_bayonetta_final\"), false, true, false);",
+            "ColorBlendModule::set_disable_camera_depth_influence(boma, true);",
+            "ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, enabled);",
+            "#[cfg(target_os = \"horizon\")]",
+            "EffectModule::req_screen(agent.module_accessor, Hash40::new(\"bg_bayonetta_final\"), false, false, false);",
+            "if custom_effect_guard(agent) {",
+            "ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, true);",
+            "}",
+        ] {
+            assert!(
+                commands.iter().any(|command| matches!(command, EffectMacro::Raw(line) if line == raw)),
+                "unsupported context/shape should remain Raw: {raw:?}; {commands:#?}"
+            );
+        }
+        assert!(matches!(
+            parsed.stmts.get(1),
+            Some(EffectStmt::Raw(line)) if line.contains("EffectModule::req_screen(")
+        ));
+        let wrong_track = r#"unsafe extern "C" fn game_native_screen(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        EffectModule::req_screen(agent.module_accessor, Hash40::new("bg_bayonetta_final"), false, false, false);
+        ColorBlendModule::set_disable_camera_depth_influence(agent.module_accessor, true);
+    }
+}
+"#;
+        let game = parse_acmd_script(wrong_track);
+        assert!(matches!(
+            game.stmts.first(),
+            Some(crate::data::AcmdStmt::Excute(commands))
+                if commands.len() == 2 && commands.iter().all(|command| matches!(command, crate::data::ExcuteStmt::Raw(line) if line.contains("req_screen(") || line.contains("set_disable_camera_depth_influence(")))
+        ));
+
+        let json = serde_json::to_value(&parsed).unwrap();
+        let restored: crate::data::EffectScript = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), json);
+    }
+
+    #[test]
+    fn measured_off_kind_work_presets_are_closed_owner_scoped_and_roundtrip() {
+        use crate::data::{EffectControl, EffectMacro, EffectOffKindWorkPreset, EffectStmt};
+        let presets = EffectOffKindWorkPreset::all();
+        assert_eq!(presets.len(), 13);
+        let ids = presets
+            .iter()
+            .map(|preset| preset.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), presets.len());
+
+        for preset in presets {
+            let entry = crate::gimmicks::registry::resolve(
+                preset.fighter,
+                preset.work_symbol,
+                crate::gimmicks::registry::IdentifierKind::WorkInt,
+            )
+            .unwrap_or_else(|error| panic!("{} registry slot mismatch: {error}", preset.id));
+            assert!(
+                entry.group.is_empty(),
+                "{} is not instance-scoped",
+                preset.id
+            );
+            assert_eq!(
+                EffectOffKindWorkPreset::from_source_parts(
+                    preset.fighter,
+                    preset.work_symbol,
+                    preset.flags,
+                )
+                .map(|row| row.id),
+                Some(preset.id)
+            );
+            let command = EffectMacro::Control(EffectControl::OffKindWork {
+                preset_id: preset.id.to_owned(),
+            });
+            let lines = crate::move_nodes::effects::command_lines(&command).unwrap();
+            assert_eq!(
+                lines,
+                [format!(
+                    "macros::EFFECT_OFF_KIND_WORK(agent, *{}, {}, {});",
+                    preset.work_symbol, preset.flags[0], preset.flags[1]
+                )]
+            );
+            assert!(crate::move_nodes::effects::command_lines_for_fighter(
+                Some(preset.fighter),
+                &command
+            )
+            .is_ok());
+            let ownerless =
+                crate::move_nodes::effects::command_lines_for_fighter(None, &command).unwrap_err();
+            assert!(ownerless.contains("<ownerless>") && ownerless.contains(preset.id));
+            let wrong_owner =
+                crate::move_nodes::effects::command_lines_for_fighter(Some("mario"), &command)
+                    .unwrap_err();
+            assert!(wrong_owner.contains("mario"));
+            assert!(wrong_owner.contains(preset.id));
+            assert!(wrong_owner.contains(preset.fighter));
+            assert!(wrong_owner.contains(preset.work_symbol));
+
+            let source = format!(
+                "unsafe extern \"C\" fn effect_preset(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {}\n    }}\n}}\n",
+                lines.join("\n")
+            );
+            let parsed = parse_effect_script(&source);
+            let Some(EffectStmt::Excute(commands)) = parsed.stmts.first() else {
+                panic!(
+                    "preset did not parse in direct execute context: {}",
+                    preset.id
+                );
+            };
+            assert_json_eq!(
+                commands.first().unwrap(),
+                &command,
+                "preset did not parse: {}",
+                preset.id
+            );
+            let imported = crate::move_nodes::effects::import_for_fighter(preset.fighter, &parsed);
+            let graph = crate::move_nodes::model::MoveGraph {
+                tracks: vec![imported],
+                ..Default::default()
+            };
+            assert!(crate::move_nodes::live_support::source_only_tracks(&graph)
+                .any(|track| track == crate::move_nodes::model::Track::Effect));
+
+            let legacy_calls = parsed.to_effect_calls();
+            assert_eq!(
+                legacy_calls.len(),
+                1,
+                "legacy conversion lost {}",
+                preset.id
+            );
+            let legacy_source = preview_effect_fn(
+                &legacy_calls,
+                "preset",
+                &[],
+                &std::collections::BTreeMap::new(),
+            );
+            assert!(
+                legacy_source.contains(&lines[0]),
+                "legacy emitter lost {}",
+                preset.id
+            );
+            let legacy_roundtrip = parse_effect_script(&legacy_source).to_effect_calls();
+            assert_eq!(legacy_roundtrip.len(), 1);
+            assert_json_eq!(
+                legacy_roundtrip[0].control.as_ref().unwrap(),
+                &EffectControl::OffKindWork {
+                    preset_id: preset.id.to_owned()
+                },
+                "legacy source roundtrip changed {}",
+                preset.id
+            );
+            let json = serde_json::to_value(&command).unwrap();
+            assert_eq!(
+                serde_json::to_value(serde_json::from_value::<EffectMacro>(json.clone()).unwrap())
+                    .unwrap(),
+                json
+            );
+        }
+        assert!(EffectOffKindWorkPreset::by_id("not_a_preset").is_none());
+        assert!(EffectOffKindWorkPreset::from_source_parts(
+            "cloud",
+            "FIGHTER_BRAVE_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            [false, true],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn off_kind_work_parser_fails_closed_on_wrong_shapes_and_contexts() {
+        use crate::data::{EffectControl, EffectMacro, EffectStmt};
+        let valid = "macros::EFFECT_OFF_KIND_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, false, true);";
+        for malformed in [
+            valid.replace("agent,", "boma,"),
+            valid.replace(
+                "*FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+                "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+            ),
+            valid.replace("false, true", "enabled, true"),
+            valid.replace("false, true", "false, maybe"),
+            valid.replace(", true);", ");"),
+            valid.replace(", false, true);", ", false, true, false);"),
+            valid.replace(
+                "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE",
+                "FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_UNKNOWN_SLOT",
+            ),
+            valid.replace("macros::", "custom::"),
+        ] {
+            let source = format!(
+                "unsafe extern \"C\" fn effect_bad(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {malformed}\n    }}\n}}\n"
+            );
+            let parsed = parse_effect_script(&source);
+            assert!(
+                matches!(parsed.stmts.first(), Some(EffectStmt::Excute(commands)) if commands.iter().any(|command| matches!(command, EffectMacro::Raw(_)))),
+                "malformed source was admitted: {malformed}"
+            );
+            assert_eq!(
+                conserved_off_kind_count(&parsed.stmts),
+                source.matches("macros::EFFECT_OFF_KIND_WORK(").count(),
+                "malformed call was not preserved: {malformed}"
+            );
+        }
+
+        let nested_source = format!(
+            "unsafe extern \"C\" fn effect_nested(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        if custom_effect_guard(agent) {{\n            {valid}\n        }}\n    }}\n}}\n"
+        );
+        let nested = parse_effect_script(&nested_source);
+        fn contains_typed_off_kind(stmts: &[EffectStmt]) -> bool {
+            stmts.iter().any(|stmt| match stmt {
+                EffectStmt::Excute(commands) => commands.iter().any(|command| {
+                    matches!(
+                        command,
+                        EffectMacro::Control(EffectControl::OffKindWork { .. })
+                    )
+                }),
+                EffectStmt::Loop { body, .. } | EffectStmt::Cond { body, .. } => {
+                    contains_typed_off_kind(body)
+                }
+                _ => false,
+            })
+        }
+        fn conserved_off_kind_count(stmts: &[EffectStmt]) -> usize {
+            let mut count = 0;
+            for stmt in stmts {
+                match stmt {
+                    EffectStmt::Excute(commands) => {
+                        for command in commands {
+                            match command {
+                                EffectMacro::Control(EffectControl::OffKindWork { .. }) => {
+                                    count += 1
+                                }
+                                EffectMacro::Raw(raw) => {
+                                    count += raw.matches("macros::EFFECT_OFF_KIND_WORK(").count()
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    EffectStmt::Raw(raw) => {
+                        count += raw.matches("macros::EFFECT_OFF_KIND_WORK(").count()
+                    }
+                    EffectStmt::Loop { body, .. } | EffectStmt::Cond { body, .. } => {
+                        count += conserved_off_kind_count(body)
+                    }
+                    _ => {}
+                }
+            }
+            count
+        }
+        assert!(
+            !contains_typed_off_kind(&nested.stmts),
+            "nested off-kind control was typed"
+        );
+        assert_eq!(
+            conserved_off_kind_count(&nested.stmts),
+            nested_source
+                .matches("macros::EFFECT_OFF_KIND_WORK(")
+                .count(),
+            "nested call was not preserved"
+        );
+
+        let multiline = valid.replace(
+            "(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE, false, true)",
+            "(agent,\n            *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_EFFECT_KIND_SWORD_FLARE,\n            false, true)",
+        );
+        let attributed = format!("#[cfg(feature = \"fixture\")]\n{valid}");
+        let wrong_track = format!(
+            "unsafe extern \"C\" fn game_wrong_track(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {valid}\n    }}\n}}\n"
+        );
+        let bare = format!(
+            "unsafe extern \"C\" fn effect_bare(agent: &mut L2CAgentBase) {{\n    {valid}\n}}\n"
+        );
+        for (source, effect_domain) in [
+            (format!("unsafe extern \"C\" fn effect_multiline(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {multiline}\n    }}\n}}\n"), true),
+            (format!("unsafe extern \"C\" fn effect_attributed(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {attributed}\n    }}\n}}\n"), true),
+            (wrong_track, false),
+            (bare, true),
+        ] {
+            if effect_domain {
+                let parsed = parse_effect_script(&source);
+                assert!(!contains_typed_off_kind(&parsed.stmts), "unsupported placement was typed: {source}");
+                assert_eq!(
+                    conserved_off_kind_count(&parsed.stmts),
+                    source.matches("macros::EFFECT_OFF_KIND_WORK(").count(),
+                    "unsupported effect placement was not preserved: {source}"
+                );
+            } else {
+                let parsed = parse_acmd_script(&source);
+                assert!(matches!(parsed.stmts.first(), Some(crate::data::AcmdStmt::Excute(commands)) if commands.iter().any(|command| matches!(command, crate::data::ExcuteStmt::Raw(raw) if raw.contains("EFFECT_OFF_KIND_WORK")))));
+                let preserved = parsed
+                    .stmts
+                    .iter()
+                    .filter_map(|stmt| match stmt {
+                        crate::data::AcmdStmt::Excute(commands) => Some(commands.iter().filter(|command| matches!(command, crate::data::ExcuteStmt::Raw(raw) if raw.contains("EFFECT_OFF_KIND_WORK"))).count()),
+                        _ => None,
+                    })
+                    .sum::<usize>();
+                assert_eq!(preserved, 1, "wrong-track call was not preserved: {source}");
+            }
+        }
+
+        let malformed_neighbor = format!(
+            "unsafe extern \"C\" fn effect_neighbor(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {valid}\n        macros::EFFECT_OFF_KIND_WORK(agent, *FIGHTER_CLOUD_INSTANCE_WORK_ID_INT_UNKNOWN_SLOT, false, true);\n    }}\n}}\n"
+        );
+        let parsed = parse_effect_script(&malformed_neighbor);
+        let Some(EffectStmt::Excute(commands)) = parsed.stmts.first() else {
+            panic!()
+        };
+        assert!(matches!(
+            commands.first(),
+            Some(EffectMacro::Control(EffectControl::OffKindWork { .. }))
+        ));
+        assert!(
+            matches!(commands.get(1), Some(EffectMacro::Raw(raw)) if raw.contains("UNKNOWN_SLOT"))
+        );
+        let lexical = malformed_neighbor
+            .matches("macros::EFFECT_OFF_KIND_WORK(")
+            .count();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| match command {
+                    EffectMacro::Control(EffectControl::OffKindWork { .. }) => 1,
+                    EffectMacro::Raw(raw) => raw.matches("macros::EFFECT_OFF_KIND_WORK(").count(),
+                    _ => 0,
+                })
+                .sum::<usize>(),
+            lexical
+        );
+        // A syntactically invalid sibling invalidates the complete direct-statement guard.
+        // Do not partly lift an otherwise well-shaped native control out of that body.
+        let invalid_body = format!(
+            "unsafe extern \"C\" fn effect_invalid_body(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        let broken = ;\n        {valid}\n    }}\n}}\n"
+        );
+        let invalid = parse_effect_script(&invalid_body);
+        assert!(!contains_typed_off_kind(&invalid.stmts));
+        assert_eq!(conserved_off_kind_count(&invalid.stmts), 1);
+    }
+
     #[test]
     fn spawn_macros_survive_a_source_round_trip() {
         let src = r#"
@@ -7928,13 +16564,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(reparsed[0].flip_axis.as_deref(), Some("*EF_FLIP_XY"));
     }
 
-    /// `LAST_EFFECT_SET_RATE` was parsed into the IR and then dropped on the way to
-    /// `EffectCall`, so the export — which is generated from the calls — wrote no rate line at
-    /// all. Every vanilla effect that plays fast or slow shipped at normal speed.
-    ///
-    /// Kirby's down attack, verbatim: two spawns and two different rates in one block, which
-    /// is what proves the rate binds to the spawn directly above it rather than to whichever
-    /// spawn happens to be last.
     #[test]
     fn a_rate_binds_to_the_spawn_above_it_and_survives_an_export() {
         let src = r#"
@@ -7979,9 +16608,6 @@ unsafe extern "C" fn effect_downattackd(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The measured camera-flat modifier has the same last-spawn binding as rate, but its own
-    /// scalar field. Two adjacent calls keep their offsets separate and the generated source
-    /// puts each line directly below the spawn it modifies.
     #[test]
     fn camera_flat_offset_binds_to_its_spawn_and_survives_an_export() {
         let src = r#"
@@ -8066,9 +16692,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert!(residue.is_empty());
     }
 
-    /// Kirby's real `TornadoStart` call is the measured `LAST_EFFECT_SET_WORK_INT` shape.
-    /// `smash-script` has no wrapper, so the exporter uses a local helper over the linked
-    /// primitive while the editor keeps the authored Work ID token editable.
     #[test]
     fn the_work_int_effect_line_is_typed_and_exported_through_a_local_helper() {
         let src = r#"unsafe extern "C" fn effect_tornadostart(agent: &mut L2CAgentBase) {
@@ -8122,9 +16745,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert!(!report.has_blockers(), "{report:?}");
     }
 
-    /// Bare C7 calls have no spawn to bind their modifier fields to, but they are still
-    /// effect-timeline lines. Routing them through the existing residue emitter keeps the source
-    /// visible and positioned without pretending that any of the four calls is an effect spawn.
     #[test]
     fn bare_c7_effect_lines_reach_frame_residue_without_becoming_typed_calls() {
         let src = r#"unsafe extern "C" fn effect_c7(agent: &mut L2CAgentBase) {
@@ -8178,10 +16798,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Kirby's `SetInkColor` is the one corpus use of `LAST_PARTICLE_SET_COLOR`. The dump emits
-    /// the colour through three preceding `WorkModule::get_float` stack pushes and then writes a
-    /// zero-argument macro call. Keep the observed line, but leave the stack plumbing and the
-    /// wrapper mismatch explicit instead of inventing three editor values.
     #[test]
     fn the_dumped_particle_color_stack_form_is_carried_and_marked_unbuildable() {
         let src = r#"unsafe extern "C" fn effect_set_ink_color(agent: &mut L2CAgentBase) {
@@ -8238,9 +16854,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The external corpus supplies real calls for all four C4 members. They are point events in
-    /// the effect timeline, not spawn lifetimes: a detach leaves the effect alive and an area
-    /// toggle changes an existing AreaModule state.
     #[test]
     fn c4_controls_are_typed_points_and_survive_effect_export() {
         let src = r#"unsafe extern "C" fn effect_c4(agent: &mut L2CAgentBase) {
@@ -8348,12 +16961,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Kirby's up air, verbatim, and Kirby's jab, verbatim — the two vanilla shapes for the
-    /// colour and opacity modifiers. Both were deleted by every export before C1: the emitter
-    /// rebuilds the function from `EffectCall`s, and neither line was in one.
-    ///
-    /// The green and blue here are over one, which is why the panel's drag fields are not
-    /// clamped to the colour picker's range.
     #[test]
     fn a_tint_and_an_opacity_bind_to_the_spawn_above_and_survive_an_export() {
         let src = r#"
@@ -8401,16 +17008,6 @@ unsafe extern "C" fn effect_attackairhi(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Dolly's up special, verbatim: the shape 64 of the corpus's 65 colour calls are in, and
-    /// the reason modelling this macro recovered almost none of them.
-    ///
-    /// The tint is real at runtime — the game's "last effect" survives the block boundary — but
-    /// it only runs on one costume. Binding it would export a costume-specific colour as an
-    /// unconditional one, so it still binds to nothing.
-    ///
-    /// C1 left it there and reported it as a loss. C6 carries it: the line rides on the spawn
-    /// it followed, wrapped in the guard it was written in, and comes back out of the export
-    /// meaning what it meant going in.
     #[test]
     fn a_tint_cut_off_from_its_spawn_by_a_branch_is_carried_with_its_costume_check() {
         let src = r#"
@@ -8475,17 +17072,6 @@ unsafe extern "C" fn effect_specialhicommand(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// `dolly/FinalAirEnd`, trimmed to the two frames that matter and otherwise verbatim.
-    ///
-    /// This is E3's whole measured defect. Frame 40 of that script is two `CANCEL_FILL_SCREEN`
-    /// calls and nothing else — no spawn in the block for C6's carry to attach them to — so both
-    /// lines were deleted by every export of that move. It is the only such frame in the corpus,
-    /// which is why the number moved by two.
-    ///
-    /// The macro is deliberately **not** modelled. Nothing here claims to know what
-    /// `CANCEL_FILL_SCREEN(agent, 1, 30)`'s two arguments mean, and on two corpus calls nothing
-    /// should: the line is reproduced as written, exactly as a carried line is. What changed is
-    /// that a frame can now own lines, not that the editor understands these ones.
     #[test]
     fn a_frame_whose_block_holds_no_spawn_still_reaches_the_export() {
         let src = r#"unsafe extern "C" fn effect_finalairend(agent: &mut L2CAgentBase) {
@@ -8563,14 +17149,6 @@ unsafe extern "C" fn effect_specialhicommand(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The frame a residue line is keyed to is the one it was written under, not the next one.
-    ///
-    /// Composed on purpose, and the composition is the point: the corpus's only spawn-less block
-    /// is the *last* frame of `dolly/FinalAirEnd`, so it is flushed by the final `end_frame` and
-    /// says nothing about the two inside the walk. Putting a frame after it is what distinguishes
-    /// "close the block being left" from "close the block being entered" — and getting that
-    /// backwards produces an export that is well-formed, compiles, balances its braces, and plays
-    /// the line 20 frames late. Every other assertion in this file would have stayed green.
     #[test]
     fn residue_is_keyed_to_the_frame_it_was_written_at_not_the_next_one() {
         let src = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
@@ -8609,15 +17187,6 @@ unsafe extern "C" fn effect_specialhicommand(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Two spawns at one frame, each with its own costume tint — dolly's up special stripped to
-    /// its shape. The real one has three spawns and 24 tints in a single block.
-    ///
-    /// This is the case that decides whether carried lines hang off a call or off a frame, and
-    /// it is why they hang off a call. `LAST_EFFECT_SET_COLOR` recolours whatever spawned most
-    /// recently, so an export that wrote both spawns and then both tints — the natural shape if
-    /// residue were anchored to a frame — would leave `dolly_roll_l_color1` its original colour
-    /// and paint `dolly_roll_l_color2` twice. Every line would be present and the move would
-    /// still be wrong, which is the failure hardest to notice by reading the output.
     #[test]
     fn each_costume_tint_stays_with_the_spawn_it_recolours() {
         let src = r#"
@@ -8663,11 +17232,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A live colour multiplier and a script tint both want the same line. The override wins,
-    /// exactly one line is written, and the script's value is not silently added underneath it.
-    ///
-    /// Before C1 this could not be got wrong, because the script's tint was not in `EffectCall`
-    /// at all — the export wrote the tweak's colour and deleted the script's without a word.
     #[test]
     fn a_live_colour_override_replaces_the_scripts_tint_rather_than_stacking_with_it() {
         let src = r#"
@@ -8701,19 +17265,6 @@ unsafe extern "C" fn effect_attackairhi(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The rate macro names no effect, so binding it to anything but the spawn directly above
-    /// it is a guess. A line this parser does not model could itself be a spawn, and then the
-    /// rate would be written onto an effect it was never meant to touch.
-    ///
-    /// C6 made the export faithful here rather than merely cautious. The unmodelled spawn and
-    /// the rate are both carried, in order, below `sys_atk_smoke` — so the rate still lands on
-    /// whatever `SOME_UNMODELLED_SPAWN` spawns, exactly as it did in the original. The refusal
-    /// to *bind* is unchanged and still the thing under test; what changed is that refusing no
-    /// longer means deleting.
-    ///
-    /// This is also the answer to C6's stated doubling trap. A line only becomes carried
-    /// residue if it produced no `EffectCall`, so a preserved line and a regenerated call can
-    /// never be the same spawn — asserted below.
     #[test]
     fn a_rate_with_no_spawn_directly_above_it_attaches_to_nothing() {
         let src = r#"
@@ -8749,14 +17300,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The effect export regenerates the whole function from the call list, so a macro that is
-    /// not in that list is a macro the export deletes. `FLASH` and the `BURN_COLOR` family were
-    /// parsed as `Raw` lines and therefore silently dropped from every exported move — 69
-    /// occurrences in the local corpus, including the entire colour ramp below.
-    ///
-    /// Kirby's dash attack, verbatim: the snap-then-interpolate pairing that makes up almost
-    /// every real use of the family, plus the argument-less reset and a spawn in the same
-    /// function to prove the two kinds of entry share a list without disturbing each other.
     #[test]
     fn colour_commands_survive_an_export_instead_of_being_dropped() {
         let src = r#"
@@ -8862,77 +17405,6 @@ unsafe extern "C" fn effect_attackdash(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// `COL_NORMAL` is a colour-blend reset — `lua_const` names it
-    /// `MA_MSC_CMD_COLOR_BLEND_COL_NORMAL`, one of six such commands with `FLASH` — and not the
-    /// body-collision command the `game_` hurtbox panel files it under. Before C6b the effect
-    /// export had no form for it, so it deleted all eight of the corpus's occurrences: they sit
-    /// in blocks with no spawn, so C6's residue had no call to ride on.
-    ///
-    /// The source is kirby/SpecialSStart's `effect_` function verbatim, which is the smallest
-    /// real case and the one that shows the line is written *outside* an `is_excute` block.
-    #[test]
-    fn a_lone_col_normal_survives_the_effect_export() {
-        let src = r#"
-unsafe extern "C" fn effect_specialsstart(agent: &mut L2CAgentBase) {
-    frame(agent.lua_state_agent, 4.0);
-    if macros::is_excute(agent) {
-        macros::EFFECT(agent, Hash40::new("sys_flash"), Hash40::new("haver"), -0.012, 11.999, 0.137, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
-    }
-    macros::COL_NORMAL(agent);
-    wait(agent.lua_state_agent, 2.0);
-    if macros::is_excute(agent) {
-        macros::FLASH(agent, 1, 1, 1, 0.7);
-    }
-    wait(agent.lua_state_agent, 2.0);
-}
-"#;
-        let script = parse_effect_script(src);
-        assert!(
-            unexportable_effect_lines(&script).is_empty(),
-            "nothing in this function should be reported lost: {:?}",
-            unexportable_effect_lines(&script)
-        );
-
-        let calls = script.to_effect_calls();
-        assert_eq!(calls.len(), 3, "the spawn, the reset, and the flash");
-        assert_eq!(calls[1].spawn_func, "COL_NORMAL");
-        assert_eq!(
-            calls[1].color,
-            Some(crate::data::ColorCall {
-                transition: None,
-                rgba: None
-            }),
-            "it takes no arguments, exactly like BURN_COLOR_NORMAL"
-        );
-        // It reads as its own entry rather than as residue on the spawn above it, which is what
-        // makes it separately disableable — and it must not have been pulled onto that spawn's
-        // frame either.
-        assert!(calls[0].trailing.is_empty() && calls[1].leading.is_empty());
-        assert_eq!(calls[1].active_start, calls[0].active_start);
-        assert_eq!(calls[2].active_start, calls[1].active_start + 2);
-
-        let (_, emitted) = emit_effect_move_fn(
-            &calls,
-            "specialsstart",
-            &Default::default(),
-            &Default::default(),
-        );
-        assert!(
-            emitted.contains("macros::COL_NORMAL(agent);"),
-            "missing the reset from:\n{emitted}"
-        );
-        assert_eq!(
-            parse_effect_script(&emitted).to_effect_calls(),
-            calls,
-            "reading the export back must produce the very same calls"
-        );
-    }
-
-    /// The colour table is matched by substring, so a shorter name that is a tail of a longer
-    /// one is the standing hazard in this file — `COL_NORMAL` is a tail of `BURN_COLOR_NORMAL`.
-    /// The `macros::` prefix is what keeps them apart; this pins that it does, because reading a
-    /// burn reset as a blend reset would export the wrong macro and silently stop the burn from
-    /// clearing.
     #[test]
     fn a_burn_color_normal_is_not_read_as_a_col_normal() {
         let src = r#"
@@ -8948,10 +17420,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(calls[0].spawn_func, "BURN_COLOR_NORMAL");
     }
 
-    /// Teaching the effect parser about `COL_NORMAL` must not reach the `game_` parser, which
-    /// keeps its own [`crate::data::ExcuteStmt::ColNormal`] so that a `COL_PRI` span still
-    /// closes. The two never meet — every one of the corpus's ten occurrences is in an
-    /// `effect_` function — but nothing in the code says so, so it is asserted here.
     #[test]
     fn a_game_script_still_reads_col_normal_as_its_own_statement() {
         let src = r#"
@@ -8980,9 +17448,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!(stmts, vec!["ColPri(200)", "ColNormal"]);
     }
 
-    /// A colour command produces an entry in the call list, so it consumes a write-back
-    /// ordinal — and it is not a spawn, so it must not anchor a rate. Getting either half
-    /// wrong writes one call's value into another's line.
     #[test]
     fn a_colour_command_takes_an_ordinal_but_never_anchors_a_rate() {
         let src = r#"
@@ -9010,9 +17475,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A live speed override is a deliberate replacement of the kind's playback rate. Writing
-    /// both it and the spawn's own rate would leave the second line winning anyway, and would
-    /// read back as though the script had asked for the override's value.
     #[test]
     fn a_live_speed_override_replaces_the_spawns_own_rate_rather_than_joining_it() {
         let src = r#"
@@ -9046,8 +17508,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The macros take rotation as `zr, yr, xr`. Parsing them left to right into `[x, y, z]`
-    /// swapped two of the three angles against every other path in the editor.
     #[test]
     fn rotation_arguments_keep_their_zyx_slot_order() {
         let src = r#"
@@ -9070,11 +17530,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A sword trail is a texture and a set of trail parameters, not a graphic with a
-    /// transform. Rebuilding one as `EFFECT_FOLLOW` spawned a nonexistent effect and left
-    /// the trail running.
-    /// A trail's texture and joint are editable fields in the panels, but the whole call was
-    /// replayed verbatim, so renaming one exported the ORIGINAL trail and said nothing.
     #[test]
     fn renaming_a_trail_reaches_the_exported_source() {
         let src = wrap_effect_fn(
@@ -9109,53 +17564,7 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Both `AFTER_IMAGE_OFF` values the corpus writes survive a round trip, as integers.
-    ///
-    /// The four vanilla calls split 2/2 between `0` and `3`, so neither is "the" value and
-    /// normalising to either would rewrite half the archive. The slot is `ToF32`-generic, so
-    /// `0` and `0.0` both compile and no semantic check would flag the difference — the same
-    /// formatting trap B3 found, in a second family.
-    #[test]
-    fn a_trails_closing_argument_round_trips_as_the_integer_the_corpus_writes() {
-        for value in ["0", "3"] {
-            let src = format!(
-                r#"
-unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {{
-    frame(agent.lua_state_agent, 3.0);
-    if macros::is_excute(agent) {{
-        macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex1"), Hash40::new("tex2"), 4, Hash40::new("sword1"), 0, 0, 0, Hash40::new("sword2"), 0, 0, 0);
-    }}
-    frame(agent.lua_state_agent, 9.0);
-    if macros::is_excute(agent) {{
-        macros::AFTER_IMAGE_OFF(agent, {value});
-    }}
-}}
-"#
-            );
-            let calls = parse_effect_script(&src).to_effect_calls();
-            assert_eq!(calls.len(), 1, "{value}");
-            assert_eq!(calls[0].trail_off, Some(value.parse::<f32>().unwrap()));
-
-            let (_, emitted) =
-                emit_effect_move_fn(&calls, "test", &Default::default(), &Default::default());
-            assert!(
-                emitted.contains(&format!("macros::AFTER_IMAGE_OFF(agent, {value});")),
-                "{value} must come back exactly as written:\n{emitted}"
-            );
-        }
-    }
-
-    // ── C2: trails written as a raw command ──────────────────────────────────
-    //
-    // Every fixture below is the real kirby `SpecialHi2` text, not a shape invented here. The
-    // entry's earlier `_arg29` fixture was fabricated, put a `Hash40` where a coordinate goes,
-    // and would have pinned joint work to a call the game never makes.
-
     /// The first trail-ON call of kirby `SpecialHi2`, verbatim.
-    ///
-    /// 26 arguments after the command id — C2's own note said 27, having counted the id itself.
-    /// Slot 1 is the texture and slot 4 the joint, the same numbering as a `macros::` call,
-    /// because the command id sits where `agent` does.
     pub(crate) const CORPUS_TRAIL: &str = r#"        effect(*MA_MSC_CMD_EFFECT_AFTER_IMAGE3_ON, Hash40::new("tex_kirby_cutter"), Hash40::new("tex_kirby_cutter"), 12, Hash40::new("haver"), 0, 3, 0.25, Hash40::new("haver"), 0, 26, 0.5, true, Hash40::new("null"), Hash40::new("haver"), 0, 0, 0, 0, 0, 0, 1, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_BLEND_SRC_ONE, 1);"#;
 
     pub(crate) fn corpus_trail_script() -> String {
@@ -9176,11 +17585,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         )
     }
 
-    /// The trail form the corpus actually uses parses, and comes back out byte-identical.
-    ///
-    /// All four vanilla trail-ON calls are this raw `effect(*MA_MSC_CMD_…, …)` command; the three
-    /// `macros::` names C2 was written around have zero. Before this the line was untyped, so it
-    /// was carried only when a spawn happened to share its frame block and deleted otherwise.
     #[test]
     fn the_raw_command_trail_the_corpus_writes_round_trips_byte_identically() {
         let calls = parse_effect_script(&corpus_trail_script()).to_effect_calls();
@@ -9205,20 +17609,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// The graphic and joints come from slots 1, 4 and 8 specifically, not from their twins.
-    ///
-    /// **The corpus cannot prove this, and tests built only from it silently did not.** Every
-    /// vanilla call writes `Hash40::new("tex_kirby_cutter")` at both slot 1 (`trail1`) and slot 2
-    /// (`trail2`), and `Hash40::new("haver")` at slots 4 (`trail_bone1`), 8 (`trail_bone2`) and
-    /// 14 (`flare_bone`) — so reading the wrong member of either group returns the same string.
-    /// Mutations moving the graphic read to slot 2 and the joint read to slot 8 both passed the
-    /// entire suite.
-    ///
-    /// The layout below is still the corpus's, 26 arguments in vanilla order; only the twin
-    /// slots' *values* are varied, which is what a modder pointing the two trail edges at
-    /// different bones would write. The independent evidence for which slot is which is the
-    /// declaration: `AFTER_IMAGE4_ON_arg29(agent, trail1, trail2, trail_length, trail_bone1,
-    /// trail_x1, trail_y1, trail_z1, trail_bone2, …)`.
     #[test]
     fn a_raw_trails_graphic_and_joints_are_read_from_the_slots_the_declaration_names() {
         // Slot 2 is the second texture; slot 8 the trail's other edge.
@@ -9263,12 +17653,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// Retargeting the joint rewrites slot 4 and leaves the other 25 arguments alone.
-    ///
-    /// The paired half matters: an emitter that dropped the whole line would also "not contain
-    /// the old joint", so the assertion that the edit landed is checked together with the
-    /// assertion that its neighbours — including the *other* two `haver` hashes at slots 8 and
-    /// 14 — did not move.
     #[test]
     fn editing_a_raw_trails_joint_rewrites_only_that_argument() {
         let mut calls = parse_effect_script(&corpus_trail_script()).to_effect_calls();
@@ -9301,13 +17685,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// Retargeting the *second* joint rewrites slot 8 and nothing else.
-    ///
-    /// The mirror of the test above, and it has to be its own case rather than a second edit in
-    /// that one: applied together, an emitter that wrote both edits into a single slot would
-    /// still leave a line containing `top` and `blade`, and asserting on the whole line is only
-    /// decisive when exactly one slot is expected to move. Slot 8 sits between two other
-    /// `haver` hashes, so a splice that got the span even slightly wrong lands on a neighbour.
     #[test]
     fn editing_a_raw_trails_second_joint_rewrites_only_that_argument() {
         let mut calls = parse_effect_script(&corpus_trail_script()).to_effect_calls();
@@ -9347,15 +17724,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// A trail call with no slot 8 gets no second joint, rather than an empty one.
-    ///
-    /// The distinction is `Some(String::new())` versus `None`, and only the second is right: a
-    /// `Some` puts a `Bone 2` row in the panel holding nothing, which invites the user to fill
-    /// in a joint that has no argument to be written to. The export would then find no slot 8 to
-    /// splice and drop the edit without a word.
-    ///
-    /// Truncated calls are not hypothetical here — the editor loads whatever a modder's source
-    /// contains, and a hand-written trail is exactly where a short one comes from.
     #[test]
     fn a_trail_too_short_to_reach_slot_eight_offers_no_second_joint() {
         let short = r#"        effect(*MA_MSC_CMD_EFFECT_AFTER_IMAGE3_ON, Hash40::new("tex_kirby_cutter"), Hash40::new("tex_kirby_cutter"), 12, Hash40::new("haver"));"#;
@@ -9379,12 +17747,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// The two trail spellings nothing declares get no second joint to edit.
-    ///
-    /// `macros::AFTER_IMAGE4_ON` and `macros::AFTER_IMAGE_ON` are not in `smash-script` and not
-    /// in the corpus, so no signature says what slot 8 of such a call holds. They are parsed so
-    /// that a source file containing one survives a round trip — offering a `Bone 2` field on
-    /// them would invite an edit to an argument the editor has guessed the meaning of.
     #[test]
     fn an_undeclared_trail_spelling_offers_no_second_joint() {
         let undeclared = r#"        macros::AFTER_IMAGE_ON(agent, Hash40::new("tex_a"), Hash40::new("tex_b"), 12, Hash40::new("haver"), 0, 3, 0.25, Hash40::new("sword"), 0, 26, 0.5);"#;
@@ -9412,14 +17774,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// `AFTER_IMAGE_OFF` ends the trail, not whatever spawn happens to still be open.
-    ///
-    /// Kirby `SpecialHi2` starts a trail and an `EFFECT_FOLLOW` in one `is_excute`, then closes
-    /// the trail four frames later. Resolving that close against the most recent open *call*
-    /// picks the follow, which loses the `AFTER_IMAGE_OFF` — the trail then runs forever — and
-    /// gives the follow an end frame the script never wrote, so the export invents an
-    /// `EFFECT_OFF_KIND` that kills an effect early. Both halves are asserted, because either
-    /// alone passes with the other still broken.
     #[test]
     fn a_trail_off_closes_the_trail_and_not_a_spawn_still_running() {
         let calls = parse_effect_script(&corpus_trail_script()).to_effect_calls();
@@ -9460,11 +17814,6 @@ unsafe extern "C" fn effect_specialhi2(agent: &mut L2CAgentBase) {{
         );
     }
 
-    /// A trail this script did not start is carried, not dropped.
-    ///
-    /// Kirby splits the move: `SpecialHi2` turns the trail on, `SpecialHi4` turns it off. The
-    /// off-script has no trail call to close and cannot be given one, and deleting the line
-    /// would leave the trail running for the rest of the match.
     #[test]
     fn a_trail_off_with_no_trail_open_is_carried_rather_than_dropped() {
         let src = r#"
@@ -9493,13 +17842,6 @@ unsafe extern "C" fn effect_specialhi4(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Only a whole `effect` identifier starts a raw trail call.
-    ///
-    /// The parser and `scan_macro_sites` have to accept exactly the same lines: the parser's
-    /// call consumes an ordinal and the scanner's site is what a write-back edits, so a line one
-    /// accepts and the other refuses shifts every later call onto the wrong piece of source. The
-    /// positive control is the point — without it this passes for a parser that recognises
-    /// nothing at all.
     #[test]
     fn only_a_whole_effect_identifier_starts_a_raw_trail_call() {
         let real = CORPUS_TRAIL.trim();
@@ -9535,11 +17877,6 @@ unsafe extern "C" fn effect_specialhi4(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A trail the editor ends itself still exports a call that compiles.
-    ///
-    /// There is no closing line to take the argument from — the trail was retimed or added in
-    /// the editor — so the export supplies one. What it must not do is emit the bare call,
-    /// which is what happens if the argument is treated as optional because it is unknown.
     #[test]
     fn a_trail_with_no_closing_line_still_exports_the_required_argument() {
         let src = r#"
@@ -9616,8 +17953,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Projects saved before `extra_args` existed still have to export something that
-    /// compiles — the macro name alone is not enough to rebuild an unknown signature.
     #[test]
     fn a_spawn_with_no_recorded_tail_falls_back_to_the_plain_pair() {
         let call = crate::data::EffectCall {
@@ -9663,119 +17998,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Every `.txt` in the local fetch cache, as `(path, body)`. Empty on a clean machine,
-    /// which is why every caller checks for that rather than trusting the corpus to be there.
-    fn corpus_bodies() -> Vec<(String, String)> {
-        let cache = crate::scratch_dirs::app_storage_root().join("script-cache");
-        let mut bodies = Vec::new();
-        for fighter in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
-            for script in std::fs::read_dir(fighter.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                if let Some(body) = cached_script_body_at(&script.path()) {
-                    bodies.push((script.path().display().to_string(), body));
-                }
-            }
-        }
-        bodies
-    }
-
-    /// The body between a function's header line and its closing brace, newline-terminated —
-    /// the exact text `emit_*_body` is the inverse of.
-    fn function_interior(source: &str, prefix: &str) -> Option<String> {
-        let extracted = extract_function(source, prefix)?;
-        let lines: Vec<&str> = extracted.lines().collect();
-        (lines.len() >= 2).then(|| {
-            lines[1..lines.len() - 1]
-                .iter()
-                .map(|line| format!("{line}\n"))
-                .collect()
-        })
-    }
-
-    /// Every `EFFECT_OFF_KIND` the corpus writes comes back out of the export unchanged.
-    ///
-    /// **A round trip cannot show this and never could.** Until this change the parser dropped
-    /// the call's two booleans, so the export's invented `false, true` parsed back to the same
-    /// nothing the source did, and `check_effect_fidelity` — which compares the export against
-    /// the model by parsing it with that same parser — agreed with itself on every one of them.
-    /// The claim has to be pinned against the SOURCE TEXT instead.
-    ///
-    /// Ganondorf's forward smash is the move that surfaced it: `ganon_sword_flare` is killed
-    /// with `false, false` in all four of the smashes that generate his sword article, and the
-    /// export rewrote every one.
-    #[test]
-    fn every_corpus_effect_off_kind_is_exported_with_the_arguments_it_was_written_with() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-        // `macros::EFFECT_OFF_KIND(agent, Hash40::new("x"), false, true);` — the whole call, so
-        // a comparison cannot pass by matching only the name and the kind.
-        let kills = |text: &str| -> Vec<String> {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| line.starts_with("macros::EFFECT_OFF_KIND("))
-                .map(str::to_string)
-                .collect()
-        };
-
-        let mut checked = 0usize;
-        let mut pairs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut problems: Vec<String> = Vec::new();
-        for (path, body) in &bodies {
-            let Some(original) = function_interior(body, "effect_") else {
-                continue;
-            };
-            let mut want = kills(&original);
-            if want.is_empty() {
-                continue;
-            }
-            checked += want.len();
-            for line in &want {
-                if let Some(tail) = line.rsplit("\"),").next() {
-                    pairs.insert(tail.trim_end_matches(");").trim().to_string());
-                }
-            }
-            let calls = parse_effect_script(body).to_effect_calls();
-            let (_, residue) = parse_effect_script(body).to_effect_calls_and_residue();
-            let emitted = preview_effect_fn(&calls, "test", &[], &residue);
-            let mut got = kills(&emitted);
-            want.sort();
-            got.sort();
-            if want != got {
-                problems.push(format!(
-                    "{path}:\n--- source ---\n{}\n--- export ---\n{}",
-                    want.join("\n"),
-                    got.join("\n")
-                ));
-            }
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} script(s) export an EFFECT_OFF_KIND the source does not contain:\n\n{}",
-            problems.len(),
-            problems.join("\n\n")
-        );
-        // Guard the oracle with what it claims to test. Every one of these passes trivially if
-        // the corpus happens to write only the pair the export used to hardcode, and a cache
-        // holding one fighter can easily do that.
-        assert!(
-            checked > 0 && pairs.len() > 1,
-            "the cached corpus holds {checked} kill(s) spelling {pairs:?} — with fewer than two \
-             distinct argument pairs this test cannot fail, so it is not a gate"
-        );
-    }
-
-    /// A kill for an effect this script never started is kept, rather than dropped.
-    ///
-    /// The parser closes an OPEN call to consume a kill, so a kill that matches none used to
-    /// disappear along with the effect it was supposed to end. Half the corpus's kills are this
-    /// shape — a status or the other half of a two-part special started the effect — which is
-    /// the same situation an unmatched `AFTER_IMAGE_OFF` is already carried through.
     #[test]
     fn a_kill_with_no_spawn_to_close_is_carried_into_the_export() {
         let source = r#"unsafe extern "C" fn effect_specialhi(agent: &mut L2CAgentBase) {
@@ -9800,11 +18022,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The pair is read from the source and written back, not defaulted.
-    ///
-    /// Ganondorf's forward smash, cut to the two lines that matter. The mutation this is here
-    /// to catch is the one that shipped: an emitter that writes a constant pair passes every
-    /// round-trip test in this file and fails only this assertion.
     #[test]
     fn a_kill_keeps_the_booleans_its_script_wrote() {
         let source = r#"unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) {
@@ -9848,10 +18065,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A kill whose booleans are not literals is left alone entirely.
-    ///
-    /// Reading one and defaulting the other would write a call the script does not contain.
-    /// The line stays verbatim and closes nothing, so exactly one kill still reaches the game.
     #[test]
     fn a_kill_with_a_non_literal_argument_is_kept_verbatim() {
         let source = r#"unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) {
@@ -9881,96 +18094,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The gate on loading `sound_` at all.
-    ///
-    /// Until now no `sound_` function was ever read, so no file holding one could be rewritten
-    /// by mistake. Reading them gives that up, and the defence is that re-emitting what was
-    /// read reproduces the script that went in. A spot check would not do: the corpus is where
-    /// the shapes the parser has never seen live, and it is the whole population this feature
-    /// will meet.
-    ///
-    /// Three separate properties, because "byte-identical" turns out to be the wrong bar on its
-    /// own. Six corpus scripts are mis-indented at source — the dumper does not re-indent after
-    /// an `else`, so the arm's body sits at the wrong depth — and the emitter corrects them.
-    /// That is a diff, but it is not a loss, and demanding byte-equality would either fail on a
-    /// dumper bug or force the emitter to reproduce it.
-    ///
-    /// 1. **Nothing is lost.** The trimmed lines, in order, are the same. This is the property
-    ///    that matters: no line dropped, added, reordered or rewritten.
-    /// 2. **Rewriting settles.** Emitting the emitted text again is a fixed point, so a file
-    ///    rewritten once never drifts on later saves.
-    /// 3. **Formatting does not quietly rot.** Almost all of them *are* byte-exact, and the
-    ///    count is asserted so a change that reformats the whole corpus has to be deliberate.
-    #[test]
-    fn every_sound_script_in_the_corpus_survives_a_round_trip() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let trimmed = |text: &str| -> Vec<String> {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-
-        let mut checked = 0usize;
-        let mut byte_exact = 0usize;
-        let mut problems: Vec<String> = Vec::new();
-        for (path, body) in &bodies {
-            let Some(original) = function_interior(body, "sound_") else {
-                continue;
-            };
-            checked += 1;
-            let emitted = emit_sound_body(&parse_sound_script(body));
-
-            if trimmed(&emitted) != trimmed(&original) {
-                problems.push(format!(
-                    "{path} lost or changed a line:\n--- was ---\n{original}--- now ---\n{emitted}"
-                ));
-                continue;
-            }
-            // Re-parsing the emitted text has to reach the same place, or a second save would
-            // move the file again.
-            let again = emit_sound_body(&parse_sound_script(&format!(
-                "unsafe extern \"C\" fn sound_test(agent: &mut L2CAgentBase) {{\n{emitted}}}\n"
-            )));
-            if again != emitted {
-                problems.push(format!(
-                    "{path} does not settle:\n--- once ---\n{emitted}--- twice ---\n{again}"
-                ));
-                continue;
-            }
-            byte_exact += usize::from(emitted == original);
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} of {checked} sound scripts do not round-trip:\n\n{}",
-            problems.len(),
-            problems.join("\n")
-        );
-        assert!(
-            checked > 100,
-            "only {checked} sound scripts found — the corpus is too thin to be a gate"
-        );
-        assert_eq!(
-            checked - byte_exact,
-            7,
-            "{} of {checked} sound scripts came back with different whitespace; 7 are known \
-             mis-indented at source, so any other number is the emitter's formatting changing",
-            checked - byte_exact
-        );
-    }
-
-    /// One real vanilla sound script, read end to end.
-    ///
-    /// `kirby/TurnDash` because it is the only shape in the corpus that carries all three of
-    /// the family's argument layouts at once — one hash, two hashes, and a hash with a trailing
-    /// number — and it spaces them with a `frame` and two `wait`s, so a walk that ignored the
-    /// timing would still have to produce four events but would put them in the wrong places.
     #[test]
     fn a_vanilla_sound_script_reads_as_typed_calls_at_the_frames_it_writes() {
         const TURN_DASH: &str = r#"unsafe extern "C" fn sound_turndash(agent: &mut L2CAgentBase) {
@@ -10036,13 +18159,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(again.to_sound_events(), events);
     }
 
-    /// A sound written outside every `is_excute` block, which 15 corpus scripts do.
-    ///
-    /// `kirby/WalkMiddle` verbatim, because it writes one footstep each way: the first is
-    /// wrapped and the second is bare. Before D1c the bare one parsed as `Raw` and the move
-    /// showed one footstep instead of two — and the corpus oracle counts *statements*, so it
-    /// would go on passing if a bare call were typed but never walked. This is the assertion
-    /// that says the event comes out the other end.
     #[test]
     fn a_sound_written_outside_an_excute_block_still_fires() {
         const WALK_MIDDLE: &str = r#"unsafe extern "C" fn sound_walkmiddle(agent: &mut L2CAgentBase) {
@@ -10065,13 +18181,14 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
 
         // And it is written back bare. Emitting it inside an `if macros::is_excute(agent) {`
         // it never had would be a behaviour change, not a formatting one: the wrapper decides
-        // whether the line runs on this pass at all.
+        // whether the line runs on this pass at all. The dump's leading `wait_loop_sync_mot`
+        // re-rolls the script into its motion loop, so "bare" is the loop body's own indent.
         let emitted = emit_sound_body(&script);
         assert!(
             emitted.contains(
-                "\n    macros::PLAY_STEP_FLIPPABLE(agent, Hash40::new(\"se_kirby_step_right_m\")"
+                "\n        frame(agent.lua_state_agent, 30.0);\n        macros::PLAY_STEP_FLIPPABLE(agent, Hash40::new(\"se_kirby_step_right_m\")"
             ),
-            "the bare call did not come back at the function's own indent:\n{emitted}"
+            "the bare call did not come back at the loop body's own indent:\n{emitted}"
         );
 
         // And it is *editable*. Resolving a site has to walk the same shapes the site counter
@@ -10104,22 +18221,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Every iteration of a looped sound comes back as the *same* site, and the call after the
-    /// loop gets the next one.
-    ///
-    /// **Composed rather than lifted, and that needs saying.** Not one of the 301 corpus sound
-    /// scripts contains a `for`, which the corpus oracle records as measured fact — so there is
-    /// no vanilla script to lift this from. What is here is two corpus-verified shapes joined:
-    /// the `for _ in 0..3 {` header is written verbatim by real `effect_` scripts, and the calls
-    /// inside it are `kirby/TurnDash`'s own lines. Neither half is invented, which is the part
-    /// [[hand-written-fixtures-are-evidence-of-nothing]] is actually about — a *signature* nobody
-    /// checked, not a control-flow shape the parser already handles.
-    ///
-    /// The property under test is the one that makes an edit land on the right line: three
-    /// iterations of one `PLAY_SE` are three events, all of site 0, because all three are the
-    /// one line in the file. Get this wrong and the site cursor runs ahead, so retuning the
-    /// footstep after the loop rewrites something else — and the result still parses, still
-    /// compiles, and still round-trips.
     #[test]
     fn a_looped_sound_reports_the_same_site_every_time_round() {
         const LOOPED: &str = r#"unsafe extern "C" fn sound_looped(agent: &mut L2CAgentBase) {
@@ -10165,17 +18266,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         }
     }
 
-    /// A loop that runs no iterations still steps the site cursor over its body.
-    ///
-    /// This is the one thing `count_sound_stmts` is for, and it is reachable only through a
-    /// zero-count `for`: at one iteration or more the cursor arrives at the right place on its
-    /// own. So the function is untestable through any realistic script, and a mutation deleting
-    /// its `Bare` arm passed every other test in this file — including the corpus oracle, which
-    /// cannot help, because no vanilla sound script loops anything.
-    ///
-    /// Both statement shapes go inside the loop deliberately. A count that saw only the wrapped
-    /// call would leave the trailing footstep resolving to site 1, which is the *bare* call
-    /// inside the loop that never ran — an edit written to a line the game skipped.
     #[test]
     fn a_loop_that_never_runs_still_advances_the_site_cursor() {
         const EMPTY_LOOP: &str = r#"unsafe extern "C" fn sound_emptyloop(agent: &mut L2CAgentBase) {
@@ -10211,18 +18301,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The sound family's own `RawBlock` arms, which had the code but never the test.
-    ///
-    /// `count_sound_stmts` and `sound_stmt_mut` have descended into a raw block since D1c, on
-    /// evidence — 26 corpus sounds sit inside one, against zero hurtbox and zero attack-modifier
-    /// statements, which is why the sound family got the arm first and the other two waited for
-    /// B6. But *having* the arm was never pinned: deleting `RawBlock` from either left all 398
-    /// other tests green, verified by mutation.
-    ///
-    /// The corpus oracle beside this one cannot close the gap however many scripts it reads. It
-    /// compares the walk against `acmd_src::sound_sites`, a *textual* scan — a different function
-    /// from `sound_stmt_mut`, which resolves against the IR. Two implementations of "which call
-    /// is site N", and the oracle only ever exercises one of them.
     #[test]
     fn a_sound_inside_a_runtime_branch_is_counted_and_resolvable() {
         const SOUND_IN_RAW_BLOCK: &str = r#"unsafe extern "C" fn sound_rawblocksound(agent: &mut L2CAgentBase) {
@@ -10264,318 +18342,42 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Every sound call the corpus writes is *typed*, not left as `Raw`.
-    ///
-    /// The round-trip gate above cannot see this and never could: an unrecognised line
-    /// round-trips perfectly precisely *because* it is copied verbatim. So it stayed green
-    /// through the whole of D1a, when nothing in the family was typed at all, and it would stay
-    /// green if a member silently stopped being recognised tomorrow. This is the assertion that
-    /// says the new thing works rather than that nothing broke.
-    ///
-    /// Counted per script against the source text rather than in total, so a file that loses
-    /// its calls cannot be hidden by another that gains some.
-    #[test]
-    fn every_sound_call_in_the_corpus_is_typed_rather_than_left_raw() {
-        fn typed(stmts: &[crate::data::AcmdStmt]) -> usize {
-            stmts
-                .iter()
-                .map(|stmt| match stmt {
-                    crate::data::AcmdStmt::Excute(inner) => inner
-                        .iter()
-                        .filter(|s| matches!(s, ExcuteStmt::Sound(_)))
-                        .count(),
-                    crate::data::AcmdStmt::Bare(s) => {
-                        usize::from(matches!(s.as_ref(), ExcuteStmt::Sound(_)))
-                    }
-                    crate::data::AcmdStmt::Loop { body, .. }
-                    | crate::data::AcmdStmt::RawBlock { body, .. } => typed(body),
-                    _ => 0,
-                })
-                .sum()
-        }
-
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut total = 0usize;
-        let mut problems: Vec<String> = Vec::new();
-        for (path, body) in &bodies {
-            let Some(interior) = function_interior(body, "sound_") else {
-                continue;
-            };
-            let mut written = 0usize;
-            for line in interior.lines() {
-                let matched = SOUND_FUNCS
-                    .iter()
-                    .filter(|(name, _, _)| line.contains(&format!("macros::{name}(")))
-                    .count();
-                // Two needles on one line means a family name is a prefix of another and the
-                // paren is not separating them after all — the `ATTACK`/`ATTACK_ABS` trap. The
-                // wrong layout would then read `PLAY_STEP_FLIPPABLE`'s second footstep away.
-                assert!(matched <= 1, "{path}: two sound macros matched `{line}`");
-                written += matched;
-            }
-            let found = typed(&parse_sound_script(body).stmts);
-            if found != written {
-                problems.push(format!("{path}: {written} calls written, {found} typed"));
-            }
-            total += written;
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} corpus sound scripts lost a call to `Raw`:\n{}",
-            problems.len(),
-            problems.join("\n")
-        );
-        assert!(
-            total > 500,
-            "only {total} sound calls found — the corpus is too thin to be a gate"
-        );
-    }
-
-    /// Every sound event's site resolves to a call of its own macro, in every corpus script.
-    ///
-    /// This is the assertion no round trip can make. A site is the join between the walked IR
-    /// and a textual scan of the source, and the two are counted by different code: the walk
-    /// unrolls `for` bodies and steps over empty ones, while the scan just reads the file. When
-    /// they disagree, an edit is written to a *different call* — and the result is a perfectly
-    /// well-formed script, so parsing it back proves nothing. Comparing the macro name at the
-    /// resolved site is what turns a silent retarget into a failure.
-    ///
-    /// The corpus is the right place for it because the shapes that break a site counter are
-    /// the ones nobody writes by hand: a sound inside a `for`, a sound after a `for`, and a
-    /// sound outside every `is_excute` block.
-    #[test]
-    fn every_corpus_sound_site_lands_on_a_call_of_its_own_macro() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut checked = 0usize;
-        let mut problems: Vec<String> = Vec::new();
-        for (path, body) in &bodies {
-            let Some(interior) = function_interior(body, "sound_") else {
-                continue;
-            };
-            let sites = crate::acmd_src::sound_sites(&interior);
-            let events = parse_sound_script(body).to_sound_events();
-            // Every call in the text is reached by at least one event. A call the walk never
-            // visits is invisible in the panel and unreachable by an edit, and the typed-count
-            // oracle beside this one cannot see that: it counts *parsed* statements, so one
-            // that is parsed and then skipped by `eval_stmts` passes it.
-            let mut reached: Vec<usize> = events.iter().map(|e| e.site).collect();
-            reached.sort_unstable();
-            reached.dedup();
-            if reached.len() != sites.len() {
-                problems.push(format!(
-                    "{path}: {} calls in the text, {} reached by the walk",
-                    sites.len(),
-                    reached.len()
-                ));
-            }
-            for event in &events {
-                match sites.get(event.site) {
-                    Some(site) if site.name == event.call.func => {}
-                    Some(site) => problems.push(format!(
-                        "{path}: the `{}` on frame {} resolved to site {}, which is a `{}`",
-                        event.call.func, event.frame, event.site, site.name
-                    )),
-                    None => problems.push(format!(
-                        "{path}: the `{}` on frame {} has site {}, past the {} calls in the text",
-                        event.call.func,
-                        event.frame,
-                        event.site,
-                        sites.len()
-                    )),
-                }
-            }
-            checked += events.len();
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} sound events resolved to the wrong call:\n{}",
-            problems.len(),
-            problems.join("\n")
-        );
-        assert!(
-            checked > 500,
-            "only {checked} sound events resolved — the corpus is too thin to be a gate"
-        );
-        // **Measured, not assumed: not one of the 301 corpus sound scripts contains a `for`.**
-        // A guard asserting otherwise was written here first and failed, which is how this is
-        // known. So the corpus cannot exercise the loop rewind at all, and the case is covered
-        // by `a_looped_sound_reports_the_same_site_every_time_round` instead — do not read a
-        // green run here as saying anything about a looped call.
-    }
-
-    /// The same brace property over every `game_` script in the corpus, which is where the bug
-    /// actually was: 35 of them open a runtime branch, and each one exported a function with
-    /// more `{` than `}`. Nothing downstream compiled, and no test said so — the effect and
-    /// hitbox round-trips both re-parse the output with the same lenient parser that wrote it,
-    /// so an unbalanced function read back exactly as it went in.
-    #[test]
-    fn no_game_script_in_the_corpus_exports_an_unbalanced_function() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut checked = 0usize;
-        let mut branching = 0usize;
-        let mut problems: Vec<String> = Vec::new();
-        for (path, body) in &bodies {
-            if function_interior(body, "game_").is_none() {
-                continue;
-            }
-            checked += 1;
-            let script = parse_acmd_script(body);
-            if script
-                .stmts
-                .iter()
-                .any(|stmt| matches!(stmt, crate::data::AcmdStmt::RawBlock { .. }))
-            {
-                branching += 1;
-            }
-            let emitted = emit_stmts(&script.stmts, "    ").join("\n");
-            let opens = emitted.matches('{').count();
-            let closes = emitted.matches('}').count();
-            if opens != closes {
-                problems.push(format!("{path}: {opens} `{{` against {closes} `}}`"));
-            }
-        }
-
-        assert!(
-            problems.is_empty(),
-            "{} of {checked} game scripts export a function that does not close:\n{}",
-            problems.len(),
-            problems.join("\n")
-        );
-        assert!(
-            branching >= 30,
-            "only {branching} of {checked} game scripts have a top-level branch — this test \
-             passes vacuously if branches stop being recognised"
-        );
-    }
-
-    /// The bug D1b fixes, stated over real vanilla text.
-    ///
-    /// Only the project half is hand-written, and deliberately so: it is a stand-in for
-    /// arbitrary user source, and what is under test is which *category* survives the merge,
-    /// not what the user wrote. The mirror is the corpus, because the thing that must not
-    /// disappear — a move's real effects, a move's real hitboxes — only exists there.
     #[test]
     fn a_partial_project_override_keeps_every_category_it_does_not_define() {
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        const GAME_ONLY: &str = "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {\n    \
-             frame(agent.lua_state_agent, 3.0);\n}\n\n";
-        const EFFECT_ONLY: &str =
-            "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {\n    \
-             frame(agent.lua_state_agent, 3.0);\n}\n\n";
-        const SOUND_ONLY: &str = "unsafe extern \"C\" fn sound_x(agent: &mut L2CAgentBase) {\n    \
-             frame(agent.lua_state_agent, 3.0);\n}\n\n";
-
-        // A category must arrive from exactly one side. Two `game_` functions in one body
-        // parse fine — the first one wins — so nothing above would notice the merge appending
-        // vanilla's copy underneath the project's, right up until an export wrote both out.
-        let single_headers = |path: &str, merged: &str| {
-            for prefix in SCRIPT_PREFIXES {
-                let headers = merged
-                    .lines()
-                    .filter(|line| is_function_header(line.trim(), prefix))
-                    .count();
-                assert!(
-                    headers <= 1,
-                    "{path}: {headers} `{prefix}` functions in the merge"
-                );
-            }
+        let function = |prefix: &str, frame: u32| {
+            format!(
+            "unsafe extern \"C\" fn {prefix}test(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, {frame}.0);\n}}\n"
+        )
         };
-
-        // Counted separately, because a move only proves a category can be lost if it has one
-        // to lose. Requiring both at once would have run this over 52 of the 460 corpus files.
-        let (mut with_effects, mut with_hitboxes) = (0usize, 0usize);
-        for (path, mirror) in &bodies {
-            let hitboxes = parse_acmd_script(mirror).to_hitboxes().len();
-            let effects = parse_effect_script(mirror).to_effect_calls().len();
-
-            if effects > 0 {
-                with_effects += 1;
-                // Overriding the hitboxes must not take the effects with it — the shape of
-                // most hitbox mods, and what used to display as a move with no effects at all.
-                let merged = merge_project_over_mirror_blocked(GAME_ONLY, &["game_"], &[], mirror);
+        let mirror = SCRIPT_PREFIXES
+            .iter()
+            .map(|prefix| function(prefix, 1))
+            .collect::<String>();
+        for overridden in SCRIPT_PREFIXES {
+            let project = function(overridden, 3);
+            let merged = merge_project_over_mirror_blocked(&project, &[overridden], &[], &mirror);
+            for prefix in SCRIPT_PREFIXES {
+                let expected = if prefix == overridden {
+                    &project
+                } else {
+                    &mirror
+                };
                 assert_eq!(
-                    parse_effect_script(&merged).to_effect_calls().len(),
-                    effects,
-                    "{path}: a game-only override lost the mirror's effects"
+                    extract_function(&merged, prefix),
+                    extract_function(expected, prefix)
                 );
-                // …and the override still wins where it was made: vanilla's `game_` must not
-                // come back alongside it, or the move shows hitboxes the project deleted.
-                assert!(
-                    parse_acmd_script(&merged).to_hitboxes().is_empty(),
-                    "{path}: the mirror's hitboxes outlived the project's own game_"
-                );
-                single_headers(path, &merged);
-            }
-
-            if hitboxes > 0 {
-                with_hitboxes += 1;
-                let merged =
-                    merge_project_over_mirror_blocked(EFFECT_ONLY, &["effect_"], &[], mirror);
                 assert_eq!(
-                    parse_acmd_script(&merged).to_hitboxes().len(),
-                    hitboxes,
-                    "{path}: an effect-only override lost the mirror's hitboxes"
+                    merged
+                        .lines()
+                        .filter(|line| is_function_header(line.trim(), prefix))
+                        .count(),
+                    1
                 );
-                assert!(
-                    parse_effect_script(&merged).to_effect_calls().is_empty(),
-                    "{path}: the mirror's effects outlived the project's own effect_"
-                );
-                single_headers(path, &merged);
             }
-
-            // The case D1a named. A sound-only project used to fall back to the mirror whole,
-            // so its own sounds were the one thing that did not survive being loaded.
-            let merged = merge_project_over_mirror_blocked(SOUND_ONLY, &["sound_"], &[], mirror);
-            assert_eq!(
-                parse_acmd_script(&merged).to_hitboxes().len(),
-                hitboxes,
-                "{path}: a sound-only override lost the mirror's hitboxes"
-            );
-            assert_eq!(
-                parse_effect_script(&merged).to_effect_calls().len(),
-                effects,
-                "{path}: a sound-only override lost the mirror's effects"
-            );
-            assert_eq!(
-                parse_sound_script(&merged).stmts.len(),
-                1,
-                "{path}: the mirror's sounds outlived the project's own sound_"
-            );
-            single_headers(path, &merged);
         }
-
-        assert!(
-            with_effects > 100 && with_hitboxes > 60,
-            "only {with_effects} corpus moves have effects and {with_hitboxes} have hitboxes — \
-             this test passes vacuously below that"
-        );
     }
 
     /// Kirby's Final Smash start, verbatim: a `frame()` and an `is_excute` inside a runtime
-    /// branch, with an `else` arm.
-    ///
-    /// Before this was a block, the branch's opening line was kept as `Raw` and its closing
-    /// brace was thrown away, so the exported function had two fewer `}` than `{` and did not
-    /// close — the next function in the generated file was swallowed by it. Both arms were also
-    /// promoted to unconditional, so `FT_START_CUTIN` was issued twice.
     const RAW_BRANCH: &str = r#"
 unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 1.0);
@@ -10652,10 +18454,124 @@ unsafe extern "C" fn game_throwf(agent: &mut L2CAgentBase) {
         assert!(else_if.contains("    else if FighterCutInManager::is_one_on_one() {"));
     }
 
-    /// Read-only module calls are condition inputs, not editable mutation points yet. They must
-    /// still survive the source/export boundary exactly: dropping one changes which arm runs,
-    /// while inventing a typed event would make the panel and live wire claim an edit contract
-    /// that has not been measured.
+    #[test]
+    fn truncated_blocks_and_combined_else_tails_stay_raw_across_parser_domains() {
+        use crate::data::{AcmdStmt, EffectStmt};
+
+        let malformed_cases: &[&[&str]] = &[
+            &[
+                "if guard(agent) {",
+                "    if macros::is_excute(agent) {",
+                "        AttackModule::clear_all(agent.module_accessor);",
+                "    }",
+            ],
+            &[
+                "for _ in 0..2 {",
+                "    if macros::is_excute(agent) {",
+                "        AttackModule::clear_all(agent.module_accessor);",
+                "    }",
+            ],
+            &[
+                "if macros::is_excute(agent) {",
+                "    AttackModule::clear_all(agent.module_accessor);",
+            ],
+        ];
+        for domain in [
+            ParseDomain::Game,
+            ParseDomain::Sound,
+            ParseDomain::Expression,
+        ] {
+            for lines in malformed_cases {
+                let (parsed, consumed) = parse_stmts(lines, 0, domain, true);
+                assert_eq!(consumed, lines.len());
+                assert!(matches!(
+                    parsed.as_slice(),
+                    [AcmdStmt::Raw(raw)] if raw == &lines.join("\n")
+                ));
+            }
+        }
+
+        let incomplete_else = [
+            "if guard(agent) {",
+            "    frame(agent.lua_state_agent, 1.0);",
+            "} else {",
+            "    if macros::is_excute(agent) {",
+            "        AttackModule::clear_all(agent.module_accessor);",
+            "    }",
+        ];
+        let (parsed, consumed) = parse_stmts(&incomplete_else, 0, ParseDomain::Game, true);
+        assert_eq!(consumed, incomplete_else.len());
+        assert!(matches!(
+            parsed.as_slice(),
+            [AcmdStmt::Raw(raw)] if raw == &incomplete_else.join("\n")
+        ));
+
+        let valid_neighbor = [
+            "for _ in 0..2 {",
+            "    if macros::is_excute(agent) {",
+            "        AttackModule::clear_all(agent.module_accessor);",
+            "    }",
+            "}",
+            "frame(agent.lua_state_agent, 3.0);",
+        ];
+        let (parsed, consumed) = parse_stmts(&valid_neighbor, 0, ParseDomain::Game, true);
+        assert_eq!(consumed, valid_neighbor.len());
+        assert!(matches!(
+            parsed.as_slice(),
+            [AcmdStmt::Loop { body, .. }, AcmdStmt::Frame(frame)]
+                if *frame == 3.0
+                    && matches!(body.as_slice(), [AcmdStmt::Excute(commands)]
+                        if matches!(commands.as_slice(), [crate::data::ExcuteStmt::ClearAll]))
+        ));
+
+        let malformed_effect_cases: &[&[&str]] = &[
+            &[
+                "for _ in 0..2 {",
+                "    if macros::is_excute(agent) {",
+                "        macros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_attack_line\"), false, false);",
+                "    }",
+            ],
+            &[
+                "if macros::is_excute(agent) {",
+                "    macros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_attack_line\"), false, false);",
+            ],
+            &[
+                "if color_guard(agent) {",
+                "    macros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_attack_line\"), false, false);",
+                "} else {",
+                "    if macros::is_excute(agent) {",
+                "        macros::EFFECT_OFF_KIND(agent, Hash40::new(\"sys_attack_line\"), false, false);",
+                "    }",
+            ],
+        ];
+        for lines in malformed_effect_cases {
+            let (parsed, consumed) = parse_effect_stmts(lines, 0, false);
+            assert_eq!(consumed, lines.len());
+            assert!(matches!(
+                parsed.as_slice(),
+                [EffectStmt::Raw(raw)] if raw == &lines.join("\n")
+            ));
+        }
+
+        let valid_effect = [
+            "if color_guard(agent) {",
+            "    frame(agent.lua_state_agent, 1.0);",
+            "} else {",
+            "    wait(agent.lua_state_agent, 2.0);",
+            "}",
+        ];
+        let (parsed, consumed) = parse_effect_stmts(&valid_effect, 0, false);
+        assert_eq!(consumed, valid_effect.len());
+        assert!(matches!(
+            parsed.as_slice(),
+            [
+                EffectStmt::Cond { body: yes, .. },
+                EffectStmt::Cond { body: no, .. }
+            ] if matches!(yes.as_slice(), [EffectStmt::Frame(frame)] if *frame == 1.0)
+                && matches!(no.as_slice(), [EffectStmt::Wait(frames)] if *frames == 2.0)
+        ));
+    }
+
     #[test]
     fn read_only_getters_and_status_conditions_remain_verbatim_and_balanced() {
         let source = r#"
@@ -10720,91 +18636,6 @@ unsafe extern "C" fn game_status_getters(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The sample above proves each family in isolation. The retained fetch cache is the
-    /// stronger boundary: these calls appear inside real game scripts, where a parser change
-    /// could silently drop a condition without making the generated function syntactically
-    /// invalid. Count every named family before export, after export, and after a second
-    /// parse/export pass. This is preservation evidence only; it is not an editable condition
-    /// or live-game contract.
-    #[test]
-    fn every_corpus_read_only_condition_survives_raw_export() {
-        const CONDITION_FAMILIES: [&str; 9] = [
-            "WorkModule::is_flag(",
-            "WorkModule::get_int64(",
-            "WorkModule::get_float(",
-            "WorkModule::get_int(",
-            "WorkModule::get_param_float(",
-            "KineticModule::get_sum_speed_y(",
-            "StatusModule::status_kind(",
-            "StatusModule::prev_status_kind(",
-            "StatusModule::situation_kind(",
-        ];
-
-        let bodies = corpus_bodies();
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut checked = 0usize;
-        let mut total_conditions = 0usize;
-        let mut family_totals = [0usize; CONDITION_FAMILIES.len()];
-
-        for (path, body) in bodies {
-            let Some(source_interior) = function_interior(&body, "game_") else {
-                continue;
-            };
-            let script = parse_acmd_script(&body);
-            let emitted = preview_game_fn(&script, "read_only_conditions");
-            let reparsed = parse_acmd_script(&emitted);
-            let reemitted = preview_game_fn(&reparsed, "read_only_conditions");
-
-            assert_eq!(
-                emitted.matches('{').count(),
-                emitted.matches('}').count(),
-                "raw condition export is unbalanced for {path}:\n{emitted}"
-            );
-            assert_eq!(
-                reemitted, emitted,
-                "raw condition export is not a fixed point for {path}"
-            );
-
-            let mut body_conditions = 0usize;
-            for (index, needle) in CONDITION_FAMILIES.iter().enumerate() {
-                let source_count = source_interior.matches(needle).count();
-                let emitted_count = emitted.matches(needle).count();
-                let reemitted_count = reemitted.matches(needle).count();
-                assert_eq!(
-                    emitted_count, source_count,
-                    "raw condition family {needle:?} changed during export for {path}"
-                );
-                assert_eq!(
-                    reemitted_count, source_count,
-                    "raw condition family {needle:?} changed during re-export for {path}"
-                );
-                family_totals[index] += source_count;
-                body_conditions += source_count;
-            }
-            total_conditions += body_conditions;
-            checked += 1;
-        }
-
-        if checked == 0 {
-            return;
-        }
-        assert!(
-            total_conditions > 0,
-            "the retained game_ corpus contained no read-only condition family to check"
-        );
-        assert!(
-            family_totals.iter().any(|count| *count > 0),
-            "the retained game_ corpus condition-family totals were all zero"
-        );
-    }
-
-    /// The frame walk has always read a conditional hitbox as an unconditional one, because the
-    /// branch used to be flattened. Blocks must not change that on their own — eighteen `game_`
-    /// scripts in the corpus put an `ATTACK` inside an `if`, and they would all lose their
-    /// hitbox from the editor the moment a branch stopped being walked.
     #[test]
     fn a_hitbox_inside_a_branch_is_still_seen_by_the_frame_walk() {
         let source = r#"
@@ -10822,10 +18653,6 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
         assert_eq!((hitboxes[0].active_start, hitboxes[0].damage), (4, 12.0));
     }
 
-    /// A body holding an `effect_` function but no `game_` used to be read *whole* by the game
-    /// parser, so every effect line came back as `Raw` — and `emit_stmts` writes `Raw` straight
-    /// into the generated `game_` function. The move's effects would spawn twice: once from the
-    /// generated effect script, once from the game one.
     #[test]
     fn a_body_with_no_game_function_contributes_no_game_statements() {
         let source = r#"
@@ -10849,326 +18676,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// Across the whole corpus, the calls the parser makes and the sites the rewriter can edit
-    /// are the same list.
-    ///
-    /// `rewrite_effect_calls` looks a call up by its ordinal among the scanned sites, so the two
-    /// have to agree not just in count but position-for-position. When they do not, write-back
-    /// does not fail — it splices the user's edit into a *different* call, which is why this is
-    /// asserted over every script rather than left to the four trail lines that motivated it.
-    ///
-    /// The guard on the trail count is the part that keeps this honest: C2 made the raw command
-    /// form produce a call, and if a later change stops it doing so, every other script here
-    /// still agrees trivially and this test would go on passing while covering nothing.
-    #[test]
-    fn every_corpus_script_scans_to_exactly_the_calls_it_parses_to() {
-        let cache = crate::scratch_dirs::app_storage_root().join("script-cache");
-        if !cache.is_dir() {
-            return;
-        }
-        let mut checked = 0usize;
-        let mut trails = 0usize;
-        let mut mismatched = Vec::new();
-        for fighter in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
-            for script in std::fs::read_dir(fighter.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let Some(body) = cached_script_body_at(&script.path()) else {
-                    continue;
-                };
-                let ordinals = parse_effect_script(&body).call_macro_ordinals();
-                let sites = crate::acmd_src::spawn_site_names(&body);
-                trails += sites
-                    .iter()
-                    .filter(|name| name.starts_with("AFTER_IMAGE3"))
-                    .count();
-                if ordinals.iter().copied().max().map(|n| n + 1).unwrap_or(0) > sites.len() {
-                    mismatched.push(format!(
-                        "{:?}: {} calls but only {} sites",
-                        script.path(),
-                        ordinals.len(),
-                        sites.len()
-                    ));
-                }
-                checked += 1;
-            }
-        }
-        if checked == 0 {
-            return;
-        }
-        assert!(
-            mismatched.is_empty(),
-            "a call with no site behind it renumbers every later one:\n{}",
-            mismatched.join("\n")
-        );
-        assert_eq!(
-            trails, 4,
-            "the corpus holds four raw-command trails; if they stopped scanning as sites this \
-             test would agree with itself and cover nothing"
-        );
-    }
-
-    /// Audit the emitter against every script in the local fetch cache: each spawn must come
-    /// back out under the same macro name and with the same number of arguments it went in
-    /// with. Skipped when nothing has been fetched yet, so a clean machine still passes.
-    #[test]
-    fn cached_scripts_round_trip_through_the_emitter() {
-        let cache = crate::scratch_dirs::app_storage_root().join("script-cache");
-        if !cache.is_dir() {
-            return;
-        }
-        let mut bodies = Vec::new();
-        for fighter in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
-            for script in std::fs::read_dir(fighter.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                if let Some(body) = cached_script_body_at(&script.path()) {
-                    bodies.push(body);
-                }
-            }
-        }
-        if bodies.is_empty() {
-            return;
-        }
-
-        let mut spawns = 0usize;
-        let mut problems: Vec<String> = Vec::new();
-        for body in &bodies {
-            let calls = parse_effect_script(body).to_effect_calls();
-            if calls.is_empty() {
-                continue;
-            }
-            // Re-reading the generated function must find the same set of spawns: this is
-            // the property an exported mod depends on, end to end.
-            let (_, emitted) =
-                emit_effect_move_fn(&calls, "audit", &Default::default(), &Default::default());
-            let mut before: Vec<(String, String)> = calls
-                .iter()
-                .filter(|c| !c.disabled)
-                .map(|c| (c.spawn_func.clone(), c.effect_name.clone()))
-                .collect();
-            let mut after: Vec<(String, String)> = parse_effect_script(&emitted)
-                .to_effect_calls()
-                .iter()
-                .map(|c| (c.spawn_func.clone(), c.effect_name.clone()))
-                .collect();
-            before.sort();
-            after.sort();
-            if before != after {
-                problems.push(format!("re-parse mismatch:\n{before:?}\n{after:?}"));
-            }
-
-            // Every spawn macro the source used must appear in the output under its own
-            // name, with the same arity. A miscount here is a call the game would reject.
-            for call in calls.iter().filter(|c| !c.disabled) {
-                spawns += 1;
-                let Some(tail) = &call.extra_args else {
-                    continue;
-                };
-                let expected = 1 // agent
-                    + 1 // graphic
-                    + usize::from(call.effect_name_alt.is_some())
-                    + 1 // joint
-                    + 7 // pos, rot, size
-                    + tail.len();
-                let line = emit_spawn_call(call, "");
-                let Some(open) = line.find('(') else {
-                    problems.push(format!("no call emitted for {}", call.spawn_func));
-                    continue;
-                };
-                if !line.starts_with(&format!("macros::{}(", call.spawn_func)) {
-                    problems.push(format!("{} was emitted as {line}", call.spawn_func));
-                    continue;
-                }
-                let args = tokenize_args(line[open + 1..].rsplit_once(')').unwrap().0);
-                if args.len() != expected {
-                    problems.push(format!(
-                        "{} emitted {} args, source had {expected}: {line}",
-                        call.spawn_func,
-                        args.len()
-                    ));
-                }
-            }
-        }
-        assert!(
-            problems.is_empty(),
-            "{} of {spawns} spawns did not round-trip:\n{}",
-            problems.len(),
-            problems
-                .iter()
-                .take(20)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        eprintln!("[audit] {spawns} spawns across {} scripts", bodies.len());
-    }
-
-    /// C6's own corpus oracle: how much of a real effect script an export still deletes.
-    ///
-    /// C5 measured this and could only report it — 32 of the 132 effect scripts that produce
-    /// calls lost at least one line. This asserts the number rather than printing it, because
-    /// the whole family of tasks is a ratchet: every macro modelled and every line carried
-    /// should move it down, and nothing should move it back up. A change that regresses this
-    /// is a change that started silently deleting user code again.
-    ///
-    /// Two things are checked past the count. Braces must balance, or the carried lines have
-    /// produced a function that will not compile; and the output must re-parse to the same
-    /// spawns, which is what stops "preserve the line" from turning into "spawn it twice".
-    #[test]
-    fn the_effect_export_still_loses_no_more_of_the_corpus_than_it_did() {
-        let cache = crate::scratch_dirs::app_storage_root().join("script-cache");
-        if !cache.is_dir() {
-            return;
-        }
-        let mut lossy = 0usize;
-        let mut with_calls = 0usize;
-        let mut unbalanced: Vec<String> = Vec::new();
-        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
-        // The distinct residue lines the corpus produces, and any that failed to reach an
-        // export. Both are asserted below — a count that only ever shrinks would be satisfied by
-        // a change that stopped producing residue at all.
-        let mut emitted_residue: Vec<String> = Vec::new();
-        let mut missing_residue: Vec<String> = Vec::new();
-        for fighter in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
-            for entry in std::fs::read_dir(fighter.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                let Some(body) = cached_script_body_at(&entry.path()) else {
-                    continue;
-                };
-                let script = parse_effect_script(&body);
-                let (calls, residue) = script.to_effect_calls_and_residue();
-                if calls.is_empty() {
-                    continue;
-                }
-                with_calls += 1;
-                let lost = unexportable_effect_lines(&script);
-                if !lost.is_empty() {
-                    lossy += 1;
-                }
-                for line in &lost {
-                    *kinds.entry(loss_kind(line)).or_default() += 1;
-                }
-                // Every residue line must come back out. Asserted here rather than trusted,
-                // because the emitter takes residue as a separate argument and a caller that
-                // passes an empty map deletes exactly what this test claims is now kept.
-                for line in residue.values().flatten() {
-                    let text = line.trim();
-                    if text.contains("is_excute") || !text.chars().any(|c| c.is_alphanumeric()) {
-                        continue;
-                    }
-                    if !emitted_residue.iter().any(|s| s == text) {
-                        emitted_residue.push(text.to_string());
-                    }
-                }
-                let (_, emitted) =
-                    emit_effect_move_fn(&calls, "audit", &Default::default(), &residue);
-                for text in residue.values().flatten() {
-                    let text = text.trim();
-                    if text.chars().any(|c| c.is_alphanumeric()) && !emitted.contains(text) {
-                        missing_residue.push(format!("{:?}: {text}", entry.path()));
-                    }
-                }
-                let opens = emitted.matches('{').count();
-                let closes = emitted.matches('}').count();
-                if opens != closes {
-                    unbalanced.push(format!("{:?}: {opens} vs {closes}", entry.path()));
-                }
-            }
-        }
-        if with_calls == 0 {
-            return;
-        }
-        assert!(
-            unbalanced.is_empty(),
-            "carried lines left the output unbalanced:\n{}",
-            unbalanced.join("\n")
-        );
-        eprintln!("[audit] {lossy} of {with_calls} effect scripts still lose a line");
-        assert!(
-            lossy <= 13,
-            "the export deletes lines from {lossy} of {with_calls} effect scripts; C5 measured \
-             28, C6 brought it to 19, C6b's COL_NORMAL to 15, C2's raw-command trail to 13, and \
-             E3's frame-anchored residue to 12. The 13th is not a regression: the local cache \
-             gained littlemac/SpecialNDash after E3 measured 12, and it loses only the `else {{` \
-             and bare-expression shapes already counted here. Something started dropping user \
-             code again."
-        );
-        // The other half of the ratchet, and the half E3 needed. `lossy` counts what the report
-        // *names*; these two count what the export *writes*. A change that stopped producing
-        // residue — or that quietly passed an empty map to the emitter — would leave `lossy` at
-        // 12 and be caught only here.
-        assert!(
-            emitted_residue.len() >= 3,
-            "the corpus stopped producing frame-anchored residue, so the assertion below is \
-             measuring nothing: {emitted_residue:?}"
-        );
-        assert!(
-            missing_residue.is_empty(),
-            "residue that reached the emitter and did not reach its output:\n{}",
-            missing_residue.join("\n")
-        );
-
-        // The count alone was not enough. C6b wrote its remainder down as a table of which
-        // lines these are, and that table listed 18 of the 20 — the two raw
-        // `effect(*MA_MSC_CMD_EFFECT_AFTER_IMAGE3_ON, …)` calls were simply missing from it,
-        // and nothing could notice because only the script count was asserted. An entry that
-        // says "here is exactly what is left" has to be pinned to what is left, not to how much
-        // of it there is.
-        //
-        // C2 removed four entries at once, which is more than it set out to. Typing the two raw
-        // trail calls was the point; the two `methodlib::L2CAgent::pop()` lines went with them
-        // because each sits in the same `is_excute` block as a trail and had no spawn to ride on
-        // until the trail became one. C2's own estimate — 20 lines to 18, 15 scripts staying 15 —
-        // assumed `pop()` would keep those two files lossy, and it was wrong in the useful
-        // direction: kirby `SpecialHi2` and `SpecialAirHi2` are now clean.
-        let expected: std::collections::BTreeMap<String, usize> =
-            // littlemac/SpecialNDash, cached after C6b measured this, adds all five of the
-            // entries C6b did not see: two `else {`, its two bare `WorkModule::get_float`
-            // statements, and the decompiler's `if(0x1462c0(...))`.
-            [
-                ("wait_loop_sync_mot", 7),
-                ("else {", 7),
-                ("WorkModule::get_float", 2),
-                ("if", 1),
-            ]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-        assert_eq!(
-            kinds, expected,
-            "the remaining losses are not the ones C6b measured — update that entry's table"
-        );
-    }
-
-    /// Collapse a dropped line to what it *is*, so the audit above can assert composition
-    /// without pinning argument values. `macros::X(…)` → `macros::X`; the raw `effect(*CMD, …)`
-    /// form → `effect(*CMD)`, since every such call would otherwise collapse to `effect`.
-    fn loss_kind(line: &str) -> String {
-        let line = line.trim();
-        let Some(open) = line.find('(') else {
-            return line.to_string();
-        };
-        let head = &line[..open];
-        if head != "effect" {
-            return head.to_string();
-        }
-        let rest = &line[open + 1..];
-        let end = rest.find(',').unwrap_or(rest.len());
-        format!("effect({})", rest[..end].trim())
-    }
-
-    // ═══ Export preview ═════════════════════════════════════════════════════
-
-    /// The preview is only worth showing if it is what you actually get. Both functions have
-    /// to appear verbatim in the project the export writes.
     #[test]
     fn the_preview_is_exactly_what_the_export_writes() {
         let project = sample_project();
@@ -11209,8 +18716,183 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// A call with no recorded tail is the one case the export still cannot reproduce, so the
-    /// window has to say so rather than showing a substitute macro with no explanation.
+    #[test]
+    fn effect_compatibility_wrappers_keep_native_spelling_and_measured_argument_order() {
+        use crate::data::{EffectMacro, EffectScript, EffectStmt};
+        let commands = EFFECT_SPAWN_LAYOUTS
+            .iter()
+            .map(|layout| EffectMacro::Effect {
+                effect_name: "sys_smash_flash".into(),
+                effect_name_alt: layout.flip.then(|| "sys_smash_flash".into()),
+                spawn_func: layout.name.into(),
+                bone_name: "top".into(),
+                offset: [-1.25, 2.5, 0.375],
+                rotation: [15.0, -30.0, 45.0],
+                scale: 0.75,
+                follows_bone: layout.follows_bone,
+                extra_args: layout
+                    .tail
+                    .iter()
+                    .map(|(value, _)| (*value).into())
+                    .collect(),
+                flip_axis: layout.flip.then(|| "*EF_FLIP_XY".into()),
+            })
+            .collect();
+        let script = EffectScript {
+            stmts: vec![EffectStmt::Excute(commands)],
+        };
+        let (calls, residue) = script.to_effect_calls_and_residue();
+        // The flat editor infers lifetimes on source import. Check the exact statement tree
+        // it exports, rather than comparing that derived metadata to a hand-built call list.
+        let expected = parse_effect_script(&preview_effect_fn(&calls, "attack11", &[], &residue));
+        let exported = build_mod_project_full(
+            &[],
+            &[("mario".into(), "attack11".into(), calls.clone(), residue)],
+            &[],
+            &[],
+            "effect_compatibility",
+        );
+        let source = &exported
+            .files
+            .iter()
+            .find(|file| file.rel_path == "src/mario/acmd.rs")
+            .unwrap()
+            .contents;
+        syn::parse_file(source).unwrap();
+        assert_eq!(source.matches("mod macros {").count(), 1);
+        assert!(source.contains("pub use smash_script::macros::*;"));
+        for name in [
+            "EFFECT_FOLLOW_FLIP_COLOR",
+            "EFFECT_FOLLOW_FLIP_RND",
+            "EFFECT_FOLLOW_NO_SCALE",
+            "EFFECT_FOLLOW_COLOR",
+            "EFFECT_FLW_POS_UNSYNC_VIS",
+            "EFFECT_FLW_POS_NO_STOP",
+            "FOOT_EFFECT_FLIP",
+            "DOWN_EFFECT",
+            "EFFECT_ATTR",
+        ] {
+            assert_eq!(source.matches(&format!("pub unsafe fn {name}<")).count(), 1);
+            assert!(source.contains(&format!(
+                "smash::app::sv_animcmd::{name}(agent.lua_state_agent);"
+            )));
+        }
+        assert!(
+            !source.contains("pub unsafe fn EFFECT_FOLLOW<"),
+            "existing correct library wrappers must retain their owner"
+        );
+        let compatibility =
+            effect_source_compatibility_macros("macros::EFFECT_FOLLOW_FLIP_COLOR(agent);");
+        assert!(compatibility.contains("smash_script::lua_args!(agent, g, a, b, n0.to_f32(), n1.to_f32(), n2.to_f32(), n3.to_f32(), n4.to_f32(), n5.to_f32(), n6.to_f32(), t0, t1, t2.to_f32(), t3.to_f32(), t4.to_f32());"));
+        assert_eq!(compatibility.matches("agent.clear_lua_stack();").count(), 2);
+        assert!(!compatibility.contains("pub unsafe fn EFFECT_ATTR<"));
+        assert_json_eq!(parse_effect_script(source), expected);
+        for source in [
+            "macros::EFFECT_FOLLOW(agent);",
+            "// macros::EFFECT_ATTR(agent);",
+            "/* outer /* macros::FOOT_EFFECT_FLIP(agent); */ macros::DOWN_EFFECT(agent); */",
+            "let text = r#\"macros::EFFECT_ATTR(agent);\"#;",
+        ] {
+            assert!(
+                effect_source_compatibility_macros(source).is_empty(),
+                "unexpected compatibility module for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn hurtbox_status_emission_never_dereferences_an_existing_dereference_again() {
+        for (stored, expected) in [
+            ("HIT_STATUS_NORMAL", "*HIT_STATUS_NORMAL"),
+            ("*HIT_STATUS_NORMAL", "*HIT_STATUS_NORMAL"),
+            (" *HIT_STATUS_XLU ", "*HIT_STATUS_XLU"),
+            ("0", "0"),
+            ("2", "2"),
+        ] {
+            assert_eq!(emit_status(stored), expected);
+            let script = crate::data::AcmdScript {
+                stmts: vec![crate::data::AcmdStmt::Excute(vec![
+                    crate::data::ExcuteStmt::HitStatus {
+                        target: crate::data::HurtTarget::Whole,
+                        status: stored.into(),
+                    },
+                ])],
+            };
+            let emitted = preview_game_fn(&script, "hurtbox_emission");
+            assert!(emitted.contains(&format!("macros::WHOLE_HIT(agent, {expected});")));
+            assert!(!emitted.contains("**HIT_STATUS"));
+            syn::parse_file(&emitted).unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_export_imports_attack_wrapper_types_only_when_used() {
+        use crate::data::{
+            AcmdScript, AcmdStmt, AttackHeightAllKind, AttackReferenceJointKind, ExcuteStmt,
+        };
+
+        let typed = AcmdScript {
+            stmts: vec![AcmdStmt::Excute(vec![
+                ExcuteStmt::AttackModuleSetHeightAll {
+                    height: AttackHeightAllKind::High,
+                    arg3: false,
+                },
+                ExcuteStmt::AttackModuleSetAttackReferenceJointId {
+                    kind: AttackReferenceJointKind::TopYZX,
+                },
+                ExcuteStmt::HitModuleSetStatusAllNormal,
+            ])],
+        };
+        let exported = build_mod_project(
+            &[("cloud".into(), "attack11".into(), typed)],
+            "wrapper_imports",
+        );
+        let acmd = exported
+            .files
+            .iter()
+            .find(|file| file.rel_path == "src/cloud/acmd.rs")
+            .unwrap()
+            .contents
+            .as_str();
+        let header = acmd
+            .lines()
+            .take_while(|line| !line.starts_with("pub fn install"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(header.contains(
+            "app::{sv_animcmd::*, lua_bind::*, ArticleOperationTarget, AttackDirectionAxis, AttackHeight, HitStatus}"
+        ));
+        assert_eq!(header.matches("AttackDirectionAxis,").count(), 1);
+        assert_eq!(header.matches("AttackHeight,").count(), 1);
+        assert_eq!(header.matches("HitStatus}").count(), 1);
+
+        let plain = build_mod_project(
+            &[(
+                "cloud".into(),
+                "attack11".into(),
+                AcmdScript {
+                    stmts: vec![AcmdStmt::Frame(1.0)],
+                },
+            )],
+            "plain_imports",
+        );
+        let acmd = plain
+            .files
+            .iter()
+            .find(|file| file.rel_path == "src/cloud/acmd.rs")
+            .unwrap()
+            .contents
+            .as_str();
+        let header = acmd
+            .lines()
+            .take_while(|line| !line.starts_with("pub fn install"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!header.contains("AttackDirectionAxis"));
+        assert!(!header.contains("AttackHeight"));
+        assert!(!header.contains("HitStatus"));
+    }
+
     #[test]
     fn spawns_the_export_cannot_reproduce_are_reported() {
         let mut calls = sample_edits().1;
@@ -11235,8 +18917,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert!(export_spawn_downgrades(&calls).is_empty());
     }
 
-    /// Graphic slots are not always string literals; consts and locals must pass through
-    /// rather than being re-quoted into a graphic literally named after the expression.
     #[test]
     fn expression_valued_graphic_arguments_are_not_re_quoted() {
         assert_eq!(hash_arg("sys_hit"), "Hash40::new(\"sys_hit\")");
@@ -11311,19 +18991,368 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_set_speed_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::SET_SPEED(agent, 0);
-        macros::SET_SPEED(agent, 0, 1, 2);
+    fn generated_movement_helpers_consume_only_their_emitted_attributes_and_bodies() {
+        let script = AcmdScript {
+            stmts: vec![AcmdStmt::Excute(vec![
+                ExcuteStmt::SetSpeed(crate::data::SetSpeedCall {
+                    speed_x: 1.25,
+                    speed_y: -3.5,
+                }),
+                ExcuteStmt::ClrSpeed(crate::data::ClrSpeedCall {
+                    kinetic_kind: "*FIGHTER_KINETIC_ENERGY_ID_GRAVITY".into(),
+                }),
+                ExcuteStmt::SetAir,
+            ])],
+        };
+        let emitted = preview_game_fn(&script, "attackairlw");
+        let parsed = parse_acmd_script(&emitted);
+        assert_json_eq!(
+            &parsed,
+            &script,
+            "the generated helper attributes or bodies leaked into ACMD statements"
+        );
+
+        let reemitted = preview_game_fn(&parsed, "attackairlw");
+        for helper in [
+            "visionary_set_speed",
+            "visionary_clr_speed",
+            "visionary_set_air",
+        ] {
+            assert_eq!(
+                reemitted.matches(&format!("unsafe fn {helper}(")).count(),
+                1,
+                "generated helper {helper} was duplicated"
+            );
+        }
     }
+
+    #[test]
+    fn generated_effect_helpers_match_emitted_form_with_or_without_attributes() {
+        for helper in [
+            emit_last_effect_set_work_int_helper("    "),
+            emit_last_effect_set_scale_w_helper("    "),
+        ] {
+            let lines = helper.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(
+                generated_effect_helper_end(&lines, 0),
+                Some(lines.len() - 1)
+            );
+            let without_attributes = &lines[2..];
+            assert_eq!(
+                generated_effect_helper_end(without_attributes, 0),
+                Some(without_attributes.len() - 1)
+            );
+
+            let mut changed_body = helper.clone();
+            let body_line = changed_body
+                .iter_mut()
+                .find(|line| line.contains("agent.clear_lua_stack();"))
+                .unwrap();
+            *body_line = "    agent.clear_lua_stack(); // user change".into();
+            let changed_body = changed_body.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_eq!(generated_effect_helper_end(&changed_body, 0), None);
+        }
+    }
+
+    #[test]
+    fn generated_effect_helper_with_extra_cfg_attribute_remains_intact() {
+        let helper = emit_last_effect_set_scale_w_helper("    ");
+        let prefixes = [
+            vec!["    #[cfg(custom_effect_helper)]", ""],
+            vec!["    // retain this helper's annotation", ""],
+            vec!["    #[cfg(", "        custom_effect_helper", "    )"],
+        ];
+        for prefix in prefixes {
+            let mut body = prefix
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect::<Vec<_>>();
+            body.extend(helper.iter().cloned());
+            body.push("    frame(agent.lua_state_agent, 2.0);".into());
+            let source = format!(
+                "unsafe extern \"C\" fn effect_custom(agent: &mut L2CAgentBase) {{\n{}\n}}\n",
+                body.join("\n")
+            );
+            let parsed = parse_effect_script(&source);
+            assert!(matches!(
+                parsed.stmts.first(),
+                Some(crate::data::EffectStmt::Raw(prefix))
+                    if prefix.starts_with("#[cfg(") || prefix.starts_with("// retain")
+            ));
+            assert!(matches!(
+                parsed.stmts.get(1),
+                Some(crate::data::EffectStmt::Raw(attribute)) if attribute == "#[inline]"
+            ));
+            assert!(matches!(
+                parsed.stmts.get(2),
+                Some(crate::data::EffectStmt::Raw(attribute))
+                    if attribute == "#[allow(dead_code)]"
+            ));
+            assert!(matches!(
+                parsed.stmts.get(3),
+                Some(crate::data::EffectStmt::Cond { header, .. })
+                    if header.contains("unsafe fn visionary_last_effect_set_scale_w")
+            ));
+            assert!(matches!(
+                parsed.stmts.get(4),
+                Some(crate::data::EffectStmt::Frame(frame)) if *frame == 2.0
+            ));
+        }
+    }
+
+    #[test]
+    fn consecutive_generated_effect_helpers_are_consumed_from_function_prolog() {
+        let mut body = emit_last_effect_set_work_int_helper("    ");
+        body.extend(emit_last_effect_set_scale_w_helper("    "));
+        body.push("    frame(agent.lua_state_agent, 2.0);".into());
+        let source = format!(
+            "unsafe extern \"C\" fn effect_custom(agent: &mut L2CAgentBase) {{\n{}\n}}\n",
+            body.join("\n")
+        );
+        let parsed = parse_effect_script(&source);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [crate::data::EffectStmt::Frame(frame)] if *frame == 2.0
+        ));
+    }
+
+    #[test]
+    fn generated_effect_helpers_after_statements_or_inside_blocks_are_preserved() {
+        let helper = emit_last_effect_set_scale_w_helper("    ").join("\n");
+        let after_statement = format!(
+            "unsafe extern \"C\" fn effect_after(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 1.0);\n{helper}\n}}\n"
+        );
+        let parsed = parse_effect_script(&after_statement);
+        assert!(matches!(
+            parsed.stmts.first(),
+            Some(crate::data::EffectStmt::Frame(frame)) if *frame == 1.0
+        ));
+        assert!(matches!(
+            parsed.stmts.get(1),
+            Some(crate::data::EffectStmt::Raw(line)) if line == "#[inline]"
+        ));
+        assert!(matches!(
+            parsed.stmts.get(2),
+            Some(crate::data::EffectStmt::Raw(line)) if line == "#[allow(dead_code)]"
+        ));
+        assert!(matches!(
+            parsed.stmts.get(3),
+            Some(crate::data::EffectStmt::Cond { header, .. })
+                if header.contains("unsafe fn visionary_last_effect_set_scale_w")
+        ));
+
+        let nested = format!(
+            "unsafe extern \"C\" fn effect_nested(agent: &mut L2CAgentBase) {{\n    if custom_effect_guard(agent) {{\n{helper}\n    }}\n}}\n"
+        );
+        let parsed = parse_effect_script(&nested);
+        assert!(matches!(
+            parsed.stmts.first(),
+            Some(crate::data::EffectStmt::Cond { body, .. })
+                if matches!(body.first(), Some(crate::data::EffectStmt::Raw(line)) if line == "#[inline]")
+                    && matches!(body.get(2), Some(crate::data::EffectStmt::Cond { header, .. })
+                        if header.contains("unsafe fn visionary_last_effect_set_scale_w"))
+        ));
+    }
+
+    #[test]
+    fn similarly_named_effect_helpers_and_unrelated_attributes_remain_raw() {
+        let source = r#"unsafe extern "C" fn effect_custom(agent: &mut L2CAgentBase) {
+    #[allow(unused_variables)]
+    #[inline]
+    #[allow(dead_code)]
+    unsafe fn visionary_last_effect_set_scale_w(agent: &mut L2CAgentBase, values: &[f32]) {
+        custom_effect_extension(agent, values);
+    }
+    frame(agent.lua_state_agent, 2.0);
 }
 "#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_speed_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::SET_SPEED(agent, 0);"));
-        assert!(emitted.contains("macros::SET_SPEED(agent, 0, 1, 2);"));
+        let parsed = parse_effect_script(source);
+        assert!(matches!(
+            parsed.stmts.first(),
+            Some(crate::data::EffectStmt::Raw(attribute))
+                if attribute == "#[allow(unused_variables)]"
+        ));
+        assert!(matches!(
+            parsed.stmts.get(1),
+            Some(crate::data::EffectStmt::Raw(attribute)) if attribute == "#[inline]"
+        ));
+        assert!(matches!(
+            parsed.stmts.get(2),
+            Some(crate::data::EffectStmt::Raw(attribute))
+                if attribute == "#[allow(dead_code)]"
+        ));
+        assert!(matches!(
+            parsed.stmts.get(3),
+            Some(crate::data::EffectStmt::Cond { header, body })
+                if header.contains("unsafe fn visionary_last_effect_set_scale_w")
+                    && matches!(body.as_slice(), [crate::data::EffectStmt::Raw(line)]
+                        if line == "custom_effect_extension(agent, values);")
+        ));
+        assert!(matches!(
+            parsed.stmts.get(4),
+            Some(crate::data::EffectStmt::Frame(frame)) if *frame == 2.0
+        ));
+    }
+
+    #[test]
+    fn unrelated_user_attributes_and_opaque_acmd_lines_are_retained() {
+        let source = r#"unsafe extern "C" fn game_custom(agent: &mut L2CAgentBase) {
+    #[allow(unused_variables)]
+    custom_acmd_extension(agent);
+    #[cfg(custom_acmd_feature)]
+    another_opaque_extension(agent);
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert_json_eq!(
+            &parsed.stmts,
+            vec![
+                AcmdStmt::Raw("#[allow(unused_variables)]".into()),
+                AcmdStmt::Raw("custom_acmd_extension(agent);".into()),
+                AcmdStmt::Raw("#[cfg(custom_acmd_feature)]".into()),
+                AcmdStmt::Raw("another_opaque_extension(agent);".into()),
+            ]
+        );
+        let emitted = preview_game_fn(&parsed, "custom");
+        assert!(emitted.contains("#[allow(unused_variables)]\n"));
+        assert!(emitted.contains("custom_acmd_extension(agent);\n"));
+        assert!(emitted.contains("#[cfg(custom_acmd_feature)]\n"));
+        assert!(emitted.contains("another_opaque_extension(agent);\n"));
+    }
+
+    #[test]
+    fn similarly_named_user_helpers_do_not_consume_attributes_or_opaque_body() {
+        let source = r#"unsafe extern "C" fn game_custom(agent: &mut L2CAgentBase) {
+    #[allow(dead_code)]
+    unsafe fn visionary_set_air(agent: &mut L2CAgentBase) {
+        custom_acmd_extension(agent);
+    }
+    frame(agent.lua_state_agent, 2.0);
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert!(matches!(
+            parsed.stmts.first(),
+            Some(AcmdStmt::Raw(attribute)) if attribute == "#[allow(dead_code)]"
+        ));
+        assert!(
+            matches!(parsed.stmts.get(1), Some(AcmdStmt::RawBlock { header, body })
+            if header.contains("unsafe fn visionary_set_air")
+                && matches!(body.as_slice(), [AcmdStmt::Raw(line)] if line == "custom_acmd_extension(agent);"))
+        );
+        assert!(matches!(parsed.stmts.get(2), Some(AcmdStmt::Frame(frame)) if *frame == 2.0));
+    }
+
+    #[test]
+    fn malformed_native_calls_stay_raw_without_losing_valid_neighbors() {
+        for (line, bare, expected) in [
+            ("macros::SET_SPEED(agent, 0);", false, None),
+            ("macros::SET_SPEED(agent, 0, 1, 2);", false, None),
+            ("macros::FT_CATCH_STOP(agent, 6);", false, None),
+            ("macros::FT_CATCH_STOP(agent, 6, 1, 2);", false, None),
+            ("macros::FT_CATCH_STOP(other, 6, 1);", false, None),
+            ("KineticModule::add_speed(agent.module_accessor, &Vector3f{x: 1.0, y: 2.0, z: 1.0});", false, None),
+            ("KineticModule::add_speed(other, &Vector3f{x: 1.0, y: 2.0, z: 0.0});", false, None),
+            ("KineticModule::add_speed(agent.module_accessor, &Vector3f{x: 1.0, y: 2.0});", false, None),
+            ("WorkModule::on_flag(agent.module_accessor, *FLAG, 1);", false, None),
+            ("WorkModule::off_flag(other, 2);", false, None),
+            ("WorkModule::off_flag(agent.module_accessor, make_flag());", false, None),
+            ("WorkModule::on_flag(agent.module_accessor, 3);", false, Some("WorkFlag")),
+            ("WorkModule::enable_transition_term(agent.module_accessor, *TERM, 1);", false, None),
+            ("WorkModule::unable_transition_term(other, 2);", false, None),
+            ("WorkModule::unable_transition_term(agent.module_accessor, make_term());", false, None),
+            ("WorkModule::enable_transition_term(agent.module_accessor, 3);", false, Some("WorkTransitionTerm")),
+            ("WorkModule::enable_transition_term_group(boma, 4);", false, None),
+            ("WorkModule::unable_transition_term_group_ex(agent.module_accessor, make_group());", false, None),
+            ("WorkModule::unable_transition_term_group_ex(agent.module_accessor, 5);", false, Some("WorkTransitionTerm")),
+            ("WorkModule::set_int(agent.module_accessor, 1);", false, None),
+            ("WorkModule::set_int(agent.module_accessor, 1, 2, 3);", false, None),
+            ("WorkModule::set_int(other.module_accessor, 1, 2);", false, None),
+            ("WorkModule::set_int(agent.module_accessor, make_value(), 2);", false, None),
+            ("WorkModule::set_float(agent.module_accessor, value, 2);", false, None),
+            ("WorkModule::set_float(agent.module_accessor, NaN, 2);", false, None),
+            ("WorkModule::set_float(agent.module_accessor, 1.0, make_slot());", false, None),
+            ("WorkModule::set_int(agent.module_accessor, 1, slot);", false, None),
+            ("WorkModule::set_int64(agent.module_accessor, hash40(\"fall_damage\"), 2);", false, None),
+            ("WorkModule::set_int64(other.module_accessor, hash40(\"fall_damage\") as i64, 2);", false, None),
+            ("WorkModule::set_int64(agent.module_accessor, make_value(), 2);", false, None),
+            ("WorkModule::set_int64(agent.module_accessor, hash40(\"fall_damage\") as i64, make_slot());", false, None),
+            ("WorkModule::inc_int(agent.module_accessor, 1, 2);", false, None),
+            ("WorkModule::inc_int(other.module_accessor, 3);", false, None),
+            ("WorkModule::inc_int(agent.module_accessor, make_slot());", false, None),
+            ("WorkModule::inc_int(agent.module_accessor, SLOT_NAME);", false, None),
+            ("WorkModule::inc_int(agent.module_accessor, *VALID_SLOT);", false, Some("WorkModuleIncInt")),
+            ("KineticModule::suspend_energy(agent.module_accessor);", false, None),
+            ("KineticModule::resume_energy(other, *FIGHTER_KINETIC_ENERGY_ID_CONTROL);", false, None),
+            ("KineticModule::resume_energy(agent.module_accessor, );", false, None),
+            ("KineticModule::clear_speed_all(agent.module_accessor, 0);", false, None),
+            ("KineticModule::clear_speed_all(other);", false, None),
+            ("KineticModule::clear_speed_all(agent.module_accessor);", false, Some("KineticClearSpeedAll")),
+            ("KineticModule::set_consider_ground_friction(agent.module_accessor, 1, 0);", false, None),
+            ("KineticModule::set_consider_ground_friction(agent.module_accessor, true);", false, None),
+            ("KineticModule::set_consider_ground_friction(other, false, 0);", false, None),
+            ("KineticModule::set_consider_ground_friction(agent.module_accessor, false, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);", false, Some("KineticSetConsiderGroundFriction")),
+            ("macros::CLR_SPEED(agent);", false, None),
+            ("macros::CLR_SPEED(agent, 0, 1);", false, None),
+            ("macros::SET_AIR(agent, 0);", false, None),
+            ("macros::SET_AIR(other);", false, None),
+            ("KineticModule::change_kinetic(agent.module_accessor);", false, None),
+            ("KineticModule::change_kinetic(agent.module_accessor, 0, 1);", false, None),
+            ("KineticModule::change_kinetic(other.module_accessor, 0);", false, None),
+            ("macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent);", true, None),
+            ("macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent, 1, 2);", true, None),
+            ("FT_START_ADJUST_MOTION_FRAME_REVISED_arg1(1.0);", true, None),
+            ("MotionModule::set_rate(agent.module_accessor);", false, None),
+            ("MotionModule::set_rate(agent.module_accessor, 0.8, 1.0);", false, None),
+            ("MotionModule::set_rate(other.module_accessor, 0.8);", false, None),
+            ("MotionModule::set_rate(agent.module_accessor, -378992935);", false, None),
+            ("MotionModule::set_helper_calculation(agent.module_accessor);", false, None),
+            ("MotionModule::set_helper_calculation(agent.module_accessor, 1);", false, None),
+            ("MotionModule::set_helper_calculation(other.module_accessor, true);", false, None),
+            ("MotionModule::set_helper_calculation(agent.module_accessor, enabled);", false, None),
+            ("MotionModule::set_helper_calculation(agent.module_accessor, false, true);", false, None),
+            ("MotionModule::set_rate_partial(agent.module_accessor, 2);", false, None),
+            ("MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY);", false, None),
+            ("MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, -1);", false, None),
+            ("MotionModule::set_rate_partial(other.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, 1);", false, None),
+            ("MotionModule::set_rate_partial(agent.module_accessor, part_kind, 1);", false, None),
+            ("MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, rate);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, 2);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, -1);", false, None),
+            ("MotionModule::set_frame_partial(other.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, part_kind, 1);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, frame);", false, None),
+            ("MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1, sync);", false, None),
+            ("macros::SET_SPEED_EX(agent, 0, 1);", false, None),
+            ("macros::SET_SPEED_EX(agent, 0, 1, 0, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);", false, None),
+            ("macros::ADD_SPEED_NO_LIMIT(agent, 0);", false, None),
+            ("macros::ADD_SPEED_NO_LIMIT(agent, 0, 1, 2);", false, None),
+            ("macros::CORRECT(agent);", false, None),
+            ("macros::CORRECT(agent, 1, 2);", false, None),
+        ] {
+            let body = if bare { line.to_owned() } else { format!("if macros::is_excute(agent) {{\n{line}\n}}") };
+            let source = format!("unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+            let script = parse_acmd_script(&source);
+            if let Some(expected) = expected {
+                let [AcmdStmt::Excute(commands)] = script.stmts.as_slice() else { panic!("{line}") };
+                let encoded = serde_json::to_value(&commands[0]).unwrap();
+                let tag = encoded.as_str().or_else(|| encoded.as_object().and_then(|value|value.keys().next().map(String::as_str)));
+                assert_eq!(tag, Some(expected), "{line}");
+            } else {
+                let raw = match script.stmts.as_slice() {
+                    [AcmdStmt::Raw(raw)] => raw,
+                    [AcmdStmt::Excute(commands)] => match commands.as_slice() {
+                        [ExcuteStmt::Raw(raw)] => raw,
+                        _ => panic!("malformed call became typed: {line}"),
+                    },
+                    _ => panic!("malformed call changed scope: {line}"),
+                };
+                assert_eq!(raw.trim(), line);
+            }
+            let emitted = preview_game_fn(&script, "x");
+            assert_json_eq!(&script, parse_acmd_script(&emitted), "{line}");
+        }
     }
 
     #[test]
@@ -11383,24 +19412,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             parse_acmd_script(&emitted).to_ft_catch_stop_events(),
             events
         );
-    }
-
-    #[test]
-    fn malformed_ft_catch_stop_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::FT_CATCH_STOP(agent, 6);
-        macros::FT_CATCH_STOP(agent, 6, 1, 2);
-        macros::FT_CATCH_STOP(other, 6, 1);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_ft_catch_stop_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::FT_CATCH_STOP(agent, 6);"));
-        assert!(emitted.contains("macros::FT_CATCH_STOP(agent, 6, 1, 2);"));
-        assert!(emitted.contains("macros::FT_CATCH_STOP(other, 6, 1);"));
     }
 
     #[test]
@@ -11503,24 +19514,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_kinetic_add_speed_vectors_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        KineticModule::add_speed(agent.module_accessor, &Vector3f{x: 1.0, y: 2.0, z: 1.0});
-        KineticModule::add_speed(other, &Vector3f{x: 1.0, y: 2.0, z: 0.0});
-        KineticModule::add_speed(agent.module_accessor, &Vector3f{x: 1.0, y: 2.0});
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_kinetic_add_speed_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("z: 1.0"));
-        assert!(emitted.contains("KineticModule::add_speed(other"));
-        assert!(emitted.contains("Vector3f{x: 1.0, y: 2.0}"));
-    }
-
-    #[test]
     fn work_module_flags_parse_standard_and_hdr_and_round_trip() {
         let source = r#"unsafe extern "C" fn game_attackairn(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 4.0);
@@ -11552,26 +19545,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
 
         let hdr = source.replace("agent.module_accessor", "boma");
         assert_eq!(parse_acmd_script(&hdr).to_work_flag_events(), events);
-    }
-
-    #[test]
-    fn malformed_work_module_flag_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        WorkModule::on_flag(agent.module_accessor, *FLAG, 1);
-        WorkModule::off_flag(other, 2);
-        WorkModule::off_flag(agent.module_accessor, make_flag());
-        WorkModule::on_flag(agent.module_accessor, 3);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert_eq!(script.to_work_flag_events().len(), 1);
-        assert_eq!(script.to_work_flag_events()[0].call.flag, "3");
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("WorkModule::on_flag(agent.module_accessor, *FLAG, 1);"));
-        assert!(emitted.contains("WorkModule::off_flag(other, 2);"));
-        assert!(emitted.contains("WorkModule::off_flag(agent.module_accessor, make_flag());"));
     }
 
     #[test]
@@ -11646,45 +19619,85 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
                 "WorkModule::unable_transition_term(agent.module_accessor",
                 "WorkModule::unable_transition_term(boma",
             );
+        let hdr_script = parse_acmd_script(&hdr);
+        let hdr_events = hdr_script.to_work_transition_term_events();
+        assert_eq!(hdr_events.len(), 4);
         assert_eq!(
-            parse_acmd_script(&hdr).to_work_transition_term_events(),
-            events
+            hdr_events[0].call.receiver,
+            crate::data::WorkTransitionTermReceiver::Boma
         );
+        assert_eq!(
+            hdr_events[1].call.receiver,
+            crate::data::WorkTransitionTermReceiver::Boma
+        );
+        let hdr_preview = preview_game_fn(&hdr_script, "attack_air_n");
+        assert!(hdr_preview.contains(
+            "WorkModule::enable_transition_term(boma, *FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN);"
+        ));
+        assert!(hdr_preview.contains("WorkModule::unable_transition_term(boma, 17);"));
+        assert!(hdr_preview.contains(
+            "WorkModule::enable_transition_term_group(agent.module_accessor, *FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_LANDING);"
+        ));
     }
 
     #[test]
-    fn malformed_work_module_transition_term_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        WorkModule::enable_transition_term(agent.module_accessor, *TERM, 1);
-        WorkModule::unable_transition_term(other, 2);
-        WorkModule::unable_transition_term(agent.module_accessor, make_term());
-        WorkModule::enable_transition_term(agent.module_accessor, 3);
-        WorkModule::enable_transition_term_group(boma, 4);
-        WorkModule::unable_transition_term_group_ex(agent.module_accessor, make_group());
-        WorkModule::unable_transition_term_group_ex(agent.module_accessor, 5);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        let events = script.to_work_transition_term_events();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].call.transition_term, "3");
-        assert_eq!(
-            events[1].call.action,
-            crate::data::WorkTransitionTermAction::UnableGroupEx
-        );
-        assert_eq!(events[1].call.transition_term, "5");
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted
-            .contains("WorkModule::enable_transition_term(agent.module_accessor, *TERM, 1);"));
-        assert!(emitted.contains("WorkModule::unable_transition_term(other, 2);"));
-        assert!(emitted
-            .contains("WorkModule::unable_transition_term(agent.module_accessor, make_term());"));
-        assert!(emitted.contains("WorkModule::enable_transition_term_group(boma, 4);"));
-        assert!(emitted.contains(
-            "WorkModule::unable_transition_term_group_ex(agent.module_accessor, make_group());"
+    fn transition_term_parser_only_types_one_direct_standalone_statement() {
+        let call = "WorkModule::enable_transition_term(agent.module_accessor, *FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN);";
+        assert!(matches!(
+            parse_work_transition_term_call(call),
+            Some(ExcuteStmt::WorkTransitionTerm(_))
         ));
+        let boma = call.replace("agent.module_accessor", "boma");
+        assert!(matches!(
+            parse_work_transition_term_call(&boma),
+            Some(ExcuteStmt::WorkTransitionTerm(
+                crate::data::WorkTransitionTermCall {
+                    receiver: crate::data::WorkTransitionTermReceiver::Boma,
+                    ..
+                }
+            ))
+        ));
+        assert!(parse_work_transition_term_call(
+            "WorkModule::enable_transition_term_group(boma, *TERM);"
+        )
+        .is_none());
+
+        let rejected = [
+            format!("prefix {call}"),
+            format!("Other::WorkModule::{}", &call["WorkModule::".len()..]),
+            format!("wrapped({})", call.trim_end_matches(';')),
+            format!("{call} WorkModule::unable_transition_term(agent.module_accessor, 2);"),
+            format!("{call} // trailing comment"),
+            format!("/* leading comment */ {call}"),
+            "WorkModule::enable_transition_term(agent.module_accessor, /* arg */ *TERM);".into(),
+            "WorkModule::enable_transition_term(agent.module_accessor, *TERM) + 1;".into(),
+            "WorkModule::enable_transition_term(agent.module_accessor, *TERM); /* tail */".into(),
+            format!("\"{}\";", call.trim_end_matches(';')),
+        ];
+        for source_line in &rejected {
+            assert!(
+                parse_work_transition_term_call(source_line).is_none(),
+                "unexpectedly typed non-standalone form: {source_line}"
+            );
+        }
+
+        let source = format!(
+            "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n{}\n    }}\n}}\n",
+            rejected
+                .iter()
+                .map(|line| format!("        {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let script = parse_acmd_script(&source);
+        assert!(script.to_work_transition_term_events().is_empty());
+        let emitted = preview_game_fn(&script, "x");
+        for source_line in rejected {
+            assert!(
+                emitted.contains(source_line.trim()),
+                "opaque source form was not preserved: {source_line}"
+            );
+        }
     }
 
     #[test]
@@ -11743,43 +19756,362 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_work_module_value_setter_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
+    fn work_module_value_setter_parser_requires_a_standalone_call() {
+        let lines = [
+            "let saved = WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE);",
+            "wrap(WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE));",
+            "WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE); custom_call();",
+            "WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE,);",
+            "WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE); // trailing source",
+            "WorkModule::set_int64(agent.module_accessor, hash40(\"final_air_attack\") as i64 + injected(), *FIGHTER_ELIGHT_INSTANCE_WORK_ID_INT_ESWORD_INHERIT_OPEN_MOTION_KIND);",
+            "shadow::WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE);",
+            "/* WorkModule::set_float(agent.module_accessor, 0.0, *FIGHTER_MIISWORDSMAN_STATUS_FINAL_WORK_ID_FLOAT_WAVE_ANGLE); */",
+        ];
+        for line in lines {
+            let source = format!(
+                "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+            );
+            let script = parse_acmd_script(&source);
+            assert!(
+                script.to_work_module_set_events().is_empty(),
+                "non-standalone setter was typed: {line}"
+            );
+            let emitted = preview_game_fn(&script, "x");
+            assert!(
+                emitted.contains(line),
+                "unrecognized source changed: {line}\n{emitted}"
+            );
+        }
+
+        let accepted = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
-        WorkModule::set_int(agent.module_accessor, 1);
-        WorkModule::set_int(agent.module_accessor, 1, 2, 3);
-        WorkModule::set_int(other.module_accessor, 1, 2);
-        WorkModule::set_int(agent.module_accessor, make_value(), 2);
-        WorkModule::set_float(agent.module_accessor, value, 2);
-        WorkModule::set_float(agent.module_accessor, NaN, 2);
-        WorkModule::set_float(agent.module_accessor, 1.0, make_slot());
-        WorkModule::set_int(agent.module_accessor, 1, slot);
-        WorkModule::set_int64(agent.module_accessor, hash40("fall_damage"), 2);
-        WorkModule::set_int64(other.module_accessor, hash40("fall_damage") as i64, 2);
-        WorkModule::set_int64(agent.module_accessor, make_value(), 2);
-        WorkModule::set_int64(agent.module_accessor, hash40("fall_damage") as i64, make_slot());
+        WorkModule::set_int64(agent.module_accessor, hash40("final_air_attack") as i64, *FIGHTER_ELIGHT_INSTANCE_WORK_ID_INT_ESWORD_INHERIT_OPEN_MOTION_KIND);
     }
 }
 "#;
-        let script = parse_acmd_script(source);
-        assert_eq!(script.to_work_module_set_events().len(), 0);
-        let emitted = preview_game_fn(&script, "x");
-        for line in [
-            "WorkModule::set_int(agent.module_accessor, 1);",
-            "WorkModule::set_int(agent.module_accessor, 1, 2, 3);",
-            "WorkModule::set_int(other.module_accessor, 1, 2);",
-            "WorkModule::set_int(agent.module_accessor, make_value(), 2);",
-            "WorkModule::set_float(agent.module_accessor, value, 2);",
-            "WorkModule::set_float(agent.module_accessor, NaN, 2);",
-            "WorkModule::set_float(agent.module_accessor, 1.0, make_slot());",
-            "WorkModule::set_int(agent.module_accessor, 1, slot);",
-            "WorkModule::set_int64(agent.module_accessor, hash40(\"fall_damage\"), 2);",
-            "WorkModule::set_int64(other.module_accessor, hash40(\"fall_damage\") as i64, 2);",
-            "WorkModule::set_int64(agent.module_accessor, make_value(), 2);",
-            "WorkModule::set_int64(agent.module_accessor, hash40(\"fall_damage\") as i64, make_slot());",
-        ] {
-            assert!(emitted.contains(line), "raw line lost: {line}\n{emitted}");
+        let script = parse_acmd_script(accepted);
+        assert_eq!(script.to_work_module_set_events().len(), 1);
+        assert!(preview_game_fn(&script, "x").contains(
+            r#"WorkModule::set_int64(agent.module_accessor, hash40("final_air_attack") as i64, *FIGHTER_ELIGHT_INSTANCE_WORK_ID_INT_ESWORD_INHERIT_OPEN_MOTION_KIND);"#
+        ));
+    }
+
+    #[test]
+    fn slow_module_whole_parses_only_the_measured_native_call_shapes() {
+        use crate::data::{ExcuteStmt, SlowWholeCall, SLOW_WHOLE_SET_PAIRS};
+
+        for pair in SLOW_WHOLE_SET_PAIRS {
+            let source = format!(
+                "SlowModule::set_whole(agent.module_accessor, {}, {});",
+                pair.multiplier, pair.frames
+            );
+            assert!(matches!(
+                parse_slow_module_whole_call(&source),
+                Some(ExcuteStmt::SlowWhole(SlowWholeCall::Set { multiplier, frames }))
+                    if multiplier == pair.multiplier && frames == pair.frames
+            ));
         }
+        assert!(matches!(
+            parse_slow_module_whole_call("SlowModule::clear_whole(agent.module_accessor);"),
+            Some(ExcuteStmt::SlowWhole(SlowWholeCall::Clear))
+        ));
+
+        // A syntactically valid but unmeasured value is retained as a typed native call so the
+        // timeline can preserve it without authorizing edits.
+        assert!(matches!(
+            parse_slow_module_whole_call("SlowModule::set_whole(agent.module_accessor, 7, 0);"),
+            Some(ExcuteStmt::SlowWhole(SlowWholeCall::Set {
+                multiplier: 7,
+                frames: 0
+            }))
+        ));
+
+        let rejected = [
+            "SlowModule::set_whole(boma, 4, 0);",
+            "SlowModule::set_whole(other.module_accessor, 4, 0);",
+            "SlowModule::set_whole(agent.module_accessor, 4);",
+            "SlowModule::set_whole(agent.module_accessor, 4, 0, 1);",
+            "SlowModule::set_whole(agent.module_accessor, 4, 0,);",
+            "SlowModule::set_whole(agent.module_accessor, 256, 0);",
+            "SlowModule::set_whole(agent.module_accessor, 4, 2147483648);",
+            "SlowModule::set_whole(agent.module_accessor, +4, 0);",
+            "SlowModule::set_whole(agent.module_accessor, 04, 0);",
+            "SlowModule::set_whole(agent.module_accessor, 4, -0);",
+            "SlowModule::clear_whole(agent.module_accessor, 0);",
+            "SlowModule::clear_whole(agent.module_accessor,);",
+            "let x = SlowModule::set_whole(agent.module_accessor, 4, 0);",
+            "wrap(SlowModule::set_whole(agent.module_accessor, 4, 0));",
+            "SlowModule::set_whole(agent.module_accessor, 4, 0); other();",
+            "SlowModule::set_whole(agent.module_accessor, 4, 0); // trailing",
+            "/* comment */ SlowModule::clear_whole(agent.module_accessor);",
+            "shadow::SlowModule::clear_whole(agent.module_accessor);",
+            "SlowModule::clear_whole(agent.module_accessor) + 0;",
+        ];
+        for line in rejected {
+            assert!(
+                parse_slow_module_whole_call(line).is_none(),
+                "non-standalone slow call was typed: {line}"
+            );
+        }
+
+        let source = format!(
+            "unsafe extern \"C\" fn game_slow_whole(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n{}\n    }}\n}}\n",
+            rejected
+                .iter()
+                .map(|line| format!("        {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let parsed = parse_acmd_script(&source);
+        let emitted = preview_game_fn(&parsed, "slow_whole");
+        for line in rejected {
+            assert!(
+                emitted.contains(line),
+                "opaque call was lost: {line}\n{emitted}"
+            );
+        }
+        assert_json_eq!(&parsed, parse_acmd_script(&emitted));
+    }
+
+    #[test]
+    fn slow_module_whole_emits_measured_set_clear_pairs_without_shape_drift() {
+        use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt, SlowWholeCall, SLOW_WHOLE_SET_PAIRS};
+
+        let commands = SLOW_WHOLE_SET_PAIRS
+            .iter()
+            .map(|pair| {
+                ExcuteStmt::SlowWhole(SlowWholeCall::Set {
+                    multiplier: pair.multiplier,
+                    frames: pair.frames,
+                })
+            })
+            .chain(std::iter::once(ExcuteStmt::SlowWhole(SlowWholeCall::Clear)))
+            .collect::<Vec<_>>();
+        let source = AcmdScript {
+            stmts: vec![AcmdStmt::Excute(commands)],
+        };
+        let emitted = preview_game_fn(&source, "slow_whole");
+        assert!(emitted.contains("SlowModule::set_whole(agent.module_accessor, 4, 0);"));
+        assert!(emitted.contains("SlowModule::set_whole(agent.module_accessor, 20, 30);"));
+        assert!(emitted.contains("SlowModule::clear_whole(agent.module_accessor);"));
+        assert_json_eq!(parse_acmd_script(&emitted), source);
+    }
+
+    #[test]
+    fn slow_opponent_accepts_only_closed_finite_direct_game_execute_calls() {
+        use crate::data::{ExcuteStmt, SlowOpponentCall};
+
+        let observed_pairs = [
+            ("2", "60"),
+            ("2.5", "5"),
+            ("3", "30"),
+            ("3", "40"),
+            ("4", "30"),
+            ("4", "45"),
+            ("4", "50"),
+            ("4", "60"),
+            ("4", "120"),
+            ("5", "20"),
+            ("5", "30"),
+            ("5", "40"),
+            ("5", "50"),
+            ("5", "60"),
+            ("5", "80"),
+            ("5", "90"),
+            ("6", "30"),
+            ("6", "55"),
+            ("6", "60"),
+            ("6", "85"),
+            ("6", "120"),
+            ("7", "22"),
+            ("7", "30"),
+            ("7", "120"),
+            ("8", "34"),
+            ("8", "50"),
+            ("8", "60"),
+            ("8", "70"),
+            ("9", "45"),
+            ("9", "130"),
+            ("10", "60"),
+            ("10", "64"),
+            ("10", "65"),
+            ("10", "70"),
+            ("10", "75"),
+            ("10", "90"),
+            ("12", "44"),
+            ("13", "60"),
+            ("14", "60"),
+            ("15", "30"),
+            ("15", "40"),
+            ("15", "60"),
+            ("15", "70"),
+            ("20", "55"),
+            ("20", "60"),
+            ("20", "65"),
+            ("20", "75"),
+            ("20", "85"),
+            ("30", "25"),
+            ("30", "30"),
+            ("30", "48"),
+            ("30", "60"),
+            ("30", "70"),
+            ("30", "80"),
+            ("30", "100"),
+            ("40", "57"),
+            ("80", "50"),
+        ];
+        let mut distinct = std::collections::BTreeSet::new();
+        for (slow_mul, slow_time) in observed_pairs {
+            let source = format!("macros::SLOW_OPPONENT(agent, {slow_mul}, {slow_time});");
+            let Some(ExcuteStmt::SlowOpponent(call)) = parse_slow_opponent_call(&source) else {
+                panic!("observed pair was not admitted: {source}");
+            };
+            distinct.insert((call.slow_mul.to_bits(), call.slow_time.to_bits()));
+        }
+        assert_eq!(
+            distinct.len(),
+            57,
+            "the positive fixture covers the measured pair table"
+        );
+
+        let accepted = [
+            ("macros::SLOW_OPPONENT(agent, 2, 5);", 2.0, 5.0),
+            ("macros::SLOW_OPPONENT(agent, 13.5, 60.25);", 13.5, 60.25),
+            ("macros::SLOW_OPPONENT(agent, 80, 130);", 80.0, 130.0),
+        ];
+        for (source, slow_mul, slow_time) in accepted {
+            assert!(matches!(
+                parse_slow_opponent_call(source),
+                Some(ExcuteStmt::SlowOpponent(SlowOpponentCall { slow_mul: actual_mul, slow_time: actual_time }))
+                    if actual_mul == slow_mul && actual_time == slow_time
+            ));
+        }
+
+        let rejected = [
+            "macros::SLOW_OPPONENT(boma, 13, 60);",
+            "macros::SLOW_OPPONENT(agent, 1.99, 60);",
+            "macros::SLOW_OPPONENT(agent, 80.01, 60);",
+            "macros::SLOW_OPPONENT(agent, 13, 4.99);",
+            "macros::SLOW_OPPONENT(agent, 13, 130.01);",
+            "macros::SLOW_OPPONENT(agent, 13);",
+            "macros::SLOW_OPPONENT(agent, 13, 60, 1);",
+            "macros::SLOW_OPPONENT(agent, 13, 60,);",
+            "macros::SLOW_OPPONENT(agent, f32::NAN, 60);",
+            "macros::SLOW_OPPONENT(agent, 13 + 1, 60);",
+            "macros::SLOW_OPPONENT(agent, -13, 60);",
+            "macros::SLOW_OPPONENT(agent, 13, 60); other();",
+            "wrap(macros::SLOW_OPPONENT(agent, 13, 60));",
+            "shadow::macros::SLOW_OPPONENT(agent, 13, 60);",
+        ];
+        for source in rejected {
+            assert!(
+                parse_slow_opponent_call(source).is_none(),
+                "typed: {source}"
+            );
+        }
+
+        let exact = r#"unsafe extern "C" fn game_slow_opponent(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::SLOW_OPPONENT(agent, 13, 60);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(exact);
+        assert!(matches!(
+            parsed.stmts.as_slice(),
+            [crate::data::AcmdStmt::Excute(commands)]
+                if matches!(commands.as_slice(), [ExcuteStmt::SlowOpponent(_)])
+        ));
+        let emitted = preview_game_fn(&parsed, "slow_opponent");
+        assert_json_eq!(parse_acmd_script(&emitted), &parsed);
+
+        let wrong_track = crate::move_nodes::timeline::import_for_fighter(
+            "kirby",
+            crate::move_nodes::model::Track::Effect,
+            &parsed,
+        );
+        assert!(matches!(
+            wrong_track.nodes.as_slice(),
+            [crate::move_nodes::model::MoveNode {
+                kind: crate::move_nodes::model::NodeKind::Preserved { .. },
+                ..
+            }]
+        ));
+
+        fn typed_slow_calls(stmts: &[crate::data::AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    crate::data::AcmdStmt::Excute(commands) => commands
+                        .iter()
+                        .filter(|command| matches!(command, ExcuteStmt::SlowOpponent(_)))
+                        .count(),
+                    crate::data::AcmdStmt::RawBlock { body, .. }
+                    | crate::data::AcmdStmt::Loop { body, .. } => typed_slow_calls(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        // These are independently valid Rust bodies: an attributed call, a wrapped call, and a
+        // nested call remain opaque while a separate direct sibling is still the sole typed call.
+        let source = r#"unsafe extern "C" fn game_slow_opponent(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        #[allow(unused)]
+        macros::SLOW_OPPONENT(agent, 13, 60);
+        consume(macros::SLOW_OPPONENT(agent, 13, 60));
+        if true { macros::SLOW_OPPONENT(agent, 13, 60); }
+        macros::SLOW_OPPONENT(agent, 13, 60);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert_eq!(
+            typed_slow_calls(&parsed.stmts),
+            1,
+            "only the direct sibling is typed"
+        );
+        let emitted = preview_game_fn(&parsed, "slow_opponent");
+        assert!(emitted.contains("consume(macros::SLOW_OPPONENT(agent, 13, 60));"));
+        assert!(emitted.contains("if true { macros::SLOW_OPPONENT(agent, 13, 60); }"));
+        assert_json_eq!(parse_acmd_script(&emitted), parsed);
+
+        let wrapped_only = r#"unsafe extern "C" fn game_wrapped(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        consume(macros::SLOW_OPPONENT(agent, 13, 60));
+    }
+}
+"#;
+        let wrapped = parse_acmd_script(wrapped_only);
+        assert_eq!(typed_slow_calls(&wrapped.stmts), 0);
+        assert!(preview_game_fn(&wrapped, "wrapped")
+            .contains("consume(macros::SLOW_OPPONENT(agent, 13, 60));"));
+
+        let nested_only = r#"unsafe extern "C" fn game_nested(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        if true {
+            macros::SLOW_OPPONENT(agent, 13, 60);
+        }
+    }
+}
+"#;
+        let nested = parse_acmd_script(nested_only);
+        assert_eq!(typed_slow_calls(&nested.stmts), 0);
+        assert!(
+            preview_game_fn(&nested, "nested").contains("macros::SLOW_OPPONENT(agent, 13, 60);")
+        );
+
+        let attributed_only = r#"unsafe extern "C" fn game_attributed(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        #[allow(unused)]
+        macros::SLOW_OPPONENT(agent, 13, 60);
+    }
+}
+"#;
+        let attributed = parse_acmd_script(attributed_only);
+        assert_eq!(typed_slow_calls(&attributed.stmts), 0);
+        assert!(preview_game_fn(&attributed, "attributed")
+            .contains("macros::SLOW_OPPONENT(agent, 13, 60);"));
     }
 
     #[test]
@@ -11818,35 +20150,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             parse_acmd_script(&hdr).to_work_module_inc_int_events(),
             events
         );
-    }
-
-    #[test]
-    fn malformed_work_module_inc_int_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        WorkModule::inc_int(agent.module_accessor, 1, 2);
-        WorkModule::inc_int(other.module_accessor, 3);
-        WorkModule::inc_int(agent.module_accessor, make_slot());
-        WorkModule::inc_int(agent.module_accessor, SLOT_NAME);
-        WorkModule::inc_int(agent.module_accessor, *VALID_SLOT);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert_eq!(script.to_work_module_inc_int_events().len(), 1);
-        assert_eq!(
-            script.to_work_module_inc_int_events()[0].call.slot,
-            "*VALID_SLOT"
-        );
-        let emitted = preview_game_fn(&script, "x");
-        for line in [
-            "WorkModule::inc_int(agent.module_accessor, 1, 2);",
-            "WorkModule::inc_int(other.module_accessor, 3);",
-            "WorkModule::inc_int(agent.module_accessor, make_slot());",
-            "WorkModule::inc_int(agent.module_accessor, SLOT_NAME);",
-        ] {
-            assert!(emitted.contains(line), "raw line lost: {line}\n{emitted}");
-        }
     }
 
     #[test]
@@ -11892,23 +20195,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_kinetic_energy_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        KineticModule::suspend_energy(agent.module_accessor);
-        KineticModule::resume_energy(other, *FIGHTER_KINETIC_ENERGY_ID_CONTROL);
-        KineticModule::resume_energy(agent.module_accessor, );
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_kinetic_energy_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("KineticModule::suspend_energy(agent.module_accessor)"));
-        assert!(emitted.contains("KineticModule::resume_energy(other"));
-    }
-
-    #[test]
     fn kinetic_clear_speed_all_parses_standard_and_hdr_and_round_trips() {
         let source = r#"unsafe extern "C" fn game_specialhi(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 6.0);
@@ -11934,25 +20220,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             parse_acmd_script(&hdr).to_kinetic_clear_speed_all_events(),
             events
         );
-    }
-
-    #[test]
-    fn malformed_kinetic_clear_speed_all_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        KineticModule::clear_speed_all(agent.module_accessor, 0);
-        KineticModule::clear_speed_all(other);
-        KineticModule::clear_speed_all(agent.module_accessor);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        let events = script.to_kinetic_clear_speed_all_events();
-        assert_eq!(events.len(), 1);
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("KineticModule::clear_speed_all(agent.module_accessor, 0);"));
-        assert!(emitted.contains("KineticModule::clear_speed_all(other);"));
-        assert!(emitted.contains("KineticModule::clear_speed_all(agent.module_accessor);"));
     }
 
     #[test]
@@ -11990,27 +20257,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_kinetic_set_consider_ground_friction_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        KineticModule::set_consider_ground_friction(agent.module_accessor, 1, 0);
-        KineticModule::set_consider_ground_friction(agent.module_accessor, true);
-        KineticModule::set_consider_ground_friction(other, false, 0);
-        KineticModule::set_consider_ground_friction(agent.module_accessor, false, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        let events = script.to_kinetic_set_consider_ground_friction_events();
-        assert_eq!(events.len(), 1);
-        assert!(!events[0].call.consider_ground_friction);
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted
-            .contains("KineticModule::set_consider_ground_friction(agent.module_accessor, 1, 0);"));
-        assert!(emitted.contains("KineticModule::set_consider_ground_friction(other, false, 0);"));
-    }
-
-    #[test]
     fn kinetic_energy_enable_and_unable_round_trip_with_measured_ids() {
         let source = r#"unsafe extern "C" fn game_specialhi(agent: &mut L2CAgentBase) {
     if macros::is_excute(agent) {
@@ -12041,27 +20287,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             parse_acmd_script(&emitted).to_kinetic_energy_events(),
             events
         );
-    }
-
-    #[test]
-    fn malformed_clr_speed_and_set_air_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::CLR_SPEED(agent);
-        macros::CLR_SPEED(agent, 0, 1);
-        macros::SET_AIR(agent, 0);
-        macros::SET_AIR(other);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_clr_speed_events().is_empty());
-        assert!(script.to_set_air_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::CLR_SPEED(agent);"));
-        assert!(emitted.contains("macros::CLR_SPEED(agent, 0, 1);"));
-        assert!(emitted.contains("macros::SET_AIR(agent, 0);"));
-        assert!(emitted.contains("macros::SET_AIR(other);"));
     }
 
     #[test]
@@ -12120,40 +20345,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     }
 
     #[test]
-    fn malformed_change_kinetic_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        KineticModule::change_kinetic(agent.module_accessor);
-        KineticModule::change_kinetic(agent.module_accessor, 0, 1);
-        KineticModule::change_kinetic(other.module_accessor, 0);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_change_kinetic_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("KineticModule::change_kinetic(agent.module_accessor);"));
-        assert!(emitted.contains("KineticModule::change_kinetic(agent.module_accessor, 0, 1);"));
-        assert!(emitted.contains("KineticModule::change_kinetic(other.module_accessor, 0);"));
-    }
-
-    #[test]
-    fn malformed_ft_start_adjust_motion_frame_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent);
-    macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent, 1, 2);
-    FT_START_ADJUST_MOTION_FRAME_REVISED_arg1(1.0);
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_ft_start_adjust_motion_frame_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent);"));
-        assert!(emitted.contains("macros::FT_START_ADJUST_MOTION_FRAME_arg1(agent, 1, 2);"));
-        assert!(emitted.contains("FT_START_ADJUST_MOTION_FRAME_REVISED_arg1(1.0);"));
-    }
-
-    #[test]
     fn motion_module_set_rate_parse_export_round_trips_standard_and_hdr_shapes() {
         let source = r#"unsafe extern "C" fn game_attackairn(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 6.0);
@@ -12181,26 +20372,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             parse_acmd_script(&emitted).to_motion_module_set_rate_events(),
             events
         );
-    }
-
-    #[test]
-    fn malformed_motion_module_set_rate_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        MotionModule::set_rate(agent.module_accessor);
-        MotionModule::set_rate(agent.module_accessor, 0.8, 1.0);
-        MotionModule::set_rate(other.module_accessor, 0.8);
-        MotionModule::set_rate(agent.module_accessor, -378992935);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_motion_module_set_rate_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("MotionModule::set_rate(agent.module_accessor);"));
-        assert!(emitted.contains("MotionModule::set_rate(agent.module_accessor, 0.8, 1.0);"));
-        assert!(emitted.contains("MotionModule::set_rate(other.module_accessor, 0.8);"));
-        assert!(emitted.contains("MotionModule::set_rate(agent.module_accessor, -378992935);"));
     }
 
     #[test]
@@ -12234,38 +20405,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         assert_eq!(
             parse_acmd_script(&emitted).to_motion_module_set_helper_calculation_events(),
             events
-        );
-    }
-
-    #[test]
-    fn malformed_motion_module_set_helper_calculation_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        MotionModule::set_helper_calculation(agent.module_accessor);
-        MotionModule::set_helper_calculation(agent.module_accessor, 1);
-        MotionModule::set_helper_calculation(other.module_accessor, true);
-        MotionModule::set_helper_calculation(agent.module_accessor, enabled);
-        MotionModule::set_helper_calculation(agent.module_accessor, false, true);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script
-            .to_motion_module_set_helper_calculation_events()
-            .is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(
-            emitted.contains("MotionModule::set_helper_calculation(agent.module_accessor);")
-                && emitted
-                    .contains("MotionModule::set_helper_calculation(agent.module_accessor, 1);")
-                && emitted
-                    .contains("MotionModule::set_helper_calculation(other.module_accessor, true);")
-                && emitted.contains(
-                    "MotionModule::set_helper_calculation(agent.module_accessor, enabled);"
-                )
-                && emitted.contains(
-                    "MotionModule::set_helper_calculation(agent.module_accessor, false, true);"
-                )
         );
     }
 
@@ -12313,39 +20452,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             reparsed[1].call.part_kind,
             "*FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL"
         );
-    }
-
-    #[test]
-    fn malformed_motion_module_set_rate_partial_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        MotionModule::set_rate_partial(agent.module_accessor, 2);
-        MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY);
-        MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, -1);
-        MotionModule::set_rate_partial(other.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, 1);
-        MotionModule::set_rate_partial(agent.module_accessor, part_kind, 1);
-        MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, rate);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_motion_module_set_rate_partial_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("MotionModule::set_rate_partial(agent.module_accessor, 2);"));
-        assert!(emitted.contains(
-            "MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY);"
-        ));
-        assert!(emitted.contains(
-            "MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, -1);"
-        ));
-        assert!(emitted.contains(
-            "MotionModule::set_rate_partial(other.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, 1);"
-        ));
-        assert!(emitted
-            .contains("MotionModule::set_rate_partial(agent.module_accessor, part_kind, 1);"));
-        assert!(emitted.contains(
-            "MotionModule::set_rate_partial(agent.module_accessor, *FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY, rate);"
-        ));
     }
 
     #[test]
@@ -12417,81 +20523,6 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    #[test]
-    fn malformed_motion_module_set_frame_partial_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        MotionModule::set_frame_partial(agent.module_accessor, 2);
-        MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL);
-        MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, -1);
-        MotionModule::set_frame_partial(other.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1);
-        MotionModule::set_frame_partial(agent.module_accessor, part_kind, 1);
-        MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, frame);
-        MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1, sync);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script
-            .to_motion_module_set_frame_partial_events()
-            .is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        for line in [
-            "MotionModule::set_frame_partial(agent.module_accessor, 2);",
-            "MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL);",
-            "MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, -1);",
-            "MotionModule::set_frame_partial(other.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1);",
-            "MotionModule::set_frame_partial(agent.module_accessor, part_kind, 1);",
-            "MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, frame);",
-            "MotionModule::set_frame_partial(agent.module_accessor, *FIGHTER_PACMAN_MOTION_PART_SET_KIND_MATERIAL, 1, sync);",
-        ] {
-            assert!(emitted.contains(line), "malformed call was rewritten: {line}");
-        }
-    }
-
-    #[test]
-    fn malformed_set_speed_ex_dump_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::SET_SPEED_EX(agent, 0, 1);
-        macros::SET_SPEED_EX(agent, 0, 1, 0, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_speed_ex_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::SET_SPEED_EX(agent, 0, 1);"));
-        assert!(emitted.contains(
-            "macros::SET_SPEED_EX(agent, 0, 1, 0, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);"
-        ));
-    }
-
-    #[test]
-    fn malformed_add_speed_no_limit_and_correct_shapes_remain_raw() {
-        let source = r#"unsafe extern "C" fn game_x(agent: &mut L2CAgentBase) {
-    if macros::is_excute(agent) {
-        macros::ADD_SPEED_NO_LIMIT(agent, 0);
-        macros::ADD_SPEED_NO_LIMIT(agent, 0, 1, 2);
-        macros::CORRECT(agent);
-        macros::CORRECT(agent, 1, 2);
-    }
-}
-"#;
-        let script = parse_acmd_script(source);
-        assert!(script.to_add_speed_no_limit_events().is_empty());
-        assert!(script.to_correct_events().is_empty());
-        let emitted = preview_game_fn(&script, "x");
-        assert!(emitted.contains("macros::ADD_SPEED_NO_LIMIT(agent, 0);"));
-        assert!(emitted.contains("macros::ADD_SPEED_NO_LIMIT(agent, 0, 1, 2);"));
-        assert!(emitted.contains("macros::CORRECT(agent);"));
-        assert!(emitted.contains("macros::CORRECT(agent, 1, 2);"));
-    }
-
-    /// Issue 34: the motion list spells the mid forward tilt/smash
-    /// `attack_s3_s` / `attack_s4_s` while the scripts (and the archive) spell
-    /// them `attacks3` / `attacks4`. The motion's own spelling is tried first
-    /// so Ryu/Ken's real `AttackS3S.txt` still wins for them.
     #[test]
     fn ftilt_and_fsmash_motions_fall_back_to_their_script_spelling() {
         assert_eq!(
@@ -12594,5 +20625,377 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
             emitted.contains("fn game_attacks3("),
             "expected game_attacks3, got: {emitted}"
         );
+    }
+
+    fn optional_feedback_calls(
+        stmts: &[crate::data::AcmdStmt],
+    ) -> Vec<crate::data::OptionalHitFeedbackCall> {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+        let mut calls = Vec::new();
+        for stmt in stmts {
+            match stmt {
+                AcmdStmt::Excute(commands) => calls.extend(commands.iter().filter_map(|command| {
+                    if let ExcuteStmt::OptionalHitFeedback(call) = command {
+                        Some(call.clone())
+                    } else {
+                        None
+                    }
+                })),
+                AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
+                    calls.extend(optional_feedback_calls(body));
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
+    #[test]
+    fn optional_hit_feedback_parses_emits_and_serializes_closed_hash40_values() {
+        use crate::data::{Hash40Literal, OptionalHitFeedbackKind};
+
+        let source = r#"unsafe extern "C" fn game_feedback(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 2, Hash40::new("sys_hit_fire"));
+        AttackModule::set_optional_hit_sound(agent.module_accessor, 4, Hash40::new_raw(0x148397b09f));
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 1, Hash40::new("custom \"feedback\"\\variant"));
+        AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new("line\nλ\t\u{1f}"));
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new_raw(0xffffffffffffffff));
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let calls = optional_feedback_calls(&parsed.stmts);
+        assert_eq!(calls.len(), 5, "all five direct calls must be typed");
+        assert_eq!(calls[0].kind, OptionalHitFeedbackKind::Effect);
+        assert_eq!(calls[0].arg2, 2);
+        assert_eq!(calls[0].hash, Hash40Literal::Name("sys_hit_fire".into()));
+        assert_eq!(calls[1].kind, OptionalHitFeedbackKind::Sound);
+        assert_eq!(calls[1].hash, Hash40Literal::Raw(0x148397b09f));
+        assert_eq!(
+            calls[2].hash,
+            Hash40Literal::Name("custom \"feedback\"\\variant".into())
+        );
+        assert_eq!(calls[3].hash, Hash40Literal::Name("line\nλ\t\u{1f}".into()));
+        assert_eq!(calls[4].hash, Hash40Literal::Raw(u64::MAX));
+        assert_eq!(
+            serde_json::to_value(crate::data::ExcuteStmt::OptionalHitFeedback(
+                calls[0].clone()
+            ))
+            .unwrap(),
+            serde_json::json!({"optional_hit_feedback": {"kind": "effect", "arg2": 2, "hash": {"name": "sys_hit_fire"}}}),
+            "native command and closed kind serde IDs remain stable"
+        );
+
+        let emitted = preview_game_fn(&parsed, "feedback");
+        assert!(emitted.contains("AttackModule::set_optional_hit_effect(agent.module_accessor, 2, Hash40::new(\"sys_hit_fire\"));"));
+        assert!(emitted.contains("AttackModule::set_optional_hit_sound(agent.module_accessor, 4, Hash40::new_raw(0x148397b09f));"));
+        assert!(emitted.contains("AttackModule::set_optional_hit_effect(agent.module_accessor, 1, Hash40::new(\"custom \\\"feedback\\\"\\\\variant\"));"));
+        assert!(
+            syn::parse_file(&emitted).is_ok(),
+            "Debug string escaping must emit valid Rust for control and Unicode values"
+        );
+        assert!(
+            emitted.contains("Hash40::new_raw(0xffffffffffffffff)"),
+            "raw Hash40 values retain full u64 width without masking"
+        );
+        assert_json_eq!(
+            parse_acmd_script(&emitted),
+            &parsed,
+            "whole Execute tree must round-trip through source"
+        );
+
+        let name_json =
+            serde_json::to_value(Hash40Literal::Name("modded_feedback".into())).unwrap();
+        let raw_json = serde_json::to_value(Hash40Literal::Raw(0x1234)).unwrap();
+        assert_eq!(name_json["name"], "modded_feedback");
+        assert_eq!(raw_json["raw"], 0x1234);
+        assert_eq!(
+            serde_json::from_value::<Hash40Literal>(name_json).unwrap(),
+            Hash40Literal::Name("modded_feedback".into())
+        );
+        assert_eq!(
+            serde_json::from_value::<Hash40Literal>(raw_json).unwrap(),
+            Hash40Literal::Raw(0x1234)
+        );
+        assert_eq!(
+            serde_json::from_value::<Hash40Literal>(
+                serde_json::to_value(Hash40Literal::Raw(u64::MAX)).unwrap(),
+            )
+            .unwrap(),
+            Hash40Literal::Raw(u64::MAX),
+            "raw values preserve all 64 ABI bits through serde"
+        );
+        assert!(!Hash40Literal::Name(String::new()).is_valid());
+        assert!(!Hash40Literal::Name("x".repeat(256)).is_valid());
+        assert!(!Hash40Literal::Name("x\0y".into()).is_valid());
+        assert!(!crate::data::OptionalHitFeedbackCall {
+            kind: OptionalHitFeedbackKind::Effect,
+            arg2: -1,
+            hash: Hash40Literal::Name("valid".into()),
+        }
+        .is_valid());
+        assert!(!crate::data::OptionalHitFeedbackCall {
+            kind: OptionalHitFeedbackKind::Effect,
+            arg2: 5,
+            hash: Hash40Literal::Name("valid".into()),
+        }
+        .is_valid());
+    }
+
+    #[test]
+    fn optional_hit_feedback_rejects_unmeasured_shape_and_context_without_losing_source() {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+
+        // Each source is independently valid Rust; rejection is due to the closed native
+        // admission boundary, not a malformed sibling or an empty parse result.
+        let cases = [
+            ("wrong receiver", "AttackModule::set_optional_hit_effect(other.module_accessor, 0, Hash40::new(\"x\"));"),
+            ("wrong method base", "OtherModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"x\"));"),
+            ("wrapper", "consume(AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new(\"x\")));"),
+            ("attribute", "#[allow(unused)]\n        AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"x\"));"),
+            ("nested", "if true {\n            AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"x\"));\n        }"),
+            ("negative arg2", "AttackModule::set_optional_hit_effect(agent.module_accessor, -1, Hash40::new(\"x\"));"),
+            ("arg2 above observed bound", "AttackModule::set_optional_hit_effect(agent.module_accessor, 5, Hash40::new(\"x\"));"),
+            ("nonliteral hash", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, make_hash());"),
+            ("name expression", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(name));"),
+            ("leading-colon constructor", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, ::Hash40::new(\"x\"));"),
+            ("empty name", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"\"));"),
+            ("nul name", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"\\0\"));"),
+            ("raw decimal", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new_raw(1234));"),
+            ("raw suffixed", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new_raw(0x12u64));"),
+            ("extra arg", "AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"x\"), 1);"),
+        ];
+        for (label, statement) in cases {
+            let source = format!("unsafe extern \"C\" fn game_negative(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {statement}\n    }}\n}}\n");
+            assert!(
+                syn::parse_file(&source).is_ok(),
+                "{label}: negative fixture must be valid Rust"
+            );
+            let parsed = parse_acmd_script(&source);
+            assert!(
+                optional_feedback_calls(&parsed.stmts).is_empty(),
+                "{label}: unsupported source became typed"
+            );
+            let preserved = parsed.stmts.iter().any(|stmt| match stmt {
+                AcmdStmt::Excute(commands) => commands.iter().any(|command| matches!(command, ExcuteStmt::Raw(raw) if raw.contains("set_optional_hit_"))),
+                _ => false,
+            });
+            assert!(
+                preserved,
+                "{label}: original native source was not retained: {parsed:?}"
+            );
+            assert!(
+                preview_game_fn(&parsed, "negative").contains("set_optional_hit_"),
+                "{label}: emitted source lost the native call"
+            );
+        }
+
+        // A malformed sibling invalidates the complete execute block admission set. This is
+        // intentionally separate from the independent well-formed negative cases above.
+        let malformed = r#"unsafe extern "C" fn game_malformed(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new("x"));
+        let broken = ;
+    }
+}
+"#;
+        let parsed = parse_acmd_script(malformed);
+        assert!(optional_feedback_calls(&parsed.stmts).is_empty());
+        assert!(parsed.stmts.iter().any(|stmt| matches!(stmt, AcmdStmt::Excute(commands) if commands.iter().any(|command| matches!(command, ExcuteStmt::Raw(raw) if raw.contains("set_optional_hit_effect"))) && commands.iter().any(|command| matches!(command, ExcuteStmt::Raw(raw) if raw.contains("let broken = ;"))))), "malformed complete execute must retain both the call and malformed sibling as Raw: {parsed:?}");
+        let emitted = preview_game_fn(&parsed, "malformed");
+        assert!(emitted
+            .contains("set_optional_hit_effect(agent.module_accessor, 0, Hash40::new(\"x\"));"));
+        assert!(
+            emitted.contains("let broken = ;"),
+            "malformed sibling text must not be repaired"
+        );
+        assert!(
+            syn::parse_file(&emitted).is_err(),
+            "source-only compilation must refuse malformed original syntax"
+        );
+        let graph = crate::move_nodes::model::MoveGraph {
+            tracks: vec![crate::move_nodes::timeline::import_for_fighter(
+                "mario",
+                crate::move_nodes::model::Track::Game,
+                &parsed,
+            )],
+            ..Default::default()
+        };
+        let errors = crate::move_nodes::timeline::compile("mario", "malformed", &graph)
+            .expect_err("malformed original source must fail closed before source export");
+        assert!(errors.iter().any(|error| error
+            .reason
+            .starts_with("generated ACMD failed Rust parsing:")));
+    }
+
+    #[test]
+    fn hash40_literal_parser_rejects_leading_colon_and_attribute_expressions() {
+        let base = syn::parse_str::<syn::Expr>("Hash40::new(\"name\")")
+            .expect("baseline exact Hash40 expression parses");
+        assert!(parse_hash40_literal_expr(base.clone()).is_some());
+
+        let mut call_attribute = base.clone();
+        let syn::Expr::Call(call) = &mut call_attribute else {
+            panic!("expected call expression")
+        };
+        call.attrs.push(syn::parse_quote!(#[allow(unused)]));
+        assert!(
+            parse_hash40_literal_expr(call_attribute).is_none(),
+            "call attributes are not part of the closed grammar"
+        );
+
+        let mut path_attribute = base.clone();
+        let syn::Expr::Call(call) = &mut path_attribute else {
+            panic!("expected call expression")
+        };
+        let syn::Expr::Path(path) = call.func.as_mut() else {
+            panic!("expected constructor path")
+        };
+        path.attrs.push(syn::parse_quote!(#[allow(unused)]));
+        assert!(
+            parse_hash40_literal_expr(path_attribute).is_none(),
+            "path attributes are not part of the closed grammar"
+        );
+
+        let mut literal_attribute = base;
+        let syn::Expr::Call(call) = &mut literal_attribute else {
+            panic!("expected call expression")
+        };
+        let syn::Expr::Lit(literal) = call.args.first_mut().expect("one string argument") else {
+            panic!("expected string literal")
+        };
+        literal.attrs.push(syn::parse_quote!(#[allow(unused)]));
+        assert!(
+            parse_hash40_literal_expr(literal_attribute).is_none(),
+            "literal attributes are not part of the closed grammar"
+        );
+
+        assert!(parse_hash40_literal("::Hash40::new(\"name\")").is_none());
+        let leading_colon = r#"unsafe extern "C" fn game_hash40_leading_colon(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 0, ::Hash40::new("name"));
+    }
+}
+"#;
+        assert!(syn::parse_file(leading_colon).is_ok());
+        let parsed = parse_acmd_script(leading_colon);
+        assert!(optional_feedback_calls(&parsed.stmts).is_empty());
+        let emitted = preview_game_fn(&parsed, "hash40_leading_colon");
+        assert!(
+            emitted.contains("::Hash40::new(\"name\")"),
+            "rejected constructor source must not be normalized: {emitted}"
+        );
+    }
+
+    #[test]
+    fn optional_hit_feedback_is_game_execute_only_and_source_only_in_graph() {
+        use crate::data::ExcuteStmt;
+        use crate::move_nodes::model::{MoveGraph, NodeKind, Track};
+
+        let source = r#"unsafe extern "C" fn game_context(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_optional_hit_effect(agent.module_accessor, 0, Hash40::new("direct"));
+        if true {
+            AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new("nested"));
+        }
+        consume(AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new("wrapped")));
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        assert_eq!(optional_feedback_calls(&parsed.stmts).len(), 1);
+        let emitted = preview_game_fn(&parsed, "context");
+        assert!(emitted.contains(
+            "set_optional_hit_sound(agent.module_accessor, 0, Hash40::new(\"nested\"));"
+        ));
+        assert!(emitted.contains("consume(AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new(\"wrapped\")));"));
+
+        let graph = MoveGraph {
+            tracks: vec![crate::move_nodes::timeline::import_for_fighter(
+                "mario",
+                Track::Game,
+                &parsed,
+            )],
+            ..Default::default()
+        };
+        let compiled = crate::move_nodes::timeline::compile("mario", "context", &graph).unwrap();
+        assert!(crate::move_nodes::live_support::source_only_tracks(&graph)
+            .any(|track| track == Track::Game));
+        let reimported =
+            crate::move_nodes::timeline::import_for_fighter("mario", Track::Game, &compiled[0].1);
+        fn count_editable(nodes: &[crate::move_nodes::model::MoveNode]) -> usize {
+            nodes
+                .iter()
+                .map(|node| match &node.kind {
+                    NodeKind::Execute { commands } => commands
+                        .iter()
+                        .filter(|command| matches!(command, ExcuteStmt::OptionalHitFeedback(_)))
+                        .count(),
+                    NodeKind::MixedExecute { commands } => commands
+                        .iter()
+                        .filter(|command| {
+                            matches!(
+                                command,
+                                crate::move_nodes::model::MoveCommand::Editable(
+                                    ExcuteStmt::OptionalHitFeedback(_)
+                                )
+                            )
+                        })
+                        .count(),
+                    NodeKind::Repeat { body, .. } => count_editable(body),
+                    NodeKind::Branch {
+                        then_nodes,
+                        else_nodes,
+                        ..
+                    } => count_editable(then_nodes) + count_editable(else_nodes),
+                    _ => 0,
+                })
+                .sum()
+        }
+        assert_eq!(
+            count_editable(&reimported.nodes),
+            1,
+            "only direct source statement is editable"
+        );
+        let sound_script = r#"unsafe extern "C" fn game_sound_context(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_optional_hit_sound(agent.module_accessor, 0, Hash40::new("sound_track"));
+    }
+}
+"#;
+        let sound_parsed = parse_acmd_script(sound_script);
+        assert_eq!(
+            optional_feedback_calls(&sound_parsed.stmts).len(),
+            1,
+            "source parser recognizes the exact Game execute shape"
+        );
+        let sound_graph = MoveGraph {
+            tracks: vec![crate::move_nodes::timeline::import_for_fighter(
+                "mario",
+                Track::Sound,
+                &sound_parsed,
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            count_editable(&sound_graph.tracks[0].nodes),
+            0,
+            "wrong track does not authorize Game-only command"
+        );
+        let emitted_sound =
+            crate::move_nodes::timeline::compile("mario", "sound_context", &sound_graph).unwrap();
+        assert!(preview_game_fn(&emitted_sound[0].1, "sound_context")
+            .contains("set_optional_hit_sound"));
+
+        let unknown_owner =
+            crate::move_nodes::timeline::import_for_fighter("not_a_fighter", Track::Game, &parsed);
+        assert!(matches!(
+            unknown_owner.nodes.as_slice(),
+            [crate::move_nodes::model::MoveNode {
+                kind: NodeKind::Preserved { .. },
+                ..
+            }]
+        ));
     }
 }

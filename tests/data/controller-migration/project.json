@@ -1,0 +1,198 @@
+{
+  "version": 5,
+  "name": "Event driven cooldown",
+  "fighters": {
+    "mario": {
+      "move_graphs": {
+        "attack11": {
+          "version": 1,
+          "tracks": [
+            {
+              "track": "game",
+              "nodes": [
+                {
+                  "id": 1,
+                  "kind": {
+                    "execute": {
+                      "commands": [
+                        {
+                          "GimmickEvent": {
+                            "name": "begin"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "variables": [
+            {
+              "name": "counter",
+              "kind": "Int",
+              "initial": {
+                "Int": 0
+              }
+            },
+            {
+              "name": "cooldown",
+              "kind": "Timer",
+              "initial": {
+                "Int": 3
+              }
+            }
+          ],
+          "variable_scopes": {
+            "cooldown": "move_local"
+          },
+          "triggers": [
+            {
+              "name": "begin_cooldown",
+              "source": {
+                "event": {
+                  "name": "begin"
+                }
+              },
+              "actions": [
+                {
+                  "Set": {
+                    "var": "cooldown",
+                    "value": {
+                      "Const": {
+                        "Int": 4
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "name": "finish_cooldown",
+              "source": {
+                "timer_expired": {
+                  "timer": "cooldown"
+                }
+              },
+              "guard": {
+                "Compare": {
+                  "op": "Gte",
+                  "left": {
+                    "Var": "counter"
+                  },
+                  "right": {
+                    "Const": {
+                      "Int": 0
+                    }
+                  }
+                }
+              },
+              "actions": [
+                {
+                  "Add": {
+                    "var": "counter",
+                    "value": {
+                      "Const": {
+                        "Int": 1
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "routines": {
+            "increment": [
+              {
+                "Add": {
+                  "var": "counter",
+                  "value": {
+                    "Const": {
+                      "Int": 2
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "routine_calls": {
+            "begin_cooldown": [
+              {
+                "routine": "increment",
+                "before": 0
+              }
+            ]
+          }
+        }
+      },
+      "display": "",
+      "acmd": {},
+      "effect_calls": {},
+      "effect_calls_full": {},
+      "effect_dropped_lines": {},
+      "effect_frame_residue": {},
+      "sound_scripts": {},
+      "expression_scripts": {},
+      "capture_branch_warnings": {},
+      "move_sources": {},
+      "eff": null,
+      "live_tweaks": [],
+      "behavior": {
+        "initial": "active",
+        "states": [
+          {
+            "name": "active"
+          }
+        ],
+        "vars": [
+          {
+            "name": "counter",
+            "kind": "Int",
+            "initial": {
+              "Int": 0
+            }
+          }
+        ],
+        "transitions": [
+          {
+            "from": "active",
+            "to": "active",
+            "guard": {
+              "Compare": {
+                "op": "Eq",
+                "left": {
+                  "Const": {
+                    "Int": 1
+                  }
+                },
+                "right": {
+                  "Const": {
+                    "Int": 1
+                  }
+                }
+              }
+            },
+            "on_frame": true,
+            "actions": [
+              {
+                "Reset": {
+                  "var": "counter"
+                }
+              }
+            ]
+          }
+        ],
+        "emission_plan": {
+          "bindings": [
+            {
+              "hook": "onStockStart",
+              "transitions": [
+                0
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

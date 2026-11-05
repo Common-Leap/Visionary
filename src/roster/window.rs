@@ -1,4 +1,4 @@
-//! The Roster window: mod library, character select screen, new characters, and traits.
+//! The Roster window: mod library, character select, new characters, and traits.
 //!
 //! A separate viewport rather than a panel in the main window, for the same reason the Eff
 //! Editor is one: it is a whole workspace, and the main window's space belongs to the move
@@ -112,7 +112,16 @@ impl RosterTab {
                 (n > 0).then_some(n)
             }
             Self::Traits => {
-                let n: usize = window.params.values().map(|p| p.field_count()).sum();
+                let n: usize = window
+                    .params
+                    .values()
+                    .map(|params| {
+                        params
+                            .files
+                            .get(super::traits::FIGHTER_PARAM_PATH)
+                            .map_or(0, std::collections::BTreeMap::len)
+                    })
+                    .sum();
                 (n > 0).then_some(n)
             }
         }
@@ -178,6 +187,20 @@ pub struct RosterWindow {
     /// Sparse fighter-value edits, fighter name → edits. Read by `app.rs` when it builds the
     /// project file and replaced wholesale when a project is loaded, exactly like `project`.
     pub params: std::collections::BTreeMap<String, ParamMod>,
+    /// Persisted constrained behavior graphs authored in the main editor.
+    /// Keeping them here makes the project file and the visible editor share
+    /// one session-owned source of truth.
+    pub behaviors: std::collections::BTreeMap<String, crate::gimmicks::behavior::BehaviorGraph>,
+    pub behavior_layouts:
+        std::collections::BTreeMap<String, crate::gimmicks::field_canvas::FieldLayout>,
+    /// Independent authored controllers, retained even while their field is closed.
+    pub controller_charts: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::mod_project::ControllerChart>,
+    >,
+    /// Persisted meter bindings, retained independently of whether their
+    /// editor is currently open.
+    pub meters: std::collections::BTreeMap<String, Vec<crate::gimmicks::meter::MeterBinding>>,
     tab: RosterTab,
     status: String,
     import: Option<ImportJob>,
@@ -198,6 +221,9 @@ pub struct RosterWindow {
     /// Game roots in lookup order: the data root, then enabled mod roots in load order.
     /// Refreshed each frame from the library so a disabled mod stops providing files.
     roots: Vec<PathBuf>,
+    /// ArcExplorer's export folder, which may contain parameter files absent
+    /// from the main data root.
+    export_root: Option<PathBuf>,
     /// hash40 → parameter field name, supplied by `app.rs` from the label download. The
     /// parameter files store hashes, and the full-field view has nothing to show without them.
     labels: std::collections::HashMap<u64, String>,
@@ -216,6 +242,10 @@ impl Default for RosterWindow {
             authored_moves: Default::default(),
             edit_target: None,
             params: Default::default(),
+            behaviors: Default::default(),
+            behavior_layouts: Default::default(),
+            controller_charts: Default::default(),
+            meters: Default::default(),
             tab: RosterTab::Library,
             status: String::new(),
             import: None,
@@ -227,12 +257,58 @@ impl Default for RosterWindow {
             expanded_conflict: None,
             rename: None,
             roots: Vec::new(),
+            export_root: None,
             labels: Default::default(),
         }
     }
 }
 
 impl RosterWindow {
+    /// Supply ArcExplorer's export folder as a read-only fallback for base
+    /// game files. The main data root still wins when both contain a path.
+    pub fn set_export_root(&mut self, root: Option<PathBuf>) {
+        self.export_root = root;
+    }
+
+    pub fn set_parameter_labels(&mut self, labels: &std::collections::HashMap<u64, String>) {
+        if self.labels != *labels {
+            self.labels = labels.clone();
+            self.traits.invalidate();
+        }
+    }
+
+    /// Personal files resolve the winning enabled mod first, followed by base dumps.
+    /// Main-editor controls and personal-file export must use the same baseline.
+    pub fn gimmick_roots(&self, data_root: Option<&PathBuf>) -> Vec<PathBuf> {
+        self.library
+            .enabled()
+            .rev()
+            .map(|entry| entry.root.clone())
+            .chain(data_root.into_iter().cloned())
+            .chain(self.export_root.iter().cloned())
+            .fold(Vec::new(), |mut roots, root| {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+                roots
+            })
+    }
+
+    /// Preserve the existing shared roster/CSS lookup order independently.
+    fn content_roots(&self, data_root: Option<&PathBuf>) -> Vec<PathBuf> {
+        data_root
+            .into_iter()
+            .cloned()
+            .chain(self.export_root.iter().cloned())
+            .chain(self.library.enabled_roots())
+            .fold(Vec::new(), |mut roots, root| {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+                roots
+            })
+    }
+
     /// Load the saved library and adopt any pre-library `mod_roots` entries.
     ///
     /// Deferred to first use rather than done at construction: it walks every mod's files, and
@@ -258,11 +334,7 @@ impl RosterWindow {
     /// user who never opened this window would otherwise export with an empty index and
     /// report every one of its own edits as unwritable.
     fn refresh(&mut self, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
-        self.roots = data_root
-            .into_iter()
-            .cloned()
-            .chain(self.library.enabled_roots())
-            .collect();
+        self.roots = self.content_roots(data_root);
         self.css.ensure_loaded(&self.roots);
         self.index = RosterIndex::build(fighters, &self.library, &self.project, self.css.db());
     }
@@ -296,6 +368,14 @@ impl RosterWindow {
             self.param_root().as_deref(),
             &self.params,
             &self.labels,
+            &mut report,
+        )?;
+        // Personal files are one per fighter rather than one shared file, so
+        // this walks the same roots and patches each fighter's own clone.
+        crate::gimmicks::export::export_personal(
+            mod_root,
+            &self.gimmick_roots(data_root),
+            &self.params,
             &mut report,
         )?;
         super::export::export_authored_files(mod_root, &self.roots, &roster.authored, &mut report)?;
@@ -452,6 +532,7 @@ impl RosterWindow {
         fighters: &[FighterEntry],
         data_root: Option<&PathBuf>,
         labels: &std::collections::HashMap<u64, String>,
+        game_link: &crate::game_link::GameLink,
     ) {
         if !self.open {
             return;
@@ -459,10 +540,7 @@ impl RosterWindow {
         // Labels arrive asynchronously and grow; clone when contents differ rather
         // than only on length – two maps of the same length with different keys
         // would otherwise keep showing stale names.
-        if self.labels != *labels {
-            self.labels = labels.clone();
-            self.traits.invalidate();
-        }
+        self.set_parameter_labels(labels);
         self.ensure_initialized(&[]);
         self.poll_import(ctx);
         self.refresh(fighters, data_root);
@@ -477,7 +555,7 @@ impl RosterWindow {
                 .with_min_inner_size([860.0, 520.0]),
             |ui, class| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
-                    self.ui_contents(ui, fighters, data_root);
+                    self.ui_contents(ui, fighters, data_root, game_link);
                 });
                 if class != egui::ViewportClass::EmbeddedWindow
                     && ui.ctx().input(|i| i.viewport().close_requested())
@@ -488,7 +566,13 @@ impl RosterWindow {
         );
     }
 
-    fn ui_contents(&mut self, ui: &mut Ui, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
+    fn ui_contents(
+        &mut self,
+        ui: &mut Ui,
+        fighters: &[FighterEntry],
+        data_root: Option<&PathBuf>,
+        _game_link: &crate::game_link::GameLink,
+    ) {
         // Larger type for the whole roster workspace, applied once here so
         // every tab inherits it without touching each label. `.small()` stays
         // relative — it still reads as secondary text, just legibly so.
@@ -741,7 +825,7 @@ impl RosterWindow {
                         parts.push(format!("{} new", summary.authored));
                     }
                     if summary.params > 0 {
-                        parts.push(format!("{} traits", summary.params));
+                        parts.push(format!("{} fighter values", summary.params));
                     }
                     context.push_str(&format!(" · will export {}", parts.join(" · ")));
                 }
@@ -847,7 +931,7 @@ impl RosterWindow {
                         }
                         ui.add_space(4.0);
                         if ui
-                            .add(egui::Button::new("Import folder…"))
+                            .add(egui::Button::new("Import folder"))
                             .on_hover_text(
                                 "Pick a folder containing fighter/, effect/, or ui/ — or a folder that \
                                  wraps one.",
@@ -862,7 +946,7 @@ impl RosterWindow {
                             }
                         }
                         if ui
-                            .add(egui::Button::new("Import archives…"))
+                            .add(egui::Button::new("Import archives"))
                             .on_hover_text(
                                 "Pick any number of .zip / .7z mod archives. Archives are extracted for you; \
                                  folders are used in place, so your own edits stay visible.",
@@ -1570,4 +1654,133 @@ fn import_worker(paths: Vec<PathBuf>, sender: Sender<ImportMsg>) {
         }
     }
     let _ = sender.send(ImportMsg::Finished);
+}
+
+#[cfg(test)]
+mod gimmick_root_tests {
+    use super::*;
+
+    fn add_mod(window: &mut RosterWindow, root: &std::path::Path, enabled: bool) {
+        window.library.insert(library::PreparedMod {
+            name: root.display().to_string(),
+            source: ModSource::Folder(root.to_path_buf()),
+            root: root.to_path_buf(),
+            detection: library::RootDetection::AsGiven,
+            manifest: Default::default(),
+        });
+        window.library.mods.last_mut().unwrap().enabled = enabled;
+    }
+
+    #[test]
+    fn personal_baselines_follow_enabled_mod_priority_and_deduplicate() {
+        let mut window = RosterWindow::default();
+        let data = PathBuf::from("base");
+        window.set_export_root(Some(PathBuf::from("dump")));
+        add_mod(&mut window, std::path::Path::new("early"), true);
+        add_mod(&mut window, std::path::Path::new("late"), true);
+        add_mod(&mut window, std::path::Path::new("disabled"), false);
+        add_mod(&mut window, &data, true);
+        assert_eq!(
+            window.gimmick_roots(Some(&data)),
+            ["base", "late", "early", "dump"].map(PathBuf::from)
+        );
+        assert_eq!(
+            window.content_roots(Some(&data)),
+            ["base", "dump", "early", "late"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn personal_lookup_falls_back_without_writing_source_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let early = fixture.path().join("early");
+        let late = fixture.path().join("late");
+        let relative = "fighter/mario/param/vl.prc";
+        for (root, bytes) in [
+            (&base, b"base".as_slice()),
+            (&early, b"early".as_slice()),
+            (&late, b"late".as_slice()),
+        ] {
+            std::fs::create_dir_all(root.join("fighter/mario/param")).unwrap();
+            std::fs::write(root.join(relative), bytes).unwrap();
+        }
+        let mut window = RosterWindow::default();
+        add_mod(&mut window, &early, true);
+        add_mod(&mut window, &late, true);
+        let locate = |window: &RosterWindow| {
+            crate::gimmicks::params::locate_personal(&window.gimmick_roots(Some(&base)), "mario")
+                .unwrap()
+        };
+        assert_eq!(locate(&window), late.join(relative));
+        window.library.mods[1].enabled = false;
+        assert_eq!(locate(&window), early.join(relative));
+        window.library.mods[0].enabled = false;
+        assert_eq!(locate(&window), base.join(relative));
+        for (root, bytes) in [
+            (&base, b"base".as_slice()),
+            (&early, b"early".as_slice()),
+            (&late, b"late".as_slice()),
+        ] {
+            assert_eq!(std::fs::read(root.join(relative)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn personal_export_patches_the_winning_mod_and_preserves_its_other_values() {
+        use crate::gimmicks::{params, paths::NestedPath};
+        use crate::mod_project::ParamValue;
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let custom = fixture.path().join("custom");
+        let output = fixture.path().join("output");
+        let relative = "fighter/mario/param/vl.prc";
+        for (root, untouched) in [(&base, 1.0), (&custom, 7.0)] {
+            std::fs::create_dir_all(root.join("fighter/mario/param")).unwrap();
+            let tree = prc::ParamStruct(vec![
+                (
+                    prc::hash40::Hash40(hash40::hash40("charge_rate").0),
+                    prc::ParamKind::Float(2.0),
+                ),
+                (
+                    prc::hash40::Hash40(hash40::hash40("untouched").0),
+                    prc::ParamKind::Float(untouched),
+                ),
+            ]);
+            params::save_personal(&tree, &root.join(relative), "mario").unwrap();
+        }
+        let source_before = std::fs::read(custom.join(relative)).unwrap();
+        let mut window = RosterWindow {
+            initialized: true,
+            ..Default::default()
+        };
+        add_mod(&mut window, &custom, true);
+        params::record_personal_edit(
+            window.params.entry("mario".into()).or_default(),
+            "mario",
+            &NestedPath::parse("charge_rate").unwrap(),
+            ParamValue::Float(4.0),
+            Some(ParamValue::Float(2.0)),
+        )
+        .unwrap();
+        window
+            .export_into(&output, &RosterMod::default(), &[], Some(&base))
+            .unwrap();
+        let exported = params::open_personal(&output.join(relative), "mario").unwrap();
+        assert_eq!(
+            params::read_leaf(
+                &exported,
+                "mario",
+                &NestedPath::parse("charge_rate").unwrap()
+            )
+            .unwrap(),
+            ParamValue::Float(4.0)
+        );
+        assert_eq!(
+            params::read_leaf(&exported, "mario", &NestedPath::parse("untouched").unwrap())
+                .unwrap(),
+            ParamValue::Float(7.0)
+        );
+        assert_eq!(std::fs::read(custom.join(relative)).unwrap(), source_before);
+    }
 }

@@ -2,8 +2,7 @@
 //!
 //! What this produces is a costume slot with its own model, animations, effects, name, and
 //! **moveset**. What it does not produce is a separate cell on the character select grid —
-//! that needs a runtime costume pin, which is `R-55` on the board and blocked for a measured
-//! reason recorded in `docs/roster/PLAN.md`. The wizard says so before anything is created.
+//! that needs a runtime costume pin, which a known engine limit blocks. The wizard says so before anything is created.
 //!
 //! ## Why the scaffold does not copy the donor's files
 //!

@@ -106,7 +106,3 @@ pub fn hash_label(hash: u64) -> String {
 pub fn effect_index(handle: u32) -> u32 {
     handle >> 4
 }
-
-pub fn is_valid_effect_index(handle: u32) -> bool {
-    effect_index(handle) < 625
-}

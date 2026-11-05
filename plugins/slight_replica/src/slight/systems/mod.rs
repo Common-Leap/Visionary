@@ -41,4 +41,5 @@ pub fn clear_all() {
     agent_info::clear();
     init_frame::clear();
     win_screen::clear();
+    crate::slight::gimmicks::clear();
 }

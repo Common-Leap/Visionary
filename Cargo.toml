@@ -49,10 +49,14 @@ anyhow = "1"
 rfd = "0.15"
 dirs = "5"
 tempfile = "3"
+fs2 = "0.4"
+# Parse the caller-selected plugin manifest structurally. A substring check can
+# be satisfied by a comment and is not sufficient for the generated ACMD ABI.
+toml = "0.8"
 # Parses the Rust that Visionary generates, so an export that would not compile is caught
 # before it reaches disk rather than by the user's toolchain. Already in the dependency graph
 # for the host, so this only pulls in the `full` item grammar.
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 # Not used directly — `syn` reports where a parse failed only when proc-macro2 is built with
 # span locations, and "line 41, column 8" is the whole value of that report.
 proc-macro2 = { version = "1", features = ["span-locations"] }

@@ -4,9 +4,6 @@
 //! blank, and there was no notion of "the project I have open". This module gives
 //! that notion a shape that can be tested without a GUI:
 //!
-//! * [`CurrentProject`] tracks the open project's path (persisted) and whether it
-//!   holds edits autosave has not written yet. Edits autosave when a path is
-//!   known; Save As relocates; Export/Load adopt the path they touched.
 //! * [`HubState`] models the cold-start hub — Resume last / New / Open
 //!   (`modproject.json`) / Import mod / Recent / Browse without project — and the
 //!   mid-session reopen with its not-yet-autosaved guard.
@@ -34,80 +31,6 @@ pub const LAST_PROJECT_KEY: &str = "project_path";
 /// Config file holding recent project paths (one absolute path per line).
 pub const RECENT_PROJECTS_KEY: &str = "recent_projects";
 
-/// One current project holds every edit.
-#[derive(Debug, Clone, Default)]
-pub struct CurrentProject {
-    /// Where edits autosave. `None` means "never saved yet".
-    pub path: Option<PathBuf>,
-    /// True once any edit lands after the last autosave/load.
-    pub dirty: bool,
-    /// Display name (`modproject.json`'s `name`), for the hub and title bar.
-    pub name: String,
-}
-
-/// Dirty-tracking model for the hub window. The app still tracks saves with
-/// its own snapshot comparison; this model and its tests are the staged
-/// replacement — wire the hub UI to it (or remove it) rather than letting the
-/// two trackers drift.
-#[allow(dead_code)]
-impl CurrentProject {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_path(path: PathBuf, name: String) -> Self {
-        Self {
-            path: Some(path),
-            dirty: false,
-            name,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn has_path(&self) -> bool {
-        self.path.is_some()
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Any edit lands here. Called by every mutation path (or, failing that,
-    /// derived by comparing against the last autosaved snapshot).
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    /// A successful autosave/load/export-adopt clears the flag and records the path.
-    pub fn mark_saved(&mut self, path: PathBuf) {
-        self.path = Some(path);
-        self.dirty = false;
-    }
-
-    /// Loading a project (or New) replaces the current one clean.
-    #[allow(dead_code)]
-    pub fn mark_loaded(&mut self, path: Option<PathBuf>, name: String) {
-        self.path = path;
-        self.name = name;
-        self.dirty = false;
-    }
-
-    #[allow(dead_code)]
-    pub fn mark_clean(&mut self) {
-        self.dirty = false;
-    }
-
-    /// Autosave needs Save As when there is no path yet.
-    pub fn needs_save_as(&self) -> bool {
-        self.path.is_none()
-    }
-
-    /// Switching projects with edits autosave has not written must warn first.
-    pub fn needs_warning(&self) -> bool {
-        self.dirty
-    }
-}
-
 /// What the hub can do. Pure so the cold-start matrix is testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubAction {
@@ -133,18 +56,6 @@ impl HubAction {
     pub fn discards_edits(&self) -> bool {
         !matches!(self, HubAction::BrowseWithoutProject)
     }
-
-    #[allow(dead_code)]
-    pub fn label(&self) -> String {
-        match self {
-            HubAction::ResumeLast(path) => format!("Resume {}", path.display()),
-            HubAction::New(path) => format!("New project at {}", path.display()),
-            HubAction::Open(path) => format!("Open {}", path.display()),
-            HubAction::ImportMod(path) => format!("Import {}", path.display()),
-            HubAction::OpenRecent(path) => format!("Open {}", path.display()),
-            HubAction::BrowseWithoutProject => "Browse without project".to_string(),
-        }
-    }
 }
 
 /// True when choosing `action` with `dirty` edits autosave has not written must warn first.
@@ -155,6 +66,7 @@ pub fn needs_hub_warning(dirty: bool, action: &HubAction) -> bool {
 /// The hub's cold-start state, derived from persisted config.
 #[derive(Debug, Clone, Default)]
 pub struct HubState {
+    pub new_workspace: Option<String>,
     /// Whether the hub window is currently shown.
     pub show: bool,
     /// Last project path that still exists on disk, if any.
@@ -175,56 +87,7 @@ impl HubState {
             show: true,
             last,
             recent,
-        }
-    }
-
-    /// The actions the hub offers right now, in display order.
-    /// Same staged-model note as [`CurrentProject`]: tested, not yet wired.
-    #[allow(dead_code)]
-    pub fn choices(&self) -> Vec<HubChoice> {
-        let mut out = Vec::new();
-        if let Some(last) = &self.last {
-            out.push(HubChoice::ResumeLast(last.clone()));
-        }
-        out.push(HubChoice::New);
-        out.push(HubChoice::Open);
-        out.push(HubChoice::ImportMod);
-        for path in &self.recent {
-            // Resume already covers the most recent path; listing it twice
-            // invites opening it twice.
-            if Some(path) != self.last.as_ref() {
-                out.push(HubChoice::Recent(path.clone()));
-            }
-        }
-        out.push(HubChoice::BrowseWithoutProject);
-        out
-    }
-}
-
-/// One row in the hub window. `Open`/`ImportMod` without a path mean "pick via
-/// dialog"; the `HubAction` variants carry the picked path.
-/// Same staged-model note as [`CurrentProject`]: tested, not yet wired.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HubChoice {
-    ResumeLast(PathBuf),
-    New,
-    Open,
-    ImportMod,
-    Recent(PathBuf),
-    BrowseWithoutProject,
-}
-
-#[allow(dead_code)]
-impl HubChoice {
-    pub fn title(&self) -> &'static str {
-        match self {
-            HubChoice::ResumeLast(_) => "Resume last",
-            HubChoice::New => "New",
-            HubChoice::Open => "Open",
-            HubChoice::ImportMod => "Import mod",
-            HubChoice::Recent(_) => "Recent",
-            HubChoice::BrowseWithoutProject => "Browse without project",
+            new_workspace: None,
         }
     }
 }
@@ -251,11 +114,6 @@ pub fn load_last_project(config_dir: &Path) -> Option<PathBuf> {
 pub fn save_last_project(config_dir: &Path, path: &Path) {
     let _ = std::fs::create_dir_all(config_dir);
     let _ = std::fs::write(last_path(config_dir), path.to_string_lossy().as_bytes());
-}
-
-#[allow(dead_code)]
-pub fn clear_last_project(config_dir: &Path) {
-    let _ = std::fs::remove_file(last_path(config_dir));
 }
 
 pub fn load_recent_projects(config_dir: &Path) -> Vec<PathBuf> {
@@ -289,13 +147,6 @@ pub fn push_recent(config_dir: &Path, path: &Path) -> Vec<PathBuf> {
     save_recent_projects(config_dir, &recent);
     save_last_project(config_dir, path);
     recent
-}
-
-/// Starting fresh (New / Browse without project) clears the last-project resume
-/// but keeps recents: the user may still want to go back.
-#[allow(dead_code)]
-pub fn clear_current(config_dir: &Path) {
-    clear_last_project(config_dir);
 }
 
 // ── Workspace: one folder that holds every edit ──────────────────────────
@@ -1714,42 +1565,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_with_no_config_offers_new_open_import_and_browse() {
+    fn cold_start_with_no_config_shows_the_hub_with_nothing_to_resume() {
         let dir = config();
         let hub = HubState::cold_start(dir.path());
         assert!(hub.show, "the hub must appear on launch");
         assert!(hub.last.is_none());
         assert!(hub.recent.is_empty());
-        let titles: Vec<&str> = hub.choices().iter().map(|c| c.title()).collect();
-        assert_eq!(
-            titles,
-            vec!["New", "Open", "Import mod", "Browse without project"]
-        );
-    }
-
-    #[test]
-    fn resume_leads_and_recent_skips_the_duplicate() {
-        let dir = config();
-        let a = dir.path().join("a/modproject.json");
-        let b = dir.path().join("b/modproject.json");
-        touch(&a);
-        touch(&b);
-        save_last_project(dir.path(), &a);
-        save_recent_projects(dir.path(), &[a.clone(), b.clone()]);
-
-        let hub = HubState::cold_start(dir.path());
-        assert_eq!(hub.last.as_deref(), Some(a.as_path()));
-        // Recent still holds both, but the choices list Resume once.
-        let choices = hub.choices();
-        assert!(matches!(&choices[0], HubChoice::ResumeLast(p) if p == &a));
-        let recents: Vec<&PathBuf> = choices
-            .iter()
-            .filter_map(|c| match c {
-                HubChoice::Recent(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(recents, vec![&b], "Resume must not duplicate its path");
     }
 
     #[test]
@@ -1764,21 +1585,6 @@ mod tests {
             "a missing Resume target must not linger"
         );
         assert!(hub.recent.is_empty());
-    }
-
-    #[test]
-    fn save_clears_dirty_and_save_as_is_needed_only_without_a_path() {
-        let mut current = CurrentProject::new();
-        assert!(current.needs_save_as());
-        assert!(!current.is_dirty());
-        current.mark_dirty();
-        assert!(current.needs_warning());
-        let dir = config();
-        let path = dir.path().join("modproject.json");
-        current.mark_saved(path.clone());
-        assert!(!current.is_dirty());
-        assert!(!current.needs_save_as());
-        assert_eq!(current.path.as_deref(), Some(path.as_path()));
     }
 
     #[test]
@@ -1829,23 +1635,6 @@ mod tests {
             load_last_project(dir.path()).as_deref(),
             Some(paths[0].as_path())
         );
-    }
-
-    #[test]
-    fn save_round_trip_persists_path_and_recent() {
-        let dir = config();
-        let path = dir.path().join("my_mod/modproject.json");
-        touch(&path);
-        let mut current = CurrentProject::with_path(path.clone(), "my_mod".into());
-        current.mark_dirty();
-        // Save adopts the path and clears dirty; hub records it.
-        current.mark_saved(path.clone());
-        push_recent(dir.path(), &path);
-        assert!(!current.is_dirty());
-
-        let hub = HubState::cold_start(dir.path());
-        assert_eq!(hub.last.as_deref(), Some(path.as_path()));
-        assert!(hub.recent.contains(&path));
     }
 
     #[test]
@@ -2585,52 +2374,6 @@ mod tests {
             .mesh_object_groups
             .iter()
             .all(|group| !is_low_lod_mesh(&group.mesh_object_full_name)));
-    }
-
-    #[test]
-    #[ignore = "requires a local asset workspace and vanilla dump"]
-    fn carrier_local_asset_smoke() {
-        let workspace = PathBuf::from(std::env::var_os("VISIONARY_ASSET_WORKSPACE").unwrap());
-        let vanilla = PathBuf::from(std::env::var_os("VISIONARY_ASSET_VANILLA").unwrap());
-        let output = PathBuf::from(std::env::var_os("VISIONARY_ASSET_OUTPUT").unwrap());
-        let fighter = std::env::var("VISIONARY_ASSET_FIGHTER").unwrap();
-        let slot: u8 = std::env::var("VISIONARY_ASSET_SLOT")
-            .unwrap_or_else(|_| "0".into())
-            .parse()
-            .unwrap();
-        let slot_component = format!("c{slot:02}");
-        let bundle = prepare_carrier_assets(
-            &workspace,
-            &fighter,
-            slot,
-            None,
-            Some(&vanilla.join("motion/body").join(&slot_component)),
-            Some(&vanilla.join("model/body").join(&slot_component)),
-            &output,
-        )
-        .unwrap();
-        let textures: Vec<_> = bundle
-            .files
-            .iter()
-            .filter(|f| f.game_path.ends_with(".nutexb"))
-            .collect();
-        for file in &textures {
-            let texture = nutexb::NutexbFile::read_from_file(&file.workspace_path).unwrap();
-            assert!(!texture.data.is_empty());
-        }
-        let list_file = bundle
-            .files
-            .iter()
-            .find(|f| f.game_path.ends_with("/motion_list.bin"))
-            .unwrap();
-        let list = motion_lib::open(&list_file.workspace_path).unwrap();
-        assert!(!list.list.is_empty());
-        eprintln!(
-            "prepared {} files, {} textures, {} motions",
-            bundle.files.len(),
-            textures.len(),
-            list.list.len()
-        );
     }
 
     #[test]

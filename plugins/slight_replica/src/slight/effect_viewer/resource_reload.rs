@@ -486,45 +486,6 @@ pub fn evict_resident_file(file_hash: u64) -> Option<(u32, u32, usize, u32, u8)>
     Some((fp as u32, di, old_data, old_ref_count, old_state))
 }
 
-/// Mark a loaded directory incomplete so the next normal `ensure_dir_loaded` call schedules it.
-///
-/// This is paired with [`evict_resident_file`]. Clearing only the file record makes
-/// `load_effects` return 0: the directory descriptor's flag bit 0 remains set, so the resource
-/// wrapper concludes that the directory is already complete and never asks Arcropolis to read
-/// the missing file. The carrier is already gone and its effect unload has returned when this is
-/// called, so no live owner can be relying on the directory's resource reference.
-///
-/// The function does not enqueue or signal the worker. The replacement item's own loader does
-/// both through the game's normal path.
-pub fn evict_resident_directory(dir_hash: u64) -> Option<(u32, u32, u8, u8, u32)> {
-    let fs = filesystem_info()?;
-    let dir_index = dir_info_index_for_path_hash(dir_hash)?;
-    if fs.loaded_directories.is_null()
-        || dir_index as usize >= fs._loaded_directory_len as usize
-        || fs._mutex.is_null()
-    {
-        return None;
-    }
-    let old = unsafe {
-        skyline::nn::os::LockMutex(fs._mutex.cast());
-        let entry = &mut *fs.loaded_directories.add(dir_index as usize);
-        let old = (
-            dir_index,
-            entry.ref_count.load(Ordering::Acquire),
-            entry.flags,
-            entry.state as u8,
-            entry.incoming_request_count.load(Ordering::Acquire),
-        );
-        entry.ref_count.store(0, Ordering::Release);
-        entry.flags &= !1;
-        entry.state = LoadState::Unloaded;
-        entry.incoming_request_count.store(0, Ordering::Release);
-        skyline::nn::os::UnlockMutex(fs._mutex.cast());
-        old
-    };
-    Some(old)
-}
-
 /// Arc `DirInfo` index for a directory path hash — the index space the game's directory
 /// loader (`FUN_035407a0`/`FUN_03540860` @ 0x35407a0) works in (NOT the search-path index
 /// that `load_effects` takes). Used to REQUEST an absent donor's effect folder resident.

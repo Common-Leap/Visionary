@@ -5,6 +5,7 @@ mod acmd_verify;
 mod app;
 mod app_icon;
 mod asset_snapshots;
+mod capture_hitbox;
 mod carrier_motion;
 mod carrier_support;
 mod credits;
@@ -17,10 +18,12 @@ mod effect_pool;
 mod effects;
 mod emulator;
 mod game_link;
+mod gimmicks;
 mod mod_export;
 mod mod_import;
 mod mod_project;
 mod move_kinds;
+mod move_nodes;
 mod param_labels;
 mod plugin_deploy;
 mod project_hub;
@@ -34,14 +37,44 @@ mod wayland_icon;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new("--install-carrier-support")) {
-        let sd = args
-            .next()
+    let first = args.next();
+    if matches!(first.as_deref(), Some(arg) if arg == "--help" || arg == "-h") {
+        println!(
+            "Visionary - move and character editor\n\
+             Usage: visionary [COMMAND]\n\n\
+             Run without arguments to open the editor.\n\
+             Headless commands:\n\
+               --gimmick-package       Package a behavior adapter\n\
+               --install-carrier-support [SD] Install live asset support\n\n\
+               --help, -h              Show this help without launching\n\
+               --version, -V           Show the version without launching"
+        );
+        return Ok(());
+    }
+    if matches!(first.as_deref(), Some(arg) if arg == "--version" || arg == "-V") {
+        println!("Visionary {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if first.as_deref() == Some(std::ffi::OsStr::new("--install-carrier-support")) {
+        let sd_arg = args.next();
+        if matches!(sd_arg.as_deref(), Some(arg) if arg == "--help" || arg == "-h") {
+            println!("Usage: visionary --install-carrier-support [SD]\nInstall live asset support into SD, or the configured emulator SD directory.");
+            return Ok(());
+        }
+        let sd = sd_arg
             .map(std::path::PathBuf::from)
             .or_else(scratch_dirs::emulator_sd_root)
             .ok_or_else(|| anyhow::anyhow!("emulator SD directory is not configured"))?;
         println!("{}", carrier_support::install(&sd)?.display());
         return Ok(());
+    }
+    if first.as_deref() == Some(std::ffi::OsStr::new("--gimmick-package")) {
+        return gimmicks::cli::run_package(args);
+    }
+    if let Some(arg) = &first {
+        if arg.to_string_lossy().starts_with('-') {
+            anyhow::bail!("unknown command {arg:?}; use --help for headless commands");
+        }
     }
     if let Some(sd) = scratch_dirs::emulator_sd_root() {
         if let Err(error) = carrier_support::install(&sd) {

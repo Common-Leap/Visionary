@@ -453,7 +453,10 @@ pub fn record_edit(params: &mut ParamMod, key: &str, value: ParamValue, base: Op
 ///
 /// Refuses rather than truncates when the value does not fit: silently clamping a weight of
 /// 300 into an `i8` would store 44 and look like a successful edit.
-fn coerce(existing: &ParamKind, value: ParamValue) -> Result<ParamKind> {
+///
+/// Shared with the personal-prc walker (`crate::gimmicks::params`), so both editors coerce
+/// identically; the walker adds fighter/path context around the returned error.
+pub(crate) fn coerce(existing: &ParamKind, value: ParamValue) -> Result<ParamKind> {
     let number = match value {
         ParamValue::Bool(flag) => {
             return match existing {
@@ -501,7 +504,9 @@ fn coerce(existing: &ParamKind, value: ParamValue) -> Result<ParamKind> {
     }
 }
 
-fn kind_name(kind: &ParamKind) -> &'static str {
+/// Human name of a prc type, shared with the personal-prc walker for its
+/// expected-type mismatch reports.
+pub(crate) fn kind_name(kind: &ParamKind) -> &'static str {
     match kind {
         ParamKind::Bool(_) => "a yes/no value",
         ParamKind::I8(_) => "a whole number from -128 to 127",
@@ -518,7 +523,10 @@ fn kind_name(kind: &ParamKind) -> &'static str {
     }
 }
 
-fn to_param_value(kind: &ParamKind) -> Option<ParamValue> {
+/// Lift a scalar prc value into the sparse-edit model; non-scalars have no
+/// editable value here. Shared with the personal-prc walker
+/// (`crate::gimmicks::params`) so both editors read identically.
+pub(crate) fn to_param_value(kind: &ParamKind) -> Option<ParamValue> {
     Some(match kind {
         ParamKind::Bool(value) => ParamValue::Bool(*value),
         ParamKind::I8(value) => ParamValue::I8(*value),

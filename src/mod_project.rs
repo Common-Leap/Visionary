@@ -1,3 +1,4 @@
+mod legacy_move_triggers;
 // Unified mod project: every edit the toolkit makes — hitboxes/ACMD scripts, effect-call
 // (spawn) edits, authored .eff value edits, effect transplants — in one serializable file.
 // This file travels WITH exported mods so a mod can be re-opened for further editing.
@@ -9,19 +10,16 @@
 //     (c00, c07, c12, c50 …; NOT limited to 0–7). That's a modifier, expressed as
 //     `TransplantOp::one_slot_slots`, and it can ride on top of a transplant.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 7;
 
-/// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
-/// an older project loads with the new sections empty — which is exactly what was true when
-/// it was written. The version number is therefore a record of what wrote the file, not a
-/// gate, and [`ModProjectFile::migrate`] is what brings a loaded project up to date.
+/// Oldest project version supported by the load-time field defaults and migrations.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
 
 /// The source and runtime provenance needed to reopen one move without fetching it again.
@@ -38,6 +36,7 @@ pub struct MoveSourceSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "legacy_move_triggers::Project")]
 pub struct ModProjectFile {
     pub version: u32,
     pub name: String,
@@ -73,8 +72,9 @@ pub enum AcmdProjectScope<'a> {
 /// not just the sparse edit log: game scripts, effect deltas and full call lists, frame residue,
 /// loss notes, sound/expression scripts, and capture provenance warnings all stay paired by move.
 /// EFF records are removed because a Smashline source export cannot carry them. Runtime live
-/// tweaks are kept only when their effect kind is present in a retained, enabled effect call;
-/// this avoids producing a tweak-only line for a spawn the scoped export does not ship.
+/// tweaks are kept only when their effect kind is present in a retained, enabled effect call,
+/// except that structured effect tracks preserve the global tweak context so export can refuse
+/// the unsupported combination instead of silently dropping the override.
 pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>) -> ModProjectFile {
     let mut scoped = ModProjectFile {
         version: project.version,
@@ -91,15 +91,25 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
     // Treat the retained ACMD project as one generated source and use the union of its effect
     // kinds, matching `source_project`'s global tweak collection.
     let all_retained_effects = match scope {
-        AcmdProjectScope::All => project
-            .fighters
-            .values()
-            .flat_map(|fighter| fighter.effect_calls_full.values())
-            .flat_map(|calls| calls.iter())
-            .filter(|call| !call.disabled)
-            .map(|call| call.effect_name.to_ascii_lowercase())
-            .filter(|name| !name.is_empty())
-            .collect::<HashSet<_>>(),
+        AcmdProjectScope::All => {
+            let mut retained = project
+                .fighters
+                .values()
+                .flat_map(|fighter| fighter.effect_calls_full.values())
+                .flat_map(|calls| calls.iter())
+                .filter(|call| !call.disabled)
+                .map(|call| call.effect_name.to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect::<HashSet<_>>();
+            if project
+                .fighters
+                .values()
+                .any(|fighter| has_structured_effects(fighter, None))
+            {
+                retained.extend(all_live_tweak_names(project));
+            }
+            retained
+        }
         AcmdProjectScope::Move { .. } => HashSet::new(),
     };
 
@@ -117,6 +127,7 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
             move_name: selected_move,
         } => {
             if let Some(fighter) = project.fighters.get(selected_fighter) {
+                let structured_effects = has_structured_effects(fighter, Some(selected_move));
                 let retained_effects = fighter
                     .effect_calls_full
                     .get(selected_move)
@@ -126,15 +137,45 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
                     .map(|call| call.effect_name.to_ascii_lowercase())
                     .filter(|name| !name.is_empty())
                     .collect::<HashSet<_>>();
-                scoped.fighters.insert(
-                    selected_fighter.to_string(),
-                    scoped_fighter(fighter, Some(selected_move), &retained_effects),
-                );
+                let mut selected = scoped_fighter(fighter, Some(selected_move), &retained_effects);
+                if structured_effects {
+                    selected.live_tweaks = project
+                        .fighters
+                        .values()
+                        .flat_map(|fighter| fighter.live_tweaks.iter().cloned())
+                        .collect();
+                }
+                scoped
+                    .fighters
+                    .insert(selected_fighter.to_string(), selected);
             }
         }
     }
 
     scoped
+}
+
+fn has_structured_effects(fighter: &FighterMod, selected_move: Option<&str>) -> bool {
+    fighter
+        .effect_scripts
+        .keys()
+        .any(|name| selected_move.is_none_or(|selected| name == selected))
+        || fighter.move_graphs.iter().any(|(name, graph)| {
+            selected_move.is_none_or(|selected| name == selected)
+                && graph
+                    .tracks
+                    .iter()
+                    .any(|track| track.track == crate::move_nodes::model::Track::Effect)
+        })
+}
+
+fn all_live_tweak_names(project: &ModProjectFile) -> HashSet<String> {
+    project
+        .fighters
+        .values()
+        .flat_map(|fighter| fighter.live_tweaks.iter())
+        .map(|tweak| tweak.effect_name.to_ascii_lowercase())
+        .collect()
 }
 
 /// Copy one fighter's ACMD fields, retaining either every move or one named move.
@@ -148,11 +189,18 @@ fn scoped_fighter(
     scoped.acmd = scope_move_map(&fighter.acmd, selected_move);
     scoped.effect_calls = scope_move_map(&fighter.effect_calls, selected_move);
     scoped.effect_calls_full = scope_move_map(&fighter.effect_calls_full, selected_move);
+    scoped.effect_scripts = scope_move_map(&fighter.effect_scripts, selected_move);
     scoped.effect_dropped_lines = scope_move_map(&fighter.effect_dropped_lines, selected_move);
     scoped.effect_frame_residue = scope_move_map(&fighter.effect_frame_residue, selected_move);
     scoped.sound_scripts = scope_move_map(&fighter.sound_scripts, selected_move);
     scoped.expression_scripts = scope_move_map(&fighter.expression_scripts, selected_move);
     scoped.move_sources = scope_move_map(&fighter.move_sources, selected_move);
+    scoped.move_graphs = fighter
+        .move_graphs
+        .iter()
+        .filter(|(name, _)| selected_move.is_none_or(|selected| name.as_str() == selected))
+        .map(|(name, graph)| (name.clone(), graph.clone()))
+        .collect();
     scoped.capture_branch_warnings =
         scope_move_map(&fighter.capture_branch_warnings, selected_move);
     scoped.live_tweaks = fighter
@@ -203,19 +251,21 @@ impl ModProjectFile {
                 // category. The map's presence, not the statement count, carries that intent.
                 && f.sound_scripts.is_empty()
                 && f.expression_scripts.is_empty()
+                && f.effect_scripts.is_empty()
                 && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
                 && f.live_tweaks.is_empty()
                 && f.params.is_empty()
+                && f.behavior.is_empty()
+                && f.meters.is_empty()
+                && f.move_graphs.is_empty()
+                && f.controller_charts.is_empty()
         }) && self.roster.is_empty()
     }
 
     /// Bring a just-loaded project up to the current version.
     ///
-    /// Every v1→v3 field addition is additive and defaulted, so there is no data to move;
-    /// what this does is stamp the current version so a re-export is honestly labelled, and
-    /// refuse a file from a *newer* build rather than silently dropping sections it does not
-    /// understand. Silently dropping is the dangerous direction: the project would reopen
-    /// looking complete and re-save with the user's roster work gone.
+    /// Legacy move behavior is folded into the main controller during deserialization.
+    /// Stamp the current version and refuse newer files before they can be saved.
     pub fn migrate(&mut self) -> anyhow::Result<()> {
         if self.version > PROJECT_VERSION {
             anyhow::bail!(
@@ -341,7 +391,7 @@ pub struct CharaOverrides {
 
 /// A character this project added to the roster.
 ///
-/// Backed by a costume slot on `donor`; see `docs/roster/PLAN.md` for why a slot clone rather
+/// Backed by a costume slot on `donor`: a slot clone rather
 /// than a new engine fighter ID. The scaffold deliberately records *where the user's files go*
 /// rather than copying the donor's, so "did my model get picked up" is answerable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -398,6 +448,12 @@ impl AuthoredEntry {
 /// single file shared by every fighter in the game, so a whole-file copy from one mod would
 /// overwrite every other mod's fighter. It would also pin values from whatever base file
 /// happened to be installed when the edit was made.
+///
+/// Personal `vl.prc` files reuse this same map with the game-relative key
+/// `fighter/<name>/param/vl.prc` and inner keys in the nested spelling
+/// (`param_special_lw[0].limit_gauge_add`); the typed accessors live in
+/// `crate::gimmicks::params`. No schema change was needed for them, so projects
+/// saved before personal edits existed load unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ParamMod {
     #[serde(default, flatten)]
@@ -432,8 +488,31 @@ pub enum ParamValue {
     Hash(u64),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ControllerChart {
+    /// A chart's independent state machine. The legacy `behavior` field remains the reserved
+    /// `main` chart and is not duplicated here.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gimmicks::behavior::BehaviorGraph::is_empty"
+    )]
+    pub graph: crate::gimmicks::behavior::BehaviorGraph,
+    /// Editor-only positions scoped to this chart.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gimmicks::field_canvas::FieldLayout::is_empty"
+    )]
+    pub layout: crate::gimmicks::field_canvas::FieldLayout,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FighterMod {
+    /// Complete effect statement trees authored by move nodes, without flattening branches.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effect_scripts: HashMap<String, crate::data::AcmdScript>,
+    /// Structured move scripts and their editor positions.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub move_graphs: std::collections::BTreeMap<String, crate::move_nodes::model::MoveGraph>,
     #[serde(default)]
     pub display: String,
     /// move name → hitbox/script edit (the hitbox editor's existing edit-log record)
@@ -497,6 +576,29 @@ pub struct FighterMod {
     /// the rest of the fighter-wide values. Added in v3.
     #[serde(default, skip_serializing_if = "ParamMod::is_empty")]
     pub params: ParamMod,
+    /// The fighter's gimmick state machine (slice F2.1): typed variables,
+    /// guarded transitions, timers, and resets. Empty means no behavior
+    /// authored; `#[serde(default)]` keeps projects saved before F2.1
+    /// loadable, and they behave exactly as before — no behavior runs.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gimmicks::behavior::BehaviorGraph::is_empty"
+    )]
+    pub behavior: crate::gimmicks::behavior::BehaviorGraph,
+    /// Editor-only character field positions. Coordinates never affect generated behavior.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::gimmicks::field_canvas::FieldLayout::is_empty"
+    )]
+    pub behavior_layout: crate::gimmicks::field_canvas::FieldLayout,
+    /// Validated HUD bindings (slice F3.1). Rendering is intentionally a later
+    /// slice; storing these now keeps the schema typed and backward compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meters: Vec<crate::gimmicks::meter::MeterBinding>,
+    /// Additional named controller charts. The legacy `behavior` and `behavior_layout` fields
+    /// remain the reserved `main` chart; IDs are validated by the controller project layer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub controller_charts: BTreeMap<String, ControllerChart>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1047,6 +1149,7 @@ mod tests {
                         flag: "*FIGHTER_STATUS_ATTACK_FLAG_START_SMASH_HOLD".into(),
                     }),
                     ExcuteStmt::WorkTransitionTerm(WorkTransitionTermCall {
+                        receiver: Default::default(),
                         action: WorkTransitionTermAction::Enable,
                         transition_term: "*FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN".into(),
                     }),
@@ -1213,113 +1316,65 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
 
     #[test]
     fn one_move_acmd_scope_isolates_every_category_and_filters_live_tweaks() {
-        let first_call = fixture_effect_call("sys_first");
-        let second_call = fixture_effect_call("sys_second");
-        let first_edit = EffectCallEdit {
-            index: 0,
-            op: EffectCallOp::Modify(first_call.clone()),
-            pristine: Some(first_call.clone()),
-        };
-        let second_edit = EffectCallEdit {
-            index: 0,
-            op: EffectCallOp::Modify(second_call.clone()),
-            pristine: Some(second_call.clone()),
-        };
-        let first_record = EditRecord {
-            fighter: "mario".into(),
-            fighter_display: "Mario".into(),
-            move_name: "first".into(),
-            script: crate::data::AcmdScript::default(),
-            hitboxes_pristine: Vec::new(),
-            hitboxes: Vec::new(),
-            slot_scope: None,
-            slot_scopes: Vec::new(),
-        };
-        let second_record = EditRecord {
-            move_name: "second".into(),
-            ..first_record.clone()
-        };
-        let mut project = ModProjectFile {
-            version: PROJECT_VERSION,
-            name: "one_move_scope".into(),
+        let mut project = ModProjectFile::default();
+        let fighter = project.fighters.entry("mario".into()).or_default();
+        fighter.eff = Some(EffMod {
+            source_rel: "effect/fighter/mario/ef_mario.eff".into(),
             ..Default::default()
-        };
-        project.fighters.insert(
-            "mario".into(),
-            FighterMod {
-                acmd: HashMap::from([
-                    ("first".into(), first_record),
-                    ("second".into(), second_record),
-                ]),
-                effect_calls: HashMap::from([
-                    ("first".into(), vec![first_edit]),
-                    ("second".into(), vec![second_edit]),
-                ]),
-                effect_calls_full: HashMap::from([
-                    ("first".into(), vec![first_call]),
-                    ("second".into(), vec![second_call]),
-                ]),
-                effect_dropped_lines: HashMap::from([
-                    ("first".into(), vec!["first loss".into()]),
-                    ("second".into(), vec!["second loss".into()]),
-                ]),
-                effect_frame_residue: HashMap::from([
-                    (
-                        "first".into(),
-                        std::collections::BTreeMap::from([(4, vec!["first residue".into()])]),
-                    ),
-                    (
-                        "second".into(),
-                        std::collections::BTreeMap::from([(8, vec!["second residue".into()])]),
-                    ),
-                ]),
-                sound_scripts: HashMap::from([
-                    ("first".into(), fixture_sound_script()),
-                    ("second".into(), fixture_sound_script()),
-                ]),
-                expression_scripts: HashMap::from([
-                    ("first".into(), fixture_expression_script()),
-                    ("second".into(), fixture_expression_script()),
-                ]),
-                capture_branch_warnings: HashMap::from([
-                    ("first".into(), "first warning".into()),
-                    ("second".into(), "second warning".into()),
-                ]),
-                move_sources: HashMap::from([
-                    (
-                        "first".into(),
-                        MoveSourceSnapshot {
-                            body: "first source".into(),
-                            ..Default::default()
-                        },
-                    ),
-                    (
-                        "second".into(),
-                        MoveSourceSnapshot {
-                            body: "second source".into(),
-                            ..Default::default()
-                        },
-                    ),
-                ]),
-                eff: Some(EffMod {
-                    source_rel: "effect/fighter/mario/ef_mario.eff".into(),
+        });
+        for name in ["first", "second"] {
+            let call = fixture_effect_call(&format!("sys_{name}"));
+            fighter.acmd.insert(
+                name.into(),
+                EditRecord {
+                    fighter: "mario".into(),
+                    fighter_display: "Mario".into(),
+                    move_name: name.into(),
+                    script: crate::data::AcmdScript::default(),
+                    hitboxes_pristine: vec![],
+                    hitboxes: vec![],
+                    slot_scope: None,
+                    slot_scopes: vec![],
+                },
+            );
+            fighter.effect_calls.insert(
+                name.into(),
+                vec![EffectCallEdit {
+                    index: 0,
+                    op: EffectCallOp::Modify(call.clone()),
+                    pristine: Some(call.clone()),
+                }],
+            );
+            fighter.effect_calls_full.insert(name.into(), vec![call]);
+            fighter
+                .effect_dropped_lines
+                .insert(name.into(), vec![format!("{name} loss")]);
+            fighter.effect_frame_residue.insert(
+                name.into(),
+                BTreeMap::from([(4, vec![format!("{name} residue")])]),
+            );
+            fighter
+                .sound_scripts
+                .insert(name.into(), fixture_sound_script());
+            fighter
+                .expression_scripts
+                .insert(name.into(), fixture_expression_script());
+            fighter
+                .capture_branch_warnings
+                .insert(name.into(), format!("{name} warning"));
+            fighter.move_sources.insert(
+                name.into(),
+                MoveSourceSnapshot {
+                    body: format!("{name} source"),
                     ..Default::default()
-                }),
-                live_tweaks: vec![
-                    LiveTweak {
-                        effect_name: "sys_first".into(),
-                        color: Some([1.1, 1.0, 1.0, 1.0]),
-                        speed: None,
-                    },
-                    LiveTweak {
-                        effect_name: "sys_second".into(),
-                        color: Some([1.0, 1.1, 1.0, 1.0]),
-                        speed: None,
-                    },
-                ],
-                ..Default::default()
-            },
-        );
+                },
+            );
+            fighter.live_tweaks.push(LiveTweak {
+                effect_name: format!("sys_{name}"),
+                color: Some([1.1, 1.0, 1.0, 1.0]),
+                speed: None,
+            });
+        }
         project.fighters.insert(
             "luigi".into(),
             FighterMod {
@@ -1330,7 +1385,6 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
                 ..Default::default()
             },
         );
-
         let scoped = scope_acmd_project(
             &project,
             AcmdProjectScope::Move {
@@ -1341,61 +1395,33 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
         assert_eq!(scoped.fighters.len(), 1);
         let fighter = &scoped.fighters["mario"];
         assert!(fighter.eff.is_none());
-        assert_eq!(fighter.acmd.keys().collect::<Vec<_>>(), vec!["first"]);
-        assert_eq!(
-            fighter.effect_calls.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.effect_calls_full.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.effect_dropped_lines.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.effect_frame_residue.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.sound_scripts.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.expression_scripts.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.capture_branch_warnings.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
-        assert_eq!(
-            fighter.move_sources.keys().collect::<Vec<_>>(),
-            vec!["first"]
-        );
+        let encoded = serde_json::to_value(fighter).unwrap();
+        for field in [
+            "acmd",
+            "effect_calls",
+            "effect_calls_full",
+            "effect_dropped_lines",
+            "effect_frame_residue",
+            "sound_scripts",
+            "expression_scripts",
+            "capture_branch_warnings",
+            "move_sources",
+        ] {
+            assert_eq!(
+                encoded[field]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["first"],
+                "{field}"
+            );
+        }
         assert_eq!(fighter.move_sources["first"].body, "first source");
         assert_eq!(fighter.live_tweaks.len(), 1);
         assert_eq!(fighter.live_tweaks[0].effect_name, "sys_first");
-    }
-
-    /// The plugin hardcodes this prefix (`acmd_hooks::EDIT_CLONE_PREFIX`) because it cannot
-    /// depend on this crate. At spawn time it is the only signal that tells an authored edit's
-    /// redirect apart from a transplant's — and they need opposite fallback behaviour when the
-    /// carrier is not up yet. If the two ever drift, transplants silently render nothing.
-    #[test]
-    fn edit_clone_prefix_matches_the_plugin_copy() {
-        let plugin_src =
-            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
-        let declared = plugin_src
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("const EDIT_CLONE_PREFIX: &str = "))
-            .map(|l| l.trim_end_matches(';').trim_matches('"'))
-            .expect("the plugin no longer declares EDIT_CLONE_PREFIX");
-        assert_eq!(
-            declared, EDIT_CLONE_PREFIX,
-            "editor and plugin disagree on the reserved edit-clone prefix"
-        );
+        assert_eq!(project.fighters["mario"].acmd.len(), 2);
     }
 }
 
@@ -1405,57 +1431,246 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
 /// that loads with a section quietly missing looks healthy and re-saves with the user's work
 /// gone. These pin both directions of that.
 #[cfg(test)]
-mod version_three_tests {
+mod persistence_tests {
     use super::*;
+    use crate::gimmicks::{
+        behavior, codegen, field_canvas::FieldLayout, params, paths::NestedPath, templates::Preset,
+    };
+    use serde_json::json;
 
-    /// A v2 project as an older build wrote it — no `roster`, no `params`.
-    const V2_PROJECT_JSON: &str = r#"{
-        "version": 2,
-        "name": "older_mod",
-        "fighters": {
-            "mario": {
-                "display": "Mario",
-                "acmd": {},
-                "live_tweaks": []
-            }
-        }
-    }"#;
-
-    #[test]
-    fn a_v2_project_loads_with_the_new_sections_empty_and_migrates_to_v3() {
-        let mut project: ModProjectFile =
-            serde_json::from_str(V2_PROJECT_JSON).expect("v2 projects must still load");
-        assert_eq!(project.version, 2);
-        assert!(project.roster.is_empty());
-        assert!(project.fighters["mario"].params.is_empty());
-        // Loading a v2 file must not invent edits — an empty project stays exportable-as-nothing.
-        assert!(project.is_empty());
-
-        project.migrate().expect("v2 is supported");
-        assert_eq!(project.version, PROJECT_VERSION);
+    fn round_trip(project: &ModProjectFile) -> ModProjectFile {
+        serde_json::from_value(serde_json::to_value(project).unwrap()).unwrap()
     }
 
-    /// Dropping sections this build does not understand is the dangerous direction: the
-    /// project would reopen looking complete and re-save with the newer build's work gone.
     #[test]
-    fn a_project_from_a_newer_build_is_refused_rather_than_silently_downgraded() {
-        let mut project = ModProjectFile {
+    fn older_projects_default_new_sections_and_migrate_without_inventing_edits() {
+        for version in 1..PROJECT_VERSION {
+            let mut project: ModProjectFile = serde_json::from_value(json!({
+                "version": version, "name": "old", "fighters": {"mario": {"display": "Mario"}}
+            }))
+            .unwrap();
+            let fighter = &project.fighters["mario"];
+            assert!(project.is_empty());
+            assert!(project.roster.is_empty());
+            assert!(fighter.params.is_empty());
+            assert!(fighter.behavior.is_empty());
+            assert!(fighter.behavior.emission_plan.is_empty());
+            assert!(fighter.controller_charts.is_empty());
+            project.migrate().unwrap();
+            assert_eq!(project.version, PROJECT_VERSION);
+            assert!(project.is_empty());
+        }
+        let mut future = ModProjectFile {
             version: PROJECT_VERSION + 1,
             ..Default::default()
         };
-        let error = project
+        assert!(future
             .migrate()
-            .expect_err("a newer project must be refused");
-        assert!(
-            error
-                .to_string()
-                .contains(&(PROJECT_VERSION + 1).to_string()),
-            "the refusal has to name the version that wrote the file: {error}"
-        );
-        // And it must not have been stamped on the way out.
-        assert_eq!(project.version, PROJECT_VERSION + 1);
+            .unwrap_err()
+            .to_string()
+            .contains(&future.version.to_string()));
+        assert_eq!(future.version, PROJECT_VERSION + 1);
     }
 
+    #[test]
+    fn each_edit_section_alone_survives_serialization_and_makes_the_project_nonempty() {
+        let chart = ControllerChart {
+            graph: Preset::Timer.graph(),
+            layout: FieldLayout::default(),
+        };
+        for field in [
+            json!({"params": {"param/fighter_param.prc": {"weight": {"Float": 104.0}}}}),
+            json!({"meters": [{"fighter": "cloud", "enabled": true, "style": "bar",
+                "value": {"kind": "float", "symbol": "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE", "min": 0.0, "max": 100.0}}]}),
+            json!({"behavior": Preset::Charge.graph()}),
+            json!({"controller_charts": {"limit": chart}}),
+        ] {
+            let project: ModProjectFile = serde_json::from_value(
+                json!({"version": PROJECT_VERSION, "name": "test", "fighters": {"cloud": field}}),
+            )
+            .unwrap();
+            assert!(!project.is_empty());
+            let restored = round_trip(&project);
+            assert!(!restored.is_empty());
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(project).unwrap()
+            );
+        }
+        let mut roster_only = ModProjectFile::default();
+        roster_only
+            .roster
+            .hidden
+            .insert(crate::roster::RosterKey::fighter("ridley"));
+        assert!(!round_trip(&roster_only).is_empty());
+    }
+
+    #[test]
+    fn personal_edits_keep_owner_and_trait_keys_and_clear_at_the_base_value() {
+        let mut project = ModProjectFile::default();
+        for (owner, path, value) in [
+            (
+                "cloud",
+                "param_special_lw[0].limit_gauge_add",
+                ParamValue::Float(0.667),
+            ),
+            (
+                "cloud",
+                "param_special_lw[0].limit_max",
+                ParamValue::I32(120),
+            ),
+            (
+                "link",
+                "param_special_n[0].bomb_damage",
+                ParamValue::Float(7.0),
+            ),
+        ] {
+            params::record_personal_edit(
+                &mut project.fighters.entry(owner.into()).or_default().params,
+                owner,
+                &NestedPath::parse(path).unwrap(),
+                value,
+                None,
+            )
+            .unwrap();
+        }
+        project
+            .fighters
+            .entry("mario".into())
+            .or_default()
+            .params
+            .files
+            .insert(
+                "param/fighter_param.prc".into(),
+                BTreeMap::from([("weight".into(), ParamValue::Float(104.0))]),
+            );
+        let restored = round_trip(&project);
+        for (owner, fighter) in &project.fighters {
+            assert_eq!(restored.fighters[owner].params, fighter.params);
+        }
+        assert_eq!(
+            params::personal_edits(&restored.fighters["cloud"].params, "cloud").len(),
+            2
+        );
+        assert_eq!(
+            params::personal_edits(&restored.fighters["link"].params, "link").len(),
+            1
+        );
+        assert!(params::personal_edits(&restored.fighters["mario"].params, "mario").is_empty());
+
+        let mut cleared = ModProjectFile::default();
+        let edits = &mut cleared.fighters.entry("cloud".into()).or_default().params;
+        let path = NestedPath::parse("param_special_lw[0].limit_gauge_add").unwrap();
+        let value = ParamValue::Float(0.667);
+        params::record_personal_edit(edits, "cloud", &path, value, None).unwrap();
+        params::record_personal_edit(edits, "cloud", &path, value, Some(value)).unwrap();
+        assert!(round_trip(&cleared).is_empty());
+        let wire = serde_json::to_value(cleared).unwrap();
+        assert!(wire["fighters"]["cloud"].get("params").is_none());
+
+        let old: ModProjectFile =
+            serde_json::from_value(json!({"version": 3, "name": "old", "fighters": {
+                "mario": {"params": {"param/fighter_param.prc": {"weight": {"Float": 104.0}}}}
+            }}))
+            .unwrap();
+        assert!(params::personal_edits(&old.fighters["mario"].params, "mario").is_empty());
+        assert_eq!(
+            old.fighters["mario"].params.files["param/fighter_param.prc"]["weight"],
+            ParamValue::Float(104.0)
+        );
+    }
+
+    #[test]
+    fn saved_behavior_retains_actions_and_resource_sources_and_stays_exportable() {
+        for source in [
+            None,
+            Some(codegen::ResourceSource::CloudLimitGroundedNeutral),
+            Some(codegen::ResourceSource::CloudLimitIdleExpiry),
+        ] {
+            let mut graph = Preset::Charge.graph();
+            graph.transitions[0]
+                .actions
+                .push(behavior::Action::RequestWeaponStatus {
+                    target: crate::gimmicks::live_model::WeaponTarget {
+                        battle_object_id: 0x2000_0001,
+                    },
+                    symbol: "WEAPON_CLOUD_WAVE_STATUS_KIND_REGULAR".into(),
+                });
+            if let Some(source) = source {
+                graph.transitions.truncate(1);
+                graph.emission_plan = codegen::EmissionPlan {
+                    bindings: vec![codegen::HookBinding {
+                        hook: source.hook(),
+                        article: None,
+                        transitions: vec![0],
+                    }],
+                    resource_triggers: vec![codegen::ResourceTrigger {
+                        hook: source.hook(),
+                        source,
+                    }],
+                    ..Default::default()
+                };
+            }
+            let mut project = ModProjectFile::default();
+            project.fighters.entry("cloud".into()).or_default().behavior = graph.clone();
+            let restored = round_trip(&project);
+            assert_eq!(restored.fighters["cloud"].behavior, graph);
+            assert!(behavior::validate_for_fighter("cloud", &graph).is_empty());
+            crate::gimmicks::adapter::render(&BTreeMap::from([(
+                "cloud".into(),
+                restored.fighters["cloud"].behavior.clone(),
+            )]))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn controller_graphs_and_layouts_keep_independent_identity_through_save_and_scope() {
+        let chart = |name: &str, position| ControllerChart {
+            graph: behavior::BehaviorGraph {
+                initial: name.into(),
+                states: vec![behavior::StateDef {
+                    status: None,
+                    name: name.into(),
+                }],
+                ..Default::default()
+            },
+            layout: FieldLayout {
+                positions: BTreeMap::from([(format!("state/{name}"), position)]),
+            },
+        };
+        let mut project = ModProjectFile::default();
+        let fighter = project.fighters.entry("cloud".into()).or_default();
+        let main = chart("main_idle", [1.0, 2.0]);
+        fighter.behavior = main.graph;
+        fighter.behavior_layout = main.layout;
+        fighter.controller_charts = BTreeMap::from([
+            ("limit".into(), chart("limit_idle", [30.0, 40.0])),
+            ("charge".into(), chart("charge_idle", [300.0, 400.0])),
+        ]);
+        let restored = round_trip(&project);
+        let original = &project.fighters["cloud"];
+        assert_eq!(restored.fighters["cloud"].behavior, original.behavior);
+        assert_eq!(
+            restored.fighters["cloud"].behavior_layout,
+            original.behavior_layout
+        );
+        assert_eq!(
+            restored.fighters["cloud"].controller_charts,
+            original.controller_charts
+        );
+        let scoped = scope_acmd_project(
+            &restored,
+            AcmdProjectScope::Move {
+                fighter: "cloud",
+                move_name: "attack11",
+            },
+        );
+        assert_eq!(
+            scoped.fighters["cloud"].controller_charts,
+            original.controller_charts
+        );
+    }
     #[test]
     fn roster_and_param_edits_round_trip_and_keep_the_project_non_empty() {
         let key = crate::roster::RosterKey::slot("mario", 8);
@@ -1492,33 +1707,18 @@ mod version_three_tests {
         );
     }
 
-    /// A param edit alone is a real edit. Before v3 the emptiness check listed every section
-    /// that existed at the time, which is exactly the shape that goes quietly wrong when a new
-    /// one is added — a project holding only trait edits would report "No edits to export yet".
     #[test]
-    fn a_project_holding_only_a_param_edit_is_not_empty() {
-        let mut project = ModProjectFile::default();
-        project
-            .fighters
-            .entry("mario".into())
-            .or_default()
-            .params
-            .files
-            .entry("param/fighter_param.prc".into())
-            .or_default()
-            .insert("weight".into(), ParamValue::Float(104.0));
-        assert!(!project.is_empty());
-    }
-
-    /// Likewise for a roster-only project: hiding a character is an edit with no fighter
-    /// entry behind it at all.
-    #[test]
-    fn a_project_holding_only_a_roster_edit_is_not_empty() {
-        let mut project = ModProjectFile::default();
-        project
-            .roster
-            .hidden
-            .insert(crate::roster::RosterKey::fighter("ridley"));
-        assert!(!project.is_empty());
+    fn edit_clone_prefix_matches_the_plugin_copy() {
+        let plugin_src =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs");
+        let declared = plugin_src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("const EDIT_CLONE_PREFIX: &str = "))
+            .map(|l| l.trim_end_matches(';').trim_matches('"'))
+            .expect("the plugin no longer declares EDIT_CLONE_PREFIX");
+        assert_eq!(
+            declared, EDIT_CLONE_PREFIX,
+            "editor and plugin disagree on the reserved edit-clone prefix"
+        );
     }
 }

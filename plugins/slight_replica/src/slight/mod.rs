@@ -5,6 +5,7 @@ pub mod diag;
 pub mod effect_viewer;
 pub mod extras;
 pub mod frame_context;
+pub mod gimmicks;
 pub mod hitbox_viewer;
 pub mod main_smash;
 pub mod math;

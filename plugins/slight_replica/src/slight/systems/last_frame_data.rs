@@ -32,14 +32,6 @@ pub fn get(boid: u32, effect_id: u64) -> Option<EffectData> {
         .cloned()
 }
 
-pub fn for_boid(boid: u32) -> Vec<(u64, EffectData)> {
-    SNAPSHOTS
-        .lock()
-        .get(&boid)
-        .map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect())
-        .unwrap_or_default()
-}
-
 pub fn clear() {
     SNAPSHOTS.lock().clear();
 }

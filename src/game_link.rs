@@ -21,6 +21,79 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::gimmicks::registry::{self, IdentifierKind, LookupError};
+
+/// The deliberately small live-operation set. Identifiers remain symbols on
+/// the wire; `*_boid` fields select already-live game objects and are never
+/// interpreted as engine identifiers.
+#[derive(Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum GimmickOperationKind<'a> {
+    GenerateArticle { symbol: &'a str },
+    RemoveArticle { symbol: &'a str },
+    RequestWeaponStatus { weapon_boid: u32, symbol: &'a str },
+}
+
+#[derive(Serialize)]
+struct GimmickOperationRequest<'a> {
+    version: u8,
+    fighter: &'a str,
+    fighter_boid: u32,
+    #[serde(flatten)]
+    operation: GimmickOperationKind<'a>,
+}
+
+/// Local validation failure for a constrained live gimmick operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GimmickOperationError {
+    Identifier(LookupError),
+    MissingWeaponKind { fighter: String, group: String },
+    InvalidWeaponObjectId,
+    QueueFull,
+    QueueUnavailable,
+}
+
+impl From<LookupError> for GimmickOperationError {
+    fn from(error: LookupError) -> Self {
+        Self::Identifier(error)
+    }
+}
+
+impl std::fmt::Display for GimmickOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Identifier(error) => write!(formatter, "{error}"),
+            Self::MissingWeaponKind { fighter, group } => write!(
+                formatter,
+                "weapon-status group {group:?} for fighter {fighter:?} has no safe concrete weapon-kind guard"
+            ),
+            Self::InvalidWeaponObjectId => {
+                write!(formatter, "weapon_boid must be a nonzero live battle-object id")
+            }
+            Self::QueueFull => write!(
+                formatter,
+                "the live-operation queue is full; the action was not queued"
+            ),
+            Self::QueueUnavailable => write!(
+                formatter,
+                "the live-operation queue is unavailable; the action was not queued"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GimmickOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Identifier(error) => Some(error),
+            Self::MissingWeaponKind { .. }
+            | Self::InvalidWeaponObjectId
+            | Self::QueueFull
+            | Self::QueueUnavailable => None,
+        }
+    }
+}
+
 pub const PLUGIN_ADDR: &str = "127.0.0.1:7878";
 const DEFAULT_PLUGIN_PORT: u16 = 7878;
 /// How long a `connect()` may take before the attempt is abandoned. The emulator's
@@ -44,7 +117,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 const STALE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound for queued outbound frames while offline. Full-replace families are coalesced
 /// to latest, so this is only reached by pathological churn; dropping oldest keeps
-/// memory bounded and preserves the newest (authoritative) state.
+/// memory bounded and preserves the newest (authoritative) state. Constrained gimmick
+/// operations are non-idempotent, so they are never silently evicted: their caller gets
+/// [`GimmickOperationError::QueueFull`] instead.
 const OUTBOX_CAP: usize = 8192;
 
 /// Address of the in-game plugin, honouring explicit overrides first.
@@ -270,6 +345,9 @@ pub struct SpawnInjectWire {
     pub frame: f32,
     pub func: String,
     pub args: Vec<LuaArgWire>,
+    /// Condition from an If block, checked in the match when this spawn is due.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard: Option<LiveGuard>,
 }
 
 /// One live effect point-control rule. Matching includes the captured argument vector so two
@@ -959,7 +1037,63 @@ pub struct InjectRuleWire {
     /// Exact AREA_WIND family function for wind injection. Attack/grab injections omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Condition from an If block, checked in the match when this call is due.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard: Option<LiveGuard>,
 }
+
+/// An If block's condition as the plugin evaluates it. **Must match the plugin's `LiveGuard`.**
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveGuard {
+    Grounded,
+    Airborne,
+    ItemHeld,
+    FacingLeft,
+    AttackHit,
+    AttackShield,
+    Stick {
+        vertical: bool,
+        op: i8,
+        value: f32,
+        facing: bool,
+    },
+    Button(String),
+    Flag {
+        symbol: u64,
+        expected: bool,
+    },
+    Int {
+        symbol: u64,
+        op: i8,
+        value: i32,
+    },
+    Float {
+        symbol: u64,
+        op: i8,
+        value: f32,
+    },
+    Status {
+        symbol: u64,
+    },
+    Article {
+        symbol: u64,
+    },
+    Value {
+        chart: String,
+        var: String,
+        op: i8,
+        value: f32,
+    },
+    All(Vec<LiveGuard>),
+    Any(Vec<LiveGuard>),
+    Not(Box<LiveGuard>),
+}
+
+/// Wire category for a block the game's script never does. **Must equal the plugin's value.**
+pub const CAT_NODE_STEP: u8 = 37;
+/// Wire category for `ArticleModule::generate_article`. **Must equal the plugin's value.**
+pub const CAT_ARTICLE_GENERATE: u8 = 38;
 
 /// One live hitbox rule (plugin `HitboxRule`); the full list replaces on every send.
 fn is_zero_u8(v: &u8) -> bool {
@@ -1204,6 +1338,317 @@ pub struct AssetBundleStatus {
     pub reports: u64,
 }
 
+/// One live fighter or weapon identity reported by the plugin for constrained
+/// gimmick-operation pickers. Engine writes never trust this desktop copy;
+/// the plugin re-proves identity, ownership, kind, and symbol at execution.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct LiveGimmickAgent {
+    pub boid: u32,
+    pub category: i32,
+    pub kind: i32,
+    pub entry_id: i32,
+    pub owner_boid: Option<u32>,
+    pub fighter: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GimmickAgentsWire {
+    version: u8,
+    seq: u64,
+    /// Rows stay untyped until individually validated so one transient object
+    /// cannot hide every otherwise valid live fighter from the selector.
+    agents: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveGimmickMeterValue {
+    Float(f32),
+    Int(i32),
+    Flag(bool),
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct LiveGimmickMeter {
+    pub binding_id: String,
+    pub fighter: String,
+    pub entry_id: i32,
+    pub boid: u32,
+    pub symbol: String,
+    pub kind: String,
+    pub value: LiveGimmickMeterValue,
+}
+
+#[derive(Deserialize)]
+struct GimmickMetersWire {
+    version: u8,
+    seq: u64,
+    values: Vec<LiveGimmickMeter>,
+}
+
+pub type GimmickLiveAck = crate::gimmicks::live_protocol::Ack;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GimmickLiveSnapshot {
+    pub version: u8,
+    pub seq: u64,
+    pub behavior_revision: u64,
+    pub parameter_revision: u64,
+    pub behavior: Vec<serde_json::Value>,
+    pub parameters: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub parameter_health: Option<crate::gimmicks::live_params::ParameterHealth>,
+}
+
+/// Separately negotiated bounds for the V5 multi-chart telemetry rows. Keeping
+/// this out of `GimmickLiveSnapshot` lets older strict snapshot readers ignore
+/// the optional feature frame without rejecting the established V1 snapshot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GimmickControllerCapabilities {
+    pub version: u8,
+    pub seq: u64,
+    pub request_version: u8,
+    pub model_version: u8,
+    pub max_charts: u8,
+    pub max_actors: u16,
+    pub max_rows: u16,
+}
+
+impl GimmickControllerCapabilities {
+    fn is_supported_contract(&self) -> bool {
+        self.version == 1
+            && self.seq > 0
+            && self.request_version == crate::gimmicks::controller_protocol::REQUEST_VERSION
+            && self.model_version == crate::gimmicks::live_model::MODEL_VERSION
+            && self.max_charts == crate::gimmicks::controller_runtime::MAX_CHARTS as u8
+            && self.max_actors == 128
+            && self.max_rows == 1024
+    }
+}
+
+/// Optional capabilities negotiated independently from the strict V5 controller
+/// contract. Older desktops ignore this unknown frame; older plugins omit it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GimmickFeatureCapabilities {
+    version: u8,
+    seq: u64,
+    features: Vec<String>,
+}
+
+impl GimmickFeatureCapabilities {
+    fn is_well_formed(&self) -> bool {
+        self.version == 1
+            && self.seq > 0
+            && self.features.len() <= 32
+            && self.features.iter().all(|feature| {
+                !feature.is_empty() && feature.len() <= 64 && !feature.contains('\0')
+            })
+            && self
+                .features
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.features.len()
+    }
+
+    fn supports_feature(&self, feature: &str) -> bool {
+        self.is_well_formed() && self.features.iter().any(|candidate| candidate == feature)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGimmickBehaviorRow {
+    fighter: String,
+    boid: u32,
+    entry_id: i32,
+    revision: u64,
+    state: String,
+    vars: BTreeMap<String, crate::gimmicks::live_model::Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerGimmickBehaviorRow {
+    fighter: String,
+    boid: u32,
+    entry_id: i32,
+    revision: u64,
+    state: String,
+    vars: BTreeMap<String, crate::gimmicks::live_model::Value>,
+    chart_id: String,
+    program_id: String,
+    stock_generation: u32,
+}
+
+#[cfg(test)]
+fn valid_gimmick_live_rows(snapshot: &GimmickLiveSnapshot) -> bool {
+    valid_gimmick_live_rows_with_capabilities(snapshot, None)
+}
+
+fn has_controller_chart_rows(snapshot: &GimmickLiveSnapshot) -> bool {
+    snapshot.behavior.iter().any(|value| {
+        value.as_object().is_some_and(|row| {
+            row.contains_key("chart_id")
+                || row.contains_key("program_id")
+                || row.contains_key("stock_generation")
+        })
+    })
+}
+
+fn valid_gimmick_behavior_common(
+    fighter: &str,
+    entry_id: i32,
+    revision: u64,
+    snapshot: &GimmickLiveSnapshot,
+    state: &str,
+    vars: &BTreeMap<String, crate::gimmicks::live_model::Value>,
+) -> bool {
+    registry::fighter_kind_symbol(fighter).is_some()
+        && (0..8).contains(&entry_id)
+        && revision == snapshot.behavior_revision
+        && !state.is_empty()
+        && state.len() <= 48
+        && vars.len() <= crate::gimmicks::live_model::MAX_VARIABLES
+        && vars.iter().all(|(name, value)| {
+            !name.is_empty()
+                && name.len() <= 48
+                && !matches!(
+                    value,
+                    crate::gimmicks::live_model::Value::Float(number) if !number.is_finite()
+                )
+        })
+}
+
+fn valid_gimmick_live_rows_with_capabilities(
+    snapshot: &GimmickLiveSnapshot,
+    capabilities: Option<&GimmickControllerCapabilities>,
+) -> bool {
+    if snapshot
+        .parameter_health
+        .as_ref()
+        .is_some_and(|health| health.revision != snapshot.parameter_revision)
+    {
+        return false;
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct ParameterRow {
+        fighter: String,
+        path: String,
+        hits: u64,
+        baseline: Option<crate::gimmicks::live_params::LiveParamValue>,
+        last_observed: Option<crate::gimmicks::live_params::LiveParamValue>,
+    }
+    let controller_rows = has_controller_chart_rows(snapshot);
+    if controller_rows {
+        let Some(capabilities) = capabilities.filter(|caps| caps.is_supported_contract()) else {
+            return false;
+        };
+        if snapshot.behavior.len() > capabilities.max_rows as usize {
+            return false;
+        }
+        let mut actors = BTreeMap::<u32, (String, i32, u32)>::new();
+        let mut actor_charts = BTreeMap::<u32, BTreeSet<String>>::new();
+        let mut actor_variables = BTreeMap::<u32, usize>::new();
+        let mut chart_programs = BTreeMap::<(String, String), String>::new();
+        let mut actor_chart_rows = BTreeSet::<(u32, String)>::new();
+        for value in &snapshot.behavior {
+            let Ok(row) = serde_json::from_value::<ControllerGimmickBehaviorRow>(value.clone())
+            else {
+                return false;
+            };
+            if !valid_gimmick_behavior_common(
+                &row.fighter,
+                row.entry_id,
+                row.revision,
+                snapshot,
+                &row.state,
+                &row.vars,
+            ) || row.chart_id.trim().is_empty()
+                || row.chart_id.len() > crate::gimmicks::controller_protocol::MAX_CHART_ID_BYTES
+                || row.chart_id.as_bytes().contains(&0)
+                || row.program_id.trim().is_empty()
+                || row.program_id.len() > crate::gimmicks::live_model::MAX_PROGRAM_ID_BYTES
+                || row.program_id.as_bytes().contains(&0)
+                || row.vars.len() > 64
+                || !actor_chart_rows.insert((row.boid, row.chart_id.clone()))
+            {
+                return false;
+            }
+            let identity = (row.fighter.clone(), row.entry_id, row.stock_generation);
+            if actors
+                .get(&row.boid)
+                .is_some_and(|known| known != &identity)
+            {
+                return false;
+            }
+            actors.entry(row.boid).or_insert(identity);
+            let charts = actor_charts.entry(row.boid).or_default();
+            charts.insert(row.chart_id.clone());
+            if charts.len() > capabilities.max_charts as usize {
+                return false;
+            }
+            let variables = actor_variables.entry(row.boid).or_default();
+            *variables = variables.saturating_add(row.vars.len());
+            if *variables > 128 {
+                return false;
+            }
+            let key = (row.fighter.clone(), row.chart_id.clone());
+            if chart_programs
+                .get(&key)
+                .is_some_and(|known| known != &row.program_id)
+            {
+                return false;
+            }
+            chart_programs.entry(key).or_insert(row.program_id);
+        }
+        if actors.len() > capabilities.max_actors as usize {
+            return false;
+        }
+    } else {
+        // The established rows retain their original 16-row ceiling and strict shape.
+        if snapshot.behavior.len() > 16 {
+            return false;
+        }
+        let mut objects = BTreeSet::new();
+        for value in &snapshot.behavior {
+            let Ok(row) = serde_json::from_value::<LegacyGimmickBehaviorRow>(value.clone()) else {
+                return false;
+            };
+            if !valid_gimmick_behavior_common(
+                &row.fighter,
+                row.entry_id,
+                row.revision,
+                snapshot,
+                &row.state,
+                &row.vars,
+            ) || !objects.insert(row.boid)
+            {
+                return false;
+            }
+        }
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for value in &snapshot.parameters {
+        let Ok(row) = serde_json::from_value::<ParameterRow>(value.clone()) else {
+            return false;
+        };
+        if registry::fighter_kind_symbol(&row.fighter).is_none() || row.path.len() > 256
+            || crate::gimmicks::live_params::classify_engine_path(&row.path).is_err()
+            || !paths.insert((row.fighter, row.path))
+            || (row.hits == 0 && row.last_observed.is_some())
+            || [row.baseline, row.last_observed].into_iter().flatten().any(|value|
+                matches!(value, crate::gimmicks::live_params::LiveParamValue::Float(number) if !number.is_finite())) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Sparse pins-only form the plugin reports alongside merged values (newer plugins) —
 /// mirrors slight_replica kinds::Pinned. `Some` fields are active user overrides in-game.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1250,6 +1695,25 @@ struct Shared {
     status: LinkStatus,
     client_id: Option<u64>,
     connection_epoch: u64,
+    /// Complete identity-only object snapshot from the current connection.
+    /// Replaced atomically and cleared at every socket/session boundary.
+    gimmick_agents: BTreeMap<u32, LiveGimmickAgent>,
+    gimmick_agents_seq: u64,
+    gimmick_agents_wire_seq: Option<u64>,
+    gimmick_agents_epoch: u64,
+    gimmick_agents_received: Option<Instant>,
+    /// Most recent current-session roster rejection, cleared by a valid
+    /// replacement. Exposed as quiet hover detail instead of a red UI error.
+    gimmick_agents_error: Option<String>,
+    gimmick_meters: Vec<LiveGimmickMeter>,
+    gimmick_live_expected: BTreeMap<String, u64>,
+    gimmick_live_acks: BTreeMap<String, GimmickLiveAck>,
+    gimmick_live_snapshot: Option<GimmickLiveSnapshot>,
+    gimmick_controller_capabilities: Option<GimmickControllerCapabilities>,
+    gimmick_controller_capabilities_seq: Option<u64>,
+    gimmick_feature_capabilities: Option<GimmickFeatureCapabilities>,
+    gimmick_feature_capabilities_seq: Option<u64>,
+    gimmick_meters_wire_seq: Option<u64>,
     kinds: BTreeMap<u64, LiveKind>,
     /// Live ACMD capture log, keyed by motion hash (deduped; survives reconnects).
     captures: BTreeMap<u64, Vec<CaptureLine>>,
@@ -1297,6 +1761,10 @@ struct Shared {
     /// user restores the fighter, so a later playback cannot silently repopulate its memory.
     ignored_capture_kinds: BTreeSet<i32>,
     outbox: Vec<String>,
+    /// Gimmick operations temporarily removed from `outbox` for the current socket
+    /// flush. Counting them prevents a concurrent UI action burst from overfilling the
+    /// queue before an interrupted flush can put its unsent suffix back.
+    gimmick_operations_in_flight: usize,
     last_error: Option<String>,
     frames_rx: u64,
     edits_tx: u64,
@@ -1318,6 +1786,8 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"donor_bytes\":",
     "\"asset_bundle\":",
     "\"effect_names\":",
+    "\"gimmick_behavior\":",
+    "\"gimmick_parameters\":",
 ];
 
 const IDEMPOTENT_COMMAND_MARKERS: &[&str] = &[
@@ -1326,6 +1796,36 @@ const IDEMPOTENT_COMMAND_MARKERS: &[&str] = &[
     r#""command":"live_eff_reload""#,
     r#""command":"live_eff_probe""#,
 ];
+
+const GIMMICK_OPERATION_MARKER: &str = r#""gimmick_operation":"#;
+const GIMMICK_RESTART_MARKER: &str = r#""gimmick_restart":"#;
+
+fn is_gimmick_operation(message: &str) -> bool {
+    message.contains(GIMMICK_OPERATION_MARKER) || message.contains(GIMMICK_RESTART_MARKER)
+}
+
+fn discard_session_bound_messages(messages: &mut Vec<String>) {
+    messages.retain(|message| {
+        if message.contains(GIMMICK_RESTART_MARKER) {
+            return false;
+        }
+        let Some(body) = message
+            .strip_prefix("<TCP_MESSAGE>")
+            .and_then(|message| message.strip_suffix("</TCP_MESSAGE>"))
+        else {
+            return true;
+        };
+        // The old full replacements are reconnect-safe. V5 requires a new
+        // capability confirmation before being sent to a possibly older peer.
+        let controller_bundle = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|root| root.get("gimmick_behavior")?.get("version")?.as_u64())
+            == Some(u64::from(
+                crate::gimmicks::controller_protocol::REQUEST_VERSION,
+            ));
+        !controller_bundle
+    });
+}
 
 fn retain_latest_for_marker(messages: &mut Vec<String>, marker: &str) {
     let Some(latest) = messages.iter().rposition(|m| m.contains(marker)) else {
@@ -1356,12 +1856,31 @@ fn retain_latest_idempotent_commands(messages: &mut Vec<String>) {
 
 fn trim_outbox(messages: &mut Vec<String>) {
     while messages.len() > OUTBOX_CAP {
-        let removable = messages.iter().position(|message| {
-            !IDEMPOTENT_COMMAND_MARKERS
-                .iter()
-                .any(|marker| message.contains(marker))
-        });
-        messages.remove(removable.unwrap_or(0));
+        // A symbolic operation represents one user action, not an authoritative
+        // replacement snapshot. Prefer discarding ordinary edits, then idempotent
+        // commands, but never silently remove an operation. The operation-specific
+        // enqueue path refuses the only state in which every frame is protected.
+        let removable = messages
+            .iter()
+            .position(|message| {
+                !is_gimmick_operation(message)
+                    && !IDEMPOTENT_COMMAND_MARKERS
+                        .iter()
+                        .any(|marker| message.contains(marker))
+            })
+            .or_else(|| {
+                messages
+                    .iter()
+                    .position(|message| !is_gimmick_operation(message))
+            });
+        let Some(removable) = removable else {
+            debug_assert!(
+                false,
+                "gimmick operation queue exceeded its reserved capacity"
+            );
+            break;
+        };
+        messages.remove(removable);
     }
 }
 
@@ -1386,6 +1905,21 @@ impl Default for Shared {
             status: LinkStatus::Disconnected,
             client_id: None,
             connection_epoch: 0,
+            gimmick_agents: BTreeMap::new(),
+            gimmick_agents_seq: 0,
+            gimmick_agents_wire_seq: None,
+            gimmick_agents_epoch: 0,
+            gimmick_agents_received: None,
+            gimmick_agents_error: None,
+            gimmick_meters: Vec::new(),
+            gimmick_live_expected: BTreeMap::new(),
+            gimmick_live_acks: BTreeMap::new(),
+            gimmick_live_snapshot: None,
+            gimmick_controller_capabilities: None,
+            gimmick_controller_capabilities_seq: None,
+            gimmick_feature_capabilities: None,
+            gimmick_feature_capabilities_seq: None,
+            gimmick_meters_wire_seq: None,
             kinds: BTreeMap::new(),
             captures: BTreeMap::new(),
             capture_claimed_runs: BTreeMap::new(),
@@ -1410,6 +1944,7 @@ impl Default for Shared {
             capture_completed_runs: BTreeSet::new(),
             ignored_capture_kinds: BTreeSet::new(),
             outbox: Vec::new(),
+            gimmick_operations_in_flight: 0,
             last_error: None,
             frames_rx: 0,
             edits_tx: 0,
@@ -1437,6 +1972,366 @@ impl Default for GameLink {
 }
 
 impl GameLink {
+    /// Send a complete, replaceable live gimmick snapshot. The game acknowledgement,
+    /// not this queueing result, is the authority on acceptance.
+    pub fn send_gimmick_live(
+        &self,
+        family: &str,
+        request: serde_json::Value,
+    ) -> Result<(), String> {
+        let key = match family {
+            "behavior" => "gimmick_behavior",
+            "parameters" => "gimmick_parameters",
+            _ => return Err("Unknown live gimmick family".into()),
+        };
+        let revision = request
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("Live gimmick snapshot has no revision")?;
+        let controller_bundle = family == "behavior" && request.get("charts").is_some();
+        let mut required_features = std::collections::BTreeSet::new();
+        if controller_bundle {
+            let decoded = serde_json::from_value::<
+                crate::gimmicks::controller_protocol::ControllerBundleRequest,
+            >(request.clone())
+            .map_err(|error| format!("Invalid controller bundle: {error}"))?;
+            crate::gimmicks::controller_protocol::encode_request(&decoded)?;
+            for feature in decoded
+                .charts
+                .iter()
+                .flat_map(|chart| chart.program.required_native_features())
+            {
+                required_features.insert(feature.to_owned());
+            }
+        } else if family == "behavior" {
+            let decoded = serde_json::from_value::<crate::gimmicks::live_protocol::LiveRequest>(
+                request.clone(),
+            )
+            .map_err(|error| format!("Invalid live behavior snapshot: {error}"))?;
+            crate::gimmicks::live_protocol::encode_request(&decoded)?;
+            required_features.extend(
+                decoded
+                    .programs
+                    .iter()
+                    .flat_map(|program| program.required_native_features())
+                    .map(str::to_owned),
+            );
+        }
+        let payload = serde_json::to_string(&serde_json::json!({key: request}))
+            .map_err(|error| error.to_string())?;
+        let limit = if family == "behavior" {
+            crate::gimmicks::live_protocol::MAX_REQUEST_BYTES
+        } else {
+            crate::gimmicks::live_params::MAX_REQUEST_BYTES
+        };
+        if payload.len() > limit {
+            return Err(format!(
+                "Live {family} snapshot exceeds {} KiB",
+                limit / 1024
+            ));
+        }
+        let mut shared = self.shared.lock().map_err(|_| "Live queue unavailable")?;
+        if controller_bundle
+            && (shared.status != LinkStatus::Connected
+                || shared.client_id.is_none()
+                || shared
+                    .gimmick_controller_capabilities
+                    .as_ref()
+                    .is_none_or(|capabilities| !capabilities.is_supported_contract()))
+        {
+            return Err(
+                "The current connection has not confirmed multi-chart controller support".into(),
+            );
+        }
+        if !required_features.is_empty() {
+            let capabilities = shared
+                .gimmick_feature_capabilities
+                .as_ref()
+                .filter(|_| shared.client_id.is_some() && shared.status == LinkStatus::Connected)
+                .ok_or("The current plugin does not advertise optional native features")?;
+            if required_features
+                .iter()
+                .any(|feature| !capabilities.supports_feature(feature))
+            {
+                return Err(
+                    "The current plugin does not advertise every required controller feature"
+                        .into(),
+                );
+            }
+        }
+        shared
+            .gimmick_live_expected
+            .insert(family.to_owned(), revision);
+        shared.gimmick_live_acks.remove(family);
+        queue_latest_full_replace(
+            &mut shared.outbox,
+            format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"),
+        );
+        shared.edits_tx += 1;
+        Ok(())
+    }
+
+    pub fn gimmick_live_ack(&self, family: &str) -> Option<GimmickLiveAck> {
+        let shared = self.shared.lock().ok()?;
+        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+            .then(|| shared.gimmick_live_acks.get(family).cloned())
+            .flatten()
+    }
+
+    pub fn gimmick_live_snapshot(&self) -> Option<GimmickLiveSnapshot> {
+        let shared = self.shared.lock().ok()?;
+        if shared.status != LinkStatus::Connected || shared.client_id.is_none() {
+            return None;
+        }
+        let mut snapshot = shared.gimmick_live_snapshot.clone()?;
+        // Legacy callers see only the reserved main chart. Strip V5-only fields
+        // so their existing strict row readers continue to accept the projection.
+        snapshot.behavior.retain(|value| {
+            value
+                .get("chart_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|chart_id| chart_id == "main")
+        });
+        for value in &mut snapshot.behavior {
+            if let Some(row) = value.as_object_mut() {
+                row.remove("chart_id");
+                row.remove("program_id");
+                row.remove("stock_generation");
+            }
+        }
+        Some(snapshot)
+    }
+
+    /// Validated V5 multi-chart capability from the current connection.
+    #[cfg(test)]
+    pub fn gimmick_controller_capabilities(&self) -> Option<GimmickControllerCapabilities> {
+        let shared = self.shared.lock().ok()?;
+        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+            .then(|| shared.gimmick_controller_capabilities.clone())
+            .flatten()
+    }
+
+    /// Full validated controller snapshot, including all chart rows and their
+    /// actor/program identities. Legacy editor surfaces use the projected getter above.
+    pub fn gimmick_controller_snapshot(&self) -> Option<GimmickLiveSnapshot> {
+        let shared = self.shared.lock().ok()?;
+        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+            .then(|| shared.gimmick_live_snapshot.clone())
+            .flatten()
+    }
+
+    /// One-shot restart, never replayed after a transport interruption.
+    pub fn restart_gimmick_controller(
+        &self,
+        fighter: &str,
+        boid: u32,
+        revision: u64,
+    ) -> Result<(), String> {
+        self.queue_gimmick_restart(fighter, boid, None, revision)
+    }
+
+    /// One-shot restart of a specific chart after confirming that the current
+    /// accepted behavior snapshot still reports that chart for this fighter.
+    pub fn restart_gimmick_chart(
+        &self,
+        fighter: &str,
+        boid: u32,
+        chart_id: &str,
+        revision: u64,
+    ) -> Result<(), String> {
+        if chart_id.len() > crate::gimmicks::controller_protocol::MAX_CHART_ID_BYTES
+            || chart_id.trim().is_empty()
+            || chart_id.as_bytes().contains(&0)
+        {
+            return Err("Chart ID must be nonblank, at most 48 bytes, and contain no NUL".into());
+        }
+        self.queue_gimmick_restart(fighter, boid, Some(chart_id), revision)
+    }
+
+    fn queue_gimmick_restart(
+        &self,
+        fighter: &str,
+        boid: u32,
+        chart_id: Option<&str>,
+        revision: u64,
+    ) -> Result<(), String> {
+        let mut shared = self.shared.lock().map_err(|_| "Live queue unavailable")?;
+        if shared.status != LinkStatus::Connected || shared.client_id.is_none() {
+            return Err("Connect to the game before restarting a controller".into());
+        }
+        if shared.gimmick_live_expected.get("behavior") != Some(&revision)
+            || !shared
+                .gimmick_live_acks
+                .get("behavior")
+                .is_some_and(|ack| ack.accepted && ack.revision == revision)
+        {
+            return Err("Wait for the current behavior snapshot to be accepted".into());
+        }
+        if let Some(chart_id) = chart_id {
+            let snapshot = shared
+                .gimmick_live_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.behavior_revision == revision)
+                .ok_or("Wait for the accepted behavior snapshot to report this chart")?;
+            if chart_id != "main"
+                && shared
+                    .gimmick_controller_capabilities
+                    .as_ref()
+                    .is_none_or(|capabilities| !capabilities.is_supported_contract())
+            {
+                return Err(
+                    "The current connection has not confirmed multi-chart controller support"
+                        .into(),
+                );
+            }
+            let chart_exists = snapshot.behavior.iter().any(|row| {
+                let Some(row) = row.as_object() else {
+                    return false;
+                };
+                let row_chart_id = row
+                    .get("chart_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("main");
+                row.get("fighter").and_then(serde_json::Value::as_str) == Some(fighter)
+                    && row.get("boid").and_then(serde_json::Value::as_u64) == Some(u64::from(boid))
+                    && row_chart_id == chart_id
+            });
+            if !chart_exists {
+                return Err(
+                    "The accepted behavior snapshot does not contain this fighter chart".into(),
+                );
+            }
+        }
+        if shared
+            .outbox
+            .iter()
+            .filter(|message| is_gimmick_operation(message))
+            .count()
+            + shared.gimmick_operations_in_flight
+            >= OUTBOX_CAP
+        {
+            return Err("Live operation queue is full".into());
+        }
+        let mut request = serde_json::json!({
+            "fighter": fighter,
+            "boid": boid,
+            "expected_revision": revision
+        });
+        if let (Some(chart_id), Some(request)) = (chart_id, request.as_object_mut()) {
+            request.insert("chart_id".into(), chart_id.into());
+        }
+        let payload = serde_json::json!({"gimmick_restart": request});
+        shared
+            .outbox
+            .push(format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>"));
+        trim_outbox(&mut shared.outbox);
+        shared.edits_tx += 1;
+        Ok(())
+    }
+    /// Render authoring controls in tests without starting a game connection.
+    #[cfg(test)]
+    pub fn offline_for_test() -> Self {
+        let link = Self::default();
+        link.started.store(true, Ordering::SeqCst);
+        link
+    }
+
+    /// Queue a constrained article generate request. The plugin repeats all
+    /// identifier, fighter, and live-object checks on its game thread before
+    /// it can call `ArticleModule`. `Ok(())` means only that this process
+    /// accepted the action into its bounded outbound queue; inspect the plugin
+    /// diagnostic log for game-thread acceptance or rejection.
+    pub fn generate_gimmick_article(
+        &self,
+        fighter: &str,
+        fighter_boid: u32,
+        symbol: &str,
+    ) -> Result<(), GimmickOperationError> {
+        registry::resolve(fighter, symbol, IdentifierKind::Article)?;
+        self.queue_gimmick_operation(GimmickOperationRequest {
+            version: 1,
+            fighter,
+            fighter_boid,
+            operation: GimmickOperationKind::GenerateArticle { symbol },
+        })
+    }
+
+    /// Queue a constrained article removal request. Removing an absent
+    /// article is guarded and diagnostic-only on the plugin side.
+    pub fn remove_gimmick_article(
+        &self,
+        fighter: &str,
+        fighter_boid: u32,
+        symbol: &str,
+    ) -> Result<(), GimmickOperationError> {
+        registry::resolve(fighter, symbol, IdentifierKind::Article)?;
+        self.queue_gimmick_operation(GimmickOperationRequest {
+            version: 1,
+            fighter,
+            fighter_boid,
+            operation: GimmickOperationKind::RemoveArticle { symbol },
+        })
+    }
+
+    /// Queue a status request for one live weapon owned by the named fighter.
+    /// The generated concrete weapon-kind table prevents a status intended for
+    /// one article from being sent to another owned weapon.
+    pub fn request_gimmick_weapon_status(
+        &self,
+        fighter: &str,
+        fighter_boid: u32,
+        weapon_boid: u32,
+        symbol: &str,
+    ) -> Result<(), GimmickOperationError> {
+        if weapon_boid == 0 {
+            return Err(GimmickOperationError::InvalidWeaponObjectId);
+        }
+        let status = registry::resolve(fighter, symbol, IdentifierKind::WeaponStatus)?;
+        if registry::weapon_kind(fighter, status.group).is_none() {
+            return Err(GimmickOperationError::MissingWeaponKind {
+                fighter: fighter.to_owned(),
+                group: status.group.to_owned(),
+            });
+        }
+        self.queue_gimmick_operation(GimmickOperationRequest {
+            version: 1,
+            fighter,
+            fighter_boid,
+            operation: GimmickOperationKind::RequestWeaponStatus {
+                weapon_boid,
+                symbol,
+            },
+        })
+    }
+
+    fn queue_gimmick_operation(
+        &self,
+        request: GimmickOperationRequest<'_>,
+    ) -> Result<(), GimmickOperationError> {
+        let payload = serde_json::to_string(&serde_json::json!({
+            "gimmick_operation": request
+        }))
+        .expect("gimmick operation request contains only serializable fields");
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        let mut shared = self
+            .shared
+            .lock()
+            .map_err(|_| GimmickOperationError::QueueUnavailable)?;
+        let queued_operations = shared
+            .outbox
+            .iter()
+            .filter(|message| is_gimmick_operation(message))
+            .count()
+            .saturating_add(shared.gimmick_operations_in_flight);
+        if queued_operations >= OUTBOX_CAP {
+            return Err(GimmickOperationError::QueueFull);
+        }
+        shared.outbox.push(frame);
+        trim_outbox(&mut shared.outbox);
+        shared.edits_tx += 1;
+        Ok(())
+    }
+
     /// Temporarily hold live rule replacements while a project is materialized. The editor
     /// builds each move through the ordinary pushers, but the plugin must receive only the
     /// final flattened replacement for each rule family.
@@ -1495,6 +2390,51 @@ impl GameLink {
             .lock()
             .map(|s| (s.frames_rx, s.edits_tx))
             .unwrap_or((0, 0))
+    }
+
+    /// Current connection's complete live fighter/weapon snapshot.
+    pub fn gimmick_agents(&self) -> Vec<LiveGimmickAgent> {
+        self.shared
+            .lock()
+            .map(|shared| {
+                if current_gimmick_agents_snapshot(&shared) {
+                    shared.gimmick_agents.values().cloned().collect()
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether this connection has received a complete live-object snapshot,
+    /// including a valid empty snapshot while the game is outside a match.
+    pub fn has_gimmick_agents_snapshot(&self) -> bool {
+        self.shared
+            .lock()
+            .is_ok_and(|shared| current_gimmick_agents_snapshot(&shared))
+    }
+
+    /// Why the newest live-object roster was rejected, if it was malformed.
+    pub fn gimmick_agents_error(&self) -> Option<String> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|shared| shared.gimmick_agents_error.clone())
+    }
+
+    /// Current-session live values for one generated symbolic meter source.
+    pub fn gimmick_meter_values(&self, fighter: &str, symbol: &str) -> Vec<LiveGimmickMeter> {
+        self.shared
+            .lock()
+            .map(|shared| {
+                shared
+                    .gimmick_meters
+                    .iter()
+                    .filter(|meter| meter.fighter == fighter && meter.symbol == symbol)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Snapshot of all live kinds (id = hash40 of effect name).
@@ -1989,13 +2929,39 @@ fn connect_hint(error: &std::io::Error) -> &'static str {
     }
 }
 
+fn current_gimmick_agents_snapshot(shared: &Shared) -> bool {
+    // The plugin replaces the complete list and the socket/session boundary
+    // clears it. Do not expire a valid snapshot on wall-clock time: pausing the
+    // game also pauses game-thread publication, and that used to turn working
+    // selectors back into raw ID fields after three seconds. Every operation is
+    // revalidated in-game, so a paused snapshot is safe selection metadata.
+    shared.status == LinkStatus::Connected
+        && shared.client_id.is_some()
+        && shared.gimmick_agents_epoch == shared.connection_epoch
+        && shared.gimmick_agents_received.is_some()
+}
+
 fn link_thread(shared: Arc<Mutex<Shared>>) {
     loop {
         {
             let mut s = shared.lock().unwrap();
             s.status = LinkStatus::Connecting;
             s.client_id = None;
+            s.gimmick_agents.clear();
+            s.gimmick_agents_wire_seq = None;
+            s.gimmick_agents_received = None;
+            s.gimmick_agents_error = None;
+            s.gimmick_meters.clear();
+            s.gimmick_meters_wire_seq = None;
+            s.gimmick_live_acks.clear();
+            s.gimmick_live_snapshot = None;
+            s.gimmick_controller_capabilities = None;
+            s.gimmick_controller_capabilities_seq = None;
+            s.gimmick_feature_capabilities = None;
+            s.gimmick_feature_capabilities_seq = None;
+            discard_session_bound_messages(&mut s.outbox);
             s.last_rx = None;
+            s.gimmick_operations_in_flight = 0;
         }
         let addr = plugin_addr();
         match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
@@ -2013,7 +2979,20 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.status = LinkStatus::Disconnected;
                 s.last_error = reason;
                 s.client_id = None;
+                s.gimmick_agents.clear();
+                s.gimmick_agents_wire_seq = None;
+                s.gimmick_agents_received = None;
+                s.gimmick_agents_error = None;
+                s.gimmick_meters.clear();
+                s.gimmick_meters_wire_seq = None;
                 s.last_rx = None;
+                s.gimmick_live_acks.clear();
+                s.gimmick_live_snapshot = None;
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_controller_capabilities_seq = None;
+                s.gimmick_feature_capabilities = None;
+                s.gimmick_feature_capabilities_seq = None;
+                s.gimmick_operations_in_flight = 0;
             }
             Err(e) => {
                 let hint = connect_hint(&e);
@@ -2021,7 +3000,19 @@ fn link_thread(shared: Arc<Mutex<Shared>>) {
                 s.status = LinkStatus::Disconnected;
                 s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
                 s.client_id = None;
+                s.gimmick_agents.clear();
+                s.gimmick_agents_wire_seq = None;
+                s.gimmick_agents_received = None;
+                s.gimmick_agents_error = None;
+                s.gimmick_meters.clear();
+                s.gimmick_meters_wire_seq = None;
                 s.last_rx = None;
+                s.gimmick_live_acks.clear();
+                s.gimmick_live_snapshot = None;
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_controller_capabilities_seq = None;
+                s.gimmick_feature_capabilities = None;
+                s.gimmick_feature_capabilities_seq = None;
             }
         }
         std::thread::sleep(RECONNECT_DELAY);
@@ -2040,12 +3031,17 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
     // Requeue unsent frames at the FRONT, preserving order, so an interrupted flush
     // loses nothing: edits made while offline are delivered on the next connection.
     let requeue_front = |shared: &Arc<Mutex<Shared>>, unsent: Vec<String>| {
-        if unsent.is_empty() {
-            return;
-        }
         if let Ok(mut s) = shared.lock() {
+            // The current socket no longer owns any dequeued messages. Once its
+            // unsent suffix is restored below, those operations are counted from
+            // `outbox` again; if every write succeeded, there is nothing to restore.
+            s.gimmick_operations_in_flight = 0;
+            if unsent.is_empty() {
+                return;
+            }
             let mut combined = unsent;
             combined.extend(std::mem::take(&mut s.outbox));
+            discard_session_bound_messages(&mut combined);
             retain_latest_full_replace(&mut combined);
             retain_latest_idempotent_commands(&mut combined);
             trim_outbox(&mut combined);
@@ -2057,7 +3053,12 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         // Outbound edits first — they're latency-sensitive.
         let pending: Vec<String> = {
             let mut s = shared.lock().unwrap();
-            std::mem::take(&mut s.outbox)
+            let pending = std::mem::take(&mut s.outbox);
+            s.gimmick_operations_in_flight = pending
+                .iter()
+                .filter(|message| is_gimmick_operation(message))
+                .count();
+            pending
         };
         let mut pending = pending;
         retain_latest_full_replace(&mut pending);
@@ -2073,6 +3074,14 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
             let unsent: Vec<String> = pending.into_iter().skip(index).collect();
             requeue_front(shared, unsent);
             return Some(reason);
+        }
+
+        // `write_all` accepted every pending frame. There is intentionally no
+        // completion acknowledgement in this legacy TCP protocol, so operations
+        // are now only observable through the plugin diagnostic log; they must
+        // not keep consuming the local queue reservation after this point.
+        if let Ok(mut s) = shared.lock() {
+            s.gimmick_operations_in_flight = 0;
         }
 
         // Idle probe: force traffic so a half-open socket surfaces as an error even
@@ -2406,6 +3415,229 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 .and_then(|value| value.as_str())
                 .map(str::to_owned);
         }
+        "GimmickAgents" => {
+            let Some(snapshot) = body.get("GimmickAgents") else {
+                s.gimmick_agents_error = Some("live roster payload is missing".to_string());
+                return;
+            };
+            let snapshot = match serde_json::from_value::<GimmickAgentsWire>(snapshot.clone()) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    s.gimmick_agents_error =
+                        Some(format!("live roster could not be decoded: {error}"));
+                    return;
+                }
+            };
+            if snapshot.version != 1 {
+                s.gimmick_agents_error = Some(format!(
+                    "unsupported live roster version {} (expected 1)",
+                    snapshot.version
+                ));
+                return;
+            }
+            if s.gimmick_agents_epoch == s.connection_epoch
+                && s.gimmick_agents_wire_seq
+                    .is_some_and(|known| snapshot.seq <= known)
+            {
+                return;
+            }
+            let mut next = BTreeMap::new();
+            let row_count = snapshot.agents.len();
+            let mut row_warning = None;
+            for (index, value) in snapshot.agents.into_iter().enumerate() {
+                let agent = match serde_json::from_value::<LiveGimmickAgent>(value) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        row_warning.get_or_insert_with(|| {
+                            format!(
+                                "live roster row {} could not be decoded: {error}",
+                                index + 1
+                            )
+                        });
+                        continue;
+                    }
+                };
+                let reason = if !matches!(agent.category, 0 | 1) {
+                    Some("unknown object category")
+                } else if agent.category == 0
+                    && (agent.fighter.as_deref().is_none_or(str::is_empty)
+                        || agent.owner_boid.is_some())
+                {
+                    Some("invalid fighter identity")
+                } else if agent.category == 1
+                    && (agent.fighter.is_some() || agent.owner_boid.is_none())
+                {
+                    Some("invalid weapon ownership")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    row_warning.get_or_insert_with(|| {
+                        format!("live roster row {:#010x} has {reason}", agent.boid)
+                    });
+                    continue;
+                }
+                let boid = agent.boid;
+                if next.insert(boid, agent).is_some() {
+                    row_warning
+                        .get_or_insert_with(|| format!("live roster repeats object {boid:#010x}"));
+                }
+            }
+            // A nonempty publication with no usable rows is still a rejected
+            // snapshot. Preserve the last good list. Partial publications are
+            // safe selection metadata: execution re-proves object identity,
+            // ownership, kind, and symbol on the game thread.
+            if row_count != 0 && next.is_empty() && row_warning.is_some() {
+                s.gimmick_agents_error = row_warning;
+                return;
+            }
+            s.gimmick_agents = next;
+            s.gimmick_agents_seq = s.gimmick_agents_seq.wrapping_add(1);
+            s.gimmick_agents_wire_seq = Some(snapshot.seq);
+            s.gimmick_agents_epoch = s.connection_epoch;
+            s.gimmick_agents_received = Some(Instant::now());
+            s.gimmick_agents_error = row_warning;
+        }
+        "GimmickMeters" => {
+            let Some(snapshot) = body.get("GimmickMeters") else {
+                return;
+            };
+            let Ok(snapshot) = serde_json::from_value::<GimmickMetersWire>(snapshot.clone()) else {
+                return;
+            };
+            if snapshot.version != 1
+                || s.gimmick_meters_wire_seq
+                    .is_some_and(|known| snapshot.seq <= known)
+            {
+                return;
+            }
+            let mut keys = BTreeSet::new();
+            if snapshot.values.iter().any(|meter| {
+                let typed = match (meter.kind.as_str(), meter.value) {
+                    ("work_float", LiveGimmickMeterValue::Float(value)) => value.is_finite(),
+                    ("work_int", LiveGimmickMeterValue::Int(_))
+                    | ("work_flag", LiveGimmickMeterValue::Flag(_)) => true,
+                    _ => false,
+                };
+                meter.binding_id.is_empty()
+                    || meter.fighter.is_empty()
+                    || meter.symbol.is_empty()
+                    || meter.entry_id < 0
+                    || !typed
+                    || !keys.insert((meter.entry_id, meter.binding_id.clone()))
+            }) {
+                return;
+            }
+            s.gimmick_meters = snapshot.values;
+            s.gimmick_meters_wire_seq = Some(snapshot.seq);
+        }
+        "GimmickLiveAck" => {
+            let Some(value) = body.get("GimmickLiveAck") else {
+                return;
+            };
+            let Ok(ack) = serde_json::from_value::<GimmickLiveAck>(value.clone()) else {
+                return;
+            };
+            if ack.version != 1
+                || !matches!(ack.family.as_str(), "parameters" | "behavior")
+                || ack.message.len() > 4096
+                || s.gimmick_live_expected.get(&ack.family) != Some(&ack.revision)
+                || s.client_id.is_none()
+            {
+                return;
+            }
+            s.gimmick_live_acks.insert(ack.family.clone(), ack);
+        }
+        "GimmickControllerCapabilities" => {
+            let Some(value) = body.get("GimmickControllerCapabilities") else {
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_live_snapshot = None;
+                return;
+            };
+            let Some(frame_seq) = value.get("seq").and_then(serde_json::Value::as_u64) else {
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_live_snapshot = None;
+                return;
+            };
+            let newer = s
+                .gimmick_controller_capabilities_seq
+                .is_none_or(|known| frame_seq > known);
+            if !newer {
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_live_snapshot = None;
+                return;
+            }
+            // Consume a parseable sequence even when another strict field fails,
+            // so replaying that sequence with a repaired body cannot grant support.
+            s.gimmick_controller_capabilities_seq = Some(frame_seq);
+            let Ok(capabilities) =
+                serde_json::from_value::<GimmickControllerCapabilities>(value.clone())
+            else {
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_live_snapshot = None;
+                return;
+            };
+            if capabilities.is_supported_contract() && s.client_id.is_some() {
+                s.gimmick_controller_capabilities = Some(capabilities);
+            } else {
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_live_snapshot = None;
+            }
+        }
+        "GimmickFeatureCapabilities" => {
+            let Some(value) = body.get("GimmickFeatureCapabilities") else {
+                s.gimmick_feature_capabilities = None;
+                return;
+            };
+            let Some(frame_seq) = value.get("seq").and_then(serde_json::Value::as_u64) else {
+                s.gimmick_feature_capabilities = None;
+                return;
+            };
+            let newer = s
+                .gimmick_feature_capabilities_seq
+                .is_none_or(|known| frame_seq > known);
+            if !newer {
+                s.gimmick_feature_capabilities = None;
+                return;
+            }
+            // This sequence is independent of V5 controller telemetry. Consume
+            // it before strict validation to prevent repaired same-seq replays.
+            s.gimmick_feature_capabilities_seq = Some(frame_seq);
+            let Ok(capabilities) =
+                serde_json::from_value::<GimmickFeatureCapabilities>(value.clone())
+            else {
+                s.gimmick_feature_capabilities = None;
+                return;
+            };
+            if capabilities.is_well_formed() && s.client_id.is_some() {
+                s.gimmick_feature_capabilities = Some(capabilities);
+            } else {
+                s.gimmick_feature_capabilities = None;
+            }
+        }
+        "GimmickLiveState" => {
+            let Some(value) = body.get("GimmickLiveState") else {
+                return;
+            };
+            let Ok(snapshot) = serde_json::from_value::<GimmickLiveSnapshot>(value.clone()) else {
+                return;
+            };
+            if snapshot.version != 1
+                || snapshot.parameters.len() > crate::gimmicks::live_params::MAX_EDITS
+                || s.client_id.is_none()
+                || value.to_string().len() > 512 * 1024
+                || s.gimmick_live_snapshot
+                    .as_ref()
+                    .is_some_and(|old| old.seq >= snapshot.seq)
+                || !valid_gimmick_live_rows_with_capabilities(
+                    &snapshot,
+                    s.gimmick_controller_capabilities.as_ref(),
+                )
+            {
+                return;
+            }
+            s.gimmick_live_snapshot = Some(snapshot);
+        }
         "Remove" => {
             if let Some(id) = body
                 .get("Remove")
@@ -2423,6 +3655,19 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
                 .and_then(|c| c.as_u64());
             if client_id.is_some() {
                 s.connection_epoch = s.connection_epoch.wrapping_add(1).max(1);
+                discard_session_bound_messages(&mut s.outbox);
+                s.gimmick_agents.clear();
+                s.gimmick_agents_wire_seq = None;
+                s.gimmick_agents_received = None;
+                s.gimmick_agents_error = None;
+                s.gimmick_meters.clear();
+                s.gimmick_meters_wire_seq = None;
+                s.gimmick_live_acks.clear();
+                s.gimmick_live_snapshot = None;
+                s.gimmick_controller_capabilities = None;
+                s.gimmick_controller_capabilities_seq = None;
+                s.gimmick_feature_capabilities = None;
+                s.gimmick_feature_capabilities_seq = None;
             }
             s.client_id = client_id;
         }
@@ -2433,6 +3678,411 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_sync_preflight_failure_is_visible_and_recovers_when_saved_data_is_restored() {
+        let link = GameLink::offline_for_test();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.status = LinkStatus::Connected;
+            shared.client_id = Some(1);
+            shared.gimmick_live_snapshot = Some(GimmickLiveSnapshot {
+                version: 1,
+                seq: 1,
+                behavior_revision: 0,
+                parameter_revision: 0,
+                behavior: vec![],
+                parameters: vec![],
+                parameter_health: None,
+            });
+        }
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let mut sync = crate::gimmicks::live_sync::LiveSync::default();
+        let mut params = BTreeMap::new();
+        let graphs = BTreeMap::new();
+        sync.update(&params, &graphs, &link);
+        let expected = link.shared.lock().unwrap().gimmick_live_expected.clone();
+        params.insert(
+            "cloud".into(),
+            crate::mod_project::ParamMod {
+                files: BTreeMap::from([(
+                    "fighter/cloud/param/vl.prc".into(),
+                    (0..=crate::gimmicks::live_params::MAX_EDITS)
+                        .map(|index| {
+                            (
+                                format!("value_{index}"),
+                                crate::mod_project::ParamValue::Float(1.0),
+                            )
+                        })
+                        .collect(),
+                )]),
+            },
+        );
+        sync.update(&params, &graphs, &link);
+        assert!(sync.error_for("parameters").is_some());
+        assert_eq!(link.shared.lock().unwrap().gimmick_live_expected, expected);
+        params.clear();
+        sync.update(&params, &graphs, &link);
+        assert!(sync.error_for("parameters").is_none());
+        assert!(sync.error.is_empty());
+    }
+
+    #[test]
+    fn live_gimmick_rows_require_exact_typed_bounded_snapshot_data() {
+        let mut snapshot = GimmickLiveSnapshot {
+            version: 1,
+            seq: 1,
+            behavior_revision: 4,
+            parameter_revision: 5,
+            behavior: vec![
+                serde_json::json!({"fighter":"mario","boid":0,"entry_id":0,"revision":4,"state":"waiting",
+                "vars":{"remaining":{"Int":60},"ready":{"Flag":false}}}),
+            ],
+            parameters: vec![
+                serde_json::json!({"fighter":"cloud","path":"param_special_lw[0].limit_gauge_add","hits":1,
+                "baseline":{"Float":0.667},"lastObserved":{"Float":2.0}}),
+            ],
+            parameter_health: None,
+        };
+        assert!(valid_gimmick_live_rows(&snapshot));
+        snapshot.parameter_health = Some(crate::gimmicks::live_params::ParameterHealth {
+            revision: 5,
+            ..Default::default()
+        });
+        assert!(valid_gimmick_live_rows(&snapshot));
+        snapshot.parameter_health.as_mut().unwrap().revision = 6;
+        assert!(!valid_gimmick_live_rows(&snapshot));
+        snapshot.parameter_health = None;
+        snapshot.behavior[0]["revision"] = 3.into();
+        assert!(!valid_gimmick_live_rows(&snapshot));
+        snapshot.behavior[0]["revision"] = 4.into();
+        snapshot.behavior.push(snapshot.behavior[0].clone());
+        assert!(!valid_gimmick_live_rows(&snapshot));
+        snapshot.behavior.pop();
+        snapshot.parameters[0]["lastObserved"] = serde_json::json!({"Flag":true});
+        assert!(!valid_gimmick_live_rows(&snapshot));
+        snapshot.parameters[0]["lastObserved"] = serde_json::json!({"Float":2.0});
+        snapshot.parameters[0]["fighter"] = "not_a_fighter".into();
+        assert!(!valid_gimmick_live_rows(&snapshot));
+    }
+
+    #[test]
+    fn live_gimmick_full_snapshots_coalesce_per_family_and_ack_only_current_revision() {
+        let link = GameLink::offline_for_test();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.status = LinkStatus::Connected;
+            shared.client_id = Some(1);
+        }
+        for revision in 1..=3 {
+            link.send_gimmick_live(
+                "behavior",
+                serde_json::json!({"version":4,"revision":revision,"programs":[]}),
+            )
+            .unwrap();
+            link.send_gimmick_live("parameters", serde_json::json!({"revision":revision+10}))
+                .unwrap();
+        }
+        assert_eq!(link.shared.lock().unwrap().outbox.len(), 2);
+        let deliver = |revision, version| {
+            let mut frame = plugin_frame(
+                "GimmickLiveAck",
+                &serde_json::json!({"GimmickLiveAck":{
+                "version":version,"family":"behavior","revision":revision,"accepted":true,"message":"accepted"}}),
+            );
+            for payload in extract_frames(&mut frame) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        deliver(2, 1);
+        deliver(3, 2);
+        assert!(link.gimmick_live_ack("behavior").is_none());
+        deliver(3, 1);
+        assert!(link.gimmick_live_ack("behavior").unwrap().accepted);
+        assert!(link
+            .send_gimmick_live("unknown", serde_json::json!({"revision":4}))
+            .is_err());
+        assert!(link
+            .send_gimmick_live(
+                "behavior",
+                serde_json::json!({"revision":4,"large":"x".repeat(crate::gimmicks::live_protocol::MAX_REQUEST_BYTES)})
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn live_gimmick_telemetry_is_ordered_and_new_connection_clears_state_and_ack() {
+        let link = GameLink::offline_for_test();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.status = LinkStatus::Connected;
+            shared.client_id = Some(1);
+        }
+        let deliver = |header: &str, body: serde_json::Value| {
+            let mut frame = plugin_frame(header, &body);
+            for payload in extract_frames(&mut frame) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        let state = |seq, version| {
+            serde_json::json!({"GimmickLiveState": {
+            "version":version,"seq":seq,"behavior_revision":5,"parameter_revision":6,"behavior":[],"parameters":[]}})
+        };
+        deliver("GimmickLiveState", state(10, 1));
+        deliver("GimmickLiveState", state(9, 1));
+        deliver("GimmickLiveState", state(11, 2));
+        assert_eq!(link.gimmick_live_snapshot().unwrap().seq, 10);
+        assert!(link.restart_gimmick_controller("mario", 0, 5).is_err());
+        link.send_gimmick_live(
+            "behavior",
+            serde_json::json!({"version":4,"revision":5,"programs":[]}),
+        )
+        .unwrap();
+        deliver(
+            "GimmickLiveAck",
+            serde_json::json!({"GimmickLiveAck":{
+            "version":1,"family":"behavior","revision":5,"accepted":true,"message":"accepted"}}),
+        );
+        link.restart_gimmick_controller("mario", 0, 5).unwrap();
+        assert!(link
+            .shared
+            .lock()
+            .unwrap()
+            .outbox
+            .iter()
+            .any(|message| message.contains("gimmick_restart") && is_gimmick_operation(message)));
+        deliver(
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert!(!link
+            .shared
+            .lock()
+            .unwrap()
+            .outbox
+            .iter()
+            .any(|message| message.contains("gimmick_restart")));
+        assert!(link.gimmick_live_snapshot().is_none());
+        assert!(link.gimmick_live_ack("behavior").is_none());
+        assert!(link.restart_gimmick_controller("mario", 0, 5).is_err());
+    }
+
+    #[test]
+    fn targeted_chart_restart_requires_current_capability_and_snapshot_revision() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickLiveState",
+            serde_json::json!({"GimmickLiveState": {
+                "version": 1, "seq": 1, "behavior_revision": 4,
+                "parameter_revision": 5,
+                "behavior": [{"fighter":"mario","boid":10,"entry_id":0,
+                    "revision":4,"state":"waiting","vars":{}}],
+                "parameters": []
+            }}),
+        );
+        accept_behavior_revision(&link, 4);
+        assert!(link
+            .restart_gimmick_chart("mario", 10, "secondary", 4)
+            .is_err());
+
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "secondary",
+            "chart:0:secondary",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        accept_behavior_revision(&link, 5);
+        assert!(link
+            .restart_gimmick_chart("mario", 10, "secondary", 5)
+            .is_err());
+    }
+
+    #[test]
+    fn targeted_chart_restart_requires_a_known_chart_owned_by_the_requested_actor() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        accept_behavior_revision(&link, 4);
+        assert!(link
+            .restart_gimmick_chart("mario", 10, "missing", 4)
+            .is_err());
+        assert!(link.restart_gimmick_chart("luigi", 10, "main", 4).is_err());
+        assert!(link.restart_gimmick_chart("mario", 11, "main", 4).is_err());
+    }
+
+    #[test]
+    fn targeted_chart_restart_queues_exact_payload_and_is_discarded_on_session_change() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let rows = vec![
+            controller_row(
+                10,
+                "mario",
+                0,
+                "main",
+                "live:mario",
+                2,
+                serde_json::json!({}),
+            ),
+            controller_row(
+                10,
+                "mario",
+                0,
+                "secondary",
+                "chart:0:secondary",
+                2,
+                serde_json::json!({}),
+            ),
+        ];
+        deliver(&link, "GimmickLiveState", controller_state(1, rows));
+        accept_behavior_revision(&link, 4);
+        link.restart_gimmick_chart("mario", 10, "secondary", 4)
+            .unwrap();
+        let expected = r#"<TCP_MESSAGE>{"gimmick_restart":{"boid":10,"chart_id":"secondary","expected_revision":4,"fighter":"mario"}}</TCP_MESSAGE>"#;
+        assert_eq!(link.shared.lock().unwrap().outbox, [expected]);
+
+        deliver(
+            &link,
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert!(!link
+            .shared
+            .lock()
+            .unwrap()
+            .outbox
+            .iter()
+            .any(|message| message.contains("gimmick_restart")));
+    }
+
+    #[test]
+    fn targeted_chart_restart_respects_operation_outbox_capacity_and_chart_id_bounds() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "secondary",
+            "chart:0:secondary",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        accept_behavior_revision(&link, 4);
+        let too_long = "x".repeat(49);
+        for invalid in ["", "  ", "bad\0id", too_long.as_str()] {
+            assert!(link.restart_gimmick_chart("mario", 10, invalid, 4).is_err());
+        }
+
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.outbox = (0..OUTBOX_CAP)
+                .map(|index| {
+                    format!(
+                        "<TCP_MESSAGE>{{\"gimmick_operation\":{{\"version\":1,\"fighter\":\"mario\",\"fighter_boid\":{index},\"operation\":\"generate_article\",\"symbol\":\"FIGHTER_MARIO_GENERATE_ARTICLE_FIRE\"}}}}</TCP_MESSAGE>"
+                    )
+                })
+                .collect();
+        }
+        let before = link.shared.lock().unwrap().outbox.clone();
+        assert!(link
+            .restart_gimmick_chart("mario", 10, "secondary", 4)
+            .unwrap_err()
+            .contains("queue is full"));
+        assert_eq!(link.shared.lock().unwrap().outbox, before);
+    }
+
+    #[test]
+    fn live_sync_adopts_plugin_revision_and_resends_authoritatively_after_changes() {
+        let link = GameLink::offline_for_test();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.status = LinkStatus::Connected;
+            shared.client_id = Some(1);
+            shared.gimmick_live_snapshot = Some(GimmickLiveSnapshot {
+                version: 1,
+                seq: 1,
+                behavior_revision: 99,
+                parameter_revision: 100,
+                behavior: vec![],
+                parameters: vec![],
+                parameter_health: None,
+            });
+        }
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let mut sync = crate::gimmicks::live_sync::LiveSync::default();
+        let params = BTreeMap::new();
+        let mut graphs = BTreeMap::from([(
+            "mario".into(),
+            crate::gimmicks::templates::Preset::Timer.graph(),
+        )]);
+        sync.update(&params, &graphs, &link);
+        let expected = link.shared.lock().unwrap().gimmick_live_expected.clone();
+        assert!(expected.values().all(|revision| *revision > 100));
+        sync.update(&params, &graphs, &link);
+        assert_eq!(link.shared.lock().unwrap().gimmick_live_expected, expected);
+        graphs.clear();
+        sync.update(&params, &graphs, &link);
+        {
+            let shared = link.shared.lock().unwrap();
+            let message = shared
+                .outbox
+                .iter()
+                .find(|message| message.contains("gimmick_behavior"))
+                .unwrap();
+            assert!(message.contains("disabled_fighters\":[\"mario\"]"));
+        }
+        sync.enabled = false;
+        sync.update(&params, &graphs, &link);
+        let shared = link.shared.lock().unwrap();
+        let message = shared
+            .outbox
+            .iter()
+            .find(|message| message.contains("gimmick_behavior"))
+            .unwrap();
+        assert!(message.contains("disabled_fighters\":[]"));
+    }
 
     /// Byte-exact replica of the plugin's `emit()`: body is a JSON-escaped *string*.
     fn plugin_frame(header: &str, body: &serde_json::Value) -> String {
@@ -2939,6 +4589,7 @@ mod tests {
                     frame: 5.0,
                     args: vec![LuaArgWire::Int(2), LuaArgWire::Hash(0xabc), LuaArgWire::Nil],
                     command: None,
+                    guard: None,
                 }),
                 func: None,
             },
@@ -2957,6 +4608,7 @@ mod tests {
                     frame: 12.0,
                     args: vec![LuaArgWire::Num(3.0), LuaArgWire::Num(1.0)],
                     command: Some("AREA_WIND_2ND".into()),
+                    guard: None,
                 }),
                 func: None,
             },
@@ -3891,6 +5543,7 @@ mod tests {
                     LuaArgWire::Num(0.7),
                     LuaArgWire::Num(0.6),
                 ],
+                guard: None,
             }),
         }]);
         let frame = link.shared.lock().unwrap().outbox[0].clone();
@@ -5200,6 +6853,7 @@ mod tests {
                     frame: 8.0,
                     args: Vec::new(),
                     command: Some("KineticModule::clear_speed_all".into()),
+                    guard: None,
                 }),
                 func: Some("KineticModule::clear_speed_all".into()),
             },
@@ -5260,6 +6914,7 @@ mod tests {
                     frame: 6.0,
                     args: vec![LuaArgWire::Bool(false), LuaArgWire::Int(5)],
                     command: Some("KineticModule::set_consider_ground_friction".into()),
+                    guard: None,
                 }),
                 func: Some("KineticModule::set_consider_ground_friction".into()),
             },
@@ -5324,61 +6979,37 @@ mod tests {
     }
 
     #[test]
-    fn outbound_set_speed_ex_rules_match_plugin_wire_fields() {
-        let link = GameLink::default();
-        link.send_hitbox_rules(&[HitboxRuleWire {
-            motion: 0x99,
-            category: CAT_SPEED_EX,
-            hitbox_id: Some(7),
-            suppress: false,
-            frame_start: Some(4.5),
-            frame_end: Some(5.5),
-            overrides: Some(HbOverridesWire {
-                speed_x: Some(1.5),
-                speed_y: Some(-3.8),
-                ..Default::default()
-            }),
-            inject: None,
-            func: Some("SET_SPEED_EX".into()),
-        }]);
-        let frame = link.shared.lock().unwrap().outbox[0].clone();
-        let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
-        let value: serde_json::Value = serde_json::from_str(inner).unwrap();
-        let rule = &value["hitbox_rules"][0];
-        assert_eq!(rule["category"].as_u64(), Some(CAT_SPEED_EX as u64));
-        assert_eq!(rule["hitbox_id"].as_u64(), Some(7));
-        assert_eq!(rule["func"].as_str(), Some("SET_SPEED_EX"));
-        assert_eq!(rule["overrides"]["speed_x"].as_f64(), Some(1.5));
-        assert!((rule["overrides"]["speed_y"].as_f64().unwrap() + 3.8).abs() < 1e-6);
-    }
-
-    #[test]
     fn outbound_set_speed_rules_match_plugin_wire_fields() {
-        let link = GameLink::default();
-        link.send_hitbox_rules(&[HitboxRuleWire {
-            motion: 0x99,
-            category: CAT_SPEED,
-            hitbox_id: None,
-            suppress: false,
-            frame_start: Some(4.5),
-            frame_end: Some(4.5),
-            overrides: Some(HbOverridesWire {
-                speed_x: Some(1.5),
-                speed_y: Some(-3.8),
-                ..Default::default()
-            }),
-            inject: None,
-            func: Some("SET_SPEED".into()),
-        }]);
-        let frame = link.shared.lock().unwrap().outbox[0].clone();
-        let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
-        let value: serde_json::Value = serde_json::from_str(inner).unwrap();
-        let rule = &value["hitbox_rules"][0];
-        assert_eq!(rule["category"].as_u64(), Some(CAT_SPEED as u64));
-        assert_eq!(rule["hitbox_id"], serde_json::Value::Null);
-        assert_eq!(rule["func"].as_str(), Some("SET_SPEED"));
-        assert_eq!(rule["overrides"]["speed_x"].as_f64(), Some(1.5));
-        assert!((rule["overrides"]["speed_y"].as_f64().unwrap() + 3.8).abs() < 1e-6);
+        for (category, hitbox_id, frame_end, func) in [
+            (CAT_SPEED_EX, Some(7), 5.5, "SET_SPEED_EX"),
+            (CAT_SPEED, None, 4.5, "SET_SPEED"),
+        ] {
+            let link = GameLink::default();
+            link.send_hitbox_rules(&[HitboxRuleWire {
+                motion: 0x99,
+                category,
+                hitbox_id,
+                suppress: false,
+                frame_start: Some(4.5),
+                frame_end: Some(frame_end),
+                overrides: Some(HbOverridesWire {
+                    speed_x: Some(1.5),
+                    speed_y: Some(-3.8),
+                    ..Default::default()
+                }),
+                inject: None,
+                func: Some(func.into()),
+            }]);
+            let frame = link.shared.lock().unwrap().outbox[0].clone();
+            let inner = &frame["<TCP_MESSAGE>".len()..frame.len() - "</TCP_MESSAGE>".len()];
+            let value: serde_json::Value = serde_json::from_str(inner).unwrap();
+            let rule = &value["hitbox_rules"][0];
+            assert_eq!(rule["category"].as_u64(), Some(category as u64));
+            assert_eq!(rule["hitbox_id"], serde_json::json!(hitbox_id));
+            assert_eq!(rule["func"].as_str(), Some(func));
+            assert_eq!(rule["overrides"]["speed_x"].as_f64(), Some(1.5));
+            assert!((rule["overrides"]["speed_y"].as_f64().unwrap() + 3.8).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -5461,6 +7092,7 @@ mod tests {
                     frame: 3.0,
                     args: Vec::new(),
                     command: Some("REVERSE_LR".into()),
+                    guard: None,
                 }),
                 func: None,
             },
@@ -6133,5 +7765,1491 @@ mod tests {
             assert_eq!(state.client_id, Some(1));
             assert_eq!(state.connection_epoch, expected_epoch);
         }
+    }
+
+    #[test]
+    fn gimmick_agent_snapshots_are_versioned_ordered_and_connection_scoped() {
+        let link = GameLink::default();
+        link.shared.lock().unwrap().status = LinkStatus::Connected;
+        let deliver = |header: &str, body: serde_json::Value| {
+            let mut frame = plugin_frame(header, &body);
+            for payload in extract_frames(&mut frame) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        deliver(
+            "GiveClientId",
+            serde_json::json!({ "GiveClientId": { "client_id": 7 } }),
+        );
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": {
+                    "version": 1,
+                    "seq": 2,
+                    "agents": [
+                        {"boid": 0, "category": 0, "kind": 0x3E, "entry_id": 0, "owner_boid": null, "fighter": "cloud"},
+                        {"boid": 0x10000001u32, "category": 1, "kind": 364, "entry_id": -1, "owner_boid": 0, "fighter": null}
+                    ]
+                }
+            }),
+        );
+        assert_eq!(link.gimmick_agents().len(), 2);
+        assert!(link.has_gimmick_agents_snapshot());
+        link.shared.lock().unwrap().gimmick_agents_received =
+            Some(Instant::now() - Duration::from_secs(4));
+        assert_eq!(link.gimmick_agents().len(), 2);
+        link.shared.lock().unwrap().gimmick_agents_received = Some(Instant::now());
+
+        // TCP is ordered, but a sequence guard also refuses replayed snapshots.
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": { "version": 1, "seq": 1, "agents": [] }
+            }),
+        );
+        assert_eq!(link.gimmick_agents().len(), 2);
+        // Future and malformed snapshots preserve the last complete good list.
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": { "version": 2, "seq": 3, "agents": [] }
+            }),
+        );
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": {
+                    "version": 1,
+                    "seq": 3,
+                    "agents": [{"boid": 7, "category": 9, "kind": 29, "entry_id": 0, "owner_boid": null, "fighter": "cloud"}]
+                }
+            }),
+        );
+        assert_eq!(link.gimmick_agents().len(), 2);
+        assert!(link.gimmick_agents_error().is_some());
+
+        // A bad row cannot strand valid fighter choices. The warning remains
+        // available while the usable subset replaces the previous snapshot.
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": {
+                    "version": 1,
+                    "seq": 4,
+                    "agents": [
+                        {"boid": 0, "category": 0, "kind": 0x3E, "entry_id": 0, "owner_boid": null, "fighter": "cloud"},
+                        {"boid": 7, "category": 9, "kind": 0x3E, "entry_id": 1, "owner_boid": null, "fighter": "cloud"}
+                    ]
+                }
+            }),
+        );
+        assert_eq!(link.gimmick_agents().len(), 1);
+        assert_eq!(link.gimmick_agents()[0].boid, 0);
+        assert!(link.has_gimmick_agents_snapshot());
+        assert!(link.gimmick_agents_error().is_some());
+
+        // A valid empty full replacement removes despawned objects.
+        deliver(
+            "GimmickAgents",
+            serde_json::json!({
+                "GimmickAgents": { "version": 1, "seq": 5, "agents": [] }
+            }),
+        );
+        assert!(link.gimmick_agents().is_empty());
+        assert!(link.has_gimmick_agents_snapshot());
+        assert_eq!(link.gimmick_agents_error(), None);
+
+        // A new plugin session clears even when it reuses its numeric client id.
+        deliver(
+            "GiveClientId",
+            serde_json::json!({ "GiveClientId": { "client_id": 7 } }),
+        );
+        let state = link.shared.lock().unwrap();
+        assert!(state.gimmick_agents.is_empty());
+        assert!(state.gimmick_agents_wire_seq.is_none());
+        assert_eq!(state.connection_epoch, 2);
+        drop(state);
+        assert!(!link.has_gimmick_agents_snapshot());
+    }
+
+    #[test]
+    fn gimmick_meter_snapshots_are_typed_ordered_and_connection_scoped() {
+        let link = GameLink::default();
+        let deliver = |header: &str, body: serde_json::Value| {
+            let mut frame = plugin_frame(header, &body);
+            for payload in extract_frames(&mut frame) {
+                handle_frame(&link.shared, &payload);
+            }
+        };
+        deliver(
+            "GiveClientId",
+            serde_json::json!({ "GiveClientId": { "client_id": 7 } }),
+        );
+        deliver(
+            "GimmickMeters",
+            serde_json::json!({
+                "GimmickMeters": {
+                    "version": 1,
+                    "seq": 2,
+                    "values": [{
+                        "binding_id": "fixture.cloud.limit_work",
+                        "fighter": "cloud",
+                        "entry_id": 0,
+                        "boid": 0,
+                        "symbol": "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE",
+                        "kind": "work_float",
+                        "value": { "float": 47.5 }
+                    }]
+                }
+            }),
+        );
+        let values =
+            link.gimmick_meter_values("cloud", "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].boid, 0);
+        assert_eq!(values[0].value, LiveGimmickMeterValue::Float(47.5));
+
+        // Replayed and type-mismatched frames preserve the last good value.
+        deliver(
+            "GimmickMeters",
+            serde_json::json!({
+                "GimmickMeters": { "version": 1, "seq": 1, "values": [] }
+            }),
+        );
+        deliver(
+            "GimmickMeters",
+            serde_json::json!({
+                "GimmickMeters": {
+                    "version": 1,
+                    "seq": 3,
+                    "values": [{
+                        "binding_id": "bad",
+                        "fighter": "cloud",
+                        "entry_id": 0,
+                        "boid": 0,
+                        "symbol": "BAD",
+                        "kind": "work_float",
+                        "value": { "int": 1 }
+                    }]
+                }
+            }),
+        );
+        assert_eq!(
+            link.gimmick_meter_values("cloud", "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE")
+                .len(),
+            1
+        );
+
+        deliver(
+            "GiveClientId",
+            serde_json::json!({ "GiveClientId": { "client_id": 7 } }),
+        );
+        assert!(link
+            .gimmick_meter_values("cloud", "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE")
+            .is_empty());
+    }
+
+    #[test]
+    fn gimmick_operations_keep_identifiers_symbolic_and_are_locally_typed() {
+        let link = GameLink::default();
+        let article = "FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE";
+        let status = "WEAPON_CLOUD_WAVE_STATUS_KIND_REGULAR";
+        link.generate_gimmick_article("cloud", 0x2000_0001, article)
+            .unwrap();
+        link.remove_gimmick_article("cloud", 0x2000_0001, article)
+            .unwrap();
+        link.request_gimmick_weapon_status("cloud", 0x2000_0001, 0x1000_0001, status)
+            .unwrap();
+
+        let shared = link.shared.lock().unwrap();
+        assert_eq!(shared.outbox.len(), 3);
+        let values: Vec<serde_json::Value> = shared
+            .outbox
+            .iter()
+            .map(|frame| {
+                serde_json::from_str(
+                    frame
+                        .strip_prefix("<TCP_MESSAGE>")
+                        .unwrap()
+                        .strip_suffix("</TCP_MESSAGE>")
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            values[0]["gimmick_operation"]["operation"],
+            "generate_article"
+        );
+        assert_eq!(
+            values[1]["gimmick_operation"]["operation"],
+            "remove_article"
+        );
+        assert_eq!(
+            values[2]["gimmick_operation"]["operation"],
+            "request_weapon_status"
+        );
+        assert_eq!(values[2]["gimmick_operation"]["symbol"], status);
+        assert!(values[2]["gimmick_operation"].get("value").is_none());
+    }
+
+    #[test]
+    fn desktop_refuses_numeric_wrong_kind_and_wrong_fighter_operations() {
+        let link = GameLink::default();
+        assert!(link.generate_gimmick_article("cloud", 1, "0").is_err());
+        assert!(link
+            .generate_gimmick_article("mario", 1, "FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE")
+            .is_err());
+        assert!(link
+            .generate_gimmick_article("cloud", 1, "WEAPON_CLOUD_WAVE_STATUS_KIND_REGULAR")
+            .is_err());
+        assert!(link.shared.lock().unwrap().outbox.is_empty());
+    }
+
+    #[test]
+    fn desktop_accepts_zero_fighter_id_but_refuses_zero_weapon_and_wrong_status_names() {
+        let link = GameLink::default();
+        let article = "FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE";
+        let status = "WEAPON_CLOUD_WAVE_STATUS_KIND_REGULAR";
+
+        link.generate_gimmick_article("cloud", 0, article).unwrap();
+        assert_eq!(
+            link.request_gimmick_weapon_status("cloud", 1, 0, status)
+                .unwrap_err(),
+            GimmickOperationError::InvalidWeaponObjectId
+        );
+        assert!(link
+            .request_gimmick_weapon_status("cloud", 1, 2, article)
+            .is_err());
+        assert!(link
+            .request_gimmick_weapon_status("mario", 1, 2, status)
+            .is_err());
+        assert_eq!(link.shared.lock().unwrap().outbox.len(), 1);
+    }
+
+    #[test]
+    fn non_idempotent_gimmick_operations_are_never_evicted_by_outbox_pressure() {
+        let operation = |id| {
+            format!(
+                "<TCP_MESSAGE>{{\"gimmick_operation\":{{\"version\":1,\"fighter\":\"cloud\",\"fighter_boid\":{id},\"operation\":\"generate_article\",\"symbol\":\"FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE\"}}}}</TCP_MESSAGE>"
+            )
+        };
+        let link = GameLink::default();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.outbox = (1..=OUTBOX_CAP as u32).map(operation).collect();
+        }
+
+        // Ordinary modifier traffic must give way to an already queued action.
+        link.send_modifier_edit(7, &RpmEffectData::default(), false);
+        {
+            let shared = link.shared.lock().unwrap();
+            assert_eq!(shared.outbox.len(), OUTBOX_CAP);
+            assert!(shared
+                .outbox
+                .iter()
+                .all(|frame| is_gimmick_operation(frame)));
+        }
+
+        // An additional action reports a local failure instead of silently
+        // displacing the first action in the queue.
+        assert_eq!(
+            link.generate_gimmick_article(
+                "cloud",
+                OUTBOX_CAP as u32 + 1,
+                "FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE"
+            )
+            .unwrap_err(),
+            GimmickOperationError::QueueFull
+        );
+    }
+
+    #[test]
+    fn operation_capacity_counts_the_socket_flush_reservation() {
+        let link = GameLink::default();
+        let operation = |id| {
+            format!(
+                "<TCP_MESSAGE>{{\"gimmick_operation\":{{\"version\":1,\"fighter\":\"cloud\",\"fighter_boid\":{id},\"operation\":\"generate_article\",\"symbol\":\"FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE\"}}}}</TCP_MESSAGE>"
+            )
+        };
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.outbox = (1..OUTBOX_CAP as u32).map(operation).collect();
+            shared.gimmick_operations_in_flight = 1;
+        }
+        assert_eq!(
+            link.generate_gimmick_article(
+                "cloud",
+                OUTBOX_CAP as u32,
+                "FIGHTER_CLOUD_GENERATE_ARTICLE_WAVE"
+            )
+            .unwrap_err(),
+            GimmickOperationError::QueueFull
+        );
+    }
+    fn deliver(link: &GameLink, header: &str, body: serde_json::Value) {
+        let mut frame = plugin_frame(header, &body);
+        for payload in extract_frames(&mut frame) {
+            handle_frame(&link.shared, &payload);
+        }
+    }
+
+    fn supported_capabilities(seq: u64) -> serde_json::Value {
+        serde_json::json!({
+            "GimmickControllerCapabilities": {
+                "version": 1,
+                "seq": seq,
+                "request_version": crate::gimmicks::controller_protocol::REQUEST_VERSION,
+                "model_version": crate::gimmicks::live_model::MODEL_VERSION,
+                "max_charts": 8,
+                "max_actors": 128,
+                "max_rows": 1024
+            }
+        })
+    }
+
+    fn feature_capabilities(seq: u64, features: Vec<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "GimmickFeatureCapabilities": {
+                "version": 1,
+                "seq": seq,
+                "features": features,
+            }
+        })
+    }
+
+    fn controller_row(
+        boid: u32,
+        fighter: &str,
+        entry_id: i32,
+        chart_id: &str,
+        program_id: &str,
+        stock_generation: u32,
+        vars: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "fighter": fighter,
+            "boid": boid,
+            "entry_id": entry_id,
+            "revision": 4,
+            "state": "waiting",
+            "vars": vars,
+            "chart_id": chart_id,
+            "program_id": program_id,
+            "stock_generation": stock_generation
+        })
+    }
+
+    fn controller_state(seq: u64, behavior: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "GimmickLiveState": {
+                "version": 1,
+                "seq": seq,
+                "behavior_revision": 4,
+                "parameter_revision": 5,
+                "behavior": behavior,
+                "parameters": []
+            }
+        })
+    }
+
+    fn connected_test_link() -> GameLink {
+        let link = GameLink::offline_for_test();
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.status = LinkStatus::Connected;
+            shared.client_id = Some(1);
+        }
+        link
+    }
+
+    fn accept_behavior_revision(link: &GameLink, revision: u64) {
+        let mut shared = link.shared.lock().unwrap();
+        shared
+            .gimmick_live_expected
+            .insert("behavior".into(), revision);
+        shared.gimmick_live_acks.insert(
+            "behavior".into(),
+            GimmickLiveAck {
+                version: 1,
+                family: "behavior".into(),
+                revision,
+                accepted: true,
+                message: "accepted".into(),
+            },
+        );
+    }
+
+    fn valid_controller_request(revision: u64) -> serde_json::Value {
+        let program = crate::gimmicks::live_protocol::program_from_graph(
+            "mario",
+            &crate::gimmicks::templates::Preset::Timer.graph(),
+        )
+        .unwrap();
+        let request = crate::gimmicks::controller_protocol::ControllerBundleRequest {
+            version: crate::gimmicks::controller_protocol::REQUEST_VERSION,
+            revision,
+            disabled_fighters: Vec::new(),
+            charts: vec![crate::gimmicks::controller_protocol::ControllerProgram {
+                chart_id: "main".into(),
+                program,
+            }],
+        };
+        crate::gimmicks::controller_protocol::encode_request(&request).unwrap();
+        serde_json::to_value(request).unwrap()
+    }
+
+    fn valid_attack_result_controller_request(revision: u64) -> serde_json::Value {
+        use crate::gimmicks::behavior::Predicate;
+        use crate::gimmicks::native_inputs::{AttackResultMask, AttackResultQuery, NativeInput};
+        let input = NativeInput::AttackResultFlag {
+            fighter: "mario".into(),
+            query: AttackResultQuery::DuringHitlag,
+            mask: AttackResultMask::Hit,
+        };
+        let mut graph = crate::gimmicks::templates::Preset::Timer.graph();
+        graph.transitions[0].guard = Predicate::NativeFlag(input.clone());
+        let program = crate::gimmicks::live_protocol::program_from_graph("mario", &graph).unwrap();
+        let request = crate::gimmicks::controller_protocol::ControllerBundleRequest {
+            version: crate::gimmicks::controller_protocol::REQUEST_VERSION,
+            revision,
+            disabled_fighters: Vec::new(),
+            charts: vec![crate::gimmicks::controller_protocol::ControllerProgram {
+                chart_id: "main".into(),
+                program,
+            }],
+        };
+        serde_json::to_value(request).unwrap()
+    }
+
+    fn valid_mixed_native_controller_request(revision: u64) -> serde_json::Value {
+        use crate::gimmicks::behavior::Predicate;
+        use crate::gimmicks::native_inputs::{AttackResultMask, AttackResultQuery, NativeInput};
+        let attack = NativeInput::AttackResultFlag {
+            fighter: "mario".into(),
+            query: AttackResultQuery::DuringHitlag,
+            mask: AttackResultMask::Hit,
+        };
+        let article = NativeInput::ArticleExists {
+            fighter: "mario".into(),
+            symbol: "FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL".into(),
+        };
+        let mut graph = crate::gimmicks::templates::Preset::Timer.graph();
+        graph.transitions[0].guard = Predicate::And(
+            Box::new(Predicate::NativeFlag(attack)),
+            Box::new(Predicate::NativeFlag(article)),
+        );
+        let program = crate::gimmicks::live_protocol::program_from_graph("mario", &graph).unwrap();
+        let request = crate::gimmicks::controller_protocol::ControllerBundleRequest {
+            version: crate::gimmicks::controller_protocol::REQUEST_VERSION,
+            revision,
+            disabled_fighters: Vec::new(),
+            charts: vec![crate::gimmicks::controller_protocol::ControllerProgram {
+                chart_id: "main".into(),
+                program,
+            }],
+        };
+        crate::gimmicks::controller_protocol::encode_request(&request).unwrap();
+        serde_json::to_value(request).unwrap()
+    }
+
+    #[test]
+    fn fighter_damage_feature_gates_main_and_controller_requests_before_queueing() {
+        use crate::gimmicks::{
+            behavior::{CmpOp, ConstValue, Expr, Predicate},
+            native_inputs::{FighterValue, NativeInput, FIGHTER_DAMAGE_FEATURE},
+        };
+        let mut graph = crate::gimmicks::templates::Preset::Timer.graph();
+        graph.transitions[0].guard = Predicate::Compare {
+            op: CmpOp::Gte,
+            left: Expr::NativeFloat(NativeInput::Fighter {
+                value: FighterValue::Damage,
+                fighter: "mario".into(),
+            }),
+            right: Expr::Const(ConstValue::Float(0.0)),
+        };
+        let program = crate::gimmicks::live_protocol::program_from_graph("mario", &graph).unwrap();
+        let legacy = serde_json::to_value(crate::gimmicks::live_protocol::LiveRequest {
+            version: crate::gimmicks::live_model::MODEL_VERSION,
+            revision: 30,
+            disabled_fighters: Vec::new(),
+            programs: vec![program.clone()],
+        })
+        .unwrap();
+        let bundle = serde_json::to_value(
+            crate::gimmicks::controller_protocol::ControllerBundleRequest {
+                version: crate::gimmicks::controller_protocol::REQUEST_VERSION,
+                revision: 30,
+                disabled_fighters: Vec::new(),
+                charts: vec![crate::gimmicks::controller_protocol::ControllerProgram {
+                    chart_id: "main".into(),
+                    program,
+                }],
+            },
+        )
+        .unwrap();
+        for request in [legacy, bundle] {
+            let link = connected_test_link();
+            deliver(
+                &link,
+                "GimmickControllerCapabilities",
+                supported_capabilities(1),
+            );
+            let before = {
+                let shared = link.shared.lock().unwrap();
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.edits_tx,
+                )
+            };
+            for (seq, features) in [
+                (1, vec![]),
+                (
+                    2,
+                    vec![crate::gimmicks::native_inputs::ARTICLE_PRESENCE_FEATURE],
+                ),
+            ] {
+                deliver(
+                    &link,
+                    "GimmickFeatureCapabilities",
+                    feature_capabilities(seq, features),
+                );
+                assert!(link
+                    .send_gimmick_live("behavior", request.clone())
+                    .unwrap_err()
+                    .contains("does not advertise"));
+                let shared = link.shared.lock().unwrap();
+                assert_eq!(
+                    (
+                        shared.outbox.clone(),
+                        shared.gimmick_live_expected.clone(),
+                        shared.edits_tx
+                    ),
+                    before
+                );
+            }
+            deliver(
+                &link,
+                "GimmickFeatureCapabilities",
+                feature_capabilities(3, vec![FIGHTER_DAMAGE_FEATURE]),
+            );
+            assert!(link.send_gimmick_live("behavior", request.clone()).is_ok());
+            deliver(
+                &link,
+                "GiveClientId",
+                serde_json::json!({"GiveClientId":{"client_id":2}}),
+            );
+            assert!(link.send_gimmick_live("behavior", request).is_err());
+        }
+    }
+
+    #[test]
+    fn attack_result_bundle_requires_advertised_feature_before_queueing() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let before = {
+            let shared = link.shared.lock().unwrap();
+            (
+                shared.outbox.clone(),
+                shared.gimmick_live_expected.clone(),
+                shared.edits_tx,
+            )
+        };
+        assert!(link
+            .send_gimmick_live("behavior", valid_attack_result_controller_request(8))
+            .unwrap_err()
+            .contains("does not advertise"));
+        {
+            let shared = link.shared.lock().unwrap();
+            assert_eq!(
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.edits_tx
+                ),
+                before
+            );
+        }
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(
+                1,
+                vec![crate::gimmicks::native_inputs::ATTACK_RESULT_FLAGS_FEATURE],
+            ),
+        );
+        assert!(link
+            .send_gimmick_live("behavior", valid_attack_result_controller_request(9))
+            .is_ok());
+    }
+
+    #[test]
+    fn optional_feature_frame_is_independent_of_strict_controller_telemetry() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        assert!(link.gimmick_controller_capabilities().is_some());
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(1, vec!["unknown.future.feature"]),
+        );
+        assert!(link.gimmick_controller_capabilities().is_some());
+        assert!(link
+            .send_gimmick_live("behavior", valid_controller_request(8))
+            .is_ok());
+        assert!(link
+            .send_gimmick_live("behavior", valid_attack_result_controller_request(9))
+            .unwrap_err()
+            .contains("does not advertise"));
+    }
+
+    #[test]
+    fn attack_feature_gate_also_covers_legacy_main_and_clears_on_bad_frames_and_new_client() {
+        let link = connected_test_link();
+        let bundle = valid_attack_result_controller_request(20);
+        let legacy = serde_json::json!({"version": 4, "revision": 20, "programs": [bundle["charts"][0]["program"].clone()]});
+        assert!(link.send_gimmick_live("behavior", legacy.clone()).is_err());
+        assert!(link.shared.lock().unwrap().outbox.is_empty());
+        let feature = crate::gimmicks::native_inputs::ATTACK_RESULT_FLAGS_FEATURE;
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(1, vec![feature]),
+        );
+        assert!(link.send_gimmick_live("behavior", legacy.clone()).is_ok());
+        for seq in [1, 2] {
+            let mut invalid = feature_capabilities(seq, vec![feature]);
+            invalid["GimmickFeatureCapabilities"]["unexpected"] = true.into();
+            deliver(&link, "GimmickFeatureCapabilities", invalid);
+            assert!(link.send_gimmick_live("behavior", legacy.clone()).is_err());
+            deliver(
+                &link,
+                "GimmickFeatureCapabilities",
+                feature_capabilities(seq, vec![feature]),
+            );
+            assert!(
+                link.send_gimmick_live("behavior", legacy.clone()).is_err(),
+                "same-sequence repairs cannot restore authority"
+            );
+        }
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(3, vec![feature]),
+        );
+        assert!(link.send_gimmick_live("behavior", legacy.clone()).is_ok());
+        deliver(
+            &link,
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert!(link.send_gimmick_live("behavior", legacy).is_err());
+        assert!(link
+            .shared
+            .lock()
+            .unwrap()
+            .gimmick_feature_capabilities
+            .is_none());
+    }
+
+    #[test]
+    fn contact_status_feature_is_required_for_v4_and_v5_even_without_sampled_native_inputs() {
+        use crate::gimmicks::native_inputs::{
+            DAMAGE_CAPTURE_STATUS_FEATURE, FIGHTER_STATUS_IS_FEATURE,
+        };
+        let program = serde_json::json!({
+            "version":4,"id":"contact_status","fighter":"cloud","initial":"idle","states":["idle"],
+            "vars":[{"name":"charging","kind":"flag","initial":{"Flag":false}}],
+            "native_inputs":[],
+            "transitions":[{"from":"idle","to":"idle","on_frame":true,"guard":{"Compare":{"op":"eq","left":{"Const":{"Int":0}},"right":{"Const":{"Int":0}}}},"actions":[{"SetFlag":{"var":"charging","value":{"DamageStatusIs":"status_is:cloud:FIGHTER_CLOUD_STATUS_KIND_SPECIAL_LW_CHARGE"}}}]}],
+            "bindings":[{"hook":"onTakeDamage","transitions":[0]}],"event_bindings":[],"status_triggers":[],"resource_triggers":[]
+        });
+        let legacy = serde_json::json!({"version":4,"revision":71,"programs":[program.clone()]});
+        let bundle = serde_json::json!({"version":5,"revision":71,"charts":[{"chart_id":"main","program":program}]});
+        for request in [legacy, bundle] {
+            let link = connected_test_link();
+            deliver(
+                &link,
+                "GimmickControllerCapabilities",
+                supported_capabilities(1),
+            );
+            let before = {
+                let shared = link.shared.lock().unwrap();
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.edits_tx,
+                )
+            };
+            assert!(link.send_gimmick_live("behavior", request.clone()).is_err());
+            deliver(
+                &link,
+                "GimmickFeatureCapabilities",
+                feature_capabilities(1, vec![FIGHTER_STATUS_IS_FEATURE]),
+            );
+            assert!(link
+                .send_gimmick_live("behavior", request.clone())
+                .unwrap_err()
+                .contains("every required"));
+            {
+                let shared = link.shared.lock().unwrap();
+                assert_eq!(
+                    (
+                        shared.outbox.clone(),
+                        shared.gimmick_live_expected.clone(),
+                        shared.edits_tx
+                    ),
+                    before
+                );
+            }
+            deliver(
+                &link,
+                "GimmickFeatureCapabilities",
+                feature_capabilities(2, vec![DAMAGE_CAPTURE_STATUS_FEATURE]),
+            );
+            assert!(link.send_gimmick_live("behavior", request).is_ok());
+        }
+    }
+
+    #[test]
+    fn mixed_native_controller_requires_both_advertised_features() {
+        use crate::gimmicks::native_inputs::{
+            ARTICLE_PRESENCE_FEATURE, ATTACK_RESULT_FLAGS_FEATURE,
+        };
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let mixed = valid_mixed_native_controller_request(40);
+        let before = {
+            let shared = link.shared.lock().unwrap();
+            (
+                shared.outbox.clone(),
+                shared.gimmick_live_expected.clone(),
+                shared.gimmick_live_acks.clone(),
+                shared.edits_tx,
+            )
+        };
+        assert!(link.send_gimmick_live("behavior", mixed.clone()).is_err());
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(1, vec![ARTICLE_PRESENCE_FEATURE]),
+        );
+        assert!(link
+            .send_gimmick_live("behavior", mixed.clone())
+            .unwrap_err()
+            .contains("every required"));
+        {
+            let shared = link.shared.lock().unwrap();
+            assert_eq!(
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.gimmick_live_acks.clone(),
+                    shared.edits_tx,
+                ),
+                before
+            );
+        }
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(
+                2,
+                vec![ARTICLE_PRESENCE_FEATURE, ATTACK_RESULT_FLAGS_FEATURE],
+            ),
+        );
+        assert!(link.send_gimmick_live("behavior", mixed).is_ok());
+        let legacy_main = serde_json::json!({
+            "version": 4,
+            "revision": 41,
+            "programs": [valid_mixed_native_controller_request(41)["charts"][0]["program"].clone()]
+        });
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(3, vec![ARTICLE_PRESENCE_FEATURE]),
+        );
+        assert!(link
+            .send_gimmick_live("behavior", legacy_main.clone())
+            .is_err());
+        deliver(
+            &link,
+            "GimmickFeatureCapabilities",
+            feature_capabilities(
+                4,
+                vec![ARTICLE_PRESENCE_FEATURE, ATTACK_RESULT_FLAGS_FEATURE],
+            ),
+        );
+        assert!(link.send_gimmick_live("behavior", legacy_main).is_ok());
+    }
+
+    #[test]
+    fn controller_sends_require_current_capability_before_queue_or_ack_mutation() {
+        for link in [GameLink::offline_for_test(), connected_test_link()] {
+            let before = {
+                let shared = link.shared.lock().unwrap();
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.edits_tx,
+                )
+            };
+            assert!(link
+                .send_gimmick_live("behavior", valid_controller_request(7))
+                .is_err());
+            let shared = link.shared.lock().unwrap();
+            assert_eq!(
+                (
+                    shared.outbox.clone(),
+                    shared.gimmick_live_expected.clone(),
+                    shared.edits_tx
+                ),
+                before
+            );
+        }
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        link.send_gimmick_live("behavior", valid_controller_request(7))
+            .unwrap();
+        assert_eq!(
+            link.shared.lock().unwrap().gimmick_live_expected["behavior"],
+            7
+        );
+        assert_eq!(link.shared.lock().unwrap().outbox.len(), 1);
+        let before = link.shared.lock().unwrap().outbox.clone();
+        let mut invalid = valid_controller_request(8);
+        invalid["charts"][0]["chart_id"] = " ".into();
+        assert!(link.send_gimmick_live("behavior", invalid).is_err());
+        assert_eq!(link.shared.lock().unwrap().outbox, before);
+        assert_eq!(
+            link.shared.lock().unwrap().gimmick_live_expected["behavior"],
+            7
+        );
+    }
+
+    #[test]
+    fn controller_bundles_do_not_replay_on_a_new_client_epoch() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        link.send_gimmick_live("behavior", valid_controller_request(7))
+            .unwrap();
+        deliver(
+            &link,
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert!(link.shared.lock().unwrap().outbox.is_empty());
+        assert!(link.gimmick_controller_capabilities().is_none());
+        assert!(link
+            .send_gimmick_live("behavior", valid_controller_request(8))
+            .is_err());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        link.send_gimmick_live("behavior", valid_controller_request(9))
+            .unwrap();
+        assert_eq!(link.shared.lock().unwrap().outbox.len(), 1);
+    }
+
+    #[test]
+    fn reconnect_filter_keeps_legacy_snapshots_and_parameters_not_chart_bundles_or_restarts() {
+        let legacy = r#"<TCP_MESSAGE>{"gimmick_behavior":{"version":4,"revision":1,"programs":[]}}</TCP_MESSAGE>"#.to_owned();
+        let params = r#"<TCP_MESSAGE>{"gimmick_parameters":{"version":1,"revision":2,"edits":[]}}</TCP_MESSAGE>"#.to_owned();
+        let chart = format!(
+            "<TCP_MESSAGE>{{\"gimmick_behavior\":{}}}</TCP_MESSAGE>",
+            valid_controller_request(3)
+        );
+        let restart = r#"<TCP_MESSAGE>{"gimmick_restart":{"fighter":"mario","boid":1,"expected_revision":3}}</TCP_MESSAGE>"#.to_owned();
+        let mut messages = vec![legacy.clone(), params.clone(), chart, restart];
+        discard_session_bound_messages(&mut messages);
+        assert_eq!(messages, [legacy, params]);
+    }
+
+    #[test]
+    fn legacy_rows_remain_valid_without_optional_controller_capabilities() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickLiveState",
+            serde_json::json!({"GimmickLiveState": {
+                "version": 1, "seq": 1, "behavior_revision": 4,
+                "parameter_revision": 5,
+                "behavior": [{"fighter":"mario","boid":10,"entry_id":0,
+                    "revision":4,"state":"waiting","vars":{}}],
+                "parameters": []
+            }}),
+        );
+        assert_eq!(link.gimmick_live_snapshot().unwrap().behavior.len(), 1);
+        assert!(link.gimmick_controller_capabilities().is_none());
+    }
+
+    #[test]
+    fn extended_rows_require_a_valid_capability_frame_first() {
+        let link = connected_test_link();
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        assert!(link.gimmick_controller_snapshot().is_none());
+
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(2, vec![row]));
+        assert_eq!(
+            link.gimmick_controller_snapshot().unwrap().behavior.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_capabilities_recover_only_with_a_valid_newer_sequence() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            serde_json::json!({}),
+        );
+        assert!(link.gimmick_controller_capabilities().is_none());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        assert_eq!(link.gimmick_controller_capabilities().unwrap().seq, 1);
+
+        let mut missing_sequence = supported_capabilities(2);
+        missing_sequence["GimmickControllerCapabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("seq");
+        deliver(&link, "GimmickControllerCapabilities", missing_sequence);
+        assert!(link.gimmick_controller_capabilities().is_none());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        assert!(link.gimmick_controller_capabilities().is_none());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(2),
+        );
+        assert_eq!(link.gimmick_controller_capabilities().unwrap().seq, 2);
+
+        let mut invalid = supported_capabilities(3);
+        invalid["GimmickControllerCapabilities"]["unexpected"] = true.into();
+        deliver(&link, "GimmickControllerCapabilities", invalid);
+        assert!(link.gimmick_controller_capabilities().is_none());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(3),
+        );
+        assert!(link.gimmick_controller_capabilities().is_none());
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(4),
+        );
+        assert_eq!(link.gimmick_controller_capabilities().unwrap().seq, 4);
+    }
+
+    #[test]
+    fn invalid_and_out_of_order_capability_frames_never_grant_chart_rows() {
+        let link = connected_test_link();
+        let mut invalid = supported_capabilities(1);
+        invalid["GimmickControllerCapabilities"]["request_version"] = 4.into();
+        deliver(&link, "GimmickControllerCapabilities", invalid);
+        assert!(link.gimmick_controller_capabilities().is_none());
+
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(2),
+        );
+        assert_eq!(link.gimmick_controller_capabilities().unwrap().seq, 2);
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        assert!(link.gimmick_controller_capabilities().is_none());
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "secondary",
+            "chart:0:secondary",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn v5_snapshot_accepts_two_charts_for_one_boid_and_legacy_getter_projects_main_only() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let rows = vec![
+            controller_row(
+                10,
+                "mario",
+                0,
+                "main",
+                "live:mario",
+                2,
+                serde_json::json!({}),
+            ),
+            controller_row(
+                10,
+                "mario",
+                0,
+                "secondary",
+                "chart:0:secondary",
+                2,
+                serde_json::json!({}),
+            ),
+        ];
+        deliver(&link, "GimmickLiveState", controller_state(1, rows));
+
+        assert_eq!(
+            link.gimmick_controller_snapshot().unwrap().behavior.len(),
+            2
+        );
+        let legacy = link.gimmick_live_snapshot().unwrap();
+        assert_eq!(legacy.behavior.len(), 1);
+        assert!(legacy.behavior[0].get("chart_id").is_none());
+        assert!(legacy.behavior[0].get("program_id").is_none());
+        assert!(legacy.behavior[0].get("stock_generation").is_none());
+    }
+
+    #[test]
+    fn v5_snapshot_rejects_duplicate_actor_chart_rows() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(
+            &link,
+            "GimmickLiveState",
+            controller_state(1, vec![row.clone(), row]),
+        );
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn v5_snapshot_rejects_inconsistent_actor_fighter_entry_or_generation() {
+        for second in [
+            controller_row(
+                10,
+                "cloud",
+                0,
+                "secondary",
+                "chart:0:secondary",
+                2,
+                serde_json::json!({}),
+            ),
+            controller_row(
+                10,
+                "mario",
+                1,
+                "secondary",
+                "chart:0:secondary",
+                2,
+                serde_json::json!({}),
+            ),
+            controller_row(
+                10,
+                "mario",
+                0,
+                "secondary",
+                "chart:0:secondary",
+                3,
+                serde_json::json!({}),
+            ),
+        ] {
+            let link = connected_test_link();
+            deliver(
+                &link,
+                "GimmickControllerCapabilities",
+                supported_capabilities(1),
+            );
+            let first = controller_row(
+                10,
+                "mario",
+                0,
+                "main",
+                "live:mario",
+                2,
+                serde_json::json!({}),
+            );
+            deliver(
+                &link,
+                "GimmickLiveState",
+                controller_state(1, vec![first, second]),
+            );
+            assert!(link.gimmick_controller_snapshot().is_none());
+        }
+    }
+
+    #[test]
+    fn v5_snapshot_rejects_program_id_changes_for_one_fighter_chart() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let first = controller_row(
+            10,
+            "mario",
+            0,
+            "secondary",
+            "chart:0:secondary",
+            2,
+            serde_json::json!({}),
+        );
+        let second = controller_row(
+            11,
+            "mario",
+            1,
+            "secondary",
+            "different-program",
+            7,
+            serde_json::json!({}),
+        );
+        deliver(
+            &link,
+            "GimmickLiveState",
+            controller_state(1, vec![first, second]),
+        );
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn v5_snapshot_checks_chart_program_and_stock_row_identity_fields() {
+        let invalid_rows = [
+            controller_row(10, "mario", 0, " ", "live:mario", 2, serde_json::json!({})),
+            controller_row(
+                10,
+                "mario",
+                0,
+                &"x".repeat(49),
+                "live:mario",
+                2,
+                serde_json::json!({}),
+            ),
+            controller_row(10, "mario", 0, "main", " ", 2, serde_json::json!({})),
+            controller_row(
+                10,
+                "mario",
+                0,
+                "main",
+                &"x".repeat(65),
+                2,
+                serde_json::json!({}),
+            ),
+        ];
+        for row in invalid_rows {
+            let link = connected_test_link();
+            deliver(
+                &link,
+                "GimmickControllerCapabilities",
+                supported_capabilities(1),
+            );
+            deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+            assert!(link.gimmick_controller_snapshot().is_none());
+        }
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let mut missing_generation = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        missing_generation
+            .as_object_mut()
+            .unwrap()
+            .remove("stock_generation");
+        deliver(
+            &link,
+            "GimmickLiveState",
+            controller_state(1, vec![missing_generation]),
+        );
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn v5_snapshot_enforces_actor_chart_row_and_variable_bounds() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let eight = (0..8)
+            .map(|index| {
+                controller_row(
+                    10,
+                    "mario",
+                    0,
+                    &format!("c{index}"),
+                    &format!("p{index}"),
+                    2,
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<Vec<_>>();
+        deliver(&link, "GimmickLiveState", controller_state(1, eight));
+        assert_eq!(
+            link.gimmick_controller_snapshot().unwrap().behavior.len(),
+            8
+        );
+
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let nine = (0..9)
+            .map(|index| {
+                controller_row(
+                    10,
+                    "mario",
+                    0,
+                    &format!("c{index}"),
+                    &format!("p{index}"),
+                    2,
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<Vec<_>>();
+        deliver(&link, "GimmickLiveState", controller_state(1, nine));
+        assert!(link.gimmick_controller_snapshot().is_none());
+
+        let too_many_vars = serde_json::Value::Object(
+            (0..65)
+                .map(|index| (format!("v{index}"), serde_json::json!({"Int": index})))
+                .collect(),
+        );
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(10, "mario", 0, "main", "live:mario", 2, too_many_vars);
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        assert!(link.gimmick_controller_snapshot().is_none());
+
+        let vars = serde_json::Value::Object(
+            (0..64)
+                .map(|index| (format!("v{index}"), serde_json::json!({"Int": index})))
+                .collect(),
+        );
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let rows = (0..3)
+            .map(|index| {
+                controller_row(
+                    10,
+                    "mario",
+                    0,
+                    &format!("c{index}"),
+                    &format!("p{index}"),
+                    2,
+                    vars.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        deliver(&link, "GimmickLiveState", controller_state(1, rows));
+        assert!(link.gimmick_controller_snapshot().is_none());
+
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let actors = (0..129)
+            .map(|boid| {
+                controller_row(
+                    boid,
+                    "mario",
+                    0,
+                    "main",
+                    "live:mario",
+                    2,
+                    serde_json::json!({}),
+                )
+            })
+            .collect::<Vec<_>>();
+        deliver(&link, "GimmickLiveState", controller_state(1, actors));
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn controller_capability_and_snapshot_clear_on_connection_epoch_change() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, vec![row]));
+        assert!(link.gimmick_controller_capabilities().is_some());
+        assert!(link.gimmick_controller_snapshot().is_some());
+
+        deliver(
+            &link,
+            "GiveClientId",
+            serde_json::json!({"GiveClientId":{"client_id":2}}),
+        );
+        assert!(link.gimmick_controller_capabilities().is_none());
+        assert!(link.gimmick_controller_snapshot().is_none());
+        let row = controller_row(
+            10,
+            "mario",
+            0,
+            "secondary",
+            "chart:0:secondary",
+            2,
+            serde_json::json!({}),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(2, vec![row]));
+        assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn v5_row_limit_accepts_exact_aggregate_bound_and_rejects_more() {
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        let rows = (0..128)
+            .flat_map(|actor| {
+                (0..8).map(move |chart| {
+                    controller_row(
+                        actor + 1,
+                        "mario",
+                        0,
+                        &format!("c{chart}"),
+                        &format!("p{chart}"),
+                        2,
+                        serde_json::json!({}),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        deliver(&link, "GimmickLiveState", controller_state(1, rows.clone()));
+        assert_eq!(
+            link.gimmick_controller_snapshot().unwrap().behavior.len(),
+            1024
+        );
+
+        // The contract product (128 actors × 8 charts) already equals 1024,
+        // so a 1025-row fixture necessarily also crosses an actor/chart bound.
+        // The packet-level row ceiling is checked before per-row constraints.
+        let mut too_many = rows;
+        too_many.push(controller_row(
+            129,
+            "mario",
+            0,
+            "main",
+            "live:mario",
+            2,
+            serde_json::json!({}),
+        ));
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "GimmickControllerCapabilities",
+            supported_capabilities(1),
+        );
+        deliver(&link, "GimmickLiveState", controller_state(1, too_many));
+        assert!(link.gimmick_controller_snapshot().is_none());
     }
 }
