@@ -123,7 +123,7 @@ pub(super) fn selector(
     };
     let before = (chart_id.clone(), name.clone());
     ui.horizontal_wrapped(|ui| {
-        ui.label("Controller");
+        ui.label("Gimmick");
         let previous = chart_id.clone();
         egui::ComboBox::from_id_salt("timed_chart_target")
             .selected_text(if chart_id.is_empty() {
@@ -151,7 +151,7 @@ pub(super) fn selector(
         .map(|(_, events)| events.as_slice())
         .unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label("Event");
+        ui.label("Message");
         egui::ComboBox::from_id_salt("timed_chart_event")
             .selected_text(if name.is_empty() {
                 "Choose receiver…"
@@ -242,7 +242,7 @@ pub(super) fn selector(
             "Receiver missing. Choose a controller and one of its move events.",
         );
     }
-    ui.weak("Only this controller receives it. Needs Export Mod Folder to take effect in game.");
+    ui.weak("Only this gimmick hears it.");
 }
 
 #[cfg(test)]
