@@ -1,4 +1,4 @@
-//! Read-only partner observations for Ice Climbers and Rosalina.
+//! Partner observations and damage for Ice Climbers and Rosalina.
 //!
 //! Nana is a separate fighter object driven by Popo's player entry; Luma is
 //! the rosetta_tico weapon this Rosalina owns. An absent or KO'd partner is a
@@ -66,6 +66,32 @@ unsafe fn luma(boid: u32) -> Option<*mut BattleObjectModuleAccessor> {
             && status != *WEAPON_ROSETTA_TICO_STATUS_KIND_NONE)
             .then_some(module)
     })
+}
+
+unsafe fn partner(
+    boid: u32,
+    fighter: &str,
+    identity: Identity,
+) -> Option<*mut BattleObjectModuleAccessor> {
+    match fighter {
+        "popo" => nana(identity.entry_id),
+        "rosetta" => luma(boid),
+        _ => None,
+    }
+}
+
+/// The partner's damage, when one is on stage.
+pub(crate) fn damage(boid: u32, fighter: &str, identity: Identity) -> Option<f32> {
+    unsafe { partner(boid, fighter, identity).map(|module| DamageModule::damage(module, 0)) }
+}
+
+/// Changes the partner's damage. With no partner on stage there is nothing to do.
+pub(crate) fn add_damage(boid: u32, fighter: &str, identity: Identity, delta: f32) {
+    unsafe {
+        if let Some(module) = partner(boid, fighter, identity) {
+            DamageModule::add_damage(module, delta, 0);
+        }
+    }
 }
 
 pub(crate) fn sample(

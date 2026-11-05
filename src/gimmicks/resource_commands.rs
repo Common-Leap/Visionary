@@ -27,6 +27,8 @@ pub enum Writer {
     InklingInk,
     /// `FighterSpecializer_Pickel::add_material_num`/`sub_material_num` with this material kind.
     PickelMaterial(&'static str),
+    /// `DamageModule::add_damage` on this fighter's partner (Nana, Luma). A missing partner is a no-op.
+    PartnerDamage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +74,8 @@ resources! {
     ("inklingInk", "inkling", "Ink", "FIGHTER_INKLING_INSTANCE_WORK_ID_FLOAT_INK", Float, 150.0, Writer::InklingInk),
     ("littleMacKoGauge", "littlemac", "KO meter", "FIGHTER_LITTLEMAC_INSTANCE_WORK_ID_FLOAT_KO_GAGE", Float, 100.0, Writer::Work),
     ("banjoFeathers", "buddy", "Wonderwing feathers", "FIGHTER_BUDDY_INSTANCE_WORK_ID_INT_SPECIAL_S_REMAIN", Int, 5.0, Writer::Work),
+    ("nanaDamage", "popo", "Nana's damage", "FIGHTER_POPO_INSTANCE_WORK_ID_INT_PARTNER_OBJECT_ID", Float, 999.0, Writer::PartnerDamage),
+    ("lumaDamage", "rosetta", "Luma's damage", "FIGHTER_ROSETTA_INSTANCE_WORK_ID_INT_EXTEND_BUFFER", Float, 999.0, Writer::PartnerDamage),
     ("steveDirt", "pickel", "Dirt", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_GRADE_1", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_GRADE_1")),
     ("steveWood", "pickel", "Wood", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_WOOD", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_WOOD")),
     ("steveStone", "pickel", "Stone", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_STONE", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_STONE")),

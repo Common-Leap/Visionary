@@ -41,6 +41,11 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
     let entry = command.resource.entry();
     command.validate(entry.fighter)?;
     current(boid, expected, command)?;
+    // A partner's damage lives on the partner, not in a Work field of this fighter.
+    if entry.writer == Writer::PartnerDamage {
+        let value = super::partner_control::damage(boid, entry.fighter, expected);
+        return Ok((value.unwrap_or(0.0), command.target(value.unwrap_or(0.0))?, 0));
+    }
     let module = expected.module_accessor_addr as *mut app::BattleObjectModuleAccessor;
     let integer = entry.kind == super::native_inputs::NativeKind::Int;
     let kind = if integer {
@@ -154,6 +159,14 @@ pub(crate) fn execute(boid: u32, expected: Identity, command: Command) -> Result
                     return Err("invalid native ink capacity".into());
                 }
                 app::FighterSpecializer_Inkling::change_ink(fighter, target.min(max));
+            }
+            Writer::PartnerDamage => {
+                super::partner_control::add_damage(
+                    boid,
+                    command.resource.fighter(),
+                    expected,
+                    delta,
+                );
             }
             Writer::PickelMaterial(kind) => {
                 let kind = material(kind)?;
