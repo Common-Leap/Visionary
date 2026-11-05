@@ -4572,7 +4572,6 @@ fn finish_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinishCa
     });
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor pair · Preserved until repaired");
-    } else {
     }
 }
 
@@ -4600,7 +4599,6 @@ fn final_start_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Fin
     });
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor tuple · Preserved until repaired");
-    } else {
     }
 }
 
@@ -4622,7 +4620,6 @@ fn final_fear_face_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinalF
     });
     if !call.is_measured_for(fighter) {
         ui.weak("Unmeasured donor argument · Preserved until repaired");
-    } else {
     }
 }
 
