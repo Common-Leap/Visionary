@@ -152,7 +152,7 @@ pub fn compare(op: NativeComparison) -> &'static str {
 }
 
 /// The last part of a game symbol, in lower-case words.
-fn symbol_words(symbol: &str) -> String {
+pub fn symbol_words(symbol: &str) -> String {
     let symbol = symbol.trim_start_matches('*');
     let tail = [
         "WORK_ID_",

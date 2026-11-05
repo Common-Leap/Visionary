@@ -218,7 +218,9 @@ pub fn not_live_blocks(fighter: &str, graph: &MoveGraph, source: &[String]) -> V
                     then_nodes,
                     else_nodes,
                 } => {
-                    if !super::live_steps::guard_reaches_match(condition)
+                    // A check imported from the game's script is the game's own and keeps running.
+                    if !matches!(condition, super::model::MoveCondition::Source { .. })
+                        && !super::live_steps::guard_reaches_match(condition)
                         && !source.contains(&format!("{condition:?}"))
                     {
                         out.push(super::canvas::story_caption(node));

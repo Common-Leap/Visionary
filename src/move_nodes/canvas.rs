@@ -1226,6 +1226,18 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
             "Send event",
             format!("{chart_id} · {name} · {} inputs", arguments.len()),
         ),
+        ExcuteStmt::WorkFlag(call) => (
+            "Native flag",
+            format!(
+                "{} {}",
+                super::plain::symbol_words(&call.flag),
+                if matches!(call.action, crate::data::WorkFlagAction::On) {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+        ),
         ExcuteStmt::Attack(call) => (
             "Create hitbox",
             format!(

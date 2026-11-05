@@ -59,6 +59,8 @@ pub struct NodeEditor {
     /// What the game's own scripts for this move contain, and which move and size that was.
     source_blocks: Vec<String>,
     source_blocks_for: (String, usize),
+    /// Tell a gimmick was picked before any gimmick could hear it; add it once one can.
+    pending_tell: bool,
     /// A finished edit is waiting to reach the running match.
     auto_apply: bool,
     in_expanded_field: bool,
@@ -5910,7 +5912,9 @@ pub(super) fn node_edit_error(ui: &mut Ui, error: &str) {
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Edit rejected")
+        // A short message is shown as it is; only a long one folds away.
+        let first = error.lines().next().unwrap_or(error);
+        ui.colored_label(egui::Color32::LIGHT_RED, first)
             .on_hover_text(error);
         ui.menu_button("Details", |ui| {
             ui.set_max_width(360.0);

@@ -410,6 +410,26 @@ impl NodeEditor {
         base: &BehaviorGraph,
         siblings: &BTreeMap<String, MoveGraph>,
     ) -> Rect {
+        if self.pending_tell {
+            self.add_workspace_block(
+                PaletteBlock::Node(101),
+                fighter,
+                move_name,
+                base,
+                siblings,
+                Track::Game,
+                [0.0, 0.0],
+                None,
+            );
+            if self
+                .canvas
+                .selected
+                .as_deref()
+                .is_some_and(|key| key.starts_with("node:"))
+            {
+                self.pending_tell = false;
+            }
+        }
         let bounds = ui.available_rect_before_wrap();
         let palette_width = 210.0_f32.min(bounds.width() * 0.23);
         let inspector_width = 330.0_f32.min(bounds.width() * 0.32);
@@ -903,7 +923,23 @@ impl NodeEditor {
             PaletteBlock::Node(kind) => {
                 let id = next_id(&self.draft);
                 let Some(kind) = self.make_node(kind, fighter, id, track) else {
-                    self.error = "Add a \"When: a move tells it\" block to a gimmick first.".into();
+                    // Nothing can hear it yet, so make a gimmick that does, then add the block.
+                    if self.pending_tell {
+                        self.pending_tell = false;
+                        self.error = "This fighter can't take another gimmick.".into();
+                    } else {
+                        self.pending_tell = true;
+                        self.add_workspace_block(
+                            PaletteBlock::NewController,
+                            fighter,
+                            _move_name,
+                            base,
+                            _siblings,
+                            track,
+                            position,
+                            None,
+                        );
+                    }
                     return;
                 };
                 let Some(index) = self
