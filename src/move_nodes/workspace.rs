@@ -999,7 +999,7 @@ impl NodeEditor {
                             }],
                             emission_plan: crate::gimmicks::codegen::EmissionPlan {
                                 event_bindings: vec![crate::gimmicks::codegen::EventBinding {
-                                    name: "event_1".into(),
+                                    name: "from_a_move".into(),
                                     transitions: vec![0],
                                     fields: Vec::new(),
                                 }],
