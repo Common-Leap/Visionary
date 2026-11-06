@@ -4,10 +4,7 @@ use super::{
     actor_identity::Identity,
     resource_commands::{Command, Writer},
 };
-use smash::app::{
-    self,
-    lua_bind::{StatusModule, StopModule, WorkModule},
-};
+use smash::app::{self, lua_bind::WorkModule};
 
 /// The evaluator resolves every amount to a Float constant before delivery.
 pub(crate) fn resolved(command: &Command<super::live_model::Expr>) -> Result<Command, String> {
@@ -76,26 +73,12 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
         Writer::CloudLimit => {
             super::cloud_resource::preflight(boid, expected, cloud(command, value, target))?
         }
-        // Steve's counts change during his own attacks, so earning them on a hit is safe.
-        Writer::PickelMaterial(_) => {}
-        // Other helpers stay on stable idle/fall/guard, where summon and HUD code is not running.
-        _ => unsafe {
-            let status = StatusModule::status_kind(module);
-            if StatusModule::is_changing(module)
-                || StopModule::is_stop(module)
-                || ![
-                    *smash::lib::lua_const::FIGHTER_STATUS_KIND_WAIT,
-                    *smash::lib::lua_const::FIGHTER_STATUS_KIND_FALL,
-                    *smash::lib::lua_const::FIGHTER_STATUS_KIND_GUARD,
-                ]
-                .contains(&status)
-            {
-                return Err("resource helper requires stable idle, fall or guard".into());
-            }
-            if matches!(entry.writer, Writer::HeroMp | Writer::InklingInk) {
-                fighter(boid, expected, command)?;
-            }
+        // The game runs Steve's, Joker's, Hero's and Inkling's helpers during their own attacks,
+        // so a rule may change these on a hit. Hero's and Inkling's need the real fighter object.
+        Writer::HeroMp | Writer::InklingInk => unsafe {
+            fighter(boid, expected, command)?;
         },
+        _ => {}
     }
     current(boid, expected, command)?;
     Ok((value, target, id))

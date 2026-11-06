@@ -43,11 +43,10 @@ impl Snapshot {
         {
             return Err("native Limit snapshot is outside the reviewed scalar contract");
         }
-        // Reviewed 13.0.4 statuses: WAIT, ATTACK (jab), FALL, and Cloud's
-        // SPECIAL_LW_CHARGE / SPECIAL_LW_END. Other attacks and specials keep
-        // their independent phase gate; changing status is never accepted.
-        if !matches!(self.status, 0 | 39 | 14 | 486 | 487) || self.changing {
-            return Err("native Limit writes require stable idle, jab, fall or Limit charge/end");
+        // The game raises Limit on hits during any of Cloud's attacks, so only a status change
+        // in progress is refused.
+        if self.changing {
+            return Err("native Limit writes wait for a status change to finish");
         }
         Ok(())
     }
