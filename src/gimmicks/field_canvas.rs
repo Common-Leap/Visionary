@@ -378,6 +378,10 @@ pub(crate) fn status_name(symbol: &str) -> String {
         .map_or(symbol, |(_, name)| name)
         .replace('_', " ")
         .to_lowercase()
+        .replacen("special n", "neutral special", 1)
+        .replacen("special s", "side special", 1)
+        .replacen("special hi", "up special", 1)
+        .replacen("special lw", "down special", 1)
 }
 
 /// The palette's names for variable kinds.

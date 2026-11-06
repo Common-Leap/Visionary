@@ -318,6 +318,8 @@ fn search_picker(
     egui::ComboBox::from_id_salt(hint)
         .selected_text(name(symbol))
         .height(420.0)
+        // Clicking the search box must not close the list it searches.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.add(egui::TextEdit::singleline(&mut query).hint_text(hint));
             let needle = query.to_lowercase();
@@ -326,8 +328,14 @@ fn search_picker(
                 if label.to_lowercase().contains(&needle)
                     || entry.symbol.to_lowercase().contains(&needle)
                 {
-                    ui.selectable_value(symbol, entry.symbol.into(), label)
-                        .on_hover_text(entry.symbol);
+                    if ui
+                        .selectable_value(symbol, entry.symbol.into(), label)
+                        .on_hover_text(entry.symbol)
+                        .clicked()
+                    {
+                        query.clear();
+                        ui.close();
+                    }
                 }
             }
         })

@@ -105,7 +105,7 @@ pub fn block_help(name: &str) -> Option<&'static str> {
         "Hitbox" => "An area that hits opponents. It stays on until an End hitbox block.",
         "End all hitboxes" => "Stops every hitbox this move has turned on.",
         "End one hitbox" => "Stops one hitbox and leaves the others on.",
-        "Grab box" => "An area that grabs opponents instead of hitting them.",
+        "Grab box" => "An area that grabs opponents during a grab move. To grab from any other move, use Go to another action and pick catch.",
         "End grab boxes" => "Stops every grab box.",
         "Detection box" => "An area that notices opponents without hurting them.",
         "Invincible or intangible" => "Changes whether this fighter can be hit.",
