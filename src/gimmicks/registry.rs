@@ -325,17 +325,16 @@ fn search_picker(
             let needle = query.to_lowercase();
             for entry in entries_for(fighter, kind) {
                 let label = name(entry.symbol);
-                if label.to_lowercase().contains(&needle)
-                    || entry.symbol.to_lowercase().contains(&needle)
-                {
-                    if ui
+                let matches = label.to_lowercase().contains(&needle)
+                    || entry.symbol.to_lowercase().contains(&needle);
+                if matches
+                    && ui
                         .selectable_value(symbol, entry.symbol.into(), label)
                         .on_hover_text(entry.symbol)
                         .clicked()
-                    {
-                        query.clear();
-                        ui.close();
-                    }
+                {
+                    query.clear();
+                    ui.close();
                 }
             }
         })

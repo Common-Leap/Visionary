@@ -104,9 +104,14 @@ fn preflight_rejects_unsafe_phases_and_malformed_scalars() {
     ] {
         assert!(preflight(Command::Adjust(delta), empty()).is_err());
     }
+    // Limit moves on hits during any attack, so a rule may change it in any settled status.
+    let attacking = Snapshot {
+        status: 55,
+        ..empty()
+    };
+    assert!(preflight(Command::Clear, attacking).is_ok());
     for change in [
-        (|s| s.status = 55) as Mutation,
-        |s| s.changing = true,
+        (|s| s.changing = true) as Mutation,
         |s| s.gauge = f32::NAN,
         |s| s.gauge = 101.0,
         |s| s.gauge = -1.0,

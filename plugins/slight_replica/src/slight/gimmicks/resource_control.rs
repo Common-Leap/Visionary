@@ -60,7 +60,10 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
                 fighter(boid, expected, command)?,
                 weapon,
             );
-            TIERS.iter().position(|tier| **tier == material).unwrap_or(0) as f32
+            TIERS
+                .iter()
+                .position(|tier| **tier == material)
+                .unwrap_or(0) as f32
         };
         return Ok((value, command.target(value)?, 0));
     }
