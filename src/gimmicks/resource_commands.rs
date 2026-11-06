@@ -31,13 +31,25 @@ pub enum Writer {
     PartnerDamage,
     /// Sends this fighter's partner to one action. It has no amount.
     PartnerAction(&'static str),
+    /// `sub_craft_weapon_durability` on this craft weapon kind. The game's durability getter
+    /// returned garbage in testing, so this row only wears a tool down and is never read.
+    PickelWear(&'static str),
+    /// `set_craft_weapon_param` material of this craft weapon kind: 0 wood, 1 stone, 2 iron,
+    /// 3 gold, 4 diamond.
+    PickelTier(&'static str),
 }
 
 impl Writer {
-    /// Partner rows live on the partner, so they have no Work field of this fighter behind them.
+    /// These rows live on the partner or Steve's tools, so no Work field of this fighter holds them.
     #[allow(dead_code)] // Not used by every crate that includes this file.
     pub fn is_partner(self) -> bool {
-        matches!(self, Self::PartnerDamage | Self::PartnerAction(_))
+        matches!(
+            self,
+            Self::PartnerDamage
+                | Self::PartnerAction(_)
+                | Self::PickelWear(_)
+                | Self::PickelTier(_)
+        )
     }
 }
 
@@ -98,6 +110,14 @@ resources! {
     ("steveGold", "pickel", "Gold", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_GOLD", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_GOLD")),
     ("steveDiamonds", "pickel", "Diamonds", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_DIAMOND", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_DIAMOND")),
     ("steveRedstone", "pickel", "Redstone", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_MATERIAL_NUM_RED_STONE", Int, 100.0, Writer::PickelMaterial("FIGHTER_PICKEL_MATERIAL_KIND_RED_STONE")),
+    ("steveSwordDurability", "pickel", "Wear down sword", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 200.0, Writer::PickelWear("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SWORD")),
+    ("steveSwordTier", "pickel", "Sword tier (0 wood to 4 diamond)", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 4.0, Writer::PickelTier("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SWORD")),
+    ("stevePickaxeDurability", "pickel", "Wear down pickaxe", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 200.0, Writer::PickelWear("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_PICK")),
+    ("stevePickaxeTier", "pickel", "Pickaxe tier (0 wood to 4 diamond)", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 4.0, Writer::PickelTier("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_PICK")),
+    ("steveAxeDurability", "pickel", "Wear down axe", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 200.0, Writer::PickelWear("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_AXE")),
+    ("steveAxeTier", "pickel", "Axe tier (0 wood to 4 diamond)", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 4.0, Writer::PickelTier("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_AXE")),
+    ("steveShovelDurability", "pickel", "Wear down shovel", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 200.0, Writer::PickelWear("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SHOVEL")),
+    ("steveShovelTier", "pickel", "Shovel tier (0 wood to 4 diamond)", "FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_COUNT", Int, 4.0, Writer::PickelTier("FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SHOVEL")),
 }
 
 /// A row of [`RESOURCES`], saved by its key.
@@ -176,6 +196,9 @@ impl<E> Command<E> {
     }
     pub fn label(&self) -> String {
         if matches!(self.resource.entry().writer, Writer::PartnerAction(_)) {
+            return self.resource.label().to_owned();
+        }
+        if matches!(self.resource.entry().writer, Writer::PickelWear(_)) {
             return self.resource.label().to_owned();
         }
         match self.op {

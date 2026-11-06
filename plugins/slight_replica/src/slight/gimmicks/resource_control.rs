@@ -50,6 +50,20 @@ fn checked(boid: u32, expected: Identity, command: Command) -> Result<(f32, f32,
             0,
         ));
     }
+    if matches!(entry.writer, Writer::PickelWear(_)) {
+        return Ok((0.0, 0.0, 0));
+    }
+    if let Writer::PickelTier(weapon) = entry.writer {
+        let weapon = craft_weapon(weapon)?;
+        let value = unsafe {
+            let material = app::FighterSpecializer_Pickel::get_craft_weapon_material_kind(
+                fighter(boid, expected, command)?,
+                weapon,
+            );
+            TIERS.iter().position(|tier| **tier == material).unwrap_or(0) as f32
+        };
+        return Ok((value, command.target(value)?, 0));
+    }
     let module = expected.module_accessor_addr as *mut app::BattleObjectModuleAccessor;
     let integer = entry.kind == super::native_inputs::NativeKind::Int;
     let kind = if integer {
@@ -103,6 +117,26 @@ unsafe fn fighter(
     }
     current(boid, expected, command)?;
     Ok(object.cast())
+}
+
+/// Steve's tool materials, weakest first; a tier row's amount indexes this.
+static TIERS: [&smash::lib::LuaConst; 5] = [
+    &smash::lib::lua_const::FIGHTER_PICKEL_MATERIAL_KIND_WOOD,
+    &smash::lib::lua_const::FIGHTER_PICKEL_MATERIAL_KIND_STONE,
+    &smash::lib::lua_const::FIGHTER_PICKEL_MATERIAL_KIND_IRON,
+    &smash::lib::lua_const::FIGHTER_PICKEL_MATERIAL_KIND_GOLD,
+    &smash::lib::lua_const::FIGHTER_PICKEL_MATERIAL_KIND_DIAMOND,
+];
+
+fn craft_weapon(name: &str) -> Result<app::FighterPickelCraftWeaponKind, String> {
+    use smash::lib::lua_const::*;
+    Ok(app::FighterPickelCraftWeaponKind(match name {
+        "FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SWORD" => *FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SWORD,
+        "FIGHTER_PICKEL_CRAFT_WEAPON_KIND_PICK" => *FIGHTER_PICKEL_CRAFT_WEAPON_KIND_PICK,
+        "FIGHTER_PICKEL_CRAFT_WEAPON_KIND_AXE" => *FIGHTER_PICKEL_CRAFT_WEAPON_KIND_AXE,
+        "FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SHOVEL" => *FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SHOVEL,
+        _ => return Err(format!("unknown Steve tool {name}")),
+    }))
 }
 
 fn material(name: &str) -> Result<i32, String> {
@@ -167,6 +201,26 @@ pub(crate) fn execute(boid: u32, expected: Identity, command: Command) -> Result
                     expected,
                     status,
                 )?;
+            }
+            Writer::PickelWear(weapon) => {
+                app::FighterSpecializer_Pickel::sub_craft_weapon_durability(
+                    fighter(boid, expected, command)?,
+                    craft_weapon(weapon)?,
+                    command.amount.max(0.0),
+                );
+            }
+            Writer::PickelTier(weapon) => {
+                let steve = fighter(boid, expected, command)?;
+                let weapon = craft_weapon(weapon)?;
+                let tier = TIERS
+                    .get(target.clamp(0.0, 4.0) as usize)
+                    .ok_or("unknown Steve tool tier")?;
+                app::FighterSpecializer_Pickel::set_craft_weapon_param(
+                    steve,
+                    weapon,
+                    app::FighterPickelMaterialKind(***tier),
+                    1.0,
+                );
             }
             Writer::PickelMaterial(kind) => {
                 let kind = material(kind)?;

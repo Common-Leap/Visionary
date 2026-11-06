@@ -1771,11 +1771,16 @@ pub(super) fn action_picker(
                     command.amount = Expr::Const(ConstValue::Float(1.0));
                     return;
                 }
-                egui::ComboBox::from_id_salt("native_resource_op").selected_text(format!("{:?}", command.op)).show_ui(ui, |ui| {
+                // Wearing a tool down only subtracts, so the amount is all there is to choose.
+                let wear = matches!(command.resource.entry().writer, super::resource_commands::Writer::PickelWear(_));
+                if wear {
+                    command.op = Op::Add;
+                }
+                ui.add_enabled_ui(!wear, |ui| egui::ComboBox::from_id_salt("native_resource_op").selected_text(format!("{:?}", command.op)).show_ui(ui, |ui| {
                     for op in [Op::Add, Op::Set] {
                         ui.selectable_value(&mut command.op, op, format!("{op:?}"));
                     }
-                });
+                }));
                 ui.end_row();
                 ui.label("Amount").on_hover_text(format!("Native units, 0 to {}. Helper-backed rows (Limit, MP, ink, rebel gauge, Steve's materials) need a stable status; Limit also takes jab.", command.resource.entry().max));
                 value_editor(ui, fighter, graph, &mut command.amount, VarType::Float, scope);
