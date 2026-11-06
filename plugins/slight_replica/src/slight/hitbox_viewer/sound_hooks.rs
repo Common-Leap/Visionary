@@ -243,7 +243,7 @@ unsafe fn sound_action_for_call(lua_state: u64, func: &'static str, args: &[LuaA
         );
         return false;
     };
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = super::acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let Some((suppress, overrides)) = sound_action(motion, key, frame, func) else {
         return false;

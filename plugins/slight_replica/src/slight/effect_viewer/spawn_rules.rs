@@ -27,6 +27,9 @@ pub struct SpawnInject {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnRule {
     pub eff_hash: u64,
+    /// The fighter this rule was made for; `None` fires for anyone.
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
     #[serde(default)]
     pub suppress: bool,
     /// Optional lifetime command this rule suppresses. Stop rules are checked only by the
@@ -109,6 +112,7 @@ impl SpawnRule {
     fn matches(&self, eff_hash: u64, motion: u64, frame: f32) -> bool {
         self.eff_hash == eff_hash
             && self.motion.map(|m| m == motion).unwrap_or(true)
+            && crate::slight::hitbox_viewer::acting_is(self.fighter_kind)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
     }
@@ -276,6 +280,7 @@ pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
         .filter(|(_, r)| {
             (r.inject.is_some() || r.color_inject.is_some())
                 && r.motion.map(|m| m == motion).unwrap_or(true)
+                && crate::slight::hitbox_viewer::acting_is(r.fighter_kind)
         })
         .flat_map(|(i, r)| {
             [r.inject.clone(), r.color_inject.clone()]

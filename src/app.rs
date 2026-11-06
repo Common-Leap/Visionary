@@ -4331,12 +4331,11 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+        let spawn: Vec<_> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<crate::game_link::EffectControlRuleWire> =
-            self.live_effect_control_rule_union();
+        let controls: Vec<_> = self.live_effect_control_rule_union();
         self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&hitboxes);
         self.push_effect_aliases();
 
@@ -7839,7 +7838,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+            let all: Vec<_> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
             self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
         }
@@ -7859,7 +7858,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+            let all: Vec<_> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
             self.state.status = format!("Restored all {f} hitboxes to their source data.");
         }
@@ -10928,7 +10927,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if structural {
             self.state.status = if structural_live_supported {
@@ -11592,7 +11591,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
@@ -16344,7 +16343,9 @@ impl VisionaryApp {
 
     /// Withhold source-only node tracks at the final publication boundary, including watcher
     /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
-    fn live_hitbox_rule_union(&self) -> Vec<crate::game_link::HitboxRuleWire> {
+    fn live_hitbox_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForFighter<crate::game_link::HitboxRuleWire>> {
         self.hitbox_rules_store
             .iter()
             .filter(|(key, _)| {
@@ -16375,7 +16376,7 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    rule
+                    crate::game_link::ForFighter::from_key(key, rule)
                 })
             })
             .collect()
@@ -16385,7 +16386,9 @@ impl VisionaryApp {
         crate::move_nodes::live_support::allows_flat_effect_rules(&self.move_graphs, key)
     }
 
-    fn live_effect_rule_union(&self) -> Vec<crate::game_link::SpawnRuleWire> {
+    fn live_effect_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForFighter<crate::game_link::SpawnRuleWire>> {
         self.effect_rules_store
             .iter()
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
@@ -16407,17 +16410,24 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    rule
+                    crate::game_link::ForFighter::from_key(key, rule)
                 })
             })
             .collect()
     }
 
-    fn live_effect_control_rule_union(&self) -> Vec<crate::game_link::EffectControlRuleWire> {
+    fn live_effect_control_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
         self.effect_control_rules_store
             .iter()
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
-            .flat_map(|(_, rules)| rules.iter().cloned())
+            .flat_map(|(key, rules)| {
+                rules
+                    .iter()
+                    .cloned()
+                    .map(|rule| crate::game_link::ForFighter::from_key(key, rule))
+            })
             .collect()
     }
 
@@ -19924,9 +19934,12 @@ impl VisionaryApp {
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
         self.hitbox_rules_store.clear();
-        self.game_link.send_spawn_rules(&[]);
-        self.game_link.send_effect_control_rules(&[]);
-        self.game_link.send_hitbox_rules(&[]);
+        self.game_link
+            .send_spawn_rules::<crate::game_link::SpawnRuleWire>(&[]);
+        self.game_link
+            .send_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
+        self.game_link
+            .send_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -22539,7 +22552,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if missing_donor {
             self.state.status =
@@ -22938,7 +22951,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
     }
 
@@ -23002,7 +23015,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
@@ -23097,7 +23110,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if let Some((category, label, need)) = limits.filter(|_| unrepresentable > 0) {
             self.note_live_replay_capture_limit(category);
@@ -23807,7 +23820,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
@@ -23850,7 +23863,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
@@ -24161,7 +24174,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
@@ -24204,7 +24217,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
@@ -25153,7 +25166,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+        let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
     }
 
@@ -26718,10 +26731,9 @@ impl VisionaryApp {
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+            let all: Vec<_> = self.live_effect_rule_union();
             self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<crate::game_link::EffectControlRuleWire> =
-                self.live_effect_control_rule_union();
+            let all_controls: Vec<_> = self.live_effect_control_rule_union();
             self.game_link.send_effect_control_rules(&all_controls);
         }
     }
@@ -28521,7 +28533,7 @@ impl VisionaryApp {
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+        let all: Vec<_> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&all);
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
@@ -29139,10 +29151,9 @@ impl VisionaryApp {
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+        let all: Vec<_> = self.live_effect_rule_union();
         self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<crate::game_link::EffectControlRuleWire> =
-            self.live_effect_control_rule_union();
+        let all_controls: Vec<_> = self.live_effect_control_rule_union();
         self.game_link.send_effect_control_rules(&all_controls);
         if unsupported_flip_axis {
             self.state.status =
@@ -31439,12 +31450,11 @@ impl eframe::App for VisionaryApp {
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<crate::game_link::SpawnRuleWire> = self.live_effect_rule_union();
+                let spawn: Vec<_> = self.live_effect_rule_union();
                 self.game_link.send_spawn_rules(&spawn);
-                let controls: Vec<crate::game_link::EffectControlRuleWire> =
-                    self.live_effect_control_rule_union();
+                let controls: Vec<_> = self.live_effect_control_rule_union();
                 self.game_link.send_effect_control_rules(&controls);
-                let hit: Vec<crate::game_link::HitboxRuleWire> = self.live_hitbox_rule_union();
+                let hit: Vec<_> = self.live_hitbox_rule_union();
                 self.game_link.send_hitbox_rules(&hit);
                 self.push_effect_aliases();
                 self.live_overrides.resend_tweaks(&self.game_link);

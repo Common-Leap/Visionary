@@ -2582,7 +2582,7 @@ unsafe fn resolve_injection_motion(
     boundary: CoroutineBoundary,
     observed_frame: f32,
 ) -> (u64, u64) {
-    let observed = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let observed = crate::slight::hitbox_viewer::acting_motion(boma);
     let boid = (*boma).battle_object_id;
     let hint = motion_hint_atomic(boid);
     let hint_has_rules = hint.is_some_and(|hint| {

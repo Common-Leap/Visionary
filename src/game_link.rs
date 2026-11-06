@@ -268,6 +268,27 @@ impl Default for RpmEffectData {
 /// Wire form of a plugin spawn rule (matches slight_replica spawn_rules::SpawnRule).
 /// `motion` + frame window scope the rule to ONE spawn so editing one spawn of an effect
 /// doesn't move every spawn; `pos`/`rot`/`scale` are the per-spawn transform override.
+/// A live rule tagged with its fighter. Moves share names across fighters, so without the tag an
+/// edit to one fighter's `special_n` would change every fighter's.
+#[derive(Clone, Debug, Serialize)]
+pub struct ForFighter<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fighter_kind: Option<i32>,
+    #[serde(flatten)]
+    pub rule: T,
+}
+
+impl<T> ForFighter<T> {
+    /// `key` is a rule store key, which starts with the fighter's name.
+    pub fn from_key(key: &str, rule: T) -> Self {
+        let fighter = key.split(['/', '#']).next().unwrap_or_default();
+        Self {
+            fighter_kind: crate::gimmicks::registry::fighter_kind_value(fighter),
+            rule,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SpawnRuleWire {
     pub eff_hash: u64,
@@ -2465,7 +2486,7 @@ impl GameLink {
 
     /// Replace the plugin's live spawn-rule list (suppress/retime ACMD effect spawns).
     /// Send the FULL current rule set every time — an empty slice clears all rules.
-    pub fn send_spawn_rules(&self, rules: &[SpawnRuleWire]) {
+    pub fn send_spawn_rules<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -2481,7 +2502,7 @@ impl GameLink {
     }
 
     /// Replace the live effect point-control rules (detach and area toggles).
-    pub fn send_effect_control_rules(&self, rules: &[EffectControlRuleWire]) {
+    pub fn send_effect_control_rules<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -2874,7 +2895,7 @@ impl GameLink {
 
     /// Replace the plugin's live hitbox-rule list (modify/suppress/inject ATTACKs).
     /// Always the FULL set — an empty slice clears all rules.
-    pub fn send_hitbox_rules(&self, rules: &[HitboxRuleWire]) {
+    pub fn send_hitbox_rules<T: Serialize>(&self, rules: &[T]) {
         if self.sends_suppressed() {
             return;
         }
@@ -3681,6 +3702,26 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rule_carries_the_fighter_from_its_store_key() {
+        use super::ForFighter;
+        let tagged = |key: &str| {
+            serde_json::to_value(ForFighter::from_key(
+                key,
+                serde_json::json!({ "motion": 7 }),
+            ))
+            .unwrap()
+        };
+        let cloud = crate::gimmicks::registry::fighter_kind_value("cloud").unwrap();
+        for key in ["cloud/special_n", "cloud/special_n#node_steps"] {
+            assert_eq!(tagged(key)["fighter_kind"], cloud, "{key}");
+            assert_eq!(tagged(key)["motion"], 7, "the rule's own fields stay flat");
+        }
+        assert!(tagged("not_a_fighter/special_n")
+            .get("fighter_kind")
+            .is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -7228,17 +7269,17 @@ mod tests {
     fn project_rule_batches_publish_only_after_the_flattened_union_is_ready() {
         let link = GameLink::default();
         link.begin_rule_batch();
-        link.send_spawn_rules(&[]);
-        link.send_effect_control_rules(&[]);
-        link.send_hitbox_rules(&[]);
+        link.send_spawn_rules::<SpawnRuleWire>(&[]);
+        link.send_effect_control_rules::<EffectControlRuleWire>(&[]);
+        link.send_hitbox_rules::<HitboxRuleWire>(&[]);
         assert!(
             link.shared.lock().unwrap().outbox.is_empty(),
             "intermediate materialization sends must stay local"
         );
         link.end_rule_batch();
-        link.send_spawn_rules(&[]);
-        link.send_effect_control_rules(&[]);
-        link.send_hitbox_rules(&[]);
+        link.send_spawn_rules::<SpawnRuleWire>(&[]);
+        link.send_effect_control_rules::<EffectControlRuleWire>(&[]);
+        link.send_hitbox_rules::<HitboxRuleWire>(&[]);
         let shared = link.shared.lock().unwrap();
         assert_eq!(
             shared.outbox.len(),
@@ -7261,9 +7302,9 @@ mod tests {
             }],
         };
         link.begin_project_batch();
-        link.send_spawn_rules(&[]);
-        link.send_effect_control_rules(&[]);
-        link.send_hitbox_rules(&[]);
+        link.send_spawn_rules::<SpawnRuleWire>(&[]);
+        link.send_effect_control_rules::<EffectControlRuleWire>(&[]);
+        link.send_hitbox_rules::<HitboxRuleWire>(&[]);
         link.send_effect_aliases(&[]);
         link.send_donor_effs(&[]);
         link.send_donor_bytes(&[]);
@@ -7279,9 +7320,9 @@ mod tests {
         );
 
         link.end_project_batch();
-        link.send_spawn_rules(&[]);
-        link.send_effect_control_rules(&[]);
-        link.send_hitbox_rules(&[]);
+        link.send_spawn_rules::<SpawnRuleWire>(&[]);
+        link.send_effect_control_rules::<EffectControlRuleWire>(&[]);
+        link.send_hitbox_rules::<HitboxRuleWire>(&[]);
         link.send_effect_aliases(&[]);
         link.send_donor_effs(&[]);
         link.send_donor_bytes(&[]);

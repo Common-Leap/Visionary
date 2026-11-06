@@ -190,6 +190,14 @@ pub fn fighter_kind_symbol(fighter: &str) -> Option<&'static str> {
         .map(|entry| entry.symbol)
 }
 
+/// Exact engine kind for a pinned fighter name.
+pub fn fighter_kind_value(fighter: &str) -> Option<i32> {
+    FIGHTER_KINDS
+        .iter()
+        .find(|entry| entry.fighter == fighter)
+        .and_then(|entry| i32::try_from(entry.value).ok())
+}
+
 #[cfg(test)]
 fn validate(entries: &[RegistryEntry]) -> Result<(), String> {
     let mut names = HashSet::new();
