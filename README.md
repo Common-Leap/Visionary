@@ -58,7 +58,7 @@ corresponding files are present in the export.
 ## Making moves and gimmicks with nodes
 
 The node system is not finished. Some blocks don't update live yet, many fighter mechanics aren't
-supported as gimmicks, and most testing so far has been on Mario.
+supported as gimmicks, and most fighters have barely been tested.
 
 Open the **Move nodes** tab, or start from **Gimmicks** to work on a whole character.
 
