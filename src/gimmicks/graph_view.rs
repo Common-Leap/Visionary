@@ -16,6 +16,8 @@ pub struct GraphView {
     variable_target: String,
     transition: usize,
     action_draft: Option<ControllerAction>,
+    /// The fighter `action_draft` was made for; its choices don't carry over to another fighter.
+    action_draft_fighter: String,
     timer_target: String,
     timer_frames: i32,
     status: String,
@@ -1149,6 +1151,10 @@ impl GraphView {
         egui::CollapsingHeader::new("Add action")
             .id_salt(("add_action", self.transition))
             .show(ui, |ui| {
+                if self.action_draft_fighter != fighter {
+                    self.action_draft = None;
+                    self.action_draft_fighter = fighter.to_owned();
+                }
                 let draft = self.action_draft.get_or_insert_with(|| {
                     // Start on something the rule can use right away: a variable write once one exists.
                     let kind = if graph.vars.is_empty() { ControllerActionKind::RequestFighterStatus } else { ControllerActionKind::Set };

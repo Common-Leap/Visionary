@@ -313,7 +313,8 @@ impl CanvasState {
             let bounds = max - min;
             let fitted = ((area.width() - 32.0) / bounds.x.max(1.0))
                 .min((area.height() - 32.0) / bounds.y.max(1.0))
-                .clamp(0.85, 1.25);
+                // The workspace is narrow beside its 3D view, so Fit must be able to show a whole move.
+                .clamp(if self.workspace { 0.45 } else { 0.85 }, 1.25);
             self.zoom = fitted;
             let content = bounds * fitted;
             let offset = Vec2::new(

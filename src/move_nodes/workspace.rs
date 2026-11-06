@@ -773,13 +773,24 @@ impl NodeEditor {
     fn add_character_block(&mut self, fighter: &str, block: CharacterBlock) {
         use crate::gimmicks::behavior::{CmpOp, ConstValue, Expr, Predicate, Transition, VarDef};
         use crate::gimmicks::graph_edit;
-        let chart = self
-            .canvas
-            .selected_character()
-            .map_or_else(|| "main".to_owned(), |(chart, _)| chart);
         let Some(character) = &mut self.character else {
             return;
         };
+        // With no gimmick block selected, use the gimmick that has rules, newest first.
+        let chart = self
+            .canvas
+            .selected_character()
+            .map(|(chart, _)| chart)
+            .or_else(|| {
+                character
+                    .charts
+                    .iter()
+                    .rev()
+                    .find(|(_, chart)| !chart.graph.states.is_empty())
+                    .map(|(name, _)| name.clone())
+                    .filter(|_| character.main.states.is_empty())
+            })
+            .unwrap_or_else(|| "main".to_owned());
         let graph = if chart == "main" {
             &mut character.main
         } else if let Some(chart) = character.charts.get_mut(&chart) {
@@ -955,6 +966,27 @@ impl NodeEditor {
                 format!("node:{id}")
             }
             PaletteBlock::Character(block) => {
+                // A rule needs a gimmick to live in, so make one rather than refuse.
+                let needs_gimmick = !matches!(block, CharacterBlock::State)
+                    && self.character.as_ref().is_some_and(|character| {
+                        character.main.states.is_empty()
+                            && character
+                                .charts
+                                .values()
+                                .all(|chart| chart.graph.states.is_empty())
+                    });
+                if needs_gimmick {
+                    self.add_workspace_block(
+                        PaletteBlock::NewController,
+                        fighter,
+                        _move_name,
+                        base,
+                        _siblings,
+                        track,
+                        position,
+                        None,
+                    );
+                }
                 self.add_character_block(fighter, block);
                 return;
             }
@@ -1373,6 +1405,42 @@ mod tests {
             editor.character.map(|c| c.main.initial).as_deref(),
             Some("b"),
             "workspace edits survive"
+        );
+    }
+    #[test]
+    fn a_rule_finds_or_makes_the_gimmick_it_belongs_to() {
+        let mut editor = NodeEditor {
+            character: Some(CharacterDraft {
+                main: BehaviorGraph::default(),
+                charts: BTreeMap::new(),
+                layout: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let base = BehaviorGraph::default();
+        let add = |editor: &mut NodeEditor| {
+            editor.add_workspace_block(
+                PaletteBlock::Character(CharacterBlock::Transition(HookName::OnDealDamage)),
+                "mario",
+                "attack_11",
+                &base,
+                &BTreeMap::new(),
+                Track::Game,
+                [0.0, 0.0],
+                None,
+            );
+            editor.canvas = Default::default();
+        };
+        add(&mut editor);
+        add(&mut editor);
+        assert!(editor.error.is_empty(), "{}", editor.error);
+        let character = editor.character.as_ref().unwrap();
+        assert_eq!(character.charts.len(), 1, "one gimmick, reused");
+        let chart = character.charts.values().next().unwrap();
+        assert_eq!(
+            chart.graph.transitions.len(),
+            3,
+            "starter rule and both new rules"
         );
     }
     #[test]

@@ -831,7 +831,13 @@ pub fn compile(
             errors.push(error(fighter, &track_path, reason));
         } else {
             let emitted = preview(track.track, &script, move_name);
-            if let Err(parse_error) = syn::parse_file(&emitted) {
+            // The game's own scripts carry this decompiler artefact (Inkling's jab). It isn't
+            // Rust, but it's untouched source and must not block the user's edits to the move.
+            let checked = emitted.replace(
+                "if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(",
+                "if (original_guard(",
+            );
+            if let Err(parse_error) = syn::parse_file(&checked) {
                 errors.push(error(
                     fighter,
                     &track_path,
@@ -5829,6 +5835,23 @@ mod tests {
             .unwrap();
         let restored: ExcuteStmt = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(restored).unwrap(), json);
+    }
+
+    #[test]
+    fn a_decompiler_guard_in_the_source_does_not_block_edits() {
+        let source = crate::acmd::parse_acmd_script(
+            r#"unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 33.0);
+    if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(false, true)){
+        if macros::is_excute(agent) {
+            macros::FT_MOTION_INTP_WAIT(agent);
+        }
+    }
+}
+"#,
+        );
+        let track = import_for_fighter("inkling", Track::Expression, &source);
+        compile("inkling", "attack_11", &graph(track)).expect("the original line stays allowed");
     }
 
     #[test]
