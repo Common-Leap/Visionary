@@ -9445,7 +9445,6 @@ impl VisionaryApp {
                 PrimaryEditorTab::AudioFeedback,
                 PrimaryEditorTab::Effects,
                 PrimaryEditorTab::Gimmicks,
-                PrimaryEditorTab::Nodes,
             ] {
                 if ui
                     .selectable_label(self.primary_tab == tab, tab.title())
@@ -9453,20 +9452,14 @@ impl VisionaryApp {
                     .clicked()
                 {
                     self.primary_tab = tab;
-                    if tab == PrimaryEditorTab::Nodes {
-                        self.node_workspace = true;
-                        self.node_editor.refresh_character();
-                    }
                     self.show_add_hitbox = false;
                 }
             }
         });
 
+        // Move nodes has its own screen, switched from the top bar.
         if self.primary_tab == PrimaryEditorTab::Nodes {
-            if ui.button("Open Move nodes").clicked() {
-                self.node_workspace = true;
-            }
-            return;
+            self.primary_tab = PrimaryEditorTab::Collisions;
         }
 
         if self.primary_tab == PrimaryEditorTab::Gimmicks {
@@ -30668,6 +30661,22 @@ impl eframe::App for VisionaryApp {
                 let menu_config = egui::containers::menu::MenuConfig::new()
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 ui.label(egui::RichText::new("Visionary").size(16.0).color(egui::Color32::WHITE));
+                ui.separator();
+                // The two ways to edit a move, always one click away.
+                let classic = ui
+                    .selectable_label(!self.node_workspace, egui::RichText::new("Classic editor").strong())
+                    .on_hover_text("Edit a move with the hitbox, motion, sound and effect tabs");
+                let nodes = ui
+                    .selectable_label(self.node_workspace, egui::RichText::new("Move nodes").strong())
+                    .on_hover_text("Build or change a move with blocks, and see each block's code");
+                if classic.clicked() {
+                    self.node_workspace = false;
+                }
+                if nodes.clicked() && !self.node_workspace {
+                    self.node_workspace = true;
+                    self.primary_tab = PrimaryEditorTab::Nodes;
+                    self.node_editor.refresh_character();
+                }
                 ui.separator();
 
                 egui::containers::menu::MenuButton::new("File")
