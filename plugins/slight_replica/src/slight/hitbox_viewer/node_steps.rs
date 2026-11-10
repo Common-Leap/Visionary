@@ -403,6 +403,98 @@ fn common_flag(symbol: u64) -> Option<i32> {
 }
 
 /// The cancel options the block list offers.
+/// Most attack code never asks whether a cancel is allowed, so an Allow cancel block would do
+/// nothing on its own. Once one has run in this move, take the player's input ourselves.
+pub unsafe fn follow_cancels(boma: *mut Boma, symbols: &[u64]) {
+    let ground = StatusModule::situation_kind(boma) == *SITUATION_KIND_GROUND;
+    let cat1 = ControlModule::get_command_flag_cat(boma, 0);
+    let pressed = |flags: &[i32]| flags.iter().any(|flag| cat1 & *flag != 0);
+    let jumps_left = WorkModule::get_int(boma, *FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT)
+        < WorkModule::get_int(boma, *FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT_MAX);
+    for symbol in symbols {
+        let Some(term) = transition_term(*symbol) else {
+            continue;
+        };
+        // A later Block cancel in the same move turns it back off.
+        if !WorkModule::is_enable_transition_term(boma, term) {
+            continue;
+        }
+        let jump = *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP;
+        let jump_button = *FIGHTER_PAD_CMD_CAT1_FLAG_JUMP_BUTTON;
+        let air_attacks = [
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_N,
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_AIR_N,
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_AIR_F,
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_AIR_B,
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_AIR_HI,
+            *FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_AIR_LW,
+        ];
+        let (fire, status) = match term {
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON => (
+                ground && pressed(&[jump_button]),
+                *FIGHTER_STATUS_KIND_JUMP_SQUAT,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT => {
+                (ground && pressed(&[jump]), *FIGHTER_STATUS_KIND_JUMP_SQUAT)
+            }
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL_BUTTON => (
+                !ground && jumps_left && pressed(&[jump_button]),
+                *FIGHTER_STATUS_KIND_JUMP_AERIAL,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL => (
+                !ground && jumps_left && pressed(&[jump]),
+                *FIGHTER_STATUS_KIND_JUMP_AERIAL,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK => (
+                ground && pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ATTACK_N]),
+                *FIGHTER_STATUS_KIND_ATTACK,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_AIR => (
+                !ground && pressed(&air_attacks),
+                *FIGHTER_STATUS_KIND_ATTACK_AIR,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_N => (
+                pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_N]),
+                *FIGHTER_STATUS_KIND_SPECIAL_N,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S => (
+                pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_S]),
+                *FIGHTER_STATUS_KIND_SPECIAL_S,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI => (
+                pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_HI]),
+                *FIGHTER_STATUS_KIND_SPECIAL_HI,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW => (
+                pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_SPECIAL_LW]),
+                *FIGHTER_STATUS_KIND_SPECIAL_LW,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON => (
+                ground && ControlModule::check_button_on(boma, *CONTROL_PAD_BUTTON_GUARD),
+                *FIGHTER_STATUS_KIND_GUARD_ON,
+            ),
+            t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ESCAPE => {
+                if ground {
+                    (
+                        pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ESCAPE]),
+                        *FIGHTER_STATUS_KIND_ESCAPE,
+                    )
+                } else {
+                    (
+                        pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_AIR_ESCAPE]),
+                        *FIGHTER_STATUS_KIND_ESCAPE_AIR,
+                    )
+                }
+            }
+            _ => continue,
+        };
+        if fire {
+            StatusModule::change_status_request_from_script(boma, status, true);
+            return;
+        }
+    }
+}
+
 fn transition_term(symbol: u64) -> Option<i32> {
     macro_rules! table { ($($name:ident,)*) => {
         $(if symbol == name_hash(stringify!($name)) { return Some(*$name); })*
@@ -411,12 +503,23 @@ fn transition_term(symbol: u64) -> Option<i32> {
         FIGHTER_DIDDY_STATUS_SPECIAL_S_TRANSITION_TERM_ID_GROUND,
         FIGHTER_LUIGI_STATUS_SPECIAL_S_RAM_TRANSITION_TERM_ID_GROUND,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_AIR,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_HI3,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW3,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_LW4_START,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S3,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_S4_START,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ESCAPE,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ITEM_THROW,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL_BUTTON,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_N,
+        FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S,
         FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_TURN_DASH,
         FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN,
         FIGHTER_STATUS_TRANSITION_TERM_ID_LANDING,

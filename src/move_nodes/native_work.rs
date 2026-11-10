@@ -9,6 +9,49 @@ use crate::gimmicks::registry::{self, IdentifierKind};
 
 pub const DASH_TO_RUN_TERM: &str = "*FIGHTER_STATUS_TRANSITION_TERM_ID_DASH_TO_RUN";
 
+/// Everyday ways out of a move, shared by every fighter.
+const COMMON_CANCELS: &[(&str, &str)] = &[
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT_BUTTON",
+        "Jump (button)",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_SQUAT",
+        "Jump (stick up)",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL_BUTTON",
+        "Air jump (button)",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_JUMP_AERIAL",
+        "Air jump (stick up)",
+    ),
+    ("*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK", "Jab"),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ATTACK_AIR",
+        "Air attack",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_N",
+        "Neutral special",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_S",
+        "Side special",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_HI",
+        "Up special",
+    ),
+    (
+        "*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_SPECIAL_LW",
+        "Down special",
+    ),
+    ("*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_GUARD_ON", "Shield"),
+    ("*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ESCAPE", "Dodge"),
+];
+
 /// A measured source-only transition-term operation admitted for one concrete fighter.
 /// The symbolic token remains part of the identity: several owner-specific constants share
 /// the same numeric Work ID in the pinned registry.
@@ -161,6 +204,19 @@ pub fn source_transition_term_choices(fighter: &str) -> Vec<SourceTransitionTerm
         transition_term: DASH_TO_RUN_TERM,
         label: "Dash-to-run",
     }];
+    for action in [
+        crate::data::WorkTransitionTermAction::Enable,
+        crate::data::WorkTransitionTermAction::Unable,
+    ] {
+        choices.extend(COMMON_CANCELS.iter().map(|(transition_term, label)| {
+            SourceTransitionTermDescriptor {
+                fighter,
+                action,
+                transition_term,
+                label,
+            }
+        }));
+    }
     choices.extend(
         source_transition_term_descriptors()
             .iter()
@@ -580,7 +636,17 @@ pub fn validate_source_transition_term(
     {
         return validate_dash_to_run_transition_term(fighter, call);
     }
-    if source_transition_term_descriptor(fighter, call.action, &call.transition_term).is_some() {
+    if source_transition_term_descriptor(fighter, call.action, &call.transition_term).is_some()
+        || (registry::fighter_kind_symbol(fighter).is_some()
+            && matches!(
+                call.action,
+                crate::data::WorkTransitionTermAction::Enable
+                    | crate::data::WorkTransitionTermAction::Unable
+            )
+            && COMMON_CANCELS
+                .iter()
+                .any(|(term, _)| *term == call.transition_term))
+    {
         return Ok(());
     }
     Err(format!(
@@ -1240,8 +1306,14 @@ mod tests {
                 action: wrong_action,
                 ..call.clone()
             };
+            // Everyday cancels may be allowed or blocked on any move.
+            let common = COMMON_CANCELS
+                .iter()
+                .any(|(term, _)| *term == descriptor.transition_term);
             assert!(
-                validate_source_transition_term(descriptor.fighter, &mismatched_action).is_err()
+                common
+                    || validate_source_transition_term(descriptor.fighter, &mismatched_action)
+                        .is_err()
             );
 
             let wrong_owner = if descriptor.fighter == "mario" {
@@ -1249,7 +1321,7 @@ mod tests {
             } else {
                 "mario"
             };
-            assert!(validate_source_transition_term(wrong_owner, &call).is_err());
+            assert!(common || validate_source_transition_term(wrong_owner, &call).is_err());
 
             let wrong_symbol = WorkTransitionTermCall {
                 transition_term: "*UNMEASURED_TRANSITION_TERM".into(),
@@ -1277,6 +1349,16 @@ mod tests {
         assert!(validate_source_transition_term("luigi", &luigi_call).is_ok());
         assert!(validate_source_transition_term("diddy", &luigi_call).is_err());
         assert!(source_transition_term_choices("not_a_fighter").is_empty());
+        // Every fighter can allow or block the everyday cancels.
+        for action in [Action::Enable, Action::Unable] {
+            let call = WorkTransitionTermCall {
+                action,
+                receiver: Receiver::AgentAccessor,
+                transition_term: COMMON_CANCELS[0].0.into(),
+            };
+            assert!(validate_source_transition_term("donkey", &call).is_ok());
+            assert!(validate_source_transition_term("not_a_fighter", &call).is_err());
+        }
     }
 
     #[test]

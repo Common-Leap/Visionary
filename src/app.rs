@@ -23104,6 +23104,11 @@ impl VisionaryApp {
             return;
         };
         let (rules, unrepresentable) = build(self, motion);
+        // Blocks of these kinds added in the node editor go to the match as node steps.
+        let sent_as_steps = matches!(
+            key,
+            "speed" | "add_speed_no_limit" | "work_flag" | "work_transition_term"
+        );
         let key = format!("{mv_key}#{key}");
         if rules.is_empty() {
             self.hitbox_rules_store.remove(&key);
@@ -23112,7 +23117,9 @@ impl VisionaryApp {
         }
         let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
-        if let Some((category, label, need)) = limits.filter(|_| unrepresentable > 0) {
+        if let Some((category, label, need)) =
+            limits.filter(|_| unrepresentable > 0 && !sent_as_steps)
+        {
             self.note_live_replay_capture_limit(category);
             self.state.status =
                 format!("{label} edit staged, but {unrepresentable} point(s) need {need}");

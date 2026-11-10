@@ -3780,6 +3780,23 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 || live_fingerprints.contains(fingerprint)
         });
 
+    let cancels: Vec<u64> = injections
+        .iter()
+        .filter(|(_, category, inj)| {
+            *category == node_steps::CAT_NODE_STEP
+                && inj.command.as_deref() == Some("enable_term")
+                && frame >= inj.frame
+        })
+        .filter_map(|(_, _, inj)| match inj.args.first() {
+            Some(LuaArg::Hash(symbol)) => Some(*symbol),
+            _ => None,
+        })
+        .collect();
+    if !cancels.is_empty() {
+        let _g = InjectGuard::new();
+        node_steps::follow_cancels(boma, &cancels);
+    }
+
     for (fingerprint, category, inj) in injections {
         let key = (boid, fingerprint);
         let due = frame >= inj.frame;

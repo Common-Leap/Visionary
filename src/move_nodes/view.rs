@@ -1809,7 +1809,8 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
             });
         }
         ExcuteStmt::AttackAbs(call) => {
-            ui.weak("Absolute damage definition — applying a throw to its captured target is a separate native command.").on_hover_text(&call.kind);
+            ui.weak("Sets the throw's damage. Apply throw is what hits the held opponent with it.")
+                .on_hover_text(&call.kind);
             ui.horizontal_wrapped(|ui| {
                 ui.label("ID");
                 ui.add(egui::DragValue::new(&mut call.id).range(0..=255));
@@ -2850,7 +2851,8 @@ fn node_choices_for_fighter(track: Track, fighter: &str) -> Vec<(usize, &'static
             89 => crate::data::EffectOffKindWorkPreset::all()
                 .iter()
                 .any(|preset| preset.fighter == fighter),
-            74..=76 => super::native_work::source_transition_term_descriptors()
+            74 | 75 => crate::gimmicks::registry::fighter_kind_symbol(fighter).is_some(),
+            76 => super::native_work::source_transition_term_descriptors()
                 .iter()
                 .any(|descriptor| {
                     descriptor.fighter == fighter
@@ -2963,9 +2965,13 @@ pub(super) fn context_command(kind: usize, fighter: &str) -> ExcuteStmt {
     }
     if matches!(kind, 74..=76) {
         let action = transition_palette_action(kind);
-        let term = super::native_work::source_transition_term_descriptors()
-            .iter()
-            .find(|descriptor| descriptor.fighter == fighter && descriptor.action == action)
+        // A new block starts on a real choice, never on the internal dash-to-run term.
+        let term = super::native_work::source_transition_term_choices(fighter)
+            .into_iter()
+            .find(|descriptor| {
+                descriptor.action == action
+                    && descriptor.transition_term != super::native_work::DASH_TO_RUN_TERM
+            })
             .map_or("", |descriptor| descriptor.transition_term);
         return ExcuteStmt::WorkTransitionTerm(crate::data::WorkTransitionTermCall {
             action,
@@ -3709,13 +3715,16 @@ fn transition_permission_ui(
     let label = choices
         .iter()
         .find(|descriptor| descriptor.transition_term == call.transition_term)
-        .map_or("Unsupported source", |descriptor| descriptor.label);
-    ui.label(operation).on_hover_text(format!(
-        "{}({}, {})",
-        call.func(),
-        call.receiver.token(),
-        call.transition_term
-    ));
+        .map_or("Not available for this fighter", |descriptor| {
+            descriptor.label
+        });
+    ui.label(super::plain::block_name(operation))
+        .on_hover_text(format!(
+            "{}({}, {})",
+            call.func(),
+            call.receiver.token(),
+            call.transition_term
+        ));
     if accepted {
         egui::ComboBox::from_id_salt("transition_permission")
             .width(220.0)
@@ -3947,7 +3956,7 @@ fn native_command_ui(
         }
         ExcuteStmt::AttackAbsApplyThrow => {
             ui.weak("Uses the native captured throw target")
-                .on_hover_text("Applies the previously defined absolute Throw attack using the three fixed native throw-target slots. Requires a captured target from the throw status; this does not create a grab or choose a numeric object ID.");
+                .on_hover_text("Hits the held opponent with the throw damage set above. Only works during a throw, after something has grabbed them.");
         }
         ExcuteStmt::AttackModuleAddReactionFrame { id, frames }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { id, frames } => {
