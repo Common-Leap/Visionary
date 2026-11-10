@@ -111,7 +111,9 @@ pub(crate) fn request_status(
     };
     unsafe {
         if let Some(module) = partner(boid, fighter, identity) {
-            StatusModule::change_status_request(module, status, false);
+            // A plain request waits for the partner's current action to allow it, which an
+            // attack almost never does; the script form takes over right away.
+            StatusModule::change_status_request_from_script(module, status, true);
         }
     }
     Ok(())
