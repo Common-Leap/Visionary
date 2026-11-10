@@ -17081,7 +17081,7 @@ impl VisionaryApp {
             }
         }
         for (fighter, behavior) in &self.roster.behaviors {
-            if !behavior.is_empty() {
+            if !behavior.is_unset() {
                 project
                     .fighters
                     .entry(fighter.clone())
@@ -19349,7 +19349,7 @@ impl VisionaryApp {
         let stored_behaviors = project
             .fighters
             .iter()
-            .filter(|(_, fm)| !fm.behavior.is_empty())
+            .filter(|(_, fm)| !fm.behavior.is_unset())
             .map(|(fighter, fm)| (fighter.clone(), fm.behavior.clone()))
             .collect();
         project = match crate::move_nodes::project::expand(&project) {

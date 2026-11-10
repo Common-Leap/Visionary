@@ -255,7 +255,7 @@ impl ModProjectFile {
                 && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
                 && f.live_tweaks.is_empty()
                 && f.params.is_empty()
-                && f.behavior.is_empty()
+                && f.behavior.is_unset()
                 && f.meters.is_empty()
                 && f.move_graphs.is_empty()
                 && f.controller_charts.is_empty()
@@ -582,7 +582,7 @@ pub struct FighterMod {
     /// loadable, and they behave exactly as before — no behavior runs.
     #[serde(
         default,
-        skip_serializing_if = "crate::gimmicks::behavior::BehaviorGraph::is_empty"
+        skip_serializing_if = "crate::gimmicks::behavior::BehaviorGraph::is_unset"
     )]
     pub behavior: crate::gimmicks::behavior::BehaviorGraph,
     /// Editor-only character field positions. Coordinates never affect generated behavior.

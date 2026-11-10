@@ -268,6 +268,7 @@ fn lower_validated_graph(
     }
     let program = model::LiveProgram {
         custom_statuses: graph.custom_statuses.clone(),
+        costumes: graph.costumes.clone(),
         status_bindings: graph
             .states
             .iter()

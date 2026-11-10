@@ -1476,6 +1476,7 @@ mod tests {
 
     fn cloud() -> BehaviorGraph {
         BehaviorGraph {
+            costumes: Vec::new(),
             custom_statuses: Default::default(),
             initial: "idle".into(),
             states: vec![

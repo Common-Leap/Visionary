@@ -20,6 +20,7 @@ fn limit<E>(op: Op, amount: E) -> Command<E> {
 
 pub(super) fn graph() -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "idle".into(),
         states: vec![

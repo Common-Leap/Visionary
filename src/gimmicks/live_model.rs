@@ -605,6 +605,9 @@ pub struct ResourceTrigger {
 pub struct LiveProgram {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_statuses: BTreeMap<String, u8>,
+    /// Costume slots this runs on; empty runs on every costume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costumes: Vec<u8>,
     pub version: u8,
     pub id: String,
     pub fighter: String,
@@ -5024,6 +5027,7 @@ mod tests {
             });
         }
         LiveProgram {
+            costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: MODEL_VERSION,

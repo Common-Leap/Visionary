@@ -455,6 +455,7 @@ mod tests {
 
     fn valid_program(id: &str, fighter: &str) -> model::LiveProgram {
         model::LiveProgram {
+            costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: model::MODEL_VERSION,

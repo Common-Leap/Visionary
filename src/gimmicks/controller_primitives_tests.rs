@@ -15,6 +15,7 @@ fn always() -> Predicate {
 }
 fn fixture() -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "active".into(),
         states: vec![StateDef {

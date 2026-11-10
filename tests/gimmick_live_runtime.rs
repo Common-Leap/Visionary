@@ -34,6 +34,8 @@ extern crate self as smash;
 
 pub mod lib {
     pub mod lua_const {
+        pub static FIGHTER_INSTANCE_WORK_ID_INT_COLOR: std::sync::LazyLock<i32> =
+            std::sync::LazyLock::new(|| 0x1000_0000);
         pub static FIGHTER_STATUS_KIND_SPECIAL_LW: std::sync::LazyLock<i32> =
             std::sync::LazyLock::new(|| 0x1DF);
         pub static FIGHTER_STATUS_KIND_DEAD: std::sync::LazyLock<i32> =
@@ -81,6 +83,16 @@ impl<T> Mutex<T> {
 
 pub mod app {
     pub mod lua_bind {
+        pub struct WorkModule;
+        impl WorkModule {
+            /// Every test fighter wears costume 0.
+            pub unsafe fn get_int(
+                _module: *mut super::BattleObjectModuleAccessor,
+                _id: i32,
+            ) -> i32 {
+                0
+            }
+        }
         pub struct StatusModule;
         impl StatusModule {
             pub unsafe fn status_kind(module: *mut super::BattleObjectModuleAccessor) -> i32 {
@@ -1617,6 +1629,7 @@ fn program(
         bindings[0].transitions.push(transition_index);
     }
     model::LiveProgram {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         status_bindings: Vec::new(),
         event_bindings: Vec::new(),

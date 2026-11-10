@@ -35,16 +35,71 @@ impl CharacterContext {
             costume_slots,
         }
     }
+}
 
-    fn scope_description(&self) -> String {
-        if self.costume_slots.is_empty() {
-            format!(
-                "Native parameters and the saved behavior apply to all costumes of {}.",
-                self.fighter
-            )
-        } else {
-            format!("{} uses {} as its engine fighter. Gimmicks are shared with all donor costumes; the costume-scoped move target does not isolate parameters, meters, or behavior.", self.name, self.fighter)
+/// Which costumes the gimmick runs on. Parameters and meters still apply to every costume.
+fn costume_scope_ui(
+    ui: &mut Ui,
+    context: &CharacterContext,
+    roots: &[PathBuf],
+    behaviors: &mut BTreeMap<String, BehaviorGraph>,
+) {
+    let current = behaviors
+        .get(&context.fighter)
+        .map(|graph| graph.costumes.clone())
+        .unwrap_or_default();
+    let mut all = crate::data::costume_slots_or_default(roots, &context.fighter);
+    all.extend(context.costume_slots.iter().copied());
+    all.sort_unstable();
+    all.dedup();
+    let label = match current.as_slice() {
+        [] => "Runs on every costume".to_owned(),
+        slots => format!(
+            "Runs on {}",
+            slots
+                .iter()
+                .map(|slot| format!("c{slot:02}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let mut chosen = None;
+    ui.menu_button(label, |ui| {
+        if ui.button("Every costume").clicked() {
+            chosen = Some(Vec::new());
         }
+        if !context.costume_slots.is_empty()
+            && ui.button(format!("Only {}'s costumes", context.name)).clicked()
+        {
+            chosen = Some(context.costume_slots.clone());
+        }
+        ui.separator();
+        for &slot in &all {
+            let mut on = current.is_empty() || current.contains(&slot);
+            if ui.checkbox(&mut on, format!("c{slot:02}")).changed() {
+                let mut next = if current.is_empty() { all.clone() } else { current.clone() };
+                if on {
+                    next.push(slot);
+                } else {
+                    next.retain(|kept| *kept != slot);
+                }
+                next.sort_unstable();
+                next.dedup();
+                // Every slot ticked is the same as no limit.
+                if next == all {
+                    next.clear();
+                }
+                chosen = Some(next);
+            }
+        }
+    })
+    .response
+    .on_hover_text("The gimmick only runs for these costumes. Parameters and meters still change every costume.");
+    if let Some(next) = chosen.filter(|next| *next != current) {
+        behaviors
+            .entry(context.fighter.clone())
+            .or_default()
+            .costumes = next;
     }
 }
 
@@ -327,8 +382,7 @@ impl GimmicksEditor {
                     );
                 }
             }
-            ui.label(RichText::new(if context.costume_slots.is_empty() { "Fighter-wide" } else { "Donor-wide" }).small().weak())
-                .on_hover_text(context.scope_description());
+            costume_scope_ui(ui, context, data.roots, data.behaviors);
         });
         let additional_count = data
             .controller_charts

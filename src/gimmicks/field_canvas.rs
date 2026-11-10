@@ -405,6 +405,7 @@ mod tests {
 
     fn fixture() -> BehaviorGraph {
         BehaviorGraph {
+            costumes: Vec::new(),
             custom_statuses: Default::default(),
             initial: "idle".into(),
             states: vec![

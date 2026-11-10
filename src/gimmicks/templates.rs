@@ -85,6 +85,7 @@ impl Preset {
     pub fn graph(self) -> BehaviorGraph {
         match self {
             Self::KoTally => BehaviorGraph {
+                costumes: Vec::new(),
                 custom_statuses: Default::default(),
                 initial: "tracking".into(),
                 states: vec![StateDef {
@@ -121,6 +122,7 @@ impl Preset {
                 },
             },
             Self::Timer => BehaviorGraph {
+                costumes: Vec::new(),
                 custom_statuses: Default::default(),
                 initial: "waiting".into(),
                 states: vec![StateDef {
@@ -227,6 +229,7 @@ impl Preset {
             Self::Rage => rage(),
             Self::Combo => combo(),
             Self::Charge => BehaviorGraph {
+                costumes: Vec::new(),
                 custom_statuses: Default::default(),
                 initial: "charging".into(),
                 states: vec![StateDef {
@@ -779,6 +782,7 @@ fn single_state(
     hooks: &[(HookName, &[usize])],
 ) -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "active".into(),
         states: vec![StateDef {
@@ -1009,6 +1013,7 @@ fn combo() -> BehaviorGraph {
 /// Cloud's Limit gauge: count grounded Blade Beam spends and idle Limit expiries.
 fn limit_spend_starter() -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "watching".into(),
         states: vec![StateDef {

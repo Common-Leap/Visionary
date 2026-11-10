@@ -1002,7 +1002,21 @@ fn active_for_object(
             ));
         }
     }
-    active(fighter)
+    let (coordinator, source) = active(fighter)?;
+    // A gimmick made for some costumes leaves the fighter's other costumes alone.
+    let module = unsafe { smash::app::sv_battle_object::module_accessor(boid) };
+    let costume = unsafe {
+        smash::app::lua_bind::WorkModule::get_int(
+            module,
+            *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+        )
+    };
+    if module.is_null()
+        || !u8::try_from(costume).is_ok_and(|costume| coordinator.runs_for_costume(costume))
+    {
+        return Err("this costume has no gimmick".into());
+    }
+    Ok((coordinator, source))
 }
 
 pub(crate) fn owns_status(boid: u32, status: i32) -> bool {

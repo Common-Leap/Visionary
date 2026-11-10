@@ -13,6 +13,7 @@ const STATUS: &str = "FIGHTER_CLOUD_STATUS_KIND_SPECIAL_HI2";
 
 fn graph(symbol: &str) -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "idle".into(),
         states: vec![

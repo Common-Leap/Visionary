@@ -107,11 +107,13 @@ pub fn compile(
         } else {
             format!("chart:{}:{id}", kind.value)
         };
-        let program =
+        let mut program =
             super::live_protocol::from_graph(program_id, fighter, &lowered, &lowered.emission_plan)
                 .map_err(|errors| {
                     format!("fighter {fighter} controller {id:?}: {}", errors.join("; "))
                 })?;
+        // The costume choice is the fighter's, so every chart of it follows the main one.
+        program.costumes = main.costumes.clone();
         records.push(controller_protocol::ControllerProgram {
             chart_id: id.into(),
             program,

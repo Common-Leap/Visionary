@@ -90,6 +90,7 @@ use super::codegen::{EmissionPlan, HookBinding};
 use super::hooks::HookName;
 pub(crate) fn charge_graph() -> BehaviorGraph {
     BehaviorGraph {
+        costumes: Vec::new(),
         custom_statuses: Default::default(),
         initial: "idle".to_string(),
         states: ["idle", "full"]

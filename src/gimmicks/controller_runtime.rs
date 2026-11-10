@@ -73,6 +73,14 @@ pub struct ControllerStepResult {
 }
 
 impl ControllerCoordinator {
+    /// False when this costume slot is outside a chart that names its costumes.
+    #[allow(dead_code)] // Called by the plugin only.
+    pub fn runs_for_costume(&self, costume: u8) -> bool {
+        self.programs
+            .values()
+            .all(|program| program.costumes.is_empty() || program.costumes.contains(&costume))
+    }
+
     /// Validate all programs and aggregate budgets before taking ownership of
     /// any program in the coordinator.
     pub fn new(programs: BTreeMap<String, LiveProgram>) -> Result<Self, String> {
@@ -1035,6 +1043,7 @@ mod tests {
 
     fn program(id: &str, timer: i32) -> LiveProgram {
         LiveProgram {
+            costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: super::super::live_model::MODEL_VERSION,

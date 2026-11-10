@@ -69,6 +69,10 @@ pub struct BehaviorGraph {
     pub vars: Vec<VarDef>,
     #[serde(default)]
     pub transitions: Vec<Transition>,
+    /// Costume slots this gimmick runs on; empty runs on every costume. A character made on a
+    /// block of another fighter's costumes keeps its own gimmick this way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costumes: Vec<u8>,
     /// Reviewed hook bindings travel with the graph. Without this the graph
     /// has no proven engine entry point, so adapter export refuses it.
     #[serde(
@@ -86,6 +90,10 @@ impl BehaviorGraph {
             && self.vars.is_empty()
             && self.transitions.is_empty()
             && self.emission_plan.is_empty()
+    }
+    /// Nothing to save: no behavior and no costume choice.
+    pub fn is_unset(&self) -> bool {
+        self.is_empty() && self.costumes.is_empty()
     }
 }
 
