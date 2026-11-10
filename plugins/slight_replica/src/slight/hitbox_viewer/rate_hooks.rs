@@ -192,6 +192,9 @@ unsafe fn hook_motion_module_set_rate(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     rate: f32,
 ) {
+    if super::dropped(boma, &["MotionModule::set_rate"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Num(rate)];
     record_for_boma(boma, "MotionModule::set_rate", &args);
     if super::any_direct_rules(boma) {
@@ -223,6 +226,9 @@ unsafe fn hook_motion_module_set_helper_calculation(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     enabled: bool,
 ) {
+    if super::dropped(boma, &["MotionModule::set_helper_calculation"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Bool(enabled)];
     record_for_boma(boma, "MotionModule::set_helper_calculation", &args);
     if super::any_direct_rules(boma) {
@@ -258,6 +264,9 @@ unsafe fn hook_motion_module_set_rate_partial(
     part_kind: i32,
     rate: f32,
 ) {
+    if super::dropped(boma, &["MotionModule::set_rate_partial"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Int(part_kind as i64), LuaArg::Num(rate)];
     record_for_boma(boma, "MotionModule::set_rate_partial", &args);
     if super::any_direct_rules(boma) {
@@ -295,6 +304,9 @@ unsafe fn hook_motion_module_set_frame_partial(
     frame_value: f32,
     sync: bool,
 ) {
+    if super::dropped(boma, &["MotionModule::set_frame_partial"]) {
+        return Default::default();
+    }
     let args = [
         LuaArg::Int(part_kind as i64),
         LuaArg::Num(frame_value),

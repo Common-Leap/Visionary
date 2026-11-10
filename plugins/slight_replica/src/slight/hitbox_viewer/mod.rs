@@ -1889,6 +1889,13 @@ unsafe fn hook_reverse_lr(lua_state: u64) {
 /// token separately and only sends a numeric replacement when the live capture can prove it.
 #[skyline::hook(replace = smash::app::sv_kinetic_energy::clear_speed)]
 unsafe fn hook_clr_speed(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::CLR_SPEED"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "CLR_SPEED", &args);
     if any_rules() {
@@ -2006,6 +2013,9 @@ unsafe fn hook_kinetic_set_consider_ground_friction(
     consider_ground_friction: bool,
     kinetic_energy_attribute: i32,
 ) {
+    if dropped(boma, &["KineticModule::set_consider_ground_friction"]) {
+        return Default::default();
+    }
     let args = [
         LuaArg::Bool(consider_ground_friction),
         LuaArg::Int(kinetic_energy_attribute as i64),
@@ -2057,6 +2067,9 @@ unsafe fn hook_change_kinetic(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     kinetic_type: i32,
 ) -> i32 {
+    if dropped(boma, &["KineticModule::change_kinetic"]) {
+        return Default::default();
+    }
     record_for_boma(
         boma,
         "KineticModule::change_kinetic",
@@ -2145,6 +2158,9 @@ unsafe fn hook_kinetic_add_speed(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     speed: *const smash::phx::Vector3f,
 ) -> u64 {
+    if dropped(boma, &["KineticModule::add_speed"]) {
+        return Default::default();
+    }
     let Some(vector) = speed.as_ref().copied() else {
         record_for_boma(boma, "KineticModule::add_speed", &[]);
         return original!()(boma, speed);
@@ -2288,6 +2304,9 @@ work_transition_term_hook!(
 /// is the complete runtime identity because the operation has no value argument.
 #[skyline::hook(replace = smash::app::lua_bind::WorkModule::inc_int)]
 unsafe fn hook_work_module_inc_int(boma: *mut smash::app::BattleObjectModuleAccessor, slot: i32) {
+    if dropped(boma, &["WorkModule::inc_int"]) {
+        return Default::default();
+    }
     record_for_boma(boma, "WorkModule::inc_int", &[LuaArg::Int(slot as i64)]);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
@@ -2460,6 +2479,13 @@ unsafe fn hook_work_module_set_float(
 /// a frame, while the editor refuses that fallback when several calls share the frame.
 #[skyline::hook(replace = smash::app::sv_animcmd::SET_SPEED_EX)]
 unsafe fn hook_set_speed_ex(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::SET_SPEED_EX"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 3);
     record(lua_state, "SET_SPEED_EX", &args);
     if any_rules() {
@@ -2582,6 +2608,13 @@ unsafe fn hook_add_speed_no_limit(lua_state: u64) {
 /// Capture and sparsely override the verified `CORRECT` shape.
 #[skyline::hook(replace = smash::app::sv_animcmd::CORRECT)]
 unsafe fn hook_correct(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::CORRECT"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "CORRECT", &args);
     if any_rules() {
@@ -2623,6 +2656,13 @@ unsafe fn hook_correct(lua_state: u64) {
 /// either slot.
 #[skyline::hook(replace = smash::app::sv_animcmd::FT_CATCH_STOP)]
 unsafe fn hook_ft_catch_stop(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::FT_CATCH_STOP"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 2);
     record(lua_state, "FT_CATCH_STOP", &args);
     if any_rules() {
@@ -2672,6 +2712,13 @@ unsafe fn hook_ft_catch_stop(lua_state: u64) {
 /// semantic name to the value while still allowing a source-backed point to be retuned.
 #[skyline::hook(replace = smash::app::sv_animcmd::FT_START_ADJUST_MOTION_FRAME_arg1)]
 unsafe fn hook_ft_start_adjust_motion_frame(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::FT_START_ADJUST_MOTION_FRAME_arg1"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "FT_START_ADJUST_MOTION_FRAME_arg1", &args);
     if any_rules() {

@@ -775,8 +775,44 @@ unsafe fn drop_access_slope(lua_state: u64) {
     original!()(lua_state)
 }
 
+#[skyline::hook(replace = smash::app::lua_bind::KineticModule::suspend_energy)]
+unsafe fn drop_kineticmodule_suspend_energy(boma: *mut Boma, id: i32) -> u64 {
+    if super::dropped(boma, &["KineticModule::suspend_energy"]) {
+        return 0;
+    }
+    original!()(boma, id)
+}
+
+#[skyline::hook(replace = smash::app::lua_bind::KineticModule::resume_energy)]
+unsafe fn drop_kineticmodule_resume_energy(boma: *mut Boma, id: i32) -> u64 {
+    if super::dropped(boma, &["KineticModule::resume_energy"]) {
+        return 0;
+    }
+    original!()(boma, id)
+}
+
+#[skyline::hook(replace = smash::app::lua_bind::KineticModule::enable_energy)]
+unsafe fn drop_kineticmodule_enable_energy(boma: *mut Boma, id: i32) -> u64 {
+    if super::dropped(boma, &["KineticModule::enable_energy"]) {
+        return 0;
+    }
+    original!()(boma, id)
+}
+
+#[skyline::hook(replace = smash::app::lua_bind::KineticModule::unable_energy)]
+unsafe fn drop_kineticmodule_unable_energy(boma: *mut Boma, id: i32) -> u64 {
+    if super::dropped(boma, &["KineticModule::unable_energy"]) {
+        return 0;
+    }
+    original!()(boma, id)
+}
+
 pub fn install() {
     skyline::install_hooks!(
+        drop_kineticmodule_suspend_energy,
+        drop_kineticmodule_resume_energy,
+        drop_kineticmodule_enable_energy,
+        drop_kineticmodule_unable_energy,
         drop_attackmodule_set_size,
         drop_attackmodule_set_add_reaction_frame,
         drop_attackmodule_set_add_reaction_frame_revised,

@@ -2001,6 +2001,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
         ExcuteStmt::Expression(expression) => expression_command_ui(ui, expression),
         command => {
             if !native_command_ui(ui, fighter, command, joints) {
+                plain_fields_ui(ui, command);
                 match super::canvas::command_caption(command) {
                     ("Engine action", detail) => {
                         ui.label(super::plain::block_name(&detail));
@@ -2013,6 +2014,59 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
                     }
                 }
             }
+        }
+    }
+}
+
+/// Numbers and switches of a command with no editor of its own, edited in place. Names of game
+/// values stay as they are.
+fn plain_fields_ui(ui: &mut Ui, command: &mut ExcuteStmt) {
+    fn edit(ui: &mut Ui, label: &str, value: &mut serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Number(number) => {
+                let mut x = number.as_f64().unwrap_or_default();
+                let whole = number.is_i64() || number.is_u64();
+                let changed = ui
+                    .horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(&mut x).speed(if whole { 1.0 } else { 0.1 }))
+                            .changed()
+                    })
+                    .inner;
+                if changed {
+                    *value = if whole {
+                        serde_json::json!(x.round() as i64)
+                    } else {
+                        serde_json::json!(x)
+                    };
+                }
+                changed
+            }
+            serde_json::Value::Bool(on) => ui.checkbox(on, label).changed(),
+            serde_json::Value::Object(fields) => {
+                let mut changed = false;
+                for (name, field) in fields.iter_mut() {
+                    let label = name.replace('_', " ");
+                    changed |= edit(ui, &label, field);
+                }
+                changed
+            }
+            serde_json::Value::Array(items) if items.len() <= 4 => {
+                let mut changed = false;
+                for item in items.iter_mut() {
+                    changed |= edit(ui, label, item);
+                }
+                changed
+            }
+            _ => false,
+        }
+    }
+    let Ok(mut value) = serde_json::to_value(&*command) else {
+        return;
+    };
+    if edit(ui, "", &mut value) {
+        if let Ok(next) = serde_json::from_value(value) {
+            *command = next;
         }
     }
 }

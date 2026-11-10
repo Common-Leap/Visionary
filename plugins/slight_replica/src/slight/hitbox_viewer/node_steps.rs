@@ -5,7 +5,7 @@
 use super::LuaArg;
 use smash::app::lua_bind::{
     ArticleModule, AttackModule, ControlModule, HitModule, ItemModule, JostleModule, KineticModule,
-    PostureModule, SlowModule, StatusModule, VisibilityModule, WorkModule,
+    MotionModule, PostureModule, SlowModule, StatusModule, VisibilityModule, WorkModule,
 };
 use smash::app::BattleObjectModuleAccessor as Boma;
 use smash::lib::lua_const::*;
@@ -631,6 +631,28 @@ fn named_const(symbol: u64) -> Option<i64> {
         FIGHTER_BAYONETTA_COSTUME_KIND_BAYONETTA_1,
         FIGHTER_BAYONETTA_COSTUME_KIND_DEFAULT,
         FIGHTER_BAYONETTA_COSTUME_KIND_JEANNE,
+        FIGHTER_KINETIC_ENERGY_ID_CONTROL,
+        FIGHTER_KINETIC_ENERGY_ID_GRAVITY,
+        FIGHTER_KINETIC_ENERGY_ID_MOTION,
+        FIGHTER_KINETIC_TYPE_AIR_STOP,
+        FIGHTER_KINETIC_TYPE_DOLLY_SPECIAL_LW_FALL,
+        FIGHTER_KINETIC_TYPE_FALL,
+        FIGHTER_KINETIC_TYPE_FINAL_END_JUMP,
+        FIGHTER_KINETIC_TYPE_LUIGI_SPECIAL_S_RAM,
+        FIGHTER_KINETIC_TYPE_METAKNIGHT_SPECIAL_LW_END,
+        FIGHTER_KINETIC_TYPE_METAKNIGHT_SPECIAL_LW_FREE_MOVE,
+        FIGHTER_KINETIC_TYPE_PASSIVE_CEIL,
+        FIGHTER_KINETIC_TYPE_PEACH_SPECIAL_AIR_N_RAISE,
+        FIGHTER_KINETIC_TYPE_PEACH_SPECIAL_S_BRAKE,
+        FIGHTER_KINETIC_TYPE_POPO_SPECIAL_AIR_S_END,
+        FIGHTER_KINETIC_TYPE_POPO_SPECIAL_S_END,
+        FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY,
+        GROUND_CORRECT_KIND_AIR,
+        GROUND_CORRECT_KIND_GROUND,
+        GROUND_CORRECT_KIND_GROUND_CLIFF_STOP,
+        GROUND_CORRECT_KIND_GROUND_CLIFF_STOP_ATTACK,
+        GROUND_CORRECT_KIND_NONE,
+        KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN,
         MA_MSC_CMD_ATTACK_SET_LERP,
         MA_MSC_CMD_SLOPE_SLOPE,
         MA_MSC_CMD_SLOPE_SLOPE_INTP,
@@ -1252,6 +1274,63 @@ unsafe fn generic(lua_state: u64, boma: *mut Boma, name: &str, args: &[LuaArg]) 
             );
         }
         "WorkModule::set_int64" => WorkModule::set_int64(boma, int(0), int(1) as i32),
+        "KineticModule::change_kinetic" => {
+            KineticModule::change_kinetic(boma, int(0) as i32);
+        }
+        "KineticModule::suspend_energy" => {
+            KineticModule::suspend_energy(boma, int(0) as i32);
+        }
+        "KineticModule::resume_energy" => {
+            KineticModule::resume_energy(boma, int(0) as i32);
+        }
+        "KineticModule::enable_energy" => {
+            KineticModule::enable_energy(boma, int(0) as i32);
+        }
+        "KineticModule::unable_energy" => {
+            KineticModule::unable_energy(boma, int(0) as i32);
+        }
+        "KineticModule::add_speed" => {
+            let speed = smash::phx::Vector3f {
+                x: num(0),
+                y: num(1),
+                z: num(2),
+            };
+            KineticModule::add_speed(boma, &speed);
+        }
+        "KineticModule::set_consider_ground_friction" => {
+            KineticModule::set_consider_ground_friction(boma, flag(0), int(1) as i32)
+        }
+        "MotionModule::set_rate" => MotionModule::set_rate(boma, num(0)),
+        "MotionModule::set_rate_partial" => {
+            MotionModule::set_rate_partial(boma, int(0) as i32, num(1))
+        }
+        "MotionModule::set_frame_partial" => {
+            MotionModule::set_frame_partial(boma, int(0) as i32, num(1), flag(2))
+        }
+        "MotionModule::set_helper_calculation" => {
+            MotionModule::set_helper_calculation(boma, flag(0))
+        }
+        "WorkModule::inc_int" => WorkModule::inc_int(boma, int(0) as i32),
+        "macros::SET_SPEED_EX" => {
+            push(lua_state, boma, args);
+            cmd::SET_SPEED_EX(lua_state);
+        }
+        "macros::CORRECT" => {
+            push(lua_state, boma, args);
+            cmd::CORRECT(lua_state);
+        }
+        "macros::FT_CATCH_STOP" => {
+            push(lua_state, boma, args);
+            cmd::FT_CATCH_STOP(lua_state);
+        }
+        "macros::FT_START_ADJUST_MOTION_FRAME_arg1" => {
+            push(lua_state, boma, args);
+            cmd::FT_START_ADJUST_MOTION_FRAME_arg1(lua_state);
+        }
+        "macros::CLR_SPEED" => {
+            push(lua_state, boma, args);
+            smash::app::sv_kinetic_energy::clear_speed(lua_state);
+        }
         "WorkModule::enable_transition_term_group" => {
             WorkModule::enable_transition_term_group(boma, int(0) as i32)
         }

@@ -197,6 +197,23 @@ const GENERIC: &[&str] = &[
     "EffectModule::request_post_effect_line_circle",
     "EffectModule::remove_post_effect_line",
     "WorkModule::set_int64",
+    "KineticModule::change_kinetic",
+    "KineticModule::suspend_energy",
+    "KineticModule::resume_energy",
+    "KineticModule::enable_energy",
+    "KineticModule::unable_energy",
+    "KineticModule::add_speed",
+    "KineticModule::set_consider_ground_friction",
+    "MotionModule::set_rate",
+    "MotionModule::set_rate_partial",
+    "MotionModule::set_frame_partial",
+    "MotionModule::set_helper_calculation",
+    "WorkModule::inc_int",
+    "macros::SET_SPEED_EX",
+    "macros::CORRECT",
+    "macros::FT_CATCH_STOP",
+    "macros::FT_START_ADJUST_MOTION_FRAME_arg1",
+    "macros::CLR_SPEED",
     "WorkModule::enable_transition_term_group",
     "WorkModule::unable_transition_term_group_ex",
     "ArticleModule::add_motion_partial",
@@ -776,6 +793,7 @@ mod tests {
         let plugin = [
             include_str!("../../plugins/slight_replica/src/slight/hitbox_viewer/drop_hooks.rs"),
             include_str!("../../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+            include_str!("../../plugins/slight_replica/src/slight/hitbox_viewer/rate_hooks.rs"),
         ]
         .concat();
         let special = [
