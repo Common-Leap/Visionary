@@ -2001,10 +2001,16 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
         ExcuteStmt::Expression(expression) => expression_command_ui(ui, expression),
         command => {
             if !native_command_ui(ui, fighter, command, joints) {
-                let (title, detail) = super::canvas::command_caption(command);
-                ui.label(super::plain::block_name(title));
-                if !detail.is_empty() {
-                    ui.weak(detail);
+                match super::canvas::command_caption(command) {
+                    ("Engine action", detail) => {
+                        ui.label(super::plain::block_name(&detail));
+                    }
+                    (title, detail) => {
+                        ui.label(super::plain::block_name(title));
+                        if !detail.is_empty() {
+                            ui.weak(detail);
+                        }
+                    }
                 }
             }
         }

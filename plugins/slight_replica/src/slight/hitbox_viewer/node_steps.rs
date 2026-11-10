@@ -93,14 +93,22 @@ unsafe fn work_id(
     symbol: u64,
     kind: crate::slight::gimmicks::registry::IdentifierKind,
 ) -> Option<i32> {
-    use crate::slight::gimmicks::registry::{fighter_name, find_value};
-    let fighter = fighter_name(smash::app::utility::get_kind(&mut *boma))?;
-    let found =
-        common_flag(symbol).or_else(|| find_value(fighter, kind, |name| name_hash(name) == symbol));
+    let found = find_id(boma, symbol, kind);
     if found.is_none() {
         crate::slight::diag::note(format!("node step: unknown game value {symbol:#x}"));
     }
     found
+}
+
+/// [`work_id`] without the log, for lookups that try several tables.
+unsafe fn find_id(
+    boma: *mut Boma,
+    symbol: u64,
+    kind: crate::slight::gimmicks::registry::IdentifierKind,
+) -> Option<i32> {
+    use crate::slight::gimmicks::registry::{fighter_name, find_value};
+    let fighter = fighter_name(smash::app::utility::get_kind(&mut *boma))?;
+    common_flag(symbol).or_else(|| find_value(fighter, kind, |name| name_hash(name) == symbol))
 }
 
 pub unsafe fn passes(boma: *mut Boma, guard: &LiveGuard) -> bool {
@@ -931,20 +939,25 @@ fn named_const(symbol: u64) -> Option<i64> {
 /// A constant by name: a shared one, or one of this fighter's own.
 unsafe fn resolve(boma: *mut Boma, symbol: u64) -> Option<i64> {
     use crate::slight::gimmicks::registry::IdentifierKind as Id;
-    named_const(symbol).or_else(|| {
-        [
-            Id::WorkInt,
-            Id::WorkFloat,
-            Id::WorkFlag,
-            Id::FighterStatus,
-            Id::WeaponStatus,
-            Id::Article,
-            Id::Item,
-            Id::TransitionTerm,
-        ]
-        .into_iter()
-        .find_map(|kind| work_id(boma, symbol, kind).map(i64::from))
-    })
+    named_const(symbol)
+        .or_else(|| {
+            [
+                Id::WorkInt,
+                Id::WorkFloat,
+                Id::WorkFlag,
+                Id::FighterStatus,
+                Id::WeaponStatus,
+                Id::Article,
+                Id::Item,
+                Id::TransitionTerm,
+            ]
+            .into_iter()
+            .find_map(|kind| find_id(boma, symbol, kind).map(i64::from))
+        })
+        .or_else(|| {
+            crate::slight::diag::note(format!("node step: unknown game value {symbol:#x}"));
+            None
+        })
 }
 
 unsafe fn push(lua_state: u64, boma: *mut Boma, args: &[LuaArg]) {
