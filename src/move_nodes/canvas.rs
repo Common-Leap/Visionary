@@ -1254,7 +1254,7 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
             },
             format!("ID {} · {}% · angle {}", call.id, call.damage, call.angle),
         ),
-        ExcuteStmt::AttackAbsApplyThrow => ("Apply throw", "Native captured target".into()),
+        ExcuteStmt::AttackAbsApplyThrow => ("Apply throw", "The held opponent".into()),
         ExcuteStmt::WorkTransitionTerm(call)
             if call.receiver == crate::data::WorkTransitionTermReceiver::AgentAccessor
                 && call.action == crate::data::WorkTransitionTermAction::Enable
