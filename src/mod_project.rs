@@ -1722,3 +1722,32 @@ mod persistence_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod older_project_tests {
+    /// Projects saved by older builds. Set `VISIONARY_OLD_PROJECTS` to a folder of them.
+    #[test]
+    fn older_projects_load_and_expand() {
+        let Some(root) = std::env::var_os("VISIONARY_OLD_PROJECTS") else {
+            return;
+        };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root).unwrap().flatten() {
+            let path = entry.path().join("modproject.json");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut project: super::ModProjectFile = serde_json::from_str(&text)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            project
+                .migrate()
+                .and_then(|_| crate::mod_export::validate_project(&project))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            crate::move_nodes::project::expand(&project)
+                .unwrap_or_else(|errors| panic!("{}: {errors:?}", path.display()));
+            checked += 1;
+        }
+        println!("checked {checked} older projects");
+        assert!(checked > 0);
+    }
+}
