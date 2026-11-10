@@ -322,6 +322,32 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
     Ok(String::new())
 }
 
+/// One script of a fighter's object (`agent` is like "mario_fireball", `script` like
+/// "Regular"), cached beside the fighter's own. `None` when the dump has no such script.
+pub fn fetch_object_script(fighter: &str, agent: &str, script: &str) -> Option<String> {
+    let path = crate::scratch_dirs::app_storage_root()
+        .join("script-cache")
+        .join(agent)
+        .join(format!("{script}.txt"));
+    if let Some(body) = cached_script_body_at(&path) {
+        return (!body.is_empty()).then_some(body);
+    }
+    let url = format!(
+        "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/{DUMP_REV}/smashline/lua2cpp_{fighter}/{agent}/{script}.txt"
+    );
+    let response = HTTP.get(&url).send().ok()?;
+    let body = if response.status().is_success() {
+        script_source_from_body(&response.text().ok()?)
+    } else {
+        String::new()
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &body);
+    (!body.is_empty()).then_some(body)
+}
+
 pub fn parse_acmd_script(source: &str) -> AcmdScript {
     let game_fn = extract_function(source, "game_");
     // A body with no function header at all is a live capture or a paste, and is read whole —

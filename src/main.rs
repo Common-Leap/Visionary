@@ -4,6 +4,7 @@ mod acmd_src;
 mod acmd_verify;
 mod app;
 mod app_icon;
+mod article_preview;
 mod asset_snapshots;
 mod capture_hitbox;
 mod carrier_motion;

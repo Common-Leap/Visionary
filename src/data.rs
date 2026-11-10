@@ -5154,6 +5154,12 @@ impl AcmdScript {
         acc
     }
 
+    /// Objects the move creates (true) or removes (false), as (script frame, article symbol,
+    /// created), in running order.
+    pub fn to_article_spawns(&self) -> Vec<(u32, String, bool)> {
+        self.walk().article_spawns
+    }
+
     /// Flatten the script into display hitboxes with computed frame ranges.
     pub fn to_hitboxes(&self) -> Vec<Hitbox> {
         let mut hitboxes: Vec<Hitbox> = Vec::new();
@@ -6508,6 +6514,8 @@ struct WalkAccum {
     work_flags: Vec<WorkFlagEvent>,
     work_transition_terms: Vec<WorkTransitionTermEvent>,
     work_module_inc_ints: Vec<WorkModuleIncIntEvent>,
+    /// Objects the move creates (true) or removes (false): (script frame, symbol, created).
+    article_spawns: Vec<(u32, String, bool)>,
     work_module_sets: Vec<WorkModuleSetEvent>,
     /// Next site per [`SiteFamily`], each family numbered independently.
     ///
@@ -6999,8 +7007,21 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         | ExcuteStmt::AttackModuleAddReactionFrame { .. }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
         | ExcuteStmt::GrabRebound { .. } => {}
-        // Article creation/removal stays in source. The flat live move protocol has no safe
-        // ordering/ownership representation for native article lifecycle changes.
+        ExcuteStmt::ArticleLifecycle(
+            ArticleLifecycleCall::Generate { symbol }
+            | ArticleLifecycleCall::GenerateEnabled { symbol },
+        ) => hurt.article_spawns.push((
+            script_frame(frame),
+            symbol.trim_start_matches('*').to_owned(),
+            true,
+        )),
+        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::RemoveAll { symbol }) => {
+            hurt.article_spawns.push((
+                script_frame(frame),
+                symbol.trim_start_matches('*').to_owned(),
+                false,
+            ))
+        }
         ExcuteStmt::ArticleLifecycle(_)
         | ExcuteStmt::GimmickEvent { .. }
         | ExcuteStmt::GimmickChartEvent { .. }

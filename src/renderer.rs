@@ -98,6 +98,8 @@ pub struct HitboxRenderState {
     last_anim_path: Option<std::path::PathBuf>,
     last_default_anim_path: Option<std::path::PathBuf>,
     last_skel_path: Option<std::path::PathBuf>,
+    /// Model folder of each object model after the body in `render_models`.
+    object_dirs: Vec<std::path::PathBuf>,
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
@@ -142,6 +144,7 @@ impl HitboxRenderState {
             last_anim_path: None,
             last_default_anim_path: None,
             last_skel_path: None,
+            object_dirs: Vec::new(),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
         }
@@ -161,6 +164,7 @@ impl HitboxRenderState {
 
     pub fn load_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model_dir: &Path) {
         self.render_models.clear();
+        self.object_dirs.clear();
         self.weapon_skels.clear();
         if !model_dir.exists() {
             eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
@@ -261,7 +265,8 @@ impl HitboxRenderState {
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         let skel = self.cached_skel.as_ref().map(|(_, s)| s);
 
-        for render_model in &mut self.render_models {
+        // Only the body; object models after it are animated in `update_objects`.
+        if let Some(render_model) = self.render_models.first_mut() {
             // RenderModel applies animations in iterator order. Put the default eyelid layer
             // first so a selected move's visibility tracks take precedence over the baseline.
             let animations = animation_layers(
@@ -305,6 +310,51 @@ impl HitboxRenderState {
     pub fn update_camera(&mut self, queue: &wgpu::Queue, width: f32, height: f32) {
         let transforms = self.camera.transforms(width, height);
         self.renderer.update_camera(queue, transforms);
+    }
+
+    /// Shows the objects out this frame after the body model, loading each model once.
+    fn update_objects(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        objects: &[ObjectDraw],
+    ) {
+        if self.render_models.is_empty() {
+            return;
+        }
+        for (index, object) in objects.iter().enumerate() {
+            if self.object_dirs.get(index) != Some(&object.model_dir) {
+                let folder = ModelFolder::load_folder(&object.model_dir);
+                let model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+                if index < self.object_dirs.len() {
+                    self.render_models[index + 1] = model;
+                    self.object_dirs[index] = object.model_dir.clone();
+                } else {
+                    self.render_models.push(model);
+                    self.object_dirs.push(object.model_dir.clone());
+                }
+            }
+            let model = &mut self.render_models[index + 1];
+            model.is_visible = true;
+            let layers: Vec<&ssbh_data::anim_data::AnimData> = object
+                .anim
+                .as_deref()
+                .into_iter()
+                .chain(std::iter::once(&object.placement))
+                .collect();
+            model.apply_anims(
+                queue,
+                layers.iter().copied(),
+                Some(&object.skel),
+                None,
+                None,
+                &self.shared_data,
+                object.frame,
+            );
+        }
+        for model in self.render_models.iter_mut().skip(objects.len() + 1) {
+            model.is_visible = false;
+        }
     }
 
     pub fn weapon_skel_count(&self) -> usize {
@@ -694,6 +744,18 @@ pub struct ViewportCallback {
     /// Optional default eyelid visibility baseline for the selected fighter/costume.
     pub default_anim_path: Option<std::path::PathBuf>,
     pub skel_path: Option<std::path::PathBuf>,
+    /// Fighter objects out this frame.
+    pub objects: Vec<ObjectDraw>,
+}
+
+/// One object model to draw, already animated and placed.
+pub struct ObjectDraw {
+    pub model_dir: std::path::PathBuf,
+    pub skel: std::sync::Arc<ssbh_data::skel_data::SkelData>,
+    pub anim: Option<std::sync::Arc<ssbh_data::anim_data::AnimData>>,
+    pub frame: f32,
+    /// Puts the root bone in the world; layered over `anim`.
+    pub placement: ssbh_data::anim_data::AnimData,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -742,6 +804,8 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_default_anim_path = self.default_anim_path.clone();
                 state.last_skel_path = self.skel_path.clone();
             }
+
+            state.update_objects(device, queue, &self.objects);
 
             // Always re-render (camera may have changed, or egui needs a fresh frame)
             state.renderer.begin_render_models(

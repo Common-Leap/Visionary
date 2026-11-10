@@ -1,0 +1,641 @@
+//! Fighter objects (projectiles and other articles) in the 3D preview: which ones a move
+//! spawns, where they appear, how they fly, and the hitboxes their own scripts make.
+//!
+//! The game moves an object with its own status code, which is not in the scripts. The flight
+//! here is read from the object's parameters (speed, angle, gravity, life, bounces), so it is
+//! close to the game for straight shots and lobbed ones, and only a guide for anything that
+//! homes, steers or sticks.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ssbh_data::anim_data::AnimData;
+use ssbh_data::skel_data::SkelData;
+
+/// How an object moves after it is spawned, from the fighter's parameter file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Flight {
+    /// Frames before it disappears.
+    pub life: f32,
+    /// Distance per frame along `angle`.
+    pub speed: f32,
+    /// Degrees above forward; negative aims down.
+    pub angle: f32,
+    /// Downward speed gained per frame.
+    pub gravity: f32,
+    /// Upward speed after touching the ground, for objects that bounce.
+    pub bounce: Option<f32>,
+    /// How far in front of the fighter it starts.
+    pub start_ahead: f32,
+}
+
+impl Default for Flight {
+    fn default() -> Self {
+        Self {
+            life: 60.0,
+            speed: 0.0,
+            angle: 0.0,
+            gravity: 0.0,
+            bounce: None,
+            start_ahead: 0.0,
+        }
+    }
+}
+
+impl Flight {
+    /// Offset from the spawn point after `frames`, as (forward, up). The ground is at
+    /// `-start_height`, so a bouncing object turns back up there.
+    pub fn offset(&self, frames: f32, start_height: f32) -> (f32, f32) {
+        let radians = self.angle.to_radians();
+        let (mut forward, mut up) = (self.start_ahead, 0.0);
+        let (step_forward, mut step_up) = (self.speed * radians.cos(), self.speed * radians.sin());
+        let whole = frames.max(0.0).floor() as usize;
+        for _ in 0..whole {
+            forward += step_forward;
+            up += step_up;
+            step_up -= self.gravity;
+            if up < -start_height {
+                match self.bounce {
+                    Some(bounce) => {
+                        up = -start_height;
+                        step_up = bounce;
+                    }
+                    None => up = -start_height,
+                }
+            }
+        }
+        let part = frames.max(0.0) - whole as f32;
+        (forward + step_forward * part, up + step_up * part)
+    }
+}
+
+/// Everything needed to show one kind of object.
+pub struct ObjectKind {
+    /// "fireball", from `FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL`.
+    pub name: String,
+    /// Objects drawn only with effects (Samus's charge shot) have no model.
+    pub model_dir: Option<PathBuf>,
+    pub skel: Option<Arc<SkelData>>,
+    pub anim: Option<Arc<AnimData>>,
+    /// Hitboxes from the object's own script, with frames counted from its spawn.
+    pub hitboxes: Vec<crate::data::Hitbox>,
+    /// Effects from the object's own script; for many projectiles they are all you see.
+    pub effects: Vec<ObjectEffect>,
+    pub flight: Flight,
+}
+
+/// An effect an object's script shows, on one of its bones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectEffect {
+    pub name: String,
+    pub bone: String,
+    pub offset: [f32; 3],
+    pub scale: f32,
+    /// Script frames it is shown, counted from the object's spawn.
+    pub start: u32,
+    pub end: u32,
+}
+
+/// The effects in an object's script. Objects often pick an effect by facing, which the
+/// effect parser leaves out, so this reads the effect lines themselves and keeps the first of
+/// each pair.
+fn object_effects(body: &str) -> Vec<ObjectEffect> {
+    let parsed = crate::acmd::parse_effect_script(body).to_effect_calls();
+    if !parsed.is_empty() {
+        return parsed
+            .into_iter()
+            .map(|call| ObjectEffect {
+                name: call.effect_name,
+                bone: call.bone_name,
+                offset: call.offset,
+                scale: call.scale,
+                start: call.active_start,
+                end: if call.follows_bone {
+                    u32::MAX
+                } else {
+                    call.active_end
+                },
+            })
+            .collect();
+    }
+    let Some(start) = body.find("fn effect_") else {
+        return Vec::new();
+    };
+    let section = &body[start..];
+    let section = &section[..section[1..]
+        .find("unsafe extern")
+        .map_or(section.len(), |end| end + 1)];
+    let mut frame = 0.0f32;
+    let mut effects: Vec<ObjectEffect> = Vec::new();
+    for line in section.lines().map(str::trim) {
+        let number = |text: &str| {
+            text.rsplit(',').next().and_then(|value| {
+                value
+                    .trim()
+                    .trim_end_matches(");")
+                    .trim()
+                    .parse::<f32>()
+                    .ok()
+            })
+        };
+        if line.starts_with("frame(") {
+            frame = number(line).unwrap_or(frame);
+        } else if line.starts_with("wait(") {
+            frame += number(line).unwrap_or(0.0);
+        } else if line.contains("EFFECT") && line.contains("Hash40::new(\"") {
+            let names: Vec<&str> = line
+                .split("Hash40::new(\"")
+                .skip(1)
+                .filter_map(|part| part.split('"').next())
+                .collect();
+            let (Some(name), Some(bone)) = (names.first(), names.get(1)) else {
+                continue;
+            };
+            let after = line.rsplit("\")").next().unwrap_or_default();
+            let numbers: Vec<f32> = after
+                .split(',')
+                .filter_map(|value| value.trim().trim_end_matches(");").parse().ok())
+                .collect();
+            let start = frame.max(1.0) as u32;
+            if effects
+                .iter()
+                .any(|effect| effect.start == start && effect.bone == *bone)
+            {
+                continue;
+            }
+            effects.push(ObjectEffect {
+                name: (*name).to_owned(),
+                bone: (*bone).to_owned(),
+                offset: [
+                    numbers.first().copied().unwrap_or(0.0),
+                    numbers.get(1).copied().unwrap_or(0.0),
+                    numbers.get(2).copied().unwrap_or(0.0),
+                ],
+                scale: numbers.get(6).copied().unwrap_or(1.0),
+                start,
+                end: if line.contains("FOLLOW") {
+                    u32::MAX
+                } else {
+                    start
+                },
+            });
+        }
+    }
+    effects
+}
+
+/// One object out at the current frame, placed in the world.
+pub struct PlacedObject {
+    pub kind: Arc<ObjectKind>,
+    /// Frames since it was spawned, from 0.
+    pub age: f32,
+    /// Object space to world space.
+    pub placement: glam::Mat4,
+}
+
+/// "FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL" becomes "fireball".
+pub fn article_name(symbol: &str) -> Option<String> {
+    symbol
+        .trim_start_matches('*')
+        .split_once("_GENERATE_ARTICLE_")
+        .map(|(_, name)| name.to_ascii_lowercase())
+}
+
+/// Reads one object's flight from its parameter block, `param_<name>`.
+pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, String>) -> Flight {
+    let mut flight = Flight::default();
+    let Ok(param) = prc::open(param_path) else {
+        return flight;
+    };
+    let wanted = format!("param_{name}");
+    let block = param.0.iter().find_map(|(hash, value)| {
+        let label = labels.get(&hash.0)?;
+        (label == &wanted || label.trim_end_matches('s') == wanted).then_some(value)
+    });
+    let fields = match block {
+        Some(prc::ParamKind::Struct(fields)) => fields,
+        Some(prc::ParamKind::List(list)) => match list.0.first() {
+            Some(prc::ParamKind::Struct(fields)) => fields,
+            _ => return flight,
+        },
+        _ => return flight,
+    };
+    let values: HashMap<&str, f32> = fields
+        .0
+        .iter()
+        .filter_map(|(hash, value)| {
+            let label = labels.get(&hash.0)?;
+            let number = match value {
+                prc::ParamKind::Float(value) => *value,
+                prc::ParamKind::I32(value) => *value as f32,
+                prc::ParamKind::U32(value) => *value as f32,
+                prc::ParamKind::I16(value) => *value as f32,
+                prc::ParamKind::U16(value) => *value as f32,
+                prc::ParamKind::I8(value) => *value as f32,
+                prc::ParamKind::U8(value) => *value as f32,
+                _ => return None,
+            };
+            Some((label.trim_end_matches('_'), number))
+        })
+        .collect();
+    let first = |names: &[&str]| names.iter().find_map(|name| values.get(name).copied());
+    if let Some(life) = first(&["life", "life_frame", "max_life"]).filter(|life| *life > 0.0) {
+        flight.life = life;
+    }
+    if let Some(speed) = first(&[
+        "speed",
+        "speed_x",
+        "init_speed",
+        "start_speed",
+        "speed_min",
+        "min_speed",
+        "speed_max",
+        "max_speed",
+    ]) {
+        flight.speed = speed.abs();
+    }
+    if let Some(angle) = first(&["angle", "shoot_angle", "start_angle"]) {
+        // A few objects store the angle in radians.
+        flight.angle = if angle.abs() < std::f32::consts::PI && angle.fract() != 0.0 {
+            angle.to_degrees()
+        } else {
+            angle
+        };
+    }
+    if let Some(gravity) = first(&["gravity_accel", "accel_y", "gravity", "fall_accel"]) {
+        flight.gravity = gravity.abs();
+    }
+    if let Some(ahead) = first(&["base_offset_x", "offset_x"]) {
+        flight.start_ahead = ahead;
+    }
+    if values.contains_key("bound_count_max") {
+        flight.bounce = first(&["bounded_speed_y_min", "bound_speed_y"]).or(Some(flight.speed));
+    }
+    flight
+}
+
+/// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
+/// one of the object's game scripts by name ("Regular"), or nothing.
+pub fn load_kind(
+    fighter_dir: &Path,
+    param_path: &Path,
+    slot: u8,
+    name: &str,
+    labels: &HashMap<u64, String>,
+    script: &dyn Fn(&str) -> Option<String>,
+) -> Option<ObjectKind> {
+    let skel_path = crate::data::find_part_skel(&fighter_dir.join("model").join(name), slot);
+    let model_dir = skel_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
+    let skel = skel_path.and_then(|path| SkelData::from_file(path).ok());
+    let motion_dir = costume_dir(&fighter_dir.join("motion").join(name), slot);
+    // The object plays the first motion in its list that has a script, "regular" first.
+    let mut motions: Vec<(String, Option<PathBuf>)> = Vec::new();
+    if let Some(dir) = &motion_dir {
+        let files: HashMap<u64, PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "nuanmb"))
+            .filter_map(|path| {
+                let file = path.file_name()?.to_str()?.to_owned();
+                Some((hash40::hash40(&file).0, path))
+            })
+            .collect();
+        if let Ok(list) = motion_lib::open(dir.join("motion_list.bin")) {
+            for (kind, motion) in list.list.iter() {
+                let Some(label) = labels.get(&kind.0) else {
+                    continue;
+                };
+                let anim = motion
+                    .animations
+                    .iter()
+                    .find_map(|animation| files.get(&animation.name.0).cloned());
+                motions.push((label.clone(), anim));
+            }
+        }
+        if motions.is_empty() {
+            motions.extend(
+                files
+                    .into_values()
+                    .take(1)
+                    .map(|path| (String::new(), Some(path))),
+            );
+        }
+    }
+    motions.sort_by_key(|(label, _)| label != "regular");
+    let mut chosen = motions.first().cloned();
+    let mut hitboxes = Vec::new();
+    let mut effects = Vec::new();
+    for (label, anim) in &motions {
+        if label.is_empty() {
+            continue;
+        }
+        let Some(body) = script(&pascal(label)) else {
+            continue;
+        };
+        let found = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        let shown = object_effects(&body);
+        if !found.is_empty() || !shown.is_empty() {
+            hitboxes = found;
+            effects = shown;
+            chosen = Some((label.clone(), anim.clone()));
+            if !hitboxes.is_empty() {
+                break;
+            }
+        }
+    }
+    let anim = chosen
+        .and_then(|(_, path)| path)
+        .and_then(|path| AnimData::from_file(path).ok())
+        .map(Arc::new);
+    let flight = flight_from_params(param_path, name, labels);
+    if skel.is_none() && hitboxes.is_empty() && effects.is_empty() && flight.speed == 0.0 {
+        return None;
+    }
+    Some(ObjectKind {
+        name: name.to_owned(),
+        model_dir,
+        skel: skel.map(Arc::new),
+        anim,
+        hitboxes,
+        effects,
+        flight,
+    })
+}
+
+/// `part/cNN` for the slot, or the part's first costume folder.
+fn costume_dir(part: &Path, slot: u8) -> Option<PathBuf> {
+    let preferred = part.join(format!("c{slot:02}"));
+    if preferred.is_dir() {
+        return Some(preferred);
+    }
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(part)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter().next()
+}
+
+/// "special_n_bound" becomes "SpecialNBound", the dump's script file name.
+fn pascal(motion: &str) -> String {
+    motion
+        .split('_')
+        .map(|part| {
+            let mut letters = part.chars();
+            letters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(letters).collect()
+            })
+        })
+        .collect()
+}
+
+/// Objects that don't fly but are held, by name: they ride the fighter's hand.
+fn held(name: &str) -> bool {
+    [
+        "gun", "blaster", "hammer", "sword", "weapon", "kassar", "umbrella", "bat", "club", "bow",
+        "fan", "racket", "pan", "staff", "tome", "book",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
+}
+
+/// The bone an object that doesn't fly rides on.
+fn ride_bone(bones: &HashMap<String, glam::Mat4>, name: &str) -> glam::Mat4 {
+    let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
+    if held(name) {
+        for bone in ["haver", "havel"] {
+            if let Some(matrix) = bones.get(bone) {
+                return *matrix;
+            }
+        }
+    }
+    let (_, rotation, position) = top.to_scale_rotation_translation();
+    glam::Mat4::from_rotation_translation(rotation, position)
+}
+
+/// Where the object starts: the fighter's hand for things that fly, its centre otherwise.
+fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool) -> glam::Vec3 {
+    let top = bones
+        .get("top")
+        .map_or(glam::Vec3::ZERO, |matrix| matrix.col(3).truncate());
+    if flies {
+        for bone in ["haver", "havel", "handr", "handl"] {
+            if let Some(matrix) = bones.get(bone) {
+                return matrix.col(3).truncate();
+            }
+        }
+        return top + glam::Vec3::Y * 8.0;
+    }
+    top
+}
+
+/// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
+/// matrices at a game frame.
+pub fn place(
+    spawns: &[(u32, Arc<ObjectKind>, Option<u32>)],
+    frame: f32,
+    bones_at: &dyn Fn(f32) -> HashMap<String, glam::Mat4>,
+) -> Vec<PlacedObject> {
+    let mut placed = Vec::new();
+    for (spawned, kind, removed) in spawns {
+        let age = frame - *spawned as f32;
+        if age < 0.0 || removed.is_some_and(|removed| frame >= removed as f32) {
+            continue;
+        }
+        // Something that doesn't fly rides the fighter until the move removes it.
+        if kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0 {
+            placed.push(PlacedObject {
+                kind: kind.clone(),
+                age,
+                placement: ride_bone(&bones_at(frame), &kind.name),
+            });
+            continue;
+        }
+        if age > kind.flight.life {
+            continue;
+        }
+        let bones = bones_at(*spawned as f32);
+        let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
+        let (_, rotation, top_position) = top.to_scale_rotation_translation();
+        let mut forward = top.z_axis.truncate();
+        forward.y = 0.0;
+        let forward = forward.try_normalize().unwrap_or(glam::Vec3::Z);
+        let start = spawn_point(&bones, kind.flight.speed > 0.0);
+        let (ahead, up) = kind.flight.offset(age, start.y - top_position.y);
+        let position = start + forward * ahead + glam::Vec3::Y * up;
+        placed.push(PlacedObject {
+            kind: kind.clone(),
+            age,
+            placement: glam::Mat4::from_rotation_translation(rotation, position),
+        });
+    }
+    placed
+}
+
+/// An object's bones in the world at its age.
+pub fn object_bones(object: &PlacedObject) -> HashMap<String, glam::Mat4> {
+    let Some(skel) = &object.kind.skel else {
+        return HashMap::from([("top".to_owned(), object.placement)]);
+    };
+    crate::renderer::compute_bone_world_matrices(skel, object.kind.anim.as_deref(), &[], object.age)
+        .into_iter()
+        .map(|(name, matrix)| (name, object.placement * matrix))
+        .collect()
+}
+
+/// A one-key animation that puts the object's root bone where `placement` says, on top of
+/// the object's own animation for that frame.
+pub fn placement_layer(object: &PlacedObject) -> Option<AnimData> {
+    use ssbh_data::anim_data::{GroupData, GroupType, NodeData, TrackData, TrackValues, Transform};
+    let skel = object.kind.skel.as_ref()?;
+    let root = skel.bones.iter().find(|bone| bone.parent_index.is_none())?;
+    let local = crate::renderer::compute_bone_world_matrices(
+        skel,
+        object.kind.anim.as_deref(),
+        &[],
+        object.age,
+    )
+    .get(&root.name)
+    .copied()
+    .unwrap_or_else(|| glam::Mat4::from_cols_array_2d(&root.transform));
+    let (scale, rotation, translation) = (object.placement * local).to_scale_rotation_translation();
+    Some(AnimData {
+        major_version: 2,
+        minor_version: 0,
+        final_frame_index: 0.0,
+        groups: vec![GroupData {
+            group_type: GroupType::Transform,
+            nodes: vec![NodeData {
+                name: root.name.clone(),
+                tracks: vec![TrackData {
+                    name: "Transform".into(),
+                    compensate_scale: false,
+                    transform_flags: Default::default(),
+                    values: TrackValues::Transform(vec![Transform {
+                        scale: ssbh_data::Vector3::new(scale.x, scale.y, scale.z),
+                        rotation: ssbh_data::Vector4::new(
+                            rotation.x, rotation.y, rotation.z, rotation.w,
+                        ),
+                        translation: ssbh_data::Vector3::new(
+                            translation.x,
+                            translation.y,
+                            translation.z,
+                        ),
+                    }]),
+                }],
+            }],
+        }],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn article_names_come_from_the_symbol() {
+        assert_eq!(
+            article_name("*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL").as_deref(),
+            Some("fireball")
+        );
+        assert_eq!(article_name("FIGHTER_MARIO_STATUS_KIND_X"), None);
+    }
+
+    #[test]
+    fn a_lobbed_object_falls_and_bounces_off_the_ground() {
+        let flight = Flight {
+            life: 70.0,
+            speed: 1.4,
+            angle: -10.0,
+            gravity: 0.1,
+            bounce: Some(1.4),
+            ..Flight::default()
+        };
+        let (ahead, up) = flight.offset(10.0, 8.0);
+        assert!(ahead > 13.0 && ahead < 14.0, "{ahead}");
+        assert!(up < 0.0 && up >= -8.0, "{up}");
+        // Long after it would have fallen through, it is still at or above the ground.
+        let lowest = (0..70)
+            .map(|frame| flight.offset(frame as f32, 8.0).1)
+            .fold(f32::INFINITY, f32::min);
+        assert!(lowest >= -8.0, "{lowest}");
+        let straight = Flight {
+            speed: 2.0,
+            ..Flight::default()
+        };
+        assert_eq!(straight.offset(5.0, 8.0), (10.0, 0.0));
+    }
+
+    #[test]
+    fn script_names_are_pascal_case() {
+        assert_eq!(pascal("regular"), "Regular");
+        assert_eq!(pascal("special_n_bound"), "SpecialNBound");
+    }
+
+    /// Reads real objects from the extracted game files.
+    #[test]
+    fn real_objects_load_with_flight_and_hitboxes() {
+        let (Some(root), Some(dump)) = (
+            std::env::var_os("VISIONARY_DATA_ROOT"),
+            std::env::var_os("VISIONARY_SCRIPT_DUMP"),
+        ) else {
+            return;
+        };
+        let labels = crate::param_labels::parse_csv(
+            &std::fs::read_to_string(
+                crate::scratch_dirs::app_storage_root().join("ParamLabels.csv"),
+            )
+            .unwrap_or_default(),
+        );
+        for (fighter, name) in [
+            ("mario", "fireball"),
+            ("samus", "cshot"),
+            ("link", "bowarrow"),
+            ("fox", "blaster_bullet"),
+        ] {
+            let fighter_dir = Path::new(&root).join("fighter").join(fighter);
+            let dump = Path::new(&dump).join(format!("lua2cpp_{fighter}/{fighter}_{name}"));
+            let kind = load_kind(
+                &fighter_dir,
+                &fighter_dir.join("param/vl.prc"),
+                0,
+                name,
+                &labels,
+                &|script| std::fs::read_to_string(dump.join(format!("{script}.txt"))).ok(),
+            )
+            .unwrap_or_else(|| panic!("{fighter} {name} did not load"));
+            println!(
+                "{fighter} {name}: {:?}, {} hitboxes, effects {:?}",
+                kind.flight,
+                kind.hitboxes.len(),
+                kind.effects
+            );
+            if name == "fireball" {
+                assert_eq!(kind.effects.len(), 1, "one of the facing pair");
+                assert_eq!(kind.effects[0].bone, "rot");
+            }
+            assert!(
+                kind.flight.speed > 0.0 || name == "blaster_bullet",
+                "{fighter} {name}"
+            );
+            assert!(!kind.hitboxes.is_empty(), "{fighter} {name}");
+            assert_eq!(
+                kind.model_dir.is_some(),
+                kind.skel.is_some(),
+                "{fighter} {name}"
+            );
+            assert!(
+                kind.anim.is_none() || kind.skel.is_some(),
+                "{fighter} {name}"
+            );
+        }
+    }
+}

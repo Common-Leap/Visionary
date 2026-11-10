@@ -3241,6 +3241,11 @@ pub struct VisionaryApp {
     pending_history_action: Option<HistoryAction>,
     // Current model/anim paths for the viewport callback
     current_model_dir: Option<PathBuf>,
+    /// Fighter objects for the preview by "fighter/object"; `None` when one can't be shown.
+    object_kinds: HashMap<String, Option<std::sync::Arc<crate::article_preview::ObjectKind>>>,
+    object_loads:
+        Vec<std::sync::mpsc::Receiver<(String, Option<crate::article_preview::ObjectKind>)>>,
+    object_pending: std::collections::HashSet<String>,
     current_anim_path: Option<PathBuf>,
     /// Visibility-only baseline applied before the selected move animation. Smash models ship
     /// with many mutually-exclusive facial meshes visible in their raw model state; this
@@ -3752,6 +3757,9 @@ impl VisionaryApp {
             history_suppress_frame: false,
             pending_history_action: None,
             current_model_dir: None,
+            object_kinds: HashMap::new(),
+            object_loads: Vec::new(),
+            object_pending: std::collections::HashSet::new(),
             current_anim_path: None,
             current_default_eyelid_path: None,
             current_skel_path: None,
@@ -8343,6 +8351,94 @@ impl VisionaryApp {
     }
 
     /// The 3D character preview with its hitbox overlays, shared by both editor layouts.
+    /// The selected move's objects that are out at the current frame, loading any not seen yet.
+    fn preview_objects(
+        &mut self,
+        frame: &eframe::Frame,
+    ) -> Vec<crate::article_preview::PlacedObject> {
+        self.object_loads.retain(|rx| match rx.try_recv() {
+            Ok((key, kind)) => {
+                self.object_pending.remove(&key);
+                self.object_kinds.insert(key, kind.map(std::sync::Arc::new));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        let mut spawns: Vec<(
+            u32,
+            std::sync::Arc<crate::article_preview::ObjectKind>,
+            Option<u32>,
+        )> = Vec::new();
+        // Objects are spawned from any of the move's scripts; Fox draws his blaster in the
+        // expression script.
+        let mut events = self.state.script.to_article_spawns();
+        events.extend(self.state.expression_script.to_article_spawns());
+        events.extend(self.state.sound_script.to_article_spawns());
+        events.sort_by_key(|(frame, ..)| *frame);
+        for (spawned, symbol, created) in &events {
+            if !created {
+                continue;
+            }
+            let spawned = *spawned;
+            // The first removal of this object after it appears.
+            let removed = events
+                .iter()
+                .find(|(at, other, created)| !created && other == symbol && *at > spawned)
+                .map(|(at, ..)| *at);
+            let Some(name) = crate::article_preview::article_name(symbol) else {
+                continue;
+            };
+            let key = format!("{}/{name}", fighter.name);
+            match self.object_kinds.get(&key) {
+                Some(Some(kind)) => spawns.push((spawned, kind.clone(), removed)),
+                Some(None) => {}
+                None if self.object_pending.insert(key.clone()) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.object_loads.push(rx);
+                    let labels = self.state.labels.clone();
+                    let fighter = fighter.clone();
+                    std::thread::spawn(move || {
+                        let agent = format!("{}_{name}", fighter.name);
+                        let kind = crate::article_preview::load_kind(
+                            &fighter.fighter_dir,
+                            &fighter.param_path,
+                            fighter.base_slot(),
+                            &name,
+                            &labels,
+                            &|script| {
+                                crate::acmd::fetch_object_script(&fighter.name, &agent, script)
+                            },
+                        );
+                        let _ = tx.send((key, kind));
+                    });
+                }
+                None => {}
+            }
+        }
+        if spawns.is_empty() {
+            return Vec::new();
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return Vec::new();
+        };
+        let renderer = wgpu_state.renderer.read();
+        let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
+            return Vec::new();
+        };
+        crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
+            rs.bone_world_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
+        })
+    }
+
     fn draw_viewport(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
@@ -8375,7 +8471,11 @@ impl VisionaryApp {
                 }
             }
 
-            // Paint the animated character. Circle overlays are drawn below by egui.
+            // Paint the animated character and its objects. Circle overlays are drawn below by egui.
+            let objects = self.preview_objects(frame);
+            if !self.object_loads.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
@@ -8386,6 +8486,18 @@ impl VisionaryApp {
                     anim_path: self.current_anim_path.clone(),
                     default_anim_path: self.current_default_eyelid_path.clone(),
                     skel_path: self.current_skel_path.clone(),
+                    objects: objects
+                        .iter()
+                        .filter_map(|object| {
+                            Some(crate::renderer::ObjectDraw {
+                                model_dir: object.kind.model_dir.clone()?,
+                                skel: object.kind.skel.clone()?,
+                                anim: object.kind.anim.clone(),
+                                frame: object.age,
+                                placement: crate::article_preview::placement_layer(object)?,
+                            })
+                        })
+                        .collect(),
                 },
             );
             ui.painter().add(callback);
@@ -8540,6 +8652,118 @@ impl VisionaryApp {
                                     );
                                 }
                             }
+                        }
+                    }
+
+                    // Each object's own hitboxes, on the object's bones.
+                    for object in &objects {
+                        let bones = crate::article_preview::object_bones(object);
+                        let (_, facing, _) = object.placement.to_scale_rotation_translation();
+                        let object_frame = object.age.floor() as u32 + 1;
+                        let mut label_at = None;
+                        for hb in &object.kind.hitboxes {
+                            if hb.category == crate::data::CAT_ABS
+                                || hb.category == crate::data::CAT_ATTACK_FP
+                                || !(hb.active_frames_empty()
+                                    || (object_frame >= hb.active_start
+                                        && object_frame <= hb.active_end))
+                            {
+                                continue;
+                            }
+                            let bone = bones
+                                .get(&hb.bone_name)
+                                .or_else(|| bones.get(&hb.bone_name.to_lowercase()))
+                                .or_else(|| bones.get("top"))
+                                .copied()
+                                .unwrap_or(object.placement);
+                            let bone = if is_system_bone(&hb.bone_name)
+                                || !bones.contains_key(&hb.bone_name)
+                            {
+                                glam::Mat4::from_rotation_translation(
+                                    facing,
+                                    bone.col(3).truncate(),
+                                )
+                            } else {
+                                bone
+                            };
+                            let start = bone.transform_point3(glam::Vec3::new(
+                                hb.offset_x,
+                                hb.offset_y,
+                                hb.offset_z,
+                            ));
+                            let end = hb
+                                .capsule_end
+                                .map(|[x, y, z]| bone.transform_point3(glam::Vec3::new(x, y, z)));
+                            let (stroke, fill) =
+                                hitbox_viewport_style(hitbox_display_color(hb), false);
+                            label_at = draw_projected_capsule(
+                                ui.painter(),
+                                rs,
+                                rect,
+                                ProjectedCapsule {
+                                    world_start: start,
+                                    world_end: end,
+                                    world_radius: hb.size,
+                                    stroke,
+                                    fill,
+                                },
+                            )
+                            .or(label_at);
+                        }
+                        for effect in &object.kind.effects {
+                            // A one-shot effect is shown for a few frames so it can be seen.
+                            let end = if effect.end == effect.start {
+                                effect.start + 8
+                            } else {
+                                effect.end
+                            };
+                            if object_frame < effect.start || object_frame > end {
+                                continue;
+                            }
+                            let bone = bones
+                                .get(&effect.bone)
+                                .or_else(|| bones.get(&effect.bone.to_lowercase()))
+                                .or_else(|| bones.get("top"))
+                                .copied()
+                                .unwrap_or(object.placement);
+                            let world = bone.transform_point3(glam::Vec3::from(effect.offset));
+                            let Some(at) = rs.world_to_screen(world, rect) else {
+                                continue;
+                            };
+                            let radius = rs
+                                .world_radius_to_screen(world, effect.scale.max(0.4), rect)
+                                .unwrap_or(effect.scale * 4.0)
+                                .clamp(5.0, 120.0);
+                            let blue = Color32::from_rgb(60, 130, 235);
+                            ui.painter().circle(
+                                at,
+                                radius,
+                                Color32::from_rgba_unmultiplied(60, 130, 235, 28),
+                                egui::Stroke::new(1.5, blue),
+                            );
+                            ui.painter().text(
+                                at + egui::vec2(radius + 3.0, radius * 0.5),
+                                egui::Align2::LEFT_CENTER,
+                                &effect.name,
+                                egui::FontId::monospace(9.0),
+                                blue,
+                            );
+                            label_at = label_at.or(Some(at));
+                        }
+                        let name_at = label_at.or_else(|| {
+                            rs.world_to_screen(object.placement.col(3).truncate(), rect)
+                        });
+                        if let Some(at) = name_at {
+                            ui.painter().text(
+                                at + egui::vec2(0.0, 14.0),
+                                egui::Align2::CENTER_TOP,
+                                crate::move_nodes::plain::object_name(&format!(
+                                    "X_GENERATE_ARTICLE_{}",
+                                    object.kind.name.to_uppercase()
+                                )),
+                                egui::FontId::proportional(11.0),
+                                Color32::from_rgb(255, 214, 120),
+                            );
                         }
                     }
 
