@@ -1205,7 +1205,7 @@ pub(super) fn effect_caption(command: &crate::data::EffectMacro) -> (&'static st
         EffectMacro::NativeCall(call) => (
             call.signature()
                 .map_or("Native call", |signature| signature.caption),
-            call.arguments.join(" · "),
+            super::plain::call_detail(&call.arguments),
         ),
         EffectMacro::Effect {
             effect_name,
@@ -1309,7 +1309,7 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
         ExcuteStmt::NativeCall(call) => (
             call.signature()
                 .map_or("Native call", |signature| signature.caption),
-            call.arguments.join(" · "),
+            super::plain::call_detail(&call.arguments),
         ),
         ExcuteStmt::GimmickChartEvent { chart_id, name } => {
             ("Send event", format!("{chart_id} · {name}"))

@@ -819,6 +819,60 @@ mod tests {
         }
     }
 
+    /// A block changed through its code reaches the match the way one changed in its fields
+    /// does: both compile to the same script, which is what the live hitbox rules come from.
+    #[test]
+    fn a_hitbox_edited_as_code_matches_the_same_edit_in_its_fields() {
+        let jab = "unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK(agent, 0, 0, Hash40::new(\"top\"), 3.0, 361, 25, 0, 20, 2.0, 0.0, 5.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);\n    }\n}\n";
+        let source = crate::acmd::parse_acmd_script(jab);
+        let unchanged = MoveGraph {
+            tracks: vec![crate::move_nodes::timeline::import_for_fighter(
+                "mario",
+                Track::Game,
+                &source,
+            )],
+            ..MoveGraph::default()
+        };
+        let block = unchanged.tracks[0]
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, NodeKind::Execute { .. }))
+            .unwrap()
+            .clone();
+        let code = crate::move_nodes::timeline::block_code("mario", &unchanged.tracks[0], &block);
+        assert!(code.contains("3.0, 361"), "{code}");
+        let mut by_code = unchanged.clone();
+        let mut replacement = crate::move_nodes::timeline::blocks_from_code(
+            "mario",
+            Track::Game,
+            &code.replace("3.0, 361", "9.0, 361"),
+        )
+        .unwrap();
+        replacement[0].id = block.id;
+        let nodes = &mut by_code.tracks[0].nodes;
+        let index = nodes.iter().position(|node| node.id == block.id).unwrap();
+        nodes.splice(index..=index, replacement);
+        let mut by_field = unchanged.clone();
+        for node in &mut by_field.tracks[0].nodes {
+            if let NodeKind::Execute { commands } = &mut node.kind {
+                for command in commands {
+                    if let crate::data::ExcuteStmt::Attack(attack) = command {
+                        attack.damage = 9.0;
+                    }
+                }
+            }
+        }
+        let script = |graph: &MoveGraph| {
+            let compiled =
+                crate::move_nodes::timeline::compile("mario", "attack11", graph).unwrap();
+            crate::acmd::preview_game_fn(&compiled[0].1, "attack11")
+        };
+        assert_ne!(script(&by_field), script(&unchanged));
+        assert_eq!(script(&by_code), script(&by_field));
+        let hitboxes = crate::acmd::parse_acmd_script(&script(&by_code)).to_hitboxes();
+        assert_eq!(hitboxes[0].damage, 9.0);
+    }
+
     #[test]
     fn a_removed_spawn_is_stopped_for_the_whole_move() {
         let mut graph = imported();

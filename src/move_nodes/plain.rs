@@ -1092,3 +1092,14 @@ pub fn error_words(error: &str) -> String {
         first.to_uppercase().chain(letters).collect()
     })
 }
+
+/// A game call's arguments for a card: the named ones (objects, animations, graphics). Plain
+/// flags and numbers mean little without the code, which Show code gives.
+pub fn call_detail(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .filter(|arg| arg.starts_with('*') || arg.contains("Hash40::new(\""))
+        .map(|arg| arg_words(arg))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
