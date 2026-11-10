@@ -68,6 +68,12 @@ pub fn fighter_kind_symbol(fighter: &str) -> Option<&'static str> {
         .map(|entry| entry.symbol)
 }
 
+pub fn weapon_kinds(fighter: &str) -> impl Iterator<Item = &'static WeaponKindEntry> + '_ {
+    generated::WEAPON_KINDS
+        .iter()
+        .filter(move |entry| entry.fighter == fighter)
+}
+
 pub fn weapon_kind(fighter: &str, group: &str) -> Option<&'static WeaponKindEntry> {
     generated::WEAPON_KINDS
         .iter()

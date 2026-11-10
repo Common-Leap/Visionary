@@ -110,6 +110,40 @@ pub fn object_op(
     Ok(())
 }
 
+/// Removes every live object of this kind the fighter owns, including ones it already let
+/// go of and the pieces it turns into (Sephiroth's Flare 1 becomes Flare 2), which the
+/// game's own article remove no longer reaches.
+pub fn remove_all(owner: u32, fighter: &str, symbol: &str) {
+    let Some(group) = symbol
+        .rsplit_once("_GENERATE_ARTICLE_")
+        .map(|(_, g)| g.to_ascii_lowercase())
+    else {
+        return;
+    };
+    let family = group.trim_end_matches(|c: char| c.is_ascii_digit());
+    let kinds: Vec<i32> = super::registry::weapon_kinds(fighter)
+        .filter(|entry| entry.group.starts_with(family))
+        .map(|entry| entry.value as i32)
+        .collect();
+    for rec in crate::slight::agents::all_records() {
+        if rec.category != 1
+            || !kinds.contains(&rec.kind)
+            || crate::slight::systems::article_notifier::weapon_owner_boid(rec.boid) != owner
+        {
+            continue;
+        }
+        let accessor = unsafe {
+            if sv_battle_object::is_null(rec.boid) || !sv_battle_object::is_active(rec.boid) {
+                continue;
+            }
+            sv_battle_object::module_accessor(rec.boid) as u64
+        };
+        if accessor != 0 {
+            queue(rec.boid, accessor, Pending::Remove("object remove"));
+        }
+    }
+}
+
 fn queue(weapon: u32, accessor: u64, op: Pending) {
     if let Some(mut queue) = ABSORBED.try_lock() {
         // A removal wins; a newer speed replaces an older one for the same weapon.

@@ -33677,6 +33677,44 @@ fn format_move_name(name: &str) -> String {
         _ => {}
     }
 
+    // Variants read as the move they belong to: "attack_hi4_hold" is "Up smash hold",
+    // "special_air_n" is "Neutral special air".
+    const PARTS: &[(&str, &str)] = &[
+        ("attack_s4", "forward smash"),
+        ("attack_hi4", "up smash"),
+        ("attack_lw4", "down smash"),
+        ("attack_s3", "forward tilt"),
+        ("attack_hi3", "up tilt"),
+        ("attack_lw3", "down tilt"),
+        ("attack_air_n", "neutral air"),
+        ("attack_air_f", "forward air"),
+        ("attack_air_b", "back air"),
+        ("attack_air_hi", "up air"),
+        ("attack_air_lw", "down air"),
+        ("attack_dash", "dash attack"),
+        ("attack_100", "rapid jab"),
+        ("special_air_n", "neutral special air"),
+        ("special_air_s", "side special air"),
+        ("special_air_hi", "up special air"),
+        ("special_air_lw", "down special air"),
+        ("special_n", "neutral special"),
+        ("special_s", "side special"),
+        ("special_hi", "up special"),
+        ("special_lw", "down special"),
+        ("final", "final smash"),
+    ];
+    let mut words = stripped.to_owned();
+    if let Some((part, plain)) = PARTS.iter().find(|(part, _)| stripped.starts_with(part)) {
+        words = format!("{plain}{}", &stripped[part.len()..]);
+    }
+    if PARTS.iter().any(|(part, _)| stripped.starts_with(part)) {
+        let words = words.replace('_', " ");
+        let mut letters = words.trim().chars();
+        return letters.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(letters).collect()
+        });
+    }
+
     stripped
         .replace('_', " ")
         .split_whitespace()
@@ -33697,6 +33735,11 @@ fn move_labels_use_familiar_names_and_preserve_unknown_fallbacks() {
     assert_eq!(format_move_name("attackairhi"), "Up air");
     assert_eq!(format_move_name("attack_11"), "Jab 1");
     assert_eq!(format_move_name("custom_motion"), "Custom Motion");
+    assert_eq!(format_move_name("attack_hi4_hold"), "Up smash hold");
+    assert_eq!(
+        format_move_name("special_air_n_start"),
+        "Neutral special air start"
+    );
 }
 
 // ── Mod project writer ────────────────────────────────────────────────────────

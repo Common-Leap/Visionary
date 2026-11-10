@@ -3720,13 +3720,7 @@ fn transition_permission_ui(
         .map_or("Not available for this fighter", |descriptor| {
             descriptor.label
         });
-    ui.label(super::plain::block_name(operation))
-        .on_hover_text(format!(
-            "{}({}, {})",
-            call.func(),
-            call.receiver.token(),
-            call.transition_term
-        ));
+    ui.label(super::plain::block_name(operation));
     if accepted {
         egui::ComboBox::from_id_salt("transition_permission")
             .width(220.0)
@@ -3737,12 +3731,11 @@ fn transition_permission_ui(
                         &mut call.transition_term,
                         descriptor.transition_term.into(),
                         descriptor.label,
-                    )
-                    .on_hover_text(descriptor.transition_term);
+                    );
                 }
             });
     } else {
-        ui.weak("Unsupported source · retained unchanged");
+        ui.weak("Kept as the game wrote it");
     }
     ui.weak("?").on_hover_text(
         "Changes native transition permission at this point in the Game track. The operation and fighter accessor stay fixed; choices are source-proven for this fighter. Permission does not force a status change or emit an event. No flat live native writes are sent.",
@@ -4757,16 +4750,16 @@ fn slow_opponent_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::
         return;
     }
     ui.horizontal_wrapped(|ui| {
-        number_field_ui(ui, "slow_mul", "Multiplier", &mut call.slow_mul, 0.1, Some(
-            "Native slow_mul argument. Editor range: 2–80, based on observed source values; not a documented engine limit.",
-        ));
-        number_field_ui(ui, "slow_time", "Time argument", &mut call.slow_time, 1.0, Some(
-            "Native slow_time argument. Editor range: 5–130. Its units are not established; this is not an authored timer.",
-        ));
+        number_field_ui(
+            ui,
+            "slow_mul",
+            "Times slower",
+            &mut call.slow_mul,
+            0.1,
+            None,
+        );
+        number_field_ui(ui, "slow_time", "Frames", &mut call.slow_time, 1.0, None);
     });
-    ui.weak("?").on_hover_text(
-        "Exports SLOW_OPPONENT(agent, multiplier, time argument). Frame and Wait connections schedule the call. ordinary live preview cannot publish this command.",
-    );
 }
 
 fn slow_whole_pair_label(multiplier: u8, frames: i32) -> String {

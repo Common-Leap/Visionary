@@ -281,6 +281,21 @@ pub unsafe fn run(lua_state: u64, boma: *mut Boma, command: &str, args: &[LuaArg
                 id,
                 smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL),
             );
+            use crate::slight::gimmicks::registry;
+            let fighter = registry::fighter_name(smash::app::utility::get_kind(&mut *boma));
+            if let Some(fighter) = fighter {
+                if let Some(symbol) = registry::symbol_for_value(
+                    fighter,
+                    registry::IdentifierKind::Article,
+                    id as u32,
+                ) {
+                    crate::slight::gimmicks::deflect_volume::remove_all(
+                        (*boma).battle_object_id,
+                        fighter,
+                        symbol,
+                    );
+                }
+            }
         }
         "article_visibility" => {
             let Some(id) = int(args.first()) else {
@@ -516,9 +531,18 @@ pub unsafe fn follow_cancels(boma: *mut Boma, symbols: &[u64]) {
             ),
             t if t == *FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ESCAPE => {
                 if ground {
+                    // Rolls forward and back are their own actions; a plain dodge is in place.
+                    let forward = pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ESCAPE_F]);
+                    let back = pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ESCAPE_B]);
                     (
-                        pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ESCAPE]),
-                        *FIGHTER_STATUS_KIND_ESCAPE,
+                        forward || back || pressed(&[*FIGHTER_PAD_CMD_CAT1_FLAG_ESCAPE]),
+                        if forward {
+                            *FIGHTER_STATUS_KIND_ESCAPE_F
+                        } else if back {
+                            *FIGHTER_STATUS_KIND_ESCAPE_B
+                        } else {
+                            *FIGHTER_STATUS_KIND_ESCAPE
+                        },
                     )
                 } else {
                     (
@@ -531,6 +555,7 @@ pub unsafe fn follow_cancels(boma: *mut Boma, symbols: &[u64]) {
         };
         if fire {
             StatusModule::change_status_request_from_script(boma, status, true);
+            crate::slight::diag::note(format!("cancel into status {status}"));
             return;
         }
     }

@@ -2,7 +2,6 @@
 //!
 //! The editor sends a removed call as a `CAT_DROP` rule keyed by the call's name. Each hook
 //! here skips the game's call while such a rule matches the acting move and frame.
-use super::{LuaArg, CAT_DROP};
 use smash::app::BattleObjectModuleAccessor as Boma;
 
 #[skyline::hook(replace = smash::app::lua_bind::AttackModule::set_size)]

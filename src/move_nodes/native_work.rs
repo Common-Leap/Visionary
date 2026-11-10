@@ -52,6 +52,20 @@ const COMMON_CANCELS: &[(&str, &str)] = &[
     ("*FIGHTER_STATUS_TRANSITION_TERM_ID_CONT_ESCAPE", "Dodge"),
 ];
 
+/// The plain name of a cancel, whichever fighter or action it came from.
+pub fn transition_term_label(term: &str) -> Option<&'static str> {
+    COMMON_CANCELS
+        .iter()
+        .find(|(known, _)| *known == term)
+        .map(|(_, label)| *label)
+        .or_else(|| {
+            source_transition_term_descriptors()
+                .iter()
+                .find(|descriptor| descriptor.transition_term == term)
+                .map(|descriptor| descriptor.label)
+        })
+}
+
 /// A measured source-only transition-term operation admitted for one concrete fighter.
 /// The symbolic token remains part of the identity: several owner-specific constants share
 /// the same numeric Work ID in the pinned registry.

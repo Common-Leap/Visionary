@@ -1269,17 +1269,8 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
                 crate::data::WorkTransitionTermAction::EnableGroup => "Allow transition group",
                 crate::data::WorkTransitionTermAction::UnableGroupEx => "Disable transition group",
             };
-            let detail = super::native_work::source_transition_term_descriptors()
-                .iter()
-                .find(|descriptor| {
-                    descriptor.action == call.action
-                        && descriptor.transition_term == call.transition_term
-                        && call.receiver == crate::data::WorkTransitionTermReceiver::AgentAccessor
-                })
-                .map_or_else(
-                    || "Preserved source".into(),
-                    |descriptor| descriptor.label.into(),
-                );
+            let detail = super::native_work::transition_term_label(&call.transition_term)
+                .map_or_else(|| "Preserved source".into(), str::to_owned);
             (title, detail)
         }
         ExcuteStmt::SlowWhole(crate::data::SlowWholeCall::Set { multiplier, frames }) => {
