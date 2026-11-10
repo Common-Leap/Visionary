@@ -226,7 +226,7 @@ fn is_cached_error_page(body: &str) -> bool {
 /// status check in [`fetch_script_body`] cannot be reached by a test without a network, so it is
 /// deliberately not the only guard: if it regressed, this would still catch the page before it
 /// reached a parser.
-fn script_source_from_body(raw: &str) -> String {
+pub(crate) fn script_source_from_body(raw: &str) -> String {
     if is_cached_error_page(raw) {
         String::new()
     } else {

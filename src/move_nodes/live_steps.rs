@@ -813,3 +813,74 @@ mod tests {
         assert!(stop.suppress && stop.frame_start.is_none());
     }
 }
+
+/// Every fighter's real moves, from a local copy of the script dump the editor fetches from.
+/// Set `VISIONARY_SCRIPT_DUMP` to the dump's `smashline` folder to run it.
+#[cfg(test)]
+mod every_fighter_tests {
+    use super::super::model::*;
+
+    #[test]
+    fn every_fighters_moves_load_and_send_nothing_until_edited() {
+        let Some(root) = std::env::var_os("VISIONARY_SCRIPT_DUMP") else {
+            return;
+        };
+        let mut problems = Vec::new();
+        let mut moves = 0;
+        let mut fighters = 0;
+        for kind in crate::gimmicks::registry::FIGHTER_KINDS {
+            let fighter = kind.fighter;
+            let dir = std::path::Path::new(&root)
+                .join(format!("lua2cpp_{fighter}"))
+                .join(fighter);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            fighters += 1;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(body) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let source =
+                    crate::acmd::parse_acmd_script(&crate::acmd::script_source_from_body(&body));
+                let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                let result = std::panic::catch_unwind(|| {
+                    let track =
+                        super::super::timeline::import_for_fighter(fighter, Track::Game, &source);
+                    let mut fingerprints = Vec::new();
+                    super::super::live_support::source_fingerprints(
+                        &track.nodes,
+                        &mut fingerprints,
+                    );
+                    let graph = MoveGraph {
+                        tracks: vec![track],
+                        ..MoveGraph::default()
+                    };
+                    let sent = super::rules(fighter, 1, &source, &graph);
+                    let waiting =
+                        super::super::live_support::not_live_blocks(fighter, &graph, &fingerprints);
+                    (sent.len(), waiting)
+                });
+                moves += 1;
+                match result {
+                    Err(_) => problems.push(format!("{fighter}/{name}: import panicked")),
+                    Ok((sent, _)) if sent > 0 => problems.push(format!(
+                        "{fighter}/{name}: unedited move sends {sent} rule(s)"
+                    )),
+                    Ok((_, waiting)) if !waiting.is_empty() => {
+                        problems.push(format!("{fighter}/{name}: not live {waiting:?}"))
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+        println!("checked {moves} moves across {fighters} fighters");
+        assert!(
+            problems.is_empty(),
+            "{} problems:\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+}
