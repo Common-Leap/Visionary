@@ -3643,6 +3643,9 @@ macro_rules! point_rule_pushers {
 impl VisionaryApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         // Set dark theme with visible text
+        // Dark always. Following the system theme left the light-mode title and status text
+        // nearly invisible on Windows set to light mode.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         // Install image loaders — this also ensures font atlas is properly initialized
         egui_extras::install_image_loaders(&cc.egui_ctx);
