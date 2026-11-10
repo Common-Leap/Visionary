@@ -2001,9 +2001,11 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
         ExcuteStmt::Expression(expression) => expression_command_ui(ui, expression),
         command => {
             if !native_command_ui(ui, fighter, command, joints) {
-                let payload = format!("{command:?}");
-                let label = payload.split(['(', '{']).next().unwrap_or("Command");
-                ui.label(label).on_hover_text(format!("{payload}\n\nFull payload remains intact. Edit more properties in its move-editor tab, then re-import."));
+                let (title, detail) = super::canvas::command_caption(command);
+                ui.label(super::plain::block_name(title));
+                if !detail.is_empty() {
+                    ui.weak(detail);
+                }
             }
         }
     }
@@ -4011,8 +4013,8 @@ fn native_command_ui(
             });
         }
         ExcuteStmt::HitModuleSetStatusAllNormal => {
-            ui.label("All hurtboxes normal");
-            ui.weak("Normal").on_hover_text("Exact HitModule::set_status_all call with HIT_STATUS_NORMAL and native tail 0. Other statuses and tails are not admitted.");
+            ui.label("Hurtboxes back to normal")
+                .on_hover_text("Makes every hurtbox on the fighter hittable again.");
         }
         ExcuteStmt::AttackModuleSetVecTargetPos(preset) => {
             ui.horizontal_wrapped(|ui| {
@@ -4021,11 +4023,8 @@ fn native_command_ui(
                     .width(225.0).height(310.0).selected_text(vector_target_label(*preset))
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                     .show_ui(ui, |ui| vector_target_options_ui(ui, preset))
-                    .response.on_hover_text("One complete measured AttackModule::set_vec_target_pos tuple: hitbox ID, top-joint Vector2f coordinates, native integer and fixed false tail. The integer's units and separate meaning are not established. This does not create an attack, emit a hit event or enable flat live preview;");
+                    .response.on_hover_text("Pulls whoever this hitbox hits toward a point near the fighter. The numbers are the hitbox, then the point's sideways and up offset.");
             });
-            let (_, _, _, arg5) = preset.source_parts();
-            ui.weak(format!("top · Native integer {arg5}"))
-                .on_hover_text(preset.source_line());
         }
         ExcuteStmt::AttackModuleSetDamageShakeScale(scale) => {
             ui.horizontal_wrapped(|ui| {
@@ -8657,5 +8656,46 @@ mod tests {
         view.paste_block("mario", "attack11", &receiver, &BTreeMap::new(), None);
         assert!(view.error.is_empty(), "{}", view.error);
         assert_eq!(view.draft.tracks[0].nodes.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod palette_live_tests {
+    /// Every block a user can add, for every fighter, reaches the running match.
+    #[test]
+    fn every_palette_block_updates_live() {
+        use super::super::model::*;
+        std::panic::set_hook(Box::new(|_| {}));
+        let mut missing = Vec::new();
+        for fighter in crate::gimmicks::registry::FIGHTER_KINDS
+            .iter()
+            .map(|kind| kind.fighter)
+        {
+            for track in [Track::Game, Track::Sound, Track::Expression, Track::Effect] {
+                for (kind, label) in super::node_choices_for_fighter(track, fighter) {
+                    // Some kinds are not offered on this track and refuse to build.
+                    let Ok(node) =
+                        std::panic::catch_unwind(|| super::context_node(kind, fighter, 1))
+                    else {
+                        continue;
+                    };
+                    let graph = MoveGraph {
+                        tracks: vec![MoveTrack {
+                            track,
+                            nodes: vec![MoveNode { id: 1, kind: node }],
+                            baseline: Vec::new(),
+                            effect_execute_baseline: Vec::new(),
+                        }],
+                        ..Default::default()
+                    };
+                    if !super::super::live_support::not_live_blocks(fighter, &graph, &[]).is_empty()
+                    {
+                        missing.push(format!("{fighter}: {label}"));
+                    }
+                }
+            }
+        }
+        let _ = std::panic::take_hook();
+        assert!(missing.is_empty(), "not live: {missing:?}");
     }
 }

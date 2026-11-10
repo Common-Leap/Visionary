@@ -61,7 +61,7 @@ fn step_for(fighter: &str, command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
                 "article_visibility",
                 vec![A::Int(article_id(fighter, symbol)?), A::Bool(*visible)],
             ),
-            _ => return None,
+            _ => return generic_step(command),
         },
         ExcuteStmt::HitModuleSetStatusAllNormal => ("hit_all_normal", Vec::new()),
         ExcuteStmt::StartCutIn => ("start_cutin", Vec::new()),
@@ -78,7 +78,7 @@ fn step_for(fighter: &str, command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
             let on = matches!(call.action, crate::data::WorkTransitionTermAction::Enable);
             let off = matches!(call.action, crate::data::WorkTransitionTermAction::Unable);
             if !on && !off {
-                return None;
+                return generic_step(command);
             }
             let term = call.transition_term.trim_start_matches('*');
             (
@@ -92,6 +92,27 @@ fn step_for(fighter: &str, command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
         }
         ExcuteStmt::GimmickChartEvent { chart_id, name } => {
             return Some((format!("event:{chart_id}:{name}"), Vec::new()))
+        }
+        // Field names ride in the command; the values follow in the same order.
+        ExcuteStmt::GimmickChartEventValues {
+            chart_id,
+            name,
+            arguments,
+        } => {
+            use crate::gimmicks::behavior::ConstValue;
+            let fields: Vec<&str> = arguments.iter().map(|arg| arg.field.as_str()).collect();
+            let values = arguments
+                .iter()
+                .map(|arg| match arg.value {
+                    ConstValue::Int(value) => A::Int(i64::from(value)),
+                    ConstValue::Float(value) => A::Num(value),
+                    ConstValue::Flag(value) => A::Bool(value),
+                })
+                .collect();
+            return Some((
+                format!("eventv:{chart_id}:{name}:{}", fields.join(",")),
+                values,
+            ));
         }
         ExcuteStmt::WorkFlag(call) => {
             let symbol = call.flag.trim_start_matches('*').to_owned();
@@ -156,6 +177,29 @@ const GENERIC: &[&str] = &[
     "macros::CANCEL_FILL_SCREEN",
     "macros::RUMBLE_HIT_STATUS",
     "macros::SHOOT_ITEM_BULLET",
+    "macros::ATK_SET_SHIELD_SETOFF_MUL",
+    "macros::ATK_SET_SHIELD_SETOFF_MUL2",
+    "macros::ATK_SET_SHIELD_SETOFF_MUL_arg3",
+    "macros::ATK_SET_SHIELD_SETOFF_MUL_arg4",
+    "macros::ATK_SET_SHIELD_SETOFF_MUL_arg5",
+    "macros::CHECK_FINISH_CAMERA",
+    "macros::CHECK_VALID_FINAL_START_CAMERA",
+    "macros::FT_SET_FINAL_FEAR_FACE",
+    "attack!",
+    "slope!",
+    "AttackModule::set_no_dead_all",
+    "AttackModule::set_catch_only_all",
+    "AttackModule::set_no_finish_camera",
+    "AttackModule::set_attack_reference_joint_id",
+    "AttackModule::set_vec_target_pos",
+    "AttackModule::set_optional_hit_effect",
+    "AttackModule::set_optional_hit_sound",
+    "EffectModule::request_post_effect_line_circle",
+    "EffectModule::remove_post_effect_line",
+    "WorkModule::set_int64",
+    "WorkModule::enable_transition_term_group",
+    "WorkModule::unable_transition_term_group_ex",
+    "ArticleModule::add_motion_partial",
 ];
 
 /// Marks a wire hash as the name of a game constant. **Must match the plugin.**
@@ -186,6 +230,23 @@ fn generic_arg(token: &str) -> Option<A> {
     token.parse::<f32>().ok().map(A::Num)
 }
 
+/// A vector argument, like `Vector2::new(1.0, 2.0)` or `&Vector2f{x: 1.0, y: 2.0}`, sent as
+/// its numbers in order.
+fn vector_parts(token: &str) -> Option<Vec<A>> {
+    if !token.contains("Vector") {
+        return None;
+    }
+    let open = token.find(['(', '{'])?;
+    let inner = token[open + 1..].trim_end().trim_end_matches([')', '}']);
+    inner
+        .split(',')
+        .map(|part| {
+            let part = part.rsplit(':').next()?.trim();
+            part.parse::<f32>().ok().map(A::Num)
+        })
+        .collect()
+}
+
 /// A block whose one-line game call is in [`GENERIC`].
 fn generic_step(command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
     let lines = crate::acmd::preview_excute_stmts(std::slice::from_ref(command));
@@ -200,8 +261,8 @@ fn generic_step(command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
     for (at, letter) in inner.char_indices() {
         match letter {
             '"' => quoted = !quoted,
-            '(' if !quoted => depth += 1,
-            ')' if !quoted => depth -= 1,
+            '(' | '{' if !quoted => depth += 1,
+            ')' | '}' if !quoted => depth -= 1,
             ',' if !quoted && depth == 0 => {
                 tokens.push(&inner[start..at]);
                 start = at + 1;
@@ -215,8 +276,12 @@ fn generic_step(command: &ExcuteStmt) -> Option<(String, Vec<A>)> {
         .into_iter()
         .skip(1)
         .filter(|token| !token.trim().is_empty())
-        .map(generic_arg)
-        .collect::<Option<Vec<_>>>()?;
+        .map(|token| match vector_parts(token) {
+            Some(parts) => Some(parts),
+            None => generic_arg(token).map(|arg| vec![arg]),
+        })
+        .collect::<Option<Vec<_>>>()?
+        .concat();
     Some(((*name).to_owned(), args))
 }
 
@@ -268,6 +333,24 @@ fn guard_for(condition: &MoveCondition) -> Option<LiveGuard> {
             symbol: hash40::hash40(symbol.trim_start_matches('*')).0,
             op: compare(*op),
             value: *value,
+        },
+        MoveCondition::WorkInt {
+            symbol,
+            op,
+            value: NativeIntOperand::FighterKind(owner),
+        } => LiveGuard::Int {
+            symbol: hash40::hash40(symbol.trim_start_matches('*')).0,
+            op: compare(*op),
+            value: crate::gimmicks::registry::fighter_kind_value(owner)?,
+        },
+        MoveCondition::WorkInt {
+            symbol,
+            op,
+            value: NativeIntOperand::Choice(choice),
+        } => LiveGuard::IntNamed {
+            symbol: hash40::hash40(symbol.trim_start_matches('*')).0,
+            op: compare(*op),
+            value: hash40::hash40(choice.trim_start_matches('*')).0,
         },
         MoveCondition::WorkFloat { symbol, op, value } => LiveGuard::Float {
             symbol: hash40::hash40(symbol.trim_start_matches('*')).0,
@@ -412,6 +495,11 @@ fn flat(fighter: &str, graph: &MoveGraph) -> Vec<Flat> {
     flat_track(fighter, graph, Track::Game)
 }
 
+/// The plugin's key for a removed call. **Must match the plugin's `drop_key`.**
+fn drop_key(name: &str) -> u64 {
+    hash40::hash40(&name.to_ascii_lowercase()).0
+}
+
 /// Plugin rule category that suppresses a removed call of this step.
 fn suppress_category(command: &str) -> Option<u8> {
     use crate::game_link as link;
@@ -480,8 +568,25 @@ pub fn rules(
         let Some((command, args)) = was.step else {
             continue;
         };
-        let Some(category) = suppress_category(&command) else {
-            continue;
+        let category = match suppress_category(&command) {
+            Some(category) => category,
+            // A gimmick message is never in the game's own script.
+            None if command.starts_with("event") => continue,
+            None => {
+                let center = crate::data::script_to_motion_frame(was.frame);
+                out.push(HitboxRuleWire {
+                    motion,
+                    category: crate::game_link::CAT_DROP,
+                    hitbox_id: Some(drop_key(&command)),
+                    suppress: true,
+                    frame_start: Some(center - 1.0),
+                    frame_end: Some(center + 1.0),
+                    overrides: None,
+                    inject: None,
+                    func: None,
+                });
+                continue;
+            }
         };
         let center = crate::data::script_to_motion_frame(was.frame);
         // The game's frame drifts from the script's under an animation-speed call. With no spawn
@@ -664,6 +769,36 @@ mod tests {
     #[test]
     fn an_untouched_move_sends_nothing() {
         assert_eq!(rules("mario", 1, &source(), &imported()).len(), 0);
+    }
+
+    #[test]
+    fn every_removable_call_has_a_plugin_hook() {
+        let plugin = [
+            include_str!("../../plugins/slight_replica/src/slight/hitbox_viewer/drop_hooks.rs"),
+            include_str!("../../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        ]
+        .concat();
+        let special = [
+            "set_whole",
+            "hit_all_normal",
+            "start_cutin",
+            "flash_eye",
+            "jostle",
+            "camera_zoom_out",
+            "slow_whole",
+            "slow_clear",
+            "shoot_article",
+            "remove_article",
+            "article_visibility",
+        ];
+        for name in GENERIC.iter().chain(&special) {
+            assert!(
+                suppress_category(name).is_some()
+                    || plugin.contains(&format!("\"{name}\"]"))
+                    || plugin.contains(&format!("\"{name}\", ")),
+                "removing {name} from a move would not reach the match"
+            );
+        }
     }
 
     #[test]

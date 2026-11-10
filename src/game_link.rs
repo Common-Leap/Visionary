@@ -783,6 +783,8 @@ pub const CAT_CLR_SPEED: u8 = 19;
 
 /// Wire category for the measured argument-less `SET_AIR` kinetic point.
 pub const CAT_SET_AIR: u8 = 20;
+/// A game call the user removed from a move. **Must equal the plugin's `CAT_DROP`.**
+pub const CAT_DROP: u8 = 39;
 
 /// Wire category for the direct `KineticModule::change_kinetic` kinetic point.
 pub const CAT_CHANGE_KINETIC: u8 = 21;
@@ -1088,6 +1090,12 @@ pub enum LiveGuard {
         symbol: u64,
         op: i8,
         value: i32,
+    },
+    /// An integer compared with a game constant the plugin looks up by name.
+    IntNamed {
+        symbol: u64,
+        op: i8,
+        value: u64,
     },
     Float {
         symbol: u64,

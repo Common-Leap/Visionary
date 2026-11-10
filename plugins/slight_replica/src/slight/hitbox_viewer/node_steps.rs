@@ -40,6 +40,11 @@ pub enum LiveGuard {
         op: i8,
         value: i32,
     },
+    IntNamed {
+        symbol: u64,
+        op: i8,
+        value: u64,
+    },
     Float {
         symbol: u64,
         op: i8,
@@ -142,6 +147,14 @@ pub unsafe fn passes(boma: *mut Boma, guard: &LiveGuard) -> bool {
             Some(id) => compare(*op, WorkModule::get_int(boma, id) as f32, *value as f32),
             None => false,
         },
+        LiveGuard::IntNamed { symbol, op, value } => {
+            match (work_id(boma, *symbol, Id::WorkInt), named_const(*value)) {
+                (Some(id), Some(value)) => {
+                    compare(*op, WorkModule::get_int(boma, id) as f32, value as f32)
+                }
+                _ => false,
+            }
+        }
         LiveGuard::Float { symbol, op, value } => match work_id(boma, *symbol, Id::WorkFloat) {
             Some(id) => compare(*op, WorkModule::get_float(boma, id), *value),
             None => false,
@@ -186,6 +199,34 @@ fn int(arg: Option<&LuaArg>) -> Option<i32> {
 pub unsafe fn run(lua_state: u64, boma: *mut Boma, command: &str, args: &[LuaArg]) -> bool {
     use crate::slight::gimmicks::registry::IdentifierKind as Id;
     if generic(lua_state, boma, command, args).unwrap_or(false) {
+        return true;
+    }
+    if let Some(target) = command.strip_prefix("eventv:") {
+        let mut parts = target.splitn(3, ':');
+        let (Some(chart), Some(name), Some(fields)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        use crate::slight::gimmicks::ChartEventValue as V;
+        let values: Vec<(&str, V)> = fields
+            .split(',')
+            .filter(|field| !field.is_empty())
+            .zip(args)
+            .filter_map(|(field, arg)| {
+                Some((
+                    field,
+                    match arg {
+                        LuaArg::Int(value) => V::Int(*value as i32),
+                        LuaArg::Num(value) => V::Float(*value),
+                        LuaArg::Bool(value) => V::Flag(*value),
+                        _ => return None,
+                    },
+                ))
+            })
+            .collect();
+        crate::slight::gimmicks::dispatch_named_chart_values_from_module(
+            boma, chart, name, &values,
+        );
         return true;
     }
     if let Some(target) = command.strip_prefix("event:") {
@@ -536,6 +577,40 @@ fn named_const(symbol: u64) -> Option<i64> {
         $(if symbol == name_hash(stringify!($name)) { return Some(*$name as i64); })*
     }; }
     table! {
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_ATTACK,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_CLIFF,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_ESCAPE,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_ITEM_THROW,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_JUMP_AERIAL,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_LANDING,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_LASSO,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_SPECIAL,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_TREAD_JUMP,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_AIR_WALL_JUMP,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_ATTACK,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_CATCH,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_ESCAPE,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_GUARD,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_ITEM,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_JUMP,
+        FIGHTER_STATUS_TRANSITION_GROUP_CHK_GROUND_SPECIAL,
+        FIGHTER_BAYONETTA_COSTUME_KIND_BAYONETTA_1,
+        FIGHTER_BAYONETTA_COSTUME_KIND_DEFAULT,
+        FIGHTER_BAYONETTA_COSTUME_KIND_JEANNE,
+        MA_MSC_CMD_ATTACK_SET_LERP,
+        MA_MSC_CMD_SLOPE_SLOPE,
+        MA_MSC_CMD_SLOPE_SLOPE_INTP,
+        SLOPE_STATUS_L,
+        SLOPE_STATUS_LR,
+        SLOPE_STATUS_NONE,
+        SLOPE_STATUS_PART,
+        SLOPE_STATUS_R,
+        SLOPE_STATUS_TERM,
+        SLOPE_STATUS_TOP,
+        SLOPE_STATUS_TPART,
+        WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE,
+        WEAPON_ELIGHT_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE,
         ARTICLE_OPE_TARGET_ALL,
         ARTICLE_OPE_TARGET_FIRST,
         ARTICLE_OPE_TARGET_LAST,
@@ -1036,6 +1111,135 @@ unsafe fn generic(lua_state: u64, boma: *mut Boma, name: &str, args: &[LuaArg]) 
         }
         "macros::SHOOT_ITEM_BULLET" => {
             cmd::SHOOT_ITEM_BULLET(lua_state);
+        }
+        "macros::ATK_SET_SHIELD_SETOFF_MUL" => {
+            push(lua_state, boma, args);
+            cmd::ATK_SET_SHIELD_SETOFF_MUL(lua_state);
+        }
+        "macros::ATK_SET_SHIELD_SETOFF_MUL2" => {
+            push(lua_state, boma, args);
+            cmd::ATK_SET_SHIELD_SETOFF_MUL2(lua_state);
+        }
+        "macros::ATK_SET_SHIELD_SETOFF_MUL_arg3" => {
+            push(lua_state, boma, args);
+            cmd::ATK_SET_SHIELD_SETOFF_MUL_arg3(lua_state);
+        }
+        "macros::ATK_SET_SHIELD_SETOFF_MUL_arg4" => {
+            push(lua_state, boma, args);
+            cmd::ATK_SET_SHIELD_SETOFF_MUL_arg4(lua_state);
+        }
+        "macros::ATK_SET_SHIELD_SETOFF_MUL_arg5" => {
+            push(lua_state, boma, args);
+            cmd::ATK_SET_SHIELD_SETOFF_MUL_arg5(lua_state);
+        }
+        "macros::CHECK_FINISH_CAMERA" => {
+            push(lua_state, boma, args);
+            cmd::CHECK_FINISH_CAMERA(lua_state);
+        }
+        "macros::CHECK_VALID_FINAL_START_CAMERA" => {
+            push(lua_state, boma, args);
+            cmd::CHECK_VALID_FINAL_START_CAMERA(lua_state);
+        }
+        "macros::FT_SET_FINAL_FEAR_FACE" => {
+            push(lua_state, boma, args);
+            cmd::FT_SET_FINAL_FEAR_FACE(lua_state);
+        }
+        "attack!" => {
+            push(lua_state, boma, args);
+            smash::app::sv_module_access::attack(lua_state);
+        }
+        "slope!" => {
+            push(lua_state, boma, args);
+            smash::app::sv_module_access::slope(lua_state);
+        }
+        "AttackModule::set_no_dead_all" => AttackModule::set_no_dead_all(boma, flag(0), flag(1)),
+        "AttackModule::set_catch_only_all" => {
+            AttackModule::set_catch_only_all(boma, flag(0), flag(1))
+        }
+        "AttackModule::set_no_finish_camera" => {
+            AttackModule::set_no_finish_camera(boma, int(0) as i32, flag(1), flag(2))
+        }
+        "AttackModule::set_attack_reference_joint_id" => {
+            use smash::app::AttackDirectionAxis as Axis;
+            AttackModule::set_attack_reference_joint_id(
+                boma,
+                hash(0),
+                Axis(int(1) as i32),
+                Axis(int(2) as i32),
+                Axis(int(3) as i32),
+            )
+        }
+        "AttackModule::set_vec_target_pos" => {
+            let target = smash::phx::Vector2f {
+                x: num(2),
+                y: num(3),
+            };
+            AttackModule::set_vec_target_pos(
+                boma,
+                int(0) as i32,
+                hash(1),
+                &target,
+                int(4) as u32,
+                flag(5),
+            )
+        }
+        "AttackModule::set_optional_hit_effect" => {
+            AttackModule::set_optional_hit_effect(boma, int(0) as i32, hash(1))
+        }
+        "AttackModule::set_optional_hit_sound" => {
+            AttackModule::set_optional_hit_sound(boma, int(0) as i32, hash(1))
+        }
+        "EffectModule::request_post_effect_line_circle" => {
+            use smash::phx::simd::{Vector2, Vector3};
+            smash::app::lua_bind::EffectModule::request_post_effect_line_circle(
+                boma,
+                hash(0),
+                hash(1),
+                Vector2 {
+                    vec: [num(2), num(3)],
+                },
+                Vector3 {
+                    vec: [num(4), num(5), num(6)],
+                },
+                flag(7),
+                num(8),
+                num(9),
+            );
+        }
+        "EffectModule::remove_post_effect_line" => {
+            smash::app::lua_bind::EffectModule::remove_post_effect_line(
+                boma,
+                int(0) as i32,
+                flag(1),
+            );
+        }
+        "WorkModule::set_int64" => WorkModule::set_int64(boma, int(0), int(1) as i32),
+        "WorkModule::enable_transition_term_group" => {
+            WorkModule::enable_transition_term_group(boma, int(0) as i32)
+        }
+        "WorkModule::unable_transition_term_group_ex" => {
+            WorkModule::unable_transition_term_group_ex(boma, int(0) as i32)
+        }
+        "ArticleModule::add_motion_partial" => {
+            // An unknown part set must not fall back to part set 0.
+            if !matches!(args.get(1), Some(LuaArg::Hash(h)) if resolve(boma, h & !CONST_BIT).is_some())
+            {
+                return Some(false);
+            }
+            ArticleModule::add_motion_partial(
+                boma,
+                int(0) as i32,
+                int(1) as i32,
+                hash(2),
+                num(3),
+                num(4),
+                flag(5),
+                flag(6),
+                num(7),
+                flag(8),
+                flag(9),
+                flag(10),
+            );
         }
         _ => return None,
     }

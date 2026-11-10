@@ -33,6 +33,7 @@ use parking_lot::Mutex;
 use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
+mod drop_hooks;
 mod node_steps;
 pub use node_steps::{passes as guard_passes, LiveGuard};
 mod rate_hooks;
@@ -237,6 +238,8 @@ pub const CAT_CLR_SPEED: u8 = 19;
 
 /// `SET_AIR` — an argument-less kinetic-state point. Must equal the editor's wire category.
 pub const CAT_SET_AIR: u8 = 20;
+/// A game call the user removed from a move. Keyed by the hash of the call's name.
+pub const CAT_DROP: u8 = 39;
 
 /// `KineticModule::change_kinetic` — a direct kinetic-type point. Must equal the editor's wire category.
 pub const CAT_CHANGE_KINETIC: u8 = 21;
@@ -1562,6 +1565,42 @@ impl HitboxRule {
 
 static RULES: LazyLock<Mutex<Vec<HitboxRule>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static HAVE_RULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Separate from [`HAVE_RULES`]: some dropped calls run every frame for every fighter.
+static HAVE_DROPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The editor's key for a call name. **Must match the editor's `drop_key`.**
+fn drop_key(name: &str) -> u64 {
+    smash::hash40(&name.to_ascii_lowercase())
+}
+
+/// True when the user removed this game call from the move the fighter is doing now.
+pub(crate) unsafe fn dropped(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    names: &[&str],
+) -> bool {
+    if !HAVE_DROPS.load(std::sync::atomic::Ordering::Acquire) || boma.is_null() || is_injecting() {
+        return false;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return false;
+    }
+    let motion = acting_motion(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let hit = names.iter().find(|name| {
+        matches!(
+            action_for(CAT_DROP, motion, drop_key(name), frame),
+            Some((true, _))
+        )
+    });
+    if let Some(name) = hit {
+        crate::slight::diag::note(format!(
+            "dropped {name} (motion {motion:#x} frame {frame:.1})"
+        ));
+    }
+    hit.is_some()
+}
 
 /// Full-list replace (same semantics as effect spawn rules).
 pub fn set_rules(rules: Vec<HitboxRule>) {
@@ -1571,6 +1610,10 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
         *guard = rules;
     }
     HAVE_RULES.store(n != 0, std::sync::atomic::Ordering::Release);
+    HAVE_DROPS.store(
+        RULES.lock().iter().any(|rule| rule.category == CAT_DROP),
+        std::sync::atomic::Ordering::Release,
+    );
     // Categories, not just a count. "2 rule(s)" is true whether they are two hitbox rules or a
     // hitbox rule and a sound rule, and those need different answers when a live edit does
     // nothing — one says the editor never sent the family, the other says it sent it and the
@@ -1604,6 +1647,7 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
                     CAT_FT_START_ADJUST_MOTION_FRAME => "ft_start_adjust_motion_frame",
                     CAT_CLR_SPEED => "clr_speed",
                     CAT_SET_AIR => "set_air",
+                    CAT_DROP => "drop",
                     CAT_CHANGE_KINETIC => "change_kinetic",
                     CAT_KINETIC_ADD_SPEED => "kinetic_add_speed",
                     CAT_KINETIC_SUSPEND_ENERGY => "kinetic_suspend_energy",
@@ -2283,6 +2327,9 @@ unsafe fn hook_work_module_set_int(
     value: i32,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_int"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Int(value as i64), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_int", &args);
     if any_direct_rules(boma) {
@@ -2327,6 +2374,9 @@ unsafe fn hook_work_module_set_int64(
     value: i64,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_int64"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Int(value), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_int64", &args);
     if any_direct_rules(boma) {
@@ -2365,6 +2415,9 @@ unsafe fn hook_work_module_set_float(
     value: f32,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_float"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Num(value), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_float", &args);
     if any_direct_rules(boma) {
@@ -2707,6 +2760,9 @@ unsafe fn hook_control_set_rumble(
     looped: bool,
     target: u32,
 ) {
+    if dropped(boma, &["ControlModule::set_rumble"]) {
+        return Default::default();
+    }
     let args = [
         LuaArg::Hash(kind.hash),
         LuaArg::Int(duration as i64),
@@ -3581,6 +3637,13 @@ unsafe fn hook_hit_no(lua_state: u64) {
 
 #[skyline::hook(replace = smash::app::sv_animcmd::COL_PRI)]
 unsafe fn hook_col_pri(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::COL_PRI"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     if !args.is_empty() {
         // `COL_PRI` is per fighter rather than per target, so every rule for it shares one key.
@@ -3709,6 +3772,13 @@ unsafe fn hook_atk_power(lua_state: u64) {
 
 #[skyline::hook(replace = smash::app::sv_animcmd::ATK_SET_SHIELD_SETOFF_MUL)]
 unsafe fn hook_atk_set_shield_setoff_mul(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::ATK_SET_SHIELD_SETOFF_MUL"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 2);
     if args.len() >= 2
         && attack_mod_action(
@@ -4201,6 +4271,7 @@ pub unsafe fn inject_tick(lua_state: u64) {
 }
 
 pub fn install() {
+    drop_hooks::install();
     capture_archive::init();
     skyline::install_hooks!(
         hook_attack,
