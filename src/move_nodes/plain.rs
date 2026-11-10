@@ -63,7 +63,6 @@ pub fn block_name(internal: &str) -> &str {
         "Attack module set final finish cut in" => "Final Smash finish cut-in",
         "Attack module set height all" => "Hitbox height",
         "Attack module set all" | "Attack module set indexed" => "Hitbox setting",
-        "Attack mod" => "Change hitbox power",
         "Attack fp" => "Hitbox at a point",
         "Grab rebound" => "Grab bounce-off",
         "Item visibility" => "Show or hide held item",
