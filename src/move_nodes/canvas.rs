@@ -1750,7 +1750,7 @@ fn effect_name(command: &crate::data::EffectMacro) -> String {
 }
 
 /// The short name a multi-command block lists for one command.
-fn command_name(command: &crate::data::ExcuteStmt) -> String {
+pub(super) fn command_name(command: &crate::data::ExcuteStmt) -> String {
     if let Some(words) = command_words(command) {
         return words;
     }

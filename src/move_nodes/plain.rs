@@ -91,7 +91,7 @@ pub fn block_name(internal: &str) -> &str {
         "Body collision" | "Body collision area" | "Body collision area XY" => "Push box",
         "Imported actions" => "Actions",
         "Imported effects" => "Visual effects",
-        "Top-level command" | "Top-level sound" => "Action",
+        "Top-level command" => "Action",
         "Native structure" => "Original game code",
         "Native setter" | "Native call" | "Native slowdown" => "Game code",
         "New controller" => "New gimmick",
@@ -104,6 +104,38 @@ pub fn block_name(internal: &str) -> &str {
         "Event source" => "When",
         "Entry state" => "First state",
         "Attack mod" => "Change hitbox power",
+        "Article part visibility" => "Show or hide part of an object",
+        "Attack catch-only mode" => "Hitbox only grabs",
+        "Attack finish camera" => "Finishing-hit camera",
+        "Attack height" => "Hitbox height",
+        "Attack no-dead mode" => "Hitbox can't KO",
+        "Attack reference joint" => "Hitbox follows a body part",
+        "Attack target filter" => "What the hitbox can hit",
+        "Cliff hang profile" => "Ledge grab range",
+        "Damage fly smoke" => "Launch smoke",
+        "Damage shake scale" => "Hit shake amount",
+        "Disable attack tip" => "No hitbox tip effect",
+        "Disable effect render offset" | "Disable render offset" => "Effect stays in place",
+        "Enable safe position" => "Remember a safe spot",
+        "Force attack reaction" => "Force hit reaction",
+        "Inherited open motion" => "Keep the open pose",
+        "Initialize attack position" => "Reset hitbox positions",
+        "Interpolate attacks" => "Smooth hitbox movement",
+        "Model default" => "Model back to normal",
+        "Top-level sound" => "Sound",
+        "Unique attack effects" => "Hit sparks",
+        "Vector target" => "Pull opponents to a point",
+        "Sync effect initial position" | "Sync initial position" => {
+            "Effect starts where the fighter is"
+        }
+        "Circle post effect" => "Circle screen effect",
+        "Remove line post effect" => "End line screen effect",
+        "Fill screen model color" => "Fill the screen with color",
+        "Final wave angle" => "Final Smash wave angle",
+        "Item pull offset limit" => "Item pull limit",
+        "Slope status" => "Lean with the ground",
+        "Default visibility status" => "Model back to normal",
+        "Stop status sounds" => "Stop this action's sounds",
         "Counter" => "Number",
         "Gauge" => "Meter",
         other => other,
@@ -1023,4 +1055,40 @@ pub fn bone_words(bone: &str) -> String {
         "top" | "rot" | "trans" => "body".into(),
         other => other.replace('_', " ").to_lowercase(),
     }
+}
+
+/// An edit error in words a player uses. The technical text stays under Details.
+pub fn error_words(error: &str) -> String {
+    let line = error.lines().next().unwrap_or(error);
+    // "tracks[0].nodes[3]#12: reason" names the place in the saved file; the reason is enough.
+    let line = match line.rsplit_once("]: ").or_else(|| line.rsplit_once(": ")) {
+        Some((place, reason)) if place.contains("tracks[") || place.contains("nodes[") => reason,
+        _ => line,
+    };
+    let mut text = format!(" {line} ");
+    for (from, to) in [
+        ("execute block", "action block"),
+        (" Execute ", " action "),
+        (" execute ", " action "),
+        ("native ", "game "),
+        ("Native ", "Game "),
+        ("Game track", "Action lane"),
+        ("Effect track", "Visuals lane"),
+        ("Sound track", "Sound lane"),
+        ("Expression track", "Rumble & camera lane"),
+        (" root ", " top-level "),
+        ("baseline", "game's original"),
+        ("source export", "exported mod"),
+        ("article", "object"),
+        (" ACMD ", " move code "),
+        ("Branch", "If"),
+        (" motion ", " animation "),
+    ] {
+        text = text.replace(from, to);
+    }
+    let text = text.trim();
+    let mut letters = text.chars();
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
 }

@@ -391,7 +391,7 @@ impl GimmicksEditor {
         if additional_count > 0 {
             self.pending_setup = None;
             ui.weak(format!("{additional_count} additional controller{}", if additional_count == 1 { "" } else { "s" }))
-                .on_hover_text("Live preview requires a chart-capable plugin. Normal packages include every controller with a compatible selected SLight source. Standalone source and setup files cannot carry additional charts.");
+                .on_hover_text("Live updates need the Visionary plugin in the game. Exported mods include every gimmick.");
         }
         ui.horizontal_wrapped(|ui| {
             let setup_available = data.controller_charts.get(&context.fighter).is_none_or(BTreeMap::is_empty);
@@ -438,8 +438,11 @@ impl GimmicksEditor {
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Load {name}?"));
-                ui.weak("Replace this donor's personal overrides, behavior, and meters, including advanced drafts. Other fighter and trait edits are preserved.");
-                ui.horizontal(|ui| { apply = ui.button("Apply setup").clicked(); cancel = ui.button("Cancel").clicked(); });
+                ui.weak("Replaces this fighter's gimmicks, values and meters. Other edits stay.");
+                ui.horizontal(|ui| {
+                    apply = ui.button("Apply setup").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
             });
             if apply {
                 let (_, prepared) = self.pending_setup.take().unwrap();
@@ -494,17 +497,17 @@ impl GimmicksEditor {
         if self.section == Section::Parameters {
             egui::CollapsingHeader::new("Available surfaces").id_salt("gimmick_surfaces").show(ui, |ui| {
             if let Some(profile) = profile {
-                ui.weak(format!("{} articles · {} weapon statuses · {} fighter statuses", profile.articles, profile.weapon_statuses, profile.fighter_statuses));
-                ui.weak(format!("Work values: {} decimals · {} integers · {} flags", profile.work_floats, profile.work_ints, profile.work_flags));
+                ui.weak(format!("{} objects · {} object actions · {} fighter actions", profile.articles, profile.weapon_statuses, profile.fighter_statuses));
+                ui.weak(format!("Game values: {} decimals · {} whole numbers · {} switches", profile.work_floats, profile.work_ints, profile.work_flags));
                 if profile.native_sources.is_empty() {
-                    ui.weak("No validated native resource event adapter yet. Authored state/timers and discovered personal values remain available.");
+                    ui.weak("Meters and rules work. This fighter's own meter can't send messages yet.");
                 } else {
                     for source in &profile.native_sources {
                         ui.label(source.label()).on_hover_text(source.description());
                     }
                 }
             } else {
-                ui.weak("Unknown engine fighter: personal-file discovery only. Native identifiers and generated behavior stay guarded.");
+                ui.weak("Visionary doesn't know this fighter's game values. Values from its files still work.");
             }
         });
         }
@@ -558,8 +561,8 @@ impl GimmicksEditor {
         {
             egui::CollapsingHeader::new("Live parameter diagnostics").id_salt("parameter_getter_health").show(ui, |ui| {
                 match health.getter_backend {
-                    Some(super::live_params::ParameterGetterBackend::NativeParamData) => { ui.weak("Native parameter getters"); }
-                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("Exported-getter fallback: native mechanics may bypass this preview."); }
+                    Some(super::live_params::ParameterGetterBackend::NativeParamData) => { ui.weak("Values read from the game"); }
+                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("The game may change some of these in ways the preview doesn't show."); }
                     None => { ui.weak("Getter backend not reported by this plugin."); }
                 }
                 ui.weak("Game-wide counters since the accepted parameter snapshot; field read counts remain fighter-specific.");
@@ -907,7 +910,7 @@ impl GimmicksEditor {
                 });
                 ui.horizontal_wrapped(|ui| {
                     if ui.small_button("Add numeric variable").clicked() { add_variable = Some(VarType::Float); }
-                    if ui.small_button("Add flag variable").clicked() { add_variable = Some(VarType::Flag); }
+                    if ui.small_button("Add on/off value").clicked() { add_variable = Some(VarType::Flag); }
                 });
             });
         });
@@ -987,7 +990,7 @@ impl GimmicksEditor {
                     }
                 });
             if players.is_empty() {
-                ui.weak("Start a match with this fighter to test articles.");
+                ui.weak("Start a match with this fighter to test objects.");
             }
         });
     }
@@ -1041,7 +1044,7 @@ impl GimmicksEditor {
                     ui.push_id(("live_actor", row.get("boid").and_then(|value| value.as_u64()), row.get("entry_id").and_then(|value| value.as_i64())), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Player {} · {}", row.get("entry_id").and_then(|v| v.as_i64()).map_or(0, |id| id + 1), row.get("state").and_then(|v| v.as_str()).unwrap_or("unknown")));
-                        if ui.small_button("Restart").on_hover_text("Restart only this player's saved controller; does not refill a native resource.").clicked() {
+                        if ui.small_button("Restart").on_hover_text("Starts this player's gimmick over. Doesn't refill the fighter's own meter.").clicked() {
                             if let Some(boid) = row.get("boid").and_then(|value| value.as_u64()).and_then(|value| u32::try_from(value).ok()) {
                                 let result = if self.selected_chart() == super::controller_project::MAIN_CHART {
                                     link.restart_gimmick_controller(fighter, boid, snapshot.behavior_revision)
@@ -1064,7 +1067,7 @@ impl GimmicksEditor {
             ui.horizontal_wrapped(|ui| {
                 if self.preview_frames == 0 { self.preview_frames = 180; }
                 ui.add(egui::DragValue::new(&mut self.preview_frames).range(1..=3600).suffix(" preview frames"));
-                if ui.button("Simulate").on_hover_text("Pure offline evaluation: article actions are listed, never executed in the game.").clicked() {
+                if ui.button("Simulate").on_hover_text("Runs here only. Object actions are listed, not done in the game.").clicked() {
                     match super::controller::simulate_frames(fighter, graph, self.preview_frames) {
                         Ok(rows) => { self.preview = rows; self.preview_cursor = 0; }, Err(error) => self.status = error,
                     }
@@ -1836,7 +1839,7 @@ pub(super) fn action_picker(
                     }
                 }));
                 ui.end_row();
-                ui.label("Amount").on_hover_text(format!("Native units, 0 to {}. Helper-backed rows (Limit, MP, ink, rebel gauge, Steve's materials) need a stable status; Limit also takes jab.", command.resource.entry().max));
+                ui.label("Amount").on_hover_text(format!("Amount, 0 to {}. Limit, MP, ink, the rebel gauge and Steve's materials only change outside attacks; Limit also changes during jab.", command.resource.entry().max));
                 value_editor(ui, fighter, graph, &mut command.amount, VarType::Float, scope);
             }
             ControllerAction::ChooseHeroMenuSpell { slot } => {
@@ -1882,7 +1885,7 @@ pub(super) fn action_picker(
                         ui.end_row();ui.label("Size");ui.add(egui::DragValue::new(size).range(0.1..=50.0).speed(0.1));
                     }
                     Command::GrabBox {enabled,size,height,forward} => {
-                        ui.checkbox(enabled,"Enabled").on_hover_text("Only a Catch or Catch turn status accepts the capture, so bind this state to one of those.");
+                        ui.checkbox(enabled,"Enabled").on_hover_text("Only grab and grab-turn actions can catch, so pick one of those.");
                         ui.end_row();ui.label("Size");ui.add(egui::DragValue::new(size).range(0.1..=50.0).speed(0.1));
                         for (label,value) in [("Height",height),("Forward",forward)] {
                             ui.end_row();ui.label(label);ui.add(egui::DragValue::new(value).range(-100.0..=100.0).speed(0.1));
@@ -1899,7 +1902,7 @@ pub(super) fn action_picker(
                         if ui.checkbox(&mut inherit,"Inherit frame").changed() { *frame=if inherit {MotionFrame::Inherit} else {MotionFrame::Start(Expr::Const(ConstValue::Float(0.0)))}; }
                         if let MotionFrame::Start(frame)=frame {ui.end_row();ui.label("Start frame");value_editor(ui,fighter,graph,frame,VarType::Float,scope);}
                     }
-                    Command::InitializeStatus(settings) => {ui.checkbox(&mut settings.jostle,"Jostle");ui.checkbox(&mut settings.status_data.grab_invulnerable,"Grab immune").on_hover_text("FighterStatusModuleImpl::set_fighter_status_data grab flag, for this status only");ui.weak("Pre settings");}
+                    Command::InitializeStatus(settings) => {ui.checkbox(&mut settings.jostle,"Jostle");ui.checkbox(&mut settings.status_data.grab_invulnerable,"Grab immune").on_hover_text("Lets this action grab, in this action only.");ui.weak("Pre settings");}
                     Command::TransitionTerm {symbol,enabled} => {
                         super::registry::transition_picker(ui,fighter,symbol,false);
                         ui.checkbox(enabled,"Enabled");
@@ -1908,7 +1911,7 @@ pub(super) fn action_picker(
                         super::registry::transition_picker(ui,fighter,symbol,true);
                         ui.checkbox(enabled,"Enabled");
                     }
-                    Command::EnableCancel => {ui.label("Enable native cancel checks");}
+                    Command::EnableCancel => {ui.label("Allow the game's usual cancels");}
                     Command::TryCommonTransition {kind} => {
                         use super::status_commands::CommonTransition as C;
                         egui::ComboBox::from_id_salt("common transition").selected_text(format!("{kind:?}")).show_ui(ui,|ui| {
@@ -1986,7 +1989,7 @@ pub(super) fn action_picker(
                 let old = native_var_type(input);
                 let projectile = input.projectile_article().is_some();
                 native_target_picker(ui, input, if projectile { projectile_inputs(fighter) } else { writable_numbers(fighter) });
-                if projectile { ui.label("ⓘ").on_hover_text("Writes every owned live projectile. Prefer charge, counters and flags the weapon reads; weapons may overwrite state every frame. Reads sample the newest live projectile each tick; no projectile reads as zero."); }
+                if projectile { ui.label("ⓘ").on_hover_text("Changes every projectile this fighter has out. Values the projectile uses each frame work best; the projectile may change them back."); }
                 if input.kind() == Some(NativeKind::Flag) {
                     *action = ControllerAction::SetNativeFlag { input: input.clone(), on: true };
                     return;
@@ -2006,7 +2009,7 @@ pub(super) fn action_picker(
             }
             ControllerAction::ThrowHeldOpponent { direction } => {
                 use super::native_inputs::ThrowDirection;
-                ui.label("Direction").on_hover_text("Requires holding on the ground, in standard catch wait with its throw transition enabled or in a status this chart owns.");
+                ui.label("Direction").on_hover_text("Works while holding someone on the ground, or in an action this gimmick controls.");
                 egui::ComboBox::from_id_salt("throw_direction").selected_text(format!("{direction:?}")).show_ui(ui, |ui| {
                     for value in [ThrowDirection::Forward, ThrowDirection::Back, ThrowDirection::Up, ThrowDirection::Down] {
                         ui.selectable_value(direction, value, format!("{value:?}"));
@@ -2089,7 +2092,7 @@ pub(super) fn action_picker(
                 ui.push_id("speed_y", |ui| value_editor(ui, fighter, graph, y, VarType::Float, scope));
             }
             ControllerAction::SetNativeFlag { input, on } => {
-                if input.projectile_article().is_some() { ui.label("ⓘ").on_hover_text("Writes every owned live projectile. Prefer flags the weapon reads; weapons may overwrite state every frame."); }
+                if input.projectile_article().is_some() { ui.label("ⓘ").on_hover_text("Changes every projectile this fighter has out. The projectile may change it back."); }
                 native_target_picker(ui, input, if input.projectile_article().is_some() { projectile_inputs(fighter) } else { writable_inputs(fighter, native_kind_for(kind)) });
                 if input.kind() != Some(NativeKind::Flag) {
                     *action = ControllerAction::SetNative { value: super::value_edit::zero(native_var_type(input)), input: input.clone() };

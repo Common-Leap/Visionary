@@ -469,14 +469,14 @@ impl NodeEditor {
                 let coverage = super::coverage::track_summary(&self.draft.tracks[self.track]);
                 if coverage.preserved_block_count > 0 || coverage.preserved_command_count > 0 {
                     ui.weak(format!("{} editable commands · {} preserved commands · {} preserved blocks", coverage.editable_command_count, coverage.preserved_command_count, coverage.preserved_block_count))
-                    .on_hover_text("Preserved commands and blocks retain original native structure. They are not fully interpreted building blocks; mixed groups allow their supported neighbors to be edited without changing the preserved slots.");
+                    .on_hover_text("Grey blocks are parts of the game's move that Visionary keeps exactly as they are. The blocks around them can still be changed.");
                 }
                 ui.horizontal_wrapped(|ui| {
                 let selected = self.canvas.selected_node();
                 let can_paste = self.block_clipboard.as_ref().is_some_and(|clipboard| clipboard.track() == current_track);
                 ui.menu_button("Blocks", |ui| {
                     if ui.add_enabled(selected.is_some(), egui::Button::new("Copy block"))
-                        .on_hover_text("Copy this typed block and its complete nested region. Preserved native source cannot be duplicated. The clipboard stays available when changing moves or characters in this project.").clicked() {
+                        .on_hover_text("Copies this block and everything inside it. Grey blocks kept from the game can't be copied. The copy stays available when you switch moves or characters.").clicked() {
                         self.copy_selected_block(fighter);
                         ui.close();
                     }
@@ -493,7 +493,7 @@ impl NodeEditor {
                     if let Some(clipboard) = &self.block_clipboard {
                         ui.separator();
                         ui.weak(format!("{:?} · {}", clipboard.track(), clipboard.origin_fighter()))
-                            .on_hover_text("Native commands must be valid for the destination donor. Copying does not remap articles, work IDs, events or resources.");
+                            .on_hover_text("Pasted blocks must make sense for this fighter. Objects, game values and messages are not renamed to match.");
                     }
                 });
                 let trail_template = reusable_trail(&self.draft);
@@ -1112,8 +1112,9 @@ pub(super) fn guard_kind_ui(
         return;
     }
     if matches!(guard, Predicate::DamageStatusIs(_)) {
-        ui.weak("Status at contact")
-            .on_hover_text("Historical receiver status requires its owning damage root.");
+        ui.weak("Their action when hit").on_hover_text(
+            "Only available inside a rule that starts when this fighter deals damage.",
+        );
         return;
     }
     let kind = match guard {
@@ -1221,7 +1222,7 @@ pub(crate) fn damage_status_source_ui(
                 let label = native_source_label(&candidate);
                 ui.selectable_value(source, candidate, label);
             }
-        }).response.on_hover_text("Receiver status at native contact admission, retained by this damage root. Named and ordinary events cannot supply it.");
+        }).response.on_hover_text("What the opponent was doing when the hit landed. Only a rule that starts on dealing damage knows this.");
     if !matches!(source, NativeInput::FighterStatusIs { .. }) || !source.valid_for(fighter) {
         ui.colored_label(
             egui::Color32::YELLOW,
@@ -1403,7 +1404,7 @@ pub(super) fn expression_block_ui(
 ) {
     if matches!(value, Expr::PendingDamage) {
         ui.weak("Pending damage")
-            .on_hover_text("Positive native units from this damage root.");
+            .on_hover_text("How much damage the hit dealt, in percent.");
         return;
     }
     if let Expr::EventField { event, field } = value {
@@ -1655,7 +1656,7 @@ pub(crate) fn native_source_options_ui(
             });
     });
     if choices.is_empty() {
-        ui.weak("No matching sources");
+        ui.weak("Nothing matches");
     }
     ui.data_mut(|data| data.insert_temp(search_key, query));
 }
@@ -1692,10 +1693,10 @@ pub(crate) fn native_source_ui(
         .selected_text(label)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| native_source_options_ui(ui, fighter, source, kind))
-        .response.on_hover_text(format!("Read-only native input: {}\nSampled once per dispatch on the game thread. Missing observations stop the step without changing authored state.", source.reference()));
+        .response.on_hover_text(format!("Read from the game: {}\nChecked once each frame. If the game has no value, this step is skipped.", source.reference()));
     ui.weak(format!("Read-only · {type_label}"));
     if !source.valid_for(fighter) || source.kind() != Some(kind) {
-        ui.weak("Unavailable until a supported source is selected.");
+        ui.weak("Pick something to read first.");
     }
 }
 
@@ -1767,10 +1768,10 @@ fn nodes(
                         NodeKind::Frame { frame } => { ui.label("Frame"); ui.add(egui::DragValue::new(frame).range(0.0..=1_000_000.0)); },
                         NodeKind::NativeExecuteFrame { frame } => { native_execute_frame_ui(ui, frame); },
                         NodeKind::NativeMotionLoopSync => { native_motion_loop_sync_ui(ui); },
-                        NodeKind::NativeWaitLoopClear => { ui.label("Wait for motion loop").on_hover_text("Native wait_loop_clear: waits until the motion loops, then restarts the frame count. Direct root Game or Expression placement; To repeat blocks on every loop, use Repeat with Every motion loop."); },
+                        NodeKind::NativeWaitLoopClear => { ui.label("Wait for animation loop").on_hover_text("Waits until the animation starts over, then counts frames from 0 again. To repeat blocks every loop, use Repeat with Every animation loop."); },
                         NodeKind::Wait { frames } => { ui.label("Wait"); ui.add(egui::DragValue::new(frames).range(0.0..=1_000_000.0)); },
-                        NodeKind::MotionRate { rate } => { ui.label("Motion rate"); ui.add(egui::DragValue::new(rate).range(0.001..=1000.0).speed(0.01)).on_hover_text("ACMD motion-rate argument. Timing uses motion frames, not timer ticks; test the resulting playback in game."); },
-                        NodeKind::BareCommand { .. } => { ui.label("Top-level command").on_hover_text("Runs outside the Execute guard, exactly as written in the original source."); },
+                        NodeKind::MotionRate { rate } => { ui.label("Animation speed"); ui.add(egui::DragValue::new(rate).range(0.001..=1000.0).speed(0.01)).on_hover_text("How fast the animation plays. 1 is normal, 2 takes twice as long, 0.5 takes half as long. Check it in game."); },
+                        NodeKind::BareCommand { .. } => { ui.label("Top-level command").on_hover_text("Runs every time this point in the move is reached, as the game wrote it."); },
                         NodeKind::Repeat { count, motion_loop, .. } => {
                             use crate::data::MotionLoop;
                             ui.label("Repeat");
@@ -1786,13 +1787,13 @@ fn nodes(
                                     ui.selectable_value(motion_loop, MotionLoop::No, "times");
                                     if matches!(track, Track::Game | Track::Expression) {
                                         ui.selectable_value(motion_loop, MotionLoop::Clear, "every motion loop (loop clear)")
-                                            .on_hover_text("Native wait_loop_clear loop, as rapid jabs use: runs the body, waits for the motion to loop, and starts again until the move ends.");
+                                            .on_hover_text("Like a rapid jab: runs these blocks, waits for the animation to start over, and repeats until the move ends.");
                                     }
                                     ui.selectable_value(motion_loop, MotionLoop::SyncMotion, "every motion loop (sync)")
-                                        .on_hover_text("Native wait_loop_sync_mot loop, as run and walk effects, sounds and expressions use.");
+                                        .on_hover_text("Repeats every time the animation loops, like running and walking effects and sounds.");
                                 })
                                 .response
-                                .on_hover_text("An every-motion-loop repeat must be the last root block of its track;");
+                                .on_hover_text("A repeat that runs every loop must be the last block in its lane.");
                             if *motion_loop != before && motion_loop.is_loop() {
                                 *count = 1;
                             }
@@ -1800,11 +1801,11 @@ fn nodes(
                         NodeKind::Branch { .. } => { ui.label("If"); },
                         // Same titles as the block on the field.
                         NodeKind::Execute { commands } => { ui.label(match commands.as_slice() { [command] => super::plain::block_name(super::canvas::command_caption(command).0).to_string(), _ => format!("Actions ({})", commands.len()) }); },
-                        NodeKind::MixedExecute { commands } => { ui.label(format!("Imported actions ({})", commands.len())).on_hover_text("Edit supported properties without changing command order. Preserved commands stay in their original slots."); },
+                        NodeKind::MixedExecute { commands } => { ui.label(format!("Imported actions ({})", commands.len())).on_hover_text("Change these actions in place. Grey ones are kept from the game and stay where they are."); },
                         NodeKind::EffectExecute { commands } => { ui.label(match commands.as_slice() { [command] => super::canvas::effect_caption(command).0.to_string(), _ => format!("Visual effects ({})", commands.len()) }); },
-                        NodeKind::MixedEffectExecute { commands, .. } => { ui.label(format!("Imported effects ({})", commands.len())).on_hover_text("Edit supported effects in place. Native commands keep their original slots and execute boundary;"); },
-                        NodeKind::Preserved { .. } => { ui.label("Imported structure (read-only)").on_hover_text("Preserves source branches and commands the node editor does not yet author. No flattening or arbitrary Rust editing."); },
-                    }).response.on_hover_text(format!("Internal block ID: {}", node.id));
+                        NodeKind::MixedEffectExecute { commands, .. } => { ui.label(format!("Imported effects ({})", commands.len())).on_hover_text("Change these effects in place. Grey ones are kept from the game and stay where they are."); },
+                        NodeKind::Preserved { .. } => { ui.label("Imported structure (read-only)").on_hover_text("Part of the game's move that Visionary keeps exactly as it is. Open Code to see it."); },
+                    }).response.on_hover_text(format!("Block number {}", node.id));
                     if node_count > 1 {
                         if ui.add_enabled(index > 0, egui::Button::new("Up").small()).on_hover_text("Move earlier in this region").clicked() { reorder = Some((index, index - 1)); }
                         if ui.add_enabled(index + 1 < node_count, egui::Button::new("Down").small()).on_hover_text("Move later in this region").clicked() { reorder = Some((index, index + 1)); }
@@ -1835,8 +1836,9 @@ fn nodes(
                             ui.push_id(index, |ui| match command {
                                 MoveCommand::Editable(command) => command_ui(ui, fighter, command, options),
                                 MoveCommand::Preserved(command) => {
-                                    let payload = format!("{command:?}");
-                                    ui.weak("Preserved command").on_hover_text(format!("{payload}\n\nRead-only, in its original command slot. Its supported neighbors remain editable."));
+                                    let code = crate::acmd::preview_excute_stmts(std::slice::from_ref(command)).join("\n");
+                                    ui.weak(format!("{} (kept from the game)", super::canvas::command_name(command)))
+                                        .on_hover_text(format!("{code}\n\nThis action can't be changed here. The others in this block can."));
                                 }
                             });
                         }
@@ -1847,7 +1849,7 @@ fn nodes(
                             ui.push_id(index, |ui| match command {
                                 super::model::EffectCommandSlot::Editable(command) => effect_command_ui_mode(ui, command, options.joints, false, Some(fighter)),
                                 super::model::EffectCommandSlot::Preserved(command) => {
-                                    ui.weak("Preserved native effect").on_hover_text(format!("{command:?}\n\nRead-only, in its original slot. Supported neighboring effects remain editable."));
+                                    ui.weak("Kept from the game").on_hover_text(format!("{command:?}\n\nRead-only, in its original slot. Supported neighboring effects remain editable."));
                                 }
                             });
                         }
@@ -1914,7 +1916,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
                     crate::param_labels::SITUATION_MASK,
                     false,
                 );
-                ui.weak("Captured status").on_hover_text(&call.status);
+                ui.weak("Action when recorded").on_hover_text(&call.status);
             });
         }
         ExcuteStmt::Search(call) => {
@@ -1973,7 +1975,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
             ui.weak("Sets the throw's damage. Apply throw is what hits the held opponent with it.")
                 .on_hover_text(&call.kind);
             ui.horizontal_wrapped(|ui| {
-                ui.label("ID");
+                ui.label("Number");
                 ui.add(egui::DragValue::new(&mut call.id).range(0..=255));
                 ui.label("Damage");
                 ui.add(
@@ -2036,7 +2038,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
                 &mut call.speed_y,
                 "Set reserve velocity",
             );
-            ui.weak("Kinetic reserve").on_hover_text(&call.kinetic_kind);
+            ui.weak("Movement type").on_hover_text(&call.kinetic_kind);
         }
         ExcuteStmt::DamageNoReaction(call) => {
             ui.horizontal_wrapped(|ui| {
@@ -2081,7 +2083,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
                             "Shield setoff",
                         );
                     });
-                ui.label("Hitbox ID");
+                ui.label("Hitbox number");
                 ui.add(egui::DragValue::new(id).range(0..=255));
                 ui.label("Value");
                 ui.add(egui::DragValue::new(value).range(0.0..=999.0).speed(0.1));
@@ -2089,7 +2091,7 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
         }
         ExcuteStmt::Clear(id) | ExcuteStmt::EraseWind(id) => {
             ui.horizontal(|ui| {
-                ui.label("ID");
+                ui.label("Number");
                 ui.add(egui::DragValue::new(id).range(0..=255));
             });
         }
@@ -2399,7 +2401,7 @@ fn volume_ui(
     end: &mut Option<[f32; 3]>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("ID");
+        ui.label("Number");
         ui.add(egui::DragValue::new(id).range(0..=255));
         joint_picker(ui, joint, joints);
         ui.label("Radius");
@@ -2729,7 +2731,7 @@ fn wind_command_ui(ui: &mut Ui, wind: &mut crate::data::WindboxData) {
             );
         }
     });
-    ui.collapsing("Native arguments", |ui| {
+    ui.collapsing("More settings", |ui| {
         ui.horizontal_wrapped(|ui| {
             for index in 1..5 {
                 if let Some(value) = wind.args.get_mut(index) {
@@ -2789,13 +2791,14 @@ fn number_field_ui(
 /// Search aliases describe existing blocks; filtering by track and donor happens first.
 fn native_execute_frame_ui(ui: &mut Ui, frame: &mut f32) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Native execute frame").on_hover_text("Exact sv_animcmd::execute on this agent's Lua state. Not an At motion frame wait, Execute guard, or timer. Direct root placement only;");
+        ui.label("Run at frame")
+            .on_hover_text("Runs the game's frame step here. Only at the top of a lane.");
         ui.add(egui::DragValue::new(frame).range(0.0..=1_000_000.0));
     });
 }
 
 fn native_motion_loop_sync_ui(ui: &mut Ui) {
-    ui.label("Sync motion loop").on_hover_text("Exact native motion-loop synchronization on this agent's Lua state. Not a Repeat loop, timer, or animation-finished event. Direct root Effect, Sound or Expression placement only; The desktop preview does not simulate this scheduler primitive.");
+    ui.label("Match animation loop").on_hover_text("Waits to match the animation loop. Only at the top of the Visuals, Sound or Rumble lane. The preview doesn't play this.");
 }
 
 fn palette_matches(kind: usize, label: &str, query: &str) -> bool {
@@ -2850,15 +2853,15 @@ fn node_choices(track: Track) -> &'static [(usize, &'static str)] {
     match track {
         Track::Game => &[
             (0, "Frame"),
-            (106, "Native execute frame"),
-            (121, "Wait for motion loop"),
+            (106, "Run at frame"),
+            (121, "Wait for animation loop"),
             (1, "Wait"),
             (2, "Clear hitboxes"),
             (3, "Reverse facing"),
             (4, "Repeat"),
             (5, "Hitbox"),
             (6, "Branch"),
-            (15, "Motion rate"),
+            (15, "Animation speed"),
             (17, "Hurtbox status"),
             (18, "Grab volume"),
             (19, "Clear grabs"),
@@ -2945,8 +2948,8 @@ fn node_choices(track: Track) -> &'static [(usize, &'static str)] {
         ],
         Track::Effect => &[
             (0, "Frame"),
-            (107, "Sync motion loop"),
-            (106, "Native execute frame"),
+            (107, "Match animation loop"),
+            (106, "Run at frame"),
             (1, "Wait"),
             (4, "Repeat"),
             (6, "Branch"),
@@ -2973,7 +2976,7 @@ fn node_choices(track: Track) -> &'static [(usize, &'static str)] {
         ],
         Track::Sound => &[
             (0, "Frame"),
-            (107, "Sync motion loop"),
+            (107, "Match animation loop"),
             (1, "Wait"),
             (4, "Repeat"),
             (6, "Branch"),
@@ -2983,9 +2986,9 @@ fn node_choices(track: Track) -> &'static [(usize, &'static str)] {
         ],
         Track::Expression => &[
             (0, "Frame"),
-            (107, "Sync motion loop"),
-            (121, "Wait for motion loop"),
-            (106, "Native execute frame"),
+            (107, "Match animation loop"),
+            (121, "Wait for animation loop"),
+            (106, "Run at frame"),
             (1, "Wait"),
             (102, "Eye flash"),
             (4, "Repeat"),
@@ -4088,8 +4091,8 @@ fn attack_reference_joint_ui(
         });
     });
     ui.data_mut(|data| data.insert_temp(search_id, search));
-    ui.weak("Measured joint / axis tuple")
-        .on_hover_text("Retains the whole native tuple, not independent axis settings. The destination model must contain the joint. Expression calls stay in a direct root Execute block. This is not flat live replay or a projectile direction control.");
+    ui.weak("Body part and direction")
+        .on_hover_text("The body part and direction are kept together as the game uses them. The model must have that body part.");
 }
 
 fn article_motion_ui(
@@ -4118,7 +4121,7 @@ fn article_motion_ui(
                     }
                 }
             });
-        ui.label("Motion");
+        ui.label("Animation");
         egui::ComboBox::from_id_salt("timeline_article_motion")
             .selected_text(motion.as_str())
             .width(180.0)
@@ -4155,7 +4158,7 @@ fn article_motion_ui(
                 ui.data_mut(|data| data.insert_temp(search_id, search));
             });
     });
-    ui.weak("Timed article motion").on_hover_text("Only the engine donor's measured article/motion pairs for this track are offered. The native false/-1.0 tail stays fixed. Expression blocks require direct root Execute placement. This does not generate an article or change a live controller;");
+    ui.weak("Object animation").on_hover_text("Plays an animation on one of this fighter's objects. Only animations the game uses for that object are listed.");
 }
 
 fn native_command_ui(
@@ -4171,13 +4174,13 @@ fn native_command_ui(
             transition_permission_ui(ui, fighter, call);
         }
         ExcuteStmt::AttackAbsApplyThrow => {
-            ui.weak("Uses the native captured throw target")
+            ui.weak("Hits the grabbed opponent")
                 .on_hover_text("Hits the held opponent with the throw damage set above. Only works during a throw, after something has grabbed them.");
         }
         ExcuteStmt::AttackModuleAddReactionFrame { id, frames }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { id, frames } => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Hitbox ID");
+                ui.label("Hitbox number");
                 egui::ComboBox::from_id_salt("reaction_frame_hitbox")
                     .selected_text(id.to_string())
                     .show_ui(ui, |ui| {
@@ -4194,15 +4197,15 @@ fn native_command_ui(
             );
         }
         ExcuteStmt::AttackModuleInitAttackPos { id } => {
-            ui.label(format!("Initialize attack position · ID {id}"))
-                .on_hover_text("Only native ID 0 is source-measured. This is not a projectile position or live handle.");
+            ui.label(format!("Reset hitbox positions · hitbox {id}"))
+                .on_hover_text("Moves the hitbox back to where it started.");
         }
         ExcuteStmt::AttackModuleSetAttackReferenceJointId { kind } => {
             attack_reference_joint_ui(ui, kind, Track::Game);
         }
         ExcuteStmt::AttackModuleSetTargetCategory(id) => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Hitbox ID");
+                ui.label("Hitbox number");
                 egui::ComboBox::from_id_salt("native_attack_target_id")
                     .selected_text(id.attack_id().to_string())
                     .show_ui(ui, |ui| {
@@ -4210,7 +4213,9 @@ fn native_command_ui(
                             ui.selectable_value(id, choice, choice.attack_id().to_string());
                         }
                     });
-                ui.weak("NO_IF").on_hover_text("Exact measured COLLISION_CATEGORY_MASK_NO_IF as u32 argument. This changes the exported AttackModule call for an existing hitbox ID; it does not create a hitbox, choose a live target, or enable a collision callback.");
+                ui.weak("NO_IF").on_hover_text(
+                    "Changes what an existing hitbox can hit. It doesn't make a new hitbox.",
+                );
             });
         }
         ExcuteStmt::AttackModuleSetSize(preset) => {
@@ -4218,12 +4223,24 @@ fn native_command_ui(
                 ui.label("Hitbox size");
                 egui::ComboBox::from_id_salt("native_attack_size")
                     .height(360.0)
-                    .selected_text(format!("ID {} · {}", preset.attack_id(), preset.size_token()))
+                    .selected_text(format!(
+                        "ID {} · {}",
+                        preset.attack_id(),
+                        preset.size_token()
+                    ))
                     .show_ui(ui, |ui| {
                         for choice in crate::data::AttackModuleSizePreset::ALL {
-                            ui.selectable_value(preset, choice, format!("ID {} · {}", choice.attack_id(), choice.size_token()));
+                            ui.selectable_value(
+                                preset,
+                                choice,
+                                format!("ID {} · {}", choice.attack_id(), choice.size_token()),
+                            );
                         }
-                    }).response.on_hover_text("Exact measured hitbox ID / native size tuple. This changes an existing attack through AttackModule::set_size; it does not create an attack.");
+                    })
+                    .response
+                    .on_hover_text(
+                        "Changes the size of an existing hitbox. It doesn't make a new hitbox.",
+                    );
             });
         }
         ExcuteStmt::HitModuleSetStatusAllNormal => {
@@ -4249,7 +4266,9 @@ fn native_command_ui(
                         for choice in crate::data::AttackModuleDamageShakeScale::ALL {
                             ui.selectable_value(scale, choice, choice.source_token());
                         }
-                    }).response.on_hover_text("Measured native numeric values only. This changes the exported AttackModule call, not hitbox damage or a live HUD meter.");
+                    })
+                    .response
+                    .on_hover_text("Values the game uses for this setting.");
             });
         }
         ExcuteStmt::AttackModuleSetNoUniqEffectAll(pair) => {
@@ -4263,13 +4282,15 @@ fn native_command_ui(
                             let (arg2, arg3) = choice.source_args();
                             ui.selectable_value(pair, choice, format!("{arg2}, {arg3}"));
                         }
-                    }).response.on_hover_text("Exact measured arguments to AttackModule::set_no_uniq_effect_all. Their separate meanings are not inferred. this is not a live effect toggle.");
+                    })
+                    .response
+                    .on_hover_text("Turns off the hit sparks this move normally makes.");
             });
         }
         ExcuteStmt::AttackModuleSetNoDamageFlySmokeAll { arg2, arg3 } => {
-            ui.label("Damage fly smoke · native setting");
+            ui.label("Launch smoke");
             ui.weak(format!("Args: {arg2}, {arg3}"))
-                .on_hover_text("Exact measured AttackModule call. No inferred smoke timing or live override is exposed.");
+                .on_hover_text("Turns off the smoke trail behind launched opponents.");
         }
         ExcuteStmt::AttackModuleSetHeightAll { height, arg3 } => {
             ui.horizontal_wrapped(|ui| {
@@ -4297,7 +4318,7 @@ fn native_command_ui(
         } => {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Final finish cut-in");
-                ui.label("Hitbox ID");
+                ui.label("Hitbox number");
                 egui::ComboBox::from_id_salt("native_final_finish_id")
                     .selected_text(id.to_string())
                     .show_ui(ui, |ui| {
@@ -4313,7 +4334,7 @@ fn native_command_ui(
         }
         ExcuteStmt::GrabRebound { enabled } => {
             ui.checkbox(enabled, "Grab rebound")
-                .on_hover_text("Native GrabModule rebound setting;");
+                .on_hover_text("Whether a grab bounces off when it hits a shield or another grab.");
         }
         ExcuteStmt::AttackModuleSetIndexed {
             kind,
@@ -4322,12 +4343,20 @@ fn native_command_ui(
             arg4,
         } => {
             ui.horizontal_wrapped(|ui| {
-                ui.label(match kind { crate::data::AttackModuleSetIndexedKind::NoFinishCamera => "No finish camera", crate::data::AttackModuleSetIndexedKind::ForceReaction => "Force reaction" });
-                ui.label("Hitbox ID");
-                egui::ComboBox::from_id_salt("native_attack_indexed_id").selected_text(id.to_string()).show_ui(ui, |ui| {
-                    for value in 0..=3 { ui.selectable_value(id, value, value.to_string()); }
+                ui.label(match kind {
+                    crate::data::AttackModuleSetIndexedKind::NoFinishCamera => "No finish camera",
+                    crate::data::AttackModuleSetIndexedKind::ForceReaction => "Force reaction",
                 });
-                ui.weak(format!("Args: {arg3}, {arg4}")).on_hover_text("The measured native boolean tail is true, false. Its arguments are retained exactly; their independent engine semantics are not inferred.");
+                ui.label("Hitbox number");
+                egui::ComboBox::from_id_salt("native_attack_indexed_id")
+                    .selected_text(id.to_string())
+                    .show_ui(ui, |ui| {
+                        for value in 0..=3 {
+                            ui.selectable_value(id, value, value.to_string());
+                        }
+                    });
+                ui.weak(format!("Args: {arg3}, {arg4}"))
+                    .on_hover_text("Kept as the game sets it.");
             });
         }
         ExcuteStmt::AttackModuleSetAll { kind, arg2, arg3 } => {
@@ -4335,23 +4364,36 @@ fn native_command_ui(
                 ui.label(match kind {
                     crate::data::AttackModuleSetAllKind::NoDeadAll => "No-dead attack mode",
                     crate::data::AttackModuleSetAllKind::CatchOnlyAll => "Catch-only attack mode",
-                }).on_hover_text("Native AttackModule operation. Only observed argument combinations are offered;");
+                })
+                .on_hover_text("A hitbox setting. Only values the game uses are listed.");
                 egui::ComboBox::from_id_salt("native_attack_all_arguments")
                     .selected_text(format!("Args: {arg2}, {arg3}"))
                     .show_ui(ui, |ui| {
                         for candidate in [false, true] {
-                            if candidate && *kind != crate::data::AttackModuleSetAllKind::NoDeadAll { continue; }
-                            if ui.selectable_label(*arg2 && *arg3 == candidate, format!("true, {candidate}")).clicked() {
+                            if candidate && *kind != crate::data::AttackModuleSetAllKind::NoDeadAll
+                            {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(
+                                    *arg2 && *arg3 == candidate,
+                                    format!("true, {candidate}"),
+                                )
+                                .clicked()
+                            {
                                 *arg2 = true;
                                 *arg3 = candidate;
                             }
                         }
-                    }).response.on_hover_text("The two native boolean arguments are preserved exactly; their independent engine semantics are not inferred.");
+                    })
+                    .response
+                    .on_hover_text("Kept as the game sets them.");
             });
         }
         ExcuteStmt::JostleSetStatus { enabled } => {
-            ui.checkbox(enabled, "Body collision")
-                .on_hover_text("Controls native fighter jostling, not attack hitboxes.");
+            ui.checkbox(enabled, "Body collision").on_hover_text(
+                "Whether this fighter pushes other fighters away. This isn't a hitbox.",
+            );
         }
         ExcuteStmt::FixedJostleArea(call) => fixed_jostle_area_ui(ui, call),
         ExcuteStmt::VisibilitySetInt64 { group, status } => {
@@ -4429,7 +4471,7 @@ fn native_command_ui(
             });
             match call {
                 crate::data::ArticleLifecycleCall::SetVisibilityWhole { visible, .. } => {
-                    ui.checkbox(visible, "Visible").on_hover_text("Changes visibility of all instances of the selected article kind. It does not generate, launch or remove them.");
+                    ui.checkbox(visible, "Visible").on_hover_text("Shows or hides every copy of this object. It doesn't create, fire or remove it.");
                 }
                 crate::data::ArticleLifecycleCall::Shoot { target, .. }
                 | crate::data::ArticleLifecycleCall::ShootExist { target, .. } => {
@@ -4451,32 +4493,38 @@ fn native_command_ui(
                                 }
                             });
                     });
-                    ui.weak("Only objects already out").on_hover_text("Generate an article separately, then launch it at the required frame. Launch and Launch if present retain distinct native APIs and the fixed false tail. Launching does not establish projectile-hit or ownership-transfer events.");
+                    ui.weak("Only objects already out").on_hover_text("Spawn the object first with Spawn object, then launch it here at the frame you want.");
                 }
                 _ => {}
             }
         }
         ExcuteStmt::ItemVisibility { visible } => {
-            ui.checkbox(visible, "Held item visible").on_hover_text("Controls held item slot 0 on this fighter. This is not article generation, equipment ownership, or a collision event.");
+            ui.checkbox(visible, "Held item visible")
+                .on_hover_text("Shows or hides the item this fighter is holding.");
         }
         ExcuteStmt::NativeCall(call) => {
             super::native_calls::inspector_for_fighter(ui, call, fighter)
         }
         ExcuteStmt::ShootItemBullet => {
             ui.label("Fire held item");
-            ui.weak("?").on_hover_text("Runs the native SHOOT_ITEM_BULLET command in a root Game Execute block, not inside Branch or Repeat. Its effect depends on the current item; it does not give the fighter an item, generate an article, or create a projectile-hit trigger. flat live preview cannot send this command.");
+            ui.weak("?").on_hover_text(
+                "Fires the held item, like a Ray Gun or Super Scope. Does nothing without one.",
+            );
         }
         ExcuteStmt::StartInfoFlashEye => {
-            ui.weak("?").on_hover_text("Runs START_INFO_FLASH_EYE at this motion frame in a root Game or Expression Execute block. It has no editable payload. Keep imported category and placement; it is not a fighter-color setting, article spawn, collision trigger or live replay. the result depends on native fighter state.");
+            ui.weak("?")
+                .on_hover_text("Makes the fighter's eyes flash, as in a Final Smash start.");
         }
         ExcuteStmt::CameraZoomOut => {
-            ui.weak("?").on_hover_text("Runs CAM_ZOOM_OUT at this motion frame in a root Game Execute block. There are no editable camera arguments. This is not CAM_ZOOM_OUT_FINAL, a throw-finish zoom-rate setting or a live camera slider. native camera context still controls the result.");
+            ui.weak("?").on_hover_text("Zooms the camera out.");
         }
         ExcuteStmt::StartCutIn => {
-            ui.weak("?").on_hover_text("Runs FT_START_CUTIN at this motion frame in a root Game Execute block. It has no payload and depends on native cinematic context. It does not choose a camera, request a status or create a confirmed-hit event.");
+            ui.weak("?")
+                .on_hover_text("Starts the close-up cut-in, as a Final Smash does.");
         }
         ExcuteStmt::CaptureCutCommon => {
-            ui.weak("Top-level helper").on_hover_text("Runs game_CaptureCutCommon exactly once here. The pinned helper owns its Execute guard and defines the native default absolute Catch attack; it does not create a grab volume or apply throw damage. Keep it outside Execute, Branch and Repeat. Use separate blocks for authored collision volumes and throw application.");
+            ui.weak("Top-level helper")
+                .on_hover_text("Runs the game's usual grab setup.");
         }
         ExcuteStmt::Slope(call) => {
             use crate::data::{SlopeCall, SlopeStatus};
@@ -4527,9 +4575,13 @@ fn native_command_ui(
             if let SlopeCall::Interpolate { trailing_flag, .. } = call {
                 ui.collapsing("Native option", |ui| {
                     let mut present = trailing_flag.is_some();
-                    if ui.checkbox(&mut present, "Include optional flag").changed() { *trailing_flag = present.then_some(false); }
-                    if let Some(value) = trailing_flag { ui.checkbox(value, "On"); }
-                    ui.weak("The optional native argument is preserved separately; its gameplay meaning is not inferred.");
+                    if ui.checkbox(&mut present, "Include optional flag").changed() {
+                        *trailing_flag = present.then_some(false);
+                    }
+                    if let Some(value) = trailing_flag {
+                        ui.checkbox(value, "On");
+                    }
+                    ui.weak("Kept as the game sets it.");
                 });
             }
             ui.weak("Animation alignment");
@@ -4597,7 +4649,7 @@ fn native_command_ui(
         }
         ExcuteStmt::WorkFlag(call) => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Native flag");
+                ui.label("Game switch");
                 native_work_picker(ui, fighter, &mut call.flag, IdentifierKind::WorkFlag);
                 egui::ComboBox::from_id_salt("work_flag_action")
                     .selected_text(if call.action == WorkFlagAction::On {
@@ -4613,7 +4665,7 @@ fn native_command_ui(
         }
         ExcuteStmt::WorkModuleIncInt(call) => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Native counter +1");
+                ui.label("Count up a game value");
                 native_work_picker(ui, fighter, &mut call.slot, IdentifierKind::WorkInt);
             });
         }
@@ -4631,7 +4683,7 @@ fn native_command_ui(
         ExcuteStmt::OptionalHitFeedback(call) => optional_hit_feedback_ui(ui, fighter, call),
         ExcuteStmt::WorkModuleSet(call) if call.kind != WorkModuleSetKind::Int64 => {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Native value");
+                ui.label("Game value");
                 native_work_picker(
                     ui,
                     fighter,
@@ -4706,7 +4758,7 @@ fn article_state_ui(
                 for preset in crate::data::article_status_catalog::presets_for(fighter) {
                     let selected = symbol == preset.article && status == preset.status && *if_present == preset.if_present;
                     if ui.selectable_label(selected, article_state_label(preset.article, preset.status, preset.if_present))
-                        .on_hover_text(format!("{}\n{}\n{}\n{} pinned source calls", preset.article, preset.status, if preset.if_present { "change_status_exist" } else { "change_status · ARTICLE_OPE_TARGET_ALL" }, preset.source_count))
+                        .on_hover_text(format!("Object: {}\nAction: {}\n{}\nUsed {} times in the game's moves", preset.article, preset.status, if preset.if_present { "Only if the object is out" } else { "Every copy of the object" }, preset.source_count))
                         .clicked() {
                         *symbol = preset.article.into();
                         *status = preset.status.into();
@@ -4763,11 +4815,17 @@ fn body_visibility_ui(ui: &mut Ui, fighter: &str, group: &mut String, status: &m
         ui.label("Model state");
         egui::ComboBox::from_id_salt("native_model_visibility")
             .selected_text(body_visibility_label(group, status))
-            .width(180.0).truncate()
+            .width(180.0)
+            .truncate()
             .show_ui(ui, |ui| {
-                for (candidate_group, candidate_status) in crate::data::body_visibility_catalog::pairs_for(fighter) {
-                    if ui.selectable_label(group == candidate_group && status == candidate_status,
-                        body_visibility_label(candidate_group, candidate_status))
+                for (candidate_group, candidate_status) in
+                    crate::data::body_visibility_catalog::pairs_for(fighter)
+                {
+                    if ui
+                        .selectable_label(
+                            group == candidate_group && status == candidate_status,
+                            body_visibility_label(candidate_group, candidate_status),
+                        )
                         .on_hover_text(format!("{candidate_group} / {candidate_status}"))
                         .clicked()
                     {
@@ -4775,7 +4833,9 @@ fn body_visibility_ui(ui: &mut Ui, fighter: &str, group: &mut String, status: &m
                         *status = candidate_status.into();
                     }
                 }
-            }).response.on_hover_text("Complete model-group/state pairs measured for this character's source donor. Labels shorten the native names; they do not infer hidden/visible semantics. New pairs belong in a root Execute block, not a Branch or Repeat. This is not article visibility or a live model command.");
+            })
+            .response
+            .on_hover_text("Model parts and how they're shown, as this fighter's moves use them.");
     });
 }
 
@@ -4785,15 +4845,27 @@ fn finish_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinishCa
         egui::ComboBox::from_id_salt("finish_camera_preset")
             .selected_text(format!("({}, {})", call.arg1, call.arg2))
             .show_ui(ui, |ui| {
-                for preset in crate::data::FINISH_CAMERA_PRESETS.iter().filter(|preset| preset.fighter == fighter) {
-                    ui.selectable_value(call, crate::data::FinishCameraCall {
-                        arg1: preset.arg1.into(), arg2: preset.arg2.into(),
-                    }, format!("({}, {})", preset.arg1, preset.arg2));
+                for preset in crate::data::FINISH_CAMERA_PRESETS
+                    .iter()
+                    .filter(|preset| preset.fighter == fighter)
+                {
+                    ui.selectable_value(
+                        call,
+                        crate::data::FinishCameraCall {
+                            arg1: preset.arg1.into(),
+                            arg2: preset.arg2.into(),
+                        },
+                        format!("({}, {})", preset.arg1, preset.arg2),
+                    );
                 }
-            }).response.on_hover_text("Exact CHECK_FINISH_CAMERA value pairs measured for this donor. The native argument units and axes are not established. this does not expose a flat live camera command.");
+            })
+            .response
+            .on_hover_text(
+                "Camera settings for the finishing hit, as this fighter's moves use them.",
+            );
     });
     if !call.is_measured_for(fighter) {
-        ui.weak("Unmeasured donor pair · Preserved until repaired");
+        ui.weak("Not a setting this fighter uses · kept as it is");
     }
 }
 
@@ -4817,16 +4889,16 @@ fn final_start_camera_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Fin
                 }
             })
             .response
-            .on_hover_text("Exact CHECK_VALID_FINAL_START_CAMERA tuples measured for this donor. The six native arguments have no established labels, axes or units; they stay together. This is not a live camera control or an event trigger.");
+            .on_hover_text("Camera settings for the start of the Final Smash, as this fighter's moves use them.");
     });
     if !call.is_measured_for(fighter) {
-        ui.weak("Unmeasured donor tuple · Preserved until repaired");
+        ui.weak("Not a setting this fighter uses · kept as it is");
     }
 }
 
 fn final_fear_face_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinalFearFaceCall) {
     ui.horizontal_wrapped(|ui| {
-        ui.label("Native argument");
+        ui.label("Setting");
         egui::ComboBox::from_id_salt("final_fear_face_preset")
             .selected_text(&call.argument)
             .show_ui(ui, |ui| {
@@ -4834,14 +4906,18 @@ fn final_fear_face_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::FinalF
                     .iter()
                     .filter(|preset| preset.fighter == fighter)
                 {
-                    ui.selectable_value(&mut call.argument, preset.argument.into(), preset.argument);
+                    ui.selectable_value(
+                        &mut call.argument,
+                        preset.argument.into(),
+                        preset.argument,
+                    );
                 }
             })
             .response
-            .on_hover_text("Exact FT_SET_FINAL_FEAR_FACE integer tokens measured for this donor. The pinned wrapper calls this argument unk; its meaning and units are not established. Existing conditions remain separate Branch blocks; this is not a timer, event trigger or live command.");
+            .on_hover_text("Which scared face opponents make during the Final Smash.");
     });
     if !call.is_measured_for(fighter) {
-        ui.weak("Unmeasured donor argument · Preserved until repaired");
+        ui.weak("Not a setting this fighter uses · kept as it is");
     }
 }
 
@@ -4935,7 +5011,7 @@ fn optional_hit_feedback_ui(
                 if call.kind == OptionalHitFeedbackKind::Effect {
                     for raw in [0x148397b09f, 0x1484fa7486] {
                         ui.selectable_value(&mut call.hash, Hash40Literal::Raw(raw), format!("Raw 0x{raw:x}"))
-                            .on_hover_text("Unresolved raw value retained from native source; no resource name is inferred.");
+                            .on_hover_text("The game uses a name Visionary doesn't know here. It is kept as it is.");
                     }
                 }
                 let custom = matches!(&call.hash, Hash40Literal::Name(name) if !names.contains(&name.as_str()));
@@ -4949,12 +5025,16 @@ fn optional_hit_feedback_ui(
     });
     match &mut call.hash {
         Hash40Literal::Name(name) if !names.contains(&name.as_str()) => {
-            ui.add(egui::TextEdit::singleline(name).hint_text("Resource name…").desired_width(250.0))
-                .on_hover_text("A name value, not Rust code. Must be non-empty, at most 255 UTF-8 bytes and contain no NUL. Resource availability is unverified.");
+            ui.add(
+                egui::TextEdit::singleline(name)
+                    .hint_text("Resource name…")
+                    .desired_width(250.0),
+            )
+            .on_hover_text("A name, like se_common_punch_kick_swing_m.");
         }
         Hash40Literal::Raw(raw) => {
             ui.monospace(format!("0x{raw:x}"))
-                .on_hover_text("Unresolved raw hash. All 64 bits are preserved; the editor does not guess a name. Choose a named resource explicitly to replace it.");
+                .on_hover_text("The game uses a name Visionary doesn't know here. It is kept as it is; pick a named one to replace it.");
         }
         _ => {}
     }
@@ -5007,7 +5087,7 @@ fn slow_whole_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Slo
                 return;
             }
             ui.label("Set slowdown")
-                .on_hover_text("SlowModule::set_whole(agent.module_accessor, multiplier, frames)");
+                .on_hover_text("Slows the whole match by this much, for this many frames.");
             let mut selected = (*multiplier, *frames);
             egui::ComboBox::from_id_salt("slow_whole_pair")
                 .selected_text(slow_whole_pair_label(selected.0, selected.1))
@@ -5024,7 +5104,7 @@ fn slow_whole_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Slo
         }
         SlowWholeCall::Clear if known_owner => {
             ui.label("Clear slowdown")
-                .on_hover_text("SlowModule::clear_whole(agent.module_accessor)");
+                .on_hover_text("Ends the slowdown.");
         }
         SlowWholeCall::Clear => {
             ui.weak("Unsupported slowdown").on_hover_text(
@@ -5058,9 +5138,10 @@ fn source_work_module_set_ui(
         call.slot
     );
     if let Err(error) = native::validate_source_only_work_module_set(fighter, call) {
-        ui.weak("Unsupported native setter").on_hover_text(format!(
-            "{provenance}\n{error}\nImported arguments are retained."
-        ));
+        ui.weak("A game setting Visionary can't edit yet")
+            .on_hover_text(format!(
+                "{provenance}\n{error}\nImported arguments are retained."
+            ));
         return;
     }
     let Some(descriptor) =
@@ -5098,9 +5179,10 @@ fn item_pull_command_ui(ui: &mut Ui, fighter: &str, call: &mut crate::data::Work
         call.receiver, call.value, call.slot
     );
     if let Err(error) = native::validate_source_only_work_module_set(fighter, call) {
-        ui.weak("Unsupported native setter").on_hover_text(format!(
-            "{provenance}\n{error}\nImported arguments are retained."
-        ));
+        ui.weak("A game setting Visionary can't edit yet")
+            .on_hover_text(format!(
+                "{provenance}\n{error}\nImported arguments are retained."
+            ));
         return;
     }
     if call.slot == native::ITEM_GRASS_PULL_NEXT_STEP_SLOT {
@@ -5182,7 +5264,7 @@ fn expression_command_ui(ui: &mut Ui, expression: &mut crate::data::ExpressionCa
                 ui.weak("Imported loop option")
                     .on_hover_text(looped.as_str());
             }
-            ui.weak("Native target").on_hover_text(format!(
+            ui.weak("Target").on_hover_text(format!(
                 "{target}\nThe measured target is retained; no live object ID is authored here."
             ));
         }
@@ -5483,7 +5565,7 @@ fn effect_spawn_variant_ui_mode(
                         ui.close();
                     }
                 }
-            }).response.on_hover_text(format!("{before}\n\nChanging mode preserves graphic, joint and transform, and resets only the mode-specific native tail to its published defaults. Native execution needs separate validation."));
+            }).response.on_hover_text(format!("{before}\n\nChanging mode keeps the graphic, body part and position, and resets the other settings to their defaults."));
         }).response.on_disabled_hover_text("Imported mixed groups keep their original command family. Graphic and transform properties remain editable.");
     });
     ui.data_mut(|data| data.insert_temp(search_id, search));
@@ -5502,7 +5584,7 @@ fn effect_spawn_variant_ui_mode(
     let Some(layout) = crate::acmd::effect_spawn_layout(spawn_func) else {
         return;
     };
-    egui::CollapsingHeader::new("Native arguments")
+    egui::CollapsingHeader::new("More settings")
         .id_salt("effect_spawn_native_arguments")
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -5658,7 +5740,7 @@ pub(crate) fn screen_effect_preset_ui(ui: &mut Ui, preset_id: &mut String) -> bo
                     .max_height(240.0).show_rows(ui, ui.spacing().interact_size.y, choices.len(), |ui, rows| {
                         for preset in &choices[rows] {
                             if ui.selectable_value(preset_id, preset.id.to_owned(), screen_effect_label(preset))
-                                .on_hover_text(format!("{}\nFlags: {}, {}, {}\nThe graphic must be available in the mod's resources.", preset.effect_name, preset.flags[0], preset.flags[1], preset.flags[2]))
+                                .on_hover_text(format!("{}\nSettings: {}, {}, {}\nThe graphic must be in the game or the mod.", preset.effect_name, preset.flags[0], preset.flags[1], preset.flags[2]))
                                 .clicked() {
                                 ui.close();
                             }
@@ -5667,7 +5749,7 @@ pub(crate) fn screen_effect_preset_ui(ui: &mut Ui, preset_id: &mut String) -> bo
             });
             if choices.is_empty() { ui.weak("No matching screens"); }
             ui.data_mut(|data| data.insert_temp(search_id, search));
-        }).response.on_hover_text("One of 110 measured screen-effect calls. Selecting a graphic retains its complete native flag tuple. This does not create a returned effect handle or enable live preview.");
+        }).response.on_hover_text("A screen effect the game uses.");
     *preset_id != before
 }
 
@@ -5678,7 +5760,9 @@ pub(crate) fn camera_depth_influence_ui(ui: &mut Ui, disabled: &mut bool) -> boo
         .show_ui(ui, |ui| {
             ui.selectable_value(disabled, false, "Enabled");
             ui.selectable_value(disabled, true, "Disabled");
-        }).response.on_hover_text("Native ColorBlendModule camera-depth control. Enabled passes false; Disabled passes true.");
+        })
+        .response
+        .on_hover_text("Whether the fighter's tint fades with distance from the camera.");
     *disabled != before
 }
 
@@ -5722,10 +5806,10 @@ pub(crate) fn native_effect_off_preset_ui(
             {
                 count += 1;
                 ui.selectable_value(preset_id, preset.id.to_owned(), native_effect_off_label(preset))
-                    .on_hover_text(format!("{}\nOwner: {}\nFlags: {}, {}\nReads the effect kind from this registered slot; no Work value is written.", preset.work_symbol, preset.fighter, preset.flags[0], preset.flags[1]));
+                    .on_hover_text(format!("{}\nFighter: {}\nSettings: {}, {}\nUses the effect this fighter has stored here.", preset.work_symbol, preset.fighter, preset.flags[0], preset.flags[1]));
             }
-            if count == 0 { ui.weak("No measured presets for this donor"); }
-        }).response.on_hover_text("Closed native effect-off presets for this character's donor. The two literal flags stay together. This is not an arbitrary Work-slot or effect-handle editor, and does not enable flat live preview.");
+            if count == 0 { ui.weak("This fighter has none"); }
+        }).response.on_hover_text("Effects this fighter's moves turn off.");
     *preset_id != before
 }
 
@@ -5758,7 +5842,7 @@ fn effect_command_ui_mode(
         let compatible = crate::data::EffectFollowWorkPreset::by_work_symbol(work_symbol)
             .is_some_and(|preset| Some(preset.fighter) == fighter);
         ui.horizontal_wrapped(|ui| {
-            ui.label("Follow native effect");
+            ui.label("Effect that follows the fighter");
             ui.weak(if compatible {
                 format!("{} · {bone_name}", native_effect_slot_label(work_symbol))
             } else {
@@ -5845,7 +5929,7 @@ fn effect_command_ui_mode(
                             values.resize(count, 1.0);
                         }
                     }
-                }).response.on_hover_text("Preserves the native one-, two- or three-value scale form. Changing the count retains existing components and initializes new ones to 1.");
+                }).response.on_hover_text("Use one value to scale evenly, or two or three to stretch it.");
             for (index, value) in values.iter_mut().enumerate() {
                 number_field_ui(ui, ("effect_scale_component", index), ["X", "Y", "Z"][index.min(2)], value, 0.1, None);
             }
@@ -5867,14 +5951,14 @@ fn effect_command_ui_mode(
         EffectMacro::Control(EffectControl::DetachKind { effect_name, unk }) => {
             ui.label("Graphic");
             ui.add(egui::TextEdit::singleline(effect_name).desired_width(130.0));
-            ui.label("Native argument");
+            ui.label("Setting");
             ui.add(egui::DragValue::new(unk).range(-1024..=1024))
-                .on_hover_text("The native argument is retained without assigning an unverified gameplay meaning.");
+                .on_hover_text("Kept as the game sets it.");
         }
         EffectMacro::Control(EffectControl::SetDisableRenderOffsetLast
             | EffectControl::EnableSyncInitPosLast) => {
             ui.weak("Last spawned effect")
-                .on_hover_text("Ordered native control with no arguments. Does not create an effect or support flat live injection.");
+                .on_hover_text("A game effect setting with nothing to change.");
         }
         EffectMacro::Control(EffectControl::ReqScreen { preset_id }) => {
             ui.label("Screen graphic");
@@ -5888,7 +5972,7 @@ fn effect_command_ui_mode(
             camera_depth_influence_ui(ui, value);
         }
         EffectMacro::Control(EffectControl::OffKindWork { preset_id }) => {
-            ui.label("Native effect off");
+            ui.label("End visual effect");
             native_effect_off_preset_ui(ui, fighter, preset_id);
         }
         EffectMacro::NativeCall(call) => super::native_calls::inspector(ui, call),
@@ -5962,7 +6046,7 @@ fn reusable_trail(graph: &MoveGraph) -> Option<crate::data::EffectMacro> {
 
 fn trail_command_ui(ui: &mut Ui, command: &mut crate::data::EffectMacro, joints: &[String]) {
     let Ok(mut value) = super::trails::settings(command) else {
-        ui.weak("Preserved native trail");
+        ui.weak("Kept from the game");
         return;
     };
     let before = value.clone();
@@ -6157,13 +6241,7 @@ pub(super) fn node_edit_error(ui: &mut Ui, error: &str) {
     }
     ui.horizontal_wrapped(|ui| {
         // A short message is shown as it is; only a long one folds away.
-        let first: String = error
-            .lines()
-            .next()
-            .unwrap_or(error)
-            .chars()
-            .take(70)
-            .collect();
+        let first: String = super::plain::error_words(error).chars().take(90).collect();
         ui.colored_label(egui::Color32::LIGHT_RED, first)
             .on_hover_text(error);
         ui.menu_button("Details", |ui| {
@@ -6222,7 +6300,7 @@ fn hit_check_ui(
             .show_ui(ui, |ui| {
                 ui.selectable_value(query, InflictionQuery::CurrentHitlag, "During hitlag");
                 ui.selectable_value(query, InflictionQuery::CurrentStatus, "Current status");
-            }).response.on_hover_text("During hitlag samples AttackModule::is_infliction; Current status samples is_infliction_status. The pinned SDK documents their hitlag/status windows. Hit and Shield use distinct native masks. This runs only where the source branch executes, not on every collision. It has no victim, projectile, damage, hitbox ID, or duplicate-hit tracking; it is not an On attack hit event. Use Not to test absence.");
+            }).response.on_hover_text("During hitlag checks right as the hit lands; Current action checks the whole move.");
     });
 }
 
@@ -6426,12 +6504,14 @@ fn condition_controls(
         }
         MoveCondition::AttackInfliction { query, mask } => hit_check_ui(ui, query, mask),
         MoveCondition::NativeLrNegative => {
-            ui.weak("Native facing comparison").on_hover_text(
+            ui.weak("Which way the fighter faces").on_hover_text(
                 "Tests get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 at this point in the move. The exact native sign test is retained without guessing Left or Right. Use Then/Else or Not to compose it. this is not a live event or a writable value. Sound tracks are unsupported.",
             );
         }
         MoveCondition::MotionChanging => {
-            ui.weak("Native motion-change state").on_hover_text("Exact MotionModule::is_changing read at this point in a Game track. It is a condition, not a motion-change event or a frame clock. other tracks remain unsupported.");
+            ui.weak("The animation just changed").on_hover_text(
+                "True on the frame the animation switches. Only in the Action lane.",
+            );
         }
         MoveCondition::ArticleExists { symbol } => {
             work_symbol_picker(
@@ -6457,7 +6537,7 @@ fn condition_controls(
             );
             ui.checkbox(expected, "Is on");
             if super::native_work::read_only_condition_flags().contains(&symbol.as_str()) {
-                ui.weak("Read-only").on_hover_text("Reads this exact native flag at this point in the move. Set tests true; unchecked tests false.");
+                ui.weak("Read-only").on_hover_text("Checks this game switch here. Ticked checks it is on; unticked checks it is off.");
             }
         }
         MoveCondition::Stick {
@@ -6576,7 +6656,7 @@ fn condition_controls(
                         .response
                         .on_hover_text(choice.as_str());
                     if !enum_choices.iter().any(|entry| entry.symbol == choice) {
-                        ui.weak("Choose a value for this source").on_hover_text(
+                        ui.weak("Choose a value").on_hover_text(
                             "The saved native choice is preserved, but does not match this source. Select a reviewed choice or switch to Number before Apply."
                         );
                     }
@@ -7314,6 +7394,16 @@ mod tests {
         );
     }
 
+    fn text_ends_with(shape: &egui::epaint::Shape, end: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(text) => text.galley.job.text.ends_with(end),
+            egui::epaint::Shape::Vec(shapes) => {
+                shapes.iter().any(|shape| text_ends_with(shape, end))
+            }
+            _ => false,
+        }
+    }
+
     fn text_position(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
         match shape {
             egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
@@ -7800,7 +7890,7 @@ mod tests {
         let position = output
             .shapes
             .iter()
-            .find_map(|shape| text_position(&shape.shape, "Native arguments"))
+            .find_map(|shape| text_position(&shape.shape, "More settings"))
             .expect("native header must be visible");
         for pressed in [true, false] {
             render_effect_inspector(
@@ -8308,11 +8398,10 @@ mod tests {
                     "mixed block offered {forbidden}"
                 );
             }
-            assert!(output.shapes.iter().any(|shape| text_position(
-                &shape.shape,
-                "Preserved command"
-            )
-            .is_some()));
+            assert!(output
+                .shapes
+                .iter()
+                .any(|shape| text_ends_with(&shape.shape, "(kept from the game)")));
             assert!(output
                 .shapes
                 .iter()
@@ -8419,7 +8508,7 @@ mod tests {
                     "mixed effects offered {forbidden}"
                 );
             }
-            for visible in ["Preserved native effect", "Rate", "Camera depth influence"] {
+            for visible in ["Kept from the game", "Rate", "Camera depth influence"] {
                 assert!(
                     output
                         .shapes
@@ -8512,7 +8601,7 @@ mod tests {
             (35, "Generate article", "SPAWN projectile"),
             (36, "Remove article", "projectile despawn"),
             (17, "Hurtbox status", "invulnerability"),
-            (15, "Motion rate", "animation speed"),
+            (15, "Animation speed", "animation speed"),
             (21, "Set velocity", "momentum set"),
             (101, "Send event", "custom trigger"),
             (90, "Slow opponents", "opponent slow"),
