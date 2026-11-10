@@ -1043,6 +1043,39 @@ pub const COMMON_WORK: [CommonWork; 9] = {
     ]
 };
 
+/// A fighter's own game value in plain words: `FLAG_ONE_WINGED_ACTIVATED` reads
+/// "One winged activated". Each name is made once and kept.
+pub fn plain_work_name(name: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let Ok(mut names) = NAMES.get_or_init(Default::default).lock() else {
+        return "Game value";
+    };
+    if let Some(label) = names.get(name) {
+        return label;
+    }
+    let words = name
+        .trim_start_matches("INT_")
+        .trim_start_matches("FLOAT_")
+        .trim_start_matches("FLAG_")
+        .replace('_', " ")
+        .to_lowercase()
+        .replace("special n", "neutral special")
+        .replace("special s", "side special")
+        .replace("special hi", "up special")
+        .replace("special lw", "down special")
+        .replace("attack air", "aerial")
+        .replace(" num", " count");
+    let mut letters = words.chars();
+    let label: String = letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    });
+    let label: &'static str = Box::leak(label.into_boxed_str());
+    names.insert(name.to_owned(), label);
+    label
+}
+
 pub fn common_work(symbol: &str) -> Option<&'static CommonWork> {
     COMMON_WORK.iter().find(|row| row.symbol == symbol)
 }
@@ -1307,15 +1340,9 @@ impl NativeInput {
                         return label;
                     }
                 }
-                let marker = match *kind {
-                    NativeKind::Float => "_INSTANCE_WORK_ID_FLOAT_",
-                    NativeKind::Int => "_INSTANCE_WORK_ID_INT_",
-                    NativeKind::Flag => "_INSTANCE_WORK_ID_FLAG_",
-                };
                 symbol
-                    .split_once(marker)
-                    .map(|(_, suffix)| suffix)
-                    .unwrap_or(symbol)
+                    .split_once("_INSTANCE_WORK_ID_")
+                    .map_or(symbol.as_str(), |(_, name)| plain_work_name(name))
             }
             Self::Unsupported(symbol) => symbol,
         }
@@ -2864,7 +2891,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&generic).unwrap(), wire);
         let decoded: NativeInput = serde_json::from_str(&wire).unwrap();
         assert_eq!(decoded, generic);
-        assert_eq!(decoded.label(), "BURNER_ENERGY_VALUE");
+        assert_eq!(decoded.label(), "Burner energy value");
         assert_eq!(generic.canonical(), generic);
 
         let alias: NativeInput = serde_json::from_str(

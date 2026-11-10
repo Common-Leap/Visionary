@@ -68,25 +68,10 @@ pub fn all_for_fighter(fighter: &str) -> &'static [NativeGimmick] {
             {
                 continue;
             }
-            let words = name
-                .trim_start_matches("INT_")
-                .trim_start_matches("FLOAT_")
-                .trim_start_matches("FLAG_")
-                .replace('_', " ")
-                .to_lowercase()
-                .replace("special n", "neutral special")
-                .replace("special s", "side special")
-                .replace("special hi", "up special")
-                .replace("special lw", "down special")
-                .replace("attack air", "aerial")
-                .replace(" num", " count");
-            let mut letters = words.chars();
-            let label: String = letters.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(letters).collect()
-            });
+            let label = super::native_inputs::plain_work_name(name);
             list.push(NativeGimmick {
                 fighter: entry.fighter,
-                label: Box::leak(label.into_boxed_str()),
+                label,
                 symbol: entry.symbol,
                 kind,
                 range: None,
