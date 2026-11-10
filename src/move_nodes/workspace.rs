@@ -13,6 +13,8 @@ pub(super) struct CharacterDraft {
 #[derive(Clone)]
 pub(in crate::move_nodes) enum PaletteBlock {
     Node(usize),
+    /// A few lines of typed code.
+    Code,
     Preset(Preset),
     NewController,
     Character(CharacterBlock),
@@ -183,6 +185,14 @@ fn catalog(fighter: &str, track: Track, draft: &MoveGraph) -> Vec<Entry> {
             block: PaletteBlock::Node(kind),
         })
         .collect();
+    result.insert(
+        0,
+        Entry {
+            label: "Code".into(),
+            group: "Flow",
+            block: PaletteBlock::Code,
+        },
+    );
     if track == Track::Effect && reusable_trail(draft).is_some() {
         result.push(Entry {
             label: "Reuse sword trail".into(),
@@ -929,6 +939,11 @@ impl NodeEditor {
         position: [f32; 2],
         after: Option<String>,
     ) {
+        if matches!(block, PaletteBlock::Code) {
+            self.new_code = Some((track, String::new()));
+            self.code_error.clear();
+            return;
+        }
         let previous = self.draft.clone();
         let key = match block {
             PaletteBlock::Node(kind) => {
@@ -1007,6 +1022,7 @@ impl NodeEditor {
                 });
                 format!("node:{id}")
             }
+            PaletteBlock::Code => return,
             PaletteBlock::Preset(_) | PaletteBlock::NewController => {
                 let Some(character) = &mut self.character else {
                     return;

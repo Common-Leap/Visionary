@@ -22,6 +22,10 @@ pub(in crate::move_nodes) type FrameMarks = Vec<(f32, f32)>;
 
 const LANE_HEADER: f32 = 34.0;
 const ROW_HEIGHT: f32 = 92.0;
+
+fn row_height() -> f32 {
+    ROW_HEIGHT + crate::move_nodes::canvas::code_extra().y
+}
 const GAP: f32 = 32.0;
 
 /// Frame and Wait cards repeat what the frame ruler shows, so the workspace draws them narrow.
@@ -127,7 +131,7 @@ pub(in crate::move_nodes) fn project_workspace(
         (if compact.contains(&block.key) {
             COMPACT_CARD
         } else {
-            CARD
+            CARD + crate::move_nodes::canvas::code_extra().x
         }) + GAP
     };
     // Offset of each block within its frame column. Rows are nesting depths, so a branch body
@@ -189,12 +193,12 @@ pub(in crate::move_nodes) fn project_workspace(
         for (mut block, depth, frame, offset) in placed {
             block.position = [
                 column(frame) + offset,
-                top + LANE_HEADER + depth as f32 * ROW_HEIGHT,
+                top + LANE_HEADER + depth as f32 * row_height(),
             ];
             depth_max = depth_max.max(depth);
             blocks.push(block);
         }
-        let bottom = top + LANE_HEADER + (depth_max as f32 + rows) * ROW_HEIGHT + 8.0;
+        let bottom = top + LANE_HEADER + (depth_max as f32 + rows) * row_height() + 8.0;
         lanes.push(Lane {
             track: Some(track),
             label: label.into(),
@@ -408,6 +412,7 @@ impl CanvasState {
                     detail = format!("{detail} · {}", error.message);
                 }
                 blocks.push(Block {
+                    code: String::new(),
                     internal: "",
                     key: key(&node.reference),
                     title: crate::move_nodes::plain::block_name(&title).to_owned(),

@@ -77,12 +77,17 @@ pub struct CanvasState {
     hover_error: String,
     viewport: Option<Vec2>,
     search: String,
+    /// Each card shows the lines of code it writes.
+    pub(super) show_code: bool,
+    code_cache: std::collections::HashMap<String, (u64, String)>,
     center_on: Option<String>,
     /// Pan just enough to bring this block into view (after inserting it off-screen).
     pub(super) reveal: Option<String>,
 }
 
 struct Block {
+    /// The block's own lines of code, filled only while Show code is on.
+    code: String,
     internal: &'static str,
     key: String,
     title: String,
@@ -160,6 +165,7 @@ impl CanvasState {
             self.zoom = 1.0;
             self.fit = true;
         }
+        SHOW_CODE.store(self.show_code, std::sync::atomic::Ordering::Relaxed);
         let (mut blocks, mut wires) = if self.workspace {
             let (blocks, wires, lanes, frame_marks, compact) = project_workspace(graph);
             self.lanes = lanes;
@@ -177,6 +183,9 @@ impl CanvasState {
                 block.detail.clear();
             }
         }
+        if self.show_code {
+            self.fill_code(graph, &mut blocks);
+        }
         self.reconcile_selection(&blocks);
         if self.workspace
             && !ui.ctx().text_edit_focused()
@@ -192,6 +201,13 @@ impl CanvasState {
                 self.zoom = (self.zoom * 1.25).min(1.8);
             }
             if ui.small_button("Fit").clicked() {
+                self.fit = true;
+            }
+            if ui
+                .toggle_value(&mut self.show_code, "Show code")
+                .on_hover_text("Show the lines of code each block writes, inside the block")
+                .changed()
+            {
                 self.fit = true;
             }
             if ui.small_button("Arrange").clicked() {
@@ -776,11 +792,32 @@ impl CanvasState {
                 ui.visuals().text_color().gamma_multiply(0.65),
                 rect.width() - 24.0 * self.zoom,
             );
+            let code_y = detail_y + detail.size().y + 6.0 * self.zoom;
             text_painter.galley(
                 rect.min + Vec2::new(12.0 * self.zoom, detail_y),
                 detail,
                 Color32::PLACEHOLDER,
             );
+            if self.show_code && !block.code.is_empty() {
+                let code_rect = Rect::from_min_max(
+                    rect.min + Vec2::new(8.0 * self.zoom, code_y),
+                    rect.max - Vec2::splat(8.0 * self.zoom),
+                );
+                if code_rect.height() > 4.0 {
+                    painter.rect_filled(code_rect, 3.0, ui.visuals().extreme_bg_color);
+                    let code = painter.with_clip_rect(code_rect.intersect(area)).layout(
+                        block.code.clone(),
+                        FontId::monospace(9.5 * self.zoom),
+                        ui.visuals().text_color().gamma_multiply(0.85),
+                        code_rect.width() - 8.0 * self.zoom,
+                    );
+                    painter.with_clip_rect(code_rect.intersect(area)).galley(
+                        code_rect.min + Vec2::splat(4.0 * self.zoom),
+                        code,
+                        Color32::PLACEHOLDER,
+                    );
+                }
+            }
             let handles = block
                 .inputs
                 .iter()
@@ -988,16 +1025,70 @@ pub(super) fn story_caption(node: &MoveNode) -> String {
 }
 
 const CARD: f32 = 180.0;
+
+static SHOW_CODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How much bigger a card is while it shows its code.
+pub(super) fn code_extra() -> Vec2 {
+    if SHOW_CODE.load(std::sync::atomic::Ordering::Relaxed) {
+        Vec2::new(120.0, 96.0)
+    } else {
+        Vec2::ZERO
+    }
+}
 const COMPACT_CARD: f32 = 96.0;
 
 impl CanvasState {
+    /// Fills each move block's code, recompiling only blocks that changed.
+    fn fill_code(&mut self, graph: &MoveGraph, blocks: &mut [Block]) {
+        use std::hash::{Hash, Hasher};
+        for block in blocks {
+            let Some(id) = block
+                .key
+                .strip_prefix("node:")
+                .and_then(|id| id.parse().ok())
+            else {
+                continue;
+            };
+            let Some((source, node)) = graph.tracks.iter().find_map(|source| {
+                super::flow::find_node(&source.nodes, id).map(|node| (source, node))
+            }) else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_string(node)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            let hash = hasher.finish();
+            let code = match self.code_cache.get(&block.key) {
+                Some((seen, code)) if *seen == hash => code.clone(),
+                _ => {
+                    let code = super::timeline::block_code(&self.fighter, source, node);
+                    self.code_cache
+                        .insert(block.key.clone(), (hash, code.clone()));
+                    code
+                }
+            };
+            // Cards drop the boilerplate every call repeats; the Code editor shows it all.
+            block.code = if self.compact_cards.contains(&block.key) {
+                String::new()
+            } else {
+                code.replace("agent.module_accessor, ", "")
+                    .replace("agent.lua_state_agent, ", "")
+                    .replace("(agent, ", "(")
+                    .replace("(agent)", "()")
+                    .replace("macros::", "")
+            };
+        }
+    }
+
     fn card_size(&self, block: &Block) -> Vec2 {
         let width = if self.compact_cards.contains(&block.key) {
             COMPACT_CARD
         } else if block.key.contains(":state/") {
             220.0
         } else {
-            CARD
+            CARD + code_extra().x
         };
         Vec2::new(width, block_height(block))
     }
@@ -1006,6 +1097,8 @@ impl CanvasState {
 fn block_height(block: &Block) -> f32 {
     if block.key.contains(":state/") {
         96.0
+    } else if block.key.starts_with("node:") {
+        76.0 + code_extra().y
     } else {
         76.0
     }
@@ -1143,7 +1236,9 @@ pub(super) fn effect_caption(command: &crate::data::EffectMacro) -> (&'static st
                 bone_name2.as_deref().unwrap_or(bone_name)
             ),
         ),
-        EffectMacro::AfterImageOff { arg } => ("End sword trail", format!("Native control {arg}")),
+        EffectMacro::AfterImageOff { arg } => {
+            ("End sword trail", format!("fades over {arg} frames"))
+        }
         EffectMacro::LastEffectSetRate { rate } => {
             ("Effect rate", format!("{rate}× · last effect"))
         }
@@ -1200,7 +1295,7 @@ pub(super) fn effect_caption(command: &crate::data::EffectMacro) -> (&'static st
             "Fighter color",
             command.to_ascii_lowercase().replace('_', " "),
         ),
-        _ => ("Imported effect", "Native command".into()),
+        _ => ("Imported effect", String::new()),
     }
 }
 
@@ -1242,8 +1337,10 @@ pub(super) fn command_caption(command: &crate::data::ExcuteStmt) -> (&'static st
         ExcuteStmt::Attack(call) => (
             "Create hitbox",
             format!(
-                "{}% damage · {} · slot {}",
-                call.damage, call.bone_name, call.id
+                "{}% damage · size {} · on the {}",
+                call.damage,
+                call.size,
+                super::plain::bone_words(&call.bone_name)
             ),
         ),
         ExcuteStmt::AttackAbs(call) => (
@@ -1582,8 +1679,81 @@ fn variant_name(command: &impl std::fmt::Debug) -> String {
     name
 }
 
+/// Captions that only say "something from the game"; the code itself says more.
+const VAGUE: [&str; 14] = [
+    "Native call",
+    "Native setter",
+    "Native flag",
+    "Work flag",
+    "Notify event",
+    "Native slowdown",
+    "Opaque source line",
+    "Native structure",
+    "Read work flag",
+    "Read work float",
+    "Read work integer",
+    "Set native flag",
+    "Clear native flag",
+    "Native shield state",
+];
+
+/// What a command does, read from the code it writes, when its caption is vague.
+fn command_words(command: &crate::data::ExcuteStmt) -> Option<String> {
+    let (title, detail) = command_caption(command);
+    let title = if title == "Engine action" && detail == "Raw" {
+        "Native call"
+    } else {
+        title
+    };
+    // Shared game pieces are captioned by their internal names, which contain '_'.
+    if !VAGUE.contains(&title) && !title.contains('_') {
+        return None;
+    }
+    let line = crate::acmd::preview_excute_stmts(std::slice::from_ref(command))
+        .into_iter()
+        .map(|line| line.trim().to_owned())
+        .find(|line| !line.is_empty())?;
+    Some(super::plain::code_words(&line))
+}
+
+/// What a kept piece of the game's script does, read from its first line.
+fn statement_words(statement: &crate::data::AcmdStmt) -> String {
+    let text = crate::acmd::preview_game_fn(
+        &crate::data::AcmdScript {
+            stmts: vec![statement.clone()],
+        },
+        "block",
+    );
+    // Skip the function header and the game's "if the move is running" wrapper.
+    text.lines()
+        .skip_while(|line| !line.trim_end().ends_with('{'))
+        .skip(1)
+        .find(|line| {
+            !line.trim().starts_with("if is_excute")
+                && !line.trim().starts_with("if macros::is_excute")
+        })
+        .map_or_else(|| "Game code".into(), super::plain::code_words)
+}
+
+/// An effect command's name, read from its code when the caption is an internal name.
+fn effect_name(command: &crate::data::EffectMacro) -> String {
+    let title = effect_caption(command).0;
+    match command {
+        crate::data::EffectMacro::NativeCall(call)
+            if VAGUE.contains(&title) || title.contains('_') =>
+        {
+            super::plain::call_words(&call.callee, &call.arguments)
+        }
+        crate::data::EffectMacro::Raw(line) => super::plain::code_words(line),
+        _ => super::plain::block_name(title).to_owned(),
+    }
+}
+
 /// The short name a multi-command block lists for one command.
 fn command_name(command: &crate::data::ExcuteStmt) -> String {
+    if let Some(words) = command_words(command) {
+        return words;
+    }
     match command_caption(command) {
         ("Engine action", detail) => super::plain::block_name(&detail).to_owned(),
         (title, _) => super::plain::block_name(title).to_owned(),
@@ -1598,16 +1768,8 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
             NodeKind::NativeExecuteFrame { frame } => {
                 ("Execute at frame", format!("Frame {frame}"), TIME)
             }
-            NodeKind::NativeWaitLoopClear => (
-                "Wait for motion loop",
-                "Native wait_loop_clear · source export".into(),
-                TIME,
-            ),
-            NodeKind::NativeMotionLoopSync => (
-                "Sync motion loop",
-                "Native timing · source export".into(),
-                TIME,
-            ),
+            NodeKind::NativeWaitLoopClear => ("Wait for motion loop", String::new(), TIME),
+            NodeKind::NativeMotionLoopSync => ("Sync motion loop", String::new(), TIME),
             NodeKind::Wait { frames } => ("Wait", format!("{frames} motion frames"), TIME),
             NodeKind::MotionRate { rate } => ("Motion rate", format!("{rate}"), TIME),
             NodeKind::BareCommand { command }
@@ -1619,8 +1781,9 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
                     ACTION,
                 )
             }
-            NodeKind::BareCommand { .. } => {
-                ("Top-level command", "Runs outside Execute".into(), ACTION)
+            NodeKind::BareCommand { command } => {
+                let (title, detail) = command_caption(command);
+                (title, detail, ACTION)
             }
             NodeKind::Execute { commands }
                 if matches!(
@@ -1649,48 +1812,37 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
             NodeKind::MixedExecute { commands } => (
                 "Imported actions",
                 summarize(
-                    commands.iter().filter_map(|command| match command {
-                        super::model::MoveCommand::Editable(command) => Some(command_name(command)),
-                        super::model::MoveCommand::Preserved(_) => None,
+                    commands.iter().map(|command| match command {
+                        super::model::MoveCommand::Editable(command)
+                        | super::model::MoveCommand::Preserved(command) => command_name(command),
                     }),
-                    commands
-                        .iter()
-                        .filter(|command| {
-                            matches!(command, super::model::MoveCommand::Preserved(_))
-                        })
-                        .count(),
+                    0,
                 ),
                 ACTION,
             ),
             NodeKind::EffectExecute { commands } if commands.len() == 1 => {
                 let (title, detail) = effect_caption(&commands[0]);
-                (title, detail, ACTION)
+                if effect_name(&commands[0]) != super::plain::block_name(title) {
+                    ("Native structure", effect_name(&commands[0]), ACTION)
+                } else {
+                    (title, detail, ACTION)
+                }
             }
             NodeKind::EffectExecute { commands } => (
                 "Visual effects",
-                summarize(
-                    commands
-                        .iter()
-                        .map(|command| effect_caption(command).0.to_string()),
-                    0,
-                ),
+                summarize(commands.iter().map(effect_name), 0),
                 ACTION,
             ),
             NodeKind::MixedEffectExecute { commands, .. } => (
                 "Imported effects",
                 summarize(
-                    commands.iter().filter_map(|command| match command {
-                        super::model::EffectCommandSlot::Editable(command) => {
-                            Some(effect_caption(command).0.to_string())
+                    commands.iter().map(|command| match command {
+                        super::model::EffectCommandSlot::Editable(command)
+                        | super::model::EffectCommandSlot::Preserved(command) => {
+                            effect_name(command)
                         }
-                        super::model::EffectCommandSlot::Preserved(_) => None,
                     }),
-                    commands
-                        .iter()
-                        .filter(|command| {
-                            matches!(command, super::model::EffectCommandSlot::Preserved(_))
-                        })
-                        .count(),
+                    0,
                 ),
                 ACTION,
             ),
@@ -1699,9 +1851,9 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
                 ("Repeat", "Every motion loop".into(), FLOW)
             }
             NodeKind::Repeat { count, .. } => ("Repeat", format!("{count} times"), FLOW),
-            NodeKind::Preserved { .. } => (
+            NodeKind::Preserved { statement } => (
                 "Native structure",
-                "Preserved · not fully editable".into(),
+                statement_words(statement),
                 Color32::GRAY,
             ),
         };
@@ -1711,7 +1863,17 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
             "Execute at frame" => "Native execute frame · source export",
             _ => "",
         };
-        let title = if title == "Engine action" {
+        let single = match &node.kind {
+            NodeKind::Execute { commands } if commands.len() == 1 => commands.first(),
+            NodeKind::BareCommand { command } => Some(command.as_ref()),
+            _ => None,
+        };
+        let title = if let Some(words) = single.and_then(command_words) {
+            detail.clear();
+            words
+        } else if title == "Native structure" {
+            std::mem::take(&mut detail)
+        } else if title == "Engine action" {
             super::plain::block_name(&std::mem::take(&mut detail)).to_owned()
         } else if title == "If" {
             format!("If {}", std::mem::take(&mut detail))
@@ -1720,6 +1882,7 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
         };
         let detail = super::plain::detail(detail);
         blocks.push(Block {
+            code: String::new(),
             internal,
             key: key.clone(),
             title,
@@ -1938,7 +2101,7 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].title, "Visual effects");
-        assert_eq!(matching[0].detail, "Effect rate · 1 kept from the game");
+        assert_eq!(matching[0].detail, "Effect rate · Native effect");
         assert_eq!(serde_json::to_value(&graph).unwrap(), before);
     }
 
@@ -2188,5 +2351,205 @@ mod tests {
             [1, 3, 2]
         );
         assert!(state.error.is_empty(), "{}", state.error);
+    }
+}
+
+#[cfg(test)]
+mod story_wording_tests {
+    use super::*;
+    use crate::move_nodes::model::Track;
+
+    /// Writes every vanilla move's outline to VISIONARY_STORY_OUT, one line per block.
+    #[test]
+    fn dump_every_outline() {
+        let (Some(root), Some(out)) = (
+            std::env::var_os("VISIONARY_SCRIPT_DUMP"),
+            std::env::var_os("VISIONARY_STORY_OUT"),
+        ) else {
+            return;
+        };
+        let mut text = String::new();
+        let mut round_trip = Vec::new();
+        let mut checked = 0;
+        for kind in crate::gimmicks::registry::FIGHTER_KINDS {
+            let fighter = kind.fighter;
+            let dir = std::path::Path::new(&root)
+                .join(format!("lua2cpp_{fighter}"))
+                .join(fighter);
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(body) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let name = entry
+                    .path()
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                for track in [Track::Game, Track::Effect, Track::Sound, Track::Expression] {
+                    let source = match track {
+                        Track::Effect => crate::move_nodes::effects::import_for_fighter(
+                            fighter,
+                            &crate::acmd::parse_effect_script(&body),
+                        ),
+                        _ => {
+                            let parsed = match track {
+                                Track::Game => crate::acmd::parse_acmd_script(&body),
+                                Track::Sound => crate::acmd::parse_sound_script(&body),
+                                _ => crate::acmd::parse_expression_script(&body),
+                            };
+                            crate::move_nodes::timeline::import_for_fighter(fighter, track, &parsed)
+                        }
+                    };
+                    let nodes = &source.nodes;
+                    // A block's code read back must give the same code.
+                    for node in nodes.iter().filter(|node| {
+                        matches!(
+                            node.kind,
+                            NodeKind::Execute { .. } | NodeKind::EffectExecute { .. }
+                        )
+                    }) {
+                        let code = crate::move_nodes::timeline::block_code(fighter, &source, node);
+                        checked += 1;
+                        match crate::move_nodes::timeline::blocks_from_code(fighter, track, &code) {
+                            Ok(back) => {
+                                let again: Vec<String> = back
+                                    .iter()
+                                    .map(|node| {
+                                        crate::move_nodes::timeline::block_code(
+                                            fighter, &source, node,
+                                        )
+                                    })
+                                    .collect();
+                                if again.join("\n") != code && round_trip.len() < 20 {
+                                    round_trip.push(format!(
+                                        "{fighter}/{name}: changed\n{code}\n---\n{}",
+                                        again.join("\n")
+                                    ));
+                                }
+                            }
+                            Err(reason) if round_trip.len() < 20 => {
+                                round_trip.push(format!("{fighter}/{name}: {reason}\n{code}"))
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    let mut lines = Vec::new();
+                    crate::move_nodes::plain::story(nodes, 0, &mut 0.0, &story_caption, &mut lines);
+                    for line in lines {
+                        let code = line
+                            .node
+                            .and_then(|id| find(nodes, id))
+                            .filter(|node| {
+                                !matches!(
+                                    node.kind,
+                                    NodeKind::Branch { .. } | NodeKind::Repeat { .. }
+                                )
+                            })
+                            .map(|node| {
+                                crate::move_nodes::timeline::block_code(fighter, &source, node)
+                            })
+                            .unwrap_or_default()
+                            .replace('\n', " ⏎ ");
+                        text.push_str(&format!(
+                            "{fighter}/{name}/{track:?}\t{}\t{code}\n",
+                            line.text
+                        ));
+                    }
+                }
+            }
+        }
+        std::fs::write(out, &text).unwrap();
+        println!("{checked} blocks read back from their code");
+        assert!(checked > 10_000);
+        assert!(
+            round_trip.is_empty(),
+            "{checked} blocks checked; code that does not read back:\n{}",
+            round_trip.join("\n\n")
+        );
+        // Words only an engine programmer would know must not reach the outline.
+        let banned = [
+            "Native",
+            "native",
+            "Runs every time",
+            "kept from the game",
+            "Game notice",
+            "Game flag",
+            "Original game code",
+            "Opaque",
+            "game's own check",
+            "Hash40",
+            " 0x",
+            "*FIGHTER",
+            "L2C",
+            "Engine action",
+            "lua",
+        ];
+        let bad: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                let words = line.split('\t').nth(1).unwrap_or_default();
+                banned.iter().any(|word| words.contains(word))
+            })
+            .take(40)
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "engine words in the outline:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn typed_code_becomes_blocks_and_unknown_lines_are_named() {
+        let nodes = crate::move_nodes::timeline::blocks_from_code(
+            "mario",
+            Track::Game,
+            "AttackModule::clear_all(agent.module_accessor);",
+        )
+        .unwrap();
+        assert!(matches!(
+            nodes.as_slice(),
+            [MoveNode { kind: NodeKind::Execute { commands }, .. }]
+                if matches!(commands.as_slice(), [crate::data::ExcuteStmt::ClearAll])
+        ));
+        let timed = crate::move_nodes::timeline::blocks_from_code(
+            "mario",
+            Track::Game,
+            "frame(agent.lua_state_agent, 5.0);\nif macros::is_excute(agent) {\n    AttackModule::clear_all(agent.module_accessor);\n}",
+        )
+        .unwrap();
+        assert!(matches!(timed[0].kind, NodeKind::Frame { frame } if frame == 5.0));
+        let error = crate::move_nodes::timeline::blocks_from_code(
+            "mario",
+            Track::Game,
+            "AttackModule::clear_all(agent.module_accessor);\nMadeUpModule::launch_rocket(agent.module_accessor);",
+        )
+        .unwrap_err();
+        assert!(error.contains("MadeUpModule::launch_rocket"), "{error}");
+        assert!(
+            crate::move_nodes::timeline::blocks_from_code("mario", Track::Game, "not code (")
+                .is_err()
+        );
+    }
+
+    fn find(nodes: &[MoveNode], id: u32) -> Option<&MoveNode> {
+        nodes.iter().find_map(|node| {
+            if node.id == id {
+                return Some(node);
+            }
+            match &node.kind {
+                NodeKind::Branch {
+                    then_nodes,
+                    else_nodes,
+                    ..
+                } => find(then_nodes, id).or_else(|| find(else_nodes, id)),
+                NodeKind::Repeat { body, .. } => find(body, id),
+                _ => None,
+            }
+        })
     }
 }

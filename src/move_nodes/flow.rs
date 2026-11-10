@@ -315,7 +315,7 @@ pub fn reconnect_port(
     Ok(())
 }
 
-fn find_node(nodes: &[MoveNode], id: u32) -> Option<&MoveNode> {
+pub(super) fn find_node(nodes: &[MoveNode], id: u32) -> Option<&MoveNode> {
     for node in nodes {
         if node.id == id {
             return Some(node);

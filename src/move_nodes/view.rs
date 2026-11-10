@@ -65,6 +65,11 @@ pub struct NodeEditor {
     auto_apply: bool,
     in_expanded_field: bool,
     block_clipboard: Option<super::block_clipboard::BlockClipboard>,
+    /// Code being typed for the selected block: (block, code it started from, text).
+    code_edit: Option<(u32, String, String)>,
+    code_error: String,
+    /// The Code block's typing window: the lane it adds to and what has been typed.
+    new_code: Option<(Track, String)>,
 }
 
 impl NodeEditor {
@@ -632,6 +637,7 @@ impl NodeEditor {
                 }
             }
             ui.separator();
+            self.new_code_window(ui, fighter);
             if !self.list_mode {
                 self.block_inspector(ui, fighter);
             }
@@ -711,6 +717,159 @@ impl NodeEditor {
 
     /// Keep command and action properties reachable even when the field fills
     /// the window. One movable inspector follows the current card selection.
+    /// The selected block's own code, which can be edited and read back into blocks.
+    fn code_section(&mut self, ui: &mut Ui, fighter: &str, id: u32) {
+        let Some(source) = self
+            .draft
+            .tracks
+            .iter()
+            .find(|track| super::canvas::contains(&track.nodes, id))
+        else {
+            return;
+        };
+        let Some(node) = super::flow::find_node(&source.nodes, id) else {
+            return;
+        };
+        let code = super::timeline::block_code(fighter, source, node);
+        let track = source.track;
+        if self
+            .code_edit
+            .as_ref()
+            .is_none_or(|(at, start, _)| *at != id || *start != code)
+        {
+            self.code_edit = Some((id, code.clone(), code.clone()));
+            self.code_error.clear();
+        }
+        let mut apply = false;
+        egui::CollapsingHeader::new("Code")
+            .id_salt("block_code")
+            .show(ui, |ui| {
+                ui.weak("The lines this block writes. Change them and press Use this code.");
+                if let Some((_, _, text)) = &mut self.code_edit {
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .code_editor()
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                    let changed = *text != code;
+                    ui.horizontal(|ui| {
+                        apply = ui
+                            .add_enabled(changed, egui::Button::new("Use this code"))
+                            .clicked();
+                        if ui
+                            .add_enabled(changed, egui::Button::new("Reset"))
+                            .clicked()
+                        {
+                            *text = code.clone();
+                            self.code_error.clear();
+                        }
+                    });
+                }
+                if !self.code_error.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, &self.code_error);
+                }
+            });
+        if !apply {
+            return;
+        }
+        let Some((_, _, text)) = self.code_edit.clone() else {
+            return;
+        };
+        match super::timeline::blocks_from_code(fighter, track, &text) {
+            Ok(mut nodes) => {
+                let mut next = next_id(&self.draft);
+                for node in &mut nodes {
+                    rekey(node, &mut next);
+                }
+                let first = nodes[0].id;
+                if let Some(source) = self
+                    .draft
+                    .tracks
+                    .iter_mut()
+                    .find(|source| source.track == track)
+                {
+                    replace_node(&mut source.nodes, id, nodes);
+                }
+                self.canvas.selected = Some(format!("node:{first}"));
+                self.code_edit = None;
+                self.code_error.clear();
+            }
+            Err(reason) => self.code_error = reason,
+        }
+    }
+
+    /// The window for typing a new Code block.
+    fn new_code_window(&mut self, ui: &mut Ui, fighter: &str) {
+        let Some((track, text)) = &mut self.new_code else {
+            return;
+        };
+        let track = *track;
+        let mut open = true;
+        let mut add = false;
+        egui::Window::new("New code block")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(420.0)
+            .show(ui.ctx(), |ui| {
+                ui.label("Type a few lines of game code. Each line must be a call Visionary knows, so the block can update live.");
+                ui.add(
+                    egui::TextEdit::multiline(text)
+                        .code_editor()
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(match track {
+                            Track::Effect => "macros::EFFECT(agent, Hash40::new(\"sys_attack_arc\"), Hash40::new(\"top\"), 0, 10, 8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);",
+                            Track::Sound => "macros::PLAY_SE(agent, Hash40::new(\"se_common_punch_kick_swing_m\"));",
+                            _ => "AttackModule::clear_all(agent.module_accessor);",
+                        }),
+                );
+                if !self.code_error.is_empty() {
+                    ui.colored_label(ui.visuals().warn_fg_color, &self.code_error);
+                }
+                add = ui.button("Add block").clicked();
+            });
+        if !open {
+            self.new_code = None;
+            self.code_error.clear();
+            return;
+        }
+        if !add {
+            return;
+        }
+        match super::timeline::blocks_from_code(
+            fighter,
+            track,
+            &self
+                .new_code
+                .as_ref()
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default(),
+        ) {
+            Ok(mut nodes) => {
+                let mut next = next_id(&self.draft);
+                for node in &mut nodes {
+                    rekey(node, &mut next);
+                }
+                let first = nodes[0].id;
+                if let Some(index) = self
+                    .draft
+                    .tracks
+                    .iter()
+                    .position(|source| source.track == track)
+                {
+                    self.track = index;
+                    self.draft.tracks[index].nodes.extend(nodes);
+                }
+                self.canvas.selected = Some(format!("node:{first}"));
+                self.canvas.center_selected();
+                self.new_code = None;
+                self.code_error.clear();
+            }
+            Err(reason) => self.code_error = reason,
+        }
+    }
+
     fn block_inspector(&mut self, ui: &mut Ui, fighter: &str) -> bool {
         let Some(id) = self.canvas.selected_node() else {
             return false;
@@ -743,7 +902,9 @@ impl NodeEditor {
                 ui.weak("Press Apply nodes to use your edits");
             }
         });
-        if !open {
+        if open {
+            self.code_section(ui, fighter, id);
+        } else {
             self.canvas.selected = None;
         }
         true
@@ -5921,6 +6082,32 @@ fn effect_rgb_ui(ui: &mut Ui, rgb: &mut [f32; 3]) {
             None,
         );
     }
+}
+
+/// Puts `replacement` where block `id` was, at any depth.
+fn replace_node(nodes: &mut Vec<MoveNode>, id: u32, replacement: Vec<MoveNode>) -> bool {
+    if let Some(index) = nodes.iter().position(|node| node.id == id) {
+        nodes.splice(index..=index, replacement);
+        return true;
+    }
+    for node in nodes.iter_mut() {
+        let found = match &mut node.kind {
+            NodeKind::Repeat { body, .. } => replace_node(body, id, replacement.clone()),
+            NodeKind::Branch {
+                then_nodes,
+                else_nodes,
+                ..
+            } => {
+                replace_node(then_nodes, id, replacement.clone())
+                    || replace_node(else_nodes, id, replacement.clone())
+            }
+            _ => false,
+        };
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 fn rekey(node: &mut MoveNode, next: &mut u32) {

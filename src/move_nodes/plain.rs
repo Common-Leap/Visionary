@@ -55,8 +55,10 @@ pub fn block_name(internal: &str) -> &str {
         "Article motion" => "Object animation",
         "Send event" => "Tell a gimmick",
         "Effect spawn" | "Spawn effect" => "Visual effect",
+        "Follow native effect" => "Effect that follows the fighter",
         "Slope" | "Slope alignment" => "Lean with the ground",
         "Effect off" | "Native effect off" => "End visual effect",
+        "Imported effect" => "Visual effect",
         "Rumble pattern" => "Rumble",
         "Attack module set no damage fly smoke all" => "No launch smoke",
         "Attack module init attack pos" => "Reset hitbox positions",
@@ -234,7 +236,7 @@ fn flag_phrase(symbol: &str, expected: bool) -> String {
         Some((yes, no)) => (if expected { yes } else { no }).into(),
         None => format!(
             "\"{}\" is {}",
-            symbol_words(symbol),
+            move_words(&symbol_words(symbol)),
             if expected { "on" } else { "off" }
         ),
     }
@@ -244,7 +246,19 @@ fn flag_phrase(symbol: &str, expected: bool) -> String {
 pub fn condition_sentence(condition: &MoveCondition) -> String {
     match condition {
         MoveCondition::IsExecute => "the move is running".into(),
-        MoveCondition::Source { .. } => "the game's own check passes".into(),
+        MoveCondition::Source { header } => {
+            let header = header.trim().trim_start_matches('}').trim();
+            let header = header
+                .trim_start_matches("else")
+                .trim()
+                .trim_start_matches("if")
+                .trim();
+            if header.is_empty() {
+                "none of the above".into()
+            } else {
+                condition_words(header)
+            }
+        }
         MoveCondition::CharacterValue {
             chart_id,
             var,
@@ -310,10 +324,18 @@ pub fn condition_sentence(condition: &MoveCondition) -> String {
                     .replace('_', " ")
                     .to_lowercase(),
             };
-            format!("\"{}\" {} {right}", symbol_words(symbol), compare(*op))
+            format!(
+                "\"{}\" {} {right}",
+                move_words(&symbol_words(symbol)),
+                compare(*op)
+            )
         }
         MoveCondition::WorkFloat { symbol, op, value } => {
-            format!("\"{}\" {} {value}", symbol_words(symbol), compare(*op))
+            format!(
+                "\"{}\" {} {value}",
+                move_words(&symbol_words(symbol)),
+                compare(*op)
+            )
         }
         MoveCondition::And { .. } => "all of these are true".into(),
         MoveCondition::Or { .. } => "any of these is true".into(),
@@ -329,6 +351,18 @@ pub fn detail(text: String) -> String {
         .replace(" · source export", "")
         .replace("Own Execute guard", "")
         .replace("Native feedback", "");
+    // Raw game names in a detail read as words.
+    let cleaned = cleaned
+        .split(" · ")
+        .map(|part| {
+            if part.contains("Hash40::") || part.starts_with('*') || part.starts_with("0x") {
+                arg_words(part)
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
     match cleaned.as_str() {
         "Source export" | "source export" => String::new(),
         "Preserved source" => "Kept as the game wrote it".into(),
@@ -543,6 +577,13 @@ pub fn story(
                 *frame = frame.max(*at)
             }
             NodeKind::Wait { frames } => *frame += frames.max(0.0),
+            // The game wraps nearly everything in "if the move is running"; a reader
+            // gains nothing from it.
+            NodeKind::Branch {
+                condition: MoveCondition::IsExecute,
+                then_nodes,
+                else_nodes,
+            } if else_nodes.is_empty() => story(then_nodes, depth, frame, caption, out),
             NodeKind::Branch {
                 then_nodes,
                 else_nodes,
@@ -600,4 +641,386 @@ pub fn leaves_hitbox_on(nodes: &[MoveNode]) -> bool {
         }
     }
     on
+}
+
+/// Splits a call's argument list at top-level commas.
+fn split_args(inside: &str) -> Vec<String> {
+    let (mut depth, mut quoted, mut start, mut out) = (0i32, false, 0, Vec::new());
+    for (index, character) in inside.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '(' | '[' | '{' if !quoted => depth += 1,
+            ')' | ']' | '}' if !quoted => depth -= 1,
+            ',' if depth == 0 && !quoted => {
+                out.push(inside[start..index].trim().to_owned());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = inside[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_owned());
+    }
+    out
+}
+
+/// "special_hi" style parts of game names, as words a player uses.
+fn move_words(words: &str) -> String {
+    let mut text = format!(" {} ", words.to_lowercase().replace('_', " "));
+    for (from, to) in [
+        (" special hi ", " up special "),
+        (" special lw ", " down special "),
+        (" special s ", " side special "),
+        (" special n ", " neutral special "),
+        (" special air hi ", " air up special "),
+        (" special air lw ", " air down special "),
+        (" attack air ", " air attack "),
+        (" attack hi4 ", " up smash "),
+        (" attack lw4 ", " down smash "),
+        (" attack s4 ", " side smash "),
+        (" attack hi3 ", " up tilt "),
+        (" attack lw3 ", " down tilt "),
+        (" attack s3 ", " side tilt "),
+        (" lua script line max ", " arm fully stretched "),
+        (" flag ", " "),
+        (" lw ", " down "),
+        (" hi ", " up "),
+        (" lr ", " facing "),
+        (" mot ", " animation "),
+        (" situation ", " ground or air "),
+    ] {
+        while text.contains(from) {
+            text = text.replace(from, to);
+        }
+    }
+    // The game names its most used switches in shorthand.
+    match text.trim() {
+        "sscope shoot" => "Super Scope fires",
+        "fflower shoot" => "Fire Flower fires",
+        "sscope aerial req sound" => "Super Scope air sound",
+        "sscope aerial req effect" => "Super Scope air effect",
+        "enable landing" => "can land",
+        "reserve change status dlay motion" => "change action when the animation ends",
+        "start smash hold" => "smash charge starts",
+        "100 continue check" => "rapid jab keeps going",
+        "enable 100" => "rapid jab allowed",
+        "enable combo" => "next jab allowed",
+        "enable no hit combo" => "next jab allowed without a hit",
+        "backshield invisible" => "back shield hidden",
+        "catch wait" => "holding the grab",
+        "turn run" => "turning while running",
+        "turn dash" => "turning while dashing",
+        "final hit cancel" => "Final Smash hit cancel",
+        "disable final start camera" => "no Final Smash start camera",
+        "add partial mtion sword when changeing" => "sword animation carries over",
+        "request remove have craft weapon" => "put the tool away",
+        "disable furafura voice final" => "no dizzy voice",
+        "disable capture pulled se" => "no pulled-in sound",
+        "input check" => "reading the buttons",
+        "request squat se" => "crouch sound",
+        "no speed operation chk" => "keep speed as it is",
+        "slide enable control" => "can steer while sliding",
+        "slide enable gravity" => "falls while sliding",
+        "sttus end if pickup failed" => "end if the pickup fails",
+        "hoist start" => "lift starts",
+        "region jp" => "Japanese version",
+        "hit cancel" => "cancel on hit",
+        "motion change enable" => "animation can change",
+        "move trans" => "moves with the animation",
+        "enable control energy" => "player can steer",
+        "reserve gravity stable unable" => "gravity off",
+        "is check dive" => "dive check",
+        other => return other.to_owned(),
+    }
+    .to_owned()
+}
+
+/// One argument as words: a game name loses its prefix, a text name its quotes.
+fn arg_words(arg: &str) -> String {
+    let arg = arg.trim();
+    if arg.starts_with("Hash40::new_raw(") || arg.starts_with("0x") {
+        return "(unnamed)".into();
+    }
+    if let Some(name) = arg.strip_prefix("Hash40::new(") {
+        return name
+            .trim_matches(|c| c == '"' || c == ')')
+            .replace('_', " ");
+    }
+    if arg.starts_with('*')
+        || arg
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            && arg.contains('_')
+    {
+        return move_words(&symbol_words(arg));
+    }
+    arg.to_owned()
+}
+
+/// What a game module is about, for calls that have no better name.
+fn module_words(module: &str) -> &str {
+    match module {
+        "AttackModule" => "Hitbox",
+        "GrabModule" => "Grab",
+        "WorkModule" => "Game value",
+        "ItemModule" => "Held item",
+        "MotionModule" => "Animation",
+        "KineticModule" => "Movement",
+        "EffectModule" => "Effect",
+        "SoundModule" => "Sound",
+        "ControlModule" => "Controller",
+        "CameraModule" => "Camera",
+        "ArticleModule" => "Object",
+        "VisibilityModule" | "ModelModule" => "Model",
+        "GroundModule" => "Ground",
+        "PostureModule" => "Position",
+        "StatusModule" => "Action",
+        "DamageModule" => "Damage",
+        "HitModule" => "Hurtbox",
+        "ShieldModule" | "ReflectorModule" => "Shield",
+        "CatchModule" => "Grab",
+        "SlowModule" => "Slowdown",
+        "SearchModule" => "Detection",
+        "AreaModule" => "Area",
+        "JostleModule" => "Push box",
+        "ColorBlendModule" => "Fighter tint",
+        "ShakeModule" => "Shake",
+        "LinkModule" => "Link",
+        _ => "Game",
+    }
+}
+
+/// "LandingHeavyRumble" becomes "landing heavy rumble".
+fn camel_words(name: &str) -> String {
+    let mut out = String::new();
+    for (index, character) in name.chars().enumerate() {
+        if character.is_uppercase() && index > 0 {
+            out.push(' ');
+        }
+        out.extend(character.to_lowercase());
+    }
+    out
+}
+
+/// A game call as a short phrase: `WorkModule::on_flag(.., *X_FLAG_Y)` becomes `Turn on "y"`.
+pub fn call_words(callee: &str, args: &[String]) -> String {
+    let callee = callee
+        .trim()
+        .trim_start_matches("macros::")
+        .trim_end_matches('!');
+    let args: Vec<&String> = args
+        .iter()
+        .filter(|arg| {
+            !arg.starts_with("agent") && !arg.starts_with("fighter.") && arg.as_str() != "boma"
+        })
+        .collect();
+    let (module, function) = callee.rsplit_once("::").unwrap_or(("", callee));
+    let module = module.rsplit("::").next().unwrap_or(module);
+    let first = || args.first().map(|arg| arg_words(arg)).unwrap_or_default();
+    let second = || args.get(1).map(|arg| arg_words(arg)).unwrap_or_default();
+    if let Some(common) = function
+        .split_once("_game_")
+        .or_else(|| function.split_once("_expression_"))
+        .or_else(|| function.split_once("_effect_"))
+        .or_else(|| function.split_once("_sound_"))
+    {
+        return format!(
+            "Use the shared \"{}\" part",
+            camel_words(common.1.trim_end_matches("Common"))
+        );
+    }
+    match function {
+        "on_flag" => format!("Turn on \"{}\"", first()),
+        "off_flag" => format!("Turn off \"{}\"", first()),
+        "set_int" | "set_float" | "set_int64" => format!("Set \"{}\" to {}", second(), first()),
+        "inc_int" => format!("Count up \"{}\"", first()),
+        "dec_int" => format!("Count down \"{}\"", first()),
+        "add_int" | "add_float" => format!("Add {} to \"{}\"", first(), second()),
+        "notify_event_msc_cmd" => notice_words(&args),
+        "set_rumble" | "RUMBLE_HIT" | "rumble" => "Rumble".into(),
+        "PLAY_SE" | "PLAY_SE_REMAIN" | "PLAY_SE_NO_3D" => format!("Play sound {}", first()),
+        "PLAY_STEP" | "PLAY_STEP_FLIPPABLE" | "PLAY_LANDING_SE" => "Footstep sound".into(),
+        "PLAY_SEQUENCE" | "PLAY_FLY_VOICE" | "PLAY_VC" => "Voice line".into(),
+        "PLAY_STATUS" => format!("Play sound {} for this action", first()),
+        "SET_PLAY_INHIVIT" => format!("Don't repeat {} for a while", first()),
+        "STOP_SE" => format!("Stop sound {}", first()),
+        "set_devil" => "Devil form".into(),
+        "set_have_item_action" => "Held item animation".into(),
+        "set_have_item_scale_anim" => "Held item size animation".into(),
+        "pickup_item" => "Pick up an item".into(),
+        "use_item" => "Use the held item".into(),
+        "set_attach_item_visibility" => "Show or hide the attached item".into(),
+        "set_have_item_visibility" => "Show or hide the held item".into(),
+        "set_rebound" if module == "GrabModule" => "Grab bounce-off".into(),
+        "change_kinetic" => format!(
+            "Movement type: {}",
+            first().replace("fighter kinetic type ", "")
+        ),
+        "clear" if module == "AttackModule" => "End one hitbox".into(),
+        "set_visibility" | "set_whole" => "Show or hide the model".into(),
+        "clear_all" if module == "AttackModule" => "End all hitboxes".into(),
+        "wait_loop_sync_mot" => "Match the animation loop".into(),
+        "GET_VOICE_REGION" | "GET_VOICE_VARIATION" => "Pick a voice".into(),
+        "request_paint" => "Paint the fighter".into(),
+        "scale" => "Fighter size".into(),
+        "get_sum_speed_y" => "falling speed".into(),
+        "get_float" | "get_int" => format!("\"{}\"", first()),
+        "is_flag" => format!("\"{}\" is on", first()),
+        "ATTACK" => "Hitbox".into(),
+        "FT_IS_SAME_FIGHTER_CATEGORY" => "Check the fighter kind".into(),
+        "battle_object" => "Read the fighter".into(),
+        "SA_SET" if first().contains("air") => "Put the fighter in the air".into(),
+        "SA_SET" => "Put the fighter on the ground".into(),
+        _ => {
+            let words = function
+                .trim_start_matches("set_")
+                .trim_start_matches("req_")
+                .to_lowercase()
+                .replace('_', " ");
+            let words = move_words(&words);
+            if module.is_empty() {
+                let mut letters = words.chars();
+                letters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(letters).collect()
+                })
+            } else {
+                format!("{}: {words}", module_words(module))
+            }
+        }
+    }
+}
+
+/// The game's own notices, named by what they change.
+fn notice_words(args: &[&String]) -> String {
+    let event = args.first().map_or("", |arg| arg.as_str());
+    let value = args.get(1).map_or("", |arg| arg.as_str());
+    match event {
+        "Hash40::new_raw(0x2127e37c07)" => {
+            match value.trim_start_matches("*GROUND_CLIFF_CHECK_KIND_") {
+                "ALWAYS_BOTH_SIDES" => "Can grab the ledge from either side".into(),
+                "ALWAYS" => "Can grab the ledge".into(),
+                "NONE" => "Can't grab the ledge".into(),
+                _ => "Change ledge grabbing".into(),
+            }
+        }
+        "Hash40::new_raw(0x23c33f3bdc)" => "Face the other way".into(),
+        "Hash40::new_raw(0x26769bd1de)" => "Tilt the body".into(),
+        "Hash40::new_raw(0x2ea0f68425)" => format!(
+            "Pass through other fighters {}",
+            if value == "true" { "on" } else { "off" }
+        ),
+        "Hash40::new_raw(0x25fd66ecef)" => "Zoom the camera".into(),
+        _ => "Signal the fighter's own code".into(),
+    }
+}
+
+/// A condition from the game's code as words that read after "If".
+pub fn condition_words(code: &str) -> String {
+    let code = code.trim().trim_end_matches('{').trim();
+    let code = code
+        .strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .filter(|inner| split_args(inner).len() == 1)
+        .unwrap_or(code)
+        .trim();
+    if code.contains("L2CValue") || code.starts_with("0x") {
+        return "the fighter's own code says so".into();
+    }
+    for (joiner, word) in [("&&", " and "), ("||", " or ")] {
+        if code.contains(joiner) {
+            return code
+                .split(joiner)
+                .map(condition_words)
+                .collect::<Vec<_>>()
+                .join(word);
+        }
+    }
+    if let Some(inner) = code.strip_prefix('!') {
+        let words = condition_words(inner);
+        return match words.strip_suffix(" is on") {
+            Some(name) => format!("{name} is off"),
+            None => format!("not {words}"),
+        };
+    }
+    for (operator, word) in [
+        ("==", "is"),
+        ("!=", "is not"),
+        (">=", "is at least"),
+        ("<=", "is at most"),
+        (">", "is more than"),
+        ("<", "is less than"),
+    ] {
+        if let Some((left, right)) = code.split_once(operator) {
+            return format!(
+                "{} {word} {}",
+                condition_words(left).trim_end_matches(" is on"),
+                arg_words(right)
+            );
+        }
+    }
+    match code.split_once('(') {
+        Some((callee, rest)) => {
+            let callee = callee.trim().trim_start_matches("macros::");
+            let args = split_args(rest.strip_suffix(')').unwrap_or(rest));
+            match callee {
+                "is_excute" => "the move is running".into(),
+                "IS_RANDOM" => "a random roll passes".into(),
+                "FT_IS_SAME_FIGHTER_CATEGORY" => "this is a matching kind of fighter".into(),
+                "IS_HAVE_ITEM_KIND" => "holding that item".into(),
+                "is_exist_article" | "ArticleModule::is_exist" => "the object is out".into(),
+                _ => call_words(callee, &args),
+            }
+        }
+        None => arg_words(code),
+    }
+}
+
+/// One line of game code as words.
+pub fn code_words(line: &str) -> String {
+    let line = line.trim().trim_end_matches(';').trim();
+    if let Some(condition) = line.strip_prefix("if ").or_else(|| {
+        line.strip_prefix("if(")
+            .map(|rest| rest.trim_end_matches('{').trim_end().trim_end_matches(')'))
+    }) {
+        return format!("If {}", condition_words(condition));
+    }
+    if line.starts_with("else") || line.starts_with("} else") {
+        return "Otherwise".into();
+    }
+    if let Some((_, value)) = line
+        .strip_prefix("let ")
+        .and_then(|rest| rest.split_once('='))
+    {
+        return format!("Read {}", code_words(value).to_lowercase());
+    }
+    if line.starts_with("loop") || line.starts_with("for ") || line.starts_with("while ") {
+        return "Repeat".into();
+    }
+    if line.starts_with("frame(") || line.starts_with("wait(") {
+        return "Wait".into();
+    }
+    let words = match line.split_once('(') {
+        Some((callee, _)) if callee.starts_with("0x") || callee.contains("L2CValue") => {
+            "Leftover game code".into()
+        }
+        Some((callee, rest)) => {
+            let rest = rest.trim_end_matches('{').trim_end();
+            call_words(callee, &split_args(rest.strip_suffix(')').unwrap_or(rest)))
+        }
+        None => "Game code".into(),
+    };
+    if words.starts_with('"') {
+        format!("Check whether {words}")
+    } else {
+        words
+    }
+}
+
+/// Where a box sits, by bone: "top" is the fighter's centre.
+pub fn bone_words(bone: &str) -> String {
+    match bone {
+        "top" | "rot" | "trans" => "body".into(),
+        other => other.replace('_', " ").to_lowercase(),
+    }
 }

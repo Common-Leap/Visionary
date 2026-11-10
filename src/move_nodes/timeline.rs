@@ -862,6 +862,165 @@ pub fn compile(
     }
 }
 
+/// The code one block writes, on its own: what "Show code" puts inside the card.
+pub fn block_code(fighter: &str, source: &MoveTrack, node: &MoveNode) -> String {
+    let mut remaining = HashMap::new();
+    for statement in &source.baseline {
+        if let Ok(value) = json_value(statement) {
+            *remaining.entry(value.to_string()).or_default() += 1;
+        }
+    }
+    for commands in &source.effect_execute_baseline {
+        if let Ok(key) = effect_execute_witness_key(commands) {
+            *remaining.entry(key).or_default() += 1;
+        }
+    }
+    let stmts = compile_nodes(
+        fighter,
+        source.track,
+        "block",
+        std::slice::from_ref(node),
+        &source.baseline,
+        0,
+        &mut HashSet::new(),
+        &mut remaining,
+        &mut 0,
+        &mut Vec::new(),
+        false,
+    );
+    let text = preview(source.track, &AcmdScript { stmts }, "block");
+    let lines: Vec<&str> = text.lines().collect();
+    let open = lines.iter().position(|line| line.trim_end().ends_with('{'));
+    let body = match open {
+        Some(open) if lines.len() > open + 1 => &lines[open + 1..lines.len() - 1],
+        _ => &lines[..],
+    };
+    let mut body: Vec<&str> = body.to_vec();
+    // An action block runs inside the game's "if the move is running" check; show what is in it.
+    if body.len() >= 2
+        && body[0].trim().starts_with("if macros::is_excute(agent)")
+        && body[body.len() - 1].trim() == "}"
+        && body[1..body.len() - 1]
+            .iter()
+            .all(|line| line.trim().is_empty() || line.starts_with(char::is_whitespace))
+    {
+        body = body[1..body.len() - 1].to_vec();
+    }
+    let indent = body
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    body.iter()
+        .map(|line| line.get(indent..).unwrap_or(line.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads typed code back into blocks. Every line must be a call Visionary knows, so the result
+/// is ordinary blocks that export and update live like any other.
+pub fn blocks_from_code(fighter: &str, track: Track, code: &str) -> Result<Vec<MoveNode>, String> {
+    let nodes = parse_code(fighter, track, code)?;
+    if !opaque(&nodes) {
+        return Ok(nodes);
+    }
+    // Name the first line that is not understood on its own.
+    for line in code
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(';'))
+    {
+        if line.starts_with("frame(") || line.starts_with("wait(") {
+            continue;
+        }
+        if parse_code(fighter, track, line).is_ok_and(|nodes| !opaque(&nodes)) {
+            continue;
+        }
+        return Err(format!(
+            "Visionary doesn't know this line yet, so it can't run it live:\n{line}"
+        ));
+    }
+    Err("Part of this code isn't something Visionary knows yet.".into())
+}
+
+/// True when imported blocks still hold lines Visionary could not read.
+fn opaque(nodes: &[MoveNode]) -> bool {
+    nodes.iter().any(|node| match &node.kind {
+        NodeKind::Preserved { .. } | NodeKind::MixedEffectExecute { .. } => true,
+        NodeKind::MixedExecute { commands } => commands
+            .iter()
+            .any(|command| matches!(command, MoveCommand::Preserved(_))),
+        NodeKind::Execute { commands } => commands
+            .iter()
+            .any(|command| matches!(command, ExcuteStmt::Raw(_))),
+        NodeKind::BareCommand { command } => matches!(command.as_ref(), ExcuteStmt::Raw(_)),
+        NodeKind::Branch {
+            then_nodes,
+            else_nodes,
+            ..
+        } => opaque(then_nodes) || opaque(else_nodes),
+        NodeKind::Repeat { body, .. } => opaque(body),
+        _ => false,
+    })
+}
+
+fn parse_code(fighter: &str, track: Track, code: &str) -> Result<Vec<MoveNode>, String> {
+    let code = code.trim();
+    if code.is_empty() {
+        return Err("Type at least one line of code.".into());
+    }
+    let timed = code.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("frame(")
+            || line.starts_with("wait(")
+            || line.starts_with("if ")
+            || line.starts_with("for ")
+    });
+    let body = if timed {
+        code.to_owned()
+    } else {
+        format!("if macros::is_excute(agent) {{\n{code}\n}}")
+    };
+    let prefix = match track {
+        Track::Game => "game",
+        Track::Effect => "effect",
+        Track::Sound => "sound",
+        Track::Expression => "expression",
+    };
+    let source =
+        format!("unsafe extern \"C\" fn {prefix}_block(agent: &mut L2CAgentBase) {{\n{body}\n}}\n");
+    if syn::parse_file(&source).is_err() {
+        return Err(
+            "This isn't valid code. Check brackets, commas and that each line ends with ;".into(),
+        );
+    }
+    let nodes = match track {
+        Track::Effect => {
+            super::effects::import_for_fighter(fighter, &crate::acmd::parse_effect_script(&source))
+                .nodes
+        }
+        Track::Game => {
+            import_for_fighter(fighter, track, &crate::acmd::parse_acmd_script(&source)).nodes
+        }
+        Track::Sound => {
+            import_for_fighter(fighter, track, &crate::acmd::parse_sound_script(&source)).nodes
+        }
+        Track::Expression => {
+            import_for_fighter(
+                fighter,
+                track,
+                &crate::acmd::parse_expression_script(&source),
+            )
+            .nodes
+        }
+    };
+    if nodes.is_empty() {
+        return Err("Nothing in this code does anything Visionary can show.".into());
+    }
+    Ok(nodes)
+}
+
 /// A statement that itself waits for the motion to loop.
 fn waits_for_motion_loop(stmt: &AcmdStmt) -> bool {
     match stmt {
