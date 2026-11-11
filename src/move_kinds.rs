@@ -391,3 +391,116 @@ mod tests {
         }
     }
 }
+
+/// The plain name of a move, such as "Forward smash" for `attack_s4_s`.
+pub fn plain_name(name: &str) -> String {
+    let stripped = if name.len() > 3 {
+        let b = name.as_bytes();
+        if b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit() {
+            &name[3..]
+        } else {
+            name
+        }
+    } else {
+        name
+    };
+
+    match stripped.replace('_', "").as_str() {
+        "attacks4s" => return "Forward smash".into(),
+        "attacks4" => return "Forward smash".into(),
+        "attackhi4" => return "Up smash".into(),
+        "attacklw4" => return "Down smash".into(),
+        "attacks3s" => return "Forward tilt".into(),
+        "attacks3" => return "Forward tilt".into(),
+        "attackhi3" => return "Up tilt".into(),
+        "attacklw3" => return "Down tilt".into(),
+        "attackairn" => return "Neutral air".into(),
+        "attackairf" => return "Forward air".into(),
+        "attackairb" => return "Back air".into(),
+        "attackairhi" => return "Up air".into(),
+        "attackairlw" => return "Down air".into(),
+        "attackdash" => return "Dash attack".into(),
+        "attack11" => return "Jab 1".into(),
+        "attack12" => return "Jab 2".into(),
+        "attack13" => return "Jab 3".into(),
+        "catch" => return "Grab".into(),
+        "catchdash" => return "Dash grab".into(),
+        "catchturn" => return "Pivot grab".into(),
+        "throwf" => return "Forward throw".into(),
+        "throwb" => return "Back throw".into(),
+        "throwhi" => return "Up throw".into(),
+        "throwlw" => return "Down throw".into(),
+        "specialn" => return "Neutral special".into(),
+        "specials" => return "Side special".into(),
+        "specialhi" => return "Up special".into(),
+        "speciallw" => return "Down special".into(),
+        _ => {}
+    }
+
+    // Variants read as the move they belong to: "attack_hi4_hold" is "Up smash hold",
+    // "special_air_n" is "Neutral special air".
+    const PARTS: &[(&str, &str)] = &[
+        ("attack_s4", "forward smash"),
+        ("attack_hi4", "up smash"),
+        ("attack_lw4", "down smash"),
+        ("attack_s3", "forward tilt"),
+        ("attack_hi3", "up tilt"),
+        ("attack_lw3", "down tilt"),
+        ("attack_air_n", "neutral air"),
+        ("attack_air_f", "forward air"),
+        ("attack_air_b", "back air"),
+        ("attack_air_hi", "up air"),
+        ("attack_air_lw", "down air"),
+        ("attack_dash", "dash attack"),
+        ("attack_100", "rapid jab"),
+        ("special_air_n", "neutral special air"),
+        ("special_air_s", "side special air"),
+        ("special_air_hi", "up special air"),
+        ("special_air_lw", "down special air"),
+        ("special_n", "neutral special"),
+        ("special_s", "side special"),
+        ("special_hi", "up special"),
+        ("special_lw", "down special"),
+        ("final", "final smash"),
+    ];
+    let mut words = stripped.to_owned();
+    if let Some((part, plain)) = PARTS.iter().find(|(part, _)| stripped.starts_with(part)) {
+        words = format!("{plain}{}", &stripped[part.len()..]);
+    }
+    if PARTS.iter().any(|(part, _)| stripped.starts_with(part)) {
+        let words = words.replace('_', " ");
+        let mut letters = words.trim().chars();
+        return letters.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(letters).collect()
+        });
+    }
+
+    // Everything else in sentence case, with the game's short words spelled out.
+    let words: Vec<&str> = stripped
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| match word {
+            "catched" => "held by",
+            "lw" => "down",
+            "hi" => "up",
+            "f" => "forward",
+            "b" => "back",
+            "n" => "neutral",
+            "ganon" => "Ganondorf",
+            "wait" => "idle",
+            "cliff" => "ledge",
+            "catch" => "grab",
+            "escape" => "dodge",
+            "guard" => "shield",
+            "appeal" => "taunt",
+            "damage" => "hurt",
+            "lr" => "sideways",
+            other => other,
+        })
+        .collect();
+    let words = words.join(" ");
+    let mut letters = words.chars();
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
+}

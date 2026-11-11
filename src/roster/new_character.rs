@@ -176,28 +176,34 @@ impl NewCharacterView {
                     // Flex with the window instead of forcing a 220px box.
                     let combo_w = (ui.available_width() - 110.0).clamp(140.0, 220.0);
                     let previous_donor = self.donor.clone();
-                    egui::ComboBox::from_id_salt("newchar_donor")
-                        .selected_text(
-                            self.donor
-                                .clone()
-                                .unwrap_or_else(|| "Pick a fighter…".to_string()),
-                        )
-                        .width(combo_w)
-                        .show_ui(ui, |ui| {
-                            for entry in &donors {
-                                let Some(fighter) = &entry.fighter else { continue };
-                                let is_selected = self.donor.as_deref() == Some(fighter.as_str());
-                                if ui
-                                    .selectable_label(
-                                        is_selected,
-                                        format!("{}  ({fighter})", entry.display_name),
-                                    )
-                                    .clicked()
-                                {
-                                    self.donor = Some(fighter.clone());
-                                }
-                            }
-                        });
+                    let donor_list: Vec<_> =
+                        donors.iter().filter(|entry| entry.fighter.is_some()).collect();
+                    let picks: Vec<crate::ui::Pick> = donor_list
+                        .iter()
+                        .map(|entry| crate::ui::Pick {
+                            label: entry.display_name.clone(),
+                            hover: entry.fighter.clone().unwrap_or_default(),
+                            group: None,
+                        })
+                        .collect();
+                    let selected = donor_list
+                        .iter()
+                        .position(|entry| entry.fighter == self.donor);
+                    let current = self
+                        .donor
+                        .as_deref()
+                        .and_then(|donor| {
+                            donor_list
+                                .iter()
+                                .find(|entry| entry.fighter.as_deref() == Some(donor))
+                                .map(|entry| entry.display_name.clone())
+                        })
+                        .unwrap_or_else(|| "Pick a fighter".to_string());
+                    if let Some(index) =
+                        crate::ui::picker(ui, "newchar_donor", combo_w, &current, &picks, selected)
+                    {
+                        self.donor = donor_list[index].fighter.clone();
+                    }
                     if self.donor != previous_donor {
                         // Donor changed — pick a fresh range so the form never
                         // opens with a range that crosses a taken slot. Falls

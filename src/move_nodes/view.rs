@@ -984,6 +984,21 @@ fn selected_node(
 
 fn select_index(ui: &mut Ui, id: &str, index: &mut usize, labels: &[&str]) {
     *index = (*index).min(labels.len() - 1);
+    if labels.len() > 12 {
+        let picks: Vec<crate::ui::Pick> = labels
+            .iter()
+            .map(|label| crate::ui::Pick {
+                label: (*label).to_owned(),
+                hover: String::new(),
+                group: None,
+            })
+            .collect();
+        if let Some(picked) = crate::ui::picker(ui, id, 160.0, labels[*index], &picks, Some(*index))
+        {
+            *index = picked;
+        }
+        return;
+    }
     egui::ComboBox::from_id_salt(id)
         .selected_text(labels[*index])
         .show_ui(ui, |ui| {
@@ -1017,16 +1032,11 @@ pub(super) fn short_symbol(symbol: &str) -> &str {
 }
 
 fn joint_picker(ui: &mut Ui, joint: &mut String, joints: &[String]) {
-    let current = joint.clone();
-    egui::ComboBox::from_id_salt("attack_joint").selected_text(current.as_str()).width(90.0).show_ui(ui, |ui| {
-        if current != "top" && !joints.contains(&current) {
-            ui.selectable_value(joint, current.clone(), format!("{current} (from source)"));
-        }
-        ui.selectable_value(joint, "top".to_string(), "top");
-        for name in joints.iter().filter(|name| name.as_str() != "top") {
-            ui.selectable_value(joint, name.clone(), name);
-        }
-    }).response.on_hover_text("Joints from the loaded character model. An imported virtual joint is retained until explicitly changed.");
+    let mut joints = joints.to_vec();
+    if !joints.iter().any(|name| name == "top") {
+        joints.insert(0, "top".to_string());
+    }
+    crate::ui::bone_picker(ui, "attack_joint", 120.0, joint, &joints);
 }
 
 pub(super) fn variable_picker(
@@ -2438,30 +2448,29 @@ fn constant_picker(
         .first()
         .and_then(|(name, _)| name.rsplit_once('_').map(|(prefix, _)| prefix))
         .unwrap_or("");
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(
-            current
-                .strip_prefix(prefix)
-                .unwrap_or(current)
-                .trim_start_matches('_')
-                .replace('_', " "),
-        )
-        .show_ui(ui, |ui| {
-            for (name, _) in table {
-                let label = name
-                    .strip_prefix(prefix)
-                    .unwrap_or(name)
-                    .trim_start_matches('_')
-                    .replace('_', " ");
-                let stored = if dereference {
-                    format!("*{name}")
-                } else {
-                    (*name).to_owned()
-                };
-                ui.selectable_value(token, stored, label)
-                    .on_hover_text(*name);
-            }
-        });
+    let plain = |name: &str| {
+        name.strip_prefix(prefix)
+            .unwrap_or(name)
+            .trim_start_matches('_')
+            .replace('_', " ")
+    };
+    let picks: Vec<crate::ui::Pick> = table
+        .iter()
+        .map(|(name, _)| crate::ui::Pick {
+            label: plain(name),
+            hover: (*name).to_owned(),
+            group: None,
+        })
+        .collect();
+    let selected = table.iter().position(|(name, _)| *name == current);
+    if let Some(index) = crate::ui::picker(ui, id, 160.0, &plain(current), &picks, selected) {
+        let name = table[index].0;
+        *token = if dereference {
+            format!("*{name}")
+        } else {
+            name.to_owned()
+        };
+    }
 }
 
 fn nodes_ui_body(
@@ -3704,58 +3713,56 @@ fn work_symbol_choices_picker(
     dereference: bool,
     choices: &[&str],
 ) {
-    let key = ui.id().with((id, kind, "search"));
-    let mut search = ui
-        .data_mut(|data| data.get_temp::<String>(key))
-        .unwrap_or_default();
-    let current = token.trim().trim_start_matches('*');
-    egui::ComboBox::from_id_salt((id, kind))
-        .selected_text(if current.is_empty() {
-            if kind == crate::gimmicks::registry::IdentifierKind::Article {
-                "Choose article…"
-            } else {
-                "Choose native value…"
-            }
-        } else if kind == crate::gimmicks::registry::IdentifierKind::Article {
-            short_symbol(current)
+    let article = kind == crate::gimmicks::registry::IdentifierKind::Article;
+    let label = |symbol: &str| -> String {
+        let label = if article {
+            short_symbol(symbol)
         } else {
-            common_flag_label(current)
+            common_flag_label(symbol)
+        }
+        .replace('_', " ")
+        .to_lowercase();
+        let mut chars = label.chars();
+        chars.next().map_or_else(String::new, |first| {
+            first.to_uppercase().chain(chars).collect()
         })
-        .width(200.0)
-        .truncate()
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut search).hint_text("Find native value…"));
-            let query = search.trim().to_ascii_lowercase();
-            for &symbol in choices {
-                let label = (if kind == crate::gimmicks::registry::IdentifierKind::Article {
-                    short_symbol(symbol)
-                } else {
-                    common_flag_label(symbol)
-                })
-                .replace('_', " ")
-                .to_lowercase();
-                if !format!("{label} {symbol}")
-                    .to_ascii_lowercase()
-                    .contains(&query)
-                {
-                    continue;
-                }
-                let value = if dereference {
-                    format!("*{symbol}")
-                } else {
-                    symbol.to_owned()
-                };
-                if ui
-                    .selectable_value(token, value, label)
-                    .on_hover_text(symbol)
-                    .clicked()
-                {
-                    ui.close();
-                }
+    };
+    // Grouped by the move family the name belongs to, like the move list.
+    let picks: Vec<crate::ui::Pick> = choices
+        .iter()
+        .map(|symbol| {
+            let tail = symbol
+                .rsplit_once("_KIND_")
+                .map_or(*symbol, |(_, tail)| tail)
+                .to_ascii_lowercase();
+            let group = crate::move_kinds::group_of(&tail);
+            crate::ui::Pick {
+                label: label(symbol),
+                hover: (*symbol).to_owned(),
+                group: (kind == crate::gimmicks::registry::IdentifierKind::FighterStatus)
+                    .then(|| (group.label(), group.description())),
             }
-        });
-    ui.data_mut(|data| data.insert_temp(key, search));
+        })
+        .collect();
+    let current = token.trim().trim_start_matches('*').to_owned();
+    let selected = choices.iter().position(|symbol| *symbol == current);
+    let shown = if current.is_empty() {
+        if article {
+            "Choose object"
+        } else {
+            "Choose value"
+        }
+        .to_owned()
+    } else {
+        label(&current)
+    };
+    if let Some(index) = crate::ui::picker(ui, (id, kind), 200.0, &shown, &picks, selected) {
+        *token = if dereference {
+            format!("*{}", choices[index])
+        } else {
+            choices[index].to_owned()
+        };
+    }
 }
 
 fn native_work_choices(

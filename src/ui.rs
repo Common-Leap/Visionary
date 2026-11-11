@@ -89,3 +89,220 @@ pub(crate) fn game_connection(ui: &mut Ui, status: crate::game_link::LinkStatus)
     ui.colored_label(color, "●");
     ui.label(label);
 }
+
+/// One choice in a [`picker`].
+pub(crate) struct Pick {
+    pub label: String,
+    /// Shown on hover, such as the game's own name for the choice.
+    pub hover: String,
+    /// The heading the choice is listed under, with its description. Choices without one are
+    /// listed flat.
+    pub group: Option<(&'static str, &'static str)>,
+}
+
+/// A dropdown with a search box whose choices are listed under collapsible headings, the same
+/// way as the classic editor's Fighters and Moves lists. Returns the index of a picked choice.
+pub(crate) fn picker(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    width: f32,
+    selected_text: &str,
+    choices: &[Pick],
+    selected: Option<usize>,
+) -> Option<usize> {
+    let id = ui.make_persistent_id(id);
+    let mut picked = None;
+    egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .height(480.0)
+        .selected_text(selected_text)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show_ui(ui, |ui| {
+            let query_id = id.with("query");
+            let mut query: String = ui.data_mut(|d| d.get_temp(query_id).unwrap_or_default());
+            // Short lists need no search box.
+            if choices.len() > 12 {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .hint_text("Search")
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() && query.is_empty() {
+                    response.request_focus();
+                }
+            }
+            // Scroll to the current choice on the frame the list opens.
+            let frame = ui.ctx().cumulative_frame_nr();
+            let last: Option<u64> = ui.data(|d| d.get_temp(id.with("shown")));
+            let just_opened = last.is_none_or(|last| last + 1 < frame);
+            ui.data_mut(|d| d.insert_temp(id.with("shown"), frame));
+            let needle = query.trim().to_lowercase();
+            let matches = |pick: &Pick| {
+                needle.is_empty()
+                    || pick.label.to_lowercase().contains(&needle)
+                    || pick.hover.to_lowercase().contains(&needle)
+            };
+            let mut row = |ui: &mut Ui, index: usize, pick: &Pick| {
+                let response = ui
+                    .selectable_label(selected == Some(index), &pick.label)
+                    .on_hover_text(&pick.hover);
+                if selected == Some(index) && just_opened {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.clicked() {
+                    picked = Some(index);
+                }
+            };
+            egui::ScrollArea::vertical()
+                .max_height(440.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let mut groups: Vec<(&'static str, &'static str)> = Vec::new();
+                    for pick in choices {
+                        if let Some(group) = pick.group {
+                            if !groups.contains(&group) {
+                                groups.push(group);
+                            }
+                        }
+                    }
+                    let mut any = false;
+                    for (index, pick) in choices.iter().enumerate() {
+                        if pick.group.is_none() && matches(pick) {
+                            any = true;
+                            row(ui, index, pick);
+                        }
+                    }
+                    for group in groups {
+                        let members: Vec<usize> = (0..choices.len())
+                            .filter(|&i| choices[i].group == Some(group) && matches(&choices[i]))
+                            .collect();
+                        if members.is_empty() {
+                            continue;
+                        }
+                        any = true;
+                        let holds_selected = selected.is_some_and(|s| members.contains(&s));
+                        let header =
+                            egui::CollapsingHeader::new(format!("{} ({})", group.0, members.len()))
+                                .id_salt((id, group.0, !needle.is_empty()))
+                                .default_open(holds_selected);
+                        let header = if needle.is_empty() {
+                            header
+                        } else {
+                            header.open(Some(true))
+                        };
+                        header
+                            .show(ui, |ui| {
+                                for index in members {
+                                    row(ui, index, &choices[index]);
+                                }
+                            })
+                            .header_response
+                            .on_hover_text(group.1);
+                    }
+                    if !any {
+                        ui.weak("Nothing matches");
+                    }
+                });
+            if picked.is_some() {
+                query.clear();
+                ui.close();
+            }
+            ui.data_mut(|d| d.insert_temp(query_id, query));
+        });
+    picked
+}
+
+/// A bone's name in plain words, such as "Hand (right)" for `handr`.
+pub(crate) fn bone_label(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let whole = match lower.as_str() {
+        "top" => Some("Whole body"),
+        "trans" => Some("Root"),
+        "rot" => Some("Root turn"),
+        "hip" => Some("Hips"),
+        "waist" => Some("Waist"),
+        "bust" => Some("Chest"),
+        "head" => Some("Head"),
+        "neck" => Some("Neck"),
+        "throw" => Some("Throw point"),
+        "have" => Some("Held item"),
+        _ => None,
+    };
+    if let Some(whole) = whole {
+        return whole.to_string();
+    }
+    for base in [
+        "hand", "arm", "shoulder", "clavicle", "leg", "knee", "foot", "toe", "finger", "eye",
+        "ear", "have", "wing", "thumb", "elbow",
+    ] {
+        if let Some(rest) = lower.strip_prefix(base) {
+            let side = match rest {
+                "l" => "left",
+                "r" => "right",
+                _ => continue,
+            };
+            let mut title = base.to_string();
+            title[..1].make_ascii_uppercase();
+            return format!("{title} ({side})");
+        }
+    }
+    name.to_string()
+}
+
+/// The body part a bone is listed under.
+fn bone_group(name: &str) -> (&'static str, &'static str) {
+    let lower = name.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| lower.contains(word));
+    if has(&[
+        "top", "trans", "rot", "hip", "waist", "bust", "spine", "body", "throw",
+    ]) {
+        ("Body", "The whole body and the trunk")
+    } else if has(&[
+        "head", "neck", "eye", "ear", "mouth", "jaw", "hair", "face", "nose",
+    ]) {
+        ("Head", "Head, face and hair")
+    } else if has(&[
+        "hand", "arm", "shoulder", "clavicle", "finger", "thumb", "elbow", "have",
+    ]) {
+        ("Arms and hands", "Arms, hands, fingers and held items")
+    } else if has(&["leg", "knee", "foot", "toe", "thigh"]) {
+        ("Legs and feet", "Legs, knees and feet")
+    } else {
+        ("Other", "Bones for clothing, weapons and other parts")
+    }
+}
+
+/// Pick a bone, listed by body part with plain names. Returns true when the bone changed.
+pub(crate) fn bone_picker(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    width: f32,
+    bone: &mut String,
+    bones: &[String],
+) -> bool {
+    let mut names: Vec<&String> = bones.iter().collect();
+    if !bone.is_empty() && !bones.contains(bone) {
+        names.insert(0, bone);
+    }
+    let picks: Vec<Pick> = names
+        .iter()
+        .map(|name| Pick {
+            label: bone_label(name),
+            hover: (*name).clone(),
+            group: Some(bone_group(name)),
+        })
+        .collect();
+    let selected = names.iter().position(|name| *name == bone);
+    let current = if bone.is_empty() {
+        "Choose bone".to_string()
+    } else {
+        bone_label(bone)
+    };
+    match picker(ui, id, width, &current, &picks, selected) {
+        Some(index) if names[index] != bone => {
+            *bone = names[index].clone();
+            true
+        }
+        _ => false,
+    }
+}

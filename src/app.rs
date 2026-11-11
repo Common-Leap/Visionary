@@ -1,4 +1,5 @@
 use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
+use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
@@ -1522,26 +1523,69 @@ fn wind_area_world_point(root: glam::Mat4, horizontal: f32, vertical: f32) -> gl
     root.transform_point3(glam::Vec3::new(0.0, vertical, horizontal))
 }
 
+/// Every fighter as a picker choice, in roster order.
+fn fighter_picks(fighters: &[crate::data::FighterEntry]) -> Vec<crate::ui::Pick> {
+    fighters
+        .iter()
+        .map(|fighter| crate::ui::Pick {
+            label: if fighter.is_modded() {
+                format!("{}  [mod]", fighter.display_name)
+            } else {
+                fighter.display_name.clone()
+            },
+            hover: fighter.name.clone(),
+            group: None,
+        })
+        .collect()
+}
+
+/// Every move as a picker choice under its move family, with the move-list index of each choice.
+fn move_picks(moves: &[MoveEntry]) -> (Vec<crate::ui::Pick>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..moves.len()).collect();
+    order.sort_by_key(|&i| {
+        (
+            crate::move_kinds::group_of(&moves[i].name),
+            format_move_name(&moves[i].name),
+        )
+    });
+    let picks = order
+        .iter()
+        .map(|&i| {
+            let group = crate::move_kinds::group_of(&moves[i].name);
+            crate::ui::Pick {
+                label: format_move_name(&moves[i].name),
+                hover: moves[i].name.clone(),
+                group: Some((group.label(), group.description())),
+            }
+        })
+        .collect();
+    (picks, order)
+}
+
 // ── Enum combo helpers ────────────────────────────────────────────────────────
 
 fn enum_combo(ui: &mut egui::Ui, value: &mut String, id: &str, label: &str, options: &[&str]) {
     ui.horizontal(|ui| {
         ui.label(label);
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(value.as_str())
-            .show_ui(ui, |ui| {
-                // A current value the tables cannot name (a raw number from an exotic
-                // capture) is offered first, so the list ALWAYS contains — and highlights —
-                // what is actually active instead of showing nothing as selected.
-                if !value.is_empty() && !options.contains(&value.as_str()) {
-                    let current = value.clone();
-                    ui.selectable_value(value, current.clone(), current.as_str());
-                    ui.separator();
-                }
-                for &opt in options {
-                    ui.selectable_value(value, opt.to_string(), opt);
-                }
-            });
+        // A current value the tables cannot name (a raw number from an exotic capture) is
+        // offered first, so the list always contains and highlights what is active.
+        let mut choices: Vec<&str> = options.to_vec();
+        let current = value.clone();
+        if !value.is_empty() && !options.contains(&value.as_str()) {
+            choices.insert(0, &current);
+        }
+        let picks: Vec<crate::ui::Pick> = choices
+            .iter()
+            .map(|choice| crate::ui::Pick {
+                label: (*choice).to_owned(),
+                hover: String::new(),
+                group: None,
+            })
+            .collect();
+        let selected = choices.iter().position(|choice| *choice == value.as_str());
+        if let Some(index) = crate::ui::picker(ui, id, 160.0, value.as_str(), &picks, selected) {
+            *value = choices[index].to_owned();
+        }
     });
 }
 
@@ -3311,8 +3355,6 @@ pub struct VisionaryApp {
     node_editor: crate::move_nodes::view::NodeEditor,
     node_workspace: bool,
     node_preview: bool,
-    workspace_fighter_search: String,
-    workspace_move_search: String,
     move_graphs: BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     node_effect_scripts: HashMap<String, crate::data::AcmdScript>,
     node_live_cache: Option<(
@@ -3744,8 +3786,6 @@ impl VisionaryApp {
             node_editor: Default::default(),
             node_workspace: false,
             node_preview: true,
-            workspace_fighter_search: String::new(),
-            workspace_move_search: String::new(),
             move_graphs: Default::default(),
             node_effect_scripts: Default::default(),
             node_live_cache: None,
@@ -9195,91 +9235,37 @@ impl VisionaryApp {
                 self.node_workspace = false;
             }
             ui.separator();
-            egui::ComboBox::from_id_salt("workspace_character")
-                .width(160.0)
-                .selected_text(
-                    self.state
-                        .selected_fighter
-                        .and_then(|index| self.state.fighters.get(index))
-                        .map_or("Character", |fighter| fighter.display_name.as_str()),
-                )
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show_ui(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.workspace_fighter_search)
-                            .hint_text("Find character"),
-                    )
-                    .request_focus();
-                    let query = self.workspace_fighter_search.to_lowercase();
-                    egui::ScrollArea::vertical()
-                        .max_height(440.0)
-                        .show(ui, |ui| {
-                            for (index, fighter) in self.state.fighters.iter().enumerate() {
-                                if fighter.display_name.to_lowercase().contains(&query)
-                                    && ui
-                                        .selectable_value(
-                                            &mut fighter_choice,
-                                            Some(index),
-                                            &fighter.display_name,
-                                        )
-                                        .clicked()
-                                {
-                                    self.workspace_fighter_search.clear();
-                                    ui.close();
-                                }
-                            }
-                        });
-                });
-            egui::ComboBox::from_id_salt("workspace_move")
-                .width(220.0)
-                .selected_text(
-                    self.state
-                        .selected_move
-                        .as_ref()
-                        .map_or("Choose move…", |entry| entry.name.as_str()),
-                )
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show_ui(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.workspace_move_search)
-                            .hint_text("Find move…"),
-                    )
-                    .request_focus();
-                    let query = self.workspace_move_search.to_ascii_lowercase();
-                    // Names that start with the query come first; unnamed moves are bare
-                    // hashes and go last.
-                    let mut matches: Vec<_> = self
-                        .move_list
-                        .iter()
-                        .filter(|entry| entry.name.to_ascii_lowercase().contains(&query))
-                        .collect();
-                    matches.sort_by_key(|entry| {
-                        (
-                            entry.name.starts_with("0x"),
-                            !entry.name.to_ascii_lowercase().starts_with(&query),
-                        )
-                    });
-                    egui::ScrollArea::vertical()
-                        .max_height(360.0)
-                        .show(ui, |ui| {
-                            for entry in matches {
-                                if ui
-                                    .selectable_label(
-                                        self.state
-                                            .selected_move
-                                            .as_ref()
-                                            .is_some_and(|selected| selected.name == entry.name),
-                                        &entry.name,
-                                    )
-                                    .clicked()
-                                {
-                                    move_choice = Some(entry.clone());
-                                    self.workspace_move_search.clear();
-                                    ui.close();
-                                }
-                            }
-                        });
-                });
+            let fighters = fighter_picks(&self.state.fighters);
+            let current = self
+                .state
+                .selected_fighter
+                .and_then(|index| self.state.fighters.get(index))
+                .map_or("Character", |fighter| fighter.display_name.as_str());
+            if let Some(index) = crate::ui::picker(
+                ui,
+                "workspace_character",
+                160.0,
+                current,
+                &fighters,
+                self.state.selected_fighter,
+            ) {
+                fighter_choice = Some(index);
+            }
+            let (moves, order) = move_picks(&self.move_list);
+            let selected_move = self.state.selected_move.as_ref().and_then(|selected| {
+                order
+                    .iter()
+                    .position(|&i| self.move_list[i].hash == selected.hash)
+            });
+            let current = self.state.selected_move.as_ref().map_or_else(
+                || "Choose move".to_string(),
+                |entry| format_move_name(&entry.name),
+            );
+            if let Some(pick) =
+                crate::ui::picker(ui, "workspace_move", 220.0, &current, &moves, selected_move)
+            {
+                move_choice = Some(self.move_list[order[pick]].clone());
+            }
             if ui
                 .small_button(if self.state.playing { "Pause" } else { "Play" })
                 .clicked()
@@ -9872,13 +9858,7 @@ impl VisionaryApp {
                     if self.bone_names.is_empty() {
                         ui.text_edit_singleline(&mut self.add_bone);
                     } else {
-                        egui::ComboBox::from_id_salt("add_bone_select")
-                            .selected_text(&self.add_bone)
-                            .show_ui(ui, |ui| {
-                                for name in &self.bone_names.clone() {
-                                    ui.selectable_value(&mut self.add_bone, name.clone(), name);
-                                }
-                            });
+                        crate::ui::bone_picker(ui, "add_bone_select", 140.0, &mut self.add_bone, &self.bone_names);
                     }
                 }
                 let size_label = match self.add_hitbox_category {
@@ -10270,17 +10250,7 @@ impl VisionaryApp {
                                             if bone_names.is_empty() {
                                                 ui.text_edit_singleline(&mut hb.bone_name);
                                             } else {
-                                                egui::ComboBox::from_id_salt("edit_bone_select")
-                                                    .selected_text(&hb.bone_name)
-                                                    .show_ui(ui, |ui| {
-                                                        for name in &bone_names {
-                                                            ui.selectable_value(
-                                                                &mut hb.bone_name,
-                                                                name.clone(),
-                                                                name,
-                                                            );
-                                                        }
-                                                    });
+                                                crate::ui::bone_picker(ui, "edit_bone_select", 140.0, &mut hb.bone_name, &bone_names);
                                             }
                                         });
                                     }
@@ -14694,24 +14664,10 @@ impl VisionaryApp {
                                         )
                                         .changed();
                                 } else {
-                                    egui::ComboBox::from_id_salt("effect_bone_select")
-                                        .selected_text(&ec.bone_name)
-                                        .width(140.0)
-                                        .show_ui(ui, |ui| {
-                                            for name in &bone_names {
-                                                if ui
-                                                    .selectable_value(
-                                                        &mut ec.bone_name,
-                                                        name.clone(),
-                                                        name,
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    changed = true;
-                                                    respawn_needed = true;
-                                                }
-                                            }
-                                        });
+                                    if crate::ui::bone_picker(ui, "effect_bone_select", 140.0, &mut ec.bone_name, &bone_names) {
+                                        changed = true;
+                                        respawn_needed = true;
+                                    }
                                 }
                                 if let Some(p) = &pristine {
                                     orig(ui, format!("orig {}", p.bone_name));
@@ -14735,24 +14691,10 @@ impl VisionaryApp {
                                             )
                                             .changed();
                                     } else {
-                                        egui::ComboBox::from_id_salt("effect_bone2_select")
-                                            .selected_text(&bone2)
-                                            .width(140.0)
-                                            .show_ui(ui, |ui| {
-                                                for name in &bone_names {
-                                                    if ui
-                                                        .selectable_value(
-                                                            &mut bone2,
-                                                            name.clone(),
-                                                            name,
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        changed = true;
-                                                        respawn_needed = true;
-                                                    }
-                                                }
-                                            });
+                                        if crate::ui::bone_picker(ui, "effect_bone2_select", 140.0, &mut bone2, &bone_names) {
+                                            changed = true;
+                                            respawn_needed = true;
+                                        }
                                     }
                                     if ec.trail_bone2.as_deref() != Some(bone2.as_str()) {
                                         ec.trail_bone2 = Some(bone2);
@@ -26168,23 +26110,32 @@ impl VisionaryApp {
                 let (done, total) = pool.progress();
                 ui.horizontal(|ui| {
                     ui.label("Target:");
-                    egui::ComboBox::from_id_salt("transplant_target_combo")
-                        .selected_text(
-                            target
-                                .as_deref()
-                                .map(fighter_display_name)
-                                .unwrap_or_else(|| "— pick fighter —".into()),
-                        )
-                        .width(170.0)
-                        .show_ui(ui, |ui| {
-                            for (name, display_name) in &fighter_names {
-                                let is = target.as_deref() == Some(name.as_str());
-                                if ui.selectable_label(is, display_name).clicked() {
-                                    self.transplant_target = Some(name.clone());
-                                    self.transplant_replace = None;
-                                }
-                            }
-                        });
+                    let picks: Vec<crate::ui::Pick> = fighter_names
+                        .iter()
+                        .map(|(name, display_name)| crate::ui::Pick {
+                            label: display_name.clone(),
+                            hover: name.clone(),
+                            group: None,
+                        })
+                        .collect();
+                    let selected = fighter_names
+                        .iter()
+                        .position(|(name, _)| target.as_deref() == Some(name.as_str()));
+                    let current = target
+                        .as_deref()
+                        .map(fighter_display_name)
+                        .unwrap_or_else(|| "Pick a fighter".into());
+                    if let Some(index) = crate::ui::picker(
+                        ui,
+                        "transplant_target_combo",
+                        170.0,
+                        &current,
+                        &picks,
+                        selected,
+                    ) {
+                        self.transplant_target = Some(fighter_names[index].0.clone());
+                        self.transplant_replace = None;
+                    }
                     if scanning {
                         ui.label(
                             egui::RichText::new(format!("scanning effs… {done}/{total}"))
@@ -33869,108 +33820,16 @@ fn sound_candidates(labels: &HashMap<u64, String>, fighter: &str) -> Vec<String>
     out
 }
 
-fn format_move_name(name: &str) -> String {
-    let stripped = if name.len() > 3 {
-        let b = name.as_bytes();
-        if b[0].is_ascii_alphabetic() && b[1].is_ascii_digit() && b[2].is_ascii_digit() {
-            &name[3..]
-        } else {
-            name
-        }
-    } else {
-        name
-    };
-
-    match stripped.replace('_', "").as_str() {
-        "attacks4s" => return "Forward smash".into(),
-        "attacks4" => return "Forward smash".into(),
-        "attackhi4" => return "Up smash".into(),
-        "attacklw4" => return "Down smash".into(),
-        "attacks3s" => return "Forward tilt".into(),
-        "attacks3" => return "Forward tilt".into(),
-        "attackhi3" => return "Up tilt".into(),
-        "attacklw3" => return "Down tilt".into(),
-        "attackairn" => return "Neutral air".into(),
-        "attackairf" => return "Forward air".into(),
-        "attackairb" => return "Back air".into(),
-        "attackairhi" => return "Up air".into(),
-        "attackairlw" => return "Down air".into(),
-        "attackdash" => return "Dash attack".into(),
-        "attack11" => return "Jab 1".into(),
-        "attack12" => return "Jab 2".into(),
-        "attack13" => return "Jab 3".into(),
-        "catch" => return "Grab".into(),
-        "catchdash" => return "Dash grab".into(),
-        "catchturn" => return "Pivot grab".into(),
-        "throwf" => return "Forward throw".into(),
-        "throwb" => return "Back throw".into(),
-        "throwhi" => return "Up throw".into(),
-        "throwlw" => return "Down throw".into(),
-        "specialn" => return "Neutral special".into(),
-        "specials" => return "Side special".into(),
-        "specialhi" => return "Up special".into(),
-        "speciallw" => return "Down special".into(),
-        _ => {}
-    }
-
-    // Variants read as the move they belong to: "attack_hi4_hold" is "Up smash hold",
-    // "special_air_n" is "Neutral special air".
-    const PARTS: &[(&str, &str)] = &[
-        ("attack_s4", "forward smash"),
-        ("attack_hi4", "up smash"),
-        ("attack_lw4", "down smash"),
-        ("attack_s3", "forward tilt"),
-        ("attack_hi3", "up tilt"),
-        ("attack_lw3", "down tilt"),
-        ("attack_air_n", "neutral air"),
-        ("attack_air_f", "forward air"),
-        ("attack_air_b", "back air"),
-        ("attack_air_hi", "up air"),
-        ("attack_air_lw", "down air"),
-        ("attack_dash", "dash attack"),
-        ("attack_100", "rapid jab"),
-        ("special_air_n", "neutral special air"),
-        ("special_air_s", "side special air"),
-        ("special_air_hi", "up special air"),
-        ("special_air_lw", "down special air"),
-        ("special_n", "neutral special"),
-        ("special_s", "side special"),
-        ("special_hi", "up special"),
-        ("special_lw", "down special"),
-        ("final", "final smash"),
-    ];
-    let mut words = stripped.to_owned();
-    if let Some((part, plain)) = PARTS.iter().find(|(part, _)| stripped.starts_with(part)) {
-        words = format!("{plain}{}", &stripped[part.len()..]);
-    }
-    if PARTS.iter().any(|(part, _)| stripped.starts_with(part)) {
-        let words = words.replace('_', " ");
-        let mut letters = words.trim().chars();
-        return letters.next().map_or_else(String::new, |first| {
-            first.to_uppercase().chain(letters).collect()
-        });
-    }
-
-    stripped
-        .replace('_', " ")
-        .split_whitespace()
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                None => String::new(),
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[test]
 fn move_labels_use_familiar_names_and_preserve_unknown_fallbacks() {
     assert_eq!(format_move_name("attack_s4_s"), "Forward smash");
     assert_eq!(format_move_name("attackairhi"), "Up air");
     assert_eq!(format_move_name("attack_11"), "Jab 1");
-    assert_eq!(format_move_name("custom_motion"), "Custom Motion");
+    assert_eq!(format_move_name("custom_motion"), "Custom motion");
+    assert_eq!(
+        format_move_name("catched_air_ganon"),
+        "Held by air Ganondorf"
+    );
     assert_eq!(format_move_name("attack_hi4_hold"), "Up smash hold");
     assert_eq!(
         format_move_name("special_air_n_start"),

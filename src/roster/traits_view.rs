@@ -559,25 +559,34 @@ impl TraitsView {
             .unwrap_or_else(|| "Select a character".to_string());
         let current_key = self.selected.clone();
         let picker_w = (ui.available_width() - 200.0).clamp(140.0, 220.0);
-        egui::ComboBox::from_id_salt("traits_character_picker")
-            .selected_text(RichText::new(current).strong())
-            .width(picker_w)
-            .show_ui(ui, |ui| {
-                for entry in entries {
-                    let is_selected = current_key.as_ref() == Some(&entry.key);
-                    let mut label = entry.display_name.clone();
-                    if entry.backing.shares_engine_fighter() {
-                        label.push_str("  ◈ costume");
-                    }
-                    let resp = ui.selectable_label(is_selected, label);
-                    if resp.clicked() {
-                        self.selected = Some(entry.key.clone());
-                    }
-                    if is_selected {
-                        resp.scroll_to_me(Some(egui::Align::Center));
-                    }
-                }
-            });
+        let picks: Vec<crate::ui::Pick> = entries
+            .iter()
+            .map(|entry| crate::ui::Pick {
+                label: entry.display_name.clone(),
+                hover: entry.fighter.clone().unwrap_or_default(),
+                group: Some(if entry.backing.shares_engine_fighter() {
+                    (
+                        "Costume characters",
+                        "Characters that share another fighter's moves",
+                    )
+                } else {
+                    ("Fighters", "Fighters with their own moves")
+                }),
+            })
+            .collect();
+        let selected = entries
+            .iter()
+            .position(|entry| current_key.as_ref() == Some(&entry.key));
+        if let Some(index) = crate::ui::picker(
+            ui,
+            "traits_character_picker",
+            picker_w,
+            &current,
+            &picks,
+            selected,
+        ) {
+            self.selected = Some(entries[index].key.clone());
+        }
     }
 }
 
