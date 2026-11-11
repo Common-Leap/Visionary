@@ -766,6 +766,12 @@ impl NodeEditor {
                         }
                     });
                 }
+                let move_name = self.key.rsplit('/').next().unwrap_or_default();
+                if source.track == Track::Game
+                    && crate::move_kinds::group_of(move_name) == crate::move_kinds::MoveGroup::Smash
+                {
+                    ui.weak("Holding the button charges this smash. Charging raises its damage, up to 1.4 times the values shown at full charge.");
+                }
                 if source.track == Track::Game && plain::leaves_hitbox_on(&source.nodes) {
                     ui.colored_label(ui.visuals().warn_fg_color, "A hitbox stays on until the move ends. Add End all hitboxes to stop it sooner.");
                 }

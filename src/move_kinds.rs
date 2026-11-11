@@ -468,7 +468,11 @@ pub fn plain_name(name: &str) -> String {
         words = format!("{plain}{}", &stripped[part.len()..]);
     }
     if PARTS.iter().any(|(part, _)| stripped.starts_with(part)) {
-        let words = words.replace('_', " ");
+        let mut words = format!("{} ", words.replace('_', " "));
+        // Angled smashes and tilts end in hi or lw.
+        for (from, to) in [(" hi ", " angled up "), (" lw ", " angled down ")] {
+            words = words.replace(from, to);
+        }
         let mut letters = words.trim().chars();
         return letters.next().map_or_else(String::new, |first| {
             first.to_uppercase().chain(letters).collect()

@@ -160,6 +160,7 @@ pub fn block_help(name: &str) -> Option<&'static str> {
     Some(match name {
         "At frame" => "Everything after this waits until the animation reaches this frame.",
         "Wait" => "Pauses for this many frames before the next block runs.",
+        "When" => "Runs its blocks once the move reaches this point. After runs next either way.",
         "If" => "Checks something during the move. Yes runs when it is true, No when it is not, and After runs either way.",
         "Repeat" => "Runs the blocks in Loop several times.",
         "Hitbox" => "An area that hits opponents. It stays on until an End hitbox block.",
@@ -241,8 +242,8 @@ pub fn symbol_words(symbol: &str) -> String {
 fn flag_phrase(symbol: &str, expected: bool) -> String {
     let positive = match symbol {
         "FIGHTER_STATUS_ATTACK_FLAG_SMASH_SMASH_HOLD_TO_ATTACK" => Some((
-            "the smash attack was charged",
-            "the smash attack was not charged",
+            "the smash attack has been let go",
+            "the smash attack has not been let go",
         )),
         "FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO"
         | "FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO_INPUT" => Some((
@@ -274,6 +275,72 @@ fn flag_phrase(symbol: &str, expected: bool) -> String {
     }
 }
 
+/// What a check that is not really a choice marks, as words that read after "When". The game
+/// sets the smash "hold to attack" flag when the smash is let go, charged or not, so its blocks
+/// always run; charging only raises the damage.
+pub fn release_point(condition: &MoveCondition) -> Option<&'static str> {
+    let flag = match condition {
+        MoveCondition::WorkFlag {
+            symbol,
+            expected: true,
+        } => symbol.as_str(),
+        MoveCondition::Source { header } if !header.contains('!') => header.as_str(),
+        _ => return None,
+    };
+    flag.contains("FIGHTER_STATUS_ATTACK_FLAG_SMASH_SMASH_HOLD_TO_ATTACK")
+        .then_some("the smash attack is let go (charged or not)")
+}
+
+/// A costume check: the game numbers costumes from 0, players from 1.
+fn costume_words(op: NativeComparison, slot: i64) -> String {
+    match op {
+        NativeComparison::Eq => format!("the fighter wears costume {} (c{slot:02})", slot + 1),
+        NativeComparison::Ne => format!(
+            "the fighter does not wear costume {} (c{slot:02})",
+            slot + 1
+        ),
+        op => format!("the costume number {} {}", compare(op), slot + 1),
+    }
+}
+
+/// A game value such as `*FIGHTER_PICKEL_MATERIAL_KIND_GOLD` as the word a player uses ("gold").
+fn value_words(value: &str) -> String {
+    let value = value.trim().trim_start_matches('*');
+    if value.parse::<f64>().is_ok() {
+        return value.to_string();
+    }
+    let tail = ["_KIND_", "_STRENGTH_", "_SAVING_LV_", "_LV_"]
+        .iter()
+        .find_map(|separator| {
+            value
+                .rsplit_once(separator)
+                .map(|(_, tail)| (separator.trim_matches('_'), tail))
+        });
+    match tail {
+        Some(("STRENGTH", "W")) => "light".into(),
+        Some(("STRENGTH", "M")) => "medium".into(),
+        Some(("STRENGTH", "S")) => "heavy".into(),
+        Some(("SAVING_LV" | "LV", level)) => format!("level {level}"),
+        Some((_, tail)) => tail.replace('_', " ").to_lowercase(),
+        None => move_words(&symbol_words(value)).trim().to_string(),
+    }
+}
+
+/// "piece is out" as "piece is not out".
+fn negate(words: &str) -> String {
+    for (from, to) in [
+        (" is out", " is not out"),
+        (" is on", " is off"),
+        (" is off", " is on"),
+        (" wears ", " does not wear "),
+    ] {
+        if let Some(index) = words.rfind(from) {
+            return format!("{}{to}{}", &words[..index], &words[index + from.len()..]);
+        }
+    }
+    format!("it is not true that {words}")
+}
+
 /// A condition as words that read after "If".
 pub fn condition_sentence(condition: &MoveCondition) -> String {
     match condition {
@@ -284,6 +351,8 @@ pub fn condition_sentence(condition: &MoveCondition) -> String {
                 .trim_start_matches("else")
                 .trim()
                 .trim_start_matches("if")
+                .trim()
+                .trim_start_matches('{')
                 .trim();
             if header.is_empty() {
                 "none of the above".into()
@@ -346,6 +415,22 @@ pub fn condition_sentence(condition: &MoveCondition) -> String {
             super::model::InflictionMask::Shield => "this attack hit a shield".into(),
         },
         MoveCondition::WorkFlag { symbol, expected } => flag_phrase(symbol, *expected),
+        MoveCondition::WorkInt {
+            symbol,
+            op: NativeComparison::Eq,
+            value: NativeIntOperand::FighterKind(fighter),
+        } if symbol == "FIGHTER_INSTANCE_WORK_ID_INT_KIND" => {
+            if fighter == "kirby" {
+                "Kirby is using this move as a copy ability".into()
+            } else {
+                format!("the fighter is {fighter}")
+            }
+        }
+        MoveCondition::WorkInt {
+            symbol,
+            op,
+            value: NativeIntOperand::Literal(slot),
+        } if symbol == "FIGHTER_INSTANCE_WORK_ID_INT_COLOR" => costume_words(*op, i64::from(*slot)),
         MoveCondition::WorkInt { symbol, op, value } => {
             let right = match value {
                 NativeIntOperand::Literal(value) => value.to_string(),
@@ -371,7 +456,7 @@ pub fn condition_sentence(condition: &MoveCondition) -> String {
         }
         MoveCondition::And { .. } => "all of these are true".into(),
         MoveCondition::Or { .. } => "any of these is true".into(),
-        MoveCondition::Not(inner) => format!("not: {}", condition_sentence(inner)),
+        MoveCondition::Not(inner) => negate(&condition_sentence(inner)),
         MoveCondition::Group(inner) => condition_sentence(inner),
     }
 }
@@ -587,6 +672,22 @@ pub struct StoryLine {
     pub node: Option<u32>,
 }
 
+/// The game's "if the move is running" wrapper, however it was read.
+fn is_running_check(condition: &MoveCondition) -> bool {
+    match condition {
+        MoveCondition::IsExecute => true,
+        MoveCondition::Source { header } => {
+            let header = header
+                .trim()
+                .trim_start_matches("if")
+                .trim()
+                .trim_end_matches('{');
+            condition_words(header) == "the move is running"
+        }
+        _ => false,
+    }
+}
+
 /// Reads a script top to bottom as sentences. `caption` gives a block its name and detail.
 pub fn story(
     nodes: &[MoveNode],
@@ -612,10 +713,24 @@ pub fn story(
             // The game wraps nearly everything in "if the move is running"; a reader
             // gains nothing from it.
             NodeKind::Branch {
-                condition: MoveCondition::IsExecute,
+                condition,
                 then_nodes,
                 else_nodes,
-            } if else_nodes.is_empty() => story(then_nodes, depth, frame, caption, out),
+            } if is_running_check(condition) => {
+                let start = *frame;
+                story(then_nodes, depth, frame, caption, out);
+                // The check is false only while the game skips ahead through the move.
+                if !else_nodes.is_empty() {
+                    out.push(StoryLine {
+                        frame: None,
+                        depth,
+                        text: "When the game skips ahead past this point:".into(),
+                        node: Some(node.id),
+                    });
+                    let mut other = start;
+                    story(else_nodes, depth + 1, &mut other, caption, out);
+                }
+            }
             NodeKind::Branch {
                 then_nodes,
                 else_nodes,
@@ -715,6 +830,10 @@ fn move_words(words: &str) -> String {
         (" attack lw3 ", " down tilt "),
         (" attack s3 ", " side tilt "),
         (" lua script line max ", " arm fully stretched "),
+        (" neutral special neutral special ", " neutral special "),
+        (" special common int strength ", " attack strength "),
+        (" saving lv ", " charge level "),
+        (" int ", " "),
         (" flag ", " "),
         (" lw ", " down "),
         (" hi ", " up "),
@@ -890,6 +1009,9 @@ pub fn call_words(callee: &str, args: &[String]) -> String {
             first().replace("fighter kinetic type ", "")
         ),
         "clear" if module == "AttackModule" => "End one hitbox".into(),
+        "set_power_mul_status" | "set_power_mul" => {
+            format!("Damage multiplier: {}", first())
+        }
         "set_visibility" | "set_whole" => "Show or hide the model".into(),
         "clear_all" if module == "AttackModule" => "End all hitboxes".into(),
         "wait_loop_sync_mot" => "Match the animation loop".into(),
@@ -943,6 +1065,7 @@ fn notice_words(args: &[&String]) -> String {
             if value == "true" { "on" } else { "off" }
         ),
         "Hash40::new_raw(0x25fd66ecef)" => "Zoom the camera".into(),
+        "Hash40::new_raw(0x2d51fcdb09)" => "Keep firing while the button is held".into(),
         _ => "Signal the fighter's own code".into(),
     }
 }
@@ -956,8 +1079,41 @@ pub fn condition_words(code: &str) -> String {
         .filter(|inner| split_args(inner).len() == 1)
         .unwrap_or(code)
         .trim();
+    if code == "false" {
+        return "never (the game switched this off)".into();
+    }
+    if code == "true" {
+        return "always".into();
+    }
+    // The script dump writes some reads of the fighter's numbers as a bare address. These
+    // compare a number with a value.
+    if let Some((address, rest)) = code.split_once('(') {
+        if address.starts_with("0x") {
+            let args = split_args(rest.strip_suffix(')').unwrap_or(rest));
+            if let [symbol, value] = args.as_slice() {
+                if symbol.contains("WORK_ID_INT_COLOR") || symbol.contains("WORK_INT_COLOR") {
+                    if let Ok(slot) = value.trim().parse::<i64>() {
+                        return costume_words(NativeComparison::Eq, slot);
+                    }
+                }
+                if symbol.contains("_INT_") {
+                    return format!(
+                        "{} is {}",
+                        move_words(&symbol_words(symbol)),
+                        value_words(value)
+                    );
+                }
+            }
+        }
+    }
+    if code.contains("L2CValue") && code.contains("operator<=") && code.contains("-0.4") {
+        return "falling fast".into();
+    }
+    if code.contains("L2CValue") && code.contains("VOICE_DEFAULT") {
+        return "the game uses its usual voices".into();
+    }
     if code.contains("L2CValue") || code.starts_with("0x") {
-        return "the fighter's own code says so".into();
+        return "a check inside the game passes".into();
     }
     for (joiner, word) in [("&&", " and "), ("||", " or ")] {
         if code.contains(joiner) {
@@ -984,6 +1140,9 @@ pub fn condition_words(code: &str) -> String {
         ("<", "is less than"),
     ] {
         if let Some((left, right)) = code.split_once(operator) {
+            if left.contains("speed_y") {
+                return format!("the up-down speed {word} {}", arg_words(right));
+            }
             return format!(
                 "{} {word} {}",
                 condition_words(left).trim_end_matches(" is on"),
@@ -1001,6 +1160,14 @@ pub fn condition_words(code: &str) -> String {
                 "FT_IS_SAME_FIGHTER_CATEGORY" => "this is a matching kind of fighter".into(),
                 "IS_HAVE_ITEM_KIND" => "holding that item".into(),
                 "is_exist_article" | "ArticleModule::is_exist" => "the object is out".into(),
+                "IS_FIGHTER_STATUS_KIND" | "IS_STATUS_KIND" => match args.last() {
+                    Some(status) => format!(
+                        "the fighter is doing {}",
+                        crate::gimmicks::field_canvas::status_name(status.trim_start_matches('*'))
+                            .to_lowercase()
+                    ),
+                    None => "the fighter is in that action".into(),
+                },
                 _ => call_words(callee, &args),
             }
         }
@@ -1102,4 +1269,33 @@ pub fn call_detail(arguments: &[String]) -> String {
         .map(|arg| arg_words(arg))
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+#[cfg(test)]
+mod common_sense_tests {
+    use super::*;
+
+    #[test]
+    fn the_smash_release_check_is_a_when_and_game_values_read_as_words() {
+        let released = MoveCondition::WorkFlag {
+            symbol: "FIGHTER_STATUS_ATTACK_FLAG_SMASH_SMASH_HOLD_TO_ATTACK".into(),
+            expected: true,
+        };
+        assert_eq!(
+            release_point(&released),
+            Some("the smash attack is let go (charged or not)")
+        );
+        assert_eq!(
+            condition_words("0x1050b0(*FIGHTER_INSTANCE_WORK_ID_INT_COLOR, 3)"),
+            "the fighter wears costume 4 (c03)"
+        );
+        assert_eq!(
+            condition_words(
+                "0x370870(*FIGHTER_PICKEL_INSTANCE_WORK_ID_INT_HAVE_CRAFT_WEAPON_MATERIAL_KIND, *FIGHTER_PICKEL_MATERIAL_KIND_GOLD)"
+            ),
+            "held tool material is gold"
+        );
+        assert_eq!(condition_words("false"), "never (the game switched this off)");
+        assert_eq!(negate("piece is out"), "piece is not out");
+    }
 }

@@ -33845,6 +33845,7 @@ fn sound_candidates(labels: &HashMap<u64, String>, fighter: &str) -> Vec<String>
 #[test]
 fn move_labels_use_familiar_names_and_preserve_unknown_fallbacks() {
     assert_eq!(format_move_name("attack_s4_s"), "Forward smash");
+    assert_eq!(format_move_name("attack_s4_hi"), "Forward smash angled up");
     assert_eq!(format_move_name("attackairhi"), "Up air");
     assert_eq!(format_move_name("attack_11"), "Jab 1");
     assert_eq!(format_move_name("custom_motion"), "Custom motion");

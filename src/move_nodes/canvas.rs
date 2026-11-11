@@ -893,6 +893,9 @@ impl CanvasState {
                                 "Next"
                             }
                         }
+                        OutputPort::Flow(FlowPort::Then) if block.title.starts_with("When ") => {
+                            "Then"
+                        }
                         OutputPort::Flow(FlowPort::Then) => "Yes",
                         OutputPort::Flow(FlowPort::Else) => "No",
                         OutputPort::Flow(FlowPort::Repeat) => "Loop",
@@ -1007,6 +1010,8 @@ pub(super) fn node_help(node: &MoveNode) -> Option<&'static str> {
     let title = blocks[0].title.as_str();
     super::plain::block_help(if title.starts_with("If ") {
         "If"
+    } else if title.starts_with("When ") {
+        "When"
     } else {
         title
     })
@@ -1846,6 +1851,17 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
                 ),
                 ACTION,
             ),
+            NodeKind::Branch {
+                condition,
+                else_nodes,
+                ..
+            } if else_nodes.is_empty() && super::plain::release_point(condition).is_some() => (
+                "When",
+                super::plain::release_point(condition)
+                    .unwrap_or_default()
+                    .into(),
+                FLOW,
+            ),
             NodeKind::Branch { condition, .. } => ("If", condition_caption(condition), FLOW),
             NodeKind::Repeat { motion_loop, .. } if motion_loop.is_loop() => {
                 ("Repeat", "Every motion loop".into(), FLOW)
@@ -1875,12 +1891,13 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
             std::mem::take(&mut detail)
         } else if title == "Engine action" {
             super::plain::block_name(&std::mem::take(&mut detail)).to_owned()
-        } else if title == "If" {
-            format!("If {}", std::mem::take(&mut detail))
+        } else if title == "If" || title == "When" {
+            format!("{title} {}", std::mem::take(&mut detail))
         } else {
             super::plain::block_name(title).into()
         };
         let detail = super::plain::detail(detail);
+        let when = title.starts_with("When ");
         blocks.push(Block {
             code: String::new(),
             internal,
@@ -1900,6 +1917,10 @@ fn project_nodes(nodes: &[MoveNode], depth: usize, row: &mut usize, blocks: &mut
                 }
                 // Next sits mid-card, level with the chain, so it cannot be
                 // mistaken for a wire leaving Then.
+                // A "When" step always runs its blocks, so it has no No.
+                NodeKind::Branch { .. } if when => {
+                    vec![FlowPort::Then.into(), FlowPort::Next.into()]
+                }
                 NodeKind::Branch { .. } => vec![
                     FlowPort::Then.into(),
                     FlowPort::Next.into(),
@@ -2440,17 +2461,16 @@ mod story_wording_tests {
                     let mut lines = Vec::new();
                     crate::move_nodes::plain::story(nodes, 0, &mut 0.0, &story_caption, &mut lines);
                     for line in lines {
+                        // A check shows the condition it was read from.
                         let code = line
                             .node
                             .and_then(|id| find(nodes, id))
-                            .filter(|node| {
-                                !matches!(
-                                    node.kind,
-                                    NodeKind::Branch { .. } | NodeKind::Repeat { .. }
-                                )
-                            })
-                            .map(|node| {
-                                crate::move_nodes::timeline::block_code(fighter, &source, node)
+                            .filter(|node| !matches!(node.kind, NodeKind::Repeat { .. }))
+                            .map(|node| match &node.kind {
+                                NodeKind::Branch { condition, .. } => format!("{condition:?}"),
+                                _ => {
+                                    crate::move_nodes::timeline::block_code(fighter, &source, node)
+                                }
                             })
                             .unwrap_or_default()
                             .replace('\n', " ⏎ ");
