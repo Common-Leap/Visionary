@@ -67,7 +67,11 @@ pub(crate) fn plugin(root: &Path) {
     for (path, contents) in [
         (
             root.join("Cargo.toml"),
-            "[package]\nname = \"slight_replica\"\n",
+            "[package]\nname = \"slight_replica\"\nauthors = [\"Visionary\"]\n\n[lib]\nname = \"_effect_viewer\"\n",
+        ),
+        (
+            root.join("src/lib.rs"),
+            "#[skyline::main(name = \"visionary_mod\")]\npub fn main() {}\n",
         ),
         (
             modules.join("generated.rs"),

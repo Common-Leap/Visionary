@@ -92,6 +92,8 @@ pub struct NormalExportPlan {
 #[derive(Debug, Clone)]
 pub struct SelectedGimmickRuntime {
     plugin_root: PathBuf,
+    /// The crate and plugin name the mod's plugin is built under.
+    name: String,
     behavior: crate::gimmicks::adapter::RenderedAdapter,
     acmd: crate::gimmicks::acmd_adapter::RenderedAcmdAdapter,
 }
@@ -136,19 +138,18 @@ impl SelectedGimmickRuntime {
         crate::gimmicks::package::build_combined_into_package(
             &self.plugin_root,
             package_root,
+            &self.name,
             &self.behavior,
             &self.acmd,
         )
     }
 
     /// Write the plugin source this runtime builds from, with the export's code in it.
-    pub fn write_source(
-        &self,
-        dest: &Path,
-    ) -> Result<PathBuf, crate::gimmicks::package::PackageError> {
+    pub fn write_source(&self, dest: &Path) -> Result<(), crate::gimmicks::package::PackageError> {
         crate::gimmicks::package::write_source_tree(
             &self.plugin_root,
             dest,
+            &self.name,
             &self.behavior,
             &self.acmd,
         )
@@ -167,6 +168,7 @@ impl SelectedGimmickRuntime {
             &self.plugin_root,
             package_root,
             &package_root.with_extension("work"),
+            &self.name,
             &self.behavior,
             &self.acmd,
             build,
@@ -194,7 +196,8 @@ pub fn plan_normal_export(
     if selected_gimmick_plugin_root.is_none() {
         refuse_uninstalled_controller_charts(project)?;
     }
-    let expanded = crate::move_nodes::project::expand(project).map_err(node_errors)?;
+    let mut expanded = crate::move_nodes::project::expand(project).map_err(node_errors)?;
+    drop_unchanged_scripts(&mut expanded, &crate::acmd::cached_script_body);
     let project = &expanded;
     let active_gimmicks = active_gimmicks(project);
     if selected_gimmick_plugin_root.is_none() {
@@ -270,6 +273,7 @@ pub fn plan_normal_export(
         generated_source: None,
         gimmick_runtime: Some(SelectedGimmickRuntime {
             plugin_root: plugin_root.to_path_buf(),
+            name: plugin_name(project),
             behavior: artifact,
             acmd,
         }),
@@ -278,12 +282,102 @@ pub fn plan_normal_export(
     })
 }
 
+/// Leave out every script of a move that still matches the game's own. The game keeps running
+/// its version, and re-emitting dumped source can produce Rust that does not build (raw address
+/// calls and other decompiler leftovers in scripts the user never touched). The game's version
+/// is put through the same node import and compile as the user's, so only real edits differ.
+/// `vanilla` gives a move's dumped source (all four functions), or None when it isn't known.
+fn drop_unchanged_scripts(
+    project: &mut ModProjectFile,
+    vanilla: &dyn Fn(&str, &str) -> Option<String>,
+) {
+    use crate::move_nodes::model::{MoveGraph, Track};
+    let same = |a: &dyn erased_json::Json, b: &dyn erased_json::Json| a.json() == b.json();
+    for (fighter, edits) in project.fighters.iter_mut() {
+        let mut moves: Vec<String> = edits
+            .acmd
+            .keys()
+            .chain(edits.sound_scripts.keys())
+            .chain(edits.expression_scripts.keys())
+            .chain(edits.effect_scripts.keys())
+            .cloned()
+            .collect();
+        moves.sort();
+        moves.dedup();
+        for move_name in moves {
+            let Some(body) = vanilla(fighter, &move_name).filter(|body| !body.is_empty()) else {
+                continue;
+            };
+            let game = crate::acmd::parse_acmd_script(&body);
+            let sound = crate::acmd::parse_sound_script(&body);
+            let expression = crate::acmd::parse_expression_script(&body);
+            let effect = crate::acmd::parse_effect_script(&body);
+            let mut graph = MoveGraph::default();
+            graph.tracks = [Track::Game, Track::Sound, Track::Expression]
+                .into_iter()
+                .zip([&game, &sound, &expression])
+                .map(|(track, script)| {
+                    crate::move_nodes::timeline::import_for_fighter(fighter, track, script)
+                })
+                .collect();
+            graph
+                .tracks
+                .push(crate::move_nodes::effects::import_for_fighter(
+                    fighter, &effect,
+                ));
+            let mut alone = ModProjectFile::default();
+            alone
+                .fighters
+                .entry(fighter.clone())
+                .or_default()
+                .move_graphs
+                .insert(move_name.clone(), graph);
+            let Ok(compiled) = crate::move_nodes::project::expand(&alone) else {
+                continue;
+            };
+            let Some(theirs) = compiled.fighters.get(fighter) else {
+                continue;
+            };
+            if let (Some(ours), Some(game)) =
+                (edits.acmd.get(&move_name), theirs.acmd.get(&move_name))
+            {
+                if same(&ours.script, &game.script) && ours.effective_scopes().is_empty() {
+                    edits.acmd.remove(&move_name);
+                }
+            }
+            for (ours, game) in [
+                (&mut edits.sound_scripts, &theirs.sound_scripts),
+                (&mut edits.expression_scripts, &theirs.expression_scripts),
+                (&mut edits.effect_scripts, &theirs.effect_scripts),
+            ] {
+                if let (Some(mine), Some(original)) = (ours.get(&move_name), game.get(&move_name)) {
+                    if same(mine, original) {
+                        ours.remove(&move_name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+mod erased_json {
+    pub trait Json {
+        fn json(&self) -> Option<serde_json::Value>;
+    }
+    impl<T: serde::Serialize> Json for T {
+        fn json(&self) -> Option<serde_json::Value> {
+            serde_json::to_value(self).ok()
+        }
+    }
+}
+
 /// Convert every ACMD/effect-call record in a saved project into one buildable Skyline source
 /// project. Effect-call deltas are not sufficient by themselves because the generated script
 /// replaces the entire original effect script.
 pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
     refuse_uninstalled_controller_charts(project)?;
-    let expanded = crate::move_nodes::project::expand(project).map_err(node_errors)?;
+    let mut expanded = crate::move_nodes::project::expand(project).map_err(node_errors)?;
+    drop_unchanged_scripts(&mut expanded, &crate::acmd::cached_script_body);
     let project = &expanded;
     let active_gimmicks = active_gimmicks(project);
     if !active_gimmicks.is_empty() {

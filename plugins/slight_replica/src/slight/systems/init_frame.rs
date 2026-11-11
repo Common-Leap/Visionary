@@ -86,6 +86,7 @@ pub fn poll(boid: u32) -> InitAction {
 
 pub fn install() {
     load_defaults();
+    #[cfg(not(feature = "mod_plugin"))]
     let _ = crate::slight::effect_viewer::resource_reload::register_ui_db_probe();
     skyline::println!("[SLight] Init frame gates ready");
 }
@@ -93,6 +94,7 @@ pub fn install() {
 pub fn on_frame() {
     // Stage 2 hook: refresh the CSS roster data when a pin set has changed so the game
     // sees the authored slot map without waiting for a full menu reboot.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::roster_pin::enforce_pins();
 }
 

@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 
 use crate::slight::agents::AgentRecord;
 use crate::slight::effect_viewer::effect_data::EffectData;
+#[allow(unused_imports)]
 use crate::slight::systems::multipliers::EFFECT_DATA_KEY;
 use crate::slight::systems::time_counting::FrameChecker;
 

@@ -528,7 +528,7 @@ fn find_plugin_source(
         .flat_map(|dir| {
             [
                 dir.join("plugin-source"),
-                dir.join("plugins/slight_replica"),
+                dir.join("plugins/slight_replica/target/output/plugin-source"),
             ]
         });
     saved
@@ -19068,17 +19068,26 @@ impl VisionaryApp {
                     }
                 }
             };
+            // Moves alone export as a plain smashline plugin. Moves that talk to a gimmick
+            // need the gimmick runtime built into the mod's plugin.
             let needs_runtime = has_gimmicks
                 || legacy_plan
                     .as_ref()
-                    .is_some_and(|plan| plan.has_acmd_source);
+                    .and_then(|plan| plan.generated_source.as_ref())
+                    .is_some_and(|source| {
+                        source
+                            .project
+                            .files
+                            .iter()
+                            .any(|file| file.contents.contains("crate::slight::"))
+                    });
             // No Rust here: the mod carries the rules the editor sends live, and the shipped
             // plugin replays them at boot. What the user tested is what ships.
             rule_pack = !developer
                 && needs_runtime
                 && (!rust_toolchain_available()
                     || find_plugin_source(
-                        load_config_path("combined_plugin_root"),
+                        load_config_path("mod_plugin_template"),
                         std::env::current_exe().ok(),
                     )
                     .is_none());
@@ -19091,13 +19100,13 @@ impl VisionaryApp {
                 }
             } else if needs_runtime {
                 let plugin_root = match find_plugin_source(
-                    load_config_path("combined_plugin_root"),
+                    load_config_path("mod_plugin_template"),
                     std::env::current_exe().ok(),
                 ) {
                     Some(found) => found,
                     None => {
                         let mut runtime_dialog = rfd::FileDialog::new()
-                            .set_title("Select Visionary slight_replica source");
+                            .set_title("Select the plugin-source folder that came with Visionary");
                         if let Some(parent) = self.project_path.as_ref().and_then(|p| p.parent()) {
                             runtime_dialog = runtime_dialog.set_directory(parent);
                         }
@@ -19115,7 +19124,7 @@ impl VisionaryApp {
                         return;
                     }
                 };
-                save_config_path("combined_plugin_root", &plugin_root);
+                save_config_path("mod_plugin_template", &plugin_root);
                 plan
             } else {
                 legacy_plan.expect("a source-free non-gimmick export has a legacy plan")
@@ -19208,11 +19217,11 @@ impl VisionaryApp {
             }
         }
         if let Some(runtime) = &source_runtime {
-            let source = dest.join("plugin_source");
+            let source = dest.join(&plugin_name);
             match runtime.write_source(&source) {
-                Ok(crate_dir) => report.push(format!(
-                    "Plugin source in {}: build it with `cargo skyline build --release --features carries_code`",
-                    crate_dir.display()
+                Ok(()) => report.push(format!(
+                    "Plugin source in {}: build it with `cargo skyline build --release` and put the .nro in the mod folder as plugin.nro",
+                    source.display()
                 )),
                 Err(error) => errors.push(format!("plugin source: {error}")),
             }

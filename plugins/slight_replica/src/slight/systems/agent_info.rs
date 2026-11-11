@@ -88,7 +88,9 @@ pub fn notify_if_after_win(boid: u32) {
     let Some(info) = snapshot(boid) else {
         return;
     };
+    #[cfg(not(feature = "mod_plugin"))]
     crate::rust_extender::debuggable_server::notify_agent_info(&info);
+    let _ = info;
 }
 
 pub fn clear() {}

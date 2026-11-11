@@ -13,7 +13,6 @@ use super::acmd_adapter::RenderedAcmdAdapter;
 use super::adapter::{self, RenderedAdapter};
 
 const PLUGIN_NRO_NAME: &str = "plugin.nro";
-const BUILT_NRO_RELATIVE_PATH: &str = "aarch64-skyline-switch/release/lib_effect_viewer.nro";
 
 /// The one artifact this packaging path creates in the selected mod folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,20 +40,18 @@ fn error(subject: &str, reason: impl Into<String>) -> PackageError {
     }
 }
 
-/// Where the plugin crate sits inside a prepared source folder. The plugin includes shared
-/// files from Visionary's own `src/` by relative path, so the folder keeps the repository's
-/// layout: the crate under `plugins/slight_replica`, the shared files under `src/`.
-pub const PLUGIN_IN_SOURCE: &str = "plugins/slight_replica";
-
-/// Copy the plugin source at `plugin_root` into `dest` (which must not exist yet), with this
-/// export's behavior and ACMD in the two generated slots and every shared file it includes.
-/// Build output is left behind. Returns the crate folder inside `dest`.
+/// Copy the plugin template at `plugin_root` into `dest` (which must not exist yet) as a crate
+/// called `name`, with this export's behavior and ACMD in the two generated slots. The template
+/// is the mod flavour of Visionary's plugin cut down to the files it compiles (see
+/// plugins/slight_replica/tools/build_plugin.py), so the copy is an ordinary smashline plugin
+/// that names nothing outside itself. Build output is left behind.
 pub fn write_source_tree(
     plugin_root: &Path,
     dest: &Path,
+    name: &str,
     behavior: &RenderedAdapter,
     acmd: &RenderedAcmdAdapter,
-) -> Result<PathBuf, PackageError> {
+) -> Result<(), PackageError> {
     adapter::verify_plugin_for_combined_artifacts(plugin_root, behavior, acmd)
         .map_err(|e| error(&e.subject, e.reason))?;
     if dest.exists() {
@@ -63,76 +60,120 @@ pub fn write_source_tree(
             format!("{} already exists", dest.display()),
         ));
     }
-    let crate_dir = dest.join(PLUGIN_IN_SOURCE);
     let copy = |e: std::io::Error| {
         error(
             "plugin source",
             format!("copying to {}: {e}", dest.display()),
         )
     };
-    copy_tree(plugin_root, &crate_dir).map_err(copy)?;
-    copy_shared_files(plugin_root, &crate_dir).map_err(copy)?;
-    adapter::export_combined_to_plugin(&crate_dir, behavior, acmd)
+    copy_tree(plugin_root, dest).map_err(copy)?;
+    adapter::export_combined_to_plugin(dest, behavior, acmd)
         .map_err(|e| error(&e.subject, e.reason))?;
-    Ok(crate_dir)
+    name_plugin(dest, name).map_err(copy)
 }
 
-/// Copy the files outside the crate that its sources reach by a relative `../` path, and the
-/// files those reach in turn, to the same place relative to `crate_dir`.
-fn copy_shared_files(plugin_root: &Path, crate_dir: &Path) -> std::io::Result<()> {
-    let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let scan = |from_dir: &Path, to_dir: &Path, text: &str, pending: &mut Vec<_>| {
-        for piece in text.split('"').skip(1).step_by(2) {
-            if piece.starts_with("../") && piece.ends_with(".rs") {
-                pending.push((from_dir.join(piece), to_dir.join(piece)));
-            }
-        }
-    };
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
+/// Give the copied crate, its library and the plugin the game loads the mod's own name.
+fn name_plugin(crate_dir: &Path, name: &str) -> std::io::Result<()> {
+    let manifest = crate_dir.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest)?
+        .replacen(
+            "name = \"slight_replica\"",
+            &format!("name = \"{name}\""),
+            1,
+        )
+        .replacen(
+            "name = \"_effect_viewer\"",
+            &format!("name = \"{name}\""),
+            1,
+        );
+    let text = text
+        .lines()
+        .filter(|line| !line.starts_with("authors") && !line.starts_with("description"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&manifest, text + "\n")?;
+    let lib = crate_dir.join("src/lib.rs");
+    let text = std::fs::read_to_string(&lib)?.replacen(
+        "#[skyline::main(name = \"visionary_mod\")]",
+        &format!("#[skyline::main(name = \"{name}\")]"),
+        1,
+    );
+    std::fs::write(&lib, text)?;
+    rename_hooks(crate_dir, name)
+}
+
+/// `#[skyline::hook]` exports each hook under its function name, and the game's loader links a
+/// name every plugin exports to the first plugin that has it. Two mods built from this template
+/// (or a mod and Visionary's live plugin) would then run each other's hooks, so every hook in
+/// the copy is renamed after the mod.
+fn rename_hooks(crate_dir: &Path, name: &str) -> std::io::Result<()> {
+    let mut files = Vec::new();
+    collect_sources(&crate_dir.join("src"), &mut files);
+    let mut hooks = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)?;
+        for (at, _) in text.match_indices("#[skyline::hook(") {
+            let rest = &text[at..];
+            let Some(fn_at) = rest.find("fn ") else {
+                continue;
+            };
+            let ident: String = rest[fn_at + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !ident.is_empty() && !hooks.contains(&ident) {
+                hooks.push(ident);
             }
         }
     }
-    let mut sources = Vec::new();
-    walk(&crate_dir.join("src"), &mut sources);
-    for copied in sources {
-        let relative = copied.strip_prefix(crate_dir).unwrap_or(&copied);
-        let original_dir = plugin_root.join(relative).parent().map(Path::to_path_buf);
-        let copied_dir = copied.parent().map(Path::to_path_buf);
-        if let (Some(original_dir), Some(copied_dir)) = (original_dir, copied_dir) {
-            scan(
-                &original_dir,
-                &copied_dir,
-                &std::fs::read_to_string(&copied)?,
-                &mut pending,
-            );
-        }
+    if hooks.is_empty() {
+        return Ok(());
     }
-    let mut done = std::collections::BTreeSet::new();
-    while let Some((from, to)) = pending.pop() {
-        if !done.insert(to.clone()) || !from.is_file() {
-            continue;
-        }
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&from, &to)?;
-        // A shared file may include its own neighbours, by `#[path]` or `include!`.
-        let text = std::fs::read_to_string(&from)?;
-        if let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) {
-            for piece in text.split('"').skip(1).step_by(2) {
-                if piece.ends_with(".rs") && !piece.contains(' ') && !piece.starts_with('/') {
-                    pending.push((from_dir.join(piece), to_dir.join(piece)));
-                }
-            }
+    for file in &files {
+        let text = std::fs::read_to_string(file)?;
+        let renamed = rename_identifiers(&text, &hooks, name);
+        if renamed != text {
+            std::fs::write(file, renamed)?;
         }
     }
     Ok(())
+}
+
+fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Replace whole-word uses of each identifier with `<identifier>_<suffix>`.
+fn rename_identifiers(text: &str, idents: &[String], suffix: &str) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if word(c) && !text[..at].ends_with(word) {
+            let end = text[at..]
+                .find(|c: char| !word(c))
+                .map_or(text.len(), |len| at + len);
+            let token = &text[at..end];
+            out.push_str(token);
+            if idents.iter().any(|ident| ident == token) {
+                out.push('_');
+                out.push_str(suffix);
+            }
+            while chars.peek().is_some_and(|(next, _)| *next < end) {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -157,13 +198,20 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn build_combined_into_package(
     plugin_root: &Path,
     package_root: &Path,
+    name: &str,
     behavior: &RenderedAdapter,
     acmd: &RenderedAcmdAdapter,
 ) -> Result<PackagedPlugin, PackageError> {
     let work = crate::scratch_dirs::app_storage_root().join("export-plugin");
-    package_combined_with(plugin_root, package_root, &work, behavior, acmd, |tree| {
-        build_plugin(tree, &work.join("target"))
-    })
+    package_combined_with(
+        plugin_root,
+        package_root,
+        &work,
+        name,
+        behavior,
+        acmd,
+        |tree| build_plugin(tree, &work.join("target"), name),
+    )
 }
 
 /// [`build_combined_into_package`] with the build folder and builder chosen by the caller.
@@ -172,6 +220,7 @@ pub fn package_combined_with<F>(
     plugin_root: &Path,
     package_root: &Path,
     work: &Path,
+    name: &str,
     behavior: &RenderedAdapter,
     acmd: &RenderedAcmdAdapter,
     build: F,
@@ -197,8 +246,8 @@ where
         std::fs::remove_dir_all(&tree)
             .map_err(|e| error("plugin source", format!("clearing {}: {e}", tree.display())))?;
     }
-    let crate_dir = write_source_tree(plugin_root, &tree, behavior, acmd)?;
-    let built = build(&crate_dir)?;
+    write_source_tree(plugin_root, &tree, name, behavior, acmd)?;
+    let built = build(&tree)?;
     let size = std::fs::metadata(&built).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
         return Err(error(
@@ -211,19 +260,13 @@ where
     Ok(PackagedPlugin { plugin_nro })
 }
 
-/// `cargo skyline build` of the mod flavour, with build output kept in `target` between exports.
-fn build_plugin(tree: &Path, target: &Path) -> Result<PathBuf, PackageError> {
+/// `cargo skyline build` of the copied crate, with build output kept in `target` between exports.
+fn build_plugin(tree: &Path, target: &Path, name: &str) -> Result<PathBuf, PackageError> {
     let temp = crate::scratch_dirs::app_storage_root().join("export-plugin-tmp");
     std::fs::create_dir_all(&temp)
         .map_err(|e| error("plugin build", format!("creating {}: {e}", temp.display())))?;
     let output = Command::new("cargo")
-        .args([
-            "skyline",
-            "build",
-            "--release",
-            "--features",
-            "carries_code",
-        ])
+        .args(["skyline", "build", "--release"])
         .current_dir(tree)
         .env("CARGO_TARGET_DIR", target)
         .env("TMPDIR", &temp)
@@ -242,7 +285,7 @@ fn build_plugin(tree: &Path, target: &Path) -> Result<PathBuf, PackageError> {
             tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
         ));
     }
-    Ok(target.join(BUILT_NRO_RELATIVE_PATH))
+    Ok(target.join(format!("aarch64-skyline-switch/release/lib{name}.nro")))
 }
 
 #[cfg(test)]
@@ -273,11 +316,14 @@ mod tests {
             &plugin,
             &package,
             &work,
+            "my_mod_plugin",
             &artifact(),
             &super::super::acmd_adapter::render_empty(),
             |tree| {
-                assert!(tree.ends_with(PLUGIN_IN_SOURCE));
                 assert!(!tree.join("target").exists(), "build output is not copied");
+                let manifest = std::fs::read_to_string(tree.join("Cargo.toml")).unwrap();
+                assert!(manifest.contains("name = \"my_mod_plugin\""), "{manifest}");
+                assert!(!manifest.contains("slight_replica"), "{manifest}");
                 let generated =
                     std::fs::read_to_string(tree.join("src/slight/gimmicks/generated.rs")).unwrap();
                 assert!(generated.contains("register_all"));
@@ -293,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn hooks_are_renamed_after_the_mod_so_two_plugins_never_share_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[skyline::hook(offset = 0x10)]\nunsafe fn hook_get(a: u64) -> u64 { original!()(a) }\nfn install() { skyline::install_hooks!(hook_get); }\nfn hook_getter() {}\n",
+        )
+        .unwrap();
+        rename_hooks(dir.path(), "my_mod").unwrap();
+        let text = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        assert!(text.contains("unsafe fn hook_get_my_mod(a: u64)"), "{text}");
+        assert!(text.contains("install_hooks!(hook_get_my_mod)"), "{text}");
+        assert!(text.contains("fn hook_getter()"), "{text}");
+    }
+
+    #[test]
     fn an_existing_plugin_in_the_mod_folder_is_refused_before_building() {
         let dir = tempfile::tempdir().unwrap();
         let plugin = dir.path().join("plugin");
@@ -304,6 +367,7 @@ mod tests {
             &plugin,
             &package,
             &dir.path().join("work"),
+            "my_mod_plugin",
             &artifact(),
             &super::super::acmd_adapter::render_empty(),
             |_| panic!("must not build"),

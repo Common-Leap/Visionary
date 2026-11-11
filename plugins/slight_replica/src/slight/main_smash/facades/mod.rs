@@ -3,9 +3,12 @@
 pub mod animation_sequencer;
 pub mod article_notifier;
 pub mod damage_manager;
+#[cfg(not(feature = "mod_plugin"))]
 pub mod debuggable_server;
 pub mod dynamic_memory;
+#[cfg(not(feature = "mod_plugin"))]
 pub mod effect_manager;
+#[cfg(not(feature = "mod_plugin"))]
 pub mod effect_viewer;
 pub mod event_system;
 pub mod excommand;
@@ -62,11 +65,14 @@ pub fn build_registry() -> Vec<Box<dyn Facade>> {
         Box::new(overload_timer::OverloadTimerFacade),
         Box::new(event_system::EventSystemFacade),
         Box::new(excommand::ExcommandFacade),
+        #[cfg(not(feature = "mod_plugin"))]
         Box::new(effect_manager::EffectManagerFacade),
+        #[cfg(not(feature = "mod_plugin"))]
         Box::new(debuggable_server::DebuggableServerFacade),
         Box::new(damage_manager::DamageManagerFacade),
         Box::new(main_module::MainModuleFacade),
         Box::new(animation_sequencer::AnimationSequencerFacade),
+        #[cfg(not(feature = "mod_plugin"))]
         Box::new(effect_viewer::EffectViewerFacade),
     ]
 }

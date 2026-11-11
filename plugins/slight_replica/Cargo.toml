@@ -32,6 +32,8 @@ exported = []
 # An exported mod whose plugin was built with its own moves and gimmicks compiled in. It
 # always runs, since no other copy has its code.
 carries_code = ["exported"]
+# The plugin inside an exported mod: only that mod's moves and gimmicks, no editor parts.
+mod_plugin = []
 
 [profile.dev]
 panic = "abort"

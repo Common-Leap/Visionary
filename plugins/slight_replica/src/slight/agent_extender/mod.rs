@@ -87,6 +87,7 @@ pub fn install() {
 unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     let lua_state = agent.agent.lua_state_agent;
     handle_init(lua_state);
+    #[cfg(not(feature = "mod_plugin"))]
     if let Some(boma) = boma_from_lua(lua_state) {
         crate::slight::effect_viewer::effect_reload::pump_auto_carrier(boma);
         // Model/motion iteration has its own Alucard owner and lifecycle gate. Keep this on the
@@ -98,9 +99,11 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
     // Live hitbox injection still runs from the per-agent callback. Effect/control retiming is
     // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, not from this
     // status callback.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::hitbox_viewer::inject_tick(lua_state);
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::hitbox_viewer::capture_tick(lua_state);
     handle_frame(lua_state);
     if let Some(boid) = boid_from_lua(lua_state) {
@@ -122,6 +125,7 @@ unsafe extern "C" fn weapon_line_main(agent: &mut L2CFighterBase) {
     handle_init(lua_state);
     // Article/weapon hitbox capture and injection remain on the existing Main path. ACMD effect
     // retiming is generic and is handled by the effect coroutine/frame hooks for this agent too.
+    #[cfg(not(feature = "mod_plugin"))]
     crate::slight::hitbox_viewer::capture_tick(lua_state);
     crate::slight::gimmicks::deflect_volume::on_weapon_main(agent);
     handle_frame(lua_state);
@@ -226,10 +230,13 @@ fn run_one_frame() {
     // These pumps use shared state and are independent of the fighter whose Main callback
     // happened to run.  Calling them from every fighter turned an eight-CPU match into eight
     // donor retries/status probes per game frame; keep them on the single global frame pass.
-    crate::slight::effect_viewer::effect_reload::pump_donor_queue();
-    crate::slight::effect_viewer::effect_reload::pump_coload_tick();
-    crate::slight::effect_viewer::effect_reload::pump_carrier_status();
-    crate::slight::effect_viewer::asset_bundle::pump_status();
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::effect_viewer::effect_reload::pump_donor_queue();
+        crate::slight::effect_viewer::effect_reload::pump_coload_tick();
+        crate::slight::effect_viewer::effect_reload::pump_carrier_status();
+        crate::slight::effect_viewer::asset_bundle::pump_status();
+    }
 
     let after_win = crate::slight::frame_context::is_after_win();
     if !after_win && !FIGHT_STARTED.swap(true, Ordering::Relaxed) {
@@ -253,7 +260,9 @@ fn run_one_frame() {
         unsafe { skyline::nn::os::GetSystemTick() }.wrapping_sub(frame_start),
     );
 
+    #[allow(unused_variables)]
     let n = ROF_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(not(feature = "mod_plugin"))]
     if n % 30 == 0 {
         // Every SD-card poll in the plugin happens here, on this cadence. See `slight::sd_poll`
         // for why none of them may run per frame.
@@ -301,6 +310,7 @@ fn end_match() {
     crate::slight::frame_context::set_current_agent(None);
     crate::slight::gimmicks::on_match_end();
     crate::slight::agents::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
     crate::rust_extender::debuggable_server::notify_gimmick_agents();
     crate::slight::diag::note("GIMMICK_MATCH_END version=1");
     crate::slight::diag::flush();

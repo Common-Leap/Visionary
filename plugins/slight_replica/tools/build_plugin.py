@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -52,6 +53,50 @@ def main() -> None:
     exported = exported_dir / "aarch64-skyline-switch" / "release" / "lib_effect_viewer.nro"
     shutil.copy2(exported, output / "lib_visionary_mod.nro")
     print(f"Built: {exported} ({exported.stat().st_size} bytes)")
+
+    # The source an exported mod's own plugin is built from: only the files the mod flavour
+    # compiles, as one crate with nothing outside it.
+    mod_dir = target_dir / "mod_plugin"
+    mod_env = dict(environment, CARGO_TARGET_DIR=str(mod_dir))
+    subprocess.run(
+        [*command, "--features", "mod_plugin"], cwd=plugin_root, env=mod_env, check=True
+    )
+    dep_info = mod_dir / "aarch64-skyline-switch" / "release" / "deps" / "_effect_viewer.d"
+    write_mod_template(plugin_root, dep_info, output / "plugin-source")
+    print(f"Wrote: {output / 'plugin-source'}")
+
+
+def write_mod_template(plugin_root: Path, dep_info: Path, dest: Path) -> None:
+    """Copy the files `dep_info` lists into `dest`. Files outside the crate move under
+    src/shared/ and the paths that name them are rewritten to match."""
+    first = dep_info.read_text().split("\n", 1)[0]
+    listed = [part for part in first.split(":", 1)[1].split() if part.endswith(".rs")]
+    crate = plugin_root.resolve()
+    sources = {}
+    for part in listed:
+        path = (plugin_root / part).resolve()
+        try:
+            new = path.relative_to(crate)
+        except ValueError:
+            new = Path("src/shared") / path.relative_to(crate.parents[1] / "src")
+        sources[path] = new
+    if dest.exists():
+        shutil.rmtree(dest)
+    for path, new in sources.items():
+        text = path.read_text()
+        for literal in set(re.findall(r'"([^"\n]+\.rs)"', text)):
+            target = (path.parent / literal).resolve()
+            if target in sources and not literal.startswith(("/", "src")):
+                moved = os.path.relpath(dest / sources[target], (dest / new).parent)
+                if moved != literal:
+                    text = text.replace(f'"{literal}"', f'"{moved}"')
+        out = dest / new
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text)
+    cargo = (plugin_root / "Cargo.toml").read_text()
+    cargo = cargo.replace("[features]\n", '[features]\ndefault = ["mod_plugin"]\n', 1)
+    (dest / "Cargo.toml").write_text(cargo)
+    shutil.copy2(plugin_root / "Cargo.lock", dest / "Cargo.lock")
 
 
 if __name__ == "__main__":

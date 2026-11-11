@@ -259,11 +259,15 @@ pub fn on_weapon_frame() {
 
 pub fn uninstall() {
     crate::slight::systems::main_module::on_uninstall();
-    crate::slight::effect_viewer::tracker::EFFECT_TRACKER
-        .lock()
-        .clear();
-    crate::slight::effect_viewer::kinds::clear();
-    crate::slight::effect_viewer::frame_tick::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::effect_viewer::tracker::EFFECT_TRACKER
+            .lock()
+            .clear();
+        crate::slight::effect_viewer::kinds::clear();
+        crate::slight::effect_viewer::frame_tick::clear_all();
+    }
     crate::slight::agents::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
     crate::rust_extender::debuggable_server::notify_gimmick_agents();
 }
