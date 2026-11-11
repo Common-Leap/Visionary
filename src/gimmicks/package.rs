@@ -41,14 +41,20 @@ fn error(subject: &str, reason: impl Into<String>) -> PackageError {
     }
 }
 
-/// Copy the plugin source at `plugin_root` to `dest` (which must not exist yet), with this
-/// export's behavior and ACMD in the two generated slots. Build output is left behind.
+/// Where the plugin crate sits inside a prepared source folder. The plugin includes shared
+/// files from Visionary's own `src/` by relative path, so the folder keeps the repository's
+/// layout: the crate under `plugins/slight_replica`, the shared files under `src/`.
+pub const PLUGIN_IN_SOURCE: &str = "plugins/slight_replica";
+
+/// Copy the plugin source at `plugin_root` into `dest` (which must not exist yet), with this
+/// export's behavior and ACMD in the two generated slots and every shared file it includes.
+/// Build output is left behind. Returns the crate folder inside `dest`.
 pub fn write_source_tree(
     plugin_root: &Path,
     dest: &Path,
     behavior: &RenderedAdapter,
     acmd: &RenderedAcmdAdapter,
-) -> Result<(), PackageError> {
+) -> Result<PathBuf, PackageError> {
     adapter::verify_plugin_for_combined_artifacts(plugin_root, behavior, acmd)
         .map_err(|e| error(&e.subject, e.reason))?;
     if dest.exists() {
@@ -57,14 +63,75 @@ pub fn write_source_tree(
             format!("{} already exists", dest.display()),
         ));
     }
-    copy_tree(plugin_root, dest).map_err(|e| {
+    let crate_dir = dest.join(PLUGIN_IN_SOURCE);
+    let copy = |e: std::io::Error| {
         error(
             "plugin source",
             format!("copying to {}: {e}", dest.display()),
         )
-    })?;
-    adapter::export_combined_to_plugin(dest, behavior, acmd)
+    };
+    copy_tree(plugin_root, &crate_dir).map_err(copy)?;
+    copy_shared_files(plugin_root, &crate_dir).map_err(copy)?;
+    adapter::export_combined_to_plugin(&crate_dir, behavior, acmd)
         .map_err(|e| error(&e.subject, e.reason))?;
+    Ok(crate_dir)
+}
+
+/// Copy the files outside the crate that its sources reach by a relative `../` path, and the
+/// files those reach in turn, to the same place relative to `crate_dir`.
+fn copy_shared_files(plugin_root: &Path, crate_dir: &Path) -> std::io::Result<()> {
+    let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let scan = |from_dir: &Path, to_dir: &Path, text: &str, pending: &mut Vec<_>| {
+        for piece in text.split('"').skip(1).step_by(2) {
+            if piece.starts_with("../") && piece.ends_with(".rs") {
+                pending.push((from_dir.join(piece), to_dir.join(piece)));
+            }
+        }
+    };
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut sources = Vec::new();
+    walk(&crate_dir.join("src"), &mut sources);
+    for copied in sources {
+        let relative = copied.strip_prefix(crate_dir).unwrap_or(&copied);
+        let original_dir = plugin_root.join(relative).parent().map(Path::to_path_buf);
+        let copied_dir = copied.parent().map(Path::to_path_buf);
+        if let (Some(original_dir), Some(copied_dir)) = (original_dir, copied_dir) {
+            scan(
+                &original_dir,
+                &copied_dir,
+                &std::fs::read_to_string(&copied)?,
+                &mut pending,
+            );
+        }
+    }
+    let mut done = std::collections::BTreeSet::new();
+    while let Some((from, to)) = pending.pop() {
+        if !done.insert(to.clone()) || !from.is_file() {
+            continue;
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&from, &to)?;
+        // A shared file may include its own neighbours, by `#[path]` or `include!`.
+        let text = std::fs::read_to_string(&from)?;
+        if let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) {
+            for piece in text.split('"').skip(1).step_by(2) {
+                if piece.ends_with(".rs") && !piece.contains(' ') && !piece.starts_with('/') {
+                    pending.push((from_dir.join(piece), to_dir.join(piece)));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -130,8 +197,8 @@ where
         std::fs::remove_dir_all(&tree)
             .map_err(|e| error("plugin source", format!("clearing {}: {e}", tree.display())))?;
     }
-    write_source_tree(plugin_root, &tree, behavior, acmd)?;
-    let built = build(&tree)?;
+    let crate_dir = write_source_tree(plugin_root, &tree, behavior, acmd)?;
+    let built = build(&crate_dir)?;
     let size = std::fs::metadata(&built).map(|m| m.len()).unwrap_or(0);
     if size == 0 {
         return Err(error(
@@ -150,7 +217,7 @@ fn build_plugin(tree: &Path, target: &Path) -> Result<PathBuf, PackageError> {
     std::fs::create_dir_all(&temp)
         .map_err(|e| error("plugin build", format!("creating {}: {e}", temp.display())))?;
     let output = Command::new("cargo")
-        .args(["skyline", "build", "--release", "--features", "exported"])
+        .args(["skyline", "build", "--release", "--features", "carries_code"])
         .current_dir(tree)
         .env("CARGO_TARGET_DIR", target)
         .env("TMPDIR", &temp)
@@ -203,7 +270,7 @@ mod tests {
             &artifact(),
             &super::super::acmd_adapter::render_empty(),
             |tree| {
-                assert_ne!(tree, plugin.as_path());
+                assert!(tree.ends_with(PLUGIN_IN_SOURCE));
                 assert!(!tree.join("target").exists(), "build output is not copied");
                 let generated =
                     std::fs::read_to_string(tree.join("src/slight/gimmicks/generated.rs")).unwrap();

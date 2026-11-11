@@ -18970,9 +18970,9 @@ impl VisionaryApp {
         if let Some(runtime) = &source_runtime {
             let source = dest.join("plugin_source");
             match runtime.write_source(&source) {
-                Ok(()) => report.push(format!(
-                    "Plugin source in {}: build it with `cargo skyline build --release --features exported`",
-                    source.display()
+                Ok(crate_dir) => report.push(format!(
+                    "Plugin source in {}: build it with `cargo skyline build --release --features carries_code`",
+                    crate_dir.display()
                 )),
                 Err(error) => errors.push(format!("plugin source: {error}")),
             }
@@ -33742,6 +33742,7 @@ struct ExportOutcome {
 ///
 /// `Err` therefore means the destination is untouched. `ExportOutcome::errors` is the other
 /// failure channel and keeps its old meaning: one file did not write and the rest still did.
+#[cfg(test)]
 fn run_export(
     project: &crate::mod_project::ModProjectFile,
     inputs: &ExportInputs,

@@ -142,7 +142,10 @@ impl SelectedGimmickRuntime {
     }
 
     /// Write the plugin source this runtime builds from, with the export's code in it.
-    pub fn write_source(&self, dest: &Path) -> Result<(), crate::gimmicks::package::PackageError> {
+    pub fn write_source(
+        &self,
+        dest: &Path,
+    ) -> Result<PathBuf, crate::gimmicks::package::PackageError> {
         crate::gimmicks::package::write_source_tree(
             &self.plugin_root,
             dest,

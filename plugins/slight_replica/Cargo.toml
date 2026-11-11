@@ -29,6 +29,9 @@ sha2 = { version = "0.11", default-features = false }
 # The copy that ships inside an exported mod: it replays the mod's saved edits and has no
 # connection to the editor.
 exported = []
+# An exported mod whose plugin was built with its own moves and gimmicks compiled in. It
+# always runs, since no other copy has its code.
+carries_code = ["exported"]
 
 [profile.dev]
 panic = "abort"

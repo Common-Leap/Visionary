@@ -8,18 +8,41 @@ mod slight;
 
 pub const PLUGIN_VERSION: &str = "0.1.0-slight-replica";
 
-/// Every copy of this plugin exports this: the live one and the one inside each exported mod.
-/// The game resolves the name to the first copy it loaded, and only that copy installs, so two
-/// copies never hook the game twice. The live plugin loads first and replays every mod's edits.
+/// Every copy of this plugin exports this flag: the live one and the one inside each exported
+/// mod. The game's loader binds every copy's use of the name to the first copy loaded, so all
+/// copies share one flag; the first to raise it installs and the rest stay off, and two copies
+/// never hook the game twice. The live plugin loads first and replays every mod's saved edits.
+/// A mod built with its own code compiled in (`carries_code`) always runs.
 #[no_mangle]
-pub static VISIONARY_RUNTIME_OWNER: u8 = 0;
+pub static VISIONARY_RUNTIME_CLAIMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn this_copy_runs() -> bool {
-    let mut address = 0usize;
-    let result = unsafe {
-        skyline::nn::ro::LookupSymbol(&mut address, c"VISIONARY_RUNTIME_OWNER".as_ptr().cast())
-    };
-    result != 0 || address == 0 || address == core::ptr::addr_of!(VISIONARY_RUNTIME_OWNER) as usize
+    let first = !VISIONARY_RUNTIME_CLAIMED.swap(true, core::sync::atomic::Ordering::AcqRel);
+    let runs = first || cfg!(feature = "carries_code");
+    // One line per copy, so a boot shows which copy installed.
+    use std::io::Write;
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("sd:/slight/runtime_copies.txt")
+    {
+        let _ = writeln!(
+            log,
+            "{} copy {}",
+            if cfg!(feature = "exported") {
+                "mod"
+            } else {
+                "live"
+            },
+            if runs {
+                "installed"
+            } else {
+                "stayed off: another copy was already running"
+            }
+        );
+    }
+    runs
 }
 
 /// Jorge entry — `smashline_install` @ 71000013d0.
@@ -40,8 +63,13 @@ pub fn smashline_install() {
     let _ = std::fs::write(
         format!("{}/effect_viewer_boot.txt", slight::smash_utils::ERROR_LOGS),
         format!(
-            "lib_effect_viewer v{PLUGIN_VERSION}\nbuild={}\ndisabled={}\n",
+            "lib_effect_viewer v{PLUGIN_VERSION}\nbuild={}\ncopy={}\ndisabled={}\n",
             slight::effect_viewer::live_eff::BUILD_TAG,
+            if cfg!(feature = "exported") {
+                "mod"
+            } else {
+                "live"
+            },
             slight::smash_utils::disabled_subsystems(),
         ),
     );
