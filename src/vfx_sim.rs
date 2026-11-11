@@ -289,6 +289,11 @@ impl<'a> EmitterSim<'a> {
 
     fn draw(&self, emitter: usize, out: &mut Vec<Particle>) {
         let data = self.data;
+        // Mesh particles (a primitive model) are not quads; they are left out until the
+        // preview draws their meshes.
+        if data.particle_data.primitive_id != u64::MAX && data.particle_data.primitive_id != 0 {
+            return;
+        }
         let statics = &data.emitter_static;
         let colors = &data.particle_color;
         let pd = &data.particle_data;
