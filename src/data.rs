@@ -8061,6 +8061,7 @@ pub fn fighter_display_name(name: &str) -> String {
         ("popo", "Ice Climbers · Popo"),
         ("purin", "Jigglypuff"),
         ("pzenigame", "Squirtle"),
+        ("ptrainer", "Pokémon Trainer"),
         ("reflet", "Robin"),
         ("richter", "Richter"),
         ("ridley", "Ridley"),

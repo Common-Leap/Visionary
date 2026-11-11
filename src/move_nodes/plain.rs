@@ -1295,7 +1295,10 @@ mod common_sense_tests {
             ),
             "held tool material is gold"
         );
-        assert_eq!(condition_words("false"), "never (the game switched this off)");
+        assert_eq!(
+            condition_words("false"),
+            "never (the game switched this off)"
+        );
         assert_eq!(negate("piece is out"), "piece is not out");
     }
 }

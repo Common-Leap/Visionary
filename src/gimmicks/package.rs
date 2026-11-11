@@ -16,7 +16,7 @@ use std::process::Command;
 
 use fs2::FileExt;
 
-use super::acmd_adapter::{self, RenderedAcmdAdapter};
+use super::acmd_adapter::RenderedAcmdAdapter;
 use super::adapter::{self, RenderedAdapter};
 
 const PLUGIN_NRO_NAME: &str = "plugin.nro";
@@ -100,30 +100,6 @@ impl PluginBuildLock {
         })?;
         Ok(Self { _file: file })
     }
-}
-
-/// Build a selected compatible plugin and install its fresh NRO into one empty
-/// package slot.
-///
-/// `plugin_root` must be the source tree the caller explicitly selected. It
-/// is contract-checked by [`adapter::export_to_plugin`], never searched for.
-/// `package_root` must already be a normal directory, and its `plugin.nro`
-/// slot must be absent. That makes this fit a freshly staged export without
-/// replacing a compiled artifact owned by another export or user.
-///
-/// The managed adapter source is restored if any later build, artifact, or
-/// package-copy step fails.
-pub fn build_into_package(
-    plugin_root: &Path,
-    package_root: &Path,
-    artifact: &RenderedAdapter,
-) -> Result<PackagedPlugin, PackageError> {
-    build_combined_into_package(
-        plugin_root,
-        package_root,
-        artifact,
-        &acmd_adapter::render_empty(),
-    )
 }
 
 /// Build an explicitly selected compatible runtime with both managed source
@@ -693,7 +669,7 @@ where
         plugin_root,
         package_root,
         artifact,
-        &acmd_adapter::render_empty(),
+        &super::acmd_adapter::render_empty(),
         build,
     )
 }

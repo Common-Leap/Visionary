@@ -184,8 +184,8 @@ fn restore_saved<T>(store: &mut BTreeMap<String, T>, fighter: &str, saved: Optio
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Section {
-    #[default]
     Parameters,
+    #[default]
     Behavior,
     Meters,
 }
@@ -255,39 +255,17 @@ impl GimmicksEditor {
     }
 
     fn live_status(&mut self, ui: &mut Ui, fighter: &str, link: &GameLink) {
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.live.enabled, "Live preview").on_hover_text("Automatically preview supported saved parameters and behavior. Turning this off removes preview overrides and restores the installed mod; project edits remain saved.");
-            if ui.small_button("Retry").clicked() { self.live.retry(); }
-            crate::ui::game_connection(ui, link.status());
-        });
-        if link.gimmick_live_snapshot().is_none() {
-            ui.weak("Live preview needs the updated plugin and a running match.");
-        } else {
-            ui.horizontal_wrapped(|ui| {
-                for (family, title) in [("parameters", "Parameters"), ("behavior", "Behavior")] {
-                    if self.live.error_for(family).is_some() {
-                        ui.weak(format!("{title}: not sent; see details below"));
-                        continue;
-                    }
-                    let status = match link.gimmick_live_ack(family) {
-                        Some(ack) if ack.accepted => format!(
-                            "{title}: {}",
-                            if self.live.enabled {
-                                if family == "parameters" {
-                                    "table loaded"
-                                } else {
-                                    "accepted"
-                                }
-                            } else {
-                                "preview cleared"
-                            }
-                        ),
-                        Some(ack) => format!("{title}: {}", ack.message),
-                        None => format!("{title}: awaiting acknowledgement"),
-                    };
-                    ui.weak(status);
+        // The top bar shows whether the game is connected; only say what differs here.
+        if link.gimmick_live_snapshot().is_some() {
+            ui.checkbox(&mut self.live.enabled, "Show changes in the game")
+                .on_hover_text(
+                    "Off puts the game's own values back; your project keeps the changes.",
+                );
+            for family in ["parameters", "behavior"] {
+                if let Some(ack) = link.gimmick_live_ack(family).filter(|ack| !ack.accepted) {
+                    ui.colored_label(ui.visuals().warn_fg_color, &ack.message);
                 }
-            });
+            }
         }
         if let Some(warnings) = self.live.warnings.get(fighter) {
             egui::CollapsingHeader::new(format!("{} live-preview issue(s)", warnings.len()))
@@ -400,7 +378,7 @@ impl GimmicksEditor {
             } else {
                 "This character has additional controllers. Save the project to retain them; the current setup format cannot include them."
             };
-            if ui.add_enabled(setup_available, egui::Button::new("Save setup")).on_hover_text(setup_hint).clicked() {
+            if ui.add_enabled(setup_available, egui::Button::new("Save gimmick to a file")).on_hover_text(setup_hint).clicked() {
                 let empty = ParamMod::default();
                 let blueprint = super::blueprint::GimmickBlueprint::from_fighter(
                     &format!("{} gimmicks", context.name), &context.fighter,
@@ -419,7 +397,7 @@ impl GimmicksEditor {
                     Err(error) => self.status = error,
                 }
             }
-            if ui.add_enabled(setup_available, egui::Button::new("Load setup")).on_hover_text(if setup_available { "Validate all paths, types, source ownership, and behavior before replacing any saved gimmick edits." } else { setup_hint }).clicked() {
+            if ui.add_enabled(setup_available, egui::Button::new("Load gimmick from a file")).on_hover_text(if setup_available { "Validate all paths, types, source ownership, and behavior before replacing any saved gimmick edits." } else { setup_hint }).clicked() {
                 if let Some(path) = rfd::FileDialog::new().add_filter("Gimmick setup", &["json"]).pick_file() {
                     self.pending_setup = None;
                     if self.base.is_none() { self.base = Some(super::view::load_base(data.roots, &context.fighter)); }
@@ -467,9 +445,9 @@ impl GimmicksEditor {
         }
         ui.horizontal_wrapped(|ui| {
             for (section, label) in [
-                (Section::Parameters, "Parameters"),
-                (Section::Behavior, "Behavior"),
+                (Section::Behavior, "Rules"),
                 (Section::Meters, "Meters"),
+                (Section::Parameters, "Values"),
             ] {
                 let available = match section {
                     Section::Parameters => true,
@@ -493,24 +471,6 @@ impl GimmicksEditor {
                 }
             }
         });
-        // Capability details stay collapsible; they are not promises of native mechanic control.
-        if self.section == Section::Parameters {
-            egui::CollapsingHeader::new("Available surfaces").id_salt("gimmick_surfaces").show(ui, |ui| {
-            if let Some(profile) = profile {
-                ui.weak(format!("{} objects · {} object actions · {} fighter actions", profile.articles, profile.weapon_statuses, profile.fighter_statuses));
-                ui.weak(format!("Game values: {} decimals · {} whole numbers · {} switches", profile.work_floats, profile.work_ints, profile.work_flags));
-                if profile.native_sources.is_empty() {
-                    ui.weak("Meters and rules work. This fighter's own meter can't send messages yet.");
-                } else {
-                    for source in &profile.native_sources {
-                        ui.label(source.label()).on_hover_text(source.description());
-                    }
-                }
-            } else {
-                ui.weak("Visionary doesn't know this fighter's game values. Values from its files still work.");
-            }
-        });
-        }
         ui.separator();
         let has_articles = profile
             .as_ref()
@@ -525,7 +485,7 @@ impl GimmicksEditor {
                         self.controller_field(ui, &context.fighter, &mut data);
                         // Direct article/weapon operations are a live test aid, so they sit
                         // under the controller instead of in a tab of their own.
-                        if has_articles {
+                        if has_articles && std::env::var_os("VISIONARY_DEBUG").is_some() {
                             self.operations.ui(ui, &context.fighter, data.link);
                         }
                     }
@@ -548,15 +508,16 @@ impl GimmicksEditor {
     }
 
     fn parameters(&mut self, ui: &mut Ui, data: &mut EditorData<'_>) {
-        ui.weak("Supported numeric values preview on subsequent engine reads. Cached values may need the move or fighter to restart; other paths require export.");
         if let Some(health) = data
             .link
             .gimmick_live_snapshot()
             .and_then(|snapshot| snapshot.parameter_health)
             .filter(|health| {
-                data.link
-                    .gimmick_live_ack("parameters")
-                    .is_some_and(|ack| ack.accepted && ack.revision == health.revision)
+                std::env::var_os("VISIONARY_DEBUG").is_some()
+                    && data
+                        .link
+                        .gimmick_live_ack("parameters")
+                        .is_some_and(|ack| ack.accepted && ack.revision == health.revision)
             })
         {
             egui::CollapsingHeader::new("Live parameter diagnostics").id_salt("parameter_getter_health").show(ui, |ui| {
@@ -573,8 +534,8 @@ impl GimmicksEditor {
             });
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Personal values").strong()).on_hover_text(
-                "Typed scalar controls discovered from this character's actual fighter/<name>/param/vl.prc. Only changed values are saved; the source file is never edited."
+            ui.label(RichText::new("This fighter's values").strong()).on_hover_text(
+                "Numbers from the fighter's own settings file. Only the ones you change are saved; the game file is not touched."
             );
             if ui.small_button("Reload").clicked() {
                 self.base = None;
@@ -588,7 +549,7 @@ impl GimmicksEditor {
             ui,
             "gimmick_parameter_search",
             &mut self.search,
-            "Filter parameters…",
+            "Search values",
         );
         match self.base.as_ref().unwrap() {
             BaseState::Missing => {
@@ -628,6 +589,23 @@ impl GimmicksEditor {
                         if groups.is_empty() {
                             ui.weak(if data.labels.is_empty() { "Parameter labels are still loading; unresolved fields are not editable." } else { "No named scalar parameters match the filter." });
                         }
+                        // Move values first; the body's collision shapes last.
+                        let mut groups: Vec<_> = groups.into_iter().collect();
+                        groups.sort_by_key(|(group, _)| {
+                            let lower = group.to_lowercase();
+                            let body = [
+                                "coll",
+                                "hit data",
+                                "hit target",
+                                "cliff",
+                                "jostle",
+                                "shield data",
+                                "map",
+                            ]
+                            .iter()
+                            .any(|word| lower.contains(word));
+                            (body, !lower.contains("special"), lower)
+                        });
                         for (group, controls) in groups {
                             egui::CollapsingHeader::new(&group)
                                 .id_salt(("gimmick_parameter_group", &self.fighter, &group))
@@ -638,13 +616,42 @@ impl GimmicksEditor {
                                             ui.horizontal_wrapped(|ui| {
                                                 ui.label(&control.label)
                                                     .on_hover_text(&control.path);
-                                                let support = super::live_sync::parameter(&self.fighter, &control.path, control.value);
-                                                ui.weak(if support.is_ok() { "preview" } else { "export" })
-                                                    .on_hover_text(support.err().unwrap_or_else(|| "Eligible for live preview, not proof of application. A matching hooked getter must read this value; native mechanics can bypass these getters and cached values are not recomputed.".into()));
+                                                let support = super::live_sync::parameter(
+                                                    &self.fighter,
+                                                    &control.path,
+                                                    control.value,
+                                                );
+                                                if let Err(reason) = support {
+                                                    ui.weak("after export").on_hover_text(reason);
+                                                }
                                                 if control.overridden {
-                                                    if let Some(row) = live_snapshot.as_ref().and_then(|snapshot| snapshot.parameters.iter().find(|row| row.get("fighter").and_then(|v| v.as_str()) == Some(&self.fighter) && row.get("path").and_then(|v| v.as_str()) == Some(&control.path))) {
-                                                        let hits = row.get("hits").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                        ui.weak(match hits { 0 => "not read yet".into(), 1 => "1 read".into(), _ => format!("{hits} reads") });
+                                                    if let Some(row) = live_snapshot
+                                                        .as_ref()
+                                                        .filter(|_| {
+                                                            std::env::var_os("VISIONARY_DEBUG")
+                                                                .is_some()
+                                                        })
+                                                        .and_then(|snapshot| {
+                                                            snapshot.parameters.iter().find(|row| {
+                                                                row.get("fighter")
+                                                                    .and_then(|v| v.as_str())
+                                                                    == Some(&self.fighter)
+                                                                    && row
+                                                                        .get("path")
+                                                                        .and_then(|v| v.as_str())
+                                                                        == Some(&control.path)
+                                                            })
+                                                        })
+                                                    {
+                                                        let hits = row
+                                                            .get("hits")
+                                                            .and_then(|v| v.as_u64())
+                                                            .unwrap_or(0);
+                                                        ui.weak(match hits {
+                                                            0 => "not read yet".into(),
+                                                            1 => "1 read".into(),
+                                                            _ => format!("{hits} reads"),
+                                                        });
                                                     }
                                                 }
                                                 let mut value = control.value;
@@ -657,19 +664,14 @@ impl GimmicksEditor {
                                                         &control,
                                                         value,
                                                     ) {
-                                                        Ok(()) => {
-                                                            "Personal value saved in the project."
-                                                                .into()
-                                                        }
+                                                        Ok(()) => "Saved in the project.".into(),
                                                         Err(error) => error,
                                                     };
                                                 }
                                                 if control.overridden
                                                     && ui
                                                         .small_button("↺")
-                                                        .on_hover_text(
-                                                            "Return to the base-file value",
-                                                        )
+                                                        .on_hover_text("Back to the game's value")
                                                         .clicked()
                                                 {
                                                     self.status = match super::controls::save(
@@ -681,7 +683,7 @@ impl GimmicksEditor {
                                                         control.base,
                                                     ) {
                                                         Ok(()) => {
-                                                            "Personal override removed.".into()
+                                                            "Back to the game's value.".into()
                                                         }
                                                         Err(error) => error,
                                                     };
@@ -698,7 +700,7 @@ impl GimmicksEditor {
                 }
             }
         }
-        egui::CollapsingHeader::new("Individual parameter / saved edits")
+        egui::CollapsingHeader::new("Change a value by its name")
             .id_salt("gimmick_individual_parameter")
             .show(ui, |ui| {
                 self.advanced_params.ui_for_fighter(
@@ -844,12 +846,13 @@ impl GimmicksEditor {
                 self.pending = None;
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Edit in Move nodes").clicked() {
-                self.open_workspace = true;
-            }
-            ui.weak("States, events and actions are edited beside the move scripts.");
-        });
+        if ui
+            .button(RichText::new("Edit the rules in Move nodes").strong())
+            .on_hover_text("Rules are blocks, next to the moves that trigger them")
+            .clicked()
+        {
+            self.open_workspace = true;
+        }
         if let Some(graph) = graphs
             .get(fighter)
             .filter(|graph| !graph.is_empty())
@@ -1036,7 +1039,7 @@ impl GimmicksEditor {
             self.preview.clear();
             self.preview_graph = graph.cloned();
         }
-        egui::CollapsingHeader::new("Live state / offline preview").id_salt(("behavior_state", fighter)).default_open(true).show(ui, |ui| {
+        egui::CollapsingHeader::new("What the gimmick is doing now").id_salt(("behavior_state", fighter)).default_open(link.gimmick_controller_snapshot().is_some()).show(ui, |ui| {
             if let Some(snapshot) = link.gimmick_controller_snapshot().filter(|snapshot| self.live.error_for("behavior").is_none() && link.gimmick_live_ack("behavior")
                 .is_some_and(|ack| ack.accepted && ack.revision == snapshot.behavior_revision)) {
                 for row in snapshot.behavior.iter().filter(|row| row.get("fighter").and_then(|v| v.as_str()) == Some(fighter)

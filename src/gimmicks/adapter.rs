@@ -30,15 +30,6 @@ const GENERATED_SLOT_MARKER: &str = "visionary.gimmicks.generated-slot.v1";
 const GENERATED_RELATIVE_PATH: &str = "src/slight/gimmicks/generated.rs";
 const GENERATED_ACMD_RELATIVE_PATH: &str = "src/slight/gimmicks/acmd_generated.rs";
 
-/// Result of replacing a verified plugin's one managed adapter slot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginExport {
-    pub destination: PathBuf,
-    /// False means the destination already contained this exact artifact and
-    /// no filesystem mutation was made.
-    pub changed: bool,
-}
-
 /// The two and only two Visionary-managed generated source slots in a
 /// selected compatible plugin. Keeping the paths together prevents a caller
 /// from treating the second ACMD slot as arbitrary write permission.
@@ -366,16 +357,6 @@ fn meter_kind(value: &meter::MeterValue) -> &'static str {
     }
 }
 
-/// Replace one explicit regular `.rs` file with a parse-checked artifact.
-///
-/// This function intentionally has no plugin discovery or export-root logic.
-/// The parent must already exist, the final component must be a normal `.rs`
-/// filename, and an existing symlink is rejected so the caller cannot replace
-/// an indirect target by accident.
-pub fn write_to(path: &Path, artifact: &RenderedAdapter) -> Result<(), AdapterError> {
-    write_source_to(path, &artifact.source)
-}
-
 /// Replace one already-verified managed generated source slot. This is kept
 /// private to the combined exporter so callers cannot turn an arbitrary path
 /// plus ACMD text into a general source-writing surface.
@@ -443,35 +424,6 @@ fn write_source_to(path: &Path, source: &str) -> Result<(), AdapterError> {
         })
 }
 
-/// Atomically replace the one managed generated-adapter slot in an explicitly
-/// selected Skyline plugin root.
-pub fn export_to_plugin(
-    root: &Path,
-    artifact: &RenderedAdapter,
-) -> Result<PluginExport, AdapterError> {
-    if artifact_uses_controller_bundle(&artifact.source)? {
-        return Err(contract_error(
-            "multi-chart controller artifacts require the selected combined-plugin export path",
-        ));
-    }
-    let destination = verify_plugin_destination(root)?;
-    let existing = std::fs::read_to_string(&destination).map_err(|error| AdapterError {
-        subject: "adapter / plugin destination".to_string(),
-        reason: format!("could not read {}: {error}", destination.display()),
-    })?;
-    if existing == artifact.source {
-        return Ok(PluginExport {
-            destination,
-            changed: false,
-        });
-    }
-    write_to(&destination, artifact)?;
-    Ok(PluginExport {
-        destination,
-        changed: true,
-    })
-}
-
 /// Atomically update the two fixed generated slots of an explicitly selected
 /// compatible plugin. If the second replacement cannot be made, the first is
 /// restored before this returns. Later package/build failures are restored by
@@ -513,14 +465,6 @@ pub fn export_combined_to_plugin(
     })
 }
 
-/// Verify the fixed, opt-in plugin layout and return its only writable slot.
-///
-/// Kept public for callers that want to present a preflight result without
-/// rendering or mutating a project. It never writes to the selected root.
-pub fn verify_plugin_destination(root: &Path) -> Result<PathBuf, AdapterError> {
-    Ok(verify_plugin_destinations(root)?.behavior)
-}
-
 /// Verify the fixed, opt-in plugin layout and return both managed generated
 /// source slots. This is the combined-package preflight: it performs no
 pub fn verify_plugin_destinations(root: &Path) -> Result<PluginDestinations, AdapterError> {
@@ -557,15 +501,6 @@ pub(crate) fn verify_plugin_for_combined_artifacts(
     syn::parse_file(&acmd.source)
         .map_err(|error| contract_error(&format!("invalid ACMD artifact: {error}")))?;
     verify_plugin_for_artifact(root, behavior)
-}
-
-fn artifact_uses_controller_bundle(source: &str) -> Result<bool, AdapterError> {
-    let file = syn::parse_file(source)
-        .map_err(|error| contract_error(&format!("invalid behavior artifact: {error}")))?;
-    Ok(file.items.iter().any(|item| {
-        matches!(item,
-        syn::Item::Const(item) if item.ident == "VISIONARY_STATIC_CONTROLLER_BUNDLE")
-    }))
 }
 
 fn contract_error(reason: &str) -> AdapterError {
@@ -1863,81 +1798,5 @@ mod tests {
             error.subject == "cloud / transition 0 / action 0"
                 && error.reason.contains("allowlisted WeaponStatus")
         }));
-    }
-
-    #[test]
-    fn a_valid_artifact_replaces_an_existing_regular_file() {
-        let artifact = render(&BTreeMap::from([("cloud".into(), cloud())])).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let destination = dir.path().join("generated.rs");
-        std::fs::write(&destination, "stale source").unwrap();
-        write_to(&destination, &artifact).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(destination).unwrap(),
-            artifact.source
-        );
-    }
-
-    fn compatible_plugin_slot(dir: &tempfile::TempDir) -> PathBuf {
-        let root = dir.path().join("selected_plugin");
-        let gimmicks = root.join("src/slight/gimmicks");
-        std::fs::create_dir_all(&gimmicks).unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"slight_replica\"\n",
-        )
-        .unwrap();
-        std::fs::write(root.join(GENERATED_RELATIVE_PATH), GENERATED_SLOT_MARKER).unwrap();
-        std::fs::write(
-            root.join(GENERATED_ACMD_RELATIVE_PATH),
-            super::super::acmd_adapter::GENERATED_ACMD_SLOT_MARKER,
-        )
-        .unwrap();
-        root
-    }
-
-    #[test]
-    fn explicit_compatible_plugin_export_changes_only_the_managed_slot() {
-        let artifact = render(&BTreeMap::from([("cloud".into(), cloud())])).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let root = compatible_plugin_slot(&dir);
-        let unrelated = root.join("src/unrelated.rs");
-        std::fs::write(&unrelated, "keep me").unwrap();
-
-        let exported = export_to_plugin(&root, &artifact).unwrap();
-        assert!(exported.changed);
-        assert_eq!(
-            exported.destination,
-            root.join(GENERATED_RELATIVE_PATH),
-            "the plugin root chooses one fixed generated slot, not an arbitrary output path"
-        );
-        assert_eq!(
-            std::fs::read_to_string(exported.destination).unwrap(),
-            artifact.source
-        );
-        assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "keep me");
-
-        let unchanged = export_to_plugin(&root, &artifact).unwrap();
-        assert!(
-            !unchanged.changed,
-            "identical artifacts do not rewrite the slot"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plugin_export_refuses_a_symlinked_contract_file() {
-        use std::os::unix::fs::symlink;
-
-        let artifact = render(&BTreeMap::from([("cloud".into(), cloud())])).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let root = compatible_plugin_slot(&dir);
-        let cargo = root.join("Cargo.toml");
-        let replacement = root.join("Cargo.real.toml");
-        std::fs::rename(&cargo, &replacement).unwrap();
-        symlink(&replacement, &cargo).unwrap();
-
-        let error = export_to_plugin(&root, &artifact).unwrap_err();
-        assert!(error.reason.contains("non-symlink regular file"));
     }
 }

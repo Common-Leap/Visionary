@@ -562,10 +562,6 @@ mod tests {
         ));
         assert!(artifact.source.contains("GIMMICK_PIKACHU_PROGRAM"));
         syn::parse_file(&artifact.source).unwrap();
-        if let Some(destination) = std::env::var_os("VISIONARY_STATIC_CONTROLLER_CONTRACT_OUT") {
-            super::super::write_to(std::path::Path::new(&destination), &artifact)
-                .expect("cache harness selected a writable Rust destination");
-        }
     }
 
     /// The `steer_projectile` chart of fixtures/mario-batch4-combined.json, beside its

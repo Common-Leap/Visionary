@@ -17,7 +17,6 @@ mod eff_export;
 mod eff_subsections;
 mod effect_pool;
 mod effects;
-mod emulator;
 mod game_link;
 mod gimmicks;
 mod mod_export;

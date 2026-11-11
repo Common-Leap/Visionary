@@ -38,9 +38,6 @@ impl LiveSync {
     pub fn error_for(&self, family: &str) -> Option<&str> {
         self.errors.get(family).map(String::as_str)
     }
-    pub fn retry(&mut self) {
-        self.sent.clear();
-    }
 
     /// Replace the current move recipe compilation failures. An empty map clears
     /// old failures after a successful recompile.

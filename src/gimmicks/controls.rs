@@ -74,9 +74,20 @@ pub fn controls(
         let segments = &path.0;
         let first = &segments[0];
         let group = if segments.len() > 1 || first.index.is_some() {
+            // `param_special_hi` is the up special's settings.
+            let field = first.field.strip_prefix("param_").unwrap_or(&first.field);
+            let name = match field {
+                "special_n" => "Neutral special".to_string(),
+                "special_s" => "Side special".to_string(),
+                "special_hi" => "Up special".to_string(),
+                "special_lw" => "Down special".to_string(),
+                "private" => "Other".to_string(),
+                _ => humanize(field),
+            };
             match first.index {
-                Some(index) => format!("{} [{index}]", humanize(&first.field)),
-                None => humanize(&first.field),
+                Some(0) => name,
+                Some(index) => format!("{name} ({})", index + 1),
+                None => name,
             }
         } else {
             "General".to_string()
@@ -259,12 +270,12 @@ mod tests {
                 .map(|item| item.path.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "attack_rate",
-                "walk_speed_mul",
                 "param_special_lw[0].charge_enabled",
                 "param_special_lw[0].limit_gauge_add",
                 "param_special_lw[0].limit_max",
                 "param_special_lw[0].nested_group.inner",
+                "attack_rate",
+                "walk_speed_mul",
             ]
         );
         assert!(!controls
@@ -273,11 +284,11 @@ mod tests {
         assert!(!controls
             .iter()
             .any(|item| item.path.contains("unknown_root")));
-        let group = &controls[2];
-        assert_eq!(group.group, "Param Special Lw [0]");
+        let group = &controls[0];
+        assert_eq!(group.group, "Down special");
         assert_eq!(group.label, "Charge Enabled");
         assert_eq!(group.value, ParamValue::Bool(true));
-        assert_eq!(controls[0].group, "General");
+        assert_eq!(controls[4].group, "General");
     }
 
     #[test]

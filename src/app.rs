@@ -9658,25 +9658,27 @@ impl VisionaryApp {
     }
 
     fn draw_right_panel(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            for tab in [
-                PrimaryEditorTab::Collisions,
-                PrimaryEditorTab::Hurtboxes,
-                PrimaryEditorTab::MotionState,
-                PrimaryEditorTab::AudioFeedback,
-                PrimaryEditorTab::Effects,
-                PrimaryEditorTab::Gimmicks,
-            ] {
-                if ui
-                    .selectable_label(self.primary_tab == tab, tab.title())
-                    .on_hover_text(tab.description())
-                    .clicked()
-                {
-                    self.primary_tab = tab;
-                    self.show_add_hitbox = false;
+        // Gimmicks is its own page, switched from the top bar.
+        if self.primary_tab != PrimaryEditorTab::Gimmicks {
+            ui.horizontal_wrapped(|ui| {
+                for tab in [
+                    PrimaryEditorTab::Collisions,
+                    PrimaryEditorTab::Hurtboxes,
+                    PrimaryEditorTab::MotionState,
+                    PrimaryEditorTab::AudioFeedback,
+                    PrimaryEditorTab::Effects,
+                ] {
+                    if ui
+                        .selectable_label(self.primary_tab == tab, tab.title())
+                        .on_hover_text(tab.description())
+                        .clicked()
+                    {
+                        self.primary_tab = tab;
+                        self.show_add_hitbox = false;
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Move nodes has its own screen, switched from the top bar.
         if self.primary_tab == PrimaryEditorTab::Nodes {
@@ -17461,270 +17463,6 @@ impl VisionaryApp {
         project
     }
 
-    /// Export constrained behavior into an explicitly selected, contract-marked plugin tree.
-    /// The adapter boundary owns every path, marker, symlink, and atomic-write check; this UI
-    /// supplies no arbitrary output filename and never searches the user's disk for plugins.
-    fn export_gimmick_adapter(&mut self) {
-        let project = self.build_project();
-        if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
-            self.state.status = format!("Gimmick adapter refused: {error}");
-            return;
-        }
-        let project = match crate::move_nodes::project::expand(&project) {
-            Ok(project) => project,
-            Err(errors) => {
-                self.state.status = format!(
-                    "Move nodes refused: {}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return;
-            }
-        };
-        let graphs = project
-            .fighters
-            .iter()
-            .map(|(fighter, edits)| (fighter.clone(), edits.behavior.clone()))
-            .collect();
-        let meters = project
-            .fighters
-            .into_iter()
-            .filter_map(|(fighter, edits)| {
-                (!edits.meters.is_empty()).then_some((fighter, edits.meters))
-            })
-            .collect();
-        let artifact = match crate::gimmicks::adapter::render_with_meters(&graphs, &meters) {
-            Ok(artifact) if !artifact.fighters.is_empty() => artifact,
-            Ok(_) => {
-                self.state.status = "No enabled gimmick behavior or meters to export.".into();
-                return;
-            }
-            Err(errors) => {
-                self.state.status = format!(
-                    "Gimmick adapter refused: {}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return;
-            }
-        };
-        let mut dialog = rfd::FileDialog::new().set_title("Select compatible plugin source…");
-        if let Some(parent) = self.project_path.as_ref().and_then(|path| path.parent()) {
-            dialog = dialog.set_directory(parent);
-        }
-        let Some(plugin_root) = dialog.pick_folder() else {
-            return;
-        };
-        match crate::gimmicks::adapter::export_to_plugin(&plugin_root, &artifact) {
-            Ok(export) if export.changed => {
-                self.state.status = format!(
-                    "Exported gimmick adapter for {} fighter(s) to {}",
-                    artifact.fighters.len(),
-                    export.destination.display()
-                );
-            }
-            Ok(export) => {
-                self.state.status = format!(
-                    "Gimmick adapter is already current at {}",
-                    export.destination.display()
-                );
-            }
-            Err(error) => {
-                self.state.status = format!("Gimmick adapter refused: {error}");
-            }
-        }
-    }
-
-    /// Build only the managed gimmick runtime in the selected `slight_replica` source tree.
-    /// Normal mod export owns the combined ACMD + gimmick path; this advanced command is useful
-    /// when testing the runtime by itself and deliberately clears the managed ACMD slot.
-    fn build_gimmick_plugin(&mut self) {
-        if self.export_build.is_some() {
-            self.state.status = "Wait for the current plugin build to finish.".into();
-            return;
-        }
-        let project = self.build_project();
-        if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
-            self.state.status = format!("Gimmick plugin refused: {error}");
-            return;
-        }
-        let project = match crate::move_nodes::project::expand(&project) {
-            Ok(project) => project,
-            Err(errors) => {
-                self.state.status = format!(
-                    "Move nodes refused: {}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return;
-            }
-        };
-        let graphs = project
-            .fighters
-            .iter()
-            .map(|(fighter, edits)| (fighter.clone(), edits.behavior.clone()))
-            .collect();
-        let meters = project
-            .fighters
-            .into_iter()
-            .filter_map(|(fighter, edits)| {
-                (!edits.meters.is_empty()).then_some((fighter, edits.meters))
-            })
-            .collect();
-        let artifact = match crate::gimmicks::adapter::render_with_meters(&graphs, &meters) {
-            Ok(artifact) if !artifact.fighters.is_empty() => artifact,
-            Ok(_) => {
-                self.state.status = "No enabled gimmick behavior or meters to build.".into();
-                return;
-            }
-            Err(errors) => {
-                self.state.status = format!(
-                    "Gimmick plugin refused: {}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                );
-                return;
-            }
-        };
-
-        let Some(plugin_root) = rfd::FileDialog::new()
-            .set_title("Select compatible plugin source…")
-            .pick_folder()
-        else {
-            return;
-        };
-        let mut package_dialog =
-            rfd::FileDialog::new().set_title("Select existing target mod folder…");
-        if let Some(directory) = &self.export_dir {
-            package_dialog = package_dialog.set_directory(directory);
-        }
-        let Some(package_root) = package_dialog.pick_folder() else {
-            return;
-        };
-
-        let state = std::sync::Arc::new(std::sync::Mutex::new(ExportBuildState {
-            done: false,
-            message: format!(
-                "building gimmick plugin for {} fighter(s)…",
-                artifact.fighters.len()
-            ),
-        }));
-        self.export_build = Some(state.clone());
-        std::thread::spawn(move || {
-            let message = match crate::gimmicks::package::build_into_package(
-                &plugin_root,
-                &package_root,
-                &artifact,
-            ) {
-                Ok(packaged) => format!(
-                    "Gimmick plugin ready → {}{}",
-                    packaged.plugin_nro.display(),
-                    if packaged.adapter_changed {
-                        ""
-                    } else {
-                        " (adapter source was already current)"
-                    }
-                ),
-                Err(error) => format!("Gimmick plugin build refused: {error}"),
-            };
-            if let Ok(mut progress) = state.lock() {
-                progress.done = true;
-                progress.message = message;
-            }
-        });
-    }
-
-    fn export_project(&mut self) {
-        if self.workspace_copy_rx.is_some() {
-            self.state.status =
-                "Wait for the base game files to finish copying before exporting.".into();
-            return;
-        }
-        let project = self.build_project();
-        // A project may intentionally contain only the binary `romfs/` overlay (for example a
-        // model/animation iteration with no ACMD or EFF edits). Keep that useful project
-        // exportable instead of treating the serialized edit model as the whole project.
-        let has_workspace_overlay = self
-            .project_path
-            .as_ref()
-            .and_then(|path| path.parent())
-            .is_some_and(crate::project_hub::workspace_romfs_has_files);
-        if project.is_empty() && !has_workspace_overlay {
-            self.state.status = "No edits to export yet.".into();
-            return;
-        }
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Export editable mod project…")
-            .set_file_name(crate::mod_project::PROJECT_FILE_NAME)
-            .add_filter("Mod project", &["json"]);
-        if let Some(dir) = &self.export_dir {
-            dialog = dialog.set_directory(dir);
-        }
-        // Start in the current project's folder so Save-adjacent exports land together.
-        if let Some(current) = self
-            .project_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        {
-            dialog = dialog.set_directory(current);
-        }
-        let Some(path) = dialog.save_file() else {
-            return;
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(crate::mod_export::slugify)
-            .unwrap_or_else(|| "project".into());
-        let asset_dir = format!("{stem}_assets");
-        let previous_project = self.project_path.clone();
-        match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
-            Ok(()) => {
-                let overlay_report = previous_project
-                    .as_deref()
-                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
-                // Export adopts the path: later edits autosave here.
-                self.adopt_project_path(&path, &project);
-                self.state.status = format!("Project exported to {}", path.display());
-                match overlay_report {
-                    Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
-                        self.state.status.push_str(&format!(
-                            " — copied {copied} workspace overlay file{}{}",
-                            if copied == 1 { "" } else { "s" },
-                            if skipped.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    "; skipped {} generated conflict{}",
-                                    skipped.len(),
-                                    if skipped.len() == 1 { "" } else { "s" }
-                                )
-                            }
-                        ));
-                    }
-                    Some(Err(error)) => self
-                        .state
-                        .status
-                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
-                    _ => {}
-                }
-            }
-            Err(e) => self.state.status = format!("Project export failed: {e}"),
-        }
-    }
-
     fn load_project(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Mod project", &["json"])
@@ -18063,8 +17801,7 @@ impl VisionaryApp {
             }
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
-                self.state.status =
-                    "Browsing without a project — edits stay in memory until File → Save As… gives them a home.".into();
+                self.state.status = String::new();
             }
         }
     }
@@ -30861,13 +30598,28 @@ impl eframe::App for VisionaryApp {
                 ui.separator();
                 // The two ways to edit a move, always one click away.
                 let classic = ui
-                    .selectable_label(!self.node_workspace, egui::RichText::new("Classic editor").strong())
+                    .selectable_label(
+                        !self.node_workspace
+                            && !self.roster.open
+                            && self.primary_tab != PrimaryEditorTab::Gimmicks,
+                        egui::RichText::new("Classic editor").strong(),
+                    )
                     .on_hover_text("Edit a move with the hitbox, motion, sound and effect tabs");
                 let nodes = ui
-                    .selectable_label(self.node_workspace, egui::RichText::new("Move nodes").strong())
+                    .selectable_label(
+                        self.node_workspace && !self.roster.open,
+                        egui::RichText::new("Move nodes").strong(),
+                    )
                     .on_hover_text("Build or change a move with blocks, and see each block's code");
                 if classic.clicked() {
                     self.node_workspace = false;
+                    self.roster.open = false;
+                    if self.primary_tab == PrimaryEditorTab::Gimmicks {
+                        self.primary_tab = PrimaryEditorTab::Collisions;
+                    }
+                }
+                if nodes.clicked() {
+                    self.roster.open = false;
                 }
                 if nodes.clicked() && !self.node_workspace {
                     self.node_workspace = true;
@@ -30876,73 +30628,100 @@ impl eframe::App for VisionaryApp {
                 }
                 ui.separator();
 
+                let gimmicks = ui
+                    .selectable_label(
+                        !self.node_workspace
+                            && !self.roster.open
+                            && self.primary_tab == PrimaryEditorTab::Gimmicks,
+                        egui::RichText::new("Gimmicks").strong(),
+                    )
+                    .on_hover_text("Rules and meters that make up a character's gimmick");
+                if gimmicks.clicked() {
+                    self.primary_tab = PrimaryEditorTab::Gimmicks;
+                    self.node_workspace = false;
+                    self.roster.open = false;
+                }
+                if ui
+                    .selectable_label(self.roster.open, egui::RichText::new("Characters").strong())
+                    .on_hover_text("Installed mods, the character select screen, new characters and fighter values")
+                    .clicked()
+                {
+                    self.roster.open = true;
+                }
+                ui.separator();
+
                 egui::containers::menu::MenuButton::new("File")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
-                    if ui.button("Project Hub").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
-                        self.project_hub.show = true;
-                        ui.close();
-                    }
-                    if ui.add_enabled(self.project_path.is_some(), egui::Button::new("Save").shortcut_text("Ctrl+S"))
-                        .on_hover_text("Flush applied edits and layouts to the current project. Unapplied controller and move drafts remain drafts.").clicked() {
-                        self.save_project_silent();
-                        ui.close();
-                    }
-                    if ui.button("Save As").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
-                        self.save_project_as();
-                        ui.close();
-                    }
-                    if ui.button("Open Project").clicked() {
-                        self.load_project();
-                        ui.close();
-                    }
-                    if ui.button("New Project").on_hover_text("Enter a workspace folder — every edit lives there and autosaves").clicked() {
+                    ui.horizontal(|ui| {
+                        ui.label("Project name");
+                        ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(140.0));
+                    });
+                    ui.label(
+                        egui::RichText::new(match &self.project_path {
+                            Some(path) => format!("Saved in {}", path.display()),
+                            None => "Not saved yet. Save as to keep your edits.".into(),
+                        })
+                        .small()
+                        .weak(),
+                    );
+                    ui.separator();
+                    if ui.button("New project").on_hover_text("Pick a folder for a new project; every edit saves there").clicked() {
                         self.project_hub.show = true;
                         self.project_hub.new_workspace = Some(String::new());
                         ui.close();
                     }
-                    if ui.button("Import Mod as Project").on_hover_text("Adopt a compiled mod folder as an editable project").clicked() {
+                    if ui.button("Open project").clicked() {
+                        self.load_project();
+                        ui.close();
+                    }
+                    if ui.button("Recent projects").on_hover_text("Resume, open recent, or browse without a project").clicked() {
+                        self.project_hub.show = true;
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.project_path.is_some(), egui::Button::new("Save").shortcut_text("Ctrl+S"))
+                        .on_hover_text("Edits save themselves; this saves right now").clicked() {
+                        self.save_project_silent();
+                        ui.close();
+                    }
+                    if ui.button("Save as").on_hover_text("Save the project and its files in a new folder").clicked() {
+                        self.save_project_as();
+                        ui.close();
+                    }
+                    if ui.button("Import a mod as a project").on_hover_text("Open a finished mod folder so its edits can be changed").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             self.request_hub_action(crate::project_hub::HubAction::ImportMod(folder));
                         }
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Choose base game folder").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
+                    if ui.button("Game files folder").on_hover_text("The extracted game folder with fighter/, effect/ and ui/").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.set_data_root(path);
                         }
                         ui.close();
                     }
-                    // ── Modded characters + extra skins ──────────────────────────────
                     if ui
-                        .button("Mod Library")
-                        .on_hover_text(
-                            "Import compiled mods — folders or .zip/.7z archives, many at \
-                             once — and set which one wins when two provide the same file. \
-                             Added-character mods appear in the fighter list; slot-add mods \
-                             extend an existing fighter's skin list.",
-                        )
-                        .clicked()
-                    {
-                        self.roster.open = true;
-                        ui.close();
-                    }
-                    if ui
-                        .button("Rescan skins")
-                        .on_hover_text(
-                            "Re-read every fighter's costume slots from disk (after \
-                             installing a new skin)",
-                        )
+                        .button("Refresh skins and mods")
+                        .on_hover_text("Read costumes and installed mods from disk again, after installing a skin or a character")
                         .clicked()
                     {
                         self.rescan_costume_slots();
-                        self.state.status = "Rescanned costume slots.".into();
+                        self.roster.request_rescan();
+                        self.state.status = "Read skins and mods again.".into();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Your source code")
+                        .on_hover_text("Link your own smashline project, so moves load from it and edits go back into it")
+                        .clicked()
+                    {
+                        self.show_acmd_src = true;
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Open Effect File")
-                        .on_hover_text("Load any .eff from disk (even outside the game data root) into the preview and donor pool")
+                    if ui.button("Open effect file")
+                        .on_hover_text("Load any .eff from disk into the preview and the effects you can borrow from")
                         .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
@@ -30955,7 +30734,7 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     if !self.recent_effs.is_empty() {
-                        ui.menu_button("Recent Effect Files", |ui| {
+                        ui.menu_button("Recent effect files", |ui| {
                             let recents = self.recent_effs.clone();
                             for p in recents {
                                 let label = p
@@ -30971,197 +30750,81 @@ impl eframe::App for VisionaryApp {
                     }
                 });
 
-                egui::containers::menu::MenuButton::new("Windows")
+                egui::containers::menu::MenuButton::new("Tools")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
-                    if ui.selectable_label(self.primary_tab == PrimaryEditorTab::Gimmicks, "Gimmicks").on_hover_text("Edit the selected character's parameters, reusable behavior, meters, and live article controls in the main editor").clicked() {
-                        self.primary_tab = PrimaryEditorTab::Gimmicks;
-                        self.node_workspace = false;
-                        ui.close();
-                    }
-                    ui.checkbox(&mut self.roster.open, "Roster")
-                        .on_hover_text(
-                            "Mod library, character select screen, new characters, and \
-                             fighter-wide trait values (separate window)",
-                        );
                     let eff_toggle = ui
-                        .checkbox(&mut self.eff_editor.open, "Effect Editor  Ctrl+Shift+E")
-                        .on_hover_text("Edit .eff authored values with in-game live preview (separate window)");
+                        .checkbox(&mut self.eff_editor.open, "Effect editor  Ctrl+Shift+E")
+                        .on_hover_text("Change effect files and see them in the game");
                     if eff_toggle.changed() && self.eff_editor.open {
-                        // Opening the window always shows the selected fighter's eff (a
-                        // queued load may have been consumed by an earlier open, or a
-                        // different file loaded manually since).
                         if let Some(p) = self.current_eff_path.clone() {
                             self.eff_editor.queue_load(&p);
                         }
                     }
-                    ui.checkbox(&mut self.show_transplant, "Transplant Effects")
-                        .on_hover_text(
-                            "Transplant any effect from another EFF into the current fighter's \
-                             EFF and redirect its uses",
-                        );
+                    ui.checkbox(&mut self.show_transplant, "Borrow effects")
+                        .on_hover_text("Copy an effect from another fighter into this one");
+                    ui.checkbox(&mut self.show_workspace, "Project files")
+                        .on_hover_text("The files in this project, including models and animations you add yourself");
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
                     ui.add_enabled_ui(has_log, |ui| {
-                        ui.checkbox(&mut self.show_edit_log, "Edit Log")
-                            .on_hover_text("View and manage all saved edits");
+                        ui.checkbox(&mut self.show_edit_log, "Changes")
+                            .on_hover_text("Every edit in this project");
                     });
-                    ui.checkbox(&mut self.show_acmd_src, "ACMD Source")
-                        .on_hover_text(
-                            "Read and edit ACMD scripts from your own smashline project, \
-                             instead of the online archive of vanilla scripts",
-                        );
-                    ui.checkbox(&mut self.show_workspace, "Project Files")
-                        .on_hover_text(
-                            "Where every edit lives: what Visionary models vs the manual \
-                             romfs overlay for models, animations, and other unsupported files",
-                        );
-                    ui.checkbox(&mut self.show_debug, "Debug");
-                    ui.checkbox(&mut self.show_capture_debug, "Capture Debug")
-                        .on_hover_text(
-                            "Show attempted, successful, and failed live captures by character",
-                        );
-                    ui.checkbox(&mut self.credits.open, "Credits")
-                        .on_hover_text("The people who helped make Visionary possible");
+                    if std::env::var_os("VISIONARY_DEBUG").is_some() {
+                        ui.separator();
+                        ui.checkbox(&mut self.show_debug, "Debug overlay");
+                        ui.checkbox(&mut self.show_capture_debug, "Capture log");
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.credits.open, "Credits");
                 });
 
-                egui::containers::menu::MenuButton::new("Project")
+                ui.separator();
+                // The live system: the running game, and what it holds.
+                let status = self.game_link.status();
+                egui::containers::menu::MenuButton::from_button(egui::Button::new(match status {
+                    crate::game_link::LinkStatus::Connected => egui::RichText::new("● Live in game").color(egui::Color32::from_rgb(90, 220, 90)),
+                    crate::game_link::LinkStatus::Connecting => egui::RichText::new("● Connecting").color(egui::Color32::YELLOW),
+                    crate::game_link::LinkStatus::Disconnected => egui::RichText::new("● Game offline").color(egui::Color32::from_rgb(220, 90, 90)),
+                }).frame(false))
                     .config(menu_config)
                     .ui(ui, |ui| {
-                    if ui.button("Project files").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
-                        self.show_workspace = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("name:");
-                        ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(140.0));
+                    ui.label(match status {
+                        crate::game_link::LinkStatus::Connected => "Edits reach the running game as you make them.",
+                        _ => "Start the game with Visionary's plugin installed; edits reach it as you make them.",
                     });
-                    if let Some(path) = &self.project_path {
-                        ui.label(
-                            egui::RichText::new(format!("file: {}", path.display()))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("file: in memory (use File → Save As… for autosave)")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
                     ui.separator();
-                    if ui.button("Export Project")
-                        .on_hover_text("Export an editable modproject.json and its assets separately from installable mod and developer files")
-                        .clicked()
-                    {
-                        self.export_project();
-                        ui.close();
-                    }
-                    ui.separator();
-                    // Was "Deploy live eff to Eden", which rebuilt the FIGHTER's own eff and
-                    // asked the plugin to reparse it. That path is a dead end: the reparse
-                    // rebuilds from the resident buffer and never re-requests the file, so the
-                    // edited bytes were never read (`cb_game=0`) — and it could hang the game.
-                    // Both routes now go through the live carrier.
-                    if ui.button("Send edits to game")
-                        .on_hover_text("Rebuild the live carrier with this fighter's transplants and authored edits baked in, and hand it to the running game. Re-trigger the move to see it on a fresh spawn.")
+                    if ui.button("Send effect edits now")
+                        .on_hover_text("Effect file edits need the move played again to show")
                         .clicked()
                     {
                         self.sync_eff_mods_from_editor();
                         self.push_effect_aliases();
                         ui.close();
                     }
-                    if ui.button("Clear all game edits")
-                        .on_hover_text("Wipe the game's saved pins (which survive restarts) + all live spawn/hitbox rules — use when old edits keep re-appearing")
+                    if ui.button("Put the game back to normal")
+                        .on_hover_text("Remove every change Visionary made in the running game. Your project keeps them.")
                         .clicked()
                     {
                         self.clear_all_game_edits();
                         ui.close();
                     }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.export_build.is_none(),
-                            egui::Button::new("Export Mod Folder"),
-                        )
-                        .on_hover_text("Export one complete ARCropolis mod folder, including effects and one slight_replica plugin.nro containing both ACMD and gimmick behavior")
-                        .clicked()
-                    {
-                        self.export_full_mod();
-                        ui.close();
-                    }
-                    if ui.button("Export Developer Files")
-                        .on_hover_text("Export rebuilt effect files and editable ACMD Rust source in separate folders")
-                        .clicked()
-                    {
-                        self.export_developer_files();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.roster.behaviors.values().any(|graph| !graph.is_empty())
-                                || self
-                                    .roster
-                                    .meters
-                                    .values()
-                                    .flatten()
-                                    .any(|binding| binding.enabled),
-                            egui::Button::new("Export Gimmick Adapter"),
-                        )
-                        .on_hover_text(
-                            "Write saved gimmick behavior and enabled meters into the managed slot of an explicitly selected compatible slight_replica source tree",
-                        )
-                        .clicked()
-                    {
-                        self.export_gimmick_adapter();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.export_build.is_none()
-                                && (self
-                                    .roster
-                                    .behaviors
-                                    .values()
-                                    .any(|graph| !graph.is_empty())
-                                    || self
-                                        .roster
-                                        .meters
-                                        .values()
-                                        .flatten()
-                                        .any(|binding| binding.enabled)),
-                            egui::Button::new("Build Gimmick Runtime Only"),
-                        )
-                        .on_hover_text(
-                            "Advanced: build the managed gimmick runtime by itself in one compatible slight_replica plugin; normal Mod Folder export combines it with ACMD",
-                        )
-                        .clicked()
-                    {
-                        self.build_gimmick_plugin();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.acmd_src.is_some(),
-                            egui::Button::new("Sync Edits Into Source"),
-                        )
-                        .on_hover_text(
-                            "Write this move's edited hitbox/effect values and bounded, isolated \
-                             effect timing blocks back into your own linked ACMD project. Branches, \
-                             loops, collisions, and ambiguous stop pairings are reported instead \
-                             of guessed. Link a project in Windows → ACMD Source.",
-                        )
-                        .clicked()
-                    {
-                        self.sync_edits_to_source();
-                        ui.close();
-                    }
                 });
-
                 ui.separator();
-                // Game-link status — same widget language as the Eff Editor header.
-                crate::ui::game_connection(ui, self.game_link.status());
+                if ui
+                    .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod"))
+                    .on_hover_text("A finished mod folder to put in ARCropolis's mods folder")
+                    .clicked()
+                {
+                    self.export_full_mod();
+                }
+                if ui
+                    .button("Export source code")
+                    .on_hover_text("The source code and files the exported mod is made from, for building it yourself")
+                    .clicked()
+                {
+                    self.export_developer_files();
+                }
                 ui.separator();
             });
         });
@@ -31213,7 +30876,7 @@ impl eframe::App for VisionaryApp {
                         );
                     } else {
                         ui.label(
-                            RichText::new("Project: in memory (File → Save As… to autosave)")
+                            RichText::new("Not saved yet: File > Save as keeps your edits")
                                 .small()
                                 .color(Color32::GRAY),
                         );
@@ -31236,15 +30899,18 @@ impl eframe::App for VisionaryApp {
             timeline_row_count,
             (ui.available_height() * 0.55).max(100.0),
         );
-        egui::Panel::bottom("scrubber")
-            .default_size(180.0)
-            .min_size(72.0)
-            .max_size(max_scrubber_height)
-            .resizable(true)
-            .show_inside(ui, |ui| {
-                ui.add_space(4.0);
-                self.draw_scrubber(ui);
-            });
+        // The Characters page has no move to scrub through.
+        if !self.roster.open {
+            egui::Panel::bottom("scrubber")
+                .default_size(180.0)
+                .min_size(72.0)
+                .max_size(max_scrubber_height)
+                .resizable(true)
+                .show_inside(ui, |ui| {
+                    ui.add_space(4.0);
+                    self.draw_scrubber(ui);
+                });
+        }
         self.perf.end("scrubber", t);
 
         // Eff editor (separate OS viewport; authored .eff editing + live game preview)
@@ -31371,23 +31037,12 @@ impl eframe::App for VisionaryApp {
             });
         self.roster.set_export_root(roster_export_root);
         self.roster.set_parameter_labels(&self.state.labels);
-        self.roster.show(
+        self.roster.prepare(
             &ctx,
             &self.state.fighters,
             self.state.data_root.as_ref(),
             &self.state.labels,
-            &self.game_link,
         );
-        // Deploy stages from in-memory state, so flush the project alongside
-        // it — `build_project` carries the roster edits (order, names, new
-        // characters, traits), keeping the file on disk level with the SD.
-        // Only when the project has a path: a Save As dialog popping
-        // out of Deploy would hijack the flow, so a pathless project stages
-        // from memory and is told to use Save As.
-        if self.roster.take_save_request() {
-            let saved = self.project_path.is_some() && self.save_project_silent();
-            self.roster.note_deploy_saved(saved);
-        }
         // The library is the authoring surface for mod roots; `extra_roots` is the resolved
         // list every existing path lookup reads. Refreshing here rather than inside the window
         // keeps the roster module from reaching into the fighter index.
@@ -31832,7 +31487,9 @@ impl eframe::App for VisionaryApp {
             self.preview_transplant_result(&fighter);
         }
 
-        if self.node_workspace {
+        if self.roster.open {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.roster.page(ui));
+        } else if self.node_workspace {
             egui::CentralPanel::default().show_inside(ui, |ui| self.draw_node_workspace(ui, frame));
             self.commit_current_edits();
         } else {
