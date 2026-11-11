@@ -3516,6 +3516,8 @@ pub struct VisionaryApp {
     main_geometry_restored: bool,
     /// Live geometry of the transplant viewport, captured while it is open.
     transplant_geometry: Option<WindowGeometry>,
+    /// Size and position the borrow-effects window opened with, kept while it is open.
+    transplant_placement: Option<([f32; 2], [f32; 2])>,
     /// Per-frame timing breakdown, active only when `VISIONARY_PROFILE` is set.
     perf: FrameProfiler,
 }
@@ -3898,6 +3900,7 @@ impl VisionaryApp {
             geometry_saved_at: std::time::Instant::now(),
             main_geometry_restored: false,
             transplant_geometry: None,
+            transplant_placement: None,
             perf: FrameProfiler::new(),
         };
 
@@ -25763,6 +25766,7 @@ impl VisionaryApp {
     /// optionally scope the replacement to one or more skins.
     fn draw_transplant_studio(&mut self, ctx: &egui::Context) {
         if !self.show_transplant {
+            self.transplant_placement = None;
             return;
         }
         if self.effect_pool.is_none() {
@@ -25812,8 +25816,12 @@ impl VisionaryApp {
             (Some(g), Some(m)) => Some(g.clamped_to_screen(m.x, m.y)),
             (g, _) => g,
         };
-        let transplant_size = saved.map_or([560.0, 720.0], |g| [g.w, g.h]);
-        let transplant_pos = saved.map_or([200.0, 120.0], |g| [g.x, g.y]);
+        // Placed once when it opens. Sending the saved spot every frame pulled the window back
+        // whenever it was dragged onto another monitor (issue 32).
+        let (transplant_size, transplant_pos) = *self.transplant_placement.get_or_insert((
+            saved.map_or([560.0, 720.0], |g| [g.w, g.h]),
+            saved.map_or([200.0, 120.0], |g| [g.x, g.y]),
+        ));
 
         let mut do_transplant: Option<(String, String, String)> = None; // (rel, donor, new name)
                                                                         // Snapshot the transplants ALREADY recorded for the target, so the studio shows what
