@@ -3755,7 +3755,47 @@ fn effect_source_compatibility_macros(source: &str) -> String {
     // The pinned script crate has no wrapper for this measured source spelling.
     let shoot_item_bullet_used = used.contains("SHOOT_ITEM_BULLET");
     let native_wrappers = crate::move_nodes::native_calls::compatibility_wrappers(&used);
-    if layouts.is_empty() && !shoot_item_bullet_used && native_wrappers.is_empty() {
+    // Any other macro the script library lacks goes to the game's own entry point, with the
+    // arguments pushed on the Lua stack the way the library's own wrappers do it.
+    let mut fallback_wrappers = String::new();
+    for site in crate::acmd_src::scan_macro_sites(source, 0..source.len()) {
+        let name = site.name.as_str();
+        if crate::acmd_macro_names::SMASH_SCRIPT_MACROS.contains(&name)
+            || !crate::acmd_macro_names::SV_ANIMCMD.contains(&name)
+            || COMPAT_NAMES.contains(&name)
+            || name == "SHOOT_ITEM_BULLET"
+            || native_wrappers.contains(&format!("pub unsafe fn {name}<"))
+            || fallback_wrappers.contains(&format!("pub unsafe fn {name}<"))
+        {
+            continue;
+        }
+        let count = site.args.len().saturating_sub(1);
+        let generics = (0..count)
+            .map(|i| format!("A{i}: Into<smash::lib::L2CValue>"))
+            .collect::<Vec<_>>();
+        let parameters = std::iter::once("agent: &mut L2CAgentBase".to_owned())
+            .chain((0..count).map(|i| format!("a{i}: A{i}")))
+            .collect::<Vec<_>>();
+        let push = if count == 0 {
+            String::new()
+        } else {
+            let values = (0..count).map(|i| format!("a{i}")).collect::<Vec<_>>();
+            format!(
+                "        smash_script::lua_args!(agent, {});\n",
+                values.join(", ")
+            )
+        };
+        fallback_wrappers.push_str(&format!(
+            "    #[inline]\n    pub unsafe fn {name}<{}>({}) {{\n        agent.clear_lua_stack();\n{push}        smash::app::sv_animcmd::{name}(agent.lua_state_agent);\n        agent.clear_lua_stack();\n    }}\n",
+            generics.join(", "),
+            parameters.join(", "),
+        ));
+    }
+    if layouts.is_empty()
+        && !shoot_item_bullet_used
+        && native_wrappers.is_empty()
+        && fallback_wrappers.is_empty()
+    {
         return String::new();
     }
     let mut output = String::from(
@@ -3810,6 +3850,7 @@ fn effect_source_compatibility_macros(source: &str) -> String {
         );
     }
     output.push_str(&native_wrappers);
+    output.push_str(&fallback_wrappers);
     output.push_str("}\n\n");
     output
 }
@@ -8034,7 +8075,21 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
 
 pub(crate) fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    for stmt in stmts {
+    let mut stmts = stmts.iter().peekable();
+    while let Some(stmt) = stmts.next() {
+        // The script dumper writes `if X == true then` as the call on one line and an
+        // `operator==` header on the next. Put the call back into the condition.
+        if let crate::data::AcmdStmt::Raw(call) = stmt {
+            if let Some(crate::data::AcmdStmt::RawBlock { header, body }) = stmts.peek() {
+                if let Some(condition) = dumped_comparison(call, header) {
+                    stmts.next();
+                    lines.push(format!("{indent}if {condition} {{"));
+                    lines.extend(emit_stmts(body, &format!("{indent}    ")));
+                    lines.push(format!("{indent}}}"));
+                    continue;
+                }
+            }
+        }
         match stmt {
             crate::data::AcmdStmt::Frame(f) => lines.push(format!(
                 "{indent}frame(agent.lua_state_agent, {});",
@@ -8110,6 +8165,41 @@ pub(crate) fn emit_stmts(stmts: &[crate::data::AcmdStmt], indent: &str) -> Vec<S
         }
     }
     lines
+}
+
+/// The condition a dumped `call; if(...operator==...(false, X)){` pair tests, as Rust. The last
+/// word is the value the call's result is compared to. Calls that answer through the Lua stack
+/// are made through `sv_animcmd` and their answer is read back.
+fn dumped_comparison(call: &str, header: &str) -> Option<String> {
+    let expected = header
+        .strip_prefix("if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(false, ")?
+        .strip_suffix(")){")?;
+    let negate = match expected {
+        "true" => "",
+        "false" => "!",
+        _ => return None,
+    };
+    let call = call.trim().strip_suffix(';')?;
+    let open = call.find('(')?;
+    let (name, args) = (&call[..open], call[open + 1..].strip_suffix(')')?);
+    let test = match name {
+        "WorkModule::is_flag"
+        | "EffectModule::is_exist_effect"
+        | "macros::IS_GENERATABLE_ARTICLE" => call.to_string(),
+        "macros::IS_RANDOM" => {
+            let rest = args.strip_prefix("agent, ")?;
+            format!("{{ agent.clear_lua_stack(); smash_script::lua_args!(agent, {rest}); let hit = smash::app::sv_animcmd::IS_RANDOM(agent.lua_state_agent); agent.clear_lua_stack(); hit }}")
+        }
+        "macros::IS_HAVE_ITEM_KIND"
+        | "macros::IS_FIGHTER_STATUS_KIND"
+        | "macros::IS_STATUS_KIND" => {
+            let rest = args.strip_prefix("agent, ")?;
+            let function = name.strip_prefix("macros::")?;
+            format!("{{ agent.clear_lua_stack(); smash_script::lua_args!(agent, {rest}); smash::app::sv_animcmd::{function}(agent.lua_state_agent); agent.pop_lua_stack(1).get_bool() }}")
+        }
+        _ => return None,
+    };
+    Some(format!("{negate}{test}"))
 }
 
 fn contains_set_speed(stmts: &[crate::data::AcmdStmt]) -> bool {
@@ -14485,6 +14575,35 @@ unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
                 .count(),
             1
         );
+    }
+
+    /// Lines from the game's own Inkling scripts: the dumper splits `if X == true` into the
+    /// call and an `operator==` header, which is not Rust until the call goes back in.
+    #[test]
+    fn dumped_comparisons_export_as_rust_conditions() {
+        let source = r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 33.0);
+    WorkModule::is_flag(agent.module_accessor, *FIGHTER_INKLING_INSTANCE_WORK_ID_FLAG_BOY);
+    if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(false, true)){
+        if macros::is_excute(agent) {
+            macros::FT_MOTION_INTP_WAIT(agent);
+        }
+    }
+    macros::IS_HAVE_ITEM_KIND(agent, *ITEM_KIND_SPECIALFLAG);
+    if(methodlib::L2CValue::operator==(lib::L2CValueconst&)const(false, false)){
+        frame(agent.lua_state_agent, 11.0);
+    }
+}
+"#;
+        let parsed = parse_acmd_script(source);
+        let body = emit_stmts(&parsed.stmts, "    ").join("\n");
+        assert!(
+            body.contains("if WorkModule::is_flag(agent.module_accessor, *FIGHTER_INKLING_INSTANCE_WORK_ID_FLAG_BOY) {"),
+            "{body}"
+        );
+        assert!(body.contains("if !{ agent.clear_lua_stack(); smash_script::lua_args!(agent, *ITEM_KIND_SPECIALFLAG); smash::app::sv_animcmd::IS_HAVE_ITEM_KIND(agent.lua_state_agent); agent.pop_lua_stack(1).get_bool() } {"), "{body}");
+        assert!(!body.contains("operator=="), "{body}");
+        syn::parse_file(&format!("fn f() {{\n{body}\n}}")).expect("exported condition is Rust");
     }
 
     #[test]
