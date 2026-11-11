@@ -31083,6 +31083,7 @@ impl eframe::App for VisionaryApp {
             });
         self.roster.set_export_root(roster_export_root);
         self.roster.set_parameter_labels(&self.state.labels);
+        self.roster.set_project_saved(self.project_path.is_some());
         self.roster.prepare(
             &ctx,
             &self.state.fighters,

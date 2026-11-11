@@ -533,6 +533,11 @@ impl RosterWindow {
         self.refresh(fighters, data_root);
     }
 
+    /// Whether the project has a folder on disk; new characters need one.
+    pub fn set_project_saved(&mut self, saved: bool) {
+        self.new_character.project_saved = saved;
+    }
+
     /// The Characters page, drawn in the main window.
     pub fn page(&mut self, ui: &mut Ui) {
         self.ui_contents(ui);
