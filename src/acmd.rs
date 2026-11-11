@@ -47,7 +47,40 @@ pub fn move_script_aliases(move_name: &str) -> Vec<String> {
             out.push(alias.to_string());
         }
     }
+    if let Ok(names) = MOTION_SCRIPTS.read() {
+        for ((_, motion), script) in names.iter() {
+            if motion == move_name && !out.contains(script) {
+                out.push(script.clone());
+            }
+        }
+    }
     out
+}
+
+/// Motions whose game script has another name, per (fighter, motion), read from each fighter's
+/// motion_list.bin as its move list loads.
+static MOTION_SCRIPTS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<(String, String), String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Remember which script spelling each of a fighter's motions runs (see [`motion_script_alias`]).
+pub fn register_motion_scripts(fighter: &str, pairs: Vec<(String, String)>) {
+    if let Ok(mut names) = MOTION_SCRIPTS.write() {
+        names.retain(|(owner, _), _| owner != fighter);
+        for (motion, script) in pairs {
+            names.insert((fighter.to_string(), motion), script);
+        }
+    }
+}
+
+/// The script spelling a fighter's motion runs, when the motion list names another one.
+pub fn registered_motion_script(fighter: &str, move_name: &str) -> Option<String> {
+    let fighter = fighter.strip_prefix("fighter_").unwrap_or(fighter);
+    MOTION_SCRIPTS
+        .read()
+        .ok()?
+        .get(&(fighter.to_ascii_lowercase(), move_name.to_string()))
+        .cloned()
 }
 
 /// ACMD script names to try for a motion + category prefix, in order.
@@ -111,6 +144,10 @@ pub fn script_name_aliases(script_name: &str) -> Vec<String> {
 /// `attack_s3_s2`/`s3` map to `attack_s3_2`/`_3` (`AttackS32/33.txt`); Link's
 /// `attack_s4_s2` keeps its `s` and needs no resolution.
 pub fn resolve_script_move_name(fighter: &str, move_name: &str) -> String {
+    // The game runs the script its motion list names, whatever the motion is called.
+    if let Some(script) = registered_motion_script(fighter, move_name) {
+        return script;
+    }
     let aliases = move_script_aliases(move_name);
     if aliases.len() <= 1 {
         return move_name.to_string();
@@ -21023,5 +21060,181 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
                 ..
             }]
         ));
+    }
+}
+
+/// The move spelling whose scripts the game runs for a motion, when it is not the motion's own
+/// name. motion_list.bin names each motion's game script only by hash, so this tries the other
+/// motions in the list and the motion's own name with words left out, and keeps the spelling
+/// whose `game_` name has that hash. Banjo's `special_air_n_shoot_fire` runs
+/// `game_specialairnfire2`.
+pub fn motion_script_alias(
+    move_name: &str,
+    game_script: u64,
+    other_motions: &[&str],
+) -> Option<String> {
+    let hash = |name: &str| hash40::hash40(&script_function_name("game", name)).0;
+    // `game_` alone means the motion has no game script.
+    if game_script == 0
+        || game_script == hash40::hash40("game_").0
+        || hash(move_name) == game_script
+    {
+        return None;
+    }
+    if let Some(other) = other_motions
+        .iter()
+        .find(|other| hash(other) == game_script)
+    {
+        return Some((*other).to_string());
+    }
+    let words: Vec<&str> = move_name
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.len() > 10 {
+        return None;
+    }
+    // The game's script names spell some words differently from the motion names.
+    let spellings = |word: &str| -> Vec<String> {
+        let mut out = vec![word.to_string()];
+        out.extend(
+            match word {
+                "f" => &["front"][..],
+                "b" => &["back"],
+                "hold" => &["charge"],
+                "lw" => &["low"],
+                _ => &[],
+            }
+            .iter()
+            .map(|other| other.to_string()),
+        );
+        out
+    };
+    // Fewest words left out first, so the closest spelling wins.
+    let mut masks: Vec<u32> = (0..(1u32 << words.len())).collect();
+    masks.sort_by_key(|mask| mask.count_ones());
+    for mask in masks {
+        let kept: Vec<&str> = words
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) == 0)
+            .map(|(_, word)| *word)
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+        let mut orders = vec![kept.clone()];
+        if kept.len() == 2 {
+            orders.push(vec![kept[1], kept[0]]);
+        }
+        for order in orders {
+            let mut names = vec![String::new()];
+            for word in &order {
+                names = names
+                    .iter()
+                    .flat_map(|name| {
+                        spellings(word).into_iter().map(move |spelling| {
+                            if name.is_empty() {
+                                spelling
+                            } else {
+                                format!("{name}_{spelling}")
+                            }
+                        })
+                    })
+                    .collect();
+            }
+            for name in names {
+                for suffix in ["", "1", "2", "3", "4", "n"] {
+                    let name = format!("{name}{suffix}");
+                    if (mask != 0 || !suffix.is_empty() || name != move_name)
+                        && hash(&name) == game_script
+                    {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod motion_script_alias_tests {
+    use super::motion_script_alias;
+
+    #[test]
+    fn a_motion_finds_the_script_it_runs_by_leaving_out_words() {
+        let hash = hash40::hash40("game_specialairnfire2").0;
+        assert_eq!(
+            motion_script_alias("special_air_n_shoot_fire", hash, &[]).as_deref(),
+            Some("special_air_n_fire2")
+        );
+        let own = hash40::hash40("game_attack11").0;
+        assert_eq!(motion_script_alias("attack_11", own, &[]), None);
+    }
+
+    /// Run with VISIONARY_DATA_ROOT set to a dumped game to count, for every fighter, motions
+    /// whose script is not their own name and how many of those this resolves.
+    #[test]
+    fn every_motion_with_another_script_is_resolved() {
+        let Ok(root) = std::env::var("VISIONARY_DATA_ROOT") else {
+            return;
+        };
+        let labels = crate::param_labels::parse_csv(
+            &std::fs::read_to_string(
+                crate::scratch_dirs::app_storage_root().join("ParamLabels.csv"),
+            )
+            .unwrap_or_default(),
+        );
+        let (mut differ, mut resolved, mut total, mut in_dump) = (0, 0, 0, 0);
+        let mut missed = Vec::new();
+        for entry in std::fs::read_dir(std::path::Path::new(&root).join("fighter")).unwrap() {
+            let fighter = entry.unwrap().path();
+            let Ok(list) = motion_lib::open(fighter.join("motion/body/c00/motion_list.bin")) else {
+                continue;
+            };
+            let names: Vec<String> = list
+                .list
+                .keys()
+                .filter_map(|kind| labels.get(&kind.0).cloned())
+                .collect();
+            let others: Vec<&str> = names.iter().map(String::as_str).collect();
+            for (kind, motion) in list.list.iter() {
+                let Some(name) = labels.get(&kind.0) else {
+                    continue;
+                };
+                total += 1;
+                let own = hash40::hash40(&super::script_function_name("game", name)).0;
+                if motion.game_script.0 == own
+                    || motion.game_script.0 == 0
+                    || motion.game_script.0 == hash40::hash40("game_").0
+                {
+                    continue;
+                }
+                differ += 1;
+                match motion_script_alias(name, motion.game_script.0, &others) {
+                    Some(alias) => {
+                        resolved += 1;
+                        if let Ok(corpus) = std::env::var("VISIONARY_TYPED_CORPUS") {
+                            let file = std::path::Path::new(&corpus)
+                                .join(fighter.file_name().unwrap())
+                                .join(format!("{}.txt", super::move_name_to_pascal(&alias)));
+                            if file.exists() {
+                                in_dump += 1;
+                            }
+                        }
+                    }
+                    None => missed.push(format!(
+                        "{}/{name} {:#x}",
+                        fighter.file_name().unwrap().to_string_lossy(),
+                        motion.game_script.0
+                    )),
+                }
+            }
+        }
+        eprintln!("motions {total}, other script {differ}, resolved {resolved}, in dump {in_dump}");
+        for line in missed.iter().take(60) {
+            eprintln!("missed {line}");
+        }
     }
 }

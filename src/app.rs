@@ -1748,18 +1748,34 @@ fn effect_source_label(source_dir: &str) -> String {
 /// Read the persisted open state of a collapsing header using the same parent-aware ID that the
 /// `CollapsingHeader` widget will use when it is rendered.
 fn persistent_collapsing_open(ui: &Ui, salt: impl Hash, default_open: bool) -> bool {
-    let id = ui.make_persistent_id(salt);
-    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open)
-        .is_open()
+    let id = egui::Id::new(("tracked_open", salt));
+    ui.data(|d| d.get_temp(id)).unwrap_or(default_open)
 }
 
-/// Set and persist a collapsing header's open state before the next frame draws it.
+/// Set a [`tracked_header`]'s open state for the next time it is drawn.
 fn set_persistent_collapsing_open(ui: &Ui, salt: impl Hash, open: bool) {
-    let id = ui.make_persistent_id(salt);
-    let mut state =
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
-    state.set_open(open);
-    state.store(ui.ctx());
+    let id = egui::Id::new(("tracked_open", salt));
+    if ui.data(|d| d.get_temp::<bool>(id)) != Some(open) {
+        ui.data_mut(|d| d.insert_temp(id, open));
+        ui.ctx().request_repaint();
+    }
+}
+
+/// A collapsing header whose open state lives under `salt`, so code can open or close it.
+/// egui keys its own state by the header's nested layout, which code elsewhere cannot rebuild.
+fn tracked_header<R>(
+    ui: &mut Ui,
+    salt: impl Hash + Copy,
+    header: egui::CollapsingHeader,
+    default_open: bool,
+    body: impl FnOnce(&mut Ui) -> R,
+) -> egui::CollapsingResponse<R> {
+    let open = persistent_collapsing_open(ui, salt, default_open);
+    let response = header.open(Some(open)).show(ui, body);
+    if response.header_response.clicked() {
+        set_persistent_collapsing_open(ui, salt, !open);
+    }
+    response
 }
 
 /// Allocate a scroll viewport from the space that remains in its parent rather than letting a
@@ -3076,14 +3092,6 @@ fn editor_source_is_excluded(name: &str) -> bool {
     )
 }
 
-fn missing_acmd_content_error(
-    fighter: &str,
-    move_name: &str,
-    has_source_content: bool,
-) -> Option<String> {
-    (!has_source_content).then(|| format!("No ACMD statements found for {fighter}/{move_name}"))
-}
-
 fn source_preview_budget_error(
     fighter: &str,
     move_name: &str,
@@ -3110,9 +3118,7 @@ fn source_preview_budget_error(
 
 #[cfg(test)]
 mod source_editor_discovery_tests {
-    use super::{
-        editor_source_is_excluded, missing_acmd_content_error, source_preview_budget_error,
-    };
+    use super::{editor_source_is_excluded, source_preview_budget_error};
 
     #[test]
     fn playable_components_keep_their_exact_source_identities() {
@@ -3183,10 +3189,6 @@ mod source_editor_discovery_tests {
                 || !expression.stmts.is_empty();
             assert!(has_content, "fixture must parse: {source}");
             assert_eq!(
-                missing_acmd_content_error("nana", "final_start", has_content),
-                None
-            );
-            assert_eq!(
                 source_preview_budget_error(
                     "nana",
                     "final_start",
@@ -3221,14 +3223,6 @@ mod source_editor_discovery_tests {
         assert!(huge.to_sound_events().is_empty());
         assert_eq!(serde_json::to_value(huge).unwrap(), before);
     }
-
-    #[test]
-    fn empty_source_keeps_a_named_load_error() {
-        assert_eq!(
-            missing_acmd_content_error("nana", "final_start", false).as_deref(),
-            Some("No ACMD statements found for nana/final_start")
-        );
-    }
 }
 
 pub struct VisionaryApp {
@@ -3244,6 +3238,8 @@ pub struct VisionaryApp {
     capture_motion_names: HashMap<(i32, u64), String>,
     fetching_acmd: bool,
     acmd_error: Option<String>,
+    /// The loaded move has no script in the game at all.
+    move_has_no_script: bool,
     show_add_hitbox: bool,
     add_hitbox_category: u8,
     add_wind_radial: bool,
@@ -3822,6 +3818,7 @@ impl VisionaryApp {
             show_edit_log: false,
             show_workspace: false,
             workspace_asset_slot: 0,
+            move_has_no_script: false,
             workspace_copy_rx: None,
             workspace_asset_sent_slot: None,
             workspace_asset_cache_root: None,
@@ -4533,6 +4530,7 @@ impl VisionaryApp {
         // Build move list on a background thread — reads many .nuanmb files for frame counts
         let labels = self.state.labels.clone();
         let fighter_dir = fighter.fighter_dir.clone();
+        let fighter_name = fighter.name.clone();
         let base_slot = fighter.base_slot();
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
@@ -4600,6 +4598,20 @@ impl VisionaryApp {
                 .collect();
 
             moves.sort_by(|a, b| a.name.cmp(&b.name));
+            // Some motions run a script with another name (Banjo's special_air_n_shoot_fire
+            // runs game_specialairnfire2); fetching and export follow the motion list.
+            let names: Vec<&str> = moves.iter().map(|entry| entry.name.as_str()).collect();
+            let scripts = mlist
+                .list
+                .iter()
+                .filter_map(|(kind, motion)| {
+                    let name = labels.get(&kind.0)?;
+                    let script =
+                        crate::acmd::motion_script_alias(name, motion.game_script.0, &names)?;
+                    Some((name.clone(), script))
+                })
+                .collect();
+            crate::acmd::register_motion_scripts(&fighter_name, scripts);
             let _ = tx.send(moves);
         });
     }
@@ -5932,7 +5944,10 @@ impl VisionaryApp {
         if index
             .script(
                 &fighter,
-                &crate::acmd::acmd_script_name("effect", &move_name),
+                &crate::acmd::acmd_script_name(
+                    "effect",
+                    &crate::acmd::resolve_script_move_name(&fighter, &move_name),
+                ),
             )
             .is_some()
         {
@@ -5948,7 +5963,13 @@ impl VisionaryApp {
             refresh_acmd_index(&mut index, &mut notes);
         }
         if index
-            .script(&fighter, &crate::acmd::acmd_script_name("game", &move_name))
+            .script(
+                &fighter,
+                &crate::acmd::acmd_script_name(
+                    "game",
+                    &crate::acmd::resolve_script_move_name(&fighter, &move_name),
+                ),
+            )
             .is_some()
         {
             ran = true;
@@ -6132,7 +6153,10 @@ impl VisionaryApp {
         if index
             .script(
                 &fighter,
-                &crate::acmd::acmd_script_name("sound", &move_name),
+                &crate::acmd::acmd_script_name(
+                    "sound",
+                    &crate::acmd::resolve_script_move_name(&fighter, &move_name),
+                ),
             )
             .is_some()
         {
@@ -6145,7 +6169,10 @@ impl VisionaryApp {
         if index
             .script(
                 &fighter,
-                &crate::acmd::acmd_script_name("expression", &move_name),
+                &crate::acmd::acmd_script_name(
+                    "expression",
+                    &crate::acmd::resolve_script_move_name(&fighter, &move_name),
+                ),
             )
             .is_some()
         {
@@ -6517,29 +6544,16 @@ impl VisionaryApp {
                     || !effect_script.stmts.is_empty()
                     || !sound_script.stmts.is_empty()
                     || !expression_script.stmts.is_empty();
-                self.acmd_error =
-                    missing_acmd_content_error(fighter_name, move_name, has_any_source_category)
-                        .or(preview_error);
+                self.acmd_error = preview_error;
+                self.move_has_no_script = !has_any_source_category;
                 self.state.sound_script = sound_script;
                 self.state.loaded_body = body.clone();
                 self.apply_saved_sound_edits_to_current();
                 self.state.expression_script = expression_script;
                 self.apply_saved_expression_edits_to_current();
-                let effects_only = hitboxes.is_empty() && !effect_script.stmts.is_empty();
-                // A game script can legitimately contain only hurtbox states, damage-reaction
-                // conditions, motion controls, or other non-attack statements. Treat an empty
-                // collision list as unavailable only when the parser found no game statements
-                // at all; otherwise the same script must remain the source for the sidebar,
-                // timeline, export, and live rules.
-                if hitboxes.is_empty()
-                    && !effects_only
-                    && script.stmts.is_empty()
-                    && !has_any_source_category
+                // A move with no script at all loads as an empty one, so blocks and hitboxes can
+                // be added to it; they give it a script.
                 {
-                    self.state.effect_script = crate::data::EffectScript::default();
-                    self.record_dropped_effect_lines();
-                    self.state.effects = Vec::new();
-                } else {
                     self.normalize_hitbox_bones(&mut hitboxes);
                     self.state.hitboxes_pristine = hitboxes.clone();
                     self.state.acmd_source = source_label.into();
@@ -6629,10 +6643,7 @@ impl VisionaryApp {
                         &self.state.effect_script,
                         &self.state.sound_script,
                         &self.state.expression_script,
-                    )
-                    .or_else(|| {
-                        missing_acmd_content_error(fighter_name, move_name, has_any_source_category)
-                    });
+                    );
                     self.jump_to_earliest_active_frame();
                 }
             }
@@ -8343,7 +8354,7 @@ impl VisionaryApp {
                     // Start collapsed: a full move list is hundreds of entries, and opening
                     // every category by default buries the categories themselves.
                     .default_open(false);
-                    let response = header.show(ui, |ui| {
+                    let response = tracked_header(ui, ("movecat", category), header, false, |ui| {
                         for m in group {
                             let selected = self
                                 .state
@@ -9969,6 +9980,11 @@ impl VisionaryApp {
                             let fetched = !self.state.acmd_source.is_empty();
                             if !fetched {
                                 ui.weak("Nothing loaded yet — use Move › Reload source.");
+                            } else if self.move_has_no_script {
+                                ui.weak(
+                                    "The game gives this move no script; its actions come from \
+                                     the fighter's own code. Anything you add here gives it one.",
+                                );
                             } else {
                                 ui.weak("This move has no hitboxes.");
                                 let mut has = Vec::new();
@@ -26529,7 +26545,12 @@ impl VisionaryApp {
                                 open,
                             );
                         }
-                        let response = header.show(ui, |ui| {
+                        let response = tracked_header(
+                            ui,
+                            ("transplant_source", &group.source_dir),
+                            header,
+                            false,
+                            |ui| {
                             for (rel, name) in &group.entries {
                                 let sel = self
                                     .transplant_sel
@@ -26559,7 +26580,8 @@ impl VisionaryApp {
                                     );
                                 }
                             }
-                        });
+                            },
+                        );
                         if transplant_searching && response.header_response.clicked() {
                             self.transplant_search_touched
                                 .insert(group.source_dir.clone());
@@ -44251,4 +44273,27 @@ fn hitbox_menu_scroll_area(viewport_height: f32) -> egui::ScrollArea {
         .auto_shrink([false, false])
         .min_scrolled_height(viewport_height)
         .max_height(viewport_height)
+}
+
+#[cfg(test)]
+mod collapsing_id_tests {
+    #[test]
+    fn a_header_opened_by_salt_draws_open() {
+        let ctx = egui::Context::default();
+        let mut opened = false;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                egui::ScrollArea::both().id_salt("moves").show(ui, |ui| {
+                    super::set_persistent_collapsing_open(ui, ("movecat", 3u8), true);
+                    let header = egui::CollapsingHeader::new("Jabs").id_salt(("movecat", 3u8));
+                    opened = super::tracked_header(ui, ("movecat", 3u8), header, false, |ui| {
+                        ui.label("x")
+                    })
+                    .body_returned
+                    .is_some();
+                });
+            });
+        }
+        assert!(opened);
+    }
 }
