@@ -17895,7 +17895,7 @@ impl VisionaryApp {
         // Computed once before the window: building the project commits pending
         // panel edits, which must not happen inside the UI closure.
         let dirty = self.is_project_dirty();
-        egui::Window::new("Project Hub")
+        egui::Window::new("Projects")
             .collapsible(false)
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -17918,14 +17918,14 @@ impl VisionaryApp {
                 if ui
                     .button("New project")
                     .on_hover_text(
-                        "Enter a workspace folder — every edit lives there and autosaves",
+                        "Pick a folder for the project; every edit saves there by itself",
                     )
                     .clicked()
                 {
                     self.project_hub.new_workspace = Some(String::new());
                 }
                 if let Some(path) = &mut self.project_hub.new_workspace {
-                    ui.label("Workspace folder");
+                    ui.label("Project folder");
                     ui.text_edit_singleline(path);
                     if ui.add_enabled(!path.trim().is_empty(), egui::Button::new("Create project")).clicked() {
                         chosen = Some(crate::project_hub::HubAction::New(std::path::PathBuf::from(path.trim())));
@@ -17936,7 +17936,7 @@ impl VisionaryApp {
                 }
                 if ui
                     .button("Open project")
-                    .on_hover_text("Open an editable project for further editing")
+                    .on_hover_text("Open a project you saved before")
                     .clicked()
                 {
                     if let Some(path) = rfd::FileDialog::new()
@@ -17947,10 +17947,10 @@ impl VisionaryApp {
                     }
                 }
                 if ui
-                    .button("Import mod")
+                    .button("Open a mod as a project")
                     .on_hover_text(
-                        "Import any mod folder as an editable project: roster, names, \
-                         portraits, and values are adopted; compiled scripts stay reference-only",
+                        "Open a finished mod folder as a project: its characters, names, portraits and \
+                         values become editable",
                     )
                     .clicked()
                 {
@@ -17981,7 +17981,7 @@ impl VisionaryApp {
                 }
                 ui.separator();
                 if ui
-                    .button("Browse without project")
+                    .button("Look around without a project")
                     .on_hover_text("Keep looking around with no project open")
                     .clicked()
                 {
@@ -17992,12 +17992,12 @@ impl VisionaryApp {
                     if current_path.is_none() {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Edits are in memory — File → Save As… gives them a home before switching.",
+                            "These edits aren't saved yet. File > Save as keeps them.",
                         );
                     } else {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Edits are still saving — switching now keeps what autosave already wrote.",
+                            "Still saving; switching now keeps what is already saved.",
                         );
                     }
                 }
@@ -18133,7 +18133,7 @@ impl VisionaryApp {
                     if ui.button("Close").clicked() {
                         close = true;
                     }
-                    if ui.button("Project Hub").clicked() {
+                    if ui.button("Open or create a project").clicked() {
                         self.project_hub.show = true;
                     }
                 });
@@ -18386,7 +18386,7 @@ impl VisionaryApp {
             }
         }
         let mut action = None;
-        egui::Window::new("Project Files")
+        egui::Window::new("Project files")
             .open(&mut open)
             .resizable(true)
             .show(ctx, |ui| {
@@ -18452,9 +18452,9 @@ impl VisionaryApp {
                             && asset_status.generation == self.workspace_asset_generation
                             && self.workspace_asset_sent_slot == Some(self.workspace_asset_slot)
                         {
-                            let message = format!("Asset carrier: {} · {}/{} files loaded",
+                            let message = format!("Model preview in the game: {} · {}/{} files loaded",
                                 if asset_status.ready { "preview ready" }
-                                else if asset_status.phase == "ready" { "awaiting carrier confirmation" }
+                                else if asset_status.phase == "ready" { "waiting for the game" }
                                 else { &asset_status.phase },
                                 asset_status.served, asset_status.staged);
                             ui.label(
@@ -18498,7 +18498,7 @@ impl VisionaryApp {
                                     egui::Button::new("Reload asset preview"),
                                 )
                                 .on_hover_text(
-                                    "Load model, animation, and swing resources onto the main fighter through a temporary hidden carrier. Keep the ordinary item slot empty while loading.",
+                                    "Show the changed model and animations on the fighter in the running game. The fighter must not hold an item while it loads.",
                                 )
                                 .clicked()
                             {
@@ -18525,8 +18525,8 @@ impl VisionaryApp {
                                     "1. Start Visionary before the game. Enable Visionary Live Assets in ARCropolis and restart the game after the first installation; later edits reload within the match.",
                                     "2. Import the model, texture, animation, or swing files you changed. Missing files use the selected costume's vanilla model and motion folders, including motion_list.bin.",
                                     "3. Connect in Training Mode and press Reload asset preview with the fighter's ordinary item slot empty. The preview follows the fighter's current animation and frame; the item slot is released after construction.",
-                                    "4. Edit the imported copies, then reload again. Stop preview restores the original model. Do not spawn a normal Alucard assist during a preview.",
-                                    "The preview changes appearance and swing physics; the fighter's gameplay collision and attacks remain unchanged. Export Mod Folder retains the original asset filenames.",
+                                    "4. Edit the imported copies, then reload again. Stop preview restores the original model. Don't call an Alucard assist trophy during a preview.",
+                                    "The preview changes appearance and swing physics; the fighter's gameplay collision and attacks remain unchanged. Export mod keeps the original file names.",
                                 ] {
                                     ui.label(egui::RichText::new(step).small());
                                 }
@@ -18563,7 +18563,7 @@ impl VisionaryApp {
                     });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Project Hub").clicked() {
+                    if ui.button("Open or create a project").clicked() {
                         self.project_hub.show = true;
                     }
                 });
@@ -25848,7 +25848,7 @@ impl VisionaryApp {
             egui::ViewportBuilder::default()
                 .with_app_id(crate::app_icon::APP_ID)
                 .with_icon(crate::app_icon::viewport_icon())
-                .with_title("Transplant Effects — Visionary")
+                .with_title("Borrow effects — Visionary")
                 .with_inner_size(transplant_size)
                 .with_position(transplant_pos)
                 .with_min_inner_size([380.0, 320.0]),
@@ -25862,7 +25862,7 @@ impl VisionaryApp {
                 let pool = self.effect_pool.as_ref().unwrap();
                 let (done, total) = pool.progress();
                 ui.horizontal(|ui| {
-                    ui.label("Target:");
+                    ui.label("Borrow into:");
                     let picks: Vec<crate::ui::Pick> = fighter_names
                         .iter()
                         .map(|(name, display_name)| crate::ui::Pick {
@@ -25959,43 +25959,39 @@ impl VisionaryApp {
                 // current fighter has none recorded. Two sources feed the co-load: recorded
                 // transplants (any fighter) AND direct spawn edits that name a foreign effect. Both
                 // silently rode along as the ridley/bomberman bug; both are purgeable here.
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Staged for the game — {all_transplants} transplant(s) on {all_transplant_fighters} fighter(s), \
-                         {foreign_spawn_donors} foreign spawn-edit(s)"
-                    ))
-                    .small()
-                    .color(egui::Color32::GRAY),
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(all_transplants > 0, egui::Button::new("Clear every fighter").small())
-                        .on_hover_text(
-                            "Remove ALL recorded transplants across every fighter and unload \
-                             their runtime carriers",
-                        )
-                        .clicked()
-                    {
-                        clear_ops_all = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            foreign_spawn_donors > 0,
-                            egui::Button::new("Clear foreign spawn-edits").small(),
-                        )
-                        .on_hover_text(
-                            "Remove every spawn edit that references another fighter's / assist's \
-                             effect — the OTHER source of stale donor co-loads",
-                        )
-                        .clicked()
-                    {
-                        clear_foreign_edits = true;
-                    }
-                });
+                // Only offered when there is something to remove.
+                if all_transplants + foreign_spawn_donors > 0 {
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{all_transplants} borrowed effect(s) on {all_transplant_fighters} fighter(s)"
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                        if ui
+                            .add_enabled(all_transplants > 0, egui::Button::new("Remove all borrowed effects").small())
+                            .on_hover_text("From every fighter, in the project and in the game")
+                            .clicked()
+                        {
+                            clear_ops_all = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                foreign_spawn_donors > 0,
+                                egui::Button::new("Remove other fighters' effects from moves").small(),
+                            )
+                            .on_hover_text("Moves that play an effect from another fighter go back to their own")
+                            .clicked()
+                        {
+                            clear_foreign_edits = true;
+                        }
+                    });
+                }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Apply to:");
+                    ui.label("Skins:");
                     if ui
                         .selectable_label(self.one_slot_slots.is_empty(), "All skins")
                         .on_hover_text("Transplant into the base EFF for every skin")
@@ -26080,7 +26076,7 @@ impl VisionaryApp {
                     ui.colored_label(egui::Color32::GRAY, "Pick a target fighter.");
                     return;
                 };
-                crate::ui::search_field(ui, "transplant_search", &mut self.transplant_search, "Search all effects…");
+                crate::ui::search_field(ui, "transplant_search", &mut self.transplant_search, "Search effects");
 
                 // Live kinds that match — effects the running game has actually used.
                 let q = self.transplant_search.trim().to_lowercase();
@@ -26476,7 +26472,7 @@ impl VisionaryApp {
                         do_transplant = Some((rel, donor, new_name));
                     }
                 } else {
-                    ui.colored_label(egui::Color32::GRAY, "Pick a donor effect above.");
+                    ui.colored_label(egui::Color32::GRAY, "Pick an effect above to borrow it.");
                 }
                 });
                 // Closing the OS window unticks the Windows-menu toggle.
