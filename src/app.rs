@@ -3363,6 +3363,14 @@ pub struct VisionaryApp {
     forgotten_fighters: BTreeSet<String>,
     /// The selected fighter's resolved ef_*.eff — re-queued when the Eff Editor opens.
     current_eff_path: Option<PathBuf>,
+    /// Emitter sets for the particle preview: the fighter's effect file, then the shared one,
+    /// keyed by the fighter's file path they were read for.
+    vfx_sets: Option<(
+        Option<PathBuf>,
+        std::sync::Arc<Vec<crate::vfx_sim::SimFile>>,
+    )>,
+    /// Particle textures decoded for the preview, by (file, pool index).
+    vfx_textures: HashMap<(usize, usize, bool), Option<egui::TextureHandle>>,
     /// Effs opened from outside the game data root (most-recent first), persisted.
     recent_effs: Vec<PathBuf>,
     /// Background cargo-skyline build for a normal export or explicit gimmick package.
@@ -3832,6 +3840,8 @@ impl VisionaryApp {
             roster,
             forgotten_fighters: load_forgotten_fighters(),
             current_eff_path: None,
+            vfx_sets: None,
+            vfx_textures: HashMap::new(),
             recent_effs: load_recent_effs(),
             export_build: None,
             pin_sync_client: None,
@@ -9154,6 +9164,214 @@ impl VisionaryApp {
                                     best_hurtbox_pick = Some((volume_index, distance));
                                 }
                             }
+                        }
+                    }
+
+                    // Simulated particles of every effect that is out, under its marker.
+                    if self
+                        .vfx_sets
+                        .as_ref()
+                        .is_none_or(|(path, _)| *path != self.current_eff_path)
+                    {
+                        let mut files = Vec::new();
+                        let common = self
+                            .state
+                            .data_root
+                            .as_ref()
+                            .map(|root| root.join("effect/system/common/ef_common.eff"));
+                        for path in [self.current_eff_path.clone(), common]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Ok(found) = crate::vfx_sim::load_sets(&path) {
+                                files.push(found);
+                            }
+                        }
+                        self.vfx_sets =
+                            Some((self.current_eff_path.clone(), std::sync::Arc::new(files)));
+                        self.vfx_textures.clear();
+                    }
+                    let files = self
+                        .vfx_sets
+                        .as_ref()
+                        .map(|(_, files)| files.clone())
+                        .unwrap_or_default();
+                    for ec in &self.state.effects {
+                        if ec.disabled
+                            || is_null_effect_sentinel(ec)
+                            || frame_num < ec.active_start
+                            || frame_num > ec.active_end.max(ec.active_start + 60)
+                        {
+                            continue;
+                        }
+                        let name = ec.effect_name.to_lowercase();
+                        let Some((file_index, set)) = files
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, file)| file.sets.get(&name).map(|set| (index, set)))
+                        else {
+                            continue;
+                        };
+                        let Some(bone_mat) = bone_matrices
+                            .get(&ec.bone_name)
+                            .or_else(|| bone_matrices.get(&ec.bone_name.to_lowercase()))
+                            .copied()
+                        else {
+                            continue;
+                        };
+                        let bone_mat = if is_system_bone(&ec.bone_name) {
+                            glam::Mat4::from_translation(bone_mat.col(3).truncate())
+                        } else {
+                            bone_mat
+                        };
+                        let rotation = glam::Quat::from_euler(
+                            glam::EulerRot::XYZ,
+                            ec.rotation[0].to_radians(),
+                            ec.rotation[1].to_radians(),
+                            ec.rotation[2].to_radians(),
+                        );
+                        let spawn = bone_mat
+                            * glam::Mat4::from_scale_rotation_translation(
+                                glam::Vec3::splat(ec.scale.max(0.01)),
+                                rotation,
+                                glam::Vec3::from(ec.offset),
+                            );
+                        for particle in
+                            crate::vfx_sim::particles_at(&set.emitters, frame_num - ec.active_start)
+                        {
+                            let world = spawn.transform_point3(particle.position);
+                            let Some(screen) = rs.world_to_screen(world, rect) else {
+                                continue;
+                            };
+                            let half = rs
+                                .world_radius_to_screen(
+                                    world,
+                                    particle.size * 0.5 * ec.scale.max(0.01),
+                                    rect,
+                                )
+                                .unwrap_or(2.0)
+                                .clamp(0.5, 400.0);
+                            let [r, g, b, a] = particle.color;
+                            // Additive particles add light: black adds nothing.
+                            let (rgb, alpha) = if particle.additive {
+                                let peak = r.max(g).max(b);
+                                if peak <= 0.0 {
+                                    continue;
+                                }
+                                ([r / peak, g / peak, b / peak], a * peak.min(1.0))
+                            } else {
+                                ([r, g, b], a)
+                            };
+                            if alpha <= 0.01 {
+                                continue;
+                            }
+                            let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
+                            let tint = egui::Color32::from_rgba_unmultiplied(
+                                to_byte(rgb[0]),
+                                to_byte(rgb[1]),
+                                to_byte(rgb[2]),
+                                to_byte(alpha),
+                            );
+                            // Directional billboards lie along the motion on screen.
+                            let mut up = egui::vec2(0.0, -1.0);
+                            if matches!(particle.billboard, 3 | 5) {
+                                let ahead =
+                                    spawn.transform_point3(particle.position + particle.velocity);
+                                if let Some(next) = rs.world_to_screen(ahead, rect) {
+                                    let along = next - screen;
+                                    if along.length() > 0.01 {
+                                        up = along.normalized();
+                                    }
+                                }
+                            }
+                            let side = egui::vec2(-up.y, up.x) * half;
+                            let up = up * half * particle.stretch;
+                            let alpha_only = set
+                                .alpha_only
+                                .get(particle.emitter)
+                                .copied()
+                                .unwrap_or(false);
+                            let texture = set
+                                .textures
+                                .get(particle.emitter)
+                                .copied()
+                                .flatten()
+                                .and_then(|index| {
+                                    self.vfx_textures
+                                        .entry((file_index, index, alpha_only))
+                                        .or_insert_with(|| {
+                                            let file = &files[file_index];
+                                            let pool = file.pool.as_ref()?;
+                                            let name = file.texture_names.get(index)?;
+                                            let image = crate::texture_import::decode_as_sampled(
+                                                pool,
+                                                index,
+                                                name,
+                                                Some(128),
+                                            )
+                                            .ok()?;
+                                            // A texture with black colour everywhere is an alpha
+                                            // mask: the particle's own colour fills it.
+                                            let mut image = image;
+                                            if alpha_only
+                                                || image
+                                                    .pixels()
+                                                    .all(|p| p[0].max(p[1]).max(p[2]) < 8)
+                                            {
+                                                for p in image.pixels_mut() {
+                                                    p[0] = 255;
+                                                    p[1] = 255;
+                                                    p[2] = 255;
+                                                }
+                                            }
+                                            let size =
+                                                [image.width() as usize, image.height() as usize];
+                                            Some(ui.ctx().load_texture(
+                                                format!("vfx {file_index} {index} {alpha_only}"),
+                                                egui::ColorImage::from_rgba_unmultiplied(
+                                                    size,
+                                                    image.as_raw(),
+                                                ),
+                                                egui::TextureOptions::LINEAR,
+                                            ))
+                                        })
+                                        .as_ref()
+                                        .map(|handle| handle.id())
+                                });
+                            let mut mesh = match texture {
+                                Some(id) => egui::Mesh::with_texture(id),
+                                None => egui::Mesh::default(),
+                            };
+                            let corners = [
+                                (screen - side - up, egui::pos2(0.0, 0.0)),
+                                (screen + side - up, egui::pos2(1.0, 0.0)),
+                                (screen + side + up, egui::pos2(1.0, 1.0)),
+                                (screen - side + up, egui::pos2(0.0, 1.0)),
+                            ];
+                            if texture.is_some() {
+                                for (pos, uv) in corners {
+                                    mesh.vertices.push(egui::epaint::Vertex {
+                                        pos,
+                                        uv,
+                                        color: tint,
+                                    });
+                                }
+                                mesh.add_triangle(0, 1, 2);
+                                mesh.add_triangle(0, 2, 3);
+                            } else {
+                                // No texture: a soft disc stands in.
+                                mesh.colored_vertex(screen, tint);
+                                const RIM: u32 = 16;
+                                for k in 0..RIM {
+                                    let angle = k as f32 / RIM as f32 * std::f32::consts::TAU;
+                                    mesh.colored_vertex(
+                                        screen + side * angle.cos() + up * angle.sin(),
+                                        egui::Color32::TRANSPARENT,
+                                    );
+                                    mesh.add_triangle(0, 1 + k, 1 + (k + 1) % RIM);
+                                }
+                            }
+                            ui.painter().add(egui::Shape::mesh(mesh));
                         }
                     }
 

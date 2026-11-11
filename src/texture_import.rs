@@ -433,6 +433,19 @@ fn export_for_form(stored: &image::RgbaImage, sel: [u8; 4], form: Form) -> image
     }
 }
 
+/// Decode texture `index` as the game samples it: its channel swizzle applied, so a one-channel
+/// mask arrives as alpha the way the effect shader reads it.
+pub fn decode_as_sampled(
+    pool: &[u8],
+    index: usize,
+    name: &str,
+    max_edge: Option<u32>,
+) -> Result<image::RgbaImage> {
+    let stored = decode_rgba(pool, index, name, None)?;
+    let sel = comp_sel(pool, index).unwrap_or([2, 3, 4, 5]);
+    Ok(fit(apply_swizzle(&stored, sel), max_edge))
+}
+
 /// Decode texture `index` as the panel shows it.
 pub fn decode_preview(
     pool: &[u8],

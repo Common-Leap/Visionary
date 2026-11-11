@@ -32,6 +32,7 @@ mod roster;
 mod scratch_dirs;
 mod texture_import;
 mod ui;
+mod vfx_sim;
 #[cfg(target_os = "linux")]
 mod wayland_icon;
 
