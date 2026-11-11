@@ -127,9 +127,7 @@ impl SelectedGimmickRuntime {
         Ok(())
     }
 
-    /// Build this explicit runtime into an existing mod folder whose
-    /// `plugin.nro` slot is absent. The package helper owns all source
-    /// replacement, no-clobber, and rollback guarantees.
+    /// Build this runtime into an existing mod folder's `plugin.nro`.
     pub fn build_into_package(
         &self,
         package_root: &Path,
@@ -143,6 +141,16 @@ impl SelectedGimmickRuntime {
         )
     }
 
+    /// Write the plugin source this runtime builds from, with the export's code in it.
+    pub fn write_source(&self, dest: &Path) -> Result<(), crate::gimmicks::package::PackageError> {
+        crate::gimmicks::package::write_source_tree(
+            &self.plugin_root,
+            dest,
+            &self.behavior,
+            &self.acmd,
+        )
+    }
+
     #[cfg(test)]
     fn package_with<F>(
         &self,
@@ -150,11 +158,12 @@ impl SelectedGimmickRuntime {
         build: F,
     ) -> Result<crate::gimmicks::package::PackagedPlugin, crate::gimmicks::package::PackageError>
     where
-        F: FnOnce(&Path) -> Result<(), crate::gimmicks::package::PackageError>,
+        F: FnOnce(&Path) -> Result<PathBuf, crate::gimmicks::package::PackageError>,
     {
         crate::gimmicks::package::package_combined_with(
             &self.plugin_root,
             package_root,
+            &package_root.with_extension("work"),
             &self.behavior,
             &self.acmd,
             build,
@@ -1024,10 +1033,11 @@ mod tests {
         project
     }
 
-    fn write_runtime_nro(root: &Path, bytes: &[u8]) {
-        let output = root.join("target/aarch64-skyline-switch/release/lib_effect_viewer.nro");
+    fn write_runtime_nro(root: &Path, bytes: &[u8]) -> PathBuf {
+        let output = root.join("built/lib_effect_viewer.nro");
         std::fs::create_dir_all(output.parent().unwrap()).unwrap();
-        std::fs::write(output, bytes).unwrap();
+        std::fs::write(&output, bytes).unwrap();
+        output
     }
 
     #[test]
@@ -1531,24 +1541,29 @@ mod tests {
         assert_eq!(runtime.acmd_artifact().fighters, ["cloud"]);
         assert!(runtime.acmd_artifact().source.contains("mod cloud"));
         let packaged = runtime
-            .package_with(&package, |root| {
-                write_runtime_nro(root, b"combined-runtime");
-                Ok(())
+            .package_with(&package, |tree| {
+                assert!(
+                    std::fs::read_to_string(tree.join("src/slight/gimmicks/generated.rs"))
+                        .unwrap()
+                        .contains("METER_BINDINGS")
+                );
+                assert!(std::fs::read_to_string(
+                    tree.join("src/slight/gimmicks/acmd_generated.rs")
+                )
+                .unwrap()
+                .contains("mod cloud"));
+                Ok(write_runtime_nro(tree, b"combined-runtime"))
             })
             .unwrap();
         assert_eq!(
             std::fs::read(packaged.plugin_nro).unwrap(),
             b"combined-runtime"
         );
+        // The selected plugin source is never changed by an export.
         assert!(
-            std::fs::read_to_string(plugin.join("src/slight/gimmicks/generated.rs"))
+            !std::fs::read_to_string(plugin.join("src/slight/gimmicks/generated.rs"))
                 .unwrap()
                 .contains("METER_BINDINGS")
-        );
-        assert!(
-            std::fs::read_to_string(plugin.join("src/slight/gimmicks/acmd_generated.rs"))
-                .unwrap()
-                .contains("mod cloud")
         );
     }
 
@@ -1573,9 +1588,8 @@ mod tests {
         let package = dir.path().join("fresh-package");
         std::fs::create_dir(&package).unwrap();
         let packaged = runtime
-            .package_with(&package, |root| {
-                write_runtime_nro(root, b"charted-package");
-                Ok(())
+            .package_with(&package, |tree| {
+                Ok(write_runtime_nro(tree, b"charted-package"))
             })
             .unwrap();
         assert_eq!(
@@ -1624,7 +1638,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_runtime_builder_failure_restores_both_managed_sources() {
+    fn selected_runtime_builder_failure_leaves_the_plugin_source_and_mod_folder_alone() {
         let dir = tempfile::tempdir().unwrap();
         let plugin = dir.path().join("selected-plugin");
         let package = dir.path().join("fresh-package");

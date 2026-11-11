@@ -47,11 +47,7 @@ pub struct CombinedPluginExport {
     pub acmd_changed: bool,
 }
 
-impl CombinedPluginExport {
-    pub fn changed(&self) -> bool {
-        self.behavior_changed || self.acmd_changed
-    }
-}
+impl CombinedPluginExport {}
 
 /// A rendered, parse-checked source module. The source is not written until a
 /// caller explicitly passes a destination to [`write_to`].

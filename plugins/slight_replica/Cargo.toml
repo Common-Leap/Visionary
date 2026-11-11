@@ -25,6 +25,11 @@ parking_lot = "0.12"
 regex-automata = "0.4"
 sha2 = { version = "0.11", default-features = false }
 
+[features]
+# The copy that ships inside an exported mod: it replays the mod's saved edits and has no
+# connection to the editor.
+exported = []
+
 [profile.dev]
 panic = "abort"
 

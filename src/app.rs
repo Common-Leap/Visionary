@@ -504,10 +504,11 @@ fn rust_toolchain_available() -> bool {
 }
 
 /// The plugin beside the editor in a release, or the local build in a checkout.
+/// The plugin copy exported mods carry: Visionary's runtime without the editor connection.
 fn find_prebuilt_plugin(exe: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
     const CANDIDATES: [&str; 2] = [
-        "plugin/lib_effect_viewer.nro",
-        "plugins/slight_replica/target/aarch64-skyline-switch/release/lib_effect_viewer.nro",
+        "plugin/lib_visionary_mod.nro",
+        "plugins/slight_replica/target/output/lib_visionary_mod.nro",
     ];
     exe?.ancestors().find_map(|folder| {
         CANDIDATES
@@ -18763,7 +18764,7 @@ impl VisionaryApp {
     /// Writes the live rules and the prebuilt plugin into a mod folder.
     fn write_rule_pack(&mut self, dest: &std::path::Path) -> anyhow::Result<()> {
         let plugin = find_prebuilt_plugin(std::env::current_exe().ok())
-            .ok_or_else(|| anyhow::anyhow!("the plugin that ships with Visionary is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("lib_visionary_mod.nro, the plugin exported mods carry, is missing from Visionary's plugin folder"))?;
         std::fs::create_dir_all(dest)?;
         std::fs::copy(plugin, dest.join("plugin.nro"))?;
         let mut messages = vec![
@@ -18792,12 +18793,6 @@ impl VisionaryApp {
             return;
         }
         let project = self.build_project();
-        if developer {
-            if let Err(error) = crate::mod_export::refuse_uninstalled_controller_charts(&project) {
-                self.state.status = format!("Export refused: {error}");
-                return;
-            }
-        }
         // The manual workspace overlay is a first-class export even when there are no serialized
         // ACMD/EFF edits. This is the common model/animation iteration case.
         let has_workspace_overlay = self
@@ -18810,11 +18805,13 @@ impl VisionaryApp {
             return;
         }
         let mut combined_runtime = None;
-        let mut planned_source = None;
-        let mut planned_warnings = Vec::new();
-        let mut planned_has_source = false;
-        let mut rule_pack = false;
-        if !developer {
+        let planned_source;
+        let planned_warnings;
+        let planned_has_source;
+        let rule_pack;
+        // Export source code writes the same plugin source Export mod builds.
+        let mut source_runtime = None;
+        {
             let has_gimmicks = project.fighters.values().any(|fighter| {
                 !fighter.behavior.is_empty()
                     || !fighter.controller_charts.is_empty()
@@ -18837,7 +18834,8 @@ impl VisionaryApp {
                     .is_some_and(|plan| plan.has_acmd_source);
             // No Rust here: the mod carries the rules the editor sends live, and the shipped
             // plugin replays them at boot. What the user tested is what ships.
-            rule_pack = needs_runtime
+            rule_pack = !developer
+                && needs_runtime
                 && (!rust_toolchain_available()
                     || find_plugin_source(
                         load_config_path("combined_plugin_root"),
@@ -18885,13 +18883,17 @@ impl VisionaryApp {
             planned_source = plan.generated_source;
             planned_warnings = plan.warnings;
             planned_has_source = plan.has_acmd_source;
-            combined_runtime = plan.gimmick_runtime;
+            if developer {
+                source_runtime = plan.gimmick_runtime;
+            } else {
+                combined_runtime = plan.gimmick_runtime;
+            }
         }
         let plugin_name = crate::mod_export::plugin_name(&project);
         let title = if developer {
-            "Export developer files into folder…"
+            "Export source code into folder"
         } else {
-            "Export ARCropolis mod folder…"
+            "Export mod into folder"
         };
         let mut dialog = rfd::FileDialog::new().set_title(title);
         if let Some(dir) = &self.export_dir {
@@ -18907,7 +18909,7 @@ impl VisionaryApp {
         save_config_path("export_dir", &parent);
         let slug = crate::mod_export::slugify(&project.name);
         let export_name = if developer {
-            format!("{slug}_developer_files")
+            format!("{slug}_source")
         } else {
             slug.clone()
         };
@@ -18938,18 +18940,14 @@ impl VisionaryApp {
                     .join(&plugin_name)
             },
         };
-        let outcome = match if developer {
-            run_export(&project, &inputs)
-        } else {
-            run_export_preverified(
-                &project,
-                &inputs,
-                planned_source,
-                planned_has_source,
-                combined_runtime.as_ref(),
-                planned_warnings,
-            )
-        } {
+        let outcome = match run_export_preverified(
+            &project,
+            &inputs,
+            planned_source,
+            planned_has_source,
+            combined_runtime.as_ref(),
+            planned_warnings,
+        ) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.state.status = format!("Export failed: {error}");
@@ -18967,6 +18965,16 @@ impl VisionaryApp {
         if rule_pack {
             if let Err(error) = self.write_rule_pack(&dest) {
                 errors.push(format!("mod rules: {error}"));
+            }
+        }
+        if let Some(runtime) = &source_runtime {
+            let source = dest.join("plugin_source");
+            match runtime.write_source(&source) {
+                Ok(()) => report.push(format!(
+                    "Plugin source in {}: build it with `cargo skyline build --release --features exported`",
+                    source.display()
+                )),
+                Err(error) => errors.push(format!("plugin source: {error}")),
             }
         }
 
@@ -19123,7 +19131,7 @@ impl VisionaryApp {
 
         self.state.status = if errors.is_empty() {
             let result = if developer {
-                "Developer files exported"
+                "Source code exported"
             } else if has_source {
                 "Mod folder staged"
             } else {
@@ -33769,12 +33777,13 @@ fn run_export_preverified(
 ) -> Result<ExportOutcome, String> {
     match (inputs.developer, runtime) {
         (true, Some(_)) => {
-            return Err("Developer source exports cannot embed a selected runtime.".into())
+            return Err("Source code exports write the plugin source; they build nothing.".into())
         }
         (false, Some(runtime)) => runtime
             .validate_for_project(project)
             .map_err(|error| error.to_string())?,
-        (_, None) => crate::mod_export::refuse_uninstalled_controller_charts(project)
+        (true, None) => {}
+        (false, None) => crate::mod_export::refuse_uninstalled_controller_charts(project)
             .map_err(|error| error.to_string())?,
     }
     let has_runtime = runtime.is_some();
@@ -42959,7 +42968,7 @@ mod blocked_export_writes_nothing_tests {
     }
 
     #[test]
-    fn uninstalled_charts_refuse_both_materializers_before_any_destination_write() {
+    fn uninstalled_charts_refuse_the_mod_export_before_any_destination_write() {
         let dir = tempfile::tempdir().unwrap();
         let mut project = ModProjectFile::default();
         project
@@ -42971,7 +42980,9 @@ mod blocked_export_writes_nothing_tests {
                 "extra".into(),
                 crate::mod_project::ControllerChart::default(),
             );
-        for developer in [false, true] {
+        // Export source code carries charts in the plugin source it writes, so only the mod
+        // export refuses them.
+        for developer in [false] {
             let dest = dir
                 .path()
                 .join(if developer { "developer" } else { "normal" });

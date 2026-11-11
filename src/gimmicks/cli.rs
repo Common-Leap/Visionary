@@ -34,15 +34,10 @@ pub fn run_package(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<(
         anyhow::anyhow!("combined behavior and ACMD package was not created: {error}")
     })?;
     println!(
-        "built combined runtime for {} behavior fighter(s) and {} ACMD fighter(s) into {}{}",
+        "built combined runtime for {} behavior fighter(s) and {} ACMD fighter(s) into {}",
         runtime.artifact().fighters.len(),
         runtime.acmd_artifact().fighters.len(),
         packaged.plugin_nro.display(),
-        if packaged.adapter_changed {
-            ""
-        } else {
-            " (adapter source was already current)"
-        }
     );
     Ok(())
 }
