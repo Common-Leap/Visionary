@@ -8522,7 +8522,18 @@ impl VisionaryApp {
                         rs.camera.pan(delta.x, delta.y);
                         ctx.request_repaint();
                     }
-                    // Middle drag or right drag: pan (disabled for now)
+                    // Right or middle drag: turn around the fighter. Double-click: side view.
+                    if response.dragged_by(egui::PointerButton::Secondary)
+                        || response.dragged_by(egui::PointerButton::Middle)
+                    {
+                        let delta = response.drag_delta();
+                        rs.camera.orbit(delta.x, delta.y);
+                        ctx.request_repaint();
+                    }
+                    if response.double_clicked() {
+                        rs.camera.reset_turn();
+                        ctx.request_repaint();
+                    }
                     // Scroll: zoom
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll != 0.0 && response.hovered() {

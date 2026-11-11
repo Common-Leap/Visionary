@@ -44,6 +44,18 @@ impl Camera {
         self.translation.y += delta_y * speed;
     }
 
+    /// Turn the camera around the fighter: sideways drags turn it around, vertical drags tilt
+    /// it up or down, short of looking straight down.
+    pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
+        self.rotation.y += delta_x * 0.01;
+        self.rotation.x = (self.rotation.x + delta_y * 0.01).clamp(-1.4, 1.4);
+    }
+
+    /// Back to the side view, keeping the zoom.
+    pub fn reset_turn(&mut self) {
+        self.rotation = Camera::default().rotation;
+    }
+
     /// Zoom: move along Z axis.
     pub fn zoom(&mut self, delta: f32) {
         let speed = self.translation.z.abs() * 0.1;
