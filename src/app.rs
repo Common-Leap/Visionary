@@ -6314,10 +6314,14 @@ impl VisionaryApp {
             if index.script(fighter, &script_name).is_some() {
                 continue;
             }
-            let Some(source) = crate::acmd::extract_function(&self.state.loaded_body, prefix)
-            else {
-                continue;
-            };
+            // A move the game gives no script of this kind (Mario's neutral air has no effect
+            // script) starts from an empty one, so what was added has somewhere to go.
+            let source = crate::acmd::extract_function(&self.state.loaded_body, prefix)
+                .unwrap_or_else(|| {
+                    format!(
+                        "unsafe extern \"C\" fn {script_name}(agent: &mut L2CAgentBase) {{\n}}\n"
+                    )
+                });
             match crate::acmd_src::create_script(index, fighter, &script_name, &source) {
                 Ok(new) => {
                     files.push(new.file);
@@ -6880,7 +6884,7 @@ impl VisionaryApp {
     fn draw_acmd_source_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_acmd_src;
         let saved = self.window_geometry.get("acmd_source").copied();
-        let mut window = egui::Window::new("ACMD Source")
+        let mut window = egui::Window::new("Your source code")
             .open(&mut open)
             .resizable(true)
             .default_size(saved.map_or([720.0, 560.0], |g| [g.w, g.h]));
@@ -6910,23 +6914,22 @@ impl VisionaryApp {
             // anywhere, showed an empty window instead of the code it would export.
             ui.horizontal_wrapped(|ui| match self.acmd_src.as_ref() {
                 None => {
-                    ui.label(
-                        egui::RichText::new("No source project linked")
-                            .small()
-                            .color(egui::Color32::GRAY),
-                    );
-                    if ui
-                        .small_button("Link Source Project")
-                        .on_hover_text(
-                            "Point at the root of the Rust project that builds your ACMD \
-                                 plugin — the folder holding Cargo.toml",
-                        )
-                        .clicked()
-                    {
-                        link = rfd::FileDialog::new()
-                            .set_title("Link ACMD source project")
-                            .pick_folder();
-                    }
+                    ui.vertical(|ui| {
+                        ui.label(
+                            "Moves load from the game's own scripts. If you have your own \
+                             smashline project, link it: its moves load instead, and \
+                             \"Write edits into your source\" puts your changes back into it.",
+                        );
+                        if ui
+                            .button("Link your smashline project")
+                            .on_hover_text("The folder with your plugin's Cargo.toml")
+                            .clicked()
+                        {
+                            link = rfd::FileDialog::new()
+                                .set_title("Link your smashline project")
+                                .pick_folder();
+                        }
+                    });
                 }
                 Some(index) => {
                     ui.label(
@@ -6937,11 +6940,11 @@ impl VisionaryApp {
                     let conflict_summary = if index.conflict_count() == 0 {
                         String::new()
                     } else {
-                        format!(" · {} ambiguous", index.conflict_count())
+                        format!(" · {} defined twice", index.conflict_count())
                     };
                     ui.label(
                         egui::RichText::new(format!(
-                            "· {} usable scripts · {} fighters{conflict_summary}",
+                            "· {} scripts for {} fighters{conflict_summary}",
                             index.script_count(),
                             index.fighters.len()
                         ))
@@ -7080,7 +7083,10 @@ impl VisionaryApp {
                         }
                     }
                     if ui
-                        .add_enabled(any_script, egui::Button::new("Sync edits into source"))
+                        .add_enabled(
+                            any_script,
+                            egui::Button::new("Write edits into your source"),
+                        )
                         .on_hover_text(
                             "Write this move's edited hitbox and spawn VALUES back into your \
                              source. The macros you called, your comments, and your formatting \
@@ -10014,7 +10020,7 @@ impl VisionaryApp {
                             let color = hitbox_display_color(hb);
                             let selected = hitbox_is_selected(self.selected_hitbox, i);
                             ui.horizontal(|ui| {
-                                ui.colored_label(color, "*");
+                                ui.colored_label(color, "■");
                                 let shape = if hb.category == 2 {
                                     if hb.wind.as_ref().is_some_and(|wind| wind.is_radial()) {
                                         "◯"
@@ -14197,13 +14203,15 @@ impl VisionaryApp {
             );
         ui.separator();
 
-        let has_effect_data =
-            !self.state.effect_script.stmts.is_empty() || !self.state.effects.is_empty();
+        // A loaded move with no effect script still takes new effects.
+        let has_effect_data = !self.state.acmd_source.is_empty()
+            || !self.state.effect_script.stmts.is_empty()
+            || !self.state.effects.is_empty();
 
         if !has_effect_data {
-            ui.colored_label(egui::Color32::GRAY, "Effect data unavailable");
+            ui.colored_label(egui::Color32::GRAY, "This move hasn't loaded yet");
             ui.label(
-                egui::RichText::new("Use Move → Retry source to load scripts.")
+                egui::RichText::new("Use Move > Retry source to load it.")
                     .small()
                     .color(egui::Color32::DARK_GRAY),
             );
@@ -19825,7 +19833,7 @@ impl VisionaryApp {
                 if keep.is_empty() {
                     let _ = std::fs::remove_file(&manifest);
                 } else if let Ok(json) = serde_json::to_string_pretty(&keep) {
-                    let _ = std::fs::write(&manifest, json);
+                    let _ = crate::scratch_dirs::replace_file(&manifest, json.as_bytes());
                 }
             }
         }
@@ -27857,7 +27865,7 @@ impl VisionaryApp {
             return false;
         }
         let fname = format!("ef_{fighter}_merged.eff");
-        if let Err(e) = std::fs::write(dir.join(&fname), &merged) {
+        if let Err(e) = crate::scratch_dirs::replace_file(&dir.join(&fname), &merged) {
             self.state.status = format!("Live deploy write failed: {e}");
             return false;
         }
@@ -27882,7 +27890,7 @@ impl VisionaryApp {
         entries.retain(|e| e.get("path").and_then(|p| p.as_str()) != Some(arc_path.as_str()));
         entries.push(serde_json::json!({ "path": arc_path, "file": fname }));
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
-            let _ = std::fs::write(&mpath, json);
+            let _ = crate::scratch_dirs::replace_file(&mpath, json.as_bytes());
         }
         // Refresh the plugin's served map so the staged bytes are what loads at the NEXT
         // match entry. This part is safe and is how transplants have always loaded.
@@ -30854,11 +30862,24 @@ impl eframe::App for VisionaryApp {
                     );
                     if !self.state.acmd_source.is_empty() {
                         ui.separator();
-                        ui.label(
-                            RichText::new(format!("Source: {}", self.state.acmd_source))
-                                .small()
-                                .color(Color32::GRAY),
-                        );
+                        let source = match self.state.acmd_source.as_str() {
+                            "GitHub" => "the game's scripts",
+                            other => other,
+                        };
+                        if ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(format!("Loaded from {source}"))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Click to see the code, or link your own project")
+                            .clicked()
+                        {
+                            self.show_acmd_src = true;
+                        }
                     }
                     // One current project holds every edit: always show where autosave goes.
                     ui.separator();

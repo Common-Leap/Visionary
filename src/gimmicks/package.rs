@@ -217,7 +217,13 @@ fn build_plugin(tree: &Path, target: &Path) -> Result<PathBuf, PackageError> {
     std::fs::create_dir_all(&temp)
         .map_err(|e| error("plugin build", format!("creating {}: {e}", temp.display())))?;
     let output = Command::new("cargo")
-        .args(["skyline", "build", "--release", "--features", "carries_code"])
+        .args([
+            "skyline",
+            "build",
+            "--release",
+            "--features",
+            "carries_code",
+        ])
         .current_dir(tree)
         .env("CARGO_TARGET_DIR", target)
         .env("TMPDIR", &temp)

@@ -59,6 +59,8 @@ struct ManifestEntry {
 
 /// arc-path hash40 → absolute sd path served for that path (read by the disk callback).
 static SERVED: parking_lot::Mutex<Option<HashMap<u64, String>>> = parking_lot::Mutex::new(None);
+/// hash → the last bytes served for it, used when a later read fails.
+static LAST_GOOD: parking_lot::Mutex<Option<HashMap<u64, Vec<u8>>>> = parking_lot::Mutex::new(None);
 /// hash → max_size we last registered the generic callback with. Re-registering with a
 /// bigger size re-patches the file table (monotonic) when a later deploy grows the file.
 static REGISTERED: parking_lot::Mutex<Option<HashMap<u64, usize>>> = parking_lot::Mutex::new(None);
@@ -69,22 +71,51 @@ extern "C" fn disk_cb(hash: u64, out: *mut u8, capacity: usize, out_size: &mut u
         Some(p) => p,
         None => return false,
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            crate::slight::diag::note(format!("live eff read failed ({path}): {e}"));
-            return false;
+    // Returning false for a file the game has no copy of makes ARCropolis panic ("Physical
+    // loader did not return valid file data"), so a failed read (the editor mid-write, or a
+    // Windows sharing conflict) serves the last bytes this file served instead.
+    let read = std::fs::read(&path)
+        .map_err(|e| format!("read failed: {e}"))
+        .and_then(|bytes| {
+            if bytes.is_empty() {
+                Err("file is empty".to_string())
+            } else if bytes.len() > capacity {
+                Err(format!(
+                    "too big for its slot ({} > {capacity})",
+                    bytes.len()
+                ))
+            } else {
+                Ok(bytes)
+            }
+        });
+    let bytes = match read {
+        Ok(bytes) => {
+            LAST_GOOD
+                .lock()
+                .get_or_insert_with(HashMap::new)
+                .insert(hash, bytes.clone());
+            bytes
+        }
+        Err(reason) => {
+            let last = LAST_GOOD
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(&hash).cloned())
+                .filter(|bytes| bytes.len() <= capacity);
+            crate::slight::diag::note(format!(
+                "live eff {path}: {reason}; {}",
+                if last.is_some() {
+                    "serving the last good copy"
+                } else {
+                    "no earlier copy"
+                }
+            ));
+            match last {
+                Some(bytes) => bytes,
+                None => return false,
+            }
         }
     };
-    if bytes.len() > capacity {
-        // File grew since registration and no reload re-registered it yet — serving a
-        // truncated eff would corrupt the parse, so fall back to vanilla.
-        crate::slight::diag::note(format!(
-            "live eff too big for registered size ({} > {capacity}): {path} — redeploy",
-            bytes.len()
-        ));
-        return false;
-    }
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
     }
