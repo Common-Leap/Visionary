@@ -9466,13 +9466,15 @@ impl VisionaryApp {
             &self.state.source_script,
             &self.state.expression_script,
         );
+        // Hitboxes changed in the classic editor show here too, the way export writes them.
+        let current_game = game_script_for_edits(&self.state.script, &self.state.hitboxes);
         let graph = self.node_editor.workspace_ui(
             ui,
             &fighter.name,
             &move_entry.name,
             siblings.get(&move_entry.name),
             [
-                &self.state.script,
+                &current_game,
                 &self.state.sound_script,
                 &self.state.expression_script,
             ],
