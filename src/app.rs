@@ -8505,6 +8505,7 @@ impl VisionaryApp {
         &self,
         frame: &eframe::Frame,
         animation_frame: f32,
+        objects: &[crate::article_preview::PlacedObject],
     ) -> Vec<crate::vfx_preview::EffectDraw> {
         let frame_num = self.state.current_frame;
         let Some(wgpu_state) = frame.wgpu_render_state() else {
@@ -8566,6 +8567,37 @@ impl VisionaryApp {
                 });
             }
         }
+        // Objects' own effects, on the object's bones. Many projectiles have no mesh and
+        // these are all the game shows of them.
+        for object in objects {
+            let bones = crate::article_preview::object_bones(object);
+            let object_frame = object.age.floor() as u32 + 1;
+            for effect in &object.kind.effects {
+                if object_frame < effect.start {
+                    continue;
+                }
+                let bone = bones
+                    .get(&effect.bone)
+                    .or_else(|| bones.get(&effect.bone.to_lowercase()))
+                    .or_else(|| bones.get("top"))
+                    .copied()
+                    .unwrap_or(object.placement);
+                let placement = bone
+                    * glam::Mat4::from_scale_rotation_translation(
+                        glam::Vec3::splat(effect.scale.max(0.01)),
+                        glam::Quat::IDENTITY,
+                        glam::Vec3::from(effect.offset),
+                    );
+                for file in &files {
+                    out.push(crate::vfx_preview::EffectDraw {
+                        file: file.clone(),
+                        name: effect.name.clone(),
+                        placement,
+                        frame: object_frame - effect.start,
+                    });
+                }
+            }
+        }
         out
     }
 
@@ -8618,7 +8650,7 @@ impl VisionaryApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-            let effects = self.preview_effect_draws(frame, animation_frame);
+            let effects = self.preview_effect_draws(frame, animation_frame, &objects);
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 ViewportCallback {
@@ -8852,46 +8884,6 @@ impl VisionaryApp {
                                 },
                             )
                             .or(label_at);
-                        }
-                        for effect in &object.kind.effects {
-                            // A one-shot effect is shown for a few frames so it can be seen.
-                            let end = if effect.end == effect.start {
-                                effect.start + 8
-                            } else {
-                                effect.end
-                            };
-                            if object_frame < effect.start || object_frame > end {
-                                continue;
-                            }
-                            let bone = bones
-                                .get(&effect.bone)
-                                .or_else(|| bones.get(&effect.bone.to_lowercase()))
-                                .or_else(|| bones.get("top"))
-                                .copied()
-                                .unwrap_or(object.placement);
-                            let world = bone.transform_point3(glam::Vec3::from(effect.offset));
-                            let Some(at) = rs.world_to_screen(world, rect) else {
-                                continue;
-                            };
-                            let radius = rs
-                                .world_radius_to_screen(world, effect.scale.max(0.4), rect)
-                                .unwrap_or(effect.scale * 4.0)
-                                .clamp(5.0, 120.0);
-                            let blue = Color32::from_rgb(60, 130, 235);
-                            ui.painter().circle(
-                                at,
-                                radius,
-                                Color32::from_rgba_unmultiplied(60, 130, 235, 28),
-                                egui::Stroke::new(1.5, blue),
-                            );
-                            ui.painter().text(
-                                at + egui::vec2(radius + 3.0, radius * 0.5),
-                                egui::Align2::LEFT_CENTER,
-                                &effect.name,
-                                egui::FontId::monospace(9.0),
-                                blue,
-                            );
-                            label_at = label_at.or(Some(at));
                         }
                         let name_at = label_at.or_else(|| {
                             rs.world_to_screen(object.placement.col(3).truncate(), rect)

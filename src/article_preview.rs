@@ -101,6 +101,20 @@ pub struct ObjectEffect {
 /// effect parser leaves out, so this reads the effect lines themselves and keeps the first of
 /// each pair.
 fn object_effects(body: &str) -> Vec<ObjectEffect> {
+    // The preview faces right, so the script's left-facing choice is swapped for its pair.
+    let mut effects = object_effects_as_written(body);
+    for effect in &mut effects {
+        if let Some(stem) = effect.name.strip_suffix("_l") {
+            let right = format!("{stem}_r");
+            if body.contains(&format!("\"{right}\"")) {
+                effect.name = right;
+            }
+        }
+    }
+    effects
+}
+
+fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
     let parsed = crate::acmd::parse_effect_script(body).to_effect_calls();
     if !parsed.is_empty() {
         return parsed
@@ -572,6 +586,28 @@ mod tests {
             ..Flight::default()
         };
         assert_eq!(straight.offset(5.0, 8.0), (10.0, 0.0));
+    }
+
+    #[test]
+    fn effects_chosen_by_facing_use_the_right_facing_one() {
+        // Mario's fireball, as the script dump writes it.
+        let body = r#"unsafe extern "C" fn effect_regular(agent: &mut L2CAgentBase) {
+    if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {
+        if macros::is_excute(agent) {
+            macros::EFFECT_FOLLOW(agent, Hash40::new("mario_fb_bullet_l"), Hash40::new("rot"), 0, 1.8, 0, 0, 0, 0, 1, true);
+        }
+        else {
+        if macros::is_excute(agent) {
+            macros::EFFECT_FOLLOW(agent, Hash40::new("mario_fb_bullet_r"), Hash40::new("rot"), 0, 1.8, 0, 0, 0, 0, 1, true);
+        }
+    }
+}
+}"#;
+        let effects = object_effects(body);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].name, "mario_fb_bullet_r");
+        assert_eq!(effects[0].bone, "rot");
+        assert_eq!(effects[0].offset, [0.0, 1.8, 0.0]);
     }
 
     #[test]

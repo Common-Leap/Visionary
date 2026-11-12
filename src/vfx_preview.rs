@@ -148,9 +148,8 @@ impl VfxPreview {
                 continue;
             };
             file.renderer.set_view(queue, &camera);
-            let (scale, rotation, translation) = draw.placement.to_scale_rotation_translation();
+            let (_, rotation, translation) = draw.placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
-            let _ = scale;
             for index in 0..file.emitters[set].len() {
                 let emitter = &file.emitters[set][index];
                 // A mesh primitive is looked up in this file, then in the shared one.
@@ -173,8 +172,9 @@ impl VfxPreview {
                 if s.count() == 0 {
                     continue;
                 }
-                let streams = s.streams(&draw.placement);
-                let dynamic = s.dynamic_block(&draw.placement, &rt, [1.0; 4]);
+                let srt = s.emitter_srt(&draw.placement);
+                let streams = s.streams(&srt);
+                let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), [1.0; 4]);
                 let statics = static_block::static_block(&emitter.fixed);
                 let custom0 = static_block::custom_block(&emitter.raw);
                 let rs = &emitter.data.render_state;
