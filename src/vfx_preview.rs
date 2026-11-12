@@ -38,6 +38,7 @@ struct EffectFile {
     pool: Option<Vec<u8>>,
     textures: HashMap<usize, Option<wgpu::TextureView>>,
     samplers: HashMap<(u8, u8, u8), wgpu::Sampler>,
+    meshes: HashMap<u64, vfx_runtime::mesh::Mesh>,
 }
 
 pub struct VfxPreview {
@@ -106,6 +107,7 @@ impl VfxPreview {
                 .and_then(|info| info.binary_data.clone()),
             textures: HashMap::new(),
             samplers: HashMap::new(),
+            meshes: vfx_runtime::mesh::meshes(ptcl_file),
         })
     }
 
@@ -125,7 +127,15 @@ impl VfxPreview {
         self.prepared.clear();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
         let camera = view_block::view_block(&rows(view), &rows(projection), eye, near, far, 1.0);
-        let custom2: Vec<u8> = [1.0f32; 20].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let custom2 = render::default_custom2();
+        // Meshes of the shared effect file, which other files' emitters may name.
+        let shared: HashMap<u64, vfx_runtime::mesh::Mesh> = self
+            .files
+            .iter()
+            .filter(|(path, _)| path.ends_with("ef_common.eff"))
+            .filter_map(|(_, f)| f.as_ref())
+            .flat_map(|f| f.meshes.iter().map(|(k, v)| (*k, v.clone())))
+            .collect();
         for draw in draws {
             if !self.files.contains_key(&draw.file) {
                 let loaded = self.load(device, queue, &draw.file);
@@ -143,10 +153,17 @@ impl VfxPreview {
             let _ = scale;
             for index in 0..file.emitters[set].len() {
                 let emitter = &file.emitters[set][index];
-                // Mesh emitters need their model, which this preview does not load yet.
-                let mesh =
-                    u64::from_le_bytes(emitter.fixed[0x8c8..0x8d0].try_into().unwrap()) != u64::MAX;
-                if mesh {
+                // A mesh primitive is looked up in this file, then in the shared one.
+                let mesh_id = u64::from_le_bytes(emitter.fixed[0x8c8..0x8d0].try_into().unwrap());
+                let mesh = (mesh_id != u64::MAX)
+                    .then(|| {
+                        file.meshes
+                            .get(&mesh_id)
+                            .cloned()
+                            .or_else(|| shared.get(&mesh_id).cloned())
+                    })
+                    .flatten();
+                if mesh_id != u64::MAX && mesh.is_none() {
                     continue;
                 }
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
@@ -222,6 +239,7 @@ impl VfxPreview {
                     count: s.count() as u32,
                     textures: views,
                     samplers: sampler_refs,
+                    mesh: mesh.as_ref(),
                 };
                 if let Some(prepared) = file.renderer.prepare(queue, &draw_info) {
                     self.prepared.push((draw.file.clone(), prepared));
