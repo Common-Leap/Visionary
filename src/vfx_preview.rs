@@ -33,11 +33,10 @@ struct EffectFile {
     /// Entry name (lower case) to emitter set index.
     sets: HashMap<String, usize>,
     emitters: Vec<Vec<Emitter>>,
+    ptcl: effect_library::ptcl_file::PtclFile,
     texture_ids: Vec<u64>,
-    texture_names: Vec<String>,
-    pool: Option<Vec<u8>>,
     textures: HashMap<usize, Option<wgpu::TextureView>>,
-    samplers: HashMap<(u8, u8, u8), wgpu::Sampler>,
+    samplers: HashMap<(u8, u8, u8, u32), wgpu::Sampler>,
     meshes: HashMap<u64, vfx_runtime::mesh::Mesh>,
 }
 
@@ -100,14 +99,10 @@ impl VfxPreview {
             sets,
             emitters,
             texture_ids: descriptors.iter().map(|d| d.id).collect(),
-            texture_names: descriptors.iter().map(|d| d.name.clone()).collect(),
-            pool: ptcl_file
-                .texture_info
-                .as_ref()
-                .and_then(|info| info.binary_data.clone()),
             textures: HashMap::new(),
             samplers: HashMap::new(),
             meshes: vfx_runtime::mesh::meshes(ptcl_file),
+            ptcl: ptcl_file.clone(),
         })
     }
 
@@ -200,23 +195,14 @@ impl VfxPreview {
                         continue;
                     };
                     if !file.textures.contains_key(&texture) {
-                        let view = upload_texture(
-                            device,
-                            queue,
-                            file.pool.as_deref(),
-                            texture,
-                            file.texture_names.get(texture),
-                        );
+                        let view = vfx_runtime::texture::decode(&file.ptcl, texture)
+                            .map(|t| render::upload_texture(device, queue, &t));
                         file.textures.insert(texture, view);
                     }
-                    let key = (
-                        sampler.wrap_u.as_u8(),
-                        sampler.wrap_v.as_u8(),
-                        sampler.filter,
-                    );
-                    file.samplers
-                        .entry(key)
-                        .or_insert_with(|| make_sampler(device, key));
+                    let key = sampler_key(sampler);
+                    file.samplers.entry(key).or_insert_with(|| {
+                        render::make_sampler(device, key.0, key.1, key.2, sampler.max_lod)
+                    });
                 }
                 let views: [Option<&wgpu::TextureView>; 3] = std::array::from_fn(|i| {
                     let id = samplers[i].as_ref()?.texture_id;
@@ -225,8 +211,7 @@ impl VfxPreview {
                 });
                 let sampler_refs: [Option<&wgpu::Sampler>; 3] = std::array::from_fn(|i| {
                     let s = samplers[i].as_ref()?;
-                    file.samplers
-                        .get(&(s.wrap_u.as_u8(), s.wrap_v.as_u8(), s.filter))
+                    file.samplers.get(&sampler_key(s))
                 });
                 let draw_info = render::EmitterDraw {
                     program,
@@ -257,55 +242,11 @@ impl VfxPreview {
     }
 }
 
-fn upload_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pool: Option<&[u8]>,
-    index: usize,
-    name: Option<&String>,
-) -> Option<wgpu::TextureView> {
-    use wgpu::util::DeviceExt;
-    let image = crate::texture_import::decode_as_sampled(pool?, index, name?, None).ok()?;
-    let texture = device.create_texture_with_data(
-        queue,
-        &wgpu::TextureDescriptor {
-            label: Some("vfx texture"),
-            size: wgpu::Extent3d {
-                width: image.width(),
-                height: image.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        },
-        wgpu::util::TextureDataOrder::LayerMajor,
-        image.as_raw(),
-    );
-    Some(texture.create_view(&Default::default()))
-}
-
-/// nn::vfx wrap modes: 0 mirror, 1 repeat, 2 clamp, 3 mirror once (approximated as mirror).
-fn make_sampler(device: &wgpu::Device, (u, v, filter): (u8, u8, u8)) -> wgpu::Sampler {
-    let mode = |m: u8| match m {
-        1 => wgpu::AddressMode::Repeat,
-        2 => wgpu::AddressMode::ClampToEdge,
-        _ => wgpu::AddressMode::MirrorRepeat,
-    };
-    let f = if filter == 1 {
-        wgpu::FilterMode::Nearest
-    } else {
-        wgpu::FilterMode::Linear
-    };
-    device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("vfx sampler"),
-        address_mode_u: mode(u),
-        address_mode_v: mode(v),
-        mag_filter: f,
-        min_filter: f,
-        ..Default::default()
-    })
+fn sampler_key(s: &effect_library::emitter::TextureSampler) -> (u8, u8, u8, u32) {
+    (
+        s.wrap_u.as_u8(),
+        s.wrap_v.as_u8(),
+        s.filter,
+        s.max_lod.to_bits(),
+    )
 }
