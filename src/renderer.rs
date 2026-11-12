@@ -112,6 +112,8 @@ pub struct HitboxRenderState {
     last_skel_path: Option<std::path::PathBuf>,
     /// Model folder of each object model after the body in `render_models`.
     object_dirs: Vec<std::path::PathBuf>,
+    /// Effects drawn with the game's shaders, after the models.
+    pub vfx: crate::vfx_preview::VfxPreview,
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
@@ -157,6 +159,7 @@ impl HitboxRenderState {
             last_default_anim_path: None,
             last_skel_path: None,
             object_dirs: Vec::new(),
+            vfx: crate::vfx_preview::VfxPreview::new(surface_format, None),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
         }
@@ -758,6 +761,8 @@ pub struct ViewportCallback {
     pub skel_path: Option<std::path::PathBuf>,
     /// Fighter objects out this frame.
     pub objects: Vec<ObjectDraw>,
+    /// Effect sets out this frame.
+    pub effects: Vec<crate::vfx_preview::EffectDraw>,
 }
 
 /// One object model to draw, already animated and placed.
@@ -819,6 +824,18 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
             state.update_objects(device, queue, &self.objects);
 
+            let t = state.camera.transforms(self.width, self.height);
+            let eye = t.camera_pos;
+            state.vfx.prepare(
+                device,
+                queue,
+                t.model_view_matrix,
+                t.projection_matrix,
+                [eye.x, eye.y, eye.z],
+                state.camera.near,
+                state.camera.far,
+                &self.effects,
+            );
             // Always re-render (camera may have changed, or egui needs a fresh frame)
             state.renderer.begin_render_models(
                 egui_encoder,
@@ -848,6 +865,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
     ) {
         if let Some(state) = resources.get::<HitboxRenderState>() {
             state.renderer.end_render_models(render_pass);
+            state.vfx.paint(render_pass);
         } else {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }
