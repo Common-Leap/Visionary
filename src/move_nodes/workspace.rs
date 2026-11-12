@@ -756,7 +756,9 @@ impl NodeEditor {
                 for line in &lines {
                     if line.depth == 0 && line.frame.is_some() && line.frame != last {
                         last = line.frame;
-                        ui.weak(format!("Frame {}", line.frame.unwrap_or_default()));
+                        // Lines before any frame command run at the start, which the
+                        // timeline calls frame 1.
+                        ui.weak(format!("Frame {}", line.frame.unwrap_or_default().max(1.0)));
                     }
                     ui.horizontal_wrapped(|ui| {
                         ui.add_space(8.0 + line.depth as f32 * 12.0);

@@ -10186,9 +10186,16 @@ impl VisionaryApp {
                                             ));
                                         }
                                         for (index, (text, tab)) in parts.into_iter().enumerate() {
-                                            if index > 0 {
-                                                ui.weak(if index + 1 == total { "and" } else { "," });
+                                            if index > 0 && index + 1 == total {
+                                                ui.weak("and");
                                             }
+                                            // A comma rides on the link before it, not as its own
+                                            // spaced word.
+                                            let text = if index + 2 < total {
+                                                format!("{text},")
+                                            } else {
+                                                text
+                                            };
                                             if ui.link(text).clicked() {
                                                 self.primary_tab = tab;
                                             }
