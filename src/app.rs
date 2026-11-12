@@ -833,6 +833,20 @@ mod editor_section_copy_tests {
             .description()
             .contains("damage-reaction armor"));
         assert_eq!(TimelineCategory::Effects.title(), "Visual effects");
+    }
+
+    #[test]
+    fn every_addable_sound_has_its_own_plain_name() {
+        let names: Vec<&str> = crate::acmd::SOUND_FUNCS
+            .iter()
+            .map(|(func, _, _)| {
+                sound_func_words(func).unwrap_or_else(|| panic!("{func} has no plain name"))
+            })
+            .collect();
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
         assert!(VISUAL_EFFECTS_DESCRIPTION.split_whitespace().count() >= 8);
     }
 
@@ -1019,6 +1033,43 @@ enum TimelineSelection {
     Hitbox(usize),
     Effect(usize),
     Command { family: String, site: usize },
+}
+
+/// A sound command's plain name, or `None` for one this table does not know.
+fn sound_func_words(func: &str) -> Option<&'static str> {
+    Some(match func {
+        "PLAY_SE" => "Sound",
+        "PLAY_SE_NO_3D" => "Sound, not placed in the scene",
+        "PLAY_SE_REMAIN" => "Sound that keeps playing",
+        "PLAY_STATUS" => "Sound for this action",
+        "PLAY_SEQUENCE" | "PLAY_VC" => "Voice",
+        "PLAY_FLY_VOICE" => "Voice when launched",
+        "PLAY_STEP" => "Footstep",
+        "PLAY_STEP_FLIPPABLE" => "Footstep, left or right",
+        "PLAY_LANDING_SE" => "Landing sound",
+        "PLAY_DOWN_SE" => "Knocked-down sound",
+        "STOP_SE" => "Stop sound",
+        "SET_PLAY_INHIVIT" => "Don't repeat",
+        _ => return None,
+    })
+}
+
+/// A sound command as the timeline names it: what it does, then the sound itself.
+fn sound_row_label(call: &crate::data::SoundCall) -> String {
+    let verb = sound_func_words(&call.func).unwrap_or(&call.func);
+    format!("{verb} {}", call.sounds.join(" / "))
+}
+
+/// A feedback command as the timeline names it.
+fn expression_row_label(call: &crate::data::ExpressionCall) -> String {
+    use crate::data::ExpressionCall as E;
+    match call {
+        E::RumbleHit { .. } | E::ControlModuleSetRumble { .. } => "Rumble".into(),
+        E::Quake { .. } => "Camera shake".into(),
+        E::FtAttackAbsCameraQuake { .. } => "Camera shake on throw".into(),
+        #[allow(unreachable_patterns)]
+        other => other.func().to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -9271,21 +9322,28 @@ impl VisionaryApp {
                             if selected { 55 } else { 28 },
                         );
                         let stroke_w = if selected { 2.5 } else { 1.5 };
-                        ui.painter().circle(
-                            screen_pos,
-                            radius,
-                            fill,
-                            egui::Stroke::new(stroke_w, blue),
-                        );
-                        // Crosshair dot at the exact spawn point
-                        ui.painter().circle_filled(screen_pos, 2.0, blue);
-                        ui.painter().text(
-                            screen_pos + egui::vec2(radius + 3.0, -radius * 0.5),
-                            egui::Align2::LEFT_CENTER,
-                            &ec.effect_name,
-                            egui::FontId::monospace(9.0),
-                            blue,
-                        );
+                        // The effect itself is drawn now; its marker only shows when it is the
+                        // one selected or under the pointer, and stays clickable either way.
+                        let hovered = response
+                            .hover_pos()
+                            .is_some_and(|p| p.distance(screen_pos) <= radius.max(12.0));
+                        if selected || hovered {
+                            ui.painter().circle(
+                                screen_pos,
+                                radius,
+                                fill,
+                                egui::Stroke::new(stroke_w, blue),
+                            );
+                            // Crosshair dot at the exact spawn point
+                            ui.painter().circle_filled(screen_pos, 2.0, blue);
+                            ui.painter().text(
+                                screen_pos + egui::vec2(radius + 3.0, -radius * 0.5),
+                                egui::Align2::LEFT_CENTER,
+                                &ec.effect_name,
+                                egui::FontId::monospace(9.0),
+                                blue,
+                            );
+                        }
 
                         if let Some(cp) = click_pos {
                             let d = cp.distance(screen_pos);
@@ -10077,20 +10135,65 @@ impl VisionaryApp {
                                 );
                             } else {
                                 ui.weak("This move has no hitboxes.");
-                                let mut has = Vec::new();
-                                if !self.state.sounds.is_empty() {
-                                    has.push(format!("{} sound(s)", self.state.sounds.len()));
-                                }
-                                if !self.state.effects.is_empty() {
-                                    has.push(format!("{} effect(s)", self.state.effects.len()));
-                                }
-                                if has.is_empty() {
+                                let plural = |n: usize, one: &str, many: &str| {
+                                    format!("{n} {}", if n == 1 { one } else { many })
+                                };
+                                let sounds = self.state.sounds.len();
+                                // Colour flashes and effect controls share the effect list but
+                                // are not graphics; name them for what they are.
+                                let effects = self
+                                    .state
+                                    .effects
+                                    .iter()
+                                    .filter(|e| {
+                                        e.color.is_none()
+                                            && e.control.is_none()
+                                            && !is_null_effect_sentinel(e)
+                                    })
+                                    .count();
+                                let flashes = self
+                                    .state
+                                    .effects
+                                    .iter()
+                                    .filter(|e| e.color.is_some())
+                                    .count();
+                                if sounds == 0 && effects == 0 && flashes == 0 {
                                     ui.weak("Use Move nodes or the other tabs to edit non-collision logic.");
                                 } else {
-                                    ui.weak(format!(
-                                        "It does have {} — see below.",
-                                        has.join(" and ")
-                                    ));
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.weak("It has");
+                                        let total = [sounds, effects, flashes]
+                                            .iter()
+                                            .filter(|n| **n > 0)
+                                            .count();
+                                        let mut parts = Vec::new();
+                                        if sounds > 0 {
+                                            parts.push((
+                                                plural(sounds, "sound", "sounds"),
+                                                PrimaryEditorTab::AudioFeedback,
+                                            ));
+                                        }
+                                        if effects > 0 {
+                                            parts.push((
+                                                plural(effects, "effect", "effects"),
+                                                PrimaryEditorTab::Effects,
+                                            ));
+                                        }
+                                        if flashes > 0 {
+                                            parts.push((
+                                                plural(flashes, "colour flash", "colour flashes"),
+                                                PrimaryEditorTab::Effects,
+                                            ));
+                                        }
+                                        for (index, (text, tab)) in parts.into_iter().enumerate() {
+                                            if index > 0 {
+                                                ui.weak(if index + 1 == total { "and" } else { "," });
+                                            }
+                                            if ui.link(text).clicked() {
+                                                self.primary_tab = tab;
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -11103,9 +11206,10 @@ impl VisionaryApp {
         }
 
         ui.menu_button("＋ Add sound", |ui| {
-            ui.label("Add a measured PLAY_SE-family call at the playhead:");
+            ui.label("Add at the playhead:");
             for (func, hashes, has_tail) in crate::acmd::SOUND_FUNCS {
-                if ui.button(*func).clicked() {
+                let name = sound_func_words(func).unwrap_or(func);
+                if ui.button(name).on_hover_text(*func).clicked() {
                     let fallback = candidates
                         .first()
                         .cloned()
@@ -30183,7 +30287,7 @@ impl VisionaryApp {
                 "sound",
                 event.site,
                 event.frame,
-                format!("{} {}", event.call.func, event.call.sounds.join(" / ")),
+                sound_row_label(&event.call),
                 TimelineCategory::AudioFeedback,
                 audio_color,
             );
@@ -30194,7 +30298,7 @@ impl VisionaryApp {
                 "expression",
                 event.site,
                 event.frame,
-                event.call.func(),
+                expression_row_label(&event.call),
                 TimelineCategory::AudioFeedback,
                 Color32::from_rgb(210, 180, 245),
             );
