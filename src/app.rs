@@ -8526,7 +8526,9 @@ impl VisionaryApp {
             .flatten()
             .collect();
         let mut out = Vec::new();
-        for ec in &self.state.effects {
+        // Calls inside facing branches are not on the timeline; the preview faces right.
+        let facing = self.state.effect_script.facing_right_calls();
+        for ec in self.state.effects.iter().chain(facing.iter()) {
             if ec.disabled
                 || is_null_effect_sentinel(ec)
                 || frame_num < ec.active_start

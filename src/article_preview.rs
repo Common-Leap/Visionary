@@ -441,7 +441,8 @@ fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool) -> glam::Vec3 {
         .get("top")
         .map_or(glam::Vec3::ZERO, |matrix| matrix.col(3).truncate());
     if flies {
-        for bone in ["haver", "havel", "handr", "handl"] {
+        // Mario's fireball leaves the forward hand, where the move's shoot effect plays (havel).
+        for bone in ["havel", "haver", "handl", "handr"] {
             if let Some(matrix) = bones.get(bone) {
                 return matrix.col(3).truncate();
             }
@@ -608,6 +609,38 @@ mod tests {
         assert_eq!(effects[0].name, "mario_fb_bullet_r");
         assert_eq!(effects[0].bone, "rot");
         assert_eq!(effects[0].offset, [0.0, 1.8, 0.0]);
+    }
+
+    #[test]
+    fn a_fighter_script_s_facing_branch_is_previewed_facing_right() {
+        // Mario's neutral special, as the script dump writes it: the `else` sits inside the `if`.
+        let body = r#"unsafe extern "C" fn effect_specialn(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_action_smoke_h"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);
+    }
+    frame(agent.lua_state_agent, 13.0);
+    if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {
+        if macros::is_excute(agent) {
+            macros::EFFECT_FOLLOW(agent, Hash40::new("mario_fb_shoot"), Hash40::new("havel"), 0, 0, 0, 0, 45, 0, 1, true);
+        }
+        else {
+        if macros::is_excute(agent) {
+            macros::EFFECT_FOLLOW(agent, Hash40::new("mario_fb_shoot"), Hash40::new("havel"), 0, 0, 0, 0, -45, 0, 1, true);
+        }
+    }
+}
+}"#;
+        let script = crate::acmd::parse_effect_script(body);
+        assert!(script
+            .to_effect_calls()
+            .iter()
+            .all(|call| call.effect_name != "mario_fb_shoot"));
+        let extra = script.facing_right_calls();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].effect_name, "mario_fb_shoot");
+        assert_eq!(extra[0].bone_name, "havel");
+        assert_eq!(extra[0].rotation, [0.0, -45.0, 0.0]);
+        assert_eq!(extra[0].active_start, 13);
     }
 
     #[test]

@@ -8920,6 +8920,90 @@ pub struct EffectScript {
     pub stmts: Vec<EffectStmt>,
 }
 
+impl EffectScript {
+    /// The calls a right-facing fighter spawns from `if <facing is left> { … } else { … }`
+    /// blocks, which [`Self::to_effect_calls`] leaves out (both arms are guarded, and the dumps
+    /// often nest the `else` inside the `if`). Preview only: the timeline and the export keep
+    /// the script as written.
+    pub fn facing_right_calls(&self) -> Vec<EffectCall> {
+        fn is_facing_left(header: &str) -> bool {
+            header.contains("SO_VAR_FLOAT_LR") && header.contains("< 0")
+        }
+        /// An `is_excute` block holding bare effects becomes the `Excute` statement the walk
+        /// reads; anything else is kept as written.
+        fn unwrap_excute(stmt: EffectStmt) -> Vec<EffectStmt> {
+            match stmt {
+                EffectStmt::Cond { header, body } if header == "if macros::is_excute(agent) {" => {
+                    let mut out = Vec::new();
+                    let mut bare = Vec::new();
+                    for inner in body {
+                        match inner {
+                            EffectStmt::BareEffect(effect) => bare.push(*effect),
+                            other => out.push(other),
+                        }
+                    }
+                    if !bare.is_empty() {
+                        out.insert(0, EffectStmt::Excute(bare));
+                    }
+                    out
+                }
+                other => vec![other],
+            }
+        }
+        fn resolve(stmts: &[EffectStmt]) -> Vec<EffectStmt> {
+            let mut out = Vec::new();
+            let mut skip_else = false;
+            for stmt in stmts {
+                match stmt {
+                    EffectStmt::Cond { header, body } if is_facing_left(header) => {
+                        // The dump's shape: `else` nested inside, after the left arm.
+                        let nested_else: Vec<EffectStmt> = body
+                            .iter()
+                            .filter_map(|inner| match inner {
+                                EffectStmt::Cond { header, body } if header == "else {" => {
+                                    Some(body.clone())
+                                }
+                                _ => None,
+                            })
+                            .flatten()
+                            .collect();
+                        for inner in resolve(&nested_else) {
+                            out.extend(unwrap_excute(inner));
+                        }
+                        // The proper shape: a sibling `else` right after this block.
+                        skip_else = nested_else.is_empty();
+                    }
+                    EffectStmt::Cond { header, body } if header == "else {" && skip_else => {
+                        skip_else = false;
+                        for inner in resolve(body) {
+                            out.extend(unwrap_excute(inner));
+                        }
+                    }
+                    other => {
+                        skip_else = false;
+                        out.push(other.clone());
+                    }
+                }
+            }
+            out
+        }
+        let resolved = EffectScript {
+            stmts: resolve(&self.stmts),
+        };
+        let written = self.to_effect_calls();
+        resolved
+            .to_effect_calls()
+            .into_iter()
+            .filter(|call| {
+                !call.effect_name.is_empty()
+                    && !written.iter().any(|w| {
+                        w.effect_name == call.effect_name && w.active_start == call.active_start
+                    })
+            })
+            .collect()
+    }
+}
+
 /// A resolved effect event with computed active frame range.
 ///
 /// Effect spawns that do not have an `EFFECT_OFF_KIND` remain active through the move.  ACMD
