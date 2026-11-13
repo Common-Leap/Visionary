@@ -28,6 +28,18 @@ pub struct Flight {
     pub bounce: Option<f32>,
     /// How far in front of the fighter it starts.
     pub start_ahead: f32,
+    /// For things that come back (Link's boomerang): it slows by `accel` a frame until it is
+    /// down to `turn_speed`, then comes back speeding up by `accel` to `return_speed` until it
+    /// is home.
+    pub returns: Option<Return>,
+}
+
+/// How a returning object slows, turns and comes back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Return {
+    pub accel: f32,
+    pub turn_speed: f32,
+    pub return_speed: f32,
 }
 
 impl Default for Flight {
@@ -39,6 +51,7 @@ impl Default for Flight {
             gravity: 0.0,
             bounce: None,
             start_ahead: 0.0,
+            returns: None,
         }
     }
 }
@@ -47,6 +60,9 @@ impl Flight {
     /// Offset from the spawn point after `frames`, as (forward, up). The ground is at
     /// `-start_height`, so a bouncing object turns back up there.
     pub fn offset(&self, frames: f32, start_height: f32) -> (f32, f32) {
+        if let Some(back) = self.returns {
+            return (self.returning_distance(frames, back), 0.0);
+        }
         let radians = self.angle.to_radians();
         let (mut forward, mut up) = (self.start_ahead, 0.0);
         let (step_forward, mut step_up) = (self.speed * radians.cos(), self.speed * radians.sin());
@@ -67,6 +83,30 @@ impl Flight {
         }
         let part = frames.max(0.0) - whole as f32;
         (forward + step_forward * part, up + step_up * part)
+    }
+
+    /// Distance ahead of where a returning object was thrown from, after `frames`; it never
+    /// goes behind the thrower.
+    fn returning_distance(&self, frames: f32, back: Return) -> f32 {
+        let (mut distance, mut speed, mut outward) = (self.start_ahead, self.speed, true);
+        let whole = frames.max(0.0).floor() as usize;
+        for _ in 0..whole {
+            distance += if outward { speed } else { -speed };
+            if outward {
+                speed -= back.accel;
+                if speed <= back.turn_speed {
+                    outward = false;
+                }
+            } else {
+                speed = (speed + back.accel).min(back.return_speed);
+            }
+            if distance <= 0.0 {
+                return 0.0;
+            }
+        }
+        let part = frames.max(0.0) - whole as f32;
+        let next = if outward { speed } else { -speed };
+        (distance + next * part).max(0.0)
     }
 }
 
@@ -288,6 +328,24 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
     }
     if let Some(ahead) = first(&["base_offset_x", "offset_x"]) {
         flight.start_ahead = ahead;
+    }
+    // A boomerang slows to its minimum speed and comes back (Link's: speed 2.4, accel 0.047;
+    // measured in game, a thrown one loses exactly 0.047 a frame on its way out).
+    if let (Some(accel), Some(turn_speed), Some(return_speed)) = (
+        values.get("accel").copied(),
+        values.get("speed_min").copied(),
+        values.get("speed_max").copied(),
+    ) {
+        if values.contains_key("turn_dist") && accel > 0.0 {
+            if let Some(speed) = values.get("speed").copied() {
+                flight.speed = speed.abs();
+            }
+            flight.returns = Some(Return {
+                accel,
+                turn_speed,
+                return_speed,
+            });
+        }
     }
     if values.contains_key("bound_count_max") {
         flight.bounce = first(&["bounded_speed_y_min", "bound_speed_y"]).or(Some(flight.speed));
@@ -885,5 +943,36 @@ mod thrown_object_tests {
         // Thrown: flying forward from the hand, 2 a frame from frame 27.
         assert_eq!(at(27.0), hand);
         assert_eq!(at(37.0), hand + glam::Vec3::Z * 20.0);
+    }
+}
+
+#[cfg(test)]
+mod returning_flight_tests {
+    use super::*;
+
+    #[test]
+    fn a_boomerang_slows_as_measured_then_comes_back_home() {
+        // Link's boomerang params, thrown with the flick speed the game measured (3.0 a frame).
+        // In game successive four-frame spans shrink by 0.76 (11.93, 11.17, 10.43): the
+        // 0.047 a frame slowdown. The game's spans run about 0.2 longer than these, as if it
+        // held full speed for its first frame; that offset is not modelled.
+        let flight = Flight {
+            life: 129.0,
+            speed: 3.0,
+            returns: Some(Return {
+                accel: 0.047,
+                turn_speed: 0.3,
+                return_speed: 3.0,
+            }),
+            ..Flight::default()
+        };
+        let at = |f: f32| flight.offset(f, 8.0).0;
+        let span = |n: f32| at(4.0 * (n + 1.0)) - at(4.0 * n);
+        assert!(((span(0.0) - span(1.0)) - 0.76).abs() < 0.02);
+        assert!(((span(1.0) - span(2.0)) - 0.74).abs() < 0.02);
+        // Out and back: the farthest point, then home before its life runs out.
+        let farthest = (0..129).map(|f| at(f as f32)).fold(0.0, f32::max);
+        assert!(farthest > 80.0 && farthest < 100.0, "{farthest}");
+        assert_eq!(at(128.0), 0.0);
     }
 }
