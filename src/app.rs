@@ -8970,6 +8970,11 @@ impl VisionaryApp {
                         .map(|(path, bytes)| (path.clone(), bytes.clone()))
                         .collect(),
                     repaint: ctx.clone(),
+                    floor: self
+                        .state
+                        .selected_move
+                        .as_ref()
+                        .is_none_or(|m| crate::preview_floor::move_is_grounded(&m.name)),
                     objects: objects
                         .iter()
                         .filter_map(|object| {

@@ -114,6 +114,9 @@ pub struct HitboxRenderState {
     object_dirs: Vec<std::path::PathBuf>,
     /// Effects drawn with the game's shaders, after the models.
     pub vfx: crate::vfx_preview::VfxPreview,
+    /// The stage floor under grounded moves, and its colour as stored in the scene.
+    floor: crate::preview_floor::PreviewFloor,
+    floor_color: [f32; 4],
     /// Where the models and effects are drawn before going on screen.
     pub target: crate::viewport_target::ViewportTarget,
     /// Cached GPU handles for use in paint()
@@ -129,6 +132,8 @@ impl HitboxRenderState {
     ) -> Self {
         /// The viewport's backdrop, linear, as it appears on screen.
         const VIEWPORT_BACKDROP_LINEAR: [f32; 3] = [0.05, 0.05, 0.1];
+        /// The floor under grounded moves, a shade darker than the backdrop.
+        const FLOOR_LINEAR: [f32; 3] = [0.028, 0.028, 0.055];
         let mut renderer = SsbhRenderer::new(
             device,
             queue,
@@ -189,6 +194,16 @@ impl HitboxRenderState {
                 let [r, g, b] = scene_backdrop.map(|c| (c * 255.0).round() as u8);
                 vfx.set_backdrop([r, g, b, 255]);
                 vfx
+            },
+            floor: crate::preview_floor::PreviewFloor::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            floor_color: {
+                let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
+                [r, g, b, 1.0]
             },
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
@@ -808,6 +823,8 @@ pub struct ViewportCallback {
     pub effect_overrides: Vec<(std::path::PathBuf, Option<std::sync::Arc<Vec<u8>>>)>,
     /// For painting again once effects still loading are ready.
     pub repaint: egui::Context,
+    /// Draw the stage floor: the move is done on the ground.
+    pub floor: bool,
 }
 
 /// One object model to draw, already animated and placed.
@@ -916,6 +933,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             // draw into the scene right after the models, with the models' depth, so bloom and
             // colour grading treat them as the game's post pass does.
             let vfx = &state.vfx;
+            let floor = self.floor.then_some(&state.floor);
+            if let Some(floor) = floor {
+                floor.update(queue, t.mvp_matrix, state.floor_color);
+            }
             state.renderer.begin_render_models_with_scene(
                 egui_encoder,
                 &state.render_models,
@@ -943,6 +964,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                         }),
                         ..Default::default()
                     });
+                    if let Some(floor) = floor {
+                        floor.draw(&mut pass);
+                    }
                     vfx.paint(&mut pass);
                 },
             );
