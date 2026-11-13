@@ -202,6 +202,9 @@ fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
 /// One object out at the current frame, placed in the world.
 pub struct PlacedObject {
     pub kind: Arc<ObjectKind>,
+    /// The frame it was spawned on and the one it is removed on, to place it at earlier ages.
+    pub spawned: u32,
+    pub removed: Option<u32>,
     /// Frames since it was spawned, from 0.
     pub age: f32,
     /// Object space to world space.
@@ -469,6 +472,8 @@ pub fn place(
         if kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0 {
             placed.push(PlacedObject {
                 kind: kind.clone(),
+                spawned: *spawned,
+                removed: *removed,
                 age,
                 placement: ride_bone(&bones_at(frame), &kind.name),
             });
@@ -488,6 +493,8 @@ pub fn place(
         let position = start + forward * ahead + glam::Vec3::Y * up;
         placed.push(PlacedObject {
             kind: kind.clone(),
+            spawned: *spawned,
+            removed: *removed,
             age,
             placement: glam::Mat4::from_rotation_translation(rotation, position),
         });

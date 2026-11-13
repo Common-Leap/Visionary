@@ -16,10 +16,10 @@ pub struct EffectDraw {
     pub file: PathBuf,
     /// Entry name as the game spawns it (case-insensitive).
     pub name: String,
-    /// Effect space to world: bone, offset, rotation and scale.
-    pub placement: Mat4,
-    /// Frames since the effect was spawned.
-    pub frame: u32,
+    /// Effect space to world (bone, offset, rotation and scale) on every frame since the effect
+    /// was spawned, the spawn frame first and this frame last. The emitters step through them,
+    /// so effects that emit by distance or leave particles behind follow the real path.
+    pub placements: Vec<Mat4>,
 }
 
 /// The preview viewport's backdrop colour.
@@ -153,7 +153,10 @@ impl VfxPreview {
             file.renderer.set_view(queue, &camera);
             // Refraction shaders read the frame behind them; the preview has only its backdrop.
             file.renderer.set_background(queue, VIEWPORT_BACKDROP);
-            let (_, rotation, translation) = draw.placement.to_scale_rotation_translation();
+            let Some(placement) = draw.placements.last().copied() else {
+                continue;
+            };
+            let (_, rotation, translation) = placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
             for index in 0..file.emitters[set].len() {
                 let emitter = &file.emitters[set][index];
@@ -171,16 +174,17 @@ impl VfxPreview {
                     continue;
                 }
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
-                // The game updates an emitter once before its first draw: on the spawn frame
-                // it is already one step in (live capture: time 0 drawn after one Calculate).
-                for _ in 0..=draw.frame.min(600) {
-                    s.step();
+                // The game updates an emitter once before each draw, the spawn frame included
+                // (live capture: time 0 drawn after one Calculate): one step per placement.
+                let history = &draw.placements[draw.placements.len().saturating_sub(601)..];
+                for set in history {
+                    s.step_at(set);
                 }
                 if s.count() == 0 {
                     continue;
                 }
-                let srt = s.emitter_srt(&draw.placement);
-                let streams = s.streams(&srt);
+                let srt = s.emitter_srt(&placement);
+                let streams = s.streams();
                 let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), [1.0; 4]);
                 let statics = static_block::static_block(&emitter.fixed);
                 let custom0 = static_block::custom_block(&emitter.raw);

@@ -8555,7 +8555,6 @@ impl VisionaryApp {
     fn preview_effect_draws(
         &self,
         frame: &eframe::Frame,
-        animation_frame: f32,
         objects: &[crate::article_preview::PlacedObject],
     ) -> Vec<crate::vfx_preview::EffectDraw> {
         let frame_num = self.state.current_frame;
@@ -8566,7 +8565,20 @@ impl VisionaryApp {
         let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
             return Vec::new();
         };
-        let bone_matrices = rs.bone_world_matrices_at(animation_frame);
+        // Bone matrices by game frame, computed once each for this paint.
+        let cache: std::cell::RefCell<HashMap<u32, std::rc::Rc<HashMap<String, glam::Mat4>>>> =
+            Default::default();
+        let bones_at = |game_frame: u32| {
+            cache
+                .borrow_mut()
+                .entry(game_frame)
+                .or_insert_with(|| {
+                    std::rc::Rc::new(
+                        rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
+                    )
+                })
+                .clone()
+        };
         let common = self
             .state
             .data_root
@@ -8577,6 +8589,18 @@ impl VisionaryApp {
             .flatten()
             .collect();
         let mut out = Vec::new();
+        let mut push = |name: &str, placements: Vec<glam::Mat4>| {
+            if placements.is_empty() {
+                return;
+            }
+            for file in &files {
+                out.push(crate::vfx_preview::EffectDraw {
+                    file: file.clone(),
+                    name: name.to_owned(),
+                    placements: placements.clone(),
+                });
+            }
+        };
         // Calls inside facing branches are not on the timeline; the preview faces right.
         let facing = self.state.effect_script.facing_right_calls();
         for ec in self.state.effects.iter().chain(facing.iter()) {
@@ -8587,67 +8611,85 @@ impl VisionaryApp {
             {
                 continue;
             }
-            let Some(bone_mat) = bone_matrices
-                .get(&ec.bone_name)
-                .or_else(|| bone_matrices.get(&ec.bone_name.to_lowercase()))
-                .copied()
-            else {
-                continue;
-            };
-            let bone_mat = if is_system_bone(&ec.bone_name) {
-                glam::Mat4::from_translation(bone_mat.col(3).truncate())
-            } else {
-                bone_mat
-            };
             let rotation = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
                 ec.rotation[0].to_radians(),
                 ec.rotation[1].to_radians(),
                 ec.rotation[2].to_radians(),
             );
-            let placement = bone_mat
-                * glam::Mat4::from_scale_rotation_translation(
-                    glam::Vec3::splat(ec.scale.max(0.01)),
-                    rotation,
-                    glam::Vec3::from(ec.offset),
-                );
-            for file in &files {
-                out.push(crate::vfx_preview::EffectDraw {
-                    file: file.clone(),
-                    name: ec.effect_name.clone(),
-                    placement,
-                    frame: frame_num - ec.active_start,
-                });
+            let local = glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(ec.scale.max(0.01)),
+                rotation,
+                glam::Vec3::from(ec.offset),
+            );
+            let place = |game_frame: u32| {
+                let bones = bones_at(game_frame);
+                let bone = bones
+                    .get(&ec.bone_name)
+                    .or_else(|| bones.get(&ec.bone_name.to_lowercase()))
+                    .copied()?;
+                let bone = if is_system_bone(&ec.bone_name) {
+                    glam::Mat4::from_translation(bone.col(3).truncate())
+                } else {
+                    bone
+                };
+                Some(bone * local)
+            };
+            // A following effect rides its bone every frame; any other stays where it was
+            // spawned, as the game places it once.
+            let placements: Option<Vec<glam::Mat4>> = if ec.follows_bone {
+                (ec.active_start..=frame_num).map(place).collect()
+            } else {
+                place(ec.active_start)
+                    .map(|at| vec![at; (frame_num - ec.active_start + 1) as usize])
+            };
+            if let Some(placements) = placements {
+                push(&ec.effect_name, placements);
             }
         }
-        // Objects' own effects, on the object's bones. Many projectiles have no mesh and
-        // these are all the game shows of them.
+        // Objects' own effects, on the object's bones at each age. Many projectiles have no
+        // mesh and these are all the game shows of them.
         for object in objects {
-            let bones = crate::article_preview::object_bones(object);
             let object_frame = object.age.floor() as u32 + 1;
+            let object_at = |age_frame: u32| {
+                let at = object.spawned + age_frame.saturating_sub(1);
+                crate::article_preview::place(
+                    &[(object.spawned, object.kind.clone(), object.removed)],
+                    at as f32,
+                    &|f| (*bones_at(f.max(1.0) as u32)).clone(),
+                )
+                .into_iter()
+                .next()
+            };
             for effect in &object.kind.effects {
                 if object_frame < effect.start {
                     continue;
                 }
-                let bone = bones
-                    .get(&effect.bone)
-                    .or_else(|| bones.get(&effect.bone.to_lowercase()))
-                    .or_else(|| bones.get("top"))
-                    .copied()
-                    .unwrap_or(object.placement);
-                let placement = bone
-                    * glam::Mat4::from_scale_rotation_translation(
-                        glam::Vec3::splat(effect.scale.max(0.01)),
-                        glam::Quat::IDENTITY,
-                        glam::Vec3::from(effect.offset),
-                    );
-                for file in &files {
-                    out.push(crate::vfx_preview::EffectDraw {
-                        file: file.clone(),
-                        name: effect.name.clone(),
-                        placement,
-                        frame: object_frame - effect.start,
-                    });
+                let local = glam::Mat4::from_scale_rotation_translation(
+                    glam::Vec3::splat(effect.scale.max(0.01)),
+                    glam::Quat::IDENTITY,
+                    glam::Vec3::from(effect.offset),
+                );
+                let place = |age_frame: u32| {
+                    let placed = object_at(age_frame)?;
+                    let bones = crate::article_preview::object_bones(&placed);
+                    let bone = bones
+                        .get(&effect.bone)
+                        .or_else(|| bones.get(&effect.bone.to_lowercase()))
+                        .or_else(|| bones.get("top"))
+                        .copied()
+                        .unwrap_or(placed.placement);
+                    Some(bone * local)
+                };
+                let follows = effect.end == u32::MAX;
+                let placements: Option<Vec<glam::Mat4>> = if follows {
+                    (effect.start..=object_frame).map(place).collect()
+                } else {
+                    place(effect.start)
+                        .map(|at| vec![at; (object_frame - effect.start + 1) as usize])
+                };
+                if let Some(placements) = placements {
+                    push(&effect.name, placements);
                 }
             }
         }
@@ -8703,7 +8745,7 @@ impl VisionaryApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
-            let effects = self.preview_effect_draws(frame, animation_frame, &objects);
+            let effects = self.preview_effect_draws(frame, &objects);
             let callback = egui_wgpu::Callback::new_paint_callback(
                 rect,
                 ViewportCallback {
