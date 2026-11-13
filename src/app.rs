@@ -3346,6 +3346,8 @@ pub struct VisionaryApp {
     current_skel_path: Option<PathBuf>,
     // Pending model load (set when fighter selected, consumed in update)
     pending_model_load: Option<PathBuf>,
+    /// The model being read on a background thread; only the latest request is kept.
+    model_folder_load: Option<(PathBuf, std::sync::mpsc::Receiver<ssbh_wgpu::ModelFolder>)>,
     last_frame_time: std::time::Instant,
     // Background move list loading
     move_list_receiver: Option<std::sync::mpsc::Receiver<Vec<MoveEntry>>>,
@@ -3854,6 +3856,7 @@ impl VisionaryApp {
             current_default_eyelid_path: None,
             current_skel_path: None,
             pending_model_load: None,
+            model_folder_load: None,
             last_frame_time: std::time::Instant::now(),
             move_list_receiver: None,
             pending_project_move_selection: None,
@@ -4412,6 +4415,7 @@ impl VisionaryApp {
             self.current_default_eyelid_path = None;
             self.current_skel_path = None;
             self.pending_model_load = None;
+            self.model_folder_load = None;
             self.current_eff_path = None;
             self.bone_names.clear();
             self.hurtbox_volumes.clear();
@@ -30714,7 +30718,32 @@ impl eframe::App for VisionaryApp {
 
         // Handle pending model load — needs wgpu device/queue
         let t_model = self.perf.start();
+        // Reading and parsing the model files takes up to ~40 ms, so it runs on a thread; the
+        // GPU upload below waits for it.
         if let Some(model_dir) = self.pending_model_load.take() {
+            let (send, receive) = std::sync::mpsc::channel();
+            let dir = model_dir.clone();
+            std::thread::spawn(move || {
+                let _ = send.send(ssbh_wgpu::ModelFolder::load_folder(dir));
+            });
+            self.model_folder_load = Some((model_dir, receive));
+        }
+        let loaded_folder = match &self.model_folder_load {
+            Some((dir, receive)) => match receive.try_recv() {
+                Ok(folder) => Some((dir.clone(), folder)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(15));
+                    None
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.model_folder_load = None;
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some((model_dir, folder)) = loaded_folder {
+            self.model_folder_load = None;
             if let Some(wgpu_state) = frame.wgpu_render_state() {
                 let device = &wgpu_state.device;
                 let queue = &wgpu_state.queue;
@@ -30734,7 +30763,7 @@ impl eframe::App for VisionaryApp {
                     }
 
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
-                        rs.load_model(device, queue, &model_dir);
+                        rs.load_model(device, queue, &model_dir, folder);
                         // Eagerly load skeleton and animation for projected circle overlays.
                         let skel_path = self.current_skel_path.as_deref();
                         if let Some(path) = skel_path {

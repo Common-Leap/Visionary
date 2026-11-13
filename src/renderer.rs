@@ -184,7 +184,15 @@ impl HitboxRenderState {
         self.current_height = height;
     }
 
-    pub fn load_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model_dir: &Path) {
+    /// Upload a model already read from `model_dir` (reading it is slow, so callers do that
+    /// off the GUI thread).
+    pub fn load_model(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        model_dir: &Path,
+        folder: ModelFolder,
+    ) {
         self.render_models.clear();
         self.object_dirs.clear();
         self.weapon_skels.clear();
@@ -192,7 +200,6 @@ impl HitboxRenderState {
             eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
             return;
         }
-        let folder = ModelFolder::load_folder(model_dir);
         let render_model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
         eprintln!("[MODEL] loaded from {:?}", model_dir);
         self.render_models.push(render_model);
