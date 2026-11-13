@@ -649,6 +649,66 @@ mod tests {
         assert_eq!(pascal("special_n_bound"), "SpecialNBound");
     }
 
+    /// Every object of every fighter loads, places and poses without panicking. Needs
+    /// VISIONARY_DATA_ROOT (an extracted game); skipped otherwise.
+    #[test]
+    fn every_fighter_object_loads_and_poses_without_panicking() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
+            return;
+        };
+        let labels = crate::param_labels::parse_csv(
+            &std::fs::read_to_string(
+                crate::scratch_dirs::app_storage_root().join("ParamLabels.csv"),
+            )
+            .unwrap_or_default(),
+        );
+        let mut failures = Vec::new();
+        let mut loaded = 0;
+        let fighters = Path::new(&root).join("fighter");
+        for fighter in std::fs::read_dir(&fighters).unwrap().flatten() {
+            let fighter_dir = fighter.path();
+            let Ok(parts) = std::fs::read_dir(fighter_dir.join("model")) else {
+                continue;
+            };
+            for part in parts.flatten() {
+                let name = part.file_name().to_string_lossy().into_owned();
+                if name == "body" {
+                    continue;
+                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Some(kind) = load_kind(
+                        &fighter_dir,
+                        &fighter_dir.join("param/vl.prc"),
+                        0,
+                        &name,
+                        &labels,
+                        &|_| None,
+                    ) else {
+                        return false;
+                    };
+                    let kind = Arc::new(kind);
+                    let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
+                    for frame in [0.0, 5.5, 30.0, 200.0] {
+                        for object in place(&[(0, kind.clone(), None)], frame, &bones) {
+                            let _ = object_bones(&object);
+                            let _ = placement_layer(&object);
+                        }
+                    }
+                    true
+                }));
+                match result {
+                    Ok(true) => loaded += 1,
+                    Ok(false) => {}
+                    Err(_) => {
+                        failures.push(format!("{}/{name}", fighter.file_name().to_string_lossy()))
+                    }
+                }
+            }
+        }
+        println!("{loaded} objects loaded");
+        assert!(failures.is_empty(), "panicked: {failures:?}");
+    }
+
     /// Reads real objects from the extracted game files.
     #[test]
     fn real_objects_load_with_flight_and_hitboxes() {
