@@ -3531,6 +3531,9 @@ pub struct VisionaryApp {
     effect_preview_build: EffectPreviewBuild,
     /// The selected fighter's sets of alternative meshes (sword in hand or sheathed).
     visibility_sets: Vec<crate::preview_visibility::VisibilitySet>,
+    /// Objects the selected fighter always carries: those with a model folder and a stowed
+    /// bone of their own name plus `b` on the body (Link's `bow` and `BowB`).
+    stowed_articles: Vec<String>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3957,6 +3960,7 @@ impl VisionaryApp {
             eff_mods: HashMap::new(),
             effect_preview_build: EffectPreviewBuild::default(),
             visibility_sets: Vec::new(),
+            stowed_articles: Vec::new(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -4577,6 +4581,7 @@ impl VisionaryApp {
         } else {
             acmd_bone_options(loaded_bone_names.clone())
         };
+        self.stowed_articles = stowed_articles(&model_root, &loaded_bone_names);
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
         self.hurtbox_volumes = hurtbox_result.volumes;
@@ -8540,48 +8545,37 @@ impl VisionaryApp {
             let Some(name) = crate::article_preview::article_name(symbol) else {
                 continue;
             };
-            let key = format!("{}/{name}", fighter.name);
-            match self.object_kinds.get(&key) {
-                Some(Some(kind)) => spawns.push(crate::article_preview::Spawn {
-                    kind: kind.clone(),
-                    spawned,
-                    removed,
-                    // The first throw of it while it is out.
-                    shot: shots
-                        .iter()
-                        .find(|(at, other)| {
-                            other == symbol
-                                && *at >= spawned
-                                && removed.is_none_or(|removed| *at < removed)
-                        })
-                        .map(|(at, _)| *at),
-                }),
-                Some(None) => {}
-                None if self.object_pending.insert(key.clone()) => {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.object_loads.push(rx);
-                    let labels = self.state.labels.clone();
-                    let fighter = fighter.clone();
-                    std::thread::spawn(move || {
-                        let agent = format!("{}_{name}", fighter.name);
-                        let kind = crate::article_preview::load_kind(
-                            &fighter.fighter_dir,
-                            &fighter.param_path,
-                            fighter.base_slot(),
-                            &name,
-                            &labels,
-                            &|script| {
-                                crate::acmd::fetch_object_script(&fighter.name, &agent, script)
-                            },
-                        );
-                        let _ = tx.send((key, kind));
-                    });
-                }
-                None => {}
+            let Some(kind) = self.object_kind(&fighter, &name) else {
+                continue;
+            };
+            spawns.push(crate::article_preview::Spawn {
+                kind,
+                spawned,
+                removed,
+                // The first throw of it while it is out.
+                shot: shots
+                    .iter()
+                    .find(|(at, other)| {
+                        other == symbol
+                            && *at >= spawned
+                            && removed.is_none_or(|removed| *at < removed)
+                    })
+                    .map(|(at, _)| *at),
+            });
+        }
+        // Objects the fighter always carries (Link's bow on his back) ride their stowed bone
+        // unless the move takes them out.
+        let mut stowed = Vec::new();
+        for name in self.stowed_articles.clone() {
+            if spawns.iter().any(|spawn| spawn.kind.name == name) {
+                continue;
+            }
+            if let Some(kind) = self.object_kind(&fighter, &name) {
+                stowed.push(kind);
             }
         }
         let opponent = self.preview_opponent_kind();
-        if spawns.is_empty() && opponent.is_none() {
+        if spawns.is_empty() && opponent.is_none() && stowed.is_empty() {
             return Vec::new();
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else {
@@ -8595,6 +8589,38 @@ impl VisionaryApp {
             crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
                 rs.bone_world_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
             });
+        if !stowed.is_empty() {
+            let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
+            let bones = rs.bone_world_matrices_at(animation_frame);
+            for kind in stowed {
+                let bone = format!("{}b", kind.name);
+                if let Some(at) = bones.get(&bone) {
+                    // The object hangs by its `Have` joint (its grip), as the game attaches
+                    // it, not by its root.
+                    let have = kind
+                        .skel
+                        .as_deref()
+                        .map(|skel| {
+                            crate::renderer::compute_bone_world_matrices(
+                                skel,
+                                kind.anim.as_deref(),
+                                &[],
+                                0.0,
+                            )
+                        })
+                        .and_then(|own| own.get("have").copied())
+                        .unwrap_or(glam::Mat4::IDENTITY);
+                    placed.push(crate::article_preview::PlacedObject {
+                        kind,
+                        spawned: 0,
+                        removed: None,
+                        shot: None,
+                        age: 0.0,
+                        placement: *at * have.inverse(),
+                    });
+                }
+            }
+        }
         // A grab or throw holds the opponent on the thrower's throw bone.
         if let Some(kind) = opponent {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
@@ -8694,6 +8720,43 @@ impl VisionaryApp {
             });
         }
         out
+    }
+
+    /// A fighter object's kind if it is loaded; otherwise starts loading it on a thread and
+    /// returns `None` (the viewport repaints until it arrives).
+    fn object_kind(
+        &mut self,
+        fighter: &crate::data::FighterEntry,
+        name: &str,
+    ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
+        let key = format!("{}/{name}", fighter.name);
+        match self.object_kinds.get(&key) {
+            Some(kind) => kind.clone(),
+            None => {
+                if self.object_pending.insert(key.clone()) {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.object_loads.push(rx);
+                    let labels = self.state.labels.clone();
+                    let fighter = fighter.clone();
+                    let name = name.to_owned();
+                    std::thread::spawn(move || {
+                        let agent = format!("{}_{name}", fighter.name);
+                        let kind = crate::article_preview::load_kind(
+                            &fighter.fighter_dir,
+                            &fighter.param_path,
+                            fighter.base_slot(),
+                            &name,
+                            &labels,
+                            &|script| {
+                                crate::acmd::fetch_object_script(&fighter.name, &agent, script)
+                            },
+                        );
+                        let _ = tx.send((key, kind));
+                    });
+                }
+                None
+            }
+        }
     }
 
     /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
@@ -32316,6 +32379,25 @@ fn effect_rotation(euler: [f32; 3]) -> glam::Quat {
         euler[1].to_radians(),
         euler[0].to_radians(),
     )
+}
+
+/// The fighter objects carried stowed on the body: a model folder under `model_root` whose name
+/// plus `b` is a body bone (Link: `bow` and `BowB`). The shield and sword have such bones too,
+/// but they are parts of the body model rather than folders of their own, so they are not
+/// listed twice.
+fn stowed_articles(model_root: &std::path::Path, body_bones: &[String]) -> Vec<String> {
+    let bones: std::collections::HashSet<String> =
+        body_bones.iter().map(|b| b.to_lowercase()).collect();
+    let mut names: Vec<String> = std::fs::read_dir(model_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().to_lowercase())
+        .filter(|name| name != "body" && bones.contains(&format!("{name}b")))
+        .collect();
+    names.sort();
+    names
 }
 
 /// A spawn's offset and rotation with the random ranges its call asks for applied.
