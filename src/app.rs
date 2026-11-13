@@ -8784,16 +8784,17 @@ impl VisionaryApp {
             {
                 continue;
             }
+            let (offset, euler) = spawn_with_random_ranges(ec);
             let rotation = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
-                ec.rotation[0].to_radians(),
-                ec.rotation[1].to_radians(),
-                ec.rotation[2].to_radians(),
+                euler[0].to_radians(),
+                euler[1].to_radians(),
+                euler[2].to_radians(),
             );
             let local = glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::splat(ec.scale.max(0.01)),
                 rotation,
-                glam::Vec3::from(ec.offset),
+                glam::Vec3::from(offset),
             );
             let place = |game_frame: u32| {
                 let bones = bones_at(game_frame);
@@ -32108,6 +32109,46 @@ impl Hitbox {
     }
 }
 
+/// A spawn's offset and rotation with the random ranges its call asks for applied.
+///
+/// `EFFECT`-shaped calls (`EFFECT`, `LANDING_EFFECT`, `FOOT_EFFECT` and their flips) carry, after
+/// the scale, a random range for each position axis and each rotation axis: Mario's forward
+/// smash spawns `sys_flame` with a 360 degree range on Z, and in game each spawn turns a
+/// different way about its facing axis (a capture read 131 degrees). A range is the full width
+/// of the spread, centred on the authored value, so 360 covers one turn. The game's own random
+/// numbers cannot be reproduced; the preview draws its own from the call itself, so a spawn
+/// keeps one angle from frame to frame instead of jittering.
+fn spawn_with_random_ranges(ec: &crate::data::EffectCall) -> ([f32; 3], [f32; 3]) {
+    let mut offset = ec.offset;
+    let mut euler = ec.rotation;
+    let Some(ranges) = ec.extra_args.as_ref().and_then(|args| {
+        let values: Vec<f32> = args
+            .iter()
+            .take(6)
+            .map(|a| a.trim().trim_end_matches("f32").parse::<f32>().ok())
+            .collect::<Option<_>>()?;
+        (values.len() == 6).then_some(values)
+    }) else {
+        return (offset, euler);
+    };
+    let mut seed = ec.effect_name.bytes().fold(
+        0x9e37_79b9_7f4a_7c15u64 ^ u64::from(ec.active_start),
+        |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3),
+    );
+    let mut unit = || {
+        // xorshift64*: a fixed sequence per call, in [-0.5, 0.5).
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        (seed.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+    };
+    for axis in 0..3 {
+        offset[axis] += ranges[axis] * unit();
+        euler[axis] += ranges[3 + axis] * unit();
+    }
+    (offset, euler)
+}
+
 fn hurtbox_palette(status: crate::data::HurtboxStatus) -> (Color32, Color32) {
     match status {
         crate::data::HurtboxStatus::Normal => (
@@ -44501,5 +44542,78 @@ mod collapsing_id_tests {
             });
         }
         assert!(opened);
+    }
+}
+
+#[cfg(test)]
+mod spawn_random_range_tests {
+    use super::spawn_with_random_ranges;
+
+    fn call(extra: Option<&[&str]>) -> crate::data::EffectCall {
+        crate::data::EffectCall {
+            effect_name: "sys_flame".into(),
+            effect_name_alt: None,
+            spawn_func: "EFFECT".into(),
+            bone_name: "top".into(),
+            offset: [0.0, 8.0, 12.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale: 0.8,
+            follows_bone: false,
+            active_start: 15,
+            active_end: 15,
+            disabled: false,
+            extra_args: extra.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            flip_axis: None,
+            raw_line: None,
+            trail_command: None,
+            trail_off: None,
+            off_fade: None,
+            off_detach: None,
+            trail_bone2: None,
+            rate: None,
+            work_int: None,
+            camera_offset: None,
+            tint: None,
+            particle_tint: None,
+            alpha: None,
+            scale_w: None,
+            color: None,
+            control: None,
+            guard: None,
+            leading: Vec::new(),
+            trailing: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn zero_ranges_and_follow_tails_change_nothing() {
+        // Mario's forward smash sys_atk_smoke: every range 0.
+        let zero = call(Some(&["0", "0", "0", "0", "0", "0", "true"]));
+        assert_eq!(
+            spawn_with_random_ranges(&zero),
+            ([0.0, 8.0, 12.0], [0.0; 3])
+        );
+        // An EFFECT_FOLLOW tail is only the terminate flag.
+        let follow = call(Some(&["true"]));
+        assert_eq!(
+            spawn_with_random_ranges(&follow),
+            ([0.0, 8.0, 12.0], [0.0; 3])
+        );
+        assert_eq!(
+            spawn_with_random_ranges(&call(None)),
+            ([0.0, 8.0, 12.0], [0.0; 3])
+        );
+    }
+
+    #[test]
+    fn a_full_turn_range_rolls_the_spawn_within_half_a_turn_each_way() {
+        // Mario's forward smash sys_flame: 360 on Z, as in the game script.
+        let flame = call(Some(&["0", "0", "0", "0", "0", "360", "true"]));
+        let (offset, euler) = spawn_with_random_ranges(&flame);
+        assert_eq!(offset, [0.0, 8.0, 12.0]);
+        assert_eq!(euler[0], 0.0);
+        assert!(euler[2] != 0.0 && euler[2].abs() <= 180.0, "{euler:?}");
+        // The same call keeps its angle from frame to frame.
+        assert_eq!(spawn_with_random_ranges(&flame), (offset, euler));
     }
 }
