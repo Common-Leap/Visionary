@@ -161,7 +161,10 @@ impl HitboxRenderState {
             last_default_anim_path: None,
             last_skel_path: None,
             object_dirs: Vec::new(),
-            vfx: crate::vfx_preview::VfxPreview::new(surface_format.add_srgb_suffix(), None),
+            vfx: crate::vfx_preview::VfxPreview::new(
+                surface_format.add_srgb_suffix(),
+                Some(crate::viewport_target::DEPTH_FORMAT),
+            ),
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
@@ -871,6 +874,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     });
                     state.renderer.end_render_models(&mut pass);
                 }
+                state
+                    .target
+                    .copy_depth(device, egui_encoder, state.renderer.depth_view());
                 let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("viewport effects"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -882,6 +888,16 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                             store: wgpu::StoreOp::Store,
                         },
                     })],
+                    depth_stencil_attachment: state.target.depth.as_ref().map(|view| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }
+                    }),
                     ..Default::default()
                 });
                 state.vfx.paint(&mut pass);

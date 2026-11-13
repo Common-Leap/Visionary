@@ -91,3 +91,7 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+
+# The effect preview depth-tests against the models, which needs ssbh_wgpu's depth view.
+[patch."https://github.com/ScanMountGoat/ssbh_wgpu.git"]
+ssbh_wgpu = { path = "../ssbh_wgpu-fork/ssbh_wgpu" }

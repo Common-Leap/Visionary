@@ -20,7 +20,26 @@ pub struct ViewportTarget {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     bind: Option<wgpu::BindGroup>,
+    /// The models' depth, copied out of the model renderer's multisampled buffer so effects
+    /// are hidden behind the fighter the way the game's depth test hides them.
+    pub depth: Option<wgpu::TextureView>,
+    depth_copy: wgpu::RenderPipeline,
+    depth_layout: wgpu::BindGroupLayout,
 }
+
+/// The format effects test depth in.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+const DEPTH_COPY: &str = "
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let xy = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
+    return textureLoad(src, vec2<i32>(p.xy), 0);
+}
+";
 
 const BLIT: &str = "
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -93,7 +112,60 @@ impl ViewportTarget {
             multiview_mask: None,
             cache: None,
         });
+        let depth_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewport depth copy"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let depth_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("viewport depth copy"),
+            source: wgpu::ShaderSource::Wgsl(DEPTH_COPY.into()),
+        });
+        let depth_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("viewport depth copy"),
+                bind_group_layouts: &[Some(&depth_layout)],
+                immediate_size: 0,
+            });
+        let depth_copy = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewport depth copy"),
+            layout: Some(&depth_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &depth_module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &depth_module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
+            depth: None,
+            depth_copy,
+            depth_layout,
             format,
             size: (0, 0),
             texture: None,
@@ -149,10 +221,61 @@ impl ViewportTarget {
                 },
             ],
         }));
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("viewport depth"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        self.depth = Some(depth.create_view(&Default::default()));
         self.texture = Some(texture);
         self.plain = Some(plain);
         self.srgb = Some(srgb_view);
         self.size = (width, height);
+    }
+
+    /// Copy the models' multisampled depth (first sample) into [Self::depth].
+    pub fn copy_depth(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+    ) {
+        let Some(depth) = &self.depth else {
+            return;
+        };
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viewport depth copy"),
+            layout: &self.depth_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source),
+            }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("viewport depth copy"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.depth_copy);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Copy the viewport into the window's pass (its viewport is already the panel's rect).
