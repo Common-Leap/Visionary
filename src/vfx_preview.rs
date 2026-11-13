@@ -26,6 +26,9 @@ pub struct EffectDraw {
     /// was spawned, the spawn frame first and this frame last. The emitters step through them,
     /// so effects that emit by distance or leave particles behind follow the real path.
     pub placements: Vec<Mat4>,
+    /// The step (index into `placements`) on which the move kills the effect
+    /// (`EFFECT_OFF_KIND`): from there its emitters stop and fade as their flags say.
+    pub kill_at: Option<usize>,
 }
 
 /// The shared effect file. Its meshes serve every other file, and it is far too big to warm
@@ -400,8 +403,11 @@ impl VfxPreview {
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
-                let history = &draw.placements[draw.placements.len().saturating_sub(601)..];
-                for set in history {
+                let first = draw.placements.len().saturating_sub(601);
+                for (index, set) in draw.placements.iter().enumerate().skip(first) {
+                    if draw.kill_at.is_some_and(|kill| index >= kill) {
+                        s.kill();
+                    }
                     s.step_at(set);
                 }
                 if s.count() == 0 {

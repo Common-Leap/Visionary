@@ -8975,7 +8975,7 @@ impl VisionaryApp {
         };
         let files = self.preview_effect_files();
         let mut out = Vec::new();
-        let mut push = |name: &str, placements: Vec<glam::Mat4>| {
+        let mut push = |name: &str, placements: Vec<glam::Mat4>, kill_at: Option<usize>| {
             if placements.is_empty() {
                 return;
             }
@@ -8984,19 +8984,26 @@ impl VisionaryApp {
                     file: file.clone(),
                     name: name.to_owned(),
                     placements: placements.clone(),
+                    kill_at,
                 });
             }
         };
         // Calls inside facing branches are not on the timeline; the preview faces right.
         let facing = self.state.effect_script.facing_right_calls();
         for ec in self.state.effects.iter().chain(facing.iter()) {
+            // An effect draws until its particles are gone, as in game; the preview simulates
+            // at most 600 frames of it.
             if ec.disabled
                 || is_null_effect_sentinel(ec)
                 || frame_num < ec.active_start
-                || frame_num > ec.active_end.max(ec.active_start + 60)
+                || frame_num > ec.active_start + 600
             {
                 continue;
             }
+            // Killed by the move (`EFFECT_OFF_KIND`) on its end frame.
+            let kill_at = (ec.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
+                && ec.active_end > ec.active_start)
+                .then(|| (ec.active_end - ec.active_start) as usize);
             let (offset, euler) = spawn_with_random_ranges(ec);
             let rotation = effect_rotation(euler);
             let local = glam::Mat4::from_scale_rotation_translation(
@@ -9026,7 +9033,7 @@ impl VisionaryApp {
                     .map(|at| vec![at; (frame_num - ec.active_start + 1) as usize])
             };
             if let Some(placements) = placements {
-                push(&ec.effect_name, placements);
+                push(&ec.effect_name, placements, kill_at);
             }
         }
         // Objects' own effects, on the object's bones at each age. Many projectiles have no
@@ -9076,7 +9083,7 @@ impl VisionaryApp {
                         .map(|at| vec![at; (object_frame - effect.start + 1) as usize])
                 };
                 if let Some(placements) = placements {
-                    push(&effect.name, placements);
+                    push(&effect.name, placements, None);
                 }
             }
         }
@@ -9109,6 +9116,7 @@ impl VisionaryApp {
                         file,
                         name,
                         placements: vec![at; age],
+                        kill_at: None,
                     });
                 }
             }
