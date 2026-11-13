@@ -30995,7 +30995,15 @@ impl VisionaryApp {
         let content_height = scrubber_chart_height(rows.len());
         let viewport_height = ui.available_height().max(1.0);
         if rows.is_empty() {
-            ui.weak("No timeline events match the current filters.");
+            // Say which: a filter hiding events is fixed by changing the filters; a move with
+            // no events at all (its actions are in the fighter's code) has nothing to show.
+            if self.timeline_rows(total).is_empty() {
+                ui.weak(
+                    "This move has nothing on its timeline. Drag along the frame bar to scrub.",
+                );
+            } else {
+                ui.weak("The filters above hide this move's events.");
+            }
         }
         egui::ScrollArea::vertical()
             .id_salt("timeline_rows_v3")
