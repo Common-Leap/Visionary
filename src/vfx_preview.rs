@@ -171,7 +171,9 @@ impl VfxPreview {
                     continue;
                 }
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
-                for _ in 0..draw.frame.min(600) {
+                // The game updates an emitter once before its first draw: on the spawn frame
+                // it is already one step in (live capture: time 0 drawn after one Calculate).
+                for _ in 0..=draw.frame.min(600) {
                     s.step();
                 }
                 if s.count() == 0 {
