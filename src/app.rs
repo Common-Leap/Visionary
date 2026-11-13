@@ -8866,12 +8866,7 @@ impl VisionaryApp {
                 continue;
             }
             let (offset, euler) = spawn_with_random_ranges(ec);
-            let rotation = glam::Quat::from_euler(
-                glam::EulerRot::XYZ,
-                euler[0].to_radians(),
-                euler[1].to_radians(),
-                euler[2].to_radians(),
-            );
+            let rotation = effect_rotation(euler);
             let local = glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::splat(ec.scale.max(0.01)),
                 rotation,
@@ -15567,13 +15562,13 @@ impl VisionaryApp {
 
                                 ui.label("Rotation");
                                 ui.horizontal(|ui| {
-                                    for (axis, v) in EFFECT_ROTATION_AXIS_LABELS
-                                        .into_iter()
-                                        .zip(ec.rotation.iter_mut())
+                                    // Stored reversed (see `script_rotation`): X is the last.
+                                    for (axis, index) in
+                                        EFFECT_ROTATION_AXIS_LABELS.into_iter().zip([2, 1, 0])
                                     {
-                                        changed |=
-                                            ui.add(
-                                                egui::DragValue::new(v)
+                                        changed |= ui
+                                            .add(
+                                                egui::DragValue::new(&mut ec.rotation[index])
                                                     .speed(0.5)
                                                     .prefix(format!("{axis}: ")),
                                             )
@@ -15585,7 +15580,7 @@ impl VisionaryApp {
                                         ui,
                                         format!(
                                             "orig X {:.1} · Y {:.1} · Z {:.1}",
-                                            p.rotation[0], p.rotation[1], p.rotation[2]
+                                            p.rotation[2], p.rotation[1], p.rotation[0]
                                         ),
                                     );
                                 } else {
@@ -32229,6 +32224,30 @@ impl Hitbox {
     }
 }
 
+/// An effect call's rotation in the script's own order, degrees about X, Y and Z.
+///
+/// `EffectCall::rotation` holds the three spawn arguments reversed (every parser, exporter and
+/// the live wire agree on that layout, and saved projects use it). The script's arguments are
+/// X, Y, Z: measured in game, Mario's up air `(-4, 80, 96)` turns its arc 96 degrees about Z,
+/// not about X.
+fn script_rotation(ec: &crate::data::EffectCall) -> [f32; 3] {
+    [ec.rotation[2], ec.rotation[1], ec.rotation[0]]
+}
+
+/// An effect call's rotation (degrees about X, Y and Z) as the game turns it: X first, then Y,
+/// then Z (`Rz * Ry * Rx`). Read from the game: Mario's up air spawns sys_attack_arc with
+/// (-4, 80, 96), and its emitter matrix is exactly this times the emitter's own rotation;
+/// the other orders miss by up to 1.1. Single-axis rotations look the same in every order,
+/// which is why most effects lined up before.
+fn effect_rotation(euler: [f32; 3]) -> glam::Quat {
+    glam::Quat::from_euler(
+        glam::EulerRot::ZYX,
+        euler[2].to_radians(),
+        euler[1].to_radians(),
+        euler[0].to_radians(),
+    )
+}
+
 /// A spawn's offset and rotation with the random ranges its call asks for applied.
 ///
 /// `EFFECT`-shaped calls (`EFFECT`, `LANDING_EFFECT`, `FOOT_EFFECT` and their flips) carry, after
@@ -32240,7 +32259,7 @@ impl Hitbox {
 /// keeps one angle from frame to frame instead of jittering.
 fn spawn_with_random_ranges(ec: &crate::data::EffectCall) -> ([f32; 3], [f32; 3]) {
     let mut offset = ec.offset;
-    let mut euler = ec.rotation;
+    let mut euler = script_rotation(ec);
     let Some(ranges) = ec.extra_args.as_ref().and_then(|args| {
         let values: Vec<f32> = args
             .iter()
@@ -44735,5 +44754,43 @@ mod spawn_random_range_tests {
         assert!(euler[2] != 0.0 && euler[2].abs() <= 180.0, "{euler:?}");
         // The same call keeps its angle from frame to frame.
         assert_eq!(spawn_with_random_ranges(&flame), (offset, euler));
+    }
+}
+
+#[cfg(test)]
+mod effect_rotation_tests {
+    #[test]
+    fn the_up_air_arc_from_its_script_line_turns_as_in_game() {
+        let src = r#"unsafe extern "C" fn effect_attackairhi(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new("sys_attack_arc"), Hash40::new("sys_attack_arc"), Hash40::new("top"), 0, 10, 0, -4, 80, 96, 0.95, true, *EF_FLIP_YZ);
+    }
+}"#;
+        let call = crate::acmd::parse_effect_script(src)
+            .to_effect_calls()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(super::script_rotation(&call), [-4.0, 80.0, 96.0]);
+        let (_, euler) = super::spawn_with_random_ranges(&call);
+        assert_eq!(euler, [-4.0, 80.0, 96.0]);
+    }
+
+    #[test]
+    fn mario_up_air_arc_turns_as_in_game() {
+        // sys_attack_arc from Mario's up air: rotation (-4, 80, 96), scale 0.95, and the arc1
+        // emitter's own -10 degrees about Y. The game's arc1 matrix in model space, read live:
+        let game = glam::Mat3::from_cols_array_2d(&[
+            [-0.045, 0.322, -0.893],
+            [-0.936, -0.164, -0.012],
+            [-0.158, 0.879, 0.325],
+        ]);
+        let ours = glam::Mat3::from_quat(super::effect_rotation([-4.0, 80.0, 96.0]))
+            * glam::Mat3::from_rotation_y(-10f32.to_radians())
+            * 0.95;
+        for (a, b) in ours.to_cols_array().iter().zip(game.to_cols_array()) {
+            assert!((a - b).abs() < 0.01, "{ours:?} vs {game:?}");
+        }
     }
 }

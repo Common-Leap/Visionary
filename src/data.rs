@@ -9048,8 +9048,11 @@ pub struct EffectCall {
     pub spawn_func: String,
     pub bone_name: String,
     pub offset: [f32; 3],
-    /// Euler rotation in editor order `[X, Y, Z]`; ACMD spawn arguments are `Z, Y, X` and are
-    /// converted at the parser/export boundaries.
+    /// The spawn's three rotation arguments, stored in reverse of the script's order: the
+    /// script writes X, Y, Z, and this holds `[Z, Y, X]`. Every parser, exporter and the live
+    /// wire reverse it the same way and saved projects use this layout, so it stays; anything
+    /// that means an axis reads it through `script_rotation` (measured in game: Mario's up
+    /// air `-4, 80, 96` turns 96 degrees about Z).
     pub rotation: [f32; 3],
     pub scale: f32,
     /// `true` when the effect follows the bone (EFFECT_FOLLOW variants).
