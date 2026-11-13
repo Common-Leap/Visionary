@@ -9449,7 +9449,19 @@ impl VisionaryApp {
                             .or(label_at);
                         }
                         let name_at = label_at.or_else(|| {
-                            rs.world_to_screen(object.placement.col(3).truncate(), rect)
+                            // The middle of the object's skeleton, not its root, which for a
+                            // carried object (Link's bow) is well away from the model.
+                            let bones = crate::article_preview::object_bones(object);
+                            let centre = if bones.is_empty() {
+                                object.placement.col(3).truncate()
+                            } else {
+                                bones
+                                    .values()
+                                    .map(|m| m.col(3).truncate())
+                                    .sum::<glam::Vec3>()
+                                    / bones.len() as f32
+                            };
+                            rs.world_to_screen(centre, rect)
                         });
                         if let Some(at) = name_at {
                             ui.painter().text(
