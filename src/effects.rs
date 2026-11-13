@@ -132,12 +132,8 @@ pub struct LoadedEffect {
     pub texture_pool: Option<Vec<u8>>,
 }
 
-pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file = effect_library::NamcoEffectFile::load(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-
+/// Entry name (as written and lower case) to its emitter set index, -1 for none.
+pub fn entry_set_handles(file: &effect_library::NamcoEffectFile) -> HashMap<String, i32> {
     let mut handles = HashMap::new();
     for (name, entry) in file.entry_names.iter().zip(&file.entries) {
         // `emitter_set_id` is a 1-based handle and 0 means "none" — which is what a MULTI-PART
@@ -168,7 +164,15 @@ pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
         handles.insert(name.to_lowercase(), set_idx);
         handles.insert(name.clone(), set_idx);
     }
+    handles
+}
 
+pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file = effect_library::NamcoEffectFile::load(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let handles = entry_set_handles(&file);
     let ptcl = file
         .ptcl_file
         .as_ref()

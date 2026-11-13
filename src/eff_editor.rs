@@ -477,6 +477,10 @@ pub struct EffEditor {
 
     // Live-preview state
     eff_dirty_at: Option<Instant>,
+    /// Bumped on every edit and every load, so the 3D preview knows to rebuild what it draws.
+    edit_rev: u64,
+    /// Bring the selected effect into view in the list (it was picked from elsewhere).
+    scroll_to_selected: bool,
     /// Raised when the authored edits need to reach the running game. The app drains it
     /// (`take_live_deploy_request`) and services it by rebuilding this fighter's eff and
     /// hot-reloading it — the only per-emitter-exact path there is.
@@ -569,6 +573,8 @@ impl Default for EffEditor {
             pending_transplants: Vec::new(),
             pending_transplant_removals: Vec::new(),
             eff_dirty_at: None,
+            edit_rev: 0,
+            scroll_to_selected: false,
             live_deploy_request: false,
             live_deploy_at: None,
             sending: false,
@@ -886,11 +892,15 @@ fn attr_rows_by_index(
 
                 ui.horizontal(|ui| {
                     if let Some(orig) = orig {
-                        ui.label(
-                            egui::RichText::new(format!("orig {}", attr_text(attr, orig)))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
+                        // The file's value only matters once it differs; on every row it was
+                        // a column of noise repeating the field beside it.
+                        if edited {
+                            ui.label(
+                                egui::RichText::new(format!("was {}", attr_text(attr, orig)))
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
                         // Reset is per attribute rather than per group: with three hundred rows,
                         // "put this one back" is the operation you actually want, and the
                         // emitter-wide reset is still one button away.
@@ -1020,6 +1030,7 @@ impl EffEditor {
     }
 
     fn load_eff(&mut self, path: &Path) {
+        self.edit_rev += 1;
         self.load_error = None;
         self.ptcl = None;
         self.pristine.clear();
@@ -1205,7 +1216,7 @@ impl EffEditor {
                 .and_then(|s| s.emitters.get_mut(self.selected_emitter))
             {
                 em.texture_index = Some(index as u32);
-                self.eff_dirty_at = Some(Instant::now());
+                touch(&mut self.eff_dirty_at, &mut self.edit_rev);
             }
         }
     }
@@ -1646,7 +1657,30 @@ impl EffEditor {
     /// deploy — recording a transplant, for one — so the divergence is visible rather than
     /// silent, without taking the decision to send away from the user.
     pub fn mark_unsent(&mut self) {
-        self.eff_dirty_at = Some(Instant::now());
+        self.touch();
+    }
+
+    /// An edit happened: there is something unsent, and the preview is out of date.
+    fn touch(&mut self) {
+        touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+    }
+
+    /// Changes whenever what the editor holds changes (an edit or another file loaded).
+    pub fn edit_rev(&self) -> u64 {
+        self.edit_rev
+    }
+
+    /// The file the editor has open, as loaded (the base file, even when a merged build with
+    /// transplants is what was parsed).
+    pub fn loaded_path(&self) -> Option<&Path> {
+        self.loaded_path.as_deref()
+    }
+
+    /// The selected effect's name, as the game spawns it.
+    pub fn selected_entry_name(&self) -> Option<&str> {
+        self.entries
+            .get(self.selected_entry?)
+            .map(|entry| entry.name.as_str())
     }
 
     /// Ask the app to rebuild the live carrier and hand it to the running game.
@@ -1924,10 +1958,17 @@ impl EffEditor {
         };
         self.selected_entry = self.entries.iter().position(|e| e.name == want);
         self.selected_emitter = 0;
+        self.scroll_to_selected = true;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, link: &GameLink) {
-        if !self.open {
+    /// Per-frame work while the Effects page is open: scan the files, and apply a queued load
+    /// and the project's edits to it. Drawing is done by the `page_*` parts the app lays out.
+    pub fn update(&mut self, ctx: &egui::Context, link: &GameLink) {
+        // A project load queues its edits here; they apply even while the page is closed, so
+        // the project store and the preview see them without the page having been opened.
+        let pending = self.pending_load.is_some()
+            && (self.pending_edits.is_some() || self.pending_structure.is_some());
+        if !self.open && !pending {
             return;
         }
         link.ensure_started();
@@ -1958,60 +1999,36 @@ impl EffEditor {
             self.apply_pending_select();
         }
 
-        // NOTE: no auto-apply. `eff_dirty_at` now only marks "there are unsent changes" for
-        // the Send button; nothing rebuilds or uploads until the user asks. Editing a colour
-        // used to queue a full carrier rebuild + in-game reload a moment after every change.
+        // No auto-apply: `eff_dirty_at` only marks "there are unsent changes" for the Send
+        // button; nothing is uploaded to the game until the user asks. The 3D preview follows
+        // every edit on its own (see `edit_rev`).
 
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("eff_editor"),
-            egui::ViewportBuilder::default()
-                .with_app_id(crate::app_icon::APP_ID)
-                .with_icon(crate::app_icon::viewport_icon())
-                .with_title("Eff Editor — Visionary")
-                .with_inner_size([1120.0, 680.0])
-                .with_min_inner_size([760.0, 420.0]),
-            |ui, class| {
-                // Draw inside a CentralPanel so the window gets the normal panel background
-                // (drawing straight into the viewport root left it near-black).
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    self.ui_contents(ui, link);
-                });
-                if class != egui::ViewportClass::EmbeddedWindow
-                    && ui.ctx().input(|i| i.viewport().close_requested())
-                {
-                    self.open = false;
-                }
-                // Live values change while the game runs — keep the panel fresh.
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(200));
-            },
-        );
+        // Live values change while the game runs: keep the page fresh.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
 
-    fn ui_contents(&mut self, ui: &mut Ui, link: &GameLink) {
+    /// The strip across the top of the Effects page: game connection, Send, and which file.
+    pub fn page_top(&mut self, ui: &mut Ui, link: &GameLink) {
         self.draw_header(ui, link);
-        ui.separator();
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(240.0);
-                self.draw_entry_list(ui, link);
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                ui.set_width(430.0);
-                self.draw_emitter_editor(ui);
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                // The right column now carries a texture preview on top of the game readout,
-                // which can outgrow a short window — scroll it rather than clipping it.
+    }
+
+    /// The effects in the open file.
+    pub fn page_left(&mut self, ui: &mut Ui, link: &GameLink) {
+        self.draw_entry_list(ui, link);
+    }
+
+    /// The selected effect's emitters, with its texture and the game's live values below.
+    pub fn page_right(&mut self, ui: &mut Ui, link: &GameLink) {
+        egui::Panel::bottom("eff_game_panel_split")
+            .resizable(true)
+            .default_size(240.0)
+            .min_size(60.0)
+            .show_inside(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("eff_game_panel")
-                    .show(ui, |ui| {
-                        self.draw_game_panel(ui, link);
-                    });
+                    .show(ui, |ui| self.draw_game_panel(ui, link));
             });
-        });
+        egui::CentralPanel::default().show_inside(ui, |ui| self.draw_emitter_editor(ui));
     }
 
     fn draw_header(&mut self, ui: &mut Ui, link: &GameLink) {
@@ -2110,110 +2127,22 @@ impl EffEditor {
             }
             if link.status() != LinkStatus::Connected {
                 if let Some(err) = link.last_error() {
-                    ui.label(
-                        egui::RichText::new(err)
-                            .small()
-                            .color(egui::Color32::DARK_GRAY),
-                    );
-                }
-            }
-            ui.separator();
-
-            ui.label(egui::RichText::new(self.export_root.display().to_string()).small())
-                .on_hover_text(
-                    "Where this window reads base .eff files from. Follows the data root you \
-                     opened in the main window until you pick one here.",
-                );
-            if ui.small_button("Change").clicked() {
-                let mut dialog = rfd::FileDialog::new().set_title("Select ArcExplorer export root");
-                // Start where we already are, not in the launch folder.
-                if self.export_root.is_dir() {
-                    dialog = dialog.set_directory(&self.export_root);
-                }
-                if let Some(dir) = dialog.pick_folder() {
-                    self.set_export_root(dir.clone());
-                    // Remembered across restarts, and it outranks the data root next launch —
-                    // picking a folder here used to last only as long as the session.
-                    crate::app::save_config_path(crate::app::EFF_ROOT_CONFIG_KEY, &dir);
-                }
-            }
-            if ui.small_button("Rescan").clicked() {
-                self.rescan();
-            }
-        });
-
-        // ── Edits first: the project's edited fighters are what this window is FOR. ──
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Editing:").strong());
-            if self.edit_sources.is_empty() {
-                ui.label(
-                    egui::RichText::new(
-                        "nothing yet — transplant an effect or tweak an emitter to start",
-                    )
-                    .small()
-                    .color(egui::Color32::GRAY),
-                );
-            }
-            let sources = self.edit_sources.clone();
-            for src in &sources {
-                let selected = self.loaded_path.as_deref() == Some(src.base.as_path())
-                    || (src.alt_base.is_some()
-                        && self.loaded_path.as_deref() == src.alt_base.as_deref());
-                let mut badges: Vec<String> = Vec::new();
-                if src.transplant_count > 0 {
-                    badges.push(format!(
-                        "{} transplant{}",
-                        src.transplant_count,
-                        if src.transplant_count == 1 { "" } else { "s" }
-                    ));
-                }
-                if src.authored > 0 {
-                    badges.push(format!("{} emitter edits", src.authored));
-                }
-                if src.textures > 0 {
-                    badges.push(format!(
-                        "{} texture{}",
-                        src.textures,
-                        if src.textures == 1 { "" } else { "s" }
-                    ));
-                }
-                let label = if badges.is_empty() {
-                    src.fighter.clone()
-                } else {
-                    format!("{} ({})", src.fighter, badges.join(", "))
-                };
-                // A slotted fighter whose merged build is missing signals a failed merge —
-                // surface it instead of silently showing the base file.
-                let broken = src.transplant_count > 0 && src.merged.is_none();
-                let text = if broken {
-                    egui::RichText::new(format!("⚠ {label}")).color(egui::Color32::from_rgb(230, 190, 80))
-                } else {
-                    egui::RichText::new(label)
-                };
-                let resp = ui.selectable_label(selected, text).on_hover_text(if broken {
-                    "EFF transplant merge output missing — check the status bar for the merge error, then transplant again"
-                        .to_string()
-                } else {
-                    format!("open {}'s eff with its edits applied", src.fighter)
-                });
-                if resp.clicked() {
-                    self.pending_load = Some(src.base.clone());
+                    // The full reason is long; it lives on hover rather than across the page.
+                    ui.label(egui::RichText::new("why?").small().weak())
+                        .on_hover_text(err);
                 }
             }
         });
 
-        // ── Base game files: reference source only. ──────────────────────────────────
+        // Which file: the project's edited ones first, then any of the game's.
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new("Base files (reference):")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.file_filter)
-                    .hint_text("filter (e.g. mario)")
-                    .desired_width(140.0),
-            );
+            self.draw_file_picker(ui);
+        });
+    }
+
+    fn draw_file_picker(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("File").strong());
+        {
             let loaded_name = self
                 .loaded_path
                 .as_ref()
@@ -2221,16 +2150,22 @@ impl EffEditor {
                 .map(|n| {
                     let n = n.to_string_lossy();
                     if self.loaded_is_merged {
-                        format!("{n} (+ transplants)")
+                        format!("{n} (with borrowed effects)")
                     } else {
                         n.to_string()
                     }
                 })
-                .unwrap_or_else(|| "— none —".into());
+                .unwrap_or_else(|| "none".into());
             egui::ComboBox::from_id_salt("eff_file_combo")
                 .selected_text(loaded_name)
-                .width(300.0)
+                .width(260.0)
+                .height(420.0)
                 .show_ui(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.file_filter)
+                            .hint_text("Search, e.g. mario")
+                            .desired_width(240.0),
+                    );
                     let filter = self.file_filter.to_lowercase();
                     let files: Vec<PathBuf> = self
                         .eff_files
@@ -2254,13 +2189,85 @@ impl EffEditor {
                         }
                     }
                 });
-            if let Some(err) = &self.scan_error {
-                ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
+        }
+        egui::containers::menu::MenuButton::new("Game files").ui(ui, |ui| {
+            ui.label(egui::RichText::new(self.export_root.display().to_string()).small())
+                .on_hover_text(
+                    "Where effect files are read from. Follows the data folder opened in the \
+                     main window until you pick one here.",
+                );
+            if ui.button("Change folder").clicked() {
+                let mut dialog = rfd::FileDialog::new().set_title("Select ArcExplorer export root");
+                // Start where we already are, not in the launch folder.
+                if self.export_root.is_dir() {
+                    dialog = dialog.set_directory(&self.export_root);
+                }
+                if let Some(dir) = dialog.pick_folder() {
+                    self.set_export_root(dir.clone());
+                    // Remembered across restarts, and it outranks the data root next launch —
+                    // picking a folder here used to last only as long as the session.
+                    crate::app::save_config_path(crate::app::EFF_ROOT_CONFIG_KEY, &dir);
+                }
             }
-            if let Some(err) = &self.load_error {
-                ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
+            if ui.button("Look for files again").clicked() {
+                self.rescan();
             }
         });
+        if let Some(err) = &self.scan_error {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
+        }
+        if let Some(err) = &self.load_error {
+            ui.colored_label(egui::Color32::from_rgb(220, 120, 90), err);
+        }
+        if !self.edit_sources.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("Edited").weak());
+        }
+        {
+            let sources = self.edit_sources.clone();
+            for src in &sources {
+                let selected = self.loaded_path.as_deref() == Some(src.base.as_path())
+                    || (src.alt_base.is_some()
+                        && self.loaded_path.as_deref() == src.alt_base.as_deref());
+                let mut badges: Vec<String> = Vec::new();
+                if src.transplant_count > 0 {
+                    badges.push(format!("{} borrowed", src.transplant_count));
+                }
+                if src.authored > 0 {
+                    badges.push(format!("{} changed", src.authored));
+                }
+                if src.textures > 0 {
+                    badges.push(format!(
+                        "{} texture{}",
+                        src.textures,
+                        if src.textures == 1 { "" } else { "s" }
+                    ));
+                }
+                let label = if badges.is_empty() {
+                    src.fighter.clone()
+                } else {
+                    format!("{} ({})", src.fighter, badges.join(", "))
+                };
+                // A slotted fighter whose merged build is missing signals a failed merge —
+                // surface it instead of silently showing the base file.
+                let broken = src.transplant_count > 0 && src.merged.is_none();
+                let text = if broken {
+                    egui::RichText::new(format!("⚠ {label}"))
+                        .color(egui::Color32::from_rgb(230, 190, 80))
+                } else {
+                    egui::RichText::new(label)
+                };
+                let resp = ui.selectable_label(selected, text).on_hover_text(if broken {
+                    "EFF transplant merge output missing — check the status bar for the merge error, then transplant again"
+                        .to_string()
+                } else {
+                    format!("open {}'s eff with its edits applied", src.fighter)
+                });
+                if resp.clicked() {
+                    self.pending_load = Some(src.base.clone());
+                }
+            }
+        }
     }
 
     fn draw_entry_list(&mut self, ui: &mut Ui, link: &GameLink) {
@@ -2271,7 +2278,10 @@ impl EffEditor {
             .filter(|e| edited_sets.contains(&e.set_idx))
             .count();
         ui.horizontal(|ui| {
-            ui.label(format!("Entries ({})", self.entries.len()));
+            ui.label(
+                egui::RichText::new(format!("Effects in this file ({})", self.entries.len()))
+                    .strong(),
+            );
             if edited_entries > 0 {
                 ui.label(
                     egui::RichText::new(format!("{edited_entries} edited"))
@@ -2304,7 +2314,7 @@ impl EffEditor {
             .id_salt("eff_entries")
             .show(ui, |ui| {
                 if !self.entries.iter().any(|entry| entry.name.to_lowercase().contains(&filter)) {
-                    ui.weak(if self.entries.is_empty() { "Open an effect file to browse entries" } else { "No matching effects" });
+                    ui.weak(if self.entries.is_empty() { "Open an effect file above to see its effects" } else { "No matching effects" });
                 }
                 for (i, entry) in self.entries.iter().enumerate() {
                     if !filter.is_empty() && !entry.name.to_lowercase().contains(&filter) {
@@ -2354,15 +2364,19 @@ impl EffEditor {
                         }
                         if transplant_entries.contains_key(&entry.name) {
                             ui.label(
-                                egui::RichText::new("TRANSPLANTED")
+                                egui::RichText::new("BORROWED")
                                     .small()
                                     .strong()
                                     .color(egui::Color32::from_rgb(190, 140, 255)),
                             )
-                            .on_hover_text("This entry came from an EFF transplant");
+                            .on_hover_text("Borrowed from another effect file");
                         }
                         if response.clicked() {
                             clicked = Some(i);
+                        }
+                        if selected && self.scroll_to_selected {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                            self.scroll_to_selected = false;
                         }
                     });
                 }
@@ -2382,7 +2396,10 @@ impl EffEditor {
         // leaves the previous emitter's texture on screen, with working Replace buttons.
         self.selected_texture = None;
         let Some(entry_idx) = self.selected_entry else {
-            ui.colored_label(egui::Color32::GRAY, "Select an entry to edit its emitters.");
+            ui.colored_label(
+                egui::Color32::GRAY,
+                "Pick an effect on the left to change how it looks. It plays in the view as you edit.",
+            );
             return;
         };
         let set_idx = self.entries[entry_idx].set_idx;
@@ -2448,7 +2465,7 @@ impl EffEditor {
                     p.restore(e);
                 }
             }
-            self.eff_dirty_at = Some(Instant::now());
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
 
         // Emitter tabs. Edited ones carry a dot and are tinted: a set can have twenty
@@ -2512,7 +2529,7 @@ impl EffEditor {
                         .num_columns(3)
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.label("particle scale (all axes)")
+                            ui.label("Particle size")
                                 .on_hover_text("Scales X, Y and Z together, keeping the ratio the emitter was authored with.");
                             let base = attr_f32(em, particle_scale[0]);
                             let mut v = base;
@@ -2528,19 +2545,22 @@ impl EffEditor {
                                 }
                                 changed = true;
                             }
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "orig {:.3}",
-                                    pr.attrs
-                                        .get(crate::eff_attrs::index_of(particle_scale[0]).unwrap_or(0))
-                                        .copied()
-                                        .flatten()
-                                        .map(|v| v.as_f32())
-                                        .unwrap_or(0.0)
-                                ))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                            );
+                            let was = pr
+                                .attrs
+                                .get(crate::eff_attrs::index_of(particle_scale[0]).unwrap_or(0))
+                                .copied()
+                                .flatten()
+                                .map(|v| v.as_f32())
+                                .unwrap_or(0.0);
+                            if (was - attr_f32(em, particle_scale[0])).abs() > 1e-6 {
+                                ui.label(
+                                    egui::RichText::new(format!("was {was:.3}"))
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                ui.label("");
+                            }
                             ui.end_row();
                         });
                 }
@@ -2561,48 +2581,53 @@ impl EffEditor {
                                     k.b = rgb[2];
                                     changed = true;
                                 }
-                                ui.label("frame");
+                                ui.label("at").on_hover_text(
+                                    "When in the particle's life this colour is reached",
+                                );
                                 changed |= ui
-                                    .add(egui::DragValue::new(&mut k.frame).speed(0.1))
+                                    .add(egui::DragValue::new(&mut k.frame).speed(0.01))
                                     .changed();
                                 if let Some(o) = orig.get(i) {
-                                    let mut orig_rgb = [o.r, o.g, o.b];
-                                    ui.add_enabled_ui(false, |ui| {
-                                        ui.color_edit_button_rgb(&mut orig_rgb);
-                                    });
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "orig [{:.2} {:.2} {:.2}]",
-                                            o.r, o.g, o.b
-                                        ))
-                                        .small()
-                                        .color(egui::Color32::GRAY),
-                                    );
+                                    if (o.r, o.g, o.b) != (k.r, k.g, k.b) {
+                                        ui.label(
+                                            egui::RichText::new("was").small().color(egui::Color32::GRAY),
+                                        );
+                                        let mut orig_rgb = [o.r, o.g, o.b];
+                                        ui.add_enabled_ui(false, |ui| {
+                                            ui.color_edit_button_rgb(&mut orig_rgb);
+                                        })
+                                        .response
+                                        .on_hover_text(format!("{:.2} {:.2} {:.2}", o.r, o.g, o.b));
+                                    }
                                 }
                             });
                         }
                     };
-                key_table(ui, "color0 keys", &mut em.color0, &pr.color0);
-                key_table(ui, "color1 keys", &mut em.color1, &pr.color1);
+                key_table(ui, "Colour over its life", &mut em.color0, &pr.color0);
+                key_table(ui, "Second colour over its life", &mut em.color1, &pr.color1);
 
                 if !em.alpha0_keys.is_empty() {
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("alpha keys").strong());
+                    ui.label(egui::RichText::new("Opacity over its life").strong());
                     for (i, k) in em.alpha0_keys.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(egui::DragValue::new(&mut k.r).speed(0.01).range(0.0..=4.0))
                                 .changed();
-                            ui.label("frame");
+                            ui.label("at").on_hover_text(
+                                "When in the particle's life this opacity is reached",
+                            );
                             changed |= ui
-                                .add(egui::DragValue::new(&mut k.frame).speed(0.1))
+                                .add(egui::DragValue::new(&mut k.frame).speed(0.01))
                                 .changed();
                             if let Some(o) = pr.alpha0_keys.get(i) {
-                                ui.label(
-                                    egui::RichText::new(format!("orig {:.3}", o.r))
-                                        .small()
-                                        .color(egui::Color32::GRAY),
-                                );
+                                if (o.r - k.r).abs() > 1e-6 {
+                                    ui.label(
+                                        egui::RichText::new(format!("was {:.2}", o.r))
+                                            .small()
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                }
                             }
                         });
                     }
@@ -2645,7 +2670,7 @@ impl EffEditor {
         self.selected_texture = texture_actions;
 
         if changed {
-            self.eff_dirty_at = Some(Instant::now());
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
     }
 
@@ -2836,7 +2861,7 @@ impl EffEditor {
         }
         if changed {
             self.clamp_selected_emitter(set_idx);
-            self.eff_dirty_at = Some(Instant::now());
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
     }
 
@@ -2895,7 +2920,7 @@ impl EffEditor {
                 });
         }
         if changed {
-            self.eff_dirty_at = Some(Instant::now());
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
     }
 
@@ -3106,7 +3131,7 @@ impl EffEditor {
         });
 
         if changed {
-            self.eff_dirty_at = Some(Instant::now());
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
     }
 
@@ -3243,7 +3268,7 @@ impl EffEditor {
                     .and_then(|s| s.emitters.get_mut(self.selected_emitter))
                 {
                     em.texture_index = Some(i);
-                    self.eff_dirty_at = Some(Instant::now());
+                    touch(&mut self.eff_dirty_at, &mut self.edit_rev);
                 }
             }
         }
@@ -3600,7 +3625,7 @@ impl EffEditor {
             }
         }
         self.selected_texture = None;
-        self.eff_dirty_at = Some(Instant::now());
+        touch(&mut self.eff_dirty_at, &mut self.edit_rev);
     }
 
     fn draw_texture_import(&mut self, ui: &mut Ui, index: usize, texture: &TextureInfo) {
@@ -3743,7 +3768,7 @@ impl EffEditor {
                                 ),
                             };
                             self.texture_note = Some((note, true));
-                            self.eff_dirty_at = Some(Instant::now());
+                            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
                         }
                         Err(e) => self.texture_note = Some((format!("import failed: {e}"), false)),
                     }
@@ -3765,7 +3790,7 @@ impl EffEditor {
                             png_path: String::new(),
                             raw: false,
                         });
-                    self.eff_dirty_at = Some(Instant::now());
+                    touch(&mut self.eff_dirty_at, &mut self.edit_rev);
                 }
             }
         });
@@ -4588,4 +4613,11 @@ mod tests {
         assert!(editor.pending_edits.is_some());
         assert!(editor.pending_edits_push_live);
     }
+}
+
+/// An edit happened: there is something unsent, and the preview is out of date. A free
+/// function over the two fields so it can run while an emitter is mutably borrowed.
+fn touch(dirty_at: &mut Option<Instant>, edit_rev: &mut u64) {
+    *dirty_at = Some(Instant::now());
+    *edit_rev += 1;
 }

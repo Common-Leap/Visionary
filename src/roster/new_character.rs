@@ -252,7 +252,7 @@ impl NewCharacterView {
                     if ui
                         .add_enabled(
                             can_create,
-                            egui::Button::new(RichText::new("＋ Create character").strong()),
+                            egui::Button::new(RichText::new("+ Create character").strong()),
                         )
                         .on_hover_text(
                             "Files go to Visionary's authored folder and the character imports immediately",

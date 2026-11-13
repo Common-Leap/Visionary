@@ -3527,6 +3527,8 @@ pub struct VisionaryApp {
     live_overrides: crate::game_link::LiveOverrides,
     /// Authored .eff edits per fighter (project store; synced from the eff editor).
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
+    /// The fighter's effect file rebuilt with the project's effect edits, for the 3D preview.
+    effect_preview_build: EffectPreviewBuild,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3573,6 +3575,21 @@ pub struct VisionaryApp {
     transplant_placement: Option<([f32; 2], [f32; 2])>,
     /// Per-frame timing breakdown, active only when `VISIONARY_PROFILE` is set.
     perf: FrameProfiler,
+}
+
+/// Effect files rebuilt with the project's effect edits, so the 3D preview shows what the game
+/// will. The rebuild is the exporter's own (`rebuild_eff_bytes`) and runs on a thread a moment
+/// after the last edit.
+#[derive(Default)]
+struct EffectPreviewBuild {
+    /// What the last rebuild was for: the file's draw path, the editor's edit count and the
+    /// project's transplant and texture counts for that fighter.
+    built_for: Option<(PathBuf, u64, usize, usize)>,
+    /// When the next rebuild starts: edits are let settle so a drag does not rebuild per frame.
+    due: Option<std::time::Instant>,
+    running: Option<std::sync::mpsc::Receiver<(PathBuf, Option<std::sync::Arc<Vec<u8>>>)>>,
+    /// Draw path to the edited bytes, or `None` for "back to the file on disk".
+    overrides: HashMap<PathBuf, Option<std::sync::Arc<Vec<u8>>>>,
 }
 
 /// Coarse per-section frame timing, printed periodically to stderr.
@@ -3936,6 +3953,7 @@ impl VisionaryApp {
             game_link: crate::game_link::GameLink::default(),
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
+            effect_preview_build: EffectPreviewBuild::default(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -7470,7 +7488,7 @@ impl VisionaryApp {
                                     ui.horizontal(|ui| {
                                         ui.add_space(12.0);
                                         ui.label(
-                                            RichText::new(format!("＋ {}  (c{:02} of {})", entry.display_name, entry.slot, entry.donor))
+                                            RichText::new(format!("+ {}  (c{:02} of {})", entry.display_name, entry.slot, entry.donor))
                                                 .small()
                                                 .strong()
                                                 .color(Color32::from_rgb(130, 225, 150)),
@@ -8560,6 +8578,148 @@ impl VisionaryApp {
     }
 
     /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
+    /// The path the 3D preview draws the effect editor's open file under: the selected
+    /// fighter's own effect path when the editor has that fighter's file open, so the move's
+    /// effects pick up the edits, otherwise the file itself.
+    fn effect_editor_draw_path(&self) -> Option<(String, PathBuf)> {
+        let rel = self.eff_editor.loaded_rel()?;
+        let fighter = crate::mod_project::fighter_from_source_rel(&rel);
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.clone());
+        let path = match (&self.current_eff_path, selected) {
+            (Some(own), Some(name)) if name == fighter => own.clone(),
+            _ => self.eff_editor.loaded_path()?.to_path_buf(),
+        };
+        Some((fighter, path))
+    }
+
+    /// Start rebuilding the preview's copy of the editor's file after an edit, and collect a
+    /// finished rebuild.
+    fn poll_effect_preview_build(&mut self, ctx: &egui::Context) {
+        let build = &mut self.effect_preview_build;
+        if let Some(running) = &build.running {
+            match running.try_recv() {
+                Ok((path, bytes)) => {
+                    build.overrides.insert(path, bytes);
+                    build.running = None;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => build.running = None,
+            }
+        }
+        let Some((fighter, path)) = self.effect_editor_draw_path() else {
+            return;
+        };
+        let (transplants, textures) = self
+            .eff_mods
+            .get(&fighter)
+            .map(|e| (e.transplants.len(), e.textures.len()))
+            .unwrap_or_default();
+        let key = (
+            path.clone(),
+            self.eff_editor.edit_rev(),
+            transplants,
+            textures,
+        );
+        if self.effect_preview_build.built_for.as_ref() != Some(&key) {
+            self.effect_preview_build.built_for = Some(key);
+            self.effect_preview_build.due =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+        }
+        let Some(due) = self.effect_preview_build.due else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now < due || self.effect_preview_build.running.is_some() {
+            ctx.request_repaint_after(due.saturating_duration_since(now));
+            return;
+        }
+        self.effect_preview_build.due = None;
+        self.sync_eff_mods_from_editor();
+        let eff = self
+            .eff_mods
+            .get(&fighter)
+            .cloned()
+            .filter(|e| !e.is_empty());
+        let (send, receive) = std::sync::mpsc::channel();
+        let Some(eff) = eff else {
+            // Nothing edited: draw the file on disk.
+            let _ = send.send((path, None));
+            self.effect_preview_build.running = Some(receive);
+            return;
+        };
+        let source = self.resolve_eff_source(&eff.source_rel);
+        let root = self.eff_editor.export_root().to_path_buf();
+        std::thread::spawn(move || {
+            let bytes = std::fs::read(&source)
+                .ok()
+                .and_then(|src| crate::eff_export::rebuild_eff_bytes(&src, &eff, Some(&root)).ok())
+                .map(std::sync::Arc::new);
+            let _ = send.send((path, bytes));
+        });
+        self.effect_preview_build.running = Some(receive);
+    }
+
+    /// Go to the Effects page with this effect selected, in whichever file holds it: the
+    /// fighter's own, or the shared one for the common `sys_` effects.
+    fn open_effect_for_editing(&mut self, name: &str) {
+        let shared = self
+            .preview_effect_files()
+            .into_iter()
+            .find(|path| path.ends_with("ef_common.eff"));
+        let file = if name.to_ascii_lowercase().starts_with("sys_") {
+            shared
+        } else {
+            self.current_eff_path.clone()
+        };
+        self.open_effects_page();
+        if let Some(file) = file {
+            self.eff_editor.queue_load(&file);
+        }
+        self.eff_editor.queue_select(name);
+    }
+
+    /// Show the Effects page, with the selected fighter's effect file open in it.
+    fn open_effects_page(&mut self) {
+        self.eff_editor.open = true;
+        self.roster.open = false;
+        self.node_workspace = false;
+        if self.eff_editor.loaded_path().is_none() {
+            if let Some(path) = self.current_eff_path.clone() {
+                self.eff_editor.queue_load(&path);
+            }
+        }
+    }
+
+    /// The Effects page: the open file's effects on the left, the selected one's emitters on
+    /// the right, and the 3D view between them showing the move with every edit applied.
+    fn draw_effects_page(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        egui::Panel::top("effects_page_top").show_inside(ui, |ui| {
+            self.eff_editor.page_top(ui, &self.game_link);
+        });
+        egui::Panel::left("effects_page_left")
+            .default_size(260.0)
+            .min_size(160.0)
+            .resizable(true)
+            .show_inside(ui, |ui| {
+                self.eff_editor.page_left(ui, &self.game_link);
+            });
+        egui::Panel::right("effects_page_right")
+            .default_size(460.0)
+            .min_size(280.0)
+            .resizable(true)
+            .show_inside(ui, |ui| {
+                self.eff_editor.page_right(ui, &self.game_link);
+            });
+        egui::CentralPanel::default().show_inside(ui, |ui| self.draw_viewport(ui, frame));
+    }
+
     /// The effect files a move can draw from: the fighter's own, then the shared one.
     fn preview_effect_files(&self) -> Vec<std::path::PathBuf> {
         let common = self
@@ -8706,6 +8866,39 @@ impl VisionaryApp {
                 }
             }
         }
+        // On the Effects page, the selected effect plays from the move's first frame at the
+        // fighter's feet when the move itself does not spawn it, so any effect can be seen.
+        if self.eff_editor.open {
+            let selected = self.eff_editor.selected_entry_name().map(str::to_owned);
+            let in_move = |name: &str| {
+                self.state
+                    .effects
+                    .iter()
+                    .chain(facing.iter())
+                    .any(|ec| ec.effect_name.eq_ignore_ascii_case(name))
+                    || objects.iter().any(|object| {
+                        object
+                            .kind
+                            .effects
+                            .iter()
+                            .any(|effect| effect.name.eq_ignore_ascii_case(name))
+                    })
+            };
+            if let (Some(name), Some((_, file))) = (selected, self.effect_editor_draw_path()) {
+                if !in_move(&name) {
+                    let at = bones_at(FIRST_GAME_FRAME)
+                        .get("top")
+                        .map(|m| glam::Mat4::from_translation(m.col(3).truncate()))
+                        .unwrap_or(glam::Mat4::IDENTITY);
+                    let age = frame_num.saturating_sub(FIRST_GAME_FRAME) as usize + 1;
+                    out.push(crate::vfx_preview::EffectDraw {
+                        file,
+                        name,
+                        placements: vec![at; age],
+                    });
+                }
+            }
+        }
         out
     }
 
@@ -8770,6 +8963,12 @@ impl VisionaryApp {
                     skel_path: self.current_skel_path.clone(),
                     effects,
                     effect_files: self.preview_effect_files(),
+                    effect_overrides: self
+                        .effect_preview_build
+                        .overrides
+                        .iter()
+                        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+                        .collect(),
                     repaint: ctx.clone(),
                     objects: objects
                         .iter()
@@ -11269,7 +11468,7 @@ impl VisionaryApp {
                 });
         }
 
-        ui.menu_button("＋ Add sound", |ui| {
+        ui.menu_button("+ Add sound", |ui| {
             ui.label("Add at the playhead:");
             for (func, hashes, has_tail) in crate::acmd::SOUND_FUNCS {
                 let name = sound_func_words(func).unwrap_or(func);
@@ -12483,7 +12682,7 @@ impl VisionaryApp {
             edit = reset_edit;
         }
 
-        ui.menu_button("＋ Add expression call", |ui| {
+        ui.menu_button("+ Add expression call", |ui| {
             for (label, call) in [
                 (
                     "Hit rumble",
@@ -12646,7 +12845,7 @@ impl VisionaryApp {
         }
 
         if ui
-            .small_button(format!("＋ Add at frame {}", self.state.current_frame))
+            .small_button(format!("+ Add at frame {}", self.state.current_frame))
             .on_hover_text(
                 "Insert an unconditional REVERSE_LR call at the current one-based game frame.",
             )
@@ -13184,7 +13383,7 @@ impl VisionaryApp {
 
         if ui
             .small_button(format!(
-                "＋ Add at frame {}",
+                "+ Add at frame {}",
                 self.state.current_frame
             ))
             .on_hover_text(
@@ -13340,7 +13539,7 @@ impl VisionaryApp {
         }
 
         if ui
-            .small_button(format!("＋ Add at frame {}", self.state.current_frame))
+            .small_button(format!("+ Add at frame {}", self.state.current_frame))
             .on_hover_text(
                 "Insert an unconditional set_consider_ground_friction call using the measured reserve-main attribute.",
             )
@@ -13642,7 +13841,7 @@ impl VisionaryApp {
         }
 
         if ui
-            .small_button(format!("＋ Add at frame {}", self.state.current_frame))
+            .small_button(format!("+ Add at frame {}", self.state.current_frame))
             .on_hover_text("Insert an unconditional SET_AIR call at the current game frame.")
             .clicked()
         {
@@ -14487,6 +14686,7 @@ impl VisionaryApp {
             if visible.is_empty() {
                 ui.colored_label(egui::Color32::GRAY, "No effects on this frame");
             } else {
+                let mut change_look: Option<String> = None;
                 egui::ScrollArea::vertical()
                     .id_salt("effects_list")
                     .max_height(180.0)
@@ -14554,15 +14754,31 @@ impl VisionaryApp {
                                         if selected { None } else { Some(i) };
                                     self.primary_tab = PrimaryEditorTab::Effects;
                                 }
+                                if !effect.effect_name.is_empty()
+                                    && effect.control.is_none()
+                                    && !is_null_effect_sentinel(effect)
+                                    && ui
+                                        .small_button("Change look")
+                                        .on_hover_text(
+                                            "Open this effect on the Effects page to change its \
+                                             colours, size and particles",
+                                        )
+                                        .clicked()
+                                {
+                                    change_look = Some(effect.effect_name.clone());
+                                }
                             });
                         }
                     });
+                if let Some(name) = change_look {
+                    self.open_effect_for_editing(&name);
+                }
             }
 
             // Two buttons rather than one with a picker: a spawn and a colour command share
             // the list and nothing else, so which one is being added decides every field.
             let add_color = ui
-                .small_button("＋ Add colour command")
+                .small_button("+ Add colour command")
                 .on_hover_text(
                     "Tint the fighter's model or the screen flash on this frame. A colour \
                      command has no graphic, joint, or position.",
@@ -14629,7 +14845,7 @@ impl VisionaryApp {
                 self.push_effect_rules();
             }
 
-            if ui.small_button("＋ Add effect call").clicked() {
+            if ui.small_button("+ Add effect call").clicked() {
                 self.pending_capture = None;
                 let call = crate::data::EffectCall {
                     effect_name: "sys_hit_elec".into(),
@@ -19255,6 +19471,9 @@ impl VisionaryApp {
         // export tree. They are written after `run_export` succeeds so a refused
         // ACMD/effect export leaves nothing behind, and their warnings join the
         // same report rather than a second channel nobody reads.
+        // The page keeps its copy of the labels current only while it is open (comparing the
+        // whole map every frame cost more than the rest of an idle frame), so refresh it here.
+        self.roster.set_parameter_labels(&self.state.labels);
         match self.roster.export_into(
             &dest,
             &project.roster,
@@ -19817,7 +20036,6 @@ impl VisionaryApp {
                     self.eff_editor
                         .queue_structure_edits(eff.rosters.clone(), eff.entry_edits.clone());
                     self.eff_editor.queue_edits(eff.authored.clone());
-                    self.eff_editor.open = true;
                 }
             }
         }
@@ -30698,18 +30916,14 @@ impl eframe::App for VisionaryApp {
         // Restore/track persisted window geometry.
         self.update_window_geometry(&ctx);
 
-        // The editor is a separate viewport, so give it a real keyboard route in addition to
-        // the Windows menu. This is useful when the pointer is busy on another monitor and also
-        // makes the most important live-edit surface reachable without precise menu clicking.
+        // Ctrl+Shift+E goes to the Effects page and back.
         if ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::E)
         }) {
-            let was_closed = !self.eff_editor.open;
-            self.eff_editor.open = true;
-            if was_closed {
-                if let Some(path) = self.current_eff_path.clone() {
-                    self.eff_editor.queue_load(&path);
-                }
+            if self.eff_editor.open {
+                self.eff_editor.open = false;
+            } else {
+                self.open_effects_page();
             }
         }
 
@@ -30901,16 +31115,20 @@ impl eframe::App for VisionaryApp {
                     .selectable_label(
                         !self.node_workspace
                             && !self.roster.open
+                            && !self.eff_editor.open
                             && self.primary_tab != PrimaryEditorTab::Gimmicks,
                         egui::RichText::new("Classic editor").strong(),
                     )
                     .on_hover_text("Edit a move with the hitbox, motion, sound and effect tabs");
                 let nodes = ui
                     .selectable_label(
-                        self.node_workspace && !self.roster.open,
+                        self.node_workspace && !self.roster.open && !self.eff_editor.open,
                         egui::RichText::new("Move nodes").strong(),
                     )
                     .on_hover_text("Build or change a move with blocks, and see each block's code");
+                if classic.clicked() || nodes.clicked() {
+                    self.eff_editor.open = false;
+                }
                 if classic.clicked() {
                     self.node_workspace = false;
                     self.roster.open = false;
@@ -30932,6 +31150,7 @@ impl eframe::App for VisionaryApp {
                     .selectable_label(
                         !self.node_workspace
                             && !self.roster.open
+                            && !self.eff_editor.open
                             && self.primary_tab == PrimaryEditorTab::Gimmicks,
                         egui::RichText::new("Gimmicks").strong(),
                     )
@@ -30940,6 +31159,17 @@ impl eframe::App for VisionaryApp {
                     self.primary_tab = PrimaryEditorTab::Gimmicks;
                     self.node_workspace = false;
                     self.roster.open = false;
+                    self.eff_editor.open = false;
+                }
+                if ui
+                    .selectable_label(
+                        self.eff_editor.open && !self.roster.open,
+                        egui::RichText::new("Effects").strong(),
+                    )
+                    .on_hover_text("Change how the fighter's effects look, see it here as the move plays, and send it to the game  (Ctrl+Shift+E)")
+                    .clicked()
+                {
+                    self.open_effects_page();
                 }
                 if ui
                     .selectable_label(self.roster.open, egui::RichText::new("Characters").strong())
@@ -30947,6 +31177,7 @@ impl eframe::App for VisionaryApp {
                     .clicked()
                 {
                     self.roster.open = true;
+                    self.eff_editor.open = false;
                 }
                 ui.separator();
 
@@ -31053,14 +31284,6 @@ impl eframe::App for VisionaryApp {
                 egui::containers::menu::MenuButton::new("Tools")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
-                    let eff_toggle = ui
-                        .checkbox(&mut self.eff_editor.open, "Effect editor  Ctrl+Shift+E")
-                        .on_hover_text("Change effect files and see them in the game");
-                    if eff_toggle.changed() && self.eff_editor.open {
-                        if let Some(p) = self.current_eff_path.clone() {
-                            self.eff_editor.queue_load(&p);
-                        }
-                    }
                     ui.checkbox(&mut self.show_transplant, "Borrow effects")
                         .on_hover_text("Copy an effect from another fighter into this one");
                     ui.checkbox(&mut self.show_workspace, "Project files")
@@ -31330,7 +31553,8 @@ impl eframe::App for VisionaryApp {
             self.eff_editor.set_texture_imports(imports);
         }
         let t = self.perf.start();
-        self.eff_editor.show(&ctx, &self.game_link);
+        self.eff_editor.update(&ctx, &self.game_link);
+        self.poll_effect_preview_build(&ctx);
         if std::mem::take(&mut self.eff_editor.transplant_requested) {
             self.show_transplant = true;
         }
@@ -31349,7 +31573,6 @@ impl eframe::App for VisionaryApp {
                 root.join("fighter").is_dir().then_some(root)
             });
         self.roster.set_export_root(roster_export_root);
-        self.roster.set_parameter_labels(&self.state.labels);
         self.roster.set_project_saved(self.project_path.is_some());
         self.roster.prepare(
             &ctx,
@@ -31806,6 +32029,8 @@ impl eframe::App for VisionaryApp {
         } else if self.node_workspace {
             egui::CentralPanel::default().show_inside(ui, |ui| self.draw_node_workspace(ui, frame));
             self.commit_current_edits();
+        } else if self.eff_editor.open {
+            self.draw_effects_page(ui, frame);
         } else {
             // Left panel
             let t = self.perf.start();

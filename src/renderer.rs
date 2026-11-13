@@ -779,6 +779,8 @@ pub struct ViewportCallback {
     pub effects: Vec<crate::vfx_preview::EffectDraw>,
     /// Effect files to have loaded and built ahead of use (the fighter's own and the shared).
     pub effect_files: Vec<std::path::PathBuf>,
+    /// Effect files to draw from edited bytes instead of the file on disk (`None` reverts).
+    pub effect_overrides: Vec<(std::path::PathBuf, Option<std::sync::Arc<Vec<u8>>>)>,
     /// For painting again once effects still loading are ready.
     pub repaint: egui::Context,
 }
@@ -851,6 +853,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
             let t = state.camera.transforms(self.width, self.height);
             let eye = t.camera_pos;
+            for (file, bytes) in &self.effect_overrides {
+                state.vfx.set_override(device, queue, file, bytes.clone());
+            }
             for file in &self.effect_files {
                 state.vfx.preload(device, queue, file);
             }

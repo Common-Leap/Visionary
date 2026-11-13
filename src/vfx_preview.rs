@@ -43,7 +43,11 @@ struct Emitter {
 
 /// A loaded file. Textures and pipelines fill in from the warm thread; the rest is fixed.
 struct EffectFile {
-    renderer: render::EffectRenderer,
+    /// Shared with the next version of this file when an edit leaves the shaders alone, so an
+    /// edit does not recompile anything.
+    renderer: Arc<render::EffectRenderer>,
+    shader_hash: u64,
+    texture_hash: u64,
     /// Entry name (lower case) to emitter set index.
     sets: HashMap<String, usize>,
     emitters: Vec<Vec<Emitter>>,
@@ -80,10 +84,14 @@ struct WarmQueue {
 
 type Shared = Arc<(Mutex<WarmQueue>, Condvar)>;
 
+/// A file to load: its path, the edited bytes to use instead of the file on disk, the version
+/// it replaces (whose shaders and textures it may reuse) and the request's number.
+type LoadJob = (PathBuf, Option<Arc<Vec<u8>>>, Option<Arc<EffectFile>>, u64);
+
 struct Workers {
-    load: mpsc::Sender<PathBuf>,
+    load: mpsc::Sender<LoadJob>,
     /// Behind a lock only so the preview can live in shared render state.
-    loaded: Mutex<mpsc::Receiver<(PathBuf, Option<EffectFile>)>>,
+    loaded: Mutex<mpsc::Receiver<(PathBuf, u64, Option<EffectFile>)>>,
     warm: Shared,
 }
 
@@ -97,6 +105,11 @@ pub struct VfxPreview {
     queued: HashSet<(PathBuf, Job)>,
     /// Whether the last prepare skipped something still loading or warming.
     waiting: bool,
+    /// Edited bytes standing in for files on disk, and the number of the latest load of each
+    /// file, so an older load finishing late is dropped.
+    overrides: HashMap<PathBuf, Arc<Vec<u8>>>,
+    latest: HashMap<PathBuf, u64>,
+    next_load: u64,
 }
 
 impl VfxPreview {
@@ -109,6 +122,9 @@ impl VfxPreview {
             workers: None,
             queued: HashSet::new(),
             waiting: false,
+            overrides: HashMap::new(),
+            latest: HashMap::new(),
+            next_load: 0,
         }
     }
 
@@ -120,16 +136,22 @@ impl VfxPreview {
 
     fn workers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &Workers {
         self.workers.get_or_insert_with(|| {
-            let (load, jobs) = mpsc::channel::<PathBuf>();
+            let (load, jobs) = mpsc::channel::<LoadJob>();
             let (done, loaded) = mpsc::channel();
             let (target, depth) = (self.target, self.depth);
             let (d, q) = (device.clone(), queue.clone());
             let _ = std::thread::Builder::new()
                 .name("vfx load".into())
                 .spawn(move || {
-                    for path in jobs {
-                        let file = load_file(&d, &q, target, depth, &path);
-                        if done.send((path, file)).is_err() {
+                    for (path, bytes, previous, number) in jobs {
+                        let bytes = match bytes {
+                            Some(bytes) => Some(bytes),
+                            None => std::fs::read(&path).ok().map(Arc::new),
+                        };
+                        let file = bytes.and_then(|bytes| {
+                            load_file(&d, &q, target, depth, &bytes, previous.as_deref())
+                        });
+                        if done.send((path, number, file)).is_err() {
                             break;
                         }
                     }
@@ -166,9 +188,61 @@ impl VfxPreview {
             Some(_) => return None,
             None => {}
         }
-        let _ = self.workers(device, queue).load.send(path.to_path_buf());
+        self.start_load(device, queue, path, None);
         self.files.insert(path.to_path_buf(), Slot::Loading);
         None
+    }
+
+    fn start_load(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &Path,
+        previous: Option<Arc<EffectFile>>,
+    ) {
+        self.next_load += 1;
+        let number = self.next_load;
+        self.latest.insert(path.to_path_buf(), number);
+        let bytes = self.overrides.get(path).cloned();
+        let _ =
+            self.workers(device, queue)
+                .load
+                .send((path.to_path_buf(), bytes, previous, number));
+    }
+
+    /// Draw `path` from these bytes instead of the file on disk (`None` goes back to the
+    /// file). The current version keeps drawing until the new one is loaded, and an edit that
+    /// leaves the shaders and textures alone reuses them, so editing never flickers.
+    pub fn set_override(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &Path,
+        bytes: Option<Arc<Vec<u8>>>,
+    ) {
+        let same = match (self.overrides.get(path), &bytes) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        match bytes {
+            Some(bytes) => self.overrides.insert(path.to_path_buf(), bytes),
+            None => self.overrides.remove(path),
+        };
+        let previous = match self.files.get(path) {
+            Some(Slot::Ready(file)) => Some(file.clone()),
+            Some(Slot::Loading) => None,
+            // Never loaded: load it when something draws from it.
+            None => return,
+            Some(Slot::Failed) => {
+                self.files.insert(path.to_path_buf(), Slot::Loading);
+                None
+            }
+        };
+        self.start_load(device, queue, path, previous);
     }
 
     /// Take in files the loader finished, and queue the rest of a fighter's file to warm.
@@ -182,7 +256,12 @@ impl VfxPreview {
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
             .collect();
-        for (path, file) in finished {
+        for (path, number, file) in finished {
+            if self.latest.get(&path) != Some(&number) {
+                continue;
+            }
+            // The jobs queued for the version this replaces name that version's file.
+            self.queued.retain(|(p, _)| *p != path);
             let Some(file) = file else {
                 self.files.insert(path, Slot::Failed);
                 continue;
@@ -449,13 +528,29 @@ fn load_file(
     queue: &wgpu::Queue,
     target: wgpu::TextureFormat,
     depth: Option<wgpu::TextureFormat>,
-    path: &Path,
+    bytes: &[u8],
+    previous: Option<&EffectFile>,
 ) -> Option<EffectFile> {
-    let bytes = std::fs::read(path).ok()?;
-    let file = effect_library::NamcoEffectFile::load(&bytes).ok()?;
+    let file = effect_library::NamcoEffectFile::load(bytes).ok()?;
     let ptcl_file = file.ptcl_file.as_ref()?;
-    let shaders =
-        bnsh::ShaderFile::read(ptcl_file.shader_info.as_ref()?.binary_data.as_ref()?).ok()?;
+    let shader_bytes = ptcl_file.shader_info.as_ref()?.binary_data.as_ref()?;
+    let shader_hash = hash_bytes(shader_bytes);
+    let texture_hash = ptcl_file
+        .texture_info
+        .as_ref()
+        .and_then(|info| info.binary_data.as_deref())
+        .map(hash_bytes)
+        .unwrap_or(0);
+    let renderer = match previous.filter(|p| p.shader_hash == shader_hash) {
+        Some(previous) => previous.renderer.clone(),
+        None => Arc::new(render::EffectRenderer::new(
+            device,
+            queue,
+            &bnsh::ShaderFile::read(shader_bytes).ok()?,
+            target,
+            depth,
+        )),
+    };
     let raw_sets = ptcl::emitter_sets(&ptcl_file.base_bytes);
     let mut emitters = Vec::new();
     for (index, set) in ptcl_file.emitter_list.emitter_sets.iter().enumerate() {
@@ -475,10 +570,7 @@ fn load_file(
                 .collect::<Vec<_>>(),
         );
     }
-    let sets = crate::effects::load_effect(path)
-        .ok()?
-        .index
-        .handles
+    let sets = crate::effects::entry_set_handles(&file)
         .into_iter()
         .filter_map(|(name, set)| Some((name.to_lowercase(), usize::try_from(set).ok()?)))
         .collect();
@@ -495,16 +587,31 @@ fn load_file(
             .entry(key)
             .or_insert_with(|| render::make_sampler(device, key.0, key.1, key.2, sampler.max_lod));
     }
+    let texture_ids: Vec<u64> = descriptors.iter().map(|d| d.id).collect();
+    // Decoded textures carry over when the texture section is unchanged.
+    let textures = previous
+        .filter(|p| p.texture_hash == texture_hash && p.texture_ids == texture_ids)
+        .map(|p| p.textures.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .unwrap_or_default();
     Some(EffectFile {
-        renderer: render::EffectRenderer::new(device, queue, &shaders, target, depth),
+        renderer,
+        shader_hash,
+        texture_hash,
         sets,
         emitters,
-        texture_ids: descriptors.iter().map(|d| d.id).collect(),
-        textures: Mutex::default(),
+        texture_ids,
+        textures: Mutex::new(textures),
         samplers: sampler_map,
         meshes: vfx_runtime::mesh::meshes(ptcl_file),
         ptcl: ptcl_file.clone(),
     })
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn mesh_id(emitter: &Emitter) -> u64 {
