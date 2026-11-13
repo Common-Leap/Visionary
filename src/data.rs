@@ -5160,6 +5160,16 @@ impl AcmdScript {
         self.walk().article_spawns
     }
 
+    /// The move's model visibility switches, as (script frame, set, group), in running order.
+    pub fn to_visibility_changes(&self) -> Vec<(u32, String, String)> {
+        self.walk().visibility_changes
+    }
+
+    /// Objects the move throws, as (script frame, article symbol), in running order.
+    pub fn to_article_shots(&self) -> Vec<(u32, String)> {
+        self.walk().article_shots
+    }
+
     /// Flatten the script into display hitboxes with computed frame ranges.
     pub fn to_hitboxes(&self) -> Vec<Hitbox> {
         let mut hitboxes: Vec<Hitbox> = Vec::new();
@@ -6516,6 +6526,10 @@ struct WalkAccum {
     work_module_inc_ints: Vec<WorkModuleIncIntEvent>,
     /// Objects the move creates (true) or removes (false): (script frame, symbol, created).
     article_spawns: Vec<(u32, String, bool)>,
+    /// Objects the move throws (`ArticleModule::shoot` / `shoot_exist`): (script frame, symbol).
+    article_shots: Vec<(u32, String)>,
+    /// Model visibility switches (`VisibilityModule::set_int64`): (script frame, set, group).
+    visibility_changes: Vec<(u32, String, String)>,
     work_module_sets: Vec<WorkModuleSetEvent>,
     /// Next site per [`SiteFamily`], each family numbered independently.
     ///
@@ -6984,7 +6998,6 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         // represented by the flattened live move protocol.
         ExcuteStmt::JostleSetStatus { .. }
         | ExcuteStmt::FixedJostleArea(_)
-        | ExcuteStmt::VisibilitySetInt64 { .. }
         | ExcuteStmt::VisibilitySetDefaultInt64 { .. }
         | ExcuteStmt::VisibilitySetWhole { .. }
         | ExcuteStmt::AttackModuleSetAll { .. }
@@ -7022,6 +7035,17 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
                 false,
             ))
         }
+        ExcuteStmt::VisibilitySetInt64 { group, status } => {
+            hurt.visibility_changes
+                .push((script_frame(frame), group.clone(), status.clone()))
+        }
+        ExcuteStmt::ArticleLifecycle(
+            ArticleLifecycleCall::Shoot { symbol, .. }
+            | ArticleLifecycleCall::ShootExist { symbol, .. },
+        ) => hurt.article_shots.push((
+            script_frame(frame),
+            symbol.trim_start_matches('*').to_owned(),
+        )),
         ExcuteStmt::ArticleLifecycle(_)
         | ExcuteStmt::GimmickEvent { .. }
         | ExcuteStmt::GimmickChartEvent { .. }

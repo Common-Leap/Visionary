@@ -3529,6 +3529,8 @@ pub struct VisionaryApp {
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
     /// The fighter's effect file rebuilt with the project's effect edits, for the 3D preview.
     effect_preview_build: EffectPreviewBuild,
+    /// The selected fighter's sets of alternative meshes (sword in hand or sheathed).
+    visibility_sets: Vec<crate::preview_visibility::VisibilitySet>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3954,6 +3956,7 @@ impl VisionaryApp {
             live_overrides: crate::game_link::LiveOverrides::default(),
             eff_mods: HashMap::new(),
             effect_preview_build: EffectPreviewBuild::default(),
+            visibility_sets: Vec::new(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -4583,6 +4586,9 @@ impl VisionaryApp {
 
         // Queue model load for wgpu (done in update where we have device/queue access)
         self.pending_model_load = Some(model_dir.clone());
+        self.visibility_sets = crate::preview_visibility::load(
+            &fighter.fighter_dir.join("param").join("expression_vl.prc"),
+        );
 
         // The desktop no longer simulates or renders particles. Keep the selected fighter's
         // effect file queued for the editor; live preview is provided by slight_replica in game.
@@ -8511,17 +8517,16 @@ impl VisionaryApp {
         else {
             return Vec::new();
         };
-        let mut spawns: Vec<(
-            u32,
-            std::sync::Arc<crate::article_preview::ObjectKind>,
-            Option<u32>,
-        )> = Vec::new();
+        let mut spawns: Vec<crate::article_preview::Spawn> = Vec::new();
         // Objects are spawned from any of the move's scripts; Fox draws his blaster in the
         // expression script.
         let mut events = self.state.script.to_article_spawns();
         events.extend(self.state.expression_script.to_article_spawns());
         events.extend(self.state.sound_script.to_article_spawns());
         events.sort_by_key(|(frame, ..)| *frame);
+        let mut shots = self.state.script.to_article_shots();
+        shots.extend(self.state.expression_script.to_article_shots());
+        shots.sort_by_key(|(frame, _)| *frame);
         for (spawned, symbol, created) in &events {
             if !created {
                 continue;
@@ -8537,7 +8542,20 @@ impl VisionaryApp {
             };
             let key = format!("{}/{name}", fighter.name);
             match self.object_kinds.get(&key) {
-                Some(Some(kind)) => spawns.push((spawned, kind.clone(), removed)),
+                Some(Some(kind)) => spawns.push(crate::article_preview::Spawn {
+                    kind: kind.clone(),
+                    spawned,
+                    removed,
+                    // The first throw of it while it is out.
+                    shot: shots
+                        .iter()
+                        .find(|(at, other)| {
+                            other == symbol
+                                && *at >= spawned
+                                && removed.is_none_or(|removed| *at < removed)
+                        })
+                        .map(|(at, _)| *at),
+                }),
                 Some(None) => {}
                 None if self.object_pending.insert(key.clone()) => {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -8828,7 +8846,12 @@ impl VisionaryApp {
             let object_at = |age_frame: u32| {
                 let at = object.spawned + age_frame.saturating_sub(1);
                 crate::article_preview::place(
-                    &[(object.spawned, object.kind.clone(), object.removed)],
+                    &[crate::article_preview::Spawn {
+                        kind: object.kind.clone(),
+                        spawned: object.spawned,
+                        removed: object.removed,
+                        shot: object.shot,
+                    }],
                     at as f32,
                     &|f| (*bones_at(f.max(1.0) as u32)).clone(),
                 )
@@ -8959,7 +8982,20 @@ impl VisionaryApp {
                     width: w,
                     height: h,
                     animation_frame,
-                    anim_path: self.current_anim_path.clone(),
+                    // With no move open the fighter stands in its idle pose rather than the
+                    // model's bind pose, where held weapons stick straight out.
+                    anim_path: self.current_anim_path.clone().or_else(|| {
+                        self.state
+                            .selected_move
+                            .is_none()
+                            .then(|| {
+                                self.move_list
+                                    .iter()
+                                    .find(|m| m.name == "wait")
+                                    .and_then(|m| m.anim_path.clone())
+                            })
+                            .flatten()
+                    }),
                     default_anim_path: self.current_default_eyelid_path.clone(),
                     skel_path: self.current_skel_path.clone(),
                     effects,
@@ -8971,6 +9007,16 @@ impl VisionaryApp {
                         .map(|(path, bytes)| (path.clone(), bytes.clone()))
                         .collect(),
                     repaint: ctx.clone(),
+                    hidden_nodes: {
+                        let mut changes = self.state.script.to_visibility_changes();
+                        changes.extend(self.state.expression_script.to_visibility_changes());
+                        changes.sort_by_key(|(frame, ..)| *frame);
+                        crate::preview_visibility::hidden_nodes(
+                            &self.visibility_sets,
+                            &changes,
+                            self.state.current_frame,
+                        )
+                    },
                     floor: self
                         .state
                         .selected_move

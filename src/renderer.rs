@@ -117,6 +117,8 @@ pub struct HitboxRenderState {
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
+    /// Body meshes hidden for a visibility set, to show again when the set switches back.
+    set_hidden: std::collections::HashSet<usize>,
     /// Where the models and effects are drawn before going on screen.
     pub target: crate::viewport_target::ViewportTarget,
     /// Cached GPU handles for use in paint()
@@ -201,6 +203,7 @@ impl HitboxRenderState {
                 ssbh_wgpu::DEPTH_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
+            set_hidden: std::collections::HashSet::new(),
             floor_color: {
                 let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
                 [r, g, b, 1.0]
@@ -234,6 +237,7 @@ impl HitboxRenderState {
         folder: ModelFolder,
     ) {
         self.render_models.clear();
+        self.set_hidden.clear();
         self.object_dirs.clear();
         self.weapon_skels.clear();
         if !model_dir.exists() {
@@ -353,6 +357,25 @@ impl HitboxRenderState {
                 &self.shared_data,
                 frame,
             );
+        }
+    }
+
+    /// Hide the body meshes of the visibility groups not showing, and show again the ones
+    /// hidden earlier whose group is back. Runs after the animation, which sets visibility
+    /// only for the meshes it has tracks for.
+    fn apply_hidden_nodes(&mut self, hidden: &std::collections::HashSet<u64>) {
+        let Some(model) = self.render_models.first_mut() else {
+            return;
+        };
+        for (index, mesh) in model.meshes.iter_mut().enumerate() {
+            if hidden.contains(&crate::preview_visibility::mesh_node(&mesh.name)) {
+                if mesh.is_visible || self.set_hidden.contains(&index) {
+                    mesh.is_visible = false;
+                    self.set_hidden.insert(index);
+                }
+            } else if self.set_hidden.remove(&index) {
+                mesh.is_visible = true;
+            }
         }
     }
 
@@ -825,6 +848,8 @@ pub struct ViewportCallback {
     pub repaint: egui::Context,
     /// Draw the stage floor: the move is done on the ground.
     pub floor: bool,
+    /// Body mesh nodes (hash40) the fighter's visibility sets hide at this frame.
+    pub hidden_nodes: std::collections::HashSet<u64>,
 }
 
 /// One object model to draw, already animated and placed.
@@ -885,6 +910,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_skel_path = self.skel_path.clone();
             }
 
+            state.apply_hidden_nodes(&self.hidden_nodes);
             let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
             let t_obj = std::time::Instant::now();
             state.update_objects(device, queue, &self.objects);

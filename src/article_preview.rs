@@ -71,6 +71,7 @@ impl Flight {
 }
 
 /// Everything needed to show one kind of object.
+#[derive(Default)]
 pub struct ObjectKind {
     /// "fireball", from `FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL`.
     pub name: String,
@@ -205,6 +206,8 @@ pub struct PlacedObject {
     /// The frame it was spawned on and the one it is removed on, to place it at earlier ages.
     pub spawned: u32,
     pub removed: Option<u32>,
+    /// The frame the move throws it, when it is held first (Link's boomerang).
+    pub shot: Option<u32>,
     /// Frames since it was spawned, from 0.
     pub age: f32,
     /// Object space to world space.
@@ -455,46 +458,84 @@ fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool) -> glam::Vec3 {
     top
 }
 
+/// One object a move creates.
+#[derive(Clone)]
+pub struct Spawn {
+    pub kind: Arc<ObjectKind>,
+    /// The frame it is created on.
+    pub spawned: u32,
+    /// The frame the move removes it on.
+    pub removed: Option<u32>,
+    /// The frame the move throws it (`ArticleModule::shoot`), if it is held until then:
+    /// Link's boomerang is created in his hand on frame 5 and leaves it on frame 27.
+    pub shot: Option<u32>,
+}
+
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
 /// matrices at a game frame.
 pub fn place(
-    spawns: &[(u32, Arc<ObjectKind>, Option<u32>)],
+    spawns: &[Spawn],
     frame: f32,
     bones_at: &dyn Fn(f32) -> HashMap<String, glam::Mat4>,
 ) -> Vec<PlacedObject> {
     let mut placed = Vec::new();
-    for (spawned, kind, removed) in spawns {
+    for Spawn {
+        kind,
+        spawned,
+        removed,
+        shot,
+    } in spawns
+    {
         let age = frame - *spawned as f32;
         if age < 0.0 || removed.is_some_and(|removed| frame >= removed as f32) {
             continue;
         }
-        // Something that doesn't fly rides the fighter until the move removes it.
-        if kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0 {
+        let flies = !(kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0);
+        // Something that doesn't fly rides the fighter until the move removes it; something
+        // thrown later is held in the hand until it is.
+        let held_until_shot = shot.is_some_and(|shot| frame < shot as f32);
+        if !flies || held_until_shot {
+            let bones = bones_at(frame);
+            let placement = if flies {
+                let (_, rotation, _) = bones
+                    .get("top")
+                    .copied()
+                    .unwrap_or(glam::Mat4::IDENTITY)
+                    .to_scale_rotation_translation();
+                glam::Mat4::from_rotation_translation(rotation, spawn_point(&bones, true))
+            } else {
+                ride_bone(&bones, &kind.name)
+            };
             placed.push(PlacedObject {
                 kind: kind.clone(),
                 spawned: *spawned,
                 removed: *removed,
+                shot: *shot,
                 age,
-                placement: ride_bone(&bones_at(frame), &kind.name),
+                placement,
             });
             continue;
         }
-        if age > kind.flight.life {
+        // In flight: from where it leaves the fighter, counted from then.
+        let launched = shot.unwrap_or(*spawned);
+        let flight_age = frame - launched as f32;
+        if flight_age > kind.flight.life {
             continue;
         }
-        let bones = bones_at(*spawned as f32);
+        let bones = bones_at(launched as f32);
         let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
         let (_, rotation, top_position) = top.to_scale_rotation_translation();
         let mut forward = top.z_axis.truncate();
         forward.y = 0.0;
         let forward = forward.try_normalize().unwrap_or(glam::Vec3::Z);
         let start = spawn_point(&bones, kind.flight.speed > 0.0);
-        let (ahead, up) = kind.flight.offset(age, start.y - top_position.y);
+        let (ahead, up) = kind.flight.offset(flight_age, start.y - top_position.y);
         let position = start + forward * ahead + glam::Vec3::Y * up;
         placed.push(PlacedObject {
             kind: kind.clone(),
             spawned: *spawned,
             removed: *removed,
+            shot: *shot,
             age,
             placement: glam::Mat4::from_rotation_translation(rotation, position),
         });
@@ -696,7 +737,13 @@ mod tests {
                     let kind = Arc::new(kind);
                     let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
                     for frame in [0.0, 5.5, 30.0, 200.0] {
-                        for object in place(&[(0, kind.clone(), None)], frame, &bones) {
+                        let spawn = Spawn {
+                            kind: kind.clone(),
+                            spawned: 0,
+                            removed: None,
+                            shot: None,
+                        };
+                        for object in place(&[spawn], frame, &bones) {
                             let _ = object_bones(&object);
                             let _ = placement_layer(&object);
                         }
@@ -773,5 +820,70 @@ mod tests {
                 "{fighter} {name}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod thrown_object_tests {
+    use super::*;
+
+    /// Link's side special, as the game script has it: the boomerang is created on frame 5
+    /// and thrown on frame 27.
+    const LINK_SPECIAL_S1: &str = r#"unsafe extern "C" fn game_specials1(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_BOOMERANG, false, -1);
+    }
+    frame(agent.lua_state_agent, 27.0);
+    if macros::is_excute(agent) {
+        ArticleModule::shoot(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_BOOMERANG, *ARTICLE_OPE_TARGET_ALL, false);
+    }
+}"#;
+
+    #[test]
+    fn the_script_says_when_the_boomerang_is_thrown() {
+        let script = crate::acmd::parse_acmd_script(LINK_SPECIAL_S1);
+        let shots = script.to_article_shots();
+        assert_eq!(
+            shots,
+            [(27, "FIGHTER_LINK_GENERATE_ARTICLE_BOOMERANG".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_held_object_stays_in_the_hand_until_it_is_thrown() {
+        let kind = Arc::new(ObjectKind {
+            flight: Flight {
+                life: 60.0,
+                speed: 2.0,
+                ..Flight::default()
+            },
+            ..ObjectKind::default()
+        });
+        let hand = glam::Vec3::new(1.0, 9.0, 3.0);
+        let bones = |_: f32| {
+            HashMap::from([
+                ("top".to_owned(), glam::Mat4::IDENTITY),
+                ("haver".to_owned(), glam::Mat4::from_translation(hand)),
+            ])
+        };
+        let spawn = Spawn {
+            kind,
+            spawned: 5,
+            removed: None,
+            shot: Some(27),
+        };
+        let at = |frame: f32| {
+            place(std::slice::from_ref(&spawn), frame, &bones)[0]
+                .placement
+                .col(3)
+                .truncate()
+        };
+        // Held: on the hand, however long it has been out.
+        assert_eq!(at(20.0), hand);
+        assert_eq!(at(26.0), hand);
+        // Thrown: flying forward from the hand, 2 a frame from frame 27.
+        assert_eq!(at(27.0), hand);
+        assert_eq!(at(37.0), hand + glam::Vec3::Z * 20.0);
     }
 }
