@@ -132,6 +132,8 @@ pub struct ObjectEffect {
     pub name: String,
     pub bone: String,
     pub offset: [f32; 3],
+    /// Degrees about X, Y and Z, in the script's own order.
+    pub rotation: [f32; 3],
     pub scale: f32,
     /// Script frames it is shown, counted from the object's spawn.
     pub start: u32,
@@ -164,6 +166,8 @@ fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
                 name: call.effect_name,
                 bone: call.bone_name,
                 offset: call.offset,
+                // Stored reversed on the call (see `app::script_rotation`).
+                rotation: [call.rotation[2], call.rotation[1], call.rotation[0]],
                 scale: call.scale,
                 start: call.active_start,
                 end: if call.follows_bone {
@@ -226,6 +230,11 @@ fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
                     numbers.first().copied().unwrap_or(0.0),
                     numbers.get(1).copied().unwrap_or(0.0),
                     numbers.get(2).copied().unwrap_or(0.0),
+                ],
+                rotation: [
+                    numbers.get(3).copied().unwrap_or(0.0),
+                    numbers.get(4).copied().unwrap_or(0.0),
+                    numbers.get(5).copied().unwrap_or(0.0),
                 ],
                 scale: numbers.get(6).copied().unwrap_or(1.0),
                 start,
@@ -974,5 +983,20 @@ mod returning_flight_tests {
         let farthest = (0..129).map(|f| at(f as f32)).fold(0.0, f32::max);
         assert!(farthest > 80.0 && farthest < 100.0, "{farthest}");
         assert_eq!(at(128.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod object_effect_rotation_tests {
+    #[test]
+    fn a_projectile_effect_keeps_its_rotation_in_script_order() {
+        let body = r#"unsafe extern "C" fn effect_fly(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("x_trail"), Hash40::new("top"), 0, 1, 2, -4, 80, 96, 1, true);
+    }
+}"#;
+        let effects = super::object_effects_as_written(body);
+        assert_eq!(effects[0].rotation, [-4.0, 80.0, 96.0]);
+        assert_eq!(effects[0].offset, [0.0, 1.0, 2.0]);
     }
 }

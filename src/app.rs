@@ -8922,7 +8922,7 @@ impl VisionaryApp {
                 }
                 let local = glam::Mat4::from_scale_rotation_translation(
                     glam::Vec3::splat(effect.scale.max(0.01)),
-                    glam::Quat::IDENTITY,
+                    effect_rotation(effect.rotation),
                     glam::Vec3::from(effect.offset),
                 );
                 let place = |age_frame: u32| {
