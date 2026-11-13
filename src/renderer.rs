@@ -770,6 +770,10 @@ pub struct ViewportCallback {
     pub objects: Vec<ObjectDraw>,
     /// Effect sets out this frame.
     pub effects: Vec<crate::vfx_preview::EffectDraw>,
+    /// Effect files to have loaded and built ahead of use (the fighter's own and the shared).
+    pub effect_files: Vec<std::path::PathBuf>,
+    /// For painting again once effects still loading are ready.
+    pub repaint: egui::Context,
 }
 
 /// One object model to draw, already animated and placed.
@@ -814,6 +818,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             state.wgpu_device = Some(device.clone());
             state.wgpu_queue = Some(queue.clone());
 
+            let t_anim = std::time::Instant::now();
             // Re-skin when frame, animation, or skeleton changes
             if frame_changed || anim_changed || default_anim_changed || skel_changed {
                 state.apply_animation_with_default(
@@ -829,10 +834,22 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_skel_path = self.skel_path.clone();
             }
 
+            let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
+            let t_obj = std::time::Instant::now();
             state.update_objects(device, queue, &self.objects);
+            let obj_ms = t_obj.elapsed().as_secs_f64() * 1000.0;
+            if std::env::var_os("VFX_TIMING").is_some() && anim_ms + obj_ms > 8.0 {
+                eprintln!("[vfx timing] paint anim {anim_ms:.1} ms objects {obj_ms:.1} ms");
+            }
 
             let t = state.camera.transforms(self.width, self.height);
             let eye = t.camera_pos;
+            for file in &self.effect_files {
+                state.vfx.preload(device, queue, file);
+            }
+            let timing = std::env::var_os("VFX_TIMING")
+                .is_some()
+                .then(std::time::Instant::now);
             state.vfx.prepare(
                 device,
                 queue,
@@ -843,6 +860,17 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.camera.far,
                 &self.effects,
             );
+            if let Some(start) = timing {
+                eprintln!(
+                    "[vfx timing] prepare {:?} for {} draws",
+                    start.elapsed(),
+                    self.effects.len()
+                );
+            }
+            if state.vfx.waiting() {
+                self.repaint
+                    .request_repaint_after(std::time::Duration::from_millis(30));
+            }
             // A program wgpu rejects is skipped rather than fatal; say which, once each.
             for failure in state.vfx.take_failures() {
                 eprintln!("[vfx] effect preview skipped a shader: {failure}");

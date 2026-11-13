@@ -8309,7 +8309,7 @@ impl VisionaryApp {
                         }
                     });
                     if clicked && !selected {
-                        self.select_fighter(i);
+                        { let t = self.perf.start(); self.select_fighter(i); self.perf.end("select_fighter", t); }
                     }
                 }
             });
@@ -8457,7 +8457,11 @@ impl VisionaryApp {
                         .on_hover_text(category.description());
                 }
                 if let Some(m) = to_select {
-                    self.select_move(m);
+                    {
+                        let t = self.perf.start();
+                        self.select_move(m);
+                        self.perf.end("select_move", t);
+                    }
                 }
             });
     }
@@ -8552,6 +8556,19 @@ impl VisionaryApp {
     }
 
     /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
+    /// The effect files a move can draw from: the fighter's own, then the shared one.
+    fn preview_effect_files(&self) -> Vec<std::path::PathBuf> {
+        let common = self
+            .state
+            .data_root
+            .as_ref()
+            .map(|root| root.join("effect/system/common/ef_common.eff"));
+        [self.current_eff_path.clone(), common]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     fn preview_effect_draws(
         &self,
         frame: &eframe::Frame,
@@ -8579,15 +8596,7 @@ impl VisionaryApp {
                 })
                 .clone()
         };
-        let common = self
-            .state
-            .data_root
-            .as_ref()
-            .map(|root| root.join("effect/system/common/ef_common.eff"));
-        let files: Vec<std::path::PathBuf> = [self.current_eff_path.clone(), common]
-            .into_iter()
-            .flatten()
-            .collect();
+        let files = self.preview_effect_files();
         let mut out = Vec::new();
         let mut push = |name: &str, placements: Vec<glam::Mat4>| {
             if placements.is_empty() {
@@ -8756,6 +8765,8 @@ impl VisionaryApp {
                     default_anim_path: self.current_default_eyelid_path.clone(),
                     skel_path: self.current_skel_path.clone(),
                     effects,
+                    effect_files: self.preview_effect_files(),
+                    repaint: ctx.clone(),
                     objects: objects
                         .iter()
                         .filter_map(|object| {
