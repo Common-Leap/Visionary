@@ -27,6 +27,7 @@ mod move_kinds;
 mod move_nodes;
 mod param_labels;
 mod plugin_deploy;
+mod post_grading;
 mod project_hub;
 mod renderer;
 mod roster;

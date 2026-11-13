@@ -127,19 +127,38 @@ impl HitboxRenderState {
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
+        /// The viewport's backdrop, linear, as it appears on screen.
+        const VIEWPORT_BACKDROP_LINEAR: [f32; 3] = [0.05, 0.05, 0.1];
         let mut renderer = SsbhRenderer::new(
             device,
             queue,
             1,
             1,
             1.0,
-            [0.05, 0.05, 0.1, 1.0],
+            [
+                VIEWPORT_BACKDROP_LINEAR[0] as f64,
+                VIEWPORT_BACKDROP_LINEAR[1] as f64,
+                VIEWPORT_BACKDROP_LINEAR[2] as f64,
+                1.0,
+            ],
             surface_format,
         );
         let shared_data = SharedRenderData::new(device, queue);
+        // The game's post pass: bloom, then the stage's colour grading. Effects draw into the
+        // scene before it (see `prepare`), so they glow as they do in game. The backdrop is
+        // part of the scene, as a stage is, so it is cleared opaque at the value the post pass
+        // turns into the backdrop colour.
+        renderer.update_color_lut_rgba(device, queue, &crate::post_grading::training_lut());
+        let scene_backdrop = crate::post_grading::scene_value_for(VIEWPORT_BACKDROP_LINEAR);
+        renderer.set_scene_clear_color(wgpu::Color {
+            r: scene_backdrop[0] as f64,
+            g: scene_backdrop[1] as f64,
+            b: scene_backdrop[2] as f64,
+            a: 1.0,
+        });
         // Use Shaded mode for full PBR rendering with textures
         let render_settings = RenderSettings {
-            render_bloom: false,
+            render_bloom: true,
             render_shadows: false,
             ..RenderSettings::default()
         };
@@ -161,10 +180,16 @@ impl HitboxRenderState {
             last_default_anim_path: None,
             last_skel_path: None,
             object_dirs: Vec::new(),
-            vfx: crate::vfx_preview::VfxPreview::new(
-                surface_format.add_srgb_suffix(),
-                Some(crate::viewport_target::DEPTH_FORMAT),
-            ),
+            vfx: {
+                let mut vfx = crate::vfx_preview::VfxPreview::new(
+                    ssbh_wgpu::RGBA_COLOR_FORMAT,
+                    Some(ssbh_wgpu::DEPTH_FORMAT),
+                    ssbh_wgpu::MSAA_SAMPLE_COUNT,
+                );
+                let [r, g, b] = scene_backdrop.map(|c| (c * 255.0).round() as u8);
+                vfx.set_backdrop([r, g, b, 255]);
+                vfx
+            },
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
@@ -887,60 +912,56 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             for failure in state.vfx.take_failures() {
                 eprintln!("[vfx] effect preview skipped a shader: {failure}");
             }
-            // Always re-render (camera may have changed, or egui needs a fresh frame)
-            state.renderer.begin_render_models(
+            // Always re-render (camera may have changed, or egui needs a fresh frame). Effects
+            // draw into the scene right after the models, with the models' depth, so bloom and
+            // colour grading treat them as the game's post pass does.
+            let vfx = &state.vfx;
+            state.renderer.begin_render_models_with_scene(
                 egui_encoder,
                 &state.render_models,
                 state.shared_data.database(),
                 &state.model_render_options,
-            );
-            state.target.resize(device, w.max(1), h.max(1));
-            // Models through the window's format, then effects through the sRGB view of the same
-            // texture, so they blend on linear values as the game's do.
-            if let (Some(plain), Some(srgb)) = (&state.target.plain, &state.target.srgb) {
-                {
-                    let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("viewport models"),
+                &mut |encoder, scene| {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("viewport effects"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: plain,
-                            resolve_target: None,
+                            view: scene.color,
+                            resolve_target: Some(scene.resolve),
                             depth_slice: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: wgpu::LoadOp::Load,
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: scene.depth,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
                         ..Default::default()
                     });
-                    state.renderer.end_render_models(&mut pass);
-                }
-                state
-                    .target
-                    .copy_depth(device, egui_encoder, state.renderer.depth_view());
+                    vfx.paint(&mut pass);
+                },
+            );
+            state.target.resize(device, w.max(1), h.max(1));
+            if let Some(plain) = &state.target.plain {
                 let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("viewport effects"),
+                    label: Some("viewport models"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: srgb,
+                        view: plain,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: state.target.depth.as_ref().map(|view| {
-                        wgpu::RenderPassDepthStencilAttachment {
-                            view,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Discard,
-                            }),
-                            stencil_ops: None,
-                        }
-                    }),
                     ..Default::default()
                 });
-                state.vfx.paint(&mut pass);
+                state.renderer.end_render_models(&mut pass);
             }
         }
         Vec::new()

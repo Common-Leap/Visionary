@@ -28,9 +28,6 @@ pub struct EffectDraw {
     pub placements: Vec<Mat4>,
 }
 
-/// The preview viewport's backdrop colour.
-const VIEWPORT_BACKDROP: [u8; 4] = [62, 61, 88, 255];
-
 /// The shared effect file. Its meshes serve every other file, and it is far too big to warm
 /// whole, so only what a move uses gets built.
 const SHARED_FILE: &str = "ef_common.eff";
@@ -98,6 +95,9 @@ struct Workers {
 pub struct VfxPreview {
     target: wgpu::TextureFormat,
     depth: Option<wgpu::TextureFormat>,
+    samples: u32,
+    /// What refraction shaders see behind them: the scene's backdrop, as stored in the scene.
+    backdrop: [u8; 4],
     files: HashMap<PathBuf, Slot>,
     prepared: Vec<(Arc<EffectFile>, render::PreparedDraw)>,
     workers: Option<Workers>,
@@ -113,10 +113,17 @@ pub struct VfxPreview {
 }
 
 impl VfxPreview {
-    pub fn new(target: wgpu::TextureFormat, depth: Option<wgpu::TextureFormat>) -> Self {
+    /// Effects drawn into a `target` with `samples` samples per pixel and `depth`.
+    pub fn new(
+        target: wgpu::TextureFormat,
+        depth: Option<wgpu::TextureFormat>,
+        samples: u32,
+    ) -> Self {
         Self {
             target,
             depth,
+            samples,
+            backdrop: [0, 0, 0, 255],
             files: HashMap::new(),
             prepared: Vec::new(),
             workers: None,
@@ -126,6 +133,11 @@ impl VfxPreview {
             latest: HashMap::new(),
             next_load: 0,
         }
+    }
+
+    /// The scene's backdrop colour as stored in the scene (before post processing).
+    pub fn set_backdrop(&mut self, rgba: [u8; 4]) {
+        self.backdrop = rgba;
     }
 
     /// Whether the last prepare left out an effect that is still loading. The viewport should
@@ -138,7 +150,7 @@ impl VfxPreview {
         self.workers.get_or_insert_with(|| {
             let (load, jobs) = mpsc::channel::<LoadJob>();
             let (done, loaded) = mpsc::channel();
-            let (target, depth) = (self.target, self.depth);
+            let (target, depth, samples) = (self.target, self.depth, self.samples);
             let (d, q) = (device.clone(), queue.clone());
             let _ = std::thread::Builder::new()
                 .name("vfx load".into())
@@ -149,7 +161,13 @@ impl VfxPreview {
                             None => std::fs::read(&path).ok().map(Arc::new),
                         };
                         let file = bytes.and_then(|bytes| {
-                            load_file(&d, &q, target, depth, &bytes, previous.as_deref())
+                            load_file(
+                                &d,
+                                &q,
+                                (target, depth, samples),
+                                &bytes,
+                                previous.as_deref(),
+                            )
                         });
                         if done.send((path, number, file)).is_err() {
                             break;
@@ -327,7 +345,9 @@ impl VfxPreview {
         self.collect_loaded();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
         let camera = view_block::view_block(&rows(view), &rows(projection), eye, near, far, 1.0);
-        let custom2 = render::default_custom2();
+        // Effects draw into the scene before bloom and colour grading, so they take the game's
+        // half scale, which the post pass doubles back.
+        let custom2 = render::game_custom2();
         // The shared effect file, whose meshes other files' emitters may name.
         let shared = self.files.iter().find_map(|(path, slot)| match slot {
             Slot::Ready(file) if path.ends_with(SHARED_FILE) => Some(file.clone()),
@@ -348,7 +368,7 @@ impl VfxPreview {
             };
             file.renderer.set_view(queue, &camera);
             // Refraction shaders read the frame behind them; the preview has only its backdrop.
-            file.renderer.set_background(queue, VIEWPORT_BACKDROP);
+            file.renderer.set_background(queue, self.backdrop);
             let Some(placement) = draw.placements.last().copied() else {
                 continue;
             };
@@ -526,8 +546,7 @@ fn warm_thread(device: &wgpu::Device, queue: &wgpu::Queue, shared: &Shared) {
 fn load_file(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    target: wgpu::TextureFormat,
-    depth: Option<wgpu::TextureFormat>,
+    (target, depth, samples): (wgpu::TextureFormat, Option<wgpu::TextureFormat>, u32),
     bytes: &[u8],
     previous: Option<&EffectFile>,
 ) -> Option<EffectFile> {
@@ -543,13 +562,16 @@ fn load_file(
         .unwrap_or(0);
     let renderer = match previous.filter(|p| p.shader_hash == shader_hash) {
         Some(previous) => previous.renderer.clone(),
-        None => Arc::new(render::EffectRenderer::new(
-            device,
-            queue,
-            &bnsh::ShaderFile::read(shader_bytes).ok()?,
-            target,
-            depth,
-        )),
+        None => Arc::new(
+            render::EffectRenderer::new(
+                device,
+                queue,
+                &bnsh::ShaderFile::read(shader_bytes).ok()?,
+                target,
+                depth,
+            )
+            .with_sample_count(samples),
+        ),
     };
     let raw_sets = ptcl::emitter_sets(&ptcl_file.base_bytes);
     let mut emitters = Vec::new();
