@@ -29,6 +29,7 @@ mod param_labels;
 mod plugin_deploy;
 mod post_grading;
 mod preview_floor;
+mod preview_opponent;
 mod preview_visibility;
 mod project_hub;
 mod renderer;

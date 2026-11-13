@@ -8580,7 +8580,8 @@ impl VisionaryApp {
                 None => {}
             }
         }
-        if spawns.is_empty() {
+        let opponent = self.preview_opponent_kind();
+        if spawns.is_empty() && opponent.is_none() {
             return Vec::new();
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else {
@@ -8590,9 +8591,71 @@ impl VisionaryApp {
         let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
             return Vec::new();
         };
-        crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
-            rs.bone_world_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
-        })
+        let mut placed =
+            crate::article_preview::place(&spawns, self.state.current_frame as f32, &|at| {
+                rs.bone_world_matrices_at(animation_frame_for_game_frame(at.max(1.0) as u32))
+            });
+        // A grab or throw holds the opponent on the thrower's throw bone.
+        if let Some(kind) = opponent {
+            let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
+            let bones = rs.bone_world_matrices_at(animation_frame);
+            if let Some(throw) = bones.get("Throw").or_else(|| bones.get("throw")) {
+                // The victim hangs by its hip from the throw bone.
+                let hip = kind
+                    .skel
+                    .as_deref()
+                    .map(|skel| {
+                        crate::renderer::compute_bone_world_matrices(
+                            skel,
+                            kind.anim.as_deref(),
+                            &[],
+                            animation_frame,
+                        )
+                    })
+                    .and_then(|victim| victim.get("Hip").copied())
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                placed.push(crate::article_preview::PlacedObject {
+                    kind,
+                    spawned: 0,
+                    removed: None,
+                    shot: None,
+                    age: animation_frame,
+                    placement: *throw * hip.inverse(),
+                });
+            }
+        }
+        placed
+    }
+
+    /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
+    /// training stage's usual partner, or the fighter itself when Mario is not installed.
+    fn preview_opponent_kind(
+        &mut self,
+    ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
+        let motion = self
+            .state
+            .selected_move
+            .as_ref()
+            .and_then(|m| crate::preview_opponent::victim_motion(&m.name))?;
+        let opponent = self
+            .state
+            .fighters
+            .iter()
+            .find(|f| f.name == "mario")
+            .or_else(|| {
+                self.state
+                    .selected_fighter
+                    .and_then(|i| self.state.fighters.get(i))
+            })?
+            .clone();
+        let key = format!("opponent/{}/{motion}", opponent.name);
+        self.object_kinds
+            .entry(key)
+            .or_insert_with(|| {
+                crate::preview_opponent::load(&opponent.model_dir, &opponent.motion_dir, motion)
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
     }
 
     /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
