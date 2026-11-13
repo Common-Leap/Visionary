@@ -9005,6 +9005,17 @@ impl VisionaryApp {
             if let Some(wgpu_state) = frame.wgpu_render_state() {
                 let mut renderer = wgpu_state.renderer.write();
                 if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                    // Keep the fighter in view as the move carries it: follow its root over
+                    // the ground, not up and down, so a jump still reads as height.
+                    let bones = rs.bone_world_matrices_at(animation_frame_for_game_frame(
+                        self.state.current_frame,
+                    ));
+                    let root = bones
+                        .get("Trans")
+                        .or_else(|| bones.get("trans"))
+                        .map(|m| m.col(3).truncate())
+                        .unwrap_or(glam::Vec3::ZERO);
+                    rs.camera.follow = glam::Vec3::new(root.x, 0.0, root.z);
                     // Left drag: pan in camera plane (left/right + up/down)
                     if response.dragged_by(egui::PointerButton::Primary) {
                         let delta = response.drag_delta();

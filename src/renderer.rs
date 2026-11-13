@@ -18,6 +18,9 @@ fn synthetic_top_matrix(bones: &std::collections::HashMap<String, glam::Mat4>) -
 pub struct Camera {
     pub translation: Vec3,
     pub rotation: Vec3,
+    /// The point the camera keeps centred: the fighter's position over the ground, so a move
+    /// that carries the fighter forward (a dash attack, a slide) stays in view.
+    pub follow: Vec3,
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
@@ -27,6 +30,7 @@ impl Default for Camera {
     fn default() -> Self {
         Self {
             translation: Vec3::new(0.0, -8.0, -60.0),
+            follow: Vec3::ZERO,
             rotation: Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
             fov_y: 30f32.to_radians(),
             near: 1.0,
@@ -71,7 +75,9 @@ impl Camera {
             self.rotation.y,
             self.rotation.z,
         );
-        let model_view = Mat4::from_translation(self.translation) * rotation;
+        let model_view = Mat4::from_translation(self.translation)
+            * rotation
+            * Mat4::from_translation(-self.follow);
         let projection = Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
         let mvp = projection * model_view;
         CameraTransforms {
