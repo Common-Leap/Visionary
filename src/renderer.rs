@@ -120,6 +120,8 @@ pub struct HitboxRenderState {
     object_dirs: Vec<std::path::PathBuf>,
     /// Effects drawn with the game's shaders, after the models.
     pub vfx: crate::vfx_preview::VfxPreview,
+    /// Weapon swing trails.
+    trails: crate::preview_trail::PreviewTrails,
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
@@ -203,6 +205,12 @@ impl HitboxRenderState {
                 vfx.set_backdrop([r, g, b, 255]);
                 vfx
             },
+            trails: crate::preview_trail::PreviewTrails::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
             floor: crate::preview_floor::PreviewFloor::new(
                 device,
                 ssbh_wgpu::RGBA_COLOR_FORMAT,
@@ -854,6 +862,8 @@ pub struct ViewportCallback {
     pub repaint: egui::Context,
     /// Draw the stage floor: the move is done on the ground.
     pub floor: bool,
+    /// Weapon swing trails out this frame.
+    pub trails: Vec<crate::preview_trail::TrailDraw>,
     /// Body mesh nodes (hash40) the fighter's visibility sets hide at this frame.
     pub hidden_nodes: std::collections::HashSet<u64>,
 }
@@ -964,7 +974,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             // Always re-render (camera may have changed, or egui needs a fresh frame). Effects
             // draw into the scene right after the models, with the models' depth, so bloom and
             // colour grading treat them as the game's post pass does.
+            state
+                .trails
+                .prepare(device, queue, t.mvp_matrix, &self.trails);
             let vfx = &state.vfx;
+            let trails = &state.trails;
             let floor = self.floor.then_some(&state.floor);
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
@@ -1000,6 +1014,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                         floor.draw(&mut pass);
                     }
                     vfx.paint(&mut pass);
+                    trails.draw(&mut pass);
                 },
             );
             state.target.resize(device, w.max(1), h.max(1));

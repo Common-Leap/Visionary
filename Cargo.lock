@@ -3110,6 +3110,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b1f32aa48bc74ec799cd2ecdd811984d3ee2caf5bbb07f2f0026771a3a0862"
 dependencies = [
  "binrw 0.13.4",
+ "ddsfile",
  "tegra_swizzle 0.3.2",
 ]
 

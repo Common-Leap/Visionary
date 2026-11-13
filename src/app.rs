@@ -8627,6 +8627,75 @@ impl VisionaryApp {
         placed
     }
 
+    /// Weapon swing trails out at the playhead: each trail call's blade, sampled four times a
+    /// frame over the frames the trail covers, ending where the move turned it off.
+    fn preview_trails(&self, frame: &eframe::Frame) -> Vec<crate::preview_trail::TrailDraw> {
+        let calls: Vec<&crate::data::EffectCall> = self
+            .state
+            .effects
+            .iter()
+            .filter(|ec| ec.trail_command.is_some() && !ec.disabled)
+            .collect();
+        if calls.is_empty() {
+            return Vec::new();
+        }
+        let Some(effect_dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) else {
+            return Vec::new();
+        };
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return Vec::new();
+        };
+        let renderer = wgpu_state.renderer.read();
+        let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() else {
+            return Vec::new();
+        };
+        let now = self.state.current_frame as f32;
+        let mut out = Vec::new();
+        for ec in calls {
+            let Some(spec) = ec.raw_line.as_deref().and_then(crate::preview_trail::parse) else {
+                continue;
+            };
+            let start = ec.active_start as f32;
+            let end = ec.active_end as f32;
+            // The newest edge stops where the trail is turned off; the tail catches up after.
+            let newest = now.min(end);
+            let oldest = (now - spec.frames).max(start);
+            if newest <= oldest {
+                continue;
+            }
+            let root = self.state.data_root.as_deref();
+            let (Some(texture), Some(fade)) = (
+                crate::preview_trail::texture_path(effect_dir, root, &spec.texture),
+                crate::preview_trail::texture_path(effect_dir, root, &spec.fade),
+            ) else {
+                continue;
+            };
+            let steps = ((newest - oldest) * 4.0).ceil().max(1.0) as usize;
+            let edges: Vec<[glam::Vec3; 2]> = (0..=steps)
+                .filter_map(|i| {
+                    let at = oldest + (newest - oldest) * i as f32 / steps as f32;
+                    let bones = rs.bone_world_matrices_at((at - 1.0).max(0.0));
+                    let point = |bone: &str, p: glam::Vec3| {
+                        bones
+                            .get(bone)
+                            .or_else(|| bones.get(&bone.to_lowercase()))
+                            .map(|m| m.transform_point3(p))
+                    };
+                    Some([
+                        point(&spec.bone_a, spec.point_a)?,
+                        point(&spec.bone_b, spec.point_b)?,
+                    ])
+                })
+                .collect();
+            out.push(crate::preview_trail::TrailDraw {
+                texture,
+                fade,
+                edges,
+            });
+        }
+        out
+    }
+
     /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
     /// training stage's usual partner, or the fighter itself when Mario is not installed.
     fn preview_opponent_kind(
@@ -9086,6 +9155,7 @@ impl VisionaryApp {
                             self.state.current_frame,
                         )
                     },
+                    trails: self.preview_trails(frame),
                     floor: self
                         .state
                         .selected_move
