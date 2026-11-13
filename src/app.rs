@@ -44760,6 +44760,24 @@ mod spawn_random_range_tests {
 #[cfg(test)]
 mod effect_rotation_tests {
     #[test]
+    fn mario_forward_air_arc_turns_as_in_game() {
+        // sys_attack_arc_b from Mario's forward air: rotation (-3, -11, -113), scale 1.1, and
+        // arc1's own -10 degrees about Y. The game's arc1 matrix in model space, read live
+        // (columns); the old axis order missed it by 1.3.
+        let game = glam::Mat3::from_cols_array_2d(&[
+            [-0.392, -0.949, 0.394],
+            [1.007, -0.439, -0.057],
+            [0.206, 0.34, 1.025],
+        ]);
+        let ours = glam::Mat3::from_quat(super::effect_rotation([-3.0, -11.0, -113.0]))
+            * glam::Mat3::from_rotation_y(-10f32.to_radians())
+            * 1.1;
+        for (a, b) in ours.to_cols_array().iter().zip(game.to_cols_array()) {
+            assert!((a - b).abs() < 0.01, "{ours:?} vs {game:?}");
+        }
+    }
+
+    #[test]
     fn the_up_air_arc_from_its_script_line_turns_as_in_game() {
         let src = r#"unsafe extern "C" fn effect_attackairhi(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
