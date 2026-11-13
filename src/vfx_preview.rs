@@ -408,6 +408,14 @@ impl VfxPreview {
                     continue;
                 }
                 let srt = s.emitter_srt(&placement);
+                if std::env::var_os("VFX_DUMP").is_some() {
+                    let r = srt.transpose().to_cols_array();
+                    eprintln!(
+                        "[vfx dump] {} age {} n {} srt ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3})",
+                        draw.name, draw.placements.len(), s.count(),
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
+                    );
+                }
                 let streams = s.streams();
                 let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), [1.0; 4]);
                 let statics = static_block::static_block(&emitter.fixed);
