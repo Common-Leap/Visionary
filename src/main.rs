@@ -34,6 +34,7 @@ mod scratch_dirs;
 mod texture_import;
 mod ui;
 mod vfx_preview;
+mod viewport_target;
 #[cfg(target_os = "linux")]
 mod wayland_icon;
 

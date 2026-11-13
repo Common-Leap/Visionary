@@ -114,6 +114,8 @@ pub struct HitboxRenderState {
     object_dirs: Vec<std::path::PathBuf>,
     /// Effects drawn with the game's shaders, after the models.
     pub vfx: crate::vfx_preview::VfxPreview,
+    /// Where the models and effects are drawn before going on screen.
+    pub target: crate::viewport_target::ViewportTarget,
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
@@ -159,7 +161,8 @@ impl HitboxRenderState {
             last_default_anim_path: None,
             last_skel_path: None,
             object_dirs: Vec::new(),
-            vfx: crate::vfx_preview::VfxPreview::new(surface_format, None),
+            vfx: crate::vfx_preview::VfxPreview::new(surface_format.add_srgb_suffix(), None),
+            target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
         }
@@ -173,6 +176,7 @@ impl HitboxRenderState {
             return;
         }
         self.renderer.resize(device, width, height, 1.0);
+        self.target.resize(device, width, height);
         self.current_width = width;
         self.current_height = height;
     }
@@ -847,6 +851,41 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.shared_data.database(),
                 &state.model_render_options,
             );
+            state.target.resize(device, w.max(1), h.max(1));
+            // Models through the window's format, then effects through the sRGB view of the same
+            // texture, so they blend on linear values as the game's do.
+            if let (Some(plain), Some(srgb)) = (&state.target.plain, &state.target.srgb) {
+                {
+                    let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("viewport models"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: plain,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        ..Default::default()
+                    });
+                    state.renderer.end_render_models(&mut pass);
+                }
+                let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("viewport effects"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: srgb,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                state.vfx.paint(&mut pass);
+            }
         }
         Vec::new()
     }
@@ -868,8 +907,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(state) = resources.get::<HitboxRenderState>() {
-            state.renderer.end_render_models(render_pass);
-            state.vfx.paint(render_pass);
+            state.target.paint(render_pass);
         } else {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }
