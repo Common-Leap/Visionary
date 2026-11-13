@@ -836,6 +836,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.camera.far,
                 &self.effects,
             );
+            // A program wgpu rejects is skipped rather than fatal; say which, once each.
+            for failure in state.vfx.take_failures() {
+                eprintln!("[vfx] effect preview skipped a shader: {failure}");
+            }
             // Always re-render (camera may have changed, or egui needs a fresh frame)
             state.renderer.begin_render_models(
                 egui_encoder,

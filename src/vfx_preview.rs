@@ -22,6 +22,9 @@ pub struct EffectDraw {
     pub frame: u32,
 }
 
+/// The preview viewport's backdrop colour.
+const VIEWPORT_BACKDROP: [u8; 4] = [62, 61, 88, 255];
+
 struct Emitter {
     data: effect_library::emitter::EmitterData,
     raw: ptcl::Emitter,
@@ -35,7 +38,7 @@ struct EffectFile {
     emitters: Vec<Vec<Emitter>>,
     ptcl: effect_library::ptcl_file::PtclFile,
     texture_ids: Vec<u64>,
-    textures: HashMap<usize, Option<wgpu::TextureView>>,
+    textures: HashMap<usize, Option<render::GpuTexture>>,
     samplers: HashMap<(u8, u8, u8, u32), wgpu::Sampler>,
     meshes: HashMap<u64, vfx_runtime::mesh::Mesh>,
 }
@@ -139,10 +142,17 @@ impl VfxPreview {
             let Some(Some(file)) = self.files.get_mut(&draw.file) else {
                 continue;
             };
-            let Some(&set) = file.sets.get(&draw.name.to_lowercase()) else {
+            // A set index past the file's sets (a hand-edited or mismatched eff) draws nothing.
+            let Some(&set) = file
+                .sets
+                .get(&draw.name.to_lowercase())
+                .filter(|set| **set < file.emitters.len())
+            else {
                 continue;
             };
             file.renderer.set_view(queue, &camera);
+            // Refraction shaders read the frame behind them; the preview has only its backdrop.
+            file.renderer.set_background(queue, VIEWPORT_BACKDROP);
             let (_, rotation, translation) = draw.placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
             for index in 0..file.emitters[set].len() {
@@ -204,7 +214,7 @@ impl VfxPreview {
                         render::make_sampler(device, key.0, key.1, key.2, sampler.max_lod)
                     });
                 }
-                let views: [Option<&wgpu::TextureView>; 3] = std::array::from_fn(|i| {
+                let views: [Option<&render::GpuTexture>; 3] = std::array::from_fn(|i| {
                     let id = samplers[i].as_ref()?.texture_id;
                     let texture = file.texture_ids.iter().position(|t| *t == id)?;
                     file.textures.get(&texture)?.as_ref()
@@ -231,6 +241,15 @@ impl VfxPreview {
                 }
             }
         }
+    }
+
+    /// Shader or pipeline errors the renderers caught (and skipped) since the last call.
+    pub fn take_failures(&mut self) -> Vec<String> {
+        self.files
+            .values_mut()
+            .flatten()
+            .flat_map(|f| f.renderer.take_failures())
+            .collect()
     }
 
     pub fn paint(&self, pass: &mut wgpu::RenderPass<'_>) {
