@@ -9057,6 +9057,7 @@ impl VisionaryApp {
                 && ec.active_end > ec.active_start)
                 .then(|| (ec.active_end - ec.active_start) as usize);
             let (offset, euler) = spawn_with_random_ranges(ec);
+            let offset = placement_offset(ec, offset);
             let rotation = effect_rotation(euler);
             let local = glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::splat(ec.scale.max(0.01)),
@@ -9882,7 +9883,8 @@ impl VisionaryApp {
                         } else {
                             bone_mat
                         };
-                        let world_pos = bone_mat.transform_point3(glam::Vec3::from(ec.offset));
+                        let world_pos = bone_mat
+                            .transform_point3(glam::Vec3::from(placement_offset(ec, ec.offset)));
                         let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
                             continue;
                         };
@@ -32444,6 +32446,30 @@ impl Hitbox {
     }
 }
 
+/// Where an effect call's offset points, in the fighter's model space (forward +Z).
+///
+/// An `EFFECT`-family call ends with a flag the script source leaves unnamed. Measured in game
+/// (emitter matrices from a probe, Mario facing right): with `true` the offset is in the bone's
+/// own frame, so on `top` X is sideways and Z forward (the forward smash's `sys_flame` at
+/// (0, 8, 12) is 12 in front of him); with `false` X is forward and Z sideways (the jab's
+/// `sys_attack_impact` at (12.8, 6.2, 0) is 12.8 in front of his fist, its random Z spread
+/// sideways). The vanilla scripts agree: on `top`, 65 `false` calls carry their big offset in
+/// X and 72 `true` calls in Z, against 3 each the other way. The flag moves only the
+/// position; the effect's turn is the same either way.
+fn placement_offset(ec: &crate::data::EffectCall, offset: [f32; 3]) -> [f32; 3] {
+    let facing_space = is_system_bone(&ec.bone_name)
+        && ec
+            .extra_args
+            .as_ref()
+            .and_then(|args| args.iter().rev().find(|a| *a == "true" || *a == "false"))
+            .is_some_and(|flag| flag == "false");
+    if facing_space {
+        [-offset[2], offset[1], offset[0]]
+    } else {
+        offset
+    }
+}
+
 /// An effect call's rotation in the script's own order, degrees about X, Y and Z.
 ///
 /// `EffectCall::rotation` holds the three spawn arguments reversed (every parser, exporter and
@@ -45089,5 +45115,44 @@ mod effect_rotation_tests {
         for (a, b) in ours.to_cols_array().iter().zip(game.to_cols_array()) {
             assert!((a - b).abs() < 0.01, "{ours:?} vs {game:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod placement_offset_tests {
+    fn call(line: &str) -> crate::data::EffectCall {
+        let src = format!(
+            "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}"
+        );
+        crate::acmd::parse_effect_script(&src)
+            .to_effect_calls()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_false_call_puts_its_x_forward_and_a_true_call_its_z() {
+        // Mario's jab impact: 12.8 in front of his fist in game.
+        let jab = call(
+            r#"macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 12.8, 6.2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, false);"#,
+        );
+        assert_eq!(super::placement_offset(&jab, jab.offset), [0.0, 6.2, 12.8]);
+        // Mario's forward smash flame: 12 in front of him in game.
+        let flame = call(
+            r#"macros::EFFECT(agent, Hash40::new("sys_flame"), Hash40::new("top"), 0, 8, 12, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, true);"#,
+        );
+        assert_eq!(
+            super::placement_offset(&flame, flame.offset),
+            [0.0, 8.0, 12.0]
+        );
+        // The jab's speed line (EFFECT_FLIP, flag before the flip axis): 4 behind him.
+        let line = call(
+            r#"macros::EFFECT_FLIP(agent, Hash40::new("sys_attack_line"), Hash40::new("sys_attack_line"), Hash40::new("top"), -4, 6.2, 0, 0, 0, 0, 0.95, 0, 1, 0, 0, 0, 0, false, *EF_FLIP_YZ);"#,
+        );
+        assert_eq!(
+            super::placement_offset(&line, line.offset),
+            [0.0, 6.2, -4.0]
+        );
     }
 }
