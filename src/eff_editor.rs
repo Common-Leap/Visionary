@@ -2490,18 +2490,25 @@ impl EffEditor {
         ui.horizontal(|ui| {
             ui.heading(&entry_name);
             ui.label(
-                egui::RichText::new(format!("{emitter_count} emitter(s)"))
+                egui::RichText::new(if emitter_count == 1 {
+                    "1 part".to_owned()
+                } else {
+                    format!("{emitter_count} parts")
+                })
                     .color(egui::Color32::LIGHT_GRAY),
             );
-            reset_entry = ui.small_button("Reset entry").clicked();
+            reset_entry = ui
+                .small_button("Reset effect")
+                .on_hover_text("Put every part of this effect back as the game has it")
+                .clicked();
         });
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.emitter_tab, EmitterTab::Attributes, "Attributes")
-                .on_hover_text("Every value of the selected emitter");
+            ui.selectable_value(&mut self.emitter_tab, EmitterTab::Attributes, "Look")
+                .on_hover_text("How the selected part looks and moves");
             ui.selectable_value(
                 &mut self.emitter_tab,
                 EmitterTab::Spawning,
-                "Emitters & spawning",
+                "Parts & timing",
             )
             .on_hover_text(
                 "Which emitters this effect plays, which extra parts start when, and which \
@@ -2718,7 +2725,7 @@ impl EffEditor {
                     .and_then(|i| textures.get(i).map(|t| (i, t.clone())));
 
                 ui.add_space(6.0);
-                if ui.small_button("Reset emitter").clicked() {
+                if ui.small_button("Reset this part").clicked() {
                     pr.restore(em);
                     changed = true;
                 }
