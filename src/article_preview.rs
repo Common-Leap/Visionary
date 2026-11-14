@@ -127,9 +127,10 @@ pub struct ObjectKind {
     /// Effects from the object's own script; for many projectiles they are all you see.
     pub effects: Vec<ObjectEffect>,
     pub flight: Flight,
-    /// Every motion of the object that has an animation, by motion name. A move picks one with
-    /// `ArticleModule::change_motion`: Samus's grab beam plays `catch` alongside her grab.
-    pub motions: Vec<(String, Arc<AnimData>)>,
+    /// Every motion of the object that has an animation, by hash40 of the motion kind. A move
+    /// picks one with `ArticleModule::change_motion`: Samus's grab beam plays `catch` alongside
+    /// her grab.
+    pub motions: Vec<(u64, Arc<AnimData>)>,
     /// The animation is one of those motions, made in step with the fighter's and in the
     /// fighter's space, so the object rides the fighter's `top` rather than a hand.
     pub synced: bool,
@@ -390,6 +391,7 @@ pub fn load_kind(
     let motion_dir = costume_dir(&fighter_dir.join("motion").join(name), slot);
     // The object plays the first motion in its list that has a script, "regular" first.
     let mut motions: Vec<(String, Option<PathBuf>)> = Vec::new();
+    let mut by_kind: Vec<(u64, PathBuf)> = Vec::new();
     if let Some(dir) = &motion_dir {
         let files: HashMap<u64, PathBuf> = std::fs::read_dir(dir)
             .into_iter()
@@ -404,13 +406,16 @@ pub fn load_kind(
             .collect();
         if let Ok(list) = motion_lib::open(dir.join("motion_list.bin")) {
             for (kind, motion) in list.list.iter() {
-                let Some(label) = labels.get(&kind.0) else {
-                    continue;
-                };
                 let anim = motion
                     .animations
                     .iter()
                     .find_map(|animation| files.get(&animation.name.0).cloned());
+                if let Some(path) = &anim {
+                    by_kind.push((kind.0, path.clone()));
+                }
+                let Some(label) = labels.get(&kind.0) else {
+                    continue;
+                };
                 motions.push((label.clone(), anim));
             }
         }
@@ -449,12 +454,20 @@ pub fn load_kind(
         .and_then(|(_, path)| path)
         .and_then(|path| AnimData::from_file(path).ok())
         .map(Arc::new);
-    let motions = motions
-        .iter()
-        .filter(|(label, _)| !label.is_empty())
-        .filter_map(|(label, path)| {
-            let anim = AnimData::from_file(path.as_ref()?).ok()?;
-            Some((label.clone(), Arc::new(anim)))
+    // Kinds often share one file; each is read once.
+    let mut read: HashMap<PathBuf, Arc<AnimData>> = HashMap::new();
+    let motions = by_kind
+        .into_iter()
+        .filter_map(|(kind, path)| {
+            let anim = match read.get(&path) {
+                Some(anim) => anim.clone(),
+                None => {
+                    let anim = Arc::new(AnimData::from_file(&path).ok()?);
+                    read.insert(path, anim.clone());
+                    anim
+                }
+            };
+            Some((kind, anim))
         })
         .collect();
     let flight = flight_from_params(param_path, name, labels);
@@ -472,6 +485,38 @@ pub fn load_kind(
         motions,
         synced: false,
     })
+}
+
+/// The fighter's objects by the motions they have, as hash40 of the motion kind. Objects that
+/// the fighter's status code creates rather than its scripts are found this way: Diddy Kong's
+/// rocket barrels have a `final_start` motion for his final smash.
+pub fn objects_by_motion(fighter_dir: &Path, slot: u8) -> HashMap<u64, Vec<String>> {
+    let mut objects: HashMap<u64, Vec<String>> = HashMap::new();
+    let parts = std::fs::read_dir(fighter_dir.join("motion"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path());
+    for part in parts {
+        let Some(name) = part.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if name == "body" {
+            continue;
+        }
+        let Some(dir) = costume_dir(&part, slot) else {
+            continue;
+        };
+        let Ok(list) = motion_lib::open(dir.join("motion_list.bin")) else {
+            continue;
+        };
+        for (kind, motion) in list.list.iter() {
+            if !motion.animations.is_empty() {
+                objects.entry(kind.0).or_default().push(name.clone());
+            }
+        }
+    }
+    objects
 }
 
 /// `part/cNN` for the slot, or the part's first costume folder.

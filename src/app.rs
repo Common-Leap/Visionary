@@ -3534,6 +3534,9 @@ pub struct VisionaryApp {
     /// Objects the selected fighter always carries: those with a model folder and a stowed
     /// bone of their own name plus `b` on the body (Link's `bow` and `BowB`).
     stowed_articles: Vec<String>,
+    /// The selected fighter's objects by the motions they have (hash40 of the motion kind), to
+    /// show those its status code creates for a move.
+    objects_by_motion: std::collections::HashMap<u64, Vec<String>>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3961,6 +3964,7 @@ impl VisionaryApp {
             effect_preview_build: EffectPreviewBuild::default(),
             visibility_sets: Vec::new(),
             stowed_articles: Vec::new(),
+            objects_by_motion: Default::default(),
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -4582,6 +4586,8 @@ impl VisionaryApp {
             acmd_bone_options(loaded_bone_names.clone())
         };
         self.stowed_articles = stowed_articles(&model_root, &loaded_bone_names);
+        self.objects_by_motion =
+            crate::article_preview::objects_by_motion(&self.state.fighters[idx].fighter_dir, base_slot);
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
         self.hurtbox_volumes = hurtbox_result.volumes;
@@ -8566,20 +8572,7 @@ impl VisionaryApp {
                 .iter()
                 .find(|(at, other, _)| other == symbol && alive(*at))
             {
-                let key = format!("{}/{name}@{motion}", fighter.name);
-                if let Some(Some(synced)) = self.object_kinds.get(&key) {
-                    kind = synced.clone();
-                } else if let Some((_, anim)) = kind.motions.iter().find(|(m, _)| m == motion) {
-                    let synced = std::sync::Arc::new(crate::article_preview::ObjectKind {
-                        anim: Some(anim.clone()),
-                        synced: kind.skel.as_deref().is_some_and(|skel| {
-                            crate::article_preview::plays_in_fighter_space(skel, anim)
-                        }),
-                        ..(*kind).clone()
-                    });
-                    self.object_kinds.insert(key, Some(synced.clone()));
-                    kind = synced;
-                }
+                kind = self.object_in_motion(&fighter, &name, kind, motion);
             }
             spawns.push(crate::article_preview::Spawn {
                 kind,
@@ -8600,6 +8593,36 @@ impl VisionaryApp {
                     })
                     .map(|(at, _)| *at),
             });
+        }
+        // Objects the fighter's status code creates for a special, final smash, entrance, taunt
+        // or victory pose, which its scripts never mention, play the motion named after it:
+        // Diddy Kong's rocket barrels in his final smash. Only motions made in the fighter's own
+        // space are shown, since nothing says where the others stand. Other moves are left out:
+        // an object's own `wait` or `run` shares its name with the fighter's, not its moment.
+        let status_moves = ["special", "final", "entry", "win_", "appeal", "visual_scene"];
+        if let Some(motion) = self
+            .state
+            .selected_move
+            .as_ref()
+            .map(|m| m.name.clone())
+            .filter(|name| status_moves.iter().any(|kind| name.contains(kind)))
+        {
+            let hash = hash40::hash40(&motion).0;
+            for name in self.objects_by_motion.get(&hash).cloned().unwrap_or_default() {
+                if spawns.iter().any(|spawn| spawn.kind.name == name) {
+                    continue;
+                }
+                let Some(kind) = self.object_kind(&fighter, &name) else {
+                    continue;
+                };
+                let kind = self.object_in_motion(&fighter, &name, kind, &motion);
+                if kind.synced {
+                    spawns.push(crate::article_preview::Spawn {
+                        kind,
+                        ..Default::default()
+                    });
+                }
+            }
         }
         // Objects the fighter always carries (Link's bow on his back) ride their stowed bone
         // unless the move takes them out.
@@ -8828,6 +8851,35 @@ impl VisionaryApp {
                 None
             }
         }
+    }
+
+    /// `kind` playing `motion` (by name) when it has one, placed by that motion's own space;
+    /// `kind` unchanged otherwise.
+    fn object_in_motion(
+        &mut self,
+        fighter: &crate::data::FighterEntry,
+        name: &str,
+        kind: std::sync::Arc<crate::article_preview::ObjectKind>,
+        motion: &str,
+    ) -> std::sync::Arc<crate::article_preview::ObjectKind> {
+        let key = format!("{}/{name}@{motion}", fighter.name);
+        if let Some(Some(cached)) = self.object_kinds.get(&key) {
+            return cached.clone();
+        }
+        let hash = hash40::hash40(motion).0;
+        let Some((_, anim)) = kind.motions.iter().find(|(m, _)| *m == hash) else {
+            return kind;
+        };
+        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
+            anim: Some(anim.clone()),
+            synced: kind
+                .skel
+                .as_deref()
+                .is_some_and(|skel| crate::article_preview::plays_in_fighter_space(skel, anim)),
+            ..(*kind).clone()
+        });
+        self.object_kinds.insert(key, Some(playing.clone()));
+        playing
     }
 
     /// The item the open move holds, if it is an item move and the data folder has the item;
