@@ -462,6 +462,10 @@ pub struct EffEditor {
     selected_emitter: usize,
     /// Draw only the selected emitter in the view, to see which part of the look it is.
     solo_selected: bool,
+    /// The move open in the main window, by its plain name, for "Use in <move>".
+    open_move: Option<String>,
+    /// Set when "Use in <move>" is clicked; the app adds the effect to the move.
+    pub use_in_move_requested: bool,
     /// Substring filter over the attribute tree in the emitter panel.
     attr_filter: String,
     /// Which half of the emitter column is showing: the selected emitter's attributes, or the
@@ -574,6 +578,8 @@ impl Default for EffEditor {
             selected_entry: None,
             selected_emitter: 0,
             solo_selected: false,
+            open_move: None,
+            use_in_move_requested: false,
             attr_filter: String::new(),
             emitter_tab: EmitterTab::Attributes,
             entry_info: Vec::new(),
@@ -1697,6 +1703,11 @@ impl EffEditor {
     }
 
     /// The selected effect's name, as the game spawns it.
+    /// The move open in the main window (its plain name), which "Use in" adds effects to.
+    pub fn set_open_move(&mut self, open_move: Option<String>) {
+        self.open_move = open_move;
+    }
+
     /// The emitter (index in the selected effect's set) the view draws alone, if any.
     pub fn solo_emitter(&self) -> Option<usize> {
         (self.solo_selected && self.selected_entry.is_some()).then_some(self.selected_emitter)
@@ -2501,6 +2512,21 @@ impl EffEditor {
                 .small_button("Reset effect")
                 .on_hover_text("Put every part of this effect back as the game has it")
                 .clicked();
+            let label = match &self.open_move {
+                Some(name) => format!("Use in {name}"),
+                None => "Use in a move".to_owned(),
+            };
+            if ui
+                .add_enabled(self.open_move.is_some(), egui::Button::new(label).small())
+                .on_hover_text(
+                    "Spawn this effect in the open move at the current frame, on the \
+                     fighter's root, and go to it in the Classic editor to place it.",
+                )
+                .on_disabled_hover_text("Open a move in the Classic editor first.")
+                .clicked()
+            {
+                self.use_in_move_requested = true;
+            }
         });
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.emitter_tab, EmitterTab::Attributes, "Look")

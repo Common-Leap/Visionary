@@ -9119,6 +9119,71 @@ impl VisionaryApp {
     }
 
     /// Show the Effects page, with the selected fighter's effect file open in it.
+    /// Add an `EFFECT_FOLLOW` of `name` on the fighter's root to the open move at `frame`, as
+    /// an edit of that move, and select it. Returns its index in the move's effect list.
+    fn add_effect_call(&mut self, name: &str, frame: u32) -> usize {
+        let call = crate::data::EffectCall {
+            effect_name: name.to_owned(),
+            effect_name_alt: None,
+            spawn_func: "EFFECT_FOLLOW".into(),
+            bone_name: "top".into(),
+            offset: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            follows_bone: true,
+            active_start: frame,
+            // Follow effects play through until the user explicitly opts into an
+            // EFFECT_OFF_KIND lifetime.
+            active_end: crate::data::OPEN_ENDED_EFFECT_FRAME,
+            disabled: false,
+            // This is the actual tail of the plain EFFECT_FOLLOW form. Keeping it in
+            // the model also makes source verification agree with generated output.
+            extra_args: Some(vec!["true".into()]),
+            flip_axis: None,
+            raw_line: None,
+            trail_command: None,
+            trail_off: None,
+            off_fade: None,
+            off_detach: None,
+            trail_bone2: None,
+            // A new spawn sets no rate, so no `LAST_EFFECT_SET_RATE` is written for
+            // it until the user turns one on in the properties panel.
+            rate: None,
+            work_int: None,
+            camera_offset: None,
+            tint: None,
+            particle_tint: None,
+            alpha: None,
+            scale_w: None,
+            // This button adds a spawn. Colour commands are added by their own button
+            // below, because the two share a list but nothing else.
+            color: None,
+            control: None,
+            guard: None,
+            leading: Vec::new(),
+            trailing: Vec::new(),
+        };
+        self.state.effects.push(call.clone());
+        let idx = self.state.effects.len() - 1;
+        if let Some(mv) = self.current_move_key() {
+            self.state
+                .effect_call_edits
+                .entry(mv.clone())
+                .or_default()
+                .push(crate::data::EffectCallEdit {
+                    index: idx,
+                    op: crate::data::EffectCallOp::Add(call),
+                    pristine: None,
+                });
+            self.state
+                .effect_call_full
+                .insert(mv, self.state.effects.clone());
+        }
+        self.state.selected_effect_call = Some(idx);
+        self.push_effect_rules();
+        idx
+    }
+
     fn open_effects_page(&mut self) {
         self.eff_editor.open = true;
         self.roster.open = false;
@@ -15374,65 +15439,7 @@ impl VisionaryApp {
 
             if ui.small_button("+ Add effect call").clicked() {
                 self.pending_capture = None;
-                let call = crate::data::EffectCall {
-                    effect_name: "sys_hit_elec".into(),
-                    effect_name_alt: None,
-                    spawn_func: "EFFECT_FOLLOW".into(),
-                    bone_name: "top".into(),
-                    offset: [0.0; 3],
-                    rotation: [0.0; 3],
-                    scale: 1.0,
-                    follows_bone: true,
-                    active_start: current,
-                    // Follow effects play through until the user explicitly opts into an
-                    // EFFECT_OFF_KIND lifetime.
-                    active_end: crate::data::OPEN_ENDED_EFFECT_FRAME,
-                    disabled: false,
-                    // This is the actual tail of the plain EFFECT_FOLLOW form. Keeping it in
-                    // the model also makes source verification agree with generated output.
-                    extra_args: Some(vec!["true".into()]),
-                    flip_axis: None,
-                    raw_line: None,
-                    trail_command: None,
-                    trail_off: None,
-                    off_fade: None,
-                    off_detach: None,
-                    trail_bone2: None,
-                    // A new spawn sets no rate, so no `LAST_EFFECT_SET_RATE` is written for
-                    // it until the user turns one on in the properties panel.
-                    rate: None,
-                    work_int: None,
-                    camera_offset: None,
-                    tint: None,
-                    particle_tint: None,
-                    alpha: None,
-                    scale_w: None,
-                    // This button adds a spawn. Colour commands are added by their own button
-                    // below, because the two share a list but nothing else.
-                    color: None,
-                    control: None,
-                    guard: None,
-                    leading: Vec::new(),
-                    trailing: Vec::new(),
-                };
-                self.state.effects.push(call.clone());
-                let idx = self.state.effects.len() - 1;
-                if let Some(mv) = self.current_move_key() {
-                    self.state
-                        .effect_call_edits
-                        .entry(mv.clone())
-                        .or_default()
-                        .push(crate::data::EffectCallEdit {
-                            index: idx,
-                            op: crate::data::EffectCallOp::Add(call),
-                            pristine: None,
-                        });
-                    self.state
-                        .effect_call_full
-                        .insert(mv, self.state.effects.clone());
-                }
-                self.state.selected_effect_call = Some(idx);
-                self.push_effect_rules();
+                self.add_effect_call("sys_hit_elec", current);
             }
 
             // Backspace / Delete removes the selected spawn (unless typing in a field).
@@ -32124,7 +32131,39 @@ impl eframe::App for VisionaryApp {
             self.eff_editor.set_texture_imports(imports);
         }
         let t = self.perf.start();
+        // Only the open fighter's own effects and the shared ones exist for its moves in game.
+        let usable = {
+            let selected = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone());
+            self.eff_editor.loaded_rel().is_some_and(|rel| {
+                rel.contains("system/common")
+                    || selected.as_deref()
+                        == Some(crate::mod_project::fighter_from_source_rel(&rel).as_str())
+            })
+        };
+        self.eff_editor.set_open_move(
+            self.state
+                .selected_move
+                .as_ref()
+                .filter(|_| usable)
+                .map(|m| crate::move_kinds::plain_name(&m.name)),
+        );
         self.eff_editor.update(&ctx, &self.game_link);
+        if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
+            if let Some(name) = self.eff_editor.selected_entry_name().map(str::to_owned) {
+                let frame = self.state.current_frame;
+                self.add_effect_call(&name, frame);
+                // Over to the move, with the new spawn selected for placing.
+                self.eff_editor.open = false;
+                self.node_workspace = false;
+                self.roster.open = false;
+                self.primary_tab = PrimaryEditorTab::Effects;
+                self.state.status = format!("Added {name} to the move at frame {frame}");
+            }
+        }
         self.poll_effect_preview_build(&ctx);
         if self.eff_editor.open {
             self.poll_effect_uses(&ctx);
