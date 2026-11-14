@@ -15294,7 +15294,18 @@ impl VisionaryApp {
                                 };
                                 ui.colored_label(dot_color, "●");
                                 let selected = self.state.selected_effect_call == Some(i);
-                                let display_name = effect_call_display_name(effect);
+                                let display_name = format!(
+                                    "{} · {}",
+                                    effect_call_display_name(effect),
+                                    if effect.follows_bone && effect.ends_early() {
+                                        format!(
+                                            "frames {}-{}",
+                                            effect.active_start, effect.active_end
+                                        )
+                                    } else {
+                                        format!("frame {}", effect.active_start)
+                                    }
+                                );
                                 let mut text = egui::RichText::new(display_name).monospace();
                                 if effect.disabled {
                                     text = text.strikethrough().color(egui::Color32::DARK_GRAY);
@@ -15483,8 +15494,18 @@ impl VisionaryApp {
                     // shown holding the empty strings and zeroes it stores for them.
                     let is_color = ec.color.is_some();
                     let is_control = ec.control.is_some();
-                    let orig = |ui: &mut Ui, txt: String| {
-                        ui.label(egui::RichText::new(txt).small().color(egui::Color32::GRAY));
+                    // The game's value beside a field, only where it differs: on an untouched
+                    // field it would just repeat what the field shows.
+                    let orig_if = |same: bool, ui: &mut Ui, txt: String| {
+                        if same {
+                            ui.label("");
+                        } else {
+                            ui.label(
+                                egui::RichText::new(txt.replacen("orig ", "was ", 1))
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
                     };
                     egui::Grid::new("effect_call_edit")
                         .num_columns(3)
@@ -15508,7 +15529,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 if let Some(p) = &pristine {
-                                    orig(ui, format!("orig {}", p.effect_name));
+                                    orig_if(p.effect_name == ec.effect_name, ui, format!("orig {}", p.effect_name));
                                 } else {
                                     ui.label(
                                         egui::RichText::new("added")
@@ -15530,7 +15551,7 @@ impl VisionaryApp {
                                         )
                                         .changed();
                                     if let Some(p) = &pristine {
-                                        orig(
+                                        orig_if(p.effect_name_alt == ec.effect_name_alt, 
                                             ui,
                                             format!(
                                                 "orig {}",
@@ -15612,7 +15633,7 @@ impl VisionaryApp {
                                     let mut command = spawn_command.clone();
                                     egui::ComboBox::from_id_salt("effect_spawn_command")
                                         .selected_text(&command)
-                                        .width(220.0)
+                                        .width(150.0)
                                         .show_ui(ui, |ui| {
                                             for layout in crate::acmd::EFFECT_SPAWN_LAYOUTS {
                                                 ui.selectable_value(
@@ -15628,7 +15649,7 @@ impl VisionaryApp {
                                         changed = true;
                                         respawn_needed = true;
                                     }
-                                    ui.label("swap")
+                                    ui.weak("?")
                                         .on_hover_text(
                                             "Choose any supported ACMD effect spawn family. The \
                                              transform is kept; flip graphics, follow lifetime, \
@@ -15653,7 +15674,7 @@ impl VisionaryApp {
                                 }
                             });
                             if let Some(p) = &pristine {
-                                orig(
+                                orig_if(p.spawn_func == ec.spawn_func, 
                                     ui,
                                     format!(
                                         "orig {}",
@@ -15691,7 +15712,7 @@ impl VisionaryApp {
                                     }
                                 }
                                 if let Some(p) = &pristine {
-                                    orig(ui, format!("orig {}", p.bone_name));
+                                    orig_if(p.bone_name == ec.bone_name, ui, format!("orig {}", p.bone_name));
                                 } else {
                                     ui.label("");
                                 }
@@ -15721,7 +15742,7 @@ impl VisionaryApp {
                                         ec.trail_bone2 = Some(bone2);
                                     }
                                     match pristine.as_ref().and_then(|p| p.trail_bone2.as_deref()) {
-                                        Some(was) => orig(ui, format!("orig {was}")),
+                                        Some(was) => orig_if(Some(was) == ec.trail_bone2.as_deref(), ui, format!("orig {was}")),
                                         None => {
                                             ui.label("");
                                         }
@@ -15763,7 +15784,7 @@ impl VisionaryApp {
                                     match pristine.as_ref().and_then(|p| p.color.as_ref()) {
                                         Some(crate::data::ColorCall {
                                             rgba: Some(was), ..
-                                        }) => orig(
+                                        }) => orig_if(rgba[..3] == was[..3], 
                                             ui,
                                             format!(
                                                 "orig [{:.3} {:.3} {:.3}]",
@@ -15792,7 +15813,7 @@ impl VisionaryApp {
                                     match pristine.as_ref().and_then(|p| p.color.as_ref()) {
                                         Some(crate::data::ColorCall {
                                             rgba: Some(was), ..
-                                        }) => orig(ui, format!("orig {:.3}", was[3])),
+                                        }) => orig_if(rgba[3] == was[3], ui, format!("orig {:.3}", was[3])),
                                         _ => {
                                             ui.label("");
                                         }
@@ -15825,7 +15846,7 @@ impl VisionaryApp {
                                         Some(crate::data::ColorCall {
                                             transition: Some(was),
                                             ..
-                                        }) => orig(ui, format!("orig {was:.1}")),
+                                        }) => orig_if(*frames == *was, ui, format!("orig {was:.1}")),
                                         _ => {
                                             ui.label("");
                                         }
@@ -15956,7 +15977,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 if let Some(p) = &pristine {
-                                    orig(
+                                    orig_if(p.offset == ec.offset, 
                                         ui,
                                         format!(
                                             "orig [{:.2} {:.2} {:.2}]",
@@ -15984,7 +16005,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 if let Some(p) = &pristine {
-                                    orig(
+                                    orig_if(p.rotation == ec.rotation, 
                                         ui,
                                         format!(
                                             "orig X {:.1} · Y {:.1} · Z {:.1}",
@@ -16001,7 +16022,7 @@ impl VisionaryApp {
                                     .add(egui::DragValue::new(&mut ec.scale).speed(0.02))
                                     .changed();
                                 if let Some(p) = &pristine {
-                                    orig(ui, format!("orig {:.2}", p.scale));
+                                    orig_if(p.scale == ec.scale, ui, format!("orig {:.2}", p.scale));
                                 } else {
                                     ui.label("");
                                 }
@@ -16021,7 +16042,7 @@ impl VisionaryApp {
                                         )
                                         .changed();
                                     if let Some(p) = &pristine {
-                                        orig(
+                                        orig_if(p.flip_axis == ec.flip_axis, 
                                             ui,
                                             format!(
                                                 "orig {}",
@@ -16098,8 +16119,8 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.rate) {
-                                    Some(Some(rate)) => orig(ui, format!("orig {rate:.2}")),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(Some(rate)) => orig_if(ec.rate == Some(rate), ui, format!("orig {rate:.2}")),
+                                    Some(None) => orig_if(ec.rate.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16143,8 +16164,8 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.camera_offset) {
-                                    Some(Some(offset)) => orig(ui, format!("orig {offset:.3}")),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(Some(offset)) => orig_if(ec.camera_offset == Some(offset), ui, format!("orig {offset:.3}")),
+                                    Some(None) => orig_if(ec.camera_offset.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16191,8 +16212,8 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.work_int.as_deref()) {
-                                    Some(Some(work)) => orig(ui, format!("orig {work}")),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(Some(work)) => orig_if(ec.work_int.as_deref() == Some(work), ui, format!("orig {work}")),
+                                    Some(None) => orig_if(ec.work_int.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16279,11 +16300,11 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.tint) {
-                                    Some(Some(was)) => orig(
+                                    Some(Some(was)) => orig_if(ec.tint == Some(was), 
                                         ui,
                                         format!("orig [{:.3} {:.3} {:.3}]", was[0], was[1], was[2]),
                                     ),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(None) => orig_if(ec.tint.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16331,14 +16352,14 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.particle_tint) {
-                                    Some(Some(was)) => orig(
+                                    Some(Some(was)) => orig_if(ec.particle_tint == Some(was), 
                                         ui,
                                         format!(
                                             "orig [{:.3} {:.3} {:.3}]",
                                             was[0], was[1], was[2]
                                         ),
                                     ),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(None) => orig_if(ec.particle_tint.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16376,8 +16397,8 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.alpha) {
-                                    Some(Some(was)) => orig(ui, format!("orig {was:.3}")),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(Some(was)) => orig_if(ec.alpha == Some(was), ui, format!("orig {was:.3}")),
+                                    Some(None) => orig_if(ec.alpha.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16435,7 +16456,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.scale_w.as_deref()) {
-                                    Some(Some(values)) => orig(
+                                    Some(Some(values)) => orig_if(ec.scale_w.as_deref() == Some(values), 
                                         ui,
                                         format!(
                                             "orig [{}]",
@@ -16446,7 +16467,7 @@ impl VisionaryApp {
                                                 .join(" ")
                                         ),
                                     ),
-                                    Some(None) => orig(ui, "orig none".to_string()),
+                                    Some(None) => orig_if(ec.scale_w.is_none(), ui, "orig none".to_string()),
                                     None => {
                                         ui.label("");
                                     }
@@ -16506,9 +16527,7 @@ impl VisionaryApp {
                                         changed |= end_changed;
                                     } else {
                                         ui.label(
-                                            egui::RichText::new(
-                                                "plays through; no EFFECT_OFF_KIND",
-                                            )
+                                            egui::RichText::new("plays to its end")
                                             .small()
                                             .color(egui::Color32::GRAY),
                                         );
@@ -16524,15 +16543,15 @@ impl VisionaryApp {
                             if let Some(p) = &pristine {
                                 if p.follows_bone {
                                     if p.ends_early() {
-                                        orig(
+                                        orig_if((p.follows_bone, p.active_start, p.active_end) == (ec.follows_bone, ec.active_start, ec.active_end), 
                                             ui,
                                             format!("orig {}→{}", p.active_start, p.active_end),
                                         );
                                     } else {
-                                        orig(ui, format!("orig {} onward", p.active_start));
+                                        orig_if((p.follows_bone, p.active_start, p.active_end) == (ec.follows_bone, ec.active_start, ec.active_end), ui, format!("orig {} onward", p.active_start));
                                     }
                                 } else {
-                                    orig(ui, format!("orig frame {}", p.active_start));
+                                    orig_if((p.follows_bone, p.active_start, p.active_end) == (ec.follows_bone, ec.active_start, ec.active_end), ui, format!("orig frame {}", p.active_start));
                                 }
                             } else {
                                 ui.label("");
@@ -16552,7 +16571,7 @@ impl VisionaryApp {
                                     changed = true;
                                 }
                                 match pristine.as_ref().filter(|p| p.ends_early()) {
-                                    Some(p) => orig(
+                                    Some(p) => orig_if((p.off_fade, p.off_detach) == (ec.off_fade, ec.off_detach), 
                                         ui,
                                         format!(
                                             "orig {}, {}",
@@ -16754,14 +16773,7 @@ impl VisionaryApp {
             }
         }
 
-        ui.separator();
-        editor_subsection_heading(
-            ui,
-            "Fighter effect file",
-            "Shows whether the selected fighter's .eff resource file is available. The file supplies effect definitions and assets; the move's effect_ script decides when to use them.",
-        );
-
-        // VFX file check
+        // VFX file check: only said when there is something to do about it.
         let fighter_name = self
             .state
             .selected_fighter
@@ -16781,17 +16793,13 @@ impl VisionaryApp {
                     .join(format!("ef_{}.eff", name)),
             ];
             let found = candidates.iter().find(|p| p.exists());
-            if found.is_some() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 220, 100),
-                    "Effect file: present",
+            if found.is_none() && self.current_eff_path.is_none() {
+                ui.separator();
+                editor_subsection_heading(
+                    ui,
+                    "Fighter effect file",
+                    "The fighter's .eff file holds what its effects look like. Without it the view cannot draw them.",
                 );
-            } else if self.current_eff_path.is_some() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(100, 220, 100),
-                    "Effect file: loaded manually",
-                );
-            } else {
                 ui.colored_label(egui::Color32::GRAY, "Effect file: not found");
                 ui.label(
                     egui::RichText::new("Extract effect/fighter/ from data.arc, or:")
