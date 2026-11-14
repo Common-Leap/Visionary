@@ -31306,6 +31306,13 @@ impl eframe::App for VisionaryApp {
                 );
                 renderer.callback_resources.insert(rs);
             }
+            if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                rs.use_stage(
+                    &wgpu_state.device,
+                    &wgpu_state.queue,
+                    self.state.data_root.as_deref(),
+                );
+            }
         }
 
         // Advance playback

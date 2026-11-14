@@ -122,6 +122,8 @@ pub struct HitboxRenderState {
     pub vfx: crate::vfx_preview::VfxPreview,
     /// Weapon swing trails.
     trails: crate::preview_trail::PreviewTrails,
+    /// The data folder whose training stage lighting is applied.
+    stage_root: Option<std::path::PathBuf>,
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
@@ -205,6 +207,7 @@ impl HitboxRenderState {
                 vfx.set_backdrop([r, g, b, 255]);
                 vfx
             },
+            stage_root: None,
             trails: crate::preview_trail::PreviewTrails::new(
                 device,
                 ssbh_wgpu::RGBA_COLOR_FORMAT,
@@ -371,6 +374,36 @@ impl HitboxRenderState {
                 &self.shared_data,
                 frame,
             );
+        }
+    }
+
+    /// Light the models as the training stage does, from `data_root`'s
+    /// `stage/training/normal`: its light set (the directional light, ambient and colours the
+    /// fighter shaders read) and its colour grading LUT. Without the stage files the renderer's
+    /// default lighting and the LUT read from a GPU capture stay.
+    pub fn use_stage(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data_root: Option<&Path>,
+    ) {
+        if self.stage_root.as_deref() == data_root {
+            return;
+        }
+        self.stage_root = data_root.map(Path::to_path_buf);
+        let Some(stage) = data_root.map(|root| root.join("stage/training/normal")) else {
+            return;
+        };
+        match ssbh_data::anim_data::AnimData::from_file(
+            stage.join("render/light/light00_set.nuanmb"),
+        ) {
+            Ok(light) => self.renderer.update_stage_uniforms(queue, &light, 0.0),
+            Err(_) => self.renderer.reset_stage_uniforms(queue),
+        }
+        if let Ok(lut) =
+            nutexb::NutexbFile::read_from_file(stage.join("lut/color_grading_lut.nutexb"))
+        {
+            self.renderer.update_color_lut(device, queue, &lut);
         }
     }
 
