@@ -3539,6 +3539,11 @@ pub struct VisionaryApp {
     objects_by_motion: std::collections::HashMap<u64, Vec<String>>,
     /// The selected fighter's attack-arc colour from the game's `fighter_param.prc`.
     fighter_arc_colour: Option<[f32; 3]>,
+    /// Which moves spawn each effect, for the Effects page list.
+    effect_uses: EffectUseIndex,
+    /// When the Effects page's looping play of the open effect started.
+    effect_loop_started: std::time::Instant,
+    effect_loop_for: Option<String>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3969,6 +3974,9 @@ impl VisionaryApp {
             stowed_articles: Vec::new(),
             objects_by_motion: Default::default(),
             fighter_arc_colour: None,
+            effect_uses: EffectUseIndex::default(),
+            effect_loop_started: std::time::Instant::now(),
+            effect_loop_for: None,
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -9125,6 +9133,16 @@ impl VisionaryApp {
     /// The Effects page: the open file's effects on the left, the selected one's emitters on
     /// the right, and the 3D view between them showing the move with every edit applied.
     fn draw_effects_page(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // The open effect plays on a loop in the view: start it over when another is picked,
+        // and keep the view painting while one is open.
+        let selected = self.eff_editor.selected_entry_name().map(str::to_owned);
+        if selected != self.effect_loop_for {
+            self.effect_loop_for = selected.clone();
+            self.effect_loop_started = std::time::Instant::now();
+        }
+        if selected.is_some() {
+            ui.ctx().request_repaint();
+        }
         egui::Panel::top("effects_page_top").show_inside(ui, |ui| {
             self.eff_editor.page_top(ui, &self.game_link);
         });
@@ -9188,6 +9206,12 @@ impl VisionaryApp {
         let files = self.preview_effect_files();
         let mut out = Vec::new();
         let fighter_colour = self.fighter_arc_colour;
+        // The Effects page's "Show only this part", for the effect it has open.
+        let solo = self.eff_editor.open.then(|| self.eff_editor.solo_emitter()).flatten();
+        let solo_name = self.eff_editor.selected_entry_name().map(str::to_ascii_lowercase);
+        let solo_for = |name: &str| {
+            solo.filter(|_| solo_name.as_deref() == Some(name.to_ascii_lowercase().as_str()))
+        };
         let mut push = |name: &str,
                         placements: Vec<glam::Mat4>,
                         kill_at: Option<usize>,
@@ -9203,6 +9227,8 @@ impl VisionaryApp {
                     placements: placements.clone(),
                     kill_at,
                     colour,
+                    solo: solo_for(name),
+                    looping: None,
                 });
             }
         };
@@ -9331,13 +9357,18 @@ impl VisionaryApp {
                         .get("top")
                         .map(|m| glam::Mat4::from_translation(m.col(3).truncate()))
                         .unwrap_or(glam::Mat4::IDENTITY);
-                    let age = frame_num.saturating_sub(FIRST_GAME_FRAME) as usize + 1;
+                    // Played on its own clock, over and over, so it can be seen moving
+                    // whatever frame the move's timeline is on.
+                    let clock = (self.effect_loop_started.elapsed().as_secs_f32() * 60.0) as usize;
+                    let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
                     out.push(crate::vfx_preview::EffectDraw {
                         file,
+                        solo: solo_for(&name),
                         name,
-                        placements: vec![at; age],
+                        placements: vec![at],
                         kill_at: None,
-                        colour: [1.0; 4],
+                        colour,
+                        looping: Some(clock),
                     });
                 }
             }
@@ -29160,84 +29191,79 @@ impl VisionaryApp {
         // measured ~236 ms each, so a cold cache cost roughly two minutes. Now: resolve
         // everything already on disk first (no network at all, ~5 ms for a whole fighter),
         // then pull only the misses over a shared pooled client from a small thread pool.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let fighter_s = fighter.to_string();
-        std::thread::spawn(move || {
-            let moves = match fetch_move_index(&fighter_s) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[USE-SCAN] move index fetch failed for {fighter_s}: {e}");
-                    return;
-                }
-            };
-            let _ = tx.send(UseScanMsg::Total(moves.len()));
-
-            let scan_body = |body: &str| crate::acmd::parse_effect_script(body).to_effect_calls();
-
-            // Pass 1 — disk cache only. Reports progress for every already-known move
-            // immediately, so a warm scan finishes before the prompt has even repainted.
-            let mut misses: Vec<String> = Vec::new();
-            for pascal in moves {
-                let snake = pascal_to_snake(&pascal);
-                match crate::acmd::cached_script_body(&fighter_s, &snake) {
-                    Some(body) => {
-                        if tx.send(UseScanMsg::Move(snake, scan_body(&body))).is_err() {
-                            return;
-                        }
-                    }
-                    None => misses.push(snake),
-                }
-            }
-            if misses.is_empty() {
-                return;
-            }
-
-            // Pass 2 — network, in parallel over a shared connection pool. Workers pull from
-            // one queue so a slow request never stalls the others.
-            let queue = std::sync::Arc::new(std::sync::Mutex::new(misses));
-            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let workers = crate::acmd::SCRIPT_FETCH_THREADS.min(
-                queue
-                    .lock()
-                    .map(|q| q.len())
-                    .unwrap_or(crate::acmd::SCRIPT_FETCH_THREADS),
-            );
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let queue = std::sync::Arc::clone(&queue);
-                let cancel = std::sync::Arc::clone(&cancel);
-                let tx = tx.clone();
-                let fighter_s = fighter_s.clone();
-                handles.push(std::thread::spawn(move || loop {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    let Some(snake) = queue.lock().ok().and_then(|mut q| q.pop()) else {
-                        return;
-                    };
-                    let calls = crate::acmd::fetch_script_body_cached(&fighter_s, &snake)
-                        .map(|b| crate::acmd::parse_effect_script(&b).to_effect_calls())
-                        .unwrap_or_default();
-                    if tx.send(UseScanMsg::Move(snake, calls)).is_err() {
-                        // The UI dropped the receiver (prompt closed) — stop the whole scan.
-                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return;
-                    }
-                }));
-            }
-            // Drop the spawner's sender so the channel disconnects (= "scan finished") as
-            // soon as the last worker exits.
-            drop(tx);
-            for h in handles {
-                let _ = h.join();
-            }
-        });
+        let rx = spawn_move_effect_scan(fighter);
         self.use_scan = Some(UseScan {
             rx,
             fighter: fighter.to_string(),
             done: 0,
             total: 0,
         });
+    }
+
+    /// Keep the Effects page's "used by" index for the fighter whose effects are open (the
+    /// selected fighter for the shared file), scanning its moves in the background.
+    fn poll_effect_uses(&mut self, ctx: &egui::Context) {
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.clone());
+        let Some(rel) = self.eff_editor.loaded_rel() else {
+            return;
+        };
+        let fighter = if rel.contains("/fighter/") || rel.starts_with("fighter/") {
+            crate::mod_project::fighter_from_source_rel(&rel)
+        } else if let Some(name) = selected {
+            name
+        } else {
+            return;
+        };
+        let index = &mut self.effect_uses;
+        if index.fighter != fighter {
+            *index = EffectUseIndex {
+                rx: Some(spawn_move_effect_scan(&fighter)),
+                fighter,
+                uses: HashMap::new(),
+            };
+            self.eff_editor.set_effect_uses(HashMap::new(), false);
+        }
+        let Some(rx) = &index.rx else {
+            return;
+        };
+        let mut changed = false;
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(UseScanMsg::Move(motion, calls)) => {
+                    let name = crate::move_kinds::plain_name(&motion);
+                    for call in calls.iter().filter(|c| c.color.is_none() && c.control.is_none()) {
+                        let moves = index.uses.entry(effect_name_hash(&call.effect_name)).or_default();
+                        if !moves.contains(&name) {
+                            moves.push(name.clone());
+                            changed = true;
+                        }
+                    }
+                }
+                Ok(UseScanMsg::Total(_)) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            index.rx = None;
+            for moves in index.uses.values_mut() {
+                moves.sort();
+            }
+        }
+        if changed || finished {
+            self.eff_editor.set_effect_uses(index.uses.clone(), finished);
+        }
+        if !finished {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Drain the background full-use scan: donor-using moves land in
@@ -32100,6 +32126,9 @@ impl eframe::App for VisionaryApp {
         let t = self.perf.start();
         self.eff_editor.update(&ctx, &self.game_link);
         self.poll_effect_preview_build(&ctx);
+        if self.eff_editor.open {
+            self.poll_effect_uses(&ctx);
+        }
         if std::mem::take(&mut self.eff_editor.transplant_requested) {
             self.show_transplant = true;
         }
@@ -34800,6 +34829,94 @@ struct PendingCapture {
 const CAPTURE_QUIET: std::time::Duration = std::time::Duration::from_millis(1200);
 /// Hard ceiling on the wait, so a motion that never reports an end still resolves.
 const CAPTURE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Read every move script of `fighter` in the background (disk cache first, then the network
+/// for the rest) and send each move's effect calls as it is read: `Total` first, then one
+/// `Move` per script. The channel disconnects when the scan is done.
+fn spawn_move_effect_scan(fighter: &str) -> std::sync::mpsc::Receiver<UseScanMsg> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fighter_s = fighter.to_string();
+    std::thread::spawn(move || {
+        let moves = match fetch_move_index(&fighter_s) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[USE-SCAN] move index fetch failed for {fighter_s}: {e}");
+                return;
+            }
+        };
+        let _ = tx.send(UseScanMsg::Total(moves.len()));
+
+        let scan_body = |body: &str| crate::acmd::parse_effect_script(body).to_effect_calls();
+
+        // Pass 1 — disk cache only. Reports progress for every already-known move
+        // immediately, so a warm scan finishes before the prompt has even repainted.
+        let mut misses: Vec<String> = Vec::new();
+        for pascal in moves {
+            let snake = pascal_to_snake(&pascal);
+            match crate::acmd::cached_script_body(&fighter_s, &snake) {
+                Some(body) => {
+                    if tx.send(UseScanMsg::Move(snake, scan_body(&body))).is_err() {
+                        return;
+                    }
+                }
+                None => misses.push(snake),
+            }
+        }
+        if misses.is_empty() {
+            return;
+        }
+
+        // Pass 2 — network, in parallel over a shared connection pool. Workers pull from
+        // one queue so a slow request never stalls the others.
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(misses));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let workers = crate::acmd::SCRIPT_FETCH_THREADS.min(
+            queue
+                .lock()
+                .map(|q| q.len())
+                .unwrap_or(crate::acmd::SCRIPT_FETCH_THREADS),
+        );
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let queue = std::sync::Arc::clone(&queue);
+            let cancel = std::sync::Arc::clone(&cancel);
+            let tx = tx.clone();
+            let fighter_s = fighter_s.clone();
+            handles.push(std::thread::spawn(move || loop {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let Some(snake) = queue.lock().ok().and_then(|mut q| q.pop()) else {
+                    return;
+                };
+                let calls = crate::acmd::fetch_script_body_cached(&fighter_s, &snake)
+                    .map(|b| crate::acmd::parse_effect_script(&b).to_effect_calls())
+                    .unwrap_or_default();
+                if tx.send(UseScanMsg::Move(snake, calls)).is_err() {
+                    // The UI dropped the receiver (prompt closed) — stop the whole scan.
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }));
+        }
+        // Drop the spawner's sender so the channel disconnects (= "scan finished") as
+        // soon as the last worker exits.
+        drop(tx);
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    rx
+}
+
+/// Which moves of a fighter spawn each effect (by hash40 of its name), read from every move
+/// script in the background.
+#[derive(Default)]
+struct EffectUseIndex {
+    fighter: String,
+    rx: Option<std::sync::mpsc::Receiver<UseScanMsg>>,
+    uses: HashMap<u64, Vec<String>>,
+}
 
 struct UseScan {
     rx: std::sync::mpsc::Receiver<UseScanMsg>,

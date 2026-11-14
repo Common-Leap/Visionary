@@ -2418,13 +2418,6 @@ impl GameLink {
         self.shared.lock().ok().and_then(|s| s.last_error.clone())
     }
 
-    pub fn stats(&self) -> (u64, u64) {
-        self.shared
-            .lock()
-            .map(|s| (s.frames_rx, s.edits_tx))
-            .unwrap_or((0, 0))
-    }
-
     /// Current connection's complete live fighter/weapon snapshot.
     pub fn gimmick_agents(&self) -> Vec<LiveGimmickAgent> {
         self.shared

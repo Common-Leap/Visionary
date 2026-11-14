@@ -453,9 +453,15 @@ pub struct EffEditor {
     /// Pristine snapshots per emitter set, parallel to `ptcl.emitter_sets`.
     pristine: Vec<Vec<EmitterSnapshot>>,
     entries: Vec<EffEntry>,
+    /// The moves that spawn each effect (hash40 of its name), and whether every move has been
+    /// read yet.
+    effect_uses: std::collections::HashMap<u64, Vec<String>>,
+    effect_uses_ready: bool,
     entry_filter: String,
     selected_entry: Option<usize>,
     selected_emitter: usize,
+    /// Draw only the selected emitter in the view, to see which part of the look it is.
+    solo_selected: bool,
     /// Substring filter over the attribute tree in the emitter panel.
     attr_filter: String,
     /// Which half of the emitter column is showing: the selected emitter's attributes, or the
@@ -562,9 +568,12 @@ impl Default for EffEditor {
             texture_form_note: String::new(),
             pristine: Vec::new(),
             entries: Vec::new(),
+            effect_uses: Default::default(),
+            effect_uses_ready: false,
             entry_filter: String::new(),
             selected_entry: None,
             selected_emitter: 0,
+            solo_selected: false,
             attr_filter: String::new(),
             emitter_tab: EmitterTab::Attributes,
             entry_info: Vec::new(),
@@ -1157,6 +1166,17 @@ impl EffEditor {
     }
 
     /// The project's texture replacements for the loaded eff, so the panel can show them.
+    /// The moves that spawn each effect, by hash40 of its name; `ready` once every move has
+    /// been read (until then an effect with no moves may just not have been reached).
+    pub fn set_effect_uses(
+        &mut self,
+        uses: std::collections::HashMap<u64, Vec<String>>,
+        ready: bool,
+    ) {
+        self.effect_uses = uses;
+        self.effect_uses_ready = ready;
+    }
+
     pub fn set_texture_imports(&mut self, imports: Vec<crate::mod_project::TextureImport>) {
         self.texture_imports = imports;
     }
@@ -1677,6 +1697,11 @@ impl EffEditor {
     }
 
     /// The selected effect's name, as the game spawns it.
+    /// The emitter (index in the selected effect's set) the view draws alone, if any.
+    pub fn solo_emitter(&self) -> Option<usize> {
+        (self.solo_selected && self.selected_entry.is_some()).then_some(self.selected_emitter)
+    }
+
     pub fn selected_entry_name(&self) -> Option<&str> {
         self.entries
             .get(self.selected_entry?)
@@ -2295,7 +2320,7 @@ impl EffEditor {
             ui,
             "eff_entry_search",
             &mut self.entry_filter,
-            "Search effects…",
+            "Search effects or moves…",
         );
         let filter = self.entry_filter.trim().to_lowercase();
         let transplant_entries: std::collections::HashMap<String, EffTransplant> = self
@@ -2313,11 +2338,21 @@ impl EffEditor {
         egui::ScrollArea::vertical()
             .id_salt("eff_entries")
             .show(ui, |ui| {
-                if !self.entries.iter().any(|entry| entry.name.to_lowercase().contains(&filter)) {
+                // A search finds an effect by its name or by a move that spawns it ("forward
+                // smash" lists that move's effects).
+                let uses = &self.effect_uses;
+                let matches = |entry: &EffEntry| {
+                    filter.is_empty()
+                        || entry.name.to_lowercase().contains(&filter)
+                        || uses.get(&entry.hash).is_some_and(|moves| {
+                            moves.iter().any(|m| m.to_lowercase().contains(&filter))
+                        })
+                };
+                if !self.entries.iter().any(|entry| matches(entry)) {
                     ui.weak(if self.entries.is_empty() { "Open an effect file above to see its effects" } else { "No matching effects" });
                 }
                 for (i, entry) in self.entries.iter().enumerate() {
-                    if !filter.is_empty() && !entry.name.to_lowercase().contains(&filter) {
+                    if !matches(entry) {
                         continue;
                     }
                     ui.horizontal(|ui| {
@@ -2343,8 +2378,14 @@ impl EffEditor {
                         } else {
                             text
                         };
+                        let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
                         let response = ui.selectable_label(selected, text).on_hover_text(
-                            if edited_sets.contains(&entry.set_idx) {
+                            if unused {
+                                "No move script of this fighter spawns it. It may come from \
+                                 status code, an item or another fighter.\nRight-click to copy \
+                                 the name"
+                                    .to_owned()
+                            } else if edited_sets.contains(&entry.set_idx) {
                                 format!(
                                     "hash40 0x{:010x}\nhas unsent emitter edits\nright-click to copy the name",
                                     entry.hash
@@ -2379,6 +2420,33 @@ impl EffEditor {
                             self.scroll_to_selected = false;
                         }
                     });
+                    // The moves that spawn it, under its name: the names are the game's, the
+                    // moves are what a person knows the effect by.
+                    let used = match uses.get(&entry.hash) {
+                        Some(moves) if moves.len() > 3 => {
+                            format!("{} +{} more", moves[..3].join(", "), moves.len() - 3)
+                        }
+                        Some(moves) => moves.join(", "),
+                        None => String::new(),
+                    };
+                    if !used.is_empty() {
+                        let all = uses
+                            .get(&entry.hash)
+                            .map(|moves| moves.join("\n"))
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.add_space(18.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(used)
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(all);
+                        });
+                    }
                 }
             });
         if let Some(i) = clicked {
@@ -2486,12 +2554,17 @@ impl EffEditor {
                 };
                 if ui
                     .selectable_label(self.selected_emitter == i, text)
+                    .on_hover_text(
+                        "One part of the effect. Tick \"Show only this part\" to see which.",
+                    )
                     .clicked()
                 {
                     self.selected_emitter = i;
                 }
             }
         });
+        ui.checkbox(&mut self.solo_selected, "Show only this part")
+            .on_hover_text("Hide the effect's other parts in the view while you edit this one.");
         ui.separator();
 
         let ei = self.selected_emitter;
@@ -3817,14 +3890,17 @@ impl EffEditor {
 
     fn draw_game_panel(&mut self, ui: &mut Ui, link: &GameLink) {
         self.draw_texture_panel(ui);
+        // The rest is about the running game: what it has spawned and what has been sent to
+        // it. Without a connection none of it says anything.
+        if link.status() != LinkStatus::Connected {
+            return;
+        }
         ui.separator();
-
-        ui.label("Game preview")
-            .on_hover_text("Send edits, then trigger the move again to preview them.");
-        let (frames_rx, edits_tx) = link.stats();
+        ui.label("In game")
+            .on_hover_text("Send edits, then do the move again in game to see them there.");
         ui.label(
             egui::RichText::new(format!(
-                "{} live kind(s) · {frames_rx} frames in · {edits_tx} edits out",
+                "{} of this fighter's effects seen so far",
                 link.kinds().len()
             ))
             .small()

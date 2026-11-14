@@ -32,6 +32,32 @@ pub struct EffectDraw {
     /// The set colour: red, green, blue and opacity multiplying the effect's own (see
     /// `effect_colour`).
     pub colour: [f32; 4],
+    /// Draw only this emitter of the set (the Effects page's "Show only this part").
+    pub solo: Option<usize>,
+    /// Play the effect over and over on its own length, this many frames since the loop
+    /// started, at the last placement (the Effects page shows an effect no move spawns so).
+    pub looping: Option<usize>,
+}
+
+/// Frames an effect has particles for, played on its own: until every emitter is empty after
+/// emitting at least once, up to 240.
+fn effect_length(emitters: &[Emitter]) -> usize {
+    const CAP: usize = 240;
+    let mut last = 1;
+    for emitter in emitters {
+        let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+        let mut seen = false;
+        for step in 1..=CAP {
+            s.step();
+            if s.count() > 0 {
+                seen = true;
+                last = last.max(step);
+            } else if seen && step > last + 30 {
+                break;
+            }
+        }
+    }
+    last
 }
 
 /// The shared effect file. Its meshes serve every other file, and it is far too big to warm
@@ -115,6 +141,8 @@ pub struct VfxPreview {
     /// file, so an older load finishing late is dropped.
     overrides: HashMap<PathBuf, Arc<Vec<u8>>>,
     latest: HashMap<PathBuf, u64>,
+    /// Each effect's length for looping play, by file version (its address) and set.
+    lengths: HashMap<(usize, usize), usize>,
     /// Files with a newer version loading while the old one draws: the view keeps painting
     /// until it lands, so an edit shows without waiting for the mouse to move.
     reloading: HashSet<PathBuf>,
@@ -140,6 +168,7 @@ impl VfxPreview {
             waiting: false,
             overrides: HashMap::new(),
             latest: HashMap::new(),
+            lengths: HashMap::new(),
             reloading: HashSet::new(),
             next_load: 0,
         }
@@ -300,6 +329,8 @@ impl VfxPreview {
                 continue;
             }
             self.reloading.remove(&path);
+            // Lengths are keyed by file address, which a dropped version may hand on.
+            self.lengths.clear();
             // The jobs queued for the version this replaces name that version's file.
             self.queued.retain(|(p, _)| *p != path);
             let Some(file) = file else {
@@ -391,15 +422,32 @@ impl VfxPreview {
             else {
                 continue;
             };
+            // A looping draw replays the effect from the start every length plus a short gap.
+            let looped: Vec<Mat4>;
+            let placements: &[Mat4] = match (draw.looping, draw.placements.last()) {
+                (Some(clock), Some(at)) => {
+                    let key = (Arc::as_ptr(&file) as usize, set);
+                    let length = *self
+                        .lengths
+                        .entry(key)
+                        .or_insert_with(|| effect_length(&file.emitters[set]));
+                    looped = vec![*at; clock % (length + 15) + 1];
+                    &looped
+                }
+                _ => &draw.placements,
+            };
             file.renderer.set_view(queue, &camera);
             // Refraction shaders read the frame behind them; the preview has only its backdrop.
             file.renderer.set_background(queue, self.backdrop);
-            let Some(placement) = draw.placements.last().copied() else {
+            let Some(placement) = placements.last().copied() else {
                 continue;
             };
             let (_, rotation, translation) = placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
-            for emitter in &file.emitters[set] {
+            for (index, emitter) in file.emitters[set].iter().enumerate() {
+                if draw.solo.is_some_and(|solo| solo != index) {
+                    continue;
+                }
                 // A mesh primitive is looked up in this file, then in the shared one.
                 let mesh_id = mesh_id(emitter);
                 let mesh = (mesh_id != u64::MAX)
@@ -425,8 +473,8 @@ impl VfxPreview {
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
-                let first = draw.placements.len().saturating_sub(601);
-                for (index, set) in draw.placements.iter().enumerate().skip(first) {
+                let first = placements.len().saturating_sub(601);
+                for (index, set) in placements.iter().enumerate().skip(first) {
                     if draw.kill_at.is_some_and(|kill| index >= kill) {
                         s.kill();
                     }
