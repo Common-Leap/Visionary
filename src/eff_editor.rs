@@ -1018,7 +1018,7 @@ fn draw_attribute_groups(
         if !any {
             ui.colored_label(
                 egui::Color32::GRAY,
-                format!("no attribute of this emitter matches '{filter}'"),
+                format!("no setting of this part matches '{filter}'"),
             );
         }
     }
@@ -2324,7 +2324,7 @@ impl EffEditor {
                         .small()
                         .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
                 )
-                .on_hover_text("Entries with unsent emitter edits, highlighted in the list");
+                .on_hover_text("Effects with unsent changes, highlighted in the list");
             }
         });
         crate::ui::search_field(
@@ -2398,7 +2398,7 @@ impl EffEditor {
                                     .to_owned()
                             } else if edited_sets.contains(&entry.set_idx) {
                                 format!(
-                                    "hash40 0x{:010x}\nhas unsent emitter edits\nright-click to copy the name",
+                                    "hash40 0x{:010x}\nhas unsent changes\nright-click to copy the name",
                                     entry.hash
                                 )
                             } else {
@@ -2575,7 +2575,7 @@ impl EffEditor {
         ui.horizontal_wrapped(|ui| {
             for (i, em) in set.emitters.iter().enumerate() {
                 let name = if em.name.is_empty() {
-                    format!("emitter {i}")
+                    format!("part {}", i + 1)
                 } else {
                     em.name.clone()
                 };
@@ -2602,11 +2602,11 @@ impl EffEditor {
 
         let ei = self.selected_emitter;
         let Some(em) = set.emitters.get_mut(ei) else {
-            ui.colored_label(egui::Color32::GRAY, "No emitters in this set.");
+            ui.colored_label(egui::Color32::GRAY, "This effect has no parts.");
             return;
         };
         let Some(pr) = pristine_set.get(em.source_idx) else {
-            ui.colored_label(egui::Color32::GRAY, "No emitters in this set.");
+            ui.colored_label(egui::Color32::GRAY, "This effect has no parts.");
             return;
         };
 
@@ -2636,7 +2636,7 @@ impl EffEditor {
                         .striped(true)
                         .show(ui, |ui| {
                             ui.label("Particle size")
-                                .on_hover_text("Scales X, Y and Z together, keeping the ratio the emitter was authored with.");
+                                .on_hover_text("Scales X, Y and Z together, keeping the ratio the part was made with.");
                             let base = attr_f32(em, particle_scale[0]);
                             let mut v = base;
                             if ui
@@ -2814,7 +2814,7 @@ impl EffEditor {
     /// emitter here is therefore a copy of one the effect already had, which is also what makes
     /// the edit expressible as a roster the exporter can re-apply.
     fn draw_emitter_roster(&mut self, ui: &mut Ui, set_idx: usize) {
-        ui.label(egui::RichText::new("Emitters").strong());
+        ui.label(egui::RichText::new("Parts").strong());
         let original = self.pristine.get(set_idx).map(|p| p.len()).unwrap_or(0);
         let Some(set) = self
             .ptcl
@@ -2825,7 +2825,7 @@ impl EffEditor {
         };
         ui.label(
             egui::RichText::new(format!(
-                "{} now, {original} in the file",
+                "{} now, {original} as the game has it",
                 set.emitters.len()
             ))
             .small()
@@ -2844,7 +2844,7 @@ impl EffEditor {
             ui.horizontal(|ui| {
                 ui.add_space(em.depth as f32 * 14.0);
                 let label = if em.name.is_empty() {
-                    format!("emitter {i}")
+                    format!("part {}", i + 1)
                 } else {
                     em.name.clone()
                 };
@@ -2857,14 +2857,14 @@ impl EffEditor {
                 }
                 if ui
                     .small_button("copy")
-                    .on_hover_text("Add another emitter just like this one")
+                    .on_hover_text("Add another part just like this one")
                     .clicked()
                 {
                     duplicate = Some(i);
                 }
                 if ui
                     .small_button("remove")
-                    .on_hover_text("Stop this emitter from playing at all")
+                    .on_hover_text("Stop this part from playing at all")
                     .clicked()
                 {
                     remove = Some(i);
@@ -2875,13 +2875,13 @@ impl EffEditor {
                 if ui.small_button("↓").on_hover_text("Draw later").clicked() {
                     move_by = Some((i, 1));
                 }
-                if em.depth > 0 && ui.small_button("⇤").on_hover_text("Un-nest").clicked() {
+                if em.depth > 0 && ui.small_button("⇤").on_hover_text("Stop being a child of the part above").clicked() {
                     nest = Some((i, -1));
                 }
                 if i > 0
                     && ui
                         .small_button("⇥")
-                        .on_hover_text("Nest under the emitter above")
+                        .on_hover_text("Make it a child of the part above: it spawns from that part's particles")
                         .clicked()
                 {
                     nest = Some((i, 1));
@@ -2991,7 +2991,7 @@ impl EffEditor {
         ui.label(egui::RichText::new("Timing").strong());
         ui.label(
             egui::RichText::new(
-                "Start and duration are in frames from when the effect is spawned. An emitter \
+                "Start and duration are in frames from when the effect is spawned. A part \
                  with duration 0 emits on its start frame only.",
             )
             .small()
@@ -3016,7 +3016,7 @@ impl EffEditor {
                 continue;
             };
             let name = if em.name.is_empty() {
-                format!("emitter {i}")
+                format!("part {}", i + 1)
             } else {
                 em.name.clone()
             };
@@ -3040,7 +3040,7 @@ impl EffEditor {
     /// before cloning, so a changed part list also determines which sets and external model are
     /// transferred.
     fn draw_entry_parts(&mut self, ui: &mut Ui, entry_name: &str) {
-        ui.label(egui::RichText::new("Parts & model").strong());
+        ui.label(egui::RichText::new("Linked effects & model").strong());
         let Some(idx) = self
             .entry_info
             .iter()
@@ -3066,15 +3066,15 @@ impl EffEditor {
 
         ui.label(
             egui::RichText::new(
-                "Applies to export and the live carrier. Send, then re-trigger the effect to \
-                 see the new parts, bones, primary set or model.",
+                "An effect can bring in more effects on later frames, and a model. Changes \
+                 here show in the game after Send edits, the next time the effect plays.",
             )
             .small()
             .color(egui::Color32::GRAY),
         );
 
         ui.horizontal(|ui| {
-            ui.label("primary set");
+            ui.label("main effect");
             let current = entry
                 .set_idx
                 .and_then(|s| set_names.get(s).cloned())
@@ -3108,12 +3108,12 @@ impl EffEditor {
         let mut remove_part: Option<usize> = None;
         for (i, variant) in entry.variants.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                ui.label(format!("part {}", i + 1));
+                ui.label(format!("linked {}", i + 1));
                 ui.label("frame");
                 let mut frame = variant.start_frame as i32;
                 if ui
                     .add(egui::DragValue::new(&mut frame).speed(1.0).range(0..=65535))
-                    .on_hover_text("Frames after the effect starts before this part comes in")
+                    .on_hover_text("Frames after the effect starts before this one comes in")
                     .changed()
                 {
                     variant.start_frame = frame as u16;
@@ -3150,7 +3150,7 @@ impl EffEditor {
                             .hint_text("effect attachment")
                             .desired_width(120.0),
                     )
-                    .on_hover_text("Bone this part attaches to; empty uses the effect attachment")
+                    .on_hover_text("Bone it attaches to; empty uses the effect's own")
                     .changed();
                 if ui.small_button("remove").clicked() {
                     remove_part = Some(i);
@@ -3163,8 +3163,8 @@ impl EffEditor {
         }
         ui.horizontal(|ui| {
             if ui
-                .small_button("Add part")
-                .on_hover_text("Play another emitter set as part of this effect")
+                .small_button("Add linked effect")
+                .on_hover_text("Play another effect as part of this one")
                 .clicked()
             {
                 // A new part copies the last one's set rather than defaulting to "none": a part
@@ -3260,7 +3260,7 @@ impl EffEditor {
                 egui::RichText::new(if self.ptcl.is_none() {
                     "no eff loaded"
                 } else {
-                    "this emitter samples no texture"
+                    "this part uses no texture"
                 })
                 .small()
                 .color(egui::Color32::GRAY),
@@ -3560,7 +3560,7 @@ impl EffEditor {
                 .on_disabled_hover_text(if pool.is_none() {
                     "This eff has no texture archive"
                 } else {
-                    "Select an emitter first — the copy is pointed at it"
+                    "Select a part first — the copy is pointed at it"
                 })
                 .clicked()
             {
@@ -3585,7 +3585,7 @@ impl EffEditor {
                                 raw: false,
                             });
                         self.texture_note =
-                            Some((format!("added {new_name} — this emitter now uses it"), true));
+                            Some((format!("added {new_name} — this part now uses it"), true));
                     }
                     Err(e) => self.texture_note = Some((format!("duplicate failed: {e}"), false)),
                 }
@@ -3604,7 +3604,7 @@ impl EffEditor {
                 .on_disabled_hover_text(if pool.is_none() {
                     "This eff has no texture archive".to_string()
                 } else if !has_emitter {
-                    "Select an emitter first — the new texture is pointed at it".to_string()
+                    "Select a part first — the new texture is pointed at it".to_string()
                 } else {
                     format!("Visionary cannot convert {}", texture.format)
                 })
@@ -3647,7 +3647,7 @@ impl EffEditor {
                             );
                             self.texture_note = Some((
                                 format!(
-                                    "added {new_name}: {}×{} {} — this emitter now uses it",
+                                    "added {new_name}: {}×{} {} — this part now uses it",
                                     report.width, report.height, report.format
                                 ),
                                 true,
@@ -3696,7 +3696,7 @@ impl EffEditor {
         if users > 1 {
             ui.label(
                 egui::RichText::new(format!(
-                    "{users} emitters share this texture — editing it changes all of them"
+                    "{users} parts share this texture — editing it changes all of them"
                 ))
                 .small()
                 .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
@@ -4033,13 +4033,13 @@ impl EffEditor {
         ui.add_space(4.0);
         if edited.is_empty() {
             ui.label(
-                egui::RichText::new("No emitter edits")
+                egui::RichText::new("No changes")
                     .small()
                     .color(egui::Color32::DARK_GRAY),
             );
         } else {
             ui.label(
-                egui::RichText::new(format!("{} of {total} emitters edited", edited.len())).small(),
+                egui::RichText::new(format!("{} of {total} parts changed", edited.len())).small(),
             )
             .on_hover_text(edited_names);
             ui.label(
