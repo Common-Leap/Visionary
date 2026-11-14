@@ -4813,8 +4813,8 @@ impl VisionaryApp {
             move_entry.frame_count = move_entry
                 .anim_path
                 .as_deref()
-                .and_then(|p| ssbh_data::anim_data::AnimData::from_file(p).ok())
-                .map(|a| a.final_frame_index as u32 + 1)
+                .and_then(animation_final_frame)
+                .map(|last| last as u32 + 1)
                 .unwrap_or(0);
             if let Some(cached) = self
                 .move_list
@@ -32407,6 +32407,46 @@ fn effect_rotation(euler: [f32; 3]) -> glam::Quat {
         euler[1].to_radians(),
         euler[0].to_radians(),
     )
+}
+
+/// An animation's final frame index, read from the file's header: a full decode of a large
+/// `.nuanmb` took tens of milliseconds on the GUI thread every time a move was opened, for this
+/// one number. Anything but a version 2 `ANIM` falls back to the full parse.
+fn animation_final_frame(path: &std::path::Path) -> Option<f32> {
+    use std::io::Read;
+    let mut header = [0u8; 0x1c];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok();
+    if read && &header[0..4] == b"HBSS" && &header[0x10..0x14] == b"MINA" && header[0x14] == 2 {
+        return Some(f32::from_le_bytes(header[0x18..0x1c].try_into().ok()?));
+    }
+    ssbh_data::anim_data::AnimData::from_file(path)
+        .ok()
+        .map(|anim| anim.final_frame_index)
+}
+
+#[cfg(test)]
+mod animation_header_tests {
+    #[test]
+    fn the_header_gives_the_same_final_frame_as_a_full_parse() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
+            return;
+        };
+        let dir = std::path::Path::new(&root).join("fighter/mario/motion/body/c00");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "nuanmb") {
+                let full = ssbh_data::anim_data::AnimData::from_file(&path)
+                    .unwrap()
+                    .final_frame_index;
+                assert_eq!(super::animation_final_frame(&path), Some(full), "{path:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "{checked}");
+    }
 }
 
 /// The fighter objects carried stowed on the body: a model folder under `model_root` whose name
