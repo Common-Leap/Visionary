@@ -8655,7 +8655,6 @@ impl VisionaryApp {
             let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
             let bones = rs.bone_world_matrices_at(animation_frame);
             if let Some(throw) = bones.get("Throw").or_else(|| bones.get("throw")) {
-                // The victim hangs by its hip from the throw bone.
                 let hip = kind
                     .skel
                     .as_deref()
@@ -8669,13 +8668,18 @@ impl VisionaryApp {
                     })
                     .and_then(|victim| victim.get("Hip").copied())
                     .unwrap_or(glam::Mat4::IDENTITY);
+                // Only the hip's position is linked: the victim's own capture or thrown
+                // animation turns it (to face the grabber, to spin in a throw). Taking the
+                // throw bone's turn as well laid the victim flat on its face.
+                let placement =
+                    glam::Mat4::from_translation(throw.col(3).truncate() - hip.col(3).truncate());
                 placed.push(crate::article_preview::PlacedObject {
                     kind,
                     spawned: 0,
                     removed: None,
                     shot: None,
                     age: animation_frame,
-                    placement: *throw * hip.inverse(),
+                    placement,
                 });
             }
         }
