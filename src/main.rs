@@ -29,6 +29,7 @@ mod param_labels;
 mod plugin_deploy;
 mod post_grading;
 mod preview_floor;
+mod preview_item;
 mod preview_opponent;
 mod preview_trail;
 mod preview_visibility;

@@ -8575,7 +8575,8 @@ impl VisionaryApp {
             }
         }
         let opponent = self.preview_opponent_kind();
-        if spawns.is_empty() && opponent.is_none() && stowed.is_empty() {
+        let held_item = self.preview_held_item();
+        if spawns.is_empty() && opponent.is_none() && stowed.is_empty() && held_item.is_none() {
             return Vec::new();
         }
         let Some(wgpu_state) = frame.wgpu_render_state() else {
@@ -8619,6 +8620,34 @@ impl VisionaryApp {
                         placement: *at * have.inverse(),
                     });
                 }
+            }
+        }
+        // An item move's item, in the right hand by its grip.
+        if let Some(kind) = held_item {
+            let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
+            let bones = rs.bone_world_matrices_at(animation_frame);
+            if let Some(hand) = bones.get("haver") {
+                let grip = kind
+                    .skel
+                    .as_deref()
+                    .map(|skel| {
+                        crate::renderer::compute_bone_world_matrices(
+                            skel,
+                            kind.anim.as_deref(),
+                            &[],
+                            0.0,
+                        )
+                    })
+                    .and_then(|own| own.get("have").copied())
+                    .unwrap_or(glam::Mat4::IDENTITY);
+                placed.push(crate::article_preview::PlacedObject {
+                    kind,
+                    spawned: 0,
+                    removed: None,
+                    shot: None,
+                    age: 0.0,
+                    placement: *hand * grip.inverse(),
+                });
             }
         }
         // A grab or throw holds the opponent on the thrower's throw bone.
@@ -8757,6 +8786,29 @@ impl VisionaryApp {
                 None
             }
         }
+    }
+
+    /// The item the open move holds, if it is an item move and the data folder has the item;
+    /// loaded on a thread the first time.
+    fn preview_held_item(&mut self) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
+        let folder = self
+            .state
+            .selected_move
+            .as_ref()
+            .and_then(|m| crate::preview_item::item_for_motion(&m.name))?;
+        let root = self.state.data_root.clone()?;
+        let key = format!("item/{folder}");
+        if let Some(kind) = self.object_kinds.get(&key) {
+            return kind.clone();
+        }
+        if self.object_pending.insert(key.clone()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.object_loads.push(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send((key, crate::preview_item::load(&root, folder)));
+            });
+        }
+        None
     }
 
     /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
