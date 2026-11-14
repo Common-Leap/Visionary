@@ -1967,12 +1967,8 @@ fn lighten_hitbox_color(color: egui::Color32) -> egui::Color32 {
 /// Short angle label for the hitbox list.
 fn angle_short_label(angle: i32) -> String {
     match angle {
-        361 => "Sakurai".to_string(),
-        363 => "AL:363".to_string(),
-        365 => "AL:365".to_string(),
-        366 => "AL:366".to_string(),
-        367 => "AL:367".to_string(),
-        368 => "AL:368".to_string(),
+        361 => "Sakurai angle".to_string(),
+        363 | 365..=368 => "Autolink".to_string(),
         a => format!("{}°", a),
     }
 }
@@ -11065,31 +11061,38 @@ impl VisionaryApp {
                                         "▭"
                                     }
                                 } else if hb.capsule_end.is_some() {
-                                    "⬭"
+                                    "▬"
                                 } else {
                                     "●"
                                 };
+                                let bone = crate::ui::bone_label(&hb.bone_name);
+                                let frames = if hb.active_start == hb.active_end {
+                                    format!("frame {}", hb.active_start)
+                                } else if hb.active_end >= 9999 {
+                                    format!("from frame {}", hb.active_start)
+                                } else {
+                                    format!("frames {}-{}", hb.active_start, hb.active_end)
+                                };
                                 let label = match hb.category {
                                     1 => format!(
-                                        "{} GRAB #{} {} [{}-{}]",
-                                        shape, hb.id, hb.bone_name, hb.active_start, hb.active_end
+                                        "{} Grab {} · {} · {}",
+                                        shape, hb.id, bone, frames
                                     ),
                                     // No damage to name, so what it is looking for takes that slot — it is
                                     // the property that distinguishes two search boxes on the same bone.
                                     crate::data::CAT_SEARCH => format!(
-                                        "{} SEARCH #{} {} {} [{}-{}]",
+                                        "{} Detect {} · {} · {} · {}",
                                         shape,
                                         hb.id,
-                                        hb.bone_name,
+                                        bone,
                                         hb.search
                                             .as_ref()
                                             .map(|s| search_kind_short(&s.collision_kind))
                                             .unwrap_or("?"),
-                                        hb.active_start,
-                                        hb.active_end
+                                        frames
                                     ),
                                     2 => format!(
-                                        "{} WIND #{} {} [{}-{}]",
+                                        "{} Wind {} · {} · {}",
                                         shape,
                                         hb.id,
                                         hb.wind
@@ -11101,40 +11104,31 @@ impl VisionaryApp {
                                                 format!("RECT {width:.1}×{height:.1}")
                                             })
                                             .unwrap_or_else(|| format!("~{:.1}", hb.size)),
-                                        hb.active_start,
-                                        hb.active_end
+                                        frames
                                     ),
                                     // No bone and no size to name, so the kind takes their place — it is
                                     // the only thing distinguishing two of these in the same block, and
                                     // kirby/ThrowF has exactly that.
                                     crate::data::CAT_ABS => format!(
-                                        "◈ {} {:.1}dmg {} [{}-{}]",
+                                        "◈ {} · {:.1}% · {} · {}",
                                         hb.abs
                                             .as_ref()
                                             .map(|a| abs_kind_short(&a.kind))
-                                            .unwrap_or("ABS"),
+                                            .unwrap_or("Throw"),
                                         hb.damage,
                                         angle_short_label(hb.angle),
-                                        hb.active_start,
-                                        hb.active_end
+                                        frames
                                     ),
                                     crate::data::CAT_ATTACK_FP => format!(
-                                        "◇ ATTACK_FP #{} {:.1}dmg {} [{}-{}]",
+                                        "◇ Fixed-point hit {} · {:.1}% · {} · {}",
                                         hb.id,
                                         hb.damage,
                                         angle_short_label(hb.angle),
-                                        hb.active_start,
-                                        hb.active_end
+                                        frames
                                     ),
                                     _ => format!(
-                                        "{} #{} {} {:.1}dmg {} [{}-{}]",
-                                        shape,
-                                        hb.id,
-                                        hb.bone_name,
-                                        hb.damage,
-                                        angle_short_label(hb.angle),
-                                        hb.active_start,
-                                        hb.active_end
+                                        "{} Hitbox {} · {} · {:.1}% · {}",
+                                        shape, hb.id, bone, hb.damage, frames
                                     ),
                                 };
                                 if ui.selectable_label(selected, &label).clicked() {
@@ -31239,6 +31233,7 @@ impl VisionaryApp {
             }
             ui.label(format!("Frame {current} / {total}"));
             ui.separator();
+            ui.weak("Show");
             for category in [
                 TimelineCategory::Collisions,
                 TimelineCategory::Hurtboxes,
@@ -31265,7 +31260,12 @@ impl VisionaryApp {
                     }
                 }
             }
-            if ui.small_button("All").clicked() {
+            let all = self.timeline_filters == TimelineFilters::default();
+            if ui
+                .selectable_label(all, "All")
+                .on_hover_text("Show every kind of event")
+                .clicked()
+            {
                 self.timeline_filters = TimelineFilters::default();
             }
         });
