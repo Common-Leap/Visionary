@@ -519,6 +519,49 @@ pub fn objects_by_motion(fighter_dir: &Path, slot: u8) -> HashMap<u64, Vec<Strin
     objects
 }
 
+/// Whether this object is the fighter itself in another form, shown instead of its body:
+/// Inkling's squid during her Super Jump. The game hides the body in status code, which no
+/// script or file records, so these are known by name.
+pub fn replaces_fighter(kind: &ObjectKind) -> bool {
+    kind.synced && kind.name == "squid"
+}
+
+/// The fighter's objects by the animation files they have, by file name. An object animated
+/// in step with one of the fighter's moves often has a file of the same name as the move's:
+/// Inkling's roller has `d01specialsdash.nuanmb` for her side special dash, though its motion
+/// is called `dash`.
+pub fn objects_by_animation(fighter_dir: &Path, slot: u8) -> HashMap<String, Vec<(String, PathBuf)>> {
+    let mut objects: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+    let parts = std::fs::read_dir(fighter_dir.join("motion"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path());
+    for part in parts {
+        let Some(name) = part.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if name == "body" {
+            continue;
+        }
+        let Some(dir) = costume_dir(&part, slot) else {
+            continue;
+        };
+        for file in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = file.path();
+            if path.extension().is_some_and(|e| e == "nuanmb") {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    objects
+                        .entry(file_name.to_owned())
+                        .or_default()
+                        .push((name.clone(), path.clone()));
+                }
+            }
+        }
+    }
+    objects
+}
+
 /// `part/cNN` for the slot, or the part's first costume folder.
 fn costume_dir(part: &Path, slot: u8) -> Option<PathBuf> {
     let preferred = part.join(format!("c{slot:02}"));

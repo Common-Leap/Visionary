@@ -82,17 +82,81 @@ pub fn spawn_colour(call: &crate::data::EffectCall) -> Option<[f32; 4]> {
     Some([r, g, b, alpha.unwrap_or(1.0)])
 }
 
-/// The colour the preview draws a spawn in: its own, else the fighter's for attack arcs, else
-/// white.
+/// The colours a fighter gives its effects in game.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FighterColours {
+    /// `common_effect_0` from `fighter_param.prc`, on its attack arcs.
+    pub arc: Option<[f32; 3]>,
+    /// The costume's ink colour (`ink_effect_color` in `effect.prc`), which Inkling's scripts
+    /// put on her effects.
+    pub ink: Option<[f32; 3]>,
+}
+
+impl FighterColours {
+    pub fn load(data_root: &Path, fighter: &str, slot: u8) -> Self {
+        Self {
+            arc: fighter_arc_colour(data_root, fighter),
+            // Only Inkling, and Kirby with her ability, paint in ink.
+            ink: ["inkling", "kirby"]
+                .contains(&fighter)
+                .then(|| ink_colour(data_root, slot))
+                .flatten(),
+        }
+    }
+}
+
+/// The ink colour of costume `slot` (`ink_effect_color` in `fighter/common/param/effect.prc`).
+pub fn ink_colour(data_root: &Path, slot: u8) -> Option<[f32; 3]> {
+    let root = prc::open(data_root.join("fighter/common/param/effect.prc")).ok()?;
+    let Some(ParamKind::List(colours)) = field(&root, "ink_effect_color") else {
+        return None;
+    };
+    let ParamKind::Struct(colour) = colours.0.get(slot as usize % colours.0.len().max(1))? else {
+        return None;
+    };
+    let channel = |name: &str| match field(colour, name) {
+        Some(ParamKind::Float(v)) => Some(*v),
+        _ => None,
+    };
+    Some([channel("r")?, channel("g")?, channel("b")?])
+}
+
+/// Whether a spawn takes the fighter's ink colour: Inkling's scripts read the ink colour from
+/// the fighter and set it on the spawn with an argument-less `LAST_PARTICLE_SET_COLOR` after it
+/// (the decompiled form of passing those values on). The reads can sit outside the spawn's
+/// block, so the argument-less line is what marks it; only fighters with ink have a colour
+/// for it (`FighterColours::ink`).
+pub fn takes_ink_colour(call: &crate::data::EffectCall) -> bool {
+    call.trailing
+        .iter()
+        .any(|line| line.contains("LAST_PARTICLE_SET_COLOR(agent)"))
+}
+
+/// The particle colour a spawn draws with (`LAST_PARTICLE_SET_COLOR` with its values), else
+/// white. The shaders read it per particle, apart from the set colour.
+pub fn particle_colour(call: Option<&crate::data::EffectCall>) -> [f32; 4] {
+    match call.and_then(|call| call.particle_tint) {
+        Some([r, g, b]) => [r, g, b, 1.0],
+        None => [1.0; 4],
+    }
+}
+
+/// The ink colour a spawn draws with: the fighter's, for spawns that take it.
+pub fn ink(call: Option<&crate::data::EffectCall>, fighter: FighterColours) -> Option<[f32; 3]> {
+    fighter.ink.filter(|_| call.is_some_and(takes_ink_colour))
+}
+
+/// The set colour the preview draws a spawn in: its own, else the fighter's arc colour for
+/// attack arcs, else white.
 pub fn draw_colour(
     call: Option<&crate::data::EffectCall>,
     effect: &str,
-    fighter: Option<[f32; 3]>,
+    fighter: FighterColours,
 ) -> [f32; 4] {
     if let Some(colour) = call.and_then(spawn_colour) {
         return colour;
     }
-    match fighter {
+    match fighter.arc {
         Some([r, g, b]) if takes_fighter_colour(effect) => [r, g, b, 1.0],
         _ => [1.0; 4],
     }
@@ -129,7 +193,14 @@ mod tests {
         );
         assert_eq!(arc.tint, Some([0.871, 0.145, 0.184]));
         assert_eq!(
-            draw_colour(Some(&arc), &arc.effect_name, Some([0.32, 1.6, 0.4])),
+            draw_colour(
+                Some(&arc),
+                &arc.effect_name,
+                FighterColours {
+                    arc: Some([0.32, 1.6, 0.4]),
+                    ink: None
+                }
+            ),
             [0.871, 0.145, 0.184, 1.0]
         );
     }
@@ -140,13 +211,52 @@ mod tests {
             r#"macros::EFFECT_FOLLOW(agent, Hash40::new("sys_attack_arc_b"), Hash40::new("top"), 1, 11, -2, 1.7, -39, -92, 1.65, true);"#,
         );
         assert_eq!(spawn_colour(&arc), None);
-        let green = Some([0.32, 1.6, 0.4]);
+        let green = FighterColours {
+            arc: Some([0.32, 1.6, 0.4]),
+            ink: None,
+        };
         assert_eq!(
             draw_colour(Some(&arc), &arc.effect_name, green),
             [0.32, 1.6, 0.4, 1.0]
         );
         // Other effects stay untinted (the probe: her dust and impacts drew at 1).
         assert_eq!(draw_colour(None, "sys_run_smoke", green), [1.0; 4]);
+    }
+
+    #[test]
+    fn inkling_spawns_take_the_costume_s_ink() {
+        // From her down attack, as the dump has it.
+        let src = r#"unsafe extern "C" fn effect_x(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("inkling_muzzle_shot"), Hash40::new("muzzle"), -2, 0, 0, 0, 180, 0, 1, 0, 0, 0, 0, 0, 0, true);
+    }
+    WorkModule::get_float(agent.module_accessor, *FIGHTER_INKLING_INSTANCE_WORK_ID_FLOAT_INK_R);
+    WorkModule::get_float(agent.module_accessor, -1407754940, *FIGHTER_INKLING_INSTANCE_WORK_ID_FLOAT_INK_G);
+    WorkModule::get_float(agent.module_accessor, -1407754940, *FIGHTER_INKLING_INSTANCE_WORK_ID_FLOAT_INK_B);
+    if macros::is_excute(agent) {
+        macros::LAST_PARTICLE_SET_COLOR(agent);
+    }
+}"#;
+        let shot = crate::acmd::parse_effect_script(src)
+            .to_effect_calls()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(takes_ink_colour(&shot));
+        let orange = FighterColours {
+            arc: None,
+            ink: Some([0.758, 0.116, 0.04]),
+        };
+        assert_eq!(ink(Some(&shot), orange), Some([0.758, 0.116, 0.04]));
+        // Joker's victory lines use the same form for a colour that is not ink.
+        assert_eq!(ink(Some(&shot), FighterColours::default()), None);
+        // A spawn with no ink line stays as it is.
+        let line = call(
+            r#"macros::EFFECT_FOLLOW(agent, Hash40::new("sys_attack_line_b"), Hash40::new("top"), 0, 7, -0.8, 0, 0, 0, 0.82, true);"#,
+        );
+        assert!(!takes_ink_colour(&line));
+        assert_eq!(ink(Some(&line), orange), None);
     }
 
     /// Needs VISIONARY_DATA_ROOT (an extracted game); skipped otherwise.
@@ -162,6 +272,15 @@ mod tests {
         assert_eq!(
             fighter_arc_colour(Path::new(&root), "mario"),
             Some([3.0, 0.7, 0.2])
+        );
+        // Costume 0 is the orange Inkling, costume 1 the blue one.
+        assert_eq!(
+            ink_colour(Path::new(&root), 0),
+            Some([0.758027, 0.115859, 0.04])
+        );
+        assert_eq!(
+            ink_colour(Path::new(&root), 1),
+            Some([0.04, 0.0608165, 0.758027])
         );
     }
 }

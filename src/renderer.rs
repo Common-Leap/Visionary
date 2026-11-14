@@ -976,6 +976,8 @@ pub struct ViewportCallback {
     pub trails: Vec<crate::preview_trail::TrailDraw>,
     /// Body mesh nodes (hash40) the fighter's visibility sets hide at this frame.
     pub hidden_nodes: std::collections::HashSet<u64>,
+    /// The fighter has turned into one of its objects (Inkling's squid): its body is not drawn.
+    pub hide_body: bool,
 }
 
 /// One object model to draw, already animated and placed.
@@ -1037,6 +1039,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             }
 
             state.apply_hidden_nodes(&self.hidden_nodes);
+            if let Some(body) = state.render_models.first_mut() {
+                body.is_visible = !self.hide_body;
+            }
             let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
             let t_obj = std::time::Instant::now();
             state.update_objects(device, queue, &self.objects);

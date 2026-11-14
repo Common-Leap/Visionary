@@ -3533,8 +3533,11 @@ pub struct VisionaryApp {
     /// The selected fighter's objects by the motions they have (hash40 of the motion kind), to
     /// show those its status code creates for a move.
     objects_by_motion: std::collections::HashMap<u64, Vec<String>>,
+    /// The selected fighter's objects by their animation file names (see
+    /// `article_preview::objects_by_animation`).
+    objects_by_animation: std::collections::HashMap<String, Vec<(String, PathBuf)>>,
     /// The selected fighter's attack-arc colour from the game's `fighter_param.prc`.
-    fighter_arc_colour: Option<[f32; 3]>,
+    fighter_colours: crate::effect_colour::FighterColours,
     /// The stage the preview shows (a `stage/<name>` folder), or none for the plain backdrop.
     preview_stage: Option<String>,
     /// The stages the data folder has, for the picker, and the folder they were read from.
@@ -3973,7 +3976,8 @@ impl VisionaryApp {
             visibility_sets: Vec::new(),
             stowed_articles: Vec::new(),
             objects_by_motion: Default::default(),
-            fighter_arc_colour: None,
+            objects_by_animation: Default::default(),
+            fighter_colours: Default::default(),
             preview_stage: config_path("preview_stage")
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .map(|name| name.trim().to_owned())
@@ -4603,9 +4607,22 @@ impl VisionaryApp {
             acmd_bone_options(loaded_bone_names.clone())
         };
         self.stowed_articles = stowed_articles(&model_root, &loaded_bone_names);
-        self.fighter_arc_colour = self.state.data_root.as_deref().and_then(|root| {
-            crate::effect_colour::fighter_arc_colour(root, &self.state.fighters[idx].name)
-        });
+        self.fighter_colours = self
+            .state
+            .data_root
+            .as_deref()
+            .map(|root| {
+                crate::effect_colour::FighterColours::load(
+                    root,
+                    &self.state.fighters[idx].name,
+                    base_slot,
+                )
+            })
+            .unwrap_or_default();
+        self.objects_by_animation = crate::article_preview::objects_by_animation(
+            &self.state.fighters[idx].fighter_dir,
+            base_slot,
+        );
         self.objects_by_motion = crate::article_preview::objects_by_motion(
             &self.state.fighters[idx].fighter_dir,
             base_slot,
@@ -8657,6 +8674,50 @@ impl VisionaryApp {
                     });
                 }
             }
+            // Objects with an animation file of the move's own file name (Inkling's roller).
+            let file = self
+                .current_anim_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_owned);
+            let matches = file
+                .and_then(|file| self.objects_by_animation.get(&file).cloned())
+                .unwrap_or_default();
+            for (name, path) in matches {
+                if spawns.iter().any(|spawn| spawn.kind.name == name) {
+                    continue;
+                }
+                let Some(kind) = self.object_kind(&fighter, &name) else {
+                    continue;
+                };
+                let key = format!("{}/{name}@{}", fighter.name, path.display());
+                let playing = match self.object_kinds.get(&key) {
+                    Some(Some(playing)) => playing.clone(),
+                    _ => {
+                        let Ok(anim) = ssbh_data::anim_data::AnimData::from_file(&path) else {
+                            continue;
+                        };
+                        let anim = std::sync::Arc::new(anim);
+                        let synced = kind.skel.as_deref().is_some_and(|skel| {
+                            crate::article_preview::plays_in_fighter_space(skel, &anim)
+                        });
+                        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
+                            anim: Some(anim),
+                            synced,
+                            ..(*kind).clone()
+                        });
+                        self.object_kinds.insert(key, Some(playing.clone()));
+                        playing
+                    }
+                };
+                if playing.synced {
+                    spawns.push(crate::article_preview::Spawn {
+                        kind: playing,
+                        ..Default::default()
+                    });
+                }
+            }
         }
         // Objects the fighter always carries (Link's bow on his back) ride their stowed bone
         // unless the move takes them out.
@@ -9275,7 +9336,7 @@ impl VisionaryApp {
         };
         let files = self.preview_effect_files();
         let mut out = Vec::new();
-        let fighter_colour = self.fighter_arc_colour;
+        let fighter_colour = self.fighter_colours;
         // The Effects page's "Show only this part", for the effect it has open.
         let solo = self.eff_editor.open.then(|| self.eff_editor.solo_emitter()).flatten();
         let solo_name = self.eff_editor.selected_entry_name().map(str::to_ascii_lowercase);
@@ -9290,6 +9351,8 @@ impl VisionaryApp {
                 return;
             }
             let colour = crate::effect_colour::draw_colour(call, name, fighter_colour);
+            let particle_colour = crate::effect_colour::particle_colour(call);
+            let ink = crate::effect_colour::ink(call, fighter_colour);
             for file in &files {
                 out.push(crate::vfx_preview::EffectDraw {
                     file: file.clone(),
@@ -9297,6 +9360,8 @@ impl VisionaryApp {
                     placements: placements.clone(),
                     kill_at,
                     colour,
+                    particle_colour,
+                    ink,
                     solo: solo_for(name),
                     looping: None,
                 });
@@ -9438,6 +9503,8 @@ impl VisionaryApp {
                         placements: vec![at],
                         kill_at: None,
                         colour,
+                        particle_colour: [1.0; 4],
+                        ink: None,
                         looping: Some(clock),
                     });
                 }
@@ -9618,6 +9685,9 @@ impl VisionaryApp {
                         )
                     },
                     trails: self.preview_trails(frame),
+                    hide_body: objects
+                        .iter()
+                        .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
                     floor: self
                         .state
                         .selected_move
@@ -15563,7 +15633,7 @@ impl VisionaryApp {
                     "Settings for the selected particle spawn, trail, colour change, or effect-control command. Only fields represented by its exact source command are shown.",
                 );
                 let pristine = self.state.effects_pristine.get(i).cloned();
-                let arc_colour = self.fighter_arc_colour;
+                let arc_colour = self.fighter_colours;
                 let bone_names = self.bone_names.clone();
                 let fighter_name = self
                     .state

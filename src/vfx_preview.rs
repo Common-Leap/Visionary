@@ -32,6 +32,11 @@ pub struct EffectDraw {
     /// The set colour: red, green, blue and opacity multiplying the effect's own (see
     /// `effect_colour`).
     pub colour: [f32; 4],
+    /// The particle colour (`LAST_PARTICLE_SET_COLOR`), which the shaders read per particle
+    /// rather than as the set colour.
+    pub particle_colour: [f32; 4],
+    /// The fighter's ink colour, for spawns that take it (Inkling's).
+    pub ink: Option<[f32; 3]>,
     /// Draw only this emitter of the set (the Effects page's "Show only this part").
     pub solo: Option<usize>,
     /// Play the effect over and over on its own length, this many frames since the loop
@@ -471,6 +476,7 @@ impl VfxPreview {
                     continue;
                 }
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+                s.set_particle_colour(draw.particle_colour);
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
                 let first = placements.len().saturating_sub(601);
@@ -520,6 +526,14 @@ impl VfxPreview {
                 let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), draw.colour);
                 let statics = static_block::static_block(&emitter.fixed);
                 let custom0 = static_block::custom_block(&emitter.raw);
+                // Ink spawns: the game hands the ink shaders the ink colour in this block, row 0
+                // multiplying the effect's colour and row 1 added (zero).
+                let user_block: Option<Vec<u8>> = draw.ink.map(|[r, g, b]| {
+                    [r, g, b, 1.0, 0.0, 0.0, 0.0, 0.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect()
+                });
                 let samplers = samplers(emitter);
                 let textures = file.textures.lock().unwrap_or_else(|e| e.into_inner());
                 let views: [Option<Arc<render::GpuTexture>>; 3] = std::array::from_fn(|i| {
@@ -533,6 +547,7 @@ impl VfxPreview {
                     static_block: &statics,
                     dynamic_block: &dynamic,
                     custom0_block: custom0.as_deref(),
+                    user_block: user_block.as_deref(),
                     custom2_block: Some(&custom2),
                     streams: &streams,
                     count: s.count() as u32,
