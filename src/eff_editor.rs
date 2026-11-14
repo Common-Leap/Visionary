@@ -2592,11 +2592,13 @@ impl EffEditor {
                                         ui.label(
                                             egui::RichText::new("was").small().color(egui::Color32::GRAY),
                                         );
-                                        let mut orig_rgb = [o.r, o.g, o.b];
-                                        ui.add_enabled_ui(false, |ui| {
-                                            ui.color_edit_button_rgb(&mut orig_rgb);
-                                        })
-                                        .response
+                                        // A plain swatch: a disabled colour button is drawn
+                                        // dimmed, which showed white as grey.
+                                        egui::widgets::color_picker::show_color(
+                                            ui,
+                                            egui::Rgba::from_rgb(o.r, o.g, o.b),
+                                            ui.spacing().interact_size,
+                                        )
                                         .on_hover_text(format!("{:.2} {:.2} {:.2}", o.r, o.g, o.b));
                                     }
                                 }
