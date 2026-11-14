@@ -998,7 +998,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             }
             if state.vfx.waiting() {
                 self.repaint
-                    .request_repaint_after(std::time::Duration::from_millis(30));
+                    .request_repaint_after(std::time::Duration::from_millis(4));
             }
             // A program wgpu rejects is skipped rather than fatal; say which, once each.
             for failure in state.vfx.take_failures() {

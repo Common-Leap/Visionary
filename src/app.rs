@@ -3593,8 +3593,9 @@ struct EffectPreviewBuild {
     /// What the last rebuild was for: the file's draw path, the editor's edit count and the
     /// project's transplant and texture counts for that fighter.
     built_for: Option<(PathBuf, u64, usize, usize)>,
-    /// When the next rebuild starts: edits are let settle so a drag does not rebuild per frame.
-    due: Option<std::time::Instant>,
+    /// An edit is waiting for a rebuild: one starts as soon as none is running, so the preview
+    /// follows within a couple of frames and a drag never queues more than one.
+    due: bool,
     running: Option<std::sync::mpsc::Receiver<(PathBuf, Option<std::sync::Arc<Vec<u8>>>)>>,
     /// Draw path to the edited bytes, or `None` for "back to the file on disk".
     overrides: HashMap<PathBuf, Option<std::sync::Arc<Vec<u8>>>>,
@@ -4586,8 +4587,10 @@ impl VisionaryApp {
             acmd_bone_options(loaded_bone_names.clone())
         };
         self.stowed_articles = stowed_articles(&model_root, &loaded_bone_names);
-        self.objects_by_motion =
-            crate::article_preview::objects_by_motion(&self.state.fighters[idx].fighter_dir, base_slot);
+        self.objects_by_motion = crate::article_preview::objects_by_motion(
+            &self.state.fighters[idx].fighter_dir,
+            base_slot,
+        );
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
         self.hurtbox_volumes = hurtbox_result.volumes;
@@ -8599,7 +8602,14 @@ impl VisionaryApp {
         // Diddy Kong's rocket barrels in his final smash. Only motions made in the fighter's own
         // space are shown, since nothing says where the others stand. Other moves are left out:
         // an object's own `wait` or `run` shares its name with the fighter's, not its moment.
-        let status_moves = ["special", "final", "entry", "win_", "appeal", "visual_scene"];
+        let status_moves = [
+            "special",
+            "final",
+            "entry",
+            "win_",
+            "appeal",
+            "visual_scene",
+        ];
         if let Some(motion) = self
             .state
             .selected_move
@@ -8608,7 +8618,12 @@ impl VisionaryApp {
             .filter(|name| status_moves.iter().any(|kind| name.contains(kind)))
         {
             let hash = hash40::hash40(&motion).0;
-            for name in self.objects_by_motion.get(&hash).cloned().unwrap_or_default() {
+            for name in self
+                .objects_by_motion
+                .get(&hash)
+                .cloned()
+                .unwrap_or_default()
+            {
                 if spawns.iter().any(|spawn| spawn.kind.name == name) {
                     continue;
                 }
@@ -9004,7 +9019,7 @@ impl VisionaryApp {
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(4));
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => build.running = None,
             }
@@ -9025,18 +9040,12 @@ impl VisionaryApp {
         );
         if self.effect_preview_build.built_for.as_ref() != Some(&key) {
             self.effect_preview_build.built_for = Some(key);
-            self.effect_preview_build.due =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(120));
+            self.effect_preview_build.due = true;
         }
-        let Some(due) = self.effect_preview_build.due else {
-            return;
-        };
-        let now = std::time::Instant::now();
-        if now < due || self.effect_preview_build.running.is_some() {
-            ctx.request_repaint_after(due.saturating_duration_since(now));
+        if !self.effect_preview_build.due || self.effect_preview_build.running.is_some() {
             return;
         }
-        self.effect_preview_build.due = None;
+        self.effect_preview_build.due = false;
         self.sync_eff_mods_from_editor();
         let eff = self
             .eff_mods
@@ -9053,11 +9062,25 @@ impl VisionaryApp {
         let source = self.resolve_eff_source(&eff.source_rel);
         let root = self.eff_editor.export_root().to_path_buf();
         std::thread::spawn(move || {
-            let bytes = std::fs::read(&source)
-                .ok()
-                .and_then(|src| crate::eff_export::rebuild_eff_bytes(&src, &eff, Some(&root)).ok())
-                .map(std::sync::Arc::new);
-            let _ = send.send((path, bytes));
+            let started = std::time::Instant::now();
+            let rebuilt = std::fs::read(&source)
+                .map_err(anyhow::Error::from)
+                .and_then(|src| crate::eff_export::rebuild_eff_bytes(&src, &eff, Some(&root)));
+            if std::env::var_os("VFX_TIMING").is_some() {
+                match &rebuilt {
+                    Ok(bytes) => eprintln!(
+                        "[vfx timing] rebuilt {} ({} bytes) in {:.1} ms",
+                        source.display(),
+                        bytes.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(error) => eprintln!(
+                        "[vfx timing] rebuild of {} failed: {error:#}",
+                        source.display()
+                    ),
+                }
+            }
+            let _ = send.send((path, rebuilt.ok().map(std::sync::Arc::new)));
         });
         self.effect_preview_build.running = Some(receive);
     }

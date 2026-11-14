@@ -112,6 +112,9 @@ pub struct VfxPreview {
     /// file, so an older load finishing late is dropped.
     overrides: HashMap<PathBuf, Arc<Vec<u8>>>,
     latest: HashMap<PathBuf, u64>,
+    /// Files with a newer version loading while the old one draws: the view keeps painting
+    /// until it lands, so an edit shows without waiting for the mouse to move.
+    reloading: HashSet<PathBuf>,
     next_load: u64,
 }
 
@@ -134,6 +137,7 @@ impl VfxPreview {
             waiting: false,
             overrides: HashMap::new(),
             latest: HashMap::new(),
+            reloading: HashSet::new(),
             next_load: 0,
         }
     }
@@ -159,6 +163,7 @@ impl VfxPreview {
                 .name("vfx load".into())
                 .spawn(move || {
                     for (path, bytes, previous, number) in jobs {
+                        let started = std::time::Instant::now();
                         let bytes = match bytes {
                             Some(bytes) => Some(bytes),
                             None => std::fs::read(&path).ok().map(Arc::new),
@@ -172,6 +177,13 @@ impl VfxPreview {
                                 previous.as_deref(),
                             )
                         });
+                        if std::env::var_os("VFX_TIMING").is_some() {
+                            eprintln!(
+                                "[vfx timing] read {} in {:.1} ms",
+                                path.display(),
+                                started.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
                         if done.send((path, number, file)).is_err() {
                             break;
                         }
@@ -263,6 +275,9 @@ impl VfxPreview {
                 None
             }
         };
+        if previous.is_some() {
+            self.reloading.insert(path.to_path_buf());
+        }
         self.start_load(device, queue, path, previous);
     }
 
@@ -281,6 +296,7 @@ impl VfxPreview {
             if self.latest.get(&path) != Some(&number) {
                 continue;
             }
+            self.reloading.remove(&path);
             // The jobs queued for the version this replaces name that version's file.
             self.queued.retain(|(p, _)| *p != path);
             let Some(file) = file else {
@@ -288,6 +304,9 @@ impl VfxPreview {
                 continue;
             };
             let file = Arc::new(file);
+            if std::env::var_os("VFX_TIMING").is_some() {
+                eprintln!("[vfx timing] loaded {} (version {number})", path.display());
+            }
             if !path.ends_with(SHARED_FILE) {
                 let jobs: HashSet<Job> = file
                     .emitters
@@ -344,8 +363,8 @@ impl VfxPreview {
         draws: &[EffectDraw],
     ) {
         self.prepared.clear();
-        self.waiting = false;
         self.collect_loaded();
+        self.waiting = !self.reloading.is_empty();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
         let camera = view_block::view_block(&rows(view), &rows(projection), eye, near, far, 1.0);
         // Effects draw into the scene before bloom and colour grading, so they take the game's
