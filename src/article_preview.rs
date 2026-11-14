@@ -382,7 +382,8 @@ pub fn load_kind(
     labels: &HashMap<u64, String>,
     script: &dyn Fn(&str) -> Option<String>,
 ) -> Option<ObjectKind> {
-    let skel_path = crate::data::find_part_skel(&fighter_dir.join("model").join(name), slot);
+    let skel_path =
+        crate::data::find_part_skel(&fighter_dir.join("model").join(model_folder(name)), slot);
     let model_dir = skel_path
         .as_ref()
         .and_then(|path| path.parent())
@@ -530,7 +531,10 @@ pub fn replaces_fighter(kind: &ObjectKind) -> bool {
 /// in step with one of the fighter's moves often has a file of the same name as the move's:
 /// Inkling's roller has `d01specialsdash.nuanmb` for her side special dash, though its motion
 /// is called `dash`.
-pub fn objects_by_animation(fighter_dir: &Path, slot: u8) -> HashMap<String, Vec<(String, PathBuf)>> {
+pub fn objects_by_animation(
+    fighter_dir: &Path,
+    slot: u8,
+) -> HashMap<String, Vec<(String, PathBuf)>> {
     let mut objects: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
     let parts = std::fs::read_dir(fighter_dir.join("motion"))
         .into_iter()
@@ -560,6 +564,16 @@ pub fn objects_by_animation(fighter_dir: &Path, slot: u8) -> HashMap<String, Vec
         }
     }
     objects
+}
+
+/// The model folder of an object whose model is kept under another name: Olimar's Pikmin
+/// share one set of motions (`motion/pikmin`) but have a model per colour (`model/r` for the
+/// red one, the first in his line).
+fn model_folder(name: &str) -> &str {
+    match name {
+        "pikmin" => "r",
+        _ => name,
+    }
 }
 
 /// `part/cNN` for the slot, or the part's first costume folder.

@@ -8674,13 +8674,20 @@ impl VisionaryApp {
                     });
                 }
             }
-            // Objects with an animation file of the move's own file name (Inkling's roller).
-            let file = self
-                .current_anim_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(str::to_owned);
+        }
+        // Objects with an animation file of the move's own file name (Inkling's roller,
+        // Olimar's Pikmin). The name ties the file to the move, so this holds for attacks,
+        // grabs and throws too; standing, walking and the like (`a` files) are left out, as an
+        // object's own idle animation can share their names.
+        let move_file = self
+            .current_anim_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|name| matches!(name.as_bytes().first(), Some(b'c' | b'd' | b'e' | b'j')))
+            .map(str::to_owned);
+        if move_file.is_some() {
+            let file = move_file.clone();
             let matches = file
                 .and_then(|file| self.objects_by_animation.get(&file).cloned())
                 .unwrap_or_default();
@@ -9338,8 +9345,15 @@ impl VisionaryApp {
         let mut out = Vec::new();
         let fighter_colour = self.fighter_colours;
         // The Effects page's "Show only this part", for the effect it has open.
-        let solo = self.eff_editor.open.then(|| self.eff_editor.solo_emitter()).flatten();
-        let solo_name = self.eff_editor.selected_entry_name().map(str::to_ascii_lowercase);
+        let solo = self
+            .eff_editor
+            .open
+            .then(|| self.eff_editor.solo_emitter())
+            .flatten();
+        let solo_name = self
+            .eff_editor
+            .selected_entry_name()
+            .map(str::to_ascii_lowercase);
         let solo_for = |name: &str| {
             solo.filter(|_| solo_name.as_deref() == Some(name.to_ascii_lowercase().as_str()))
         };
@@ -9547,7 +9561,9 @@ impl VisionaryApp {
                     .width(150.0)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.preview_stage, None, "No stage")
-                            .on_hover_text("A plain backdrop and floor, lit like the training stage");
+                            .on_hover_text(
+                                "A plain backdrop and floor, lit like the training stage",
+                            );
                         for stage in &stages {
                             ui.selectable_value(
                                 &mut self.preview_stage,
@@ -15713,7 +15729,7 @@ impl VisionaryApp {
                                         )
                                         .changed();
                                     if let Some(p) = &pristine {
-                                        orig_if(p.effect_name_alt == ec.effect_name_alt, 
+                                        orig_if(p.effect_name_alt == ec.effect_name_alt,
                                             ui,
                                             format!(
                                                 "orig {}",
@@ -15836,7 +15852,7 @@ impl VisionaryApp {
                                 }
                             });
                             if let Some(p) = &pristine {
-                                orig_if(p.spawn_func == ec.spawn_func, 
+                                orig_if(p.spawn_func == ec.spawn_func,
                                     ui,
                                     format!(
                                         "orig {}",
@@ -15946,7 +15962,7 @@ impl VisionaryApp {
                                     match pristine.as_ref().and_then(|p| p.color.as_ref()) {
                                         Some(crate::data::ColorCall {
                                             rgba: Some(was), ..
-                                        }) => orig_if(rgba[..3] == was[..3], 
+                                        }) => orig_if(rgba[..3] == was[..3],
                                             ui,
                                             format!(
                                                 "orig [{:.3} {:.3} {:.3}]",
@@ -16139,7 +16155,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 if let Some(p) = &pristine {
-                                    orig_if(p.offset == ec.offset, 
+                                    orig_if(p.offset == ec.offset,
                                         ui,
                                         format!(
                                             "orig [{:.2} {:.2} {:.2}]",
@@ -16167,7 +16183,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 if let Some(p) = &pristine {
-                                    orig_if(p.rotation == ec.rotation, 
+                                    orig_if(p.rotation == ec.rotation,
                                         ui,
                                         format!(
                                             "orig X {:.1} · Y {:.1} · Z {:.1}",
@@ -16204,7 +16220,7 @@ impl VisionaryApp {
                                         )
                                         .changed();
                                     if let Some(p) = &pristine {
-                                        orig_if(p.flip_axis == ec.flip_axis, 
+                                        orig_if(p.flip_axis == ec.flip_axis,
                                             ui,
                                             format!(
                                                 "orig {}",
@@ -16462,7 +16478,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.tint) {
-                                    Some(Some(was)) => orig_if(ec.tint == Some(was), 
+                                    Some(Some(was)) => orig_if(ec.tint == Some(was),
                                         ui,
                                         format!("orig [{:.3} {:.3} {:.3}]", was[0], was[1], was[2]),
                                     ),
@@ -16514,7 +16530,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.particle_tint) {
-                                    Some(Some(was)) => orig_if(ec.particle_tint == Some(was), 
+                                    Some(Some(was)) => orig_if(ec.particle_tint == Some(was),
                                         ui,
                                         format!(
                                             "orig [{:.3} {:.3} {:.3}]",
@@ -16618,7 +16634,7 @@ impl VisionaryApp {
                                     }
                                 });
                                 match pristine.as_ref().map(|p| p.scale_w.as_deref()) {
-                                    Some(Some(values)) => orig_if(ec.scale_w.as_deref() == Some(values), 
+                                    Some(Some(values)) => orig_if(ec.scale_w.as_deref() == Some(values),
                                         ui,
                                         format!(
                                             "orig [{}]",
@@ -16705,7 +16721,7 @@ impl VisionaryApp {
                             if let Some(p) = &pristine {
                                 if p.follows_bone {
                                     if p.ends_early() {
-                                        orig_if((p.follows_bone, p.active_start, p.active_end) == (ec.follows_bone, ec.active_start, ec.active_end), 
+                                        orig_if((p.follows_bone, p.active_start, p.active_end) == (ec.follows_bone, ec.active_start, ec.active_end),
                                             ui,
                                             format!("orig {}→{}", p.active_start, p.active_end),
                                         );
@@ -16733,7 +16749,7 @@ impl VisionaryApp {
                                     changed = true;
                                 }
                                 match pristine.as_ref().filter(|p| p.ends_early()) {
-                                    Some(p) => orig_if((p.off_fade, p.off_detach) == (ec.off_fade, ec.off_detach), 
+                                    Some(p) => orig_if((p.off_fade, p.off_detach) == (ec.off_fade, ec.off_detach),
                                         ui,
                                         format!(
                                             "orig {}, {}",
@@ -29407,8 +29423,14 @@ impl VisionaryApp {
             match rx.try_recv() {
                 Ok(UseScanMsg::Move(motion, calls)) => {
                     let name = crate::move_kinds::plain_name(&motion);
-                    for call in calls.iter().filter(|c| c.color.is_none() && c.control.is_none()) {
-                        let moves = index.uses.entry(effect_name_hash(&call.effect_name)).or_default();
+                    for call in calls
+                        .iter()
+                        .filter(|c| c.color.is_none() && c.control.is_none())
+                    {
+                        let moves = index
+                            .uses
+                            .entry(effect_name_hash(&call.effect_name))
+                            .or_default();
                         if !moves.contains(&name) {
                             moves.push(name.clone());
                             changed = true;
@@ -29430,7 +29452,8 @@ impl VisionaryApp {
             }
         }
         if changed || finished {
-            self.eff_editor.set_effect_uses(index.uses.clone(), finished);
+            self.eff_editor
+                .set_effect_uses(index.uses.clone(), finished);
         }
         if !finished {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
