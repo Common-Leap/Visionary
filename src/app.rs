@@ -3535,6 +3535,10 @@ pub struct VisionaryApp {
     objects_by_motion: std::collections::HashMap<u64, Vec<String>>,
     /// The selected fighter's attack-arc colour from the game's `fighter_param.prc`.
     fighter_arc_colour: Option<[f32; 3]>,
+    /// The stage the preview shows (a `stage/<name>` folder), or none for the plain backdrop.
+    preview_stage: Option<String>,
+    /// The stages the data folder has, for the picker, and the folder they were read from.
+    preview_stages: (Option<PathBuf>, Vec<String>),
     /// Which moves spawn each effect, for the Effects page list.
     effect_uses: EffectUseIndex,
     /// When the Effects page's looping play of the open effect started.
@@ -3970,6 +3974,11 @@ impl VisionaryApp {
             stowed_articles: Vec::new(),
             objects_by_motion: Default::default(),
             fighter_arc_colour: None,
+            preview_stage: config_path("preview_stage")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty()),
+            preview_stages: (None, Vec::new()),
             effect_uses: EffectUseIndex::default(),
             effect_loop_started: std::time::Instant::now(),
             effect_loop_for: None,
@@ -9437,10 +9446,79 @@ impl VisionaryApp {
         out
     }
 
+    /// The stage picker over the preview's top-left corner.
+    fn draw_stage_picker(&mut self, ui: &mut Ui, rect: egui::Rect) {
+        let root = self.state.data_root.clone();
+        if self.preview_stages.0 != root {
+            let stages = root
+                .as_deref()
+                .map(crate::preview_stage::stages)
+                .unwrap_or_default();
+            self.preview_stages = (root, stages);
+        }
+        // A stage picked before but gone from this data folder falls back to none.
+        if self
+            .preview_stage
+            .as_ref()
+            .is_some_and(|stage| !self.preview_stages.1.contains(stage))
+        {
+            self.preview_stage = None;
+        }
+        let stages = self.preview_stages.1.clone();
+        let current = self
+            .preview_stage
+            .as_deref()
+            .map(crate::preview_stage::label)
+            .unwrap_or_else(|| "No stage".to_owned());
+        let before = self.preview_stage.clone();
+        egui::Area::new(egui::Id::new("preview_stage_picker"))
+            .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::ComboBox::from_id_salt("preview_stage_combo")
+                    .selected_text(current)
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.preview_stage, None, "No stage")
+                            .on_hover_text("A plain backdrop and floor, lit like the training stage");
+                        for stage in &stages {
+                            ui.selectable_value(
+                                &mut self.preview_stage,
+                                Some(stage.clone()),
+                                crate::preview_stage::label(stage),
+                            );
+                        }
+                        if stages.iter().all(|s| s == "training") {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(
+                                    "More stages show here once their stage/<name> folders \
+                                     are in the data folder (extract them with ArcExplorer).",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
+                    })
+                    .response
+                    .on_hover_text("The stage the fighter stands on in the view");
+            });
+        if self.preview_stage != before {
+            if let Some(path) = config_path("preview_stage") {
+                let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+                let _ = std::fs::write(path, self.preview_stage.clone().unwrap_or_default());
+            }
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn draw_viewport(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         let rect = ui.available_rect_before_wrap();
+        if self.current_model_dir.is_some() {
+            self.draw_stage_picker(ui, rect);
+        }
 
         if self.current_model_dir.is_some() {
             let w = rect.width();
@@ -31622,6 +31700,7 @@ impl eframe::App for VisionaryApp {
                     &wgpu_state.device,
                     &wgpu_state.queue,
                     self.state.data_root.as_deref(),
+                    self.preview_stage.as_deref(),
                 );
             }
         }

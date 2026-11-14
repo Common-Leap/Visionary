@@ -122,8 +122,12 @@ pub struct HitboxRenderState {
     pub vfx: crate::vfx_preview::VfxPreview,
     /// Weapon swing trails.
     trails: crate::preview_trail::PreviewTrails,
-    /// The data folder whose training stage lighting is applied.
-    stage_root: Option<std::path::PathBuf>,
+    /// The data folder and stage (`None`: no stage, training lighting) the preview shows.
+    stage_root: Option<(std::path::PathBuf, Option<String>)>,
+    /// The picked stage's models, drawn after the fighter and its objects.
+    stage_models: Vec<RenderModel>,
+    /// Stage model folders being read on a thread, arriving one at a time.
+    stage_loading: Option<std::sync::Mutex<std::sync::mpsc::Receiver<StageModelLoad>>>,
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
@@ -208,6 +212,8 @@ impl HitboxRenderState {
                 vfx
             },
             stage_root: None,
+            stage_models: Vec::new(),
+            stage_loading: None,
             trails: crate::preview_trail::PreviewTrails::new(
                 device,
                 ssbh_wgpu::RGBA_COLOR_FORMAT,
@@ -386,25 +392,96 @@ impl HitboxRenderState {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         data_root: Option<&Path>,
+        stage: Option<&str>,
     ) {
-        if self.stage_root.as_deref() == data_root {
+        let key = data_root.map(|root| (root.to_path_buf(), stage.map(str::to_owned)));
+        if self.stage_root == key {
             return;
         }
-        self.stage_root = data_root.map(Path::to_path_buf);
-        let Some(stage) = data_root.map(|root| root.join("stage/training/normal")) else {
+        self.stage_root = key;
+        self.stage_models.clear();
+        self.stage_loading = None;
+        let Some(root) = data_root else {
             return;
         };
-        match ssbh_data::anim_data::AnimData::from_file(
-            stage.join("render/light/light00_set.nuanmb"),
-        ) {
-            Ok(light) => self.renderer.update_stage_uniforms(queue, &light, 0.0),
-            Err(_) => self.renderer.reset_stage_uniforms(queue),
+        // Lit by the picked stage, or by the training stage with no stage shown.
+        let picked = stage.map(|name| crate::preview_stage::files(root, name));
+        let training = crate::preview_stage::files(root, "training");
+        let light = picked
+            .as_ref()
+            .and_then(|f| f.light.clone())
+            .or(training.light.clone());
+        match light.and_then(|path| ssbh_data::anim_data::AnimData::from_file(path).ok()) {
+            Some(light) => self.renderer.update_stage_uniforms(queue, &light, 0.0),
+            None => self.renderer.reset_stage_uniforms(queue),
         }
-        if let Ok(lut) =
-            nutexb::NutexbFile::read_from_file(stage.join("lut/color_grading_lut.nutexb"))
-        {
+        let lut = picked.as_ref().and_then(|f| f.lut.clone()).or(training.lut);
+        if let Some(lut) = lut.and_then(|path| nutexb::NutexbFile::read_from_file(path).ok()) {
             self.renderer.update_color_lut(device, queue, &lut);
         }
+        // The models are large (tens of megabytes of textures): read them off the GUI thread.
+        if let Some(picked) = picked {
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for (dir, anim) in picked.models {
+                    let mut folder = ModelFolder::load_folder(&dir);
+                    crate::preview_stage::turn_to_preview(&mut folder);
+                    let anim = anim.and_then(|path| {
+                        ssbh_data::anim_data::AnimData::from_file(path).ok()
+                    });
+                    if send.send(StageModelLoad { folder, anim }).is_err() {
+                        return;
+                    }
+                }
+            });
+            self.stage_loading = Some(std::sync::Mutex::new(receive));
+        }
+    }
+
+    /// Upload the stage models read since the last frame. Returns whether more are coming.
+    fn collect_stage_models(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        let Some(loading) = &self.stage_loading else {
+            return false;
+        };
+        let loading = loading.lock().unwrap_or_else(|e| e.into_inner());
+        let mut arrived = Vec::new();
+        let more = loop {
+            match loading.try_recv() {
+                Ok(load) => arrived.push(load),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+            }
+        };
+        drop(loading);
+        if !more {
+            self.stage_loading = None;
+        }
+        for load in arrived {
+            let mut model =
+                RenderModel::from_folder(device, queue, &load.folder, &self.shared_data);
+            model.apply_anims(
+                queue,
+                load.anim.iter(),
+                load.folder.find_skel(),
+                load.folder.find_matl(),
+                load.folder.find_hlpb(),
+                &self.shared_data,
+                0.0,
+            );
+            // The layer Inkling's ink paints onto the stage draws black with no ink on it.
+            for mesh in model.meshes.iter_mut() {
+                if mesh.name.to_ascii_lowercase().starts_with("inkmesh") {
+                    mesh.is_visible = false;
+                }
+            }
+            self.stage_models.push(model);
+        }
+        more
+    }
+
+    /// Whether a stage is shown, so the preview's own floor stays away.
+    pub fn shows_stage(&self) -> bool {
+        self.stage_root.as_ref().is_some_and(|(_, stage)| stage.is_some())
     }
 
     /// Hide the body meshes of the visibility groups not showing, and show again the ones
@@ -963,6 +1040,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
             let t_obj = std::time::Instant::now();
             state.update_objects(device, queue, &self.objects);
+            if state.collect_stage_models(device, queue) {
+                self.repaint
+                    .request_repaint_after(std::time::Duration::from_millis(30));
+            }
             let obj_ms = t_obj.elapsed().as_secs_f64() * 1000.0;
             if std::env::var_os("VFX_TIMING").is_some() && anim_ms + obj_ms > 8.0 {
                 eprintln!("[vfx timing] paint anim {anim_ms:.1} ms objects {obj_ms:.1} ms");
@@ -1012,10 +1093,14 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 .prepare(device, queue, t.mvp_matrix, &self.trails);
             let vfx = &state.vfx;
             let trails = &state.trails;
-            let floor = self.floor.then_some(&state.floor);
+            let floor = (self.floor && !state.shows_stage()).then_some(&state.floor);
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }
+            // The stage's models are drawn with the fighter's, in one list for the renderer;
+            // they go back to their own list afterwards.
+            let fighter_models = state.render_models.len();
+            state.render_models.append(&mut state.stage_models);
             state.renderer.begin_render_models_with_scene(
                 egui_encoder,
                 &state.render_models,
@@ -1050,6 +1135,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     trails.draw(&mut pass);
                 },
             );
+            state.stage_models = state.render_models.split_off(fighter_models);
             state.target.resize(device, w.max(1), h.max(1));
             if let Some(plain) = &state.target.plain {
                 let mut pass = egui_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1093,4 +1179,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }
     }
+}
+
+/// One stage model folder read off the GUI thread, with the animation that places it.
+struct StageModelLoad {
+    folder: ModelFolder,
+    anim: Option<ssbh_data::anim_data::AnimData>,
 }
