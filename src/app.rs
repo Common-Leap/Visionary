@@ -15428,6 +15428,7 @@ impl VisionaryApp {
                     "Settings for the selected particle spawn, trail, colour change, or effect-control command. Only fields represented by its exact source command are shown.",
                 );
                 let pristine = self.state.effects_pristine.get(i).cloned();
+                let arc_colour = self.fighter_arc_colour;
                 let bone_names = self.bone_names.clone();
                 let fighter_name = self
                     .state
@@ -16015,7 +16016,7 @@ impl VisionaryApp {
                                     }
                                 }
 
-                                if show_advanced {
+                                {
                                 // Playback rate — the `LAST_EFFECT_SET_RATE` line that follows
                                 // this spawn. It belongs here rather than on a row of its own
                                 // because the macro names no effect: it modifies whatever
@@ -16073,6 +16074,8 @@ impl VisionaryApp {
                                 }
                                 ui.end_row();
 
+                                }
+                                if show_advanced {
                                 // Camera-flat offset — the `LAST_EFFECT_SET_OFFSET_TO_CAMERA_FLAT`
                                 // line that follows this spawn. It is not part of the spawn's
                                 // three-dimensional bone-relative offset, so it gets its own
@@ -16164,6 +16167,7 @@ impl VisionaryApp {
                                 }
                                 ui.end_row();
 
+                                }
                                 // Tint and opacity — the `LAST_EFFECT_SET_COLOR` and
                                 // `LAST_EFFECT_SET_ALPHA` lines beneath this spawn. Same
                                 // reasoning as the rate above, and the same checkbox rule: off
@@ -16174,18 +16178,29 @@ impl VisionaryApp {
                                 // common — 65 colour calls against 4 alpha ones — and folding
                                 // them together would make every recolour write an opacity line
                                 // the script never had.
-                                ui.label("Tint");
+                                // What the game draws when the script sets no colour: the
+                                // spawn's own `_COLOR` arguments, else the fighter's arc colour
+                                // for attack arcs, else the effect's own colours.
+                                let shown = crate::effect_colour::draw_colour(
+                                    Some(&*ec),
+                                    &ec.effect_name,
+                                    arc_colour,
+                                );
+                                ui.label("Colour").on_hover_text(
+                                    "Multiplies the effect's own colours. Values above 1 brighten.",
+                                );
                                 ui.horizontal(|ui| {
                                     let mut on = ec.tint.is_some();
                                     if ui
                                         .checkbox(&mut on, "")
                                         .on_hover_text(
-                                            "Recolour this one spawn. Off writes no \
-                                             LAST_EFFECT_SET_COLOR line at all.",
+                                            "Recolour this one spawn (a LAST_EFFECT_SET_COLOR \
+                                             line after it). Off leaves the colour the game \
+                                             would use.",
                                         )
                                         .changed()
                                     {
-                                        ec.tint = on.then_some([1.0, 1.0, 1.0]);
+                                        ec.tint = on.then_some([shown[0], shown[1], shown[2]]);
                                         changed = true;
                                         respawn_needed = true;
                                     }
@@ -16208,8 +16223,24 @@ impl VisionaryApp {
                                             }
                                         }
                                     } else {
+                                        egui::widgets::color_picker::show_color(
+                                            ui,
+                                            egui::Rgba::from_rgb(
+                                                shown[0].clamp(0.0, 1.0),
+                                                shown[1].clamp(0.0, 1.0),
+                                                shown[2].clamp(0.0, 1.0),
+                                            ),
+                                            egui::vec2(16.0, 16.0),
+                                        );
+                                        let why = if shown == [1.0; 4] {
+                                            "effect's own".to_owned()
+                                        } else if crate::effect_colour::spawn_colour(ec).is_some() {
+                                            "set by the spawn".to_owned()
+                                        } else {
+                                            "fighter's arc colour".to_owned()
+                                        };
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new(why)
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16227,6 +16258,7 @@ impl VisionaryApp {
                                 }
                                 ui.end_row();
 
+                                if show_advanced {
                                 // Particle tint — `LAST_PARTICLE_SET_COLOR` is not an alias for
                                 // `LAST_EFFECT_SET_COLOR`: the game applies it to the last
                                 // particle, so keep a separate optional value and live rule.
@@ -16281,6 +16313,7 @@ impl VisionaryApp {
                                 }
                                 ui.end_row();
 
+                                }
                                 ui.label("Opacity");
                                 ui.horizontal(|ui| {
                                     let mut on = ec.alpha.is_some();
@@ -16319,6 +16352,7 @@ impl VisionaryApp {
                                 }
                                 ui.end_row();
 
+                                if show_advanced {
                                 // Native dynamic-arity scale-W — the game reads one, two, or
                                 // three Lua values. Keep that count visible and editable rather
                                 // than padding a one-value dump into a different call shape.
