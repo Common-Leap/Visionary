@@ -52,6 +52,7 @@ pub fn load(model_dir: &Path, motion_dir: &Path, motion: &str) -> Option<ObjectK
         hitboxes: Vec::new(),
         effects: Vec::new(),
         flight: Flight::default(),
+        ..ObjectKind::default()
     })
 }
 

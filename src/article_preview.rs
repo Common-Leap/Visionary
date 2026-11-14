@@ -114,7 +114,7 @@ impl Flight {
 }
 
 /// Everything needed to show one kind of object.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ObjectKind {
     /// "fireball", from `FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL`.
     pub name: String,
@@ -127,6 +127,12 @@ pub struct ObjectKind {
     /// Effects from the object's own script; for many projectiles they are all you see.
     pub effects: Vec<ObjectEffect>,
     pub flight: Flight,
+    /// Every motion of the object that has an animation, by motion name. A move picks one with
+    /// `ArticleModule::change_motion`: Samus's grab beam plays `catch` alongside her grab.
+    pub motions: Vec<(String, Arc<AnimData>)>,
+    /// The animation is one of those motions, made in step with the fighter's and in the
+    /// fighter's space, so the object rides the fighter's `top` rather than a hand.
+    pub synced: bool,
 }
 
 /// An effect an object's script shows, on one of its bones.
@@ -443,6 +449,14 @@ pub fn load_kind(
         .and_then(|(_, path)| path)
         .and_then(|path| AnimData::from_file(path).ok())
         .map(Arc::new);
+    let motions = motions
+        .iter()
+        .filter(|(label, _)| !label.is_empty())
+        .filter_map(|(label, path)| {
+            let anim = AnimData::from_file(path.as_ref()?).ok()?;
+            Some((label.clone(), Arc::new(anim)))
+        })
+        .collect();
     let flight = flight_from_params(param_path, name, labels);
     if skel.is_none() && hitboxes.is_empty() && effects.is_empty() && flight.speed == 0.0 {
         return None;
@@ -455,6 +469,8 @@ pub fn load_kind(
         hitboxes,
         effects,
         flight,
+        motions,
+        synced: false,
     })
 }
 
@@ -529,7 +545,7 @@ fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool) -> glam::Vec3 {
 }
 
 /// One object a move creates.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Spawn {
     pub kind: Arc<ObjectKind>,
     /// The frame it is created on.
@@ -539,6 +555,9 @@ pub struct Spawn {
     /// The frame the move throws it (`ArticleModule::shoot`), if it is held until then:
     /// Link's boomerang is created in his hand on frame 5 and leaves it on frame 27.
     pub shot: Option<u32>,
+    /// Where the move shows or hides it (`set_visibility_whole`): (frame, shown), in order.
+    /// Samus's grab beam is created hidden on frame 1 and shown on frame 8.
+    pub shown: Vec<(u32, bool)>,
 }
 
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
@@ -554,10 +573,19 @@ pub fn place(
         spawned,
         removed,
         shot,
+        shown,
     } in spawns
     {
         let age = frame - *spawned as f32;
         if age < 0.0 || removed.is_some_and(|removed| frame >= removed as f32) {
+            continue;
+        }
+        let hidden = shown
+            .iter()
+            .rev()
+            .find(|(at, _)| *at as f32 <= frame)
+            .is_some_and(|(_, shown)| !shown);
+        if hidden {
             continue;
         }
         let flies = !(kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0);
@@ -573,6 +601,10 @@ pub fn place(
                     .unwrap_or(glam::Mat4::IDENTITY)
                     .to_scale_rotation_translation();
                 glam::Mat4::from_rotation_translation(rotation, spawn_point(&bones, true))
+            } else if kind.synced {
+                let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
+                let (_, rotation, position) = top.to_scale_rotation_translation();
+                glam::Mat4::from_rotation_translation(rotation, position)
             } else {
                 ride_bone(&bones, &kind.name)
             };
@@ -812,6 +844,7 @@ mod tests {
                             spawned: 0,
                             removed: None,
                             shot: None,
+                            shown: Vec::new(),
                         };
                         for object in place(&[spawn], frame, &bones) {
                             let _ = object_bones(&object);
@@ -942,6 +975,7 @@ mod thrown_object_tests {
             spawned: 5,
             removed: None,
             shot: Some(27),
+            shown: Vec::new(),
         };
         let at = |frame: f32| {
             place(std::slice::from_ref(&spawn), frame, &bones)[0]

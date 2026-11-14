@@ -5170,6 +5170,16 @@ impl AcmdScript {
         self.walk().article_shots
     }
 
+    /// Motions the move gives its objects, as (script frame, article symbol, motion).
+    pub fn to_article_motions(&self) -> Vec<(u32, String, String)> {
+        self.walk().article_motions
+    }
+
+    /// Objects the move shows (true) or hides (false), as (script frame, article symbol, shown).
+    pub fn to_article_visibility(&self) -> Vec<(u32, String, bool)> {
+        self.walk().article_visibility
+    }
+
     /// Flatten the script into display hitboxes with computed frame ranges.
     pub fn to_hitboxes(&self) -> Vec<Hitbox> {
         let mut hitboxes: Vec<Hitbox> = Vec::new();
@@ -6530,6 +6540,11 @@ struct WalkAccum {
     article_shots: Vec<(u32, String)>,
     /// Model visibility switches (`VisibilityModule::set_int64`): (script frame, set, group).
     visibility_changes: Vec<(u32, String, String)>,
+    /// Motions the move gives its objects (`ArticleModule::change_motion`):
+    /// (script frame, symbol, motion).
+    article_motions: Vec<(u32, String, String)>,
+    /// Objects shown or hidden (`ArticleModule::set_visibility_whole`): (script frame, symbol, shown).
+    article_visibility: Vec<(u32, String, bool)>,
     work_module_sets: Vec<WorkModuleSetEvent>,
     /// Next site per [`SiteFamily`], each family numbered independently.
     ///
@@ -6987,6 +7002,14 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         // has no safe way to replay native ItemModule writes.
         ExcuteStmt::ItemVisibility { .. } => {}
         // Item firing remains in its ACMD source; the flattened hitbox model has no equivalent.
+        // Samus's grab creates her arm cannon with `generate_article(.., true, -1)`, which no
+        // typed call covers; the preview still has to show it.
+        ExcuteStmt::NativeCall(call) if call.callee == "ArticleModule::generate_article" => {
+            if let Some(symbol) = call.arguments.first().and_then(|s| s.strip_prefix('*')) {
+                hurt.article_spawns
+                    .push((script_frame(frame), symbol.to_owned(), true));
+            }
+        }
         ExcuteStmt::ShootItemBullet | ExcuteStmt::NativeCall(_) | ExcuteStmt::Effect(_) => {}
         // The start-info eye flash is a closed source-only point call with no live-model effect.
         ExcuteStmt::StartInfoFlashEye => {}
@@ -7045,6 +7068,21 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         ) => hurt.article_shots.push((
             script_frame(frame),
             symbol.trim_start_matches('*').to_owned(),
+        )),
+        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { symbol, motion }) => {
+            hurt.article_motions.push((
+                script_frame(frame),
+                symbol.trim_start_matches('*').to_owned(),
+                motion.clone(),
+            ))
+        }
+        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::SetVisibilityWhole {
+            symbol,
+            visible,
+        }) => hurt.article_visibility.push((
+            script_frame(frame),
+            symbol.trim_start_matches('*').to_owned(),
+            *visible,
         )),
         ExcuteStmt::ArticleLifecycle(_)
         | ExcuteStmt::GimmickEvent { .. }
@@ -10008,6 +10046,65 @@ impl EffectScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Samus's grab, as her expression script has it: the arm cannon is created by a native
+    /// call no typed form covers, the grab beam hidden until frame 8, both playing `catch`.
+    #[test]
+    fn samus_grab_objects_play_her_grab() {
+        let script = crate::acmd::parse_expression_script(SAMUS_EXPRESSION_CATCH);
+        let spawns = script.to_article_spawns();
+        let gun = "FIGHTER_SAMUS_GENERATE_ARTICLE_GUN";
+        let beam = "FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM";
+        assert!(spawns.iter().any(|(_, s, created)| s == gun && *created));
+        assert!(spawns.iter().any(|(_, s, created)| s == beam && *created));
+        let motions = script.to_article_motions();
+        assert!(motions.iter().any(|(_, s, m)| s == gun && m == "catch"));
+        assert!(motions.iter().any(|(_, s, m)| s == beam && m == "catch"));
+        let shown: Vec<(u32, bool)> = script
+            .to_article_visibility()
+            .into_iter()
+            .filter(|(_, s, _)| s == beam)
+            .map(|(at, _, shown)| (at, shown))
+            .collect();
+        assert_eq!(shown.len(), 2);
+        assert!(!shown[0].1 && shown[1].1);
+        assert_eq!(shown[1].0, 8);
+    }
+
+    const SAMUS_EXPRESSION_CATCH: &str = r#"unsafe extern "C" fn expression_catch(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+        VisibilityModule::set_int64(agent.module_accessor, hash40("body") as i64, hash40("body_hide_gun") as i64);
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, Hash40::new("catch"), false, -1.0);
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, false, -1);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, Hash40::new("catch"), false, -1.0);
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+    }
+    frame(agent.lua_state_agent, 8.0);
+    if macros::is_excute(agent) {
+        ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, true, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+    }
+    frame(agent.lua_state_agent, 12.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_elecattacks"), 10, false, *BATTLE_OBJECT_ID_INVALID as u32);
+    }
+    frame(agent.lua_state_agent, 23.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_elecattacks"), 19, true, *BATTLE_OBJECT_ID_INVALID as u32);
+    }
+    frame(agent.lua_state_agent, 47.0);
+    if macros::is_excute(agent) {
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+    }
+    frame(agent.lua_state_agent, 80.0);
+    if macros::is_excute(agent) {
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+        VisibilityModule::set_int64(agent.module_accessor, hash40("body") as i64, hash40("body_normal") as i64);
+    }
+}
+"#;
 
     #[test]
     fn preview_expansion_preflight_is_bounded_for_acmd_and_effect_trees() {

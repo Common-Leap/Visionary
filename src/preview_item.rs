@@ -65,6 +65,7 @@ pub fn load_model(model_dir: &Path, name: &str) -> Option<ObjectKind> {
         hitboxes: Vec::new(),
         effects: Vec::new(),
         flight: Flight::default(),
+        ..ObjectKind::default()
     })
 }
 

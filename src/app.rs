@@ -8532,6 +8532,18 @@ impl VisionaryApp {
         let mut shots = self.state.script.to_article_shots();
         shots.extend(self.state.expression_script.to_article_shots());
         shots.sort_by_key(|(frame, _)| *frame);
+        let mut motions = Vec::new();
+        let mut shown = Vec::new();
+        for script in [
+            &self.state.script,
+            &self.state.expression_script,
+            &self.state.sound_script,
+        ] {
+            motions.extend(script.to_article_motions());
+            shown.extend(script.to_article_visibility());
+        }
+        motions.sort_by_key(|(frame, ..)| *frame);
+        shown.sort_by_key(|(frame, ..)| *frame);
         for (spawned, symbol, created) in &events {
             if !created {
                 continue;
@@ -8545,11 +8557,35 @@ impl VisionaryApp {
             let Some(name) = crate::article_preview::article_name(symbol) else {
                 continue;
             };
-            let Some(kind) = self.object_kind(&fighter, &name) else {
+            let Some(mut kind) = self.object_kind(&fighter, &name) else {
                 continue;
             };
+            let alive = |at: u32| at >= spawned && removed.is_none_or(|removed| at < removed);
+            // The motion the move gives it (Samus's grab beam plays `catch`), in place of its own.
+            if let Some((_, _, motion)) = motions
+                .iter()
+                .find(|(at, other, _)| other == symbol && alive(*at))
+            {
+                let key = format!("{}/{name}@{motion}", fighter.name);
+                if let Some(Some(synced)) = self.object_kinds.get(&key) {
+                    kind = synced.clone();
+                } else if let Some((_, anim)) = kind.motions.iter().find(|(m, _)| m == motion) {
+                    let synced = std::sync::Arc::new(crate::article_preview::ObjectKind {
+                        anim: Some(anim.clone()),
+                        synced: true,
+                        ..(*kind).clone()
+                    });
+                    self.object_kinds.insert(key, Some(synced.clone()));
+                    kind = synced;
+                }
+            }
             spawns.push(crate::article_preview::Spawn {
                 kind,
+                shown: shown
+                    .iter()
+                    .filter(|(at, other, _)| other == symbol && alive(*at))
+                    .map(|(at, _, visible)| (*at, *visible))
+                    .collect(),
                 spawned,
                 removed,
                 // The first throw of it while it is out.
@@ -9142,6 +9178,7 @@ impl VisionaryApp {
                         spawned: object.spawned,
                         removed: object.removed,
                         shot: object.shot,
+                        shown: Vec::new(),
                     }],
                     at as f32,
                     &|f| (*bones_at(f.max(1.0) as u32)).clone(),
