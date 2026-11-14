@@ -34,12 +34,32 @@ pub fn item_for_motion(motion: &str) -> Option<&'static str> {
 
 /// The item's model and skeleton, as an object the preview draws.
 pub fn load(data_root: &Path, folder: &str) -> Option<ObjectKind> {
-    let model_dir = data_root.join("item").join(folder).join("model/body/c00");
+    load_model(&data_root.join("item").join(folder).join("model/body/c00"), folder)
+}
+
+/// A costume folder (`cNN`) of a model part: the fighter's own slot, else the first there is.
+pub fn model_slot_dir(part: &Path, slot: u8) -> Option<std::path::PathBuf> {
+    let own = part.join(format!("c{slot:02}"));
+    if own.join("model.nusktb").exists() {
+        return Some(own);
+    }
+    let mut dirs: Vec<_> = std::fs::read_dir(part)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.join("model.nusktb").exists())
+        .collect();
+    dirs.sort();
+    dirs.into_iter().next()
+}
+
+/// A held model (an item or a crafted weapon) from its folder, as an object the preview draws.
+pub fn load_model(model_dir: &Path, name: &str) -> Option<ObjectKind> {
     let skel = ssbh_data::skel_data::SkelData::from_file(model_dir.join("model.nusktb")).ok()?;
     let anim = ssbh_data::anim_data::AnimData::from_file(model_dir.join("model.nuanmb")).ok();
     Some(ObjectKind {
-        name: folder.to_owned(),
-        model_dir: Some(model_dir),
+        name: name.to_owned(),
+        model_dir: Some(model_dir.to_path_buf()),
         skel: Some(Arc::new(skel)),
         anim: anim.map(Arc::new),
         hitboxes: Vec::new(),

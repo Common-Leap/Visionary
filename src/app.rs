@@ -8795,6 +8795,21 @@ impl VisionaryApp {
     /// The item the open move holds, if it is an item move and the data folder has the item;
     /// loaded on a thread the first time.
     fn preview_held_item(&mut self) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
+        // A crafted weapon (Steve's sword, axe, pick or shovel) the move's script selects.
+        if let Some((name, dir)) = self.crafted_weapon() {
+            let key = format!("crafted/{}", dir.display());
+            if let Some(kind) = self.object_kinds.get(&key) {
+                return kind.clone();
+            }
+            if self.object_pending.insert(key.clone()) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.object_loads.push(rx);
+                std::thread::spawn(move || {
+                    let _ = tx.send((key, crate::preview_item::load_model(&dir, &name)));
+                });
+            }
+            return None;
+        }
         let folder = self
             .state
             .selected_move
@@ -8813,6 +8828,28 @@ impl VisionaryApp {
             });
         }
         None
+    }
+
+    /// The weapon a move crafts and holds, named in its script by `CRAFT_WEAPON_KIND_<NAME>`
+    /// (Steve's `*FIGHTER_PICKEL_CRAFT_WEAPON_KIND_SWORD`), when the fighter has a model folder
+    /// of that name: (name, model folder).
+    fn crafted_weapon(&self) -> Option<(String, PathBuf)> {
+        let source = &self.state.loaded_body;
+        let at = source.find("CRAFT_WEAPON_KIND_")? + "CRAFT_WEAPON_KIND_".len();
+        let name: String = source[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .to_lowercase();
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))?;
+        let dir = crate::preview_item::model_slot_dir(
+            &fighter.fighter_dir.join("model").join(&name),
+            fighter.base_slot(),
+        )?;
+        Some((name, dir))
     }
 
     /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
