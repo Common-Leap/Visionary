@@ -12008,7 +12008,12 @@ impl VisionaryApp {
                             egui::Color32::from_rgb(100, 150, 100)
                         };
                         ui.colored_label(color, if active { "◆" } else { "◇" });
-                        ui.label(format!("[{}] {}", event.frame, event.call.func));
+                        ui.label(format!(
+                            "f{} · {}",
+                            event.frame,
+                            sound_func_words(&event.call.func).unwrap_or(&event.call.func)
+                        ))
+                        .on_hover_text(format!("{} on frame {}", event.call.func, event.frame));
 
                         let mut call = event.call.clone();
                         let mut changed = false;
@@ -14714,13 +14719,22 @@ impl VisionaryApp {
                         current_frame,
                     );
                     let selected = self.selected_hurtbox == Some(*index);
-                    let label = format!(
-                        "HIT_NO #{} · {} · {} · default {}",
-                        volume.index,
-                        volume.bone_name,
-                        status.label(),
-                        volume.default_status.label()
-                    );
+                    // The status, and the default only when this frame differs from it.
+                    let status_words = status.label().to_lowercase();
+                    let label = if status == volume.default_status {
+                        format!(
+                            "{} · {}",
+                            crate::ui::bone_label(&volume.bone_name),
+                            status_words
+                        )
+                    } else {
+                        format!(
+                            "{} · {} (usually {})",
+                            crate::ui::bone_label(&volume.bone_name),
+                            status_words,
+                            volume.default_status.label().to_lowercase()
+                        )
+                    };
                     let response = ui.selectable_label(selected, label);
                     if response.clicked() {
                         self.selected_hurtbox = Some(*index);
