@@ -29,6 +29,9 @@ pub struct EffectDraw {
     /// The step (index into `placements`) on which the move kills the effect
     /// (`EFFECT_OFF_KIND`): from there its emitters stop and fade as their flags say.
     pub kill_at: Option<usize>,
+    /// The set colour: red, green, blue and opacity multiplying the effect's own (see
+    /// `effect_colour`).
+    pub colour: [f32; 4],
 }
 
 /// The shared effect file. Its meshes serve every other file, and it is far too big to warm
@@ -466,7 +469,7 @@ impl VfxPreview {
                         r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
                     );
                 }
-                let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), [1.0; 4]);
+                let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), draw.colour);
                 let statics = static_block::static_block(&emitter.fixed);
                 let custom0 = static_block::custom_block(&emitter.raw);
                 let samplers = samplers(emitter);

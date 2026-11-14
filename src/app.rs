@@ -3537,6 +3537,8 @@ pub struct VisionaryApp {
     /// The selected fighter's objects by the motions they have (hash40 of the motion kind), to
     /// show those its status code creates for a move.
     objects_by_motion: std::collections::HashMap<u64, Vec<String>>,
+    /// The selected fighter's attack-arc colour from the game's `fighter_param.prc`.
+    fighter_arc_colour: Option<[f32; 3]>,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -3966,6 +3968,7 @@ impl VisionaryApp {
             visibility_sets: Vec::new(),
             stowed_articles: Vec::new(),
             objects_by_motion: Default::default(),
+            fighter_arc_colour: None,
             carrier_push_callers: Vec::new(),
             project_name: "unnamed_mod".into(),
             project_path: None,
@@ -4587,6 +4590,9 @@ impl VisionaryApp {
             acmd_bone_options(loaded_bone_names.clone())
         };
         self.stowed_articles = stowed_articles(&model_root, &loaded_bone_names);
+        self.fighter_arc_colour = self.state.data_root.as_deref().and_then(|root| {
+            crate::effect_colour::fighter_arc_colour(root, &self.state.fighters[idx].name)
+        });
         self.objects_by_motion = crate::article_preview::objects_by_motion(
             &self.state.fighters[idx].fighter_dir,
             base_slot,
@@ -9181,16 +9187,22 @@ impl VisionaryApp {
         };
         let files = self.preview_effect_files();
         let mut out = Vec::new();
-        let mut push = |name: &str, placements: Vec<glam::Mat4>, kill_at: Option<usize>| {
+        let fighter_colour = self.fighter_arc_colour;
+        let mut push = |name: &str,
+                        placements: Vec<glam::Mat4>,
+                        kill_at: Option<usize>,
+                        call: Option<&crate::data::EffectCall>| {
             if placements.is_empty() {
                 return;
             }
+            let colour = crate::effect_colour::draw_colour(call, name, fighter_colour);
             for file in &files {
                 out.push(crate::vfx_preview::EffectDraw {
                     file: file.clone(),
                     name: name.to_owned(),
                     placements: placements.clone(),
                     kill_at,
+                    colour,
                 });
             }
         };
@@ -9240,7 +9252,7 @@ impl VisionaryApp {
                     .map(|at| vec![at; (frame_num - ec.active_start + 1) as usize])
             };
             if let Some(placements) = placements {
-                push(&ec.effect_name, placements, kill_at);
+                push(&ec.effect_name, placements, kill_at, Some(ec));
             }
         }
         // Objects' own effects, on the object's bones at each age. Many projectiles have no
@@ -9291,7 +9303,7 @@ impl VisionaryApp {
                         .map(|at| vec![at; (object_frame - effect.start + 1) as usize])
                 };
                 if let Some(placements) = placements {
-                    push(&effect.name, placements, None);
+                    push(&effect.name, placements, None, None);
                 }
             }
         }
@@ -9325,6 +9337,7 @@ impl VisionaryApp {
                         name,
                         placements: vec![at; age],
                         kill_at: None,
+                        colour: [1.0; 4],
                     });
                 }
             }
