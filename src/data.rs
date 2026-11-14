@@ -6803,6 +6803,36 @@ fn record_raw_partial_frame(line: &str, frame: f32, hurt: &mut WalkAccum) {
     }
 }
 
+/// An `ArticleModule` call kept as a native call, for the preview's objects.
+fn record_native_article_call(
+    call: &crate::move_nodes::native_calls::NativeCall,
+    at: u32,
+    hurt: &mut WalkAccum,
+) {
+    let Some(symbol) = call.arguments.first().and_then(|s| s.strip_prefix('*')) else {
+        return;
+    };
+    let symbol = symbol.to_owned();
+    let second = call.arguments.get(1).map(String::as_str);
+    match call.callee.trim_start_matches("ArticleModule::") {
+        "generate_article" => hurt.article_spawns.push((at, symbol, true)),
+        "change_motion" => {
+            if let Some(motion) = second
+                .and_then(|m| m.strip_prefix("Hash40::new(\""))
+                .and_then(|m| m.strip_suffix("\")"))
+            {
+                hurt.article_motions.push((at, symbol, motion.to_owned()));
+            }
+        }
+        "set_visibility_whole" => match second {
+            Some("true") => hurt.article_visibility.push((at, symbol, true)),
+            Some("false") => hurt.article_visibility.push((at, symbol, false)),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 /// Run one statement from inside an `is_excute` block, or one written bare beside it.
 ///
 /// Split out of [`eval_stmts`] when [`AcmdStmt::Bare`] arrived so both routes share one
@@ -7002,13 +7032,11 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         // has no safe way to replay native ItemModule writes.
         ExcuteStmt::ItemVisibility { .. } => {}
         // Item firing remains in its ACMD source; the flattened hitbox model has no equivalent.
-        // Samus's grab creates her arm cannon with `generate_article(.., true, -1)`, which no
-        // typed call covers; the preview still has to show it.
-        ExcuteStmt::NativeCall(call) if call.callee == "ArticleModule::generate_article" => {
-            if let Some(symbol) = call.arguments.first().and_then(|s| s.strip_prefix('*')) {
-                hurt.article_spawns
-                    .push((script_frame(frame), symbol.to_owned(), true));
-            }
+        // Article calls in forms no typed call covers, which the preview still has to show:
+        // Samus's grab creates her arm cannon with `generate_article(.., true, -1)`, and
+        // Byleth's down tilt gives his sword its motion where a typed one is not allowed.
+        ExcuteStmt::NativeCall(call) if call.callee.starts_with("ArticleModule::") => {
+            record_native_article_call(call, script_frame(frame), hurt)
         }
         ExcuteStmt::ShootItemBullet | ExcuteStmt::NativeCall(_) | ExcuteStmt::Effect(_) => {}
         // The start-info eye flash is a closed source-only point call with no live-model effect.
@@ -10046,6 +10074,39 @@ impl EffectScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byleth's down tilt, as the game has it: the sword's motion is given in a form the
+    /// parser keeps as a native call.
+    #[test]
+    fn byleth_down_tilt_gives_the_sword_its_motion() {
+        let script = crate::acmd::parse_acmd_script(BYLETH_GAME_ATTACK_LW3);
+        let sword = "FIGHTER_MASTER_GENERATE_ARTICLE_SWORD";
+        assert_eq!(
+            script.to_article_motions(),
+            vec![(1, sword.to_owned(), "attack_lw3".to_owned())]
+        );
+    }
+
+    const BYLETH_GAME_ATTACK_LW3: &str = r#"unsafe extern "C" fn game_attacklw3(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_SWORD, false, -1);
+        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_SWORD, Hash40::new("attack_lw3"), false, -1.0);
+    }
+    frame(agent.lua_state_agent, 13.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 8.0, 93, 55, 0, 67, 2.8, 0.0, 2.8, 10.0, Some(0.0), Some(2.8), Some(12.5), 0.8, 1.0, *ATTACK_SETOFF_KIND_THRU, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_cutup"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_CUTUP, *ATTACK_REGION_SWORD);
+        macros::ATTACK(agent, 1, 0, Hash40::new("top"), 8.0, 96, 55, 0, 67, 2.8, 0.0, 2.8, 17.0, Some(0.0), Some(2.8), Some(25.5), 0.8, 1.0, *ATTACK_SETOFF_KIND_THRU, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_cutup"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_CUTUP, *ATTACK_REGION_SWORD);
+    }
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+    }
+    frame(agent.lua_state_agent, 59.0);
+    if macros::is_excute(agent) {
+        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));
+    }
+}
+"#;
 
     /// Samus's grab, as her expression script has it: the arm cannon is created by a native
     /// call no typed form covers, the grab beam hidden until frame 8, both playing `catch`.

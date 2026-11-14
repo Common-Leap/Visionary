@@ -8572,7 +8572,9 @@ impl VisionaryApp {
                 } else if let Some((_, anim)) = kind.motions.iter().find(|(m, _)| m == motion) {
                     let synced = std::sync::Arc::new(crate::article_preview::ObjectKind {
                         anim: Some(anim.clone()),
-                        synced: true,
+                        synced: kind.skel.as_deref().is_some_and(|skel| {
+                            crate::article_preview::plays_in_fighter_space(skel, anim)
+                        }),
                         ..(*kind).clone()
                     });
                     self.object_kinds.insert(key, Some(synced.clone()));

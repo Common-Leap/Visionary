@@ -645,6 +645,32 @@ pub fn place(
     placed
 }
 
+/// Whether a motion places the object in the fighter's own space, the way the motions made
+/// with a fighter's moves do (Samus's grab beam starts at her arm cannon, 15 up), rather than
+/// around its grip (Fox's blaster opening in his hand). Read from the animation: its top bones
+/// sit well away from the origin at some point.
+pub fn plays_in_fighter_space(skel: &SkelData, anim: &AnimData) -> bool {
+    let top: Vec<&str> = skel
+        .bones
+        .iter()
+        .enumerate()
+        .filter(|(_, bone)| {
+            bone.parent_index
+                .is_none_or(|parent| skel.bones[parent].parent_index.is_none())
+        })
+        .map(|(_, bone)| bone.name.as_str())
+        .collect();
+    let last = anim.final_frame_index.max(0.0);
+    [0.0, last * 0.5, last].iter().any(|&frame| {
+        let bones = crate::renderer::compute_bone_world_matrices(skel, Some(anim), &[], frame);
+        top.iter().any(|name| {
+            bones
+                .get(*name)
+                .is_some_and(|matrix| matrix.col(3).truncate().length() > 3.0)
+        })
+    })
+}
+
 /// An object's bones in the world at its age.
 pub fn object_bones(object: &PlacedObject) -> HashMap<String, glam::Mat4> {
     let Some(skel) = &object.kind.skel else {
@@ -989,6 +1015,44 @@ mod thrown_object_tests {
         // Thrown: flying forward from the hand, 2 a frame from frame 27.
         assert_eq!(at(27.0), hand);
         assert_eq!(at(37.0), hand + glam::Vec3::Z * 20.0);
+    }
+}
+
+#[cfg(test)]
+mod motion_space_tests {
+    use super::*;
+
+    /// Needs VISIONARY_DATA_ROOT (an extracted game); skipped otherwise.
+    #[test]
+    fn grab_beam_plays_in_samus_space_and_the_blaster_in_fox_s_hand() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
+            return;
+        };
+        let fighter = Path::new(&root).join("fighter");
+        let space = |part: &str, motion: &str| {
+            let (name, article) = part.split_once('/').unwrap();
+            let skel = SkelData::from_file(
+                fighter
+                    .join(name)
+                    .join("model")
+                    .join(article)
+                    .join("c00/model.nusktb"),
+            )
+            .unwrap();
+            let anim = AnimData::from_file(
+                fighter
+                    .join(name)
+                    .join("motion")
+                    .join(article)
+                    .join("c00")
+                    .join(motion),
+            )
+            .unwrap();
+            plays_in_fighter_space(&skel, &anim)
+        };
+        assert!(space("samus/gbeam", "e00catch.nuanmb"));
+        assert!(space("samus/gun", "e00catch.nuanmb"));
+        assert!(!space("fox/blaster", "blasteropen.nuanmb"));
     }
 }
 
