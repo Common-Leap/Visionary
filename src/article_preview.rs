@@ -68,9 +68,12 @@ impl Flight {
         let (step_forward, mut step_up) = (self.speed * radians.cos(), self.speed * radians.sin());
         let whole = frames.max(0.0).floor() as usize;
         for _ in 0..whole {
+            // Gravity first, then the move: measured in game, Mario's fireball falls one
+            // gravity step further each frame than moving first would give (the gap grew by
+            // exactly 0.1 a frame).
+            step_up -= self.gravity;
             forward += step_forward;
             up += step_up;
-            step_up -= self.gravity;
             if up < -start_height {
                 match self.bounce {
                     Some(bounce) => {
