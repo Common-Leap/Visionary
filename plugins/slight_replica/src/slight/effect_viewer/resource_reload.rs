@@ -1,17 +1,15 @@
-//! Access the game's loaded ARC/search tables and patch raw heap buffers (SSBU 13.0.4).
+//! Access the game's loaded ARC/search tables and patch raw heap buffers.
 //!
 //! Ported from the original effect viewer's `resource_reload.rs`. Uses the real
 //! `smash-arc` crate structs (not hand-computed offsets) to resolve a game path to its
 //! search index / loaded-data buffer.
 
+use crate::offsets;
 use smash_arc::{ArcLookup, Hash40, Region, SearchLookup};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Freeze-pinpoint marker, shared with the rest of the injection path (trace opt-in only).
 use super::effect_reload::mark;
-
-// SSBU 13.0.4 — pointer-to-FilesystemInfo (smashline `resources::types::FilesystemInfo::instance`).
-const FILESYSTEM_INFO_PTR_OFFSET: usize = 0x5331f20;
 
 #[repr(C)]
 struct CppVector {
@@ -94,7 +92,7 @@ fn filesystem_info() -> Option<&'static FilesystemInfo> {
     let text =
         unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as *const u8 };
     let fs_info_ptr = unsafe {
-        text.add(FILESYSTEM_INFO_PTR_OFFSET)
+        text.add(offsets::FILESYSTEM_INFO.get())
             .cast::<*const FilesystemInfo>()
     };
     let fs_info = unsafe { *fs_info_ptr };
@@ -127,7 +125,7 @@ pub struct ResidentDirectoryState {
 /// The game's directory-release routine. It recursively decrements the directory tree's
 /// ownership counts and queues every group whose count reaches zero for the resource worker.
 /// Its callers hold `FilesystemInfo::_mutex`; this wrapper does the same.
-#[skyline::from_offset(0x353eff0)]
+#[skyline::from_offset(offsets::QUEUE_DIRECTORY_RELEASE.get())]
 fn queue_directory_release(filesystem: *mut FilesystemInfo, directory: *mut LoadedDirectory);
 
 pub fn loaded_arc() -> Option<&'static smash_arc::LoadedArc> {

@@ -3,6 +3,7 @@
 // does not call directly. They are documented and audited in AUDIT.md.
 #![allow(dead_code)]
 
+mod offsets;
 mod rust_extender;
 mod slight;
 
@@ -11,7 +12,15 @@ pub const PLUGIN_VERSION: &str = "0.1.0-slight-replica";
 /// Jorge entry — `smashline_install` @ 71000013d0.
 #[skyline::main(name = "_effect_viewer")]
 pub fn smashline_install() {
-    skyline::println!("[SLight] Start preinstall");
+    let game_version = match offsets::initialize() {
+        Some(offsets::GameVersion::V13_0_4) => "13.0.4",
+        Some(offsets::GameVersion::V13_0_5) => "13.0.5",
+        None => {
+            skyline::println!("[SLight] Unsupported SSBU version. Expected 13.0.4 or 13.0.5.");
+            return;
+        }
+    };
+    skyline::println!("[SLight] Start preinstall on SSBU {game_version}");
     slight::smash_utils::ensure_slight_dirs();
     slight::diag::start_session();
     // The disabled set belongs in the boot log, not diag.txt: diag only flushes from the
@@ -20,7 +29,7 @@ pub fn smashline_install() {
     let _ = std::fs::write(
         format!("{}/effect_viewer_boot.txt", slight::smash_utils::ERROR_LOGS),
         format!(
-            "lib_effect_viewer v{PLUGIN_VERSION}\nbuild={}\ndisabled={}\n",
+            "lib_effect_viewer v{PLUGIN_VERSION}\ngame={game_version}\nbuild={}\ndisabled={}\n",
             slight::effect_viewer::live_eff::BUILD_TAG,
             slight::smash_utils::disabled_subsystems(),
         ),
