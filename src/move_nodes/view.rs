@@ -5931,11 +5931,13 @@ fn effect_command_ui_mode(
         EffectMacro::LastEffectSetScaleW { values } => {
             ui.label("Scale components");
             egui::ComboBox::from_id_salt("effect_scale_component_count")
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .selected_text(values.len().to_string())
                 .show_ui(ui, |ui| {
                     for count in 1..=3 {
                         if ui.selectable_label(values.len() == count, count.to_string()).clicked() {
                             values.resize(count, 1.0);
+                            ui.close();
                         }
                     }
                 }).response.on_hover_text("Use one value to scale evenly, or two or three to stretch it.");

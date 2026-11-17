@@ -2308,6 +2308,7 @@ impl EffEditor {
                 })
                 .unwrap_or_else(|| "none".into());
             egui::ComboBox::from_id_salt("eff_file_combo")
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .selected_text(loaded_name)
                 .width(260.0)
                 .height(420.0)
@@ -2337,6 +2338,7 @@ impl EffEditor {
                         let selected = self.loaded_path.as_deref() == Some(path.as_path());
                         if ui.selectable_label(selected, label).clicked() {
                             self.load_eff(&path);
+                            ui.close();
                         }
                     }
                 });

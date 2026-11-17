@@ -104,7 +104,7 @@ pub(crate) fn colour_field(
             egui::TextEdit::singleline(&mut text)
                 .id(id)
                 .font(egui::TextStyle::Monospace)
-                .desired_width(64.0),
+                .desired_width(76.0),
         )
         .on_hover_text("Colour code, like #FF8800");
     if response.has_focus() {

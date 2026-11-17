@@ -34685,6 +34685,7 @@ fn expression_selector(
                 }
                 if ui.selectable_label(custom_mode, "Custom source…").clicked() {
                     custom_mode = true;
+                    ui.close();
                 }
                 ui.separator();
                 for option in options {
@@ -34824,6 +34825,7 @@ fn rumble_kind_picker(
             .on_hover_text(hint);
         let mut selected_known = false;
         egui::ComboBox::from_id_salt(("rumble_selector", salt.0, salt.1))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .selected_text(if selected.is_empty() {
                 "Choose…"
             } else {
@@ -34839,6 +34841,7 @@ fn rumble_kind_picker(
                 }
                 if ui.selectable_label(custom_mode, "Custom source…").clicked() {
                     custom_mode = true;
+                    ui.close();
                 }
                 ui.separator();
                 let filter_id = ui.make_persistent_id(("rumble_filter", salt.0, salt.1));
@@ -34873,6 +34876,7 @@ fn rumble_kind_picker(
                             if response.clicked() {
                                 *token = rumble_kind_source_token(candidate);
                                 selected_known = true;
+                                ui.close();
                             }
                         }
                     });
@@ -35034,6 +35038,7 @@ fn sound_name_picker(
     let filter_id = ui.make_persistent_id(("sound_filter", salt.0, salt.1));
     let mut filter: String = ui.data(|d| d.get_temp(filter_id).unwrap_or_default());
     egui::ComboBox::from_id_salt(("sound_browse", salt.0, salt.1))
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .selected_text("Browse")
         .width(80.0)
         .show_ui(ui, |ui| {
@@ -35059,6 +35064,7 @@ fn sound_name_picker(
                         if ui.selectable_label(*cand == name, *cand).clicked() {
                             *name = (*cand).clone();
                             changed = true;
+                            ui.close();
                         }
                     }
                 });
