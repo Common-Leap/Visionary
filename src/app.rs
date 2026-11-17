@@ -9689,8 +9689,7 @@ impl VisionaryApp {
                         && self.eff_editor.view == crate::eff_editor::EffectView::Alone
                         && self.eff_editor.selected_entry_name().is_some()
                     {
-                        // Centred low, on the floor the effect plays on.
-                        rs.camera.follow = glam::Vec3::new(0.0, -6.0, 0.0);
+                        rs.camera.follow = glam::Vec3::ZERO;
                     }
                     // Left drag: pan in camera plane (left/right + up/down)
                     if response.dragged_by(egui::PointerButton::Primary) {

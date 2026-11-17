@@ -797,6 +797,10 @@ const BASIC_ATTRS: &[&str] = &[
     "emitter_static.color_scale",
     "emission.rate",
     "particle_data.life",
+];
+
+/// The area a part's particles start in, X Y Z.
+const SPREAD_ATTRS: [&str; 3] = [
     "emitter_info.scale_x",
     "emitter_info.scale_y",
     "emitter_info.scale_z",
@@ -885,20 +889,6 @@ fn attr_text(attr: &crate::eff_attrs::Attr, value: AttrValue) -> String {
 ///
 /// Rows the emitter does not carry are skipped, not greyed: an emitter with no sampler 2 has no
 /// sampler-2 wrap mode to show, and a disabled control implies there is a value behind it.
-fn attr_rows(
-    ui: &mut Ui,
-    salt: &str,
-    em: &mut EmitterDef,
-    pr: &EmitterSnapshot,
-    ids: &[&str],
-) -> bool {
-    let indices: Vec<usize> = ids
-        .iter()
-        .filter_map(|id| crate::eff_attrs::index_of(id))
-        .collect();
-    attr_rows_by_index(ui, salt, em, pr, &indices)
-}
-
 fn attr_rows_by_index(
     ui: &mut Ui,
     salt: &str,
@@ -906,61 +896,73 @@ fn attr_rows_by_index(
     pr: &EmitterSnapshot,
     indices: &[usize],
 ) -> bool {
-    let table = crate::eff_attrs::table();
     let mut changed = false;
     egui::Grid::new(salt)
         .num_columns(3)
         .striped(true)
         .show(ui, |ui| {
-            for &i in indices {
-                let (Some(attr), Some(Some(mut value))) = (table.get(i), em.attrs.get(i).copied())
-                else {
-                    continue;
-                };
-                let orig = pr.attrs.get(i).copied().flatten();
-                let edited = orig.is_some_and(|o| !o.same(value));
+            changed = attr_grid_rows(ui, em, pr, indices);
+        });
+    changed
+}
 
-                let label = if edited {
-                    egui::RichText::new(attr.label).color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
-                } else {
-                    egui::RichText::new(attr.label)
-                };
-                ui.label(label)
-                    .on_hover_text(format!("{}\n\n{}", attr.doc, attr.id));
+/// Attribute rows inside a three-column grid the caller opens: label, editor, the file's value
+/// once it differs.
+fn attr_grid_rows(
+    ui: &mut Ui,
+    em: &mut EmitterDef,
+    pr: &EmitterSnapshot,
+    indices: &[usize],
+) -> bool {
+    let table = crate::eff_attrs::table();
+    let mut changed = false;
+    for &i in indices {
+        let (Some(attr), Some(Some(mut value))) = (table.get(i), em.attrs.get(i).copied()) else {
+            continue;
+        };
+        let orig = pr.attrs.get(i).copied().flatten();
+        let edited = orig.is_some_and(|o| !o.same(value));
 
-                if attr_widget(ui, attr, &mut value) {
-                    em.attrs[i] = Some(value);
+        let label = if edited {
+            egui::RichText::new(attr.label).color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
+        } else {
+            egui::RichText::new(attr.label)
+        };
+        ui.label(label)
+            .on_hover_text(format!("{}\n\n{}", attr.doc, attr.id));
+
+        if attr_widget(ui, attr, &mut value) {
+            em.attrs[i] = Some(value);
+            changed = true;
+        }
+
+        ui.horizontal(|ui| {
+            if let Some(orig) = orig {
+                // The file's value only matters once it differs; on every row it was
+                // a column of noise repeating the field beside it.
+                if edited {
+                    ui.label(
+                        egui::RichText::new(format!("was {}", attr_text(attr, orig)))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                // Reset is per attribute rather than per group: with three hundred rows,
+                // "put this one back" is the operation you actually want, and the
+                // emitter-wide reset is still one button away.
+                if edited
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text("Reset to the file's value")
+                        .clicked()
+                {
+                    em.attrs[i] = Some(orig);
                     changed = true;
                 }
-
-                ui.horizontal(|ui| {
-                    if let Some(orig) = orig {
-                        // The file's value only matters once it differs; on every row it was
-                        // a column of noise repeating the field beside it.
-                        if edited {
-                            ui.label(
-                                egui::RichText::new(format!("was {}", attr_text(attr, orig)))
-                                    .small()
-                                    .color(egui::Color32::GRAY),
-                            );
-                        }
-                        // Reset is per attribute rather than per group: with three hundred rows,
-                        // "put this one back" is the operation you actually want, and the
-                        // emitter-wide reset is still one button away.
-                        if edited
-                            && ui
-                                .small_button("↺")
-                                .on_hover_text("Reset to the file's value")
-                                .clicked()
-                        {
-                            em.attrs[i] = Some(orig);
-                            changed = true;
-                        }
-                    }
-                });
-                ui.end_row();
             }
         });
+        ui.end_row();
+    }
     changed
 }
 
@@ -2168,6 +2170,12 @@ impl EffEditor {
             ui.weak("Pick an effect on the left to change how it looks.");
             return;
         }
+        // The texture of the part on the Look tab, and the game's view of the effect while one
+        // is connected; with neither there is nothing to put there.
+        if self.emitter_tab != EmitterTab::Attributes && link.status() != LinkStatus::Connected {
+            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_emitter_editor(ui));
+            return;
+        }
         egui::Panel::bottom("eff_game_panel_split")
             .resizable(true)
             .default_size(240.0)
@@ -2209,9 +2217,12 @@ impl EffEditor {
                      Re-trigger the move to see it on a fresh spawn.",
                 )
                 .on_disabled_hover_text(if self.sending {
-                    "Sending…"
+                    "Sending…".to_owned()
                 } else {
-                    "Connect to the running game first."
+                    match link.last_error() {
+                        Some(why) => format!("Connect to the running game first.\n\n{why}"),
+                        None => "Connect to the running game first.".to_owned(),
+                    }
                 })
                 .clicked()
             {
@@ -2271,13 +2282,6 @@ impl EffEditor {
                 } else {
                     egui::Color32::from_rgb(0xD0, 0x80, 0x60)
                 }));
-            }
-            if link.status() != LinkStatus::Connected {
-                if let Some(err) = link.last_error() {
-                    // The full reason is long; it lives on hover rather than across the page.
-                    ui.label(egui::RichText::new("why?").small().weak())
-                        .on_hover_text(err);
-                }
             }
         });
 
@@ -2724,26 +2728,35 @@ impl EffEditor {
                 // and out of the group tree. Each one is the SAME attribute the tree below
                 // holds, so editing it here or there is the same edit — there is no second
                 // source of truth to fall out of step.
-                changed |= attr_rows(ui, "authored_fields", em, pr, BASIC_ATTRS);
-
                 let particle_scale = [
                     "particle_scale.scale_x",
                     "particle_scale.scale_y",
                     "particle_scale.scale_z",
                 ];
-                // Uniform scale is the common intent, so it gets a control of its own: the
-                // per-axis rows are in the Particle scale group for anisotropy.
-                if particle_scale.iter().all(|id| attr(em, id).is_some()) {
-                    egui::Grid::new("uniform_scale")
-                        .num_columns(3)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("Particle size")
-                                .on_hover_text("Scales X, Y and Z together, keeping the ratio the part was made with.");
+                egui::Grid::new("authored_fields")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        let basic: Vec<usize> = BASIC_ATTRS
+                            .iter()
+                            .filter_map(|id| crate::eff_attrs::index_of(id))
+                            .collect();
+                        changed |= attr_grid_rows(ui, em, pr, &basic);
+                        // Uniform scale is the common intent, so it gets a control of its own:
+                        // the per-axis rows are in the Particle scale group for anisotropy.
+                        if particle_scale.iter().all(|id| attr(em, id).is_some()) {
+                            ui.label("Particle size").on_hover_text(
+                                "Scales X, Y and Z together, keeping the ratio the part was \
+                                 made with.",
+                            );
                             let base = attr_f32(em, particle_scale[0]);
                             let mut v = base;
                             if ui
-                                .add(egui::DragValue::new(&mut v).speed(0.01).range(0.0..=f32::MAX))
+                                .add(
+                                    egui::DragValue::new(&mut v)
+                                        .speed(0.01)
+                                        .range(0.0..=f32::MAX),
+                                )
                                 .changed()
                             {
                                 let ratio = if base.abs() > 1e-6 { v / base } else { 0.0 };
@@ -2754,11 +2767,8 @@ impl EffEditor {
                                 }
                                 changed = true;
                             }
-                            let was = pr
-                                .attrs
-                                .get(crate::eff_attrs::index_of(particle_scale[0]).unwrap_or(0))
-                                .copied()
-                                .flatten()
+                            let was = crate::eff_attrs::index_of(particle_scale[0])
+                                .and_then(|at| pr.attrs.get(at).copied().flatten())
                                 .map(|v| v.as_f32())
                                 .unwrap_or(0.0);
                             if (was - attr_f32(em, particle_scale[0])).abs() > 1e-6 {
@@ -2771,8 +2781,51 @@ impl EffEditor {
                                 ui.label("");
                             }
                             ui.end_row();
-                        });
-                }
+                        }
+                        // Where the particles start: one row, X Y Z.
+                        if SPREAD_ATTRS.iter().all(|id| attr(em, id).is_some()) {
+                            ui.label("Spread").on_hover_text(
+                                "Stretches the area the particles start in, and the way they \
+                                 move, along X, Y and Z",
+                            );
+                            ui.horizontal(|ui| {
+                                for (id, axis) in SPREAD_ATTRS.iter().zip(["X ", "Y ", "Z "]) {
+                                    let mut v = attr_f32(em, id);
+                                    if ui
+                                        .add(egui::DragValue::new(&mut v).speed(0.01).prefix(axis))
+                                        .changed()
+                                    {
+                                        set_attr(em, id, AttrValue::Float(v));
+                                        changed = true;
+                                    }
+                                }
+                            });
+                            let was: Vec<f32> = SPREAD_ATTRS
+                                .iter()
+                                .map(|id| {
+                                    crate::eff_attrs::index_of(id)
+                                        .and_then(|at| pr.attrs.get(at).copied().flatten())
+                                        .map(|v| v.as_f32())
+                                        .unwrap_or(0.0)
+                                })
+                                .collect();
+                            let now: Vec<f32> =
+                                SPREAD_ATTRS.iter().map(|id| attr_f32(em, id)).collect();
+                            if was.iter().zip(&now).any(|(a, b)| (a - b).abs() > 1e-6) {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "was {:.2} {:.2} {:.2}",
+                                        was[0], was[1], was[2]
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
 
                 let mut key_table =
                     |ui: &mut Ui, label: &str, keys: &mut Vec<ColorKey>, orig: &[ColorKey]| {
@@ -2799,7 +2852,9 @@ impl EffEditor {
                                 if let Some(o) = orig.get(i) {
                                     if (o.r, o.g, o.b) != (k.r, k.g, k.b) {
                                         ui.label(
-                                            egui::RichText::new("was").small().color(egui::Color32::GRAY),
+                                            egui::RichText::new("was")
+                                                .small()
+                                                .color(egui::Color32::GRAY),
                                         );
                                         // A plain swatch: a disabled colour button is drawn
                                         // dimmed, which showed white as grey.
@@ -2815,7 +2870,12 @@ impl EffEditor {
                         }
                     };
                 key_table(ui, "Colour over its life", &mut em.color0, &pr.color0);
-                key_table(ui, "Second colour over its life", &mut em.color1, &pr.color1);
+                key_table(
+                    ui,
+                    "Second colour over its life",
+                    &mut em.color1,
+                    &pr.color1,
+                );
 
                 if !em.alpha0_keys.is_empty() {
                     ui.add_space(6.0);
@@ -2823,7 +2883,12 @@ impl EffEditor {
                     for (i, k) in em.alpha0_keys.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             changed |= ui
-                                .add(egui::DragValue::new(&mut k.r).speed(0.01).range(0.0..=4.0))
+                                .add(
+                                    egui::DragValue::new(&mut k.r)
+                                        .speed(0.01)
+                                        .range(0.0..=4.0)
+                                        .max_decimals(2),
+                                )
                                 .changed();
                             ui.label("at").on_hover_text(
                                 "When in the particle's life this opacity is reached",
@@ -2866,8 +2931,7 @@ impl EffEditor {
 
                 ui.add_space(10.0);
                 ui.separator();
-                let attributes_changed =
-                    draw_attribute_groups(ui, em, pr, &mut self.attr_filter);
+                let attributes_changed = draw_attribute_groups(ui, em, pr, &mut self.attr_filter);
                 if attributes_changed {
                     attrs_to_effective_keys(em);
                     changed = true;
@@ -2902,9 +2966,6 @@ impl EffEditor {
                 self.draw_emitter_roster(ui, set_idx);
                 ui.add_space(10.0);
                 ui.separator();
-                self.draw_emitter_timing(ui, set_idx);
-                ui.add_space(10.0);
-                ui.separator();
                 self.draw_entry_parts(ui, entry_name);
             });
     }
@@ -2918,7 +2979,14 @@ impl EffEditor {
     /// the edit expressible as a roster the exporter can re-apply.
     fn draw_emitter_roster(&mut self, ui: &mut Ui, set_idx: usize) {
         ui.label(egui::RichText::new("Parts").strong());
-        let original = self.pristine.get(set_idx).map(|p| p.len()).unwrap_or(0);
+        ui.label(
+            egui::RichText::new(
+                "Each part makes its own particles. Frames count from when the effect is \
+                 spawned.",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
         let Some(set) = self
             .ptcl
             .as_mut()
@@ -2926,14 +2994,6 @@ impl EffEditor {
         else {
             return;
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "{} now, {original} as the game has it",
-                set.emitters.len()
-            ))
-            .small()
-            .color(egui::Color32::GRAY),
-        );
 
         // Collected and applied after the loop: every one of these changes the list being
         // iterated.
@@ -2943,53 +3003,145 @@ impl EffEditor {
         let mut nest: Option<(usize, i8)> = None;
         let mut changed = false;
 
-        for (i, em) in set.emitters.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add_space(em.depth as f32 * 14.0);
-                let label = if em.name.is_empty() {
-                    format!("part {}", i + 1)
-                } else {
-                    em.name.clone()
-                };
-                if ui
-                    .selectable_label(self.selected_emitter == i, label)
-                    .clicked()
-                {
-                    self.selected_emitter = i;
-                    self.emitter_tab = EmitterTab::Attributes;
+        let table = crate::eff_attrs::table();
+        // The part's timing, one column each; a part without one of these shows a dash.
+        const COLUMNS: &[(&str, &str, &str)] = &[
+            (
+                "emission.start",
+                "Starts",
+                "The frame the part starts making particles",
+            ),
+            (
+                "emission.rate",
+                "Per frame",
+                "Particles it makes each frame while on. Fractions add up: 0.5 is one every \
+                 other frame.",
+            ),
+            (
+                "emission.interval",
+                "Gap",
+                "Frames it waits after each burst before the next",
+            ),
+            (
+                "emission.is_one_time",
+                "Once",
+                "On: the part stops after its duration. Off: it keeps going until the effect \
+                 is removed.",
+            ),
+            (
+                "emission.duration",
+                "For",
+                "How many frames a part played once keeps going",
+            ),
+            (
+                "particle_data.life",
+                "Life",
+                "How many frames each particle stays on screen",
+            ),
+        ];
+        let selected = self.selected_emitter;
+        let mut select: Option<usize> = None;
+        egui::Grid::new(("parts_table", set_idx))
+            .num_columns(COLUMNS.len() + 2)
+            .striped(true)
+            .spacing([6.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Part").small().weak());
+                for (_, title, doc) in COLUMNS {
+                    ui.label(egui::RichText::new(*title).small().weak())
+                        .on_hover_text(*doc);
                 }
-                if ui
-                    .small_button("copy")
-                    .on_hover_text("Add another part just like this one")
-                    .clicked()
-                {
-                    duplicate = Some(i);
-                }
-                if ui
-                    .small_button("remove")
-                    .on_hover_text("Stop this part from playing at all")
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
-                if ui.small_button("↑").on_hover_text("Draw earlier").clicked() {
-                    move_by = Some((i, -1));
-                }
-                if ui.small_button("↓").on_hover_text("Draw later").clicked() {
-                    move_by = Some((i, 1));
-                }
-                if em.depth > 0 && ui.small_button("⇤").on_hover_text("Stop being a child of the part above").clicked() {
-                    nest = Some((i, -1));
-                }
-                if i > 0
-                    && ui
-                        .small_button("⇥")
-                        .on_hover_text("Make it a child of the part above: it spawns from that part's particles")
-                        .clicked()
-                {
-                    nest = Some((i, 1));
+                ui.label("");
+                ui.end_row();
+                let count = set.emitters.len();
+                for (i, em) in set.emitters.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(em.depth as f32 * 12.0);
+                        let label = if em.name.is_empty() {
+                            format!("part {}", i + 1)
+                        } else {
+                            em.name.clone()
+                        };
+                        let response = ui.selectable_label(selected == i, label);
+                        if response.clicked() {
+                            select = Some(i);
+                        }
+                        if em.depth > 0 {
+                            response.on_hover_text("Made from the particles of the part above it");
+                        }
+                    });
+                    let once = attr(em, "emission.is_one_time").is_some_and(|v| v.as_bool());
+                    for (id, _, _) in COLUMNS {
+                        let index = crate::eff_attrs::index_of(id);
+                        let current = index.and_then(|at| em.attrs.get(at).copied().flatten());
+                        match (index, current) {
+                            (Some(at), Some(mut value)) if *id != "emission.duration" || once => {
+                                ui.push_id((i, *id), |ui| {
+                                    if attr_widget(ui, &table[at], &mut value) {
+                                        em.attrs[at] = Some(value);
+                                        changed = true;
+                                    }
+                                });
+                            }
+                            _ => {
+                                ui.weak("–");
+                            }
+                        }
+                    }
+                    ui.menu_button("⋯", |ui| {
+                        if ui
+                            .button("Copy")
+                            .on_hover_text("Add another part just like this one")
+                            .clicked()
+                        {
+                            duplicate = Some(i);
+                            ui.close();
+                        }
+                        if ui
+                            .button("Remove")
+                            .on_hover_text("Stop this part from playing")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(i > 0, egui::Button::new("Draw earlier"))
+                            .clicked()
+                        {
+                            move_by = Some((i, -1));
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(i + 1 < count, egui::Button::new("Draw later"))
+                            .clicked()
+                        {
+                            move_by = Some((i, 1));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(i > 0, egui::Button::new("Make from the part above"))
+                            .on_hover_text(
+                                "Its particles come out of the particles of the part above",
+                            )
+                            .clicked()
+                        {
+                            nest = Some((i, 1));
+                            ui.close();
+                        }
+                        if em.depth > 0 && ui.button("Make on its own").clicked() {
+                            nest = Some((i, -1));
+                            ui.close();
+                        }
+                    });
+                    ui.end_row();
                 }
             });
+        if let Some(i) = select {
+            self.selected_emitter = i;
+            self.emitter_tab = EmitterTab::Attributes;
         }
 
         // Every one of these operates on an emitter's whole SUBTREE, not on the one row. The
@@ -3072,65 +3224,6 @@ impl EffEditor {
         }
         if changed {
             self.clamp_selected_emitter(set_idx);
-            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
-        }
-    }
-
-    /// When each emitter starts and how long it keeps going — the per-emitter half of an
-    /// effect's timing, gathered into one table so the whole effect's shape is readable at a
-    /// glance rather than one emitter at a time.
-    ///
-    /// These are ordinary attributes, edited here and in the attribute tree alike.
-    fn draw_emitter_timing(&mut self, ui: &mut Ui, set_idx: usize) {
-        const TIMING: &[&str] = &[
-            "emission.start",
-            "emission.timing",
-            "emission.duration",
-            "emission.interval",
-            "emission.rate",
-            "emission.is_one_time",
-            "particle_data.life",
-        ];
-        ui.label(egui::RichText::new("Timing").strong());
-        ui.label(
-            egui::RichText::new(
-                "Start and duration are in frames from when the effect is spawned. A part \
-                 with duration 0 emits on its start frame only.",
-            )
-            .small()
-            .color(egui::Color32::GRAY),
-        );
-        let Some(pristine) = self.pristine.get(set_idx).cloned() else {
-            return;
-        };
-        let Some(set) = self
-            .ptcl
-            .as_mut()
-            .and_then(|p| p.emitter_sets.get_mut(set_idx))
-        else {
-            return;
-        };
-        let mut changed = false;
-        // A short set opens every emitter, because the whole point of this table is seeing the
-        // effect's timing at once; a long one would be a wall of grids.
-        let open_by_default = set.emitters.len() <= 4;
-        for (i, em) in set.emitters.iter_mut().enumerate() {
-            let Some(pr) = pristine.get(em.source_idx) else {
-                continue;
-            };
-            let name = if em.name.is_empty() {
-                format!("part {}", i + 1)
-            } else {
-                em.name.clone()
-            };
-            egui::CollapsingHeader::new(name)
-                .id_salt(("timing", i))
-                .default_open(open_by_default)
-                .show(ui, |ui| {
-                    changed |= attr_rows(ui, &format!("timing_rows{i}"), em, pr, TIMING);
-                });
-        }
-        if changed {
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
     }
@@ -4025,7 +4118,9 @@ impl EffEditor {
     }
 
     fn draw_game_panel(&mut self, ui: &mut Ui, link: &GameLink) {
-        self.draw_texture_panel(ui);
+        if self.emitter_tab == EmitterTab::Attributes {
+            self.draw_texture_panel(ui);
+        }
         // The rest is about the running game: what it has spawned and what has been sent to
         // it. Without a connection none of it says anything.
         if link.status() != LinkStatus::Connected {
