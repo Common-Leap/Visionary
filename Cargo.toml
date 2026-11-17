@@ -10,8 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 # GUI + rendering
-eframe = { version = "0.37.0", default-features = false, features = ["wgpu"] }
-egui = { version = "0.37.0" }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "clipboard", "links"] }
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 egui-wgpu = "0.37.0"
 egui_extras = { version = "0.37.0", features = ["all_loaders"] }
 wgpu = "30.0.2"
@@ -74,7 +74,7 @@ sevenz-rust2 = "0.25.0"
 # These native window systems only exist on Linux. Keeping them out of the common eframe
 # declaration prevents Windows builds from inheriting host features they cannot use.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["wayland", "x11", "wgpu"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wayland", "x11", "wgpu", "default_fonts", "clipboard", "links"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }

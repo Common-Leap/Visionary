@@ -603,6 +603,23 @@ impl HitboxRenderState {
         self.renderer.update_camera(queue, transforms);
     }
 
+    /// Place each mesh hung on a bone for this frame's pose and camera: the fighter's, its
+    /// objects' and the stage's. ssbh_wgpu draws such meshes from this per-mesh transform.
+    fn update_per_world(&mut self, queue: &wgpu::Queue, objects: &[ObjectDraw]) {
+        let camera = self.renderer.camera_transforms();
+        let body_skel = self.cached_skel.as_ref().map(|(_, s)| s);
+        for (index, model) in self.render_models.iter_mut().enumerate() {
+            let skel = match index {
+                0 => body_skel,
+                n => objects.get(n - 1).map(|object| object.skel.as_ref()),
+            };
+            model.update_per_world(queue, &camera, skel);
+        }
+        for (model, parts) in self.stage_models.iter_mut().zip(&self.stage_parts) {
+            model.update_per_world(queue, &camera, parts.folder.find_skel());
+        }
+    }
+
     /// Shows the objects out this frame after the body model, loading each model once.
     fn update_objects(
         &mut self,
@@ -1136,6 +1153,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 self.repaint
                     .request_repaint_after(std::time::Duration::from_millis(30));
             }
+            state.update_per_world(queue, &self.objects);
             let obj_ms = t_obj.elapsed().as_secs_f64() * 1000.0;
             if std::env::var_os("VFX_TIMING").is_some() && anim_ms + obj_ms > 8.0 {
                 eprintln!("[vfx timing] paint anim {anim_ms:.1} ms objects {obj_ms:.1} ms");
