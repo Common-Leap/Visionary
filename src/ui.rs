@@ -82,7 +82,11 @@ pub(crate) fn search_field(ui: &mut Ui, id: &str, query: &mut String, hint: &str
 /// A colour: the picker, its colour code (`#FF8800`), and R G B numbers for exact values. The
 /// numbers go above 1 as the game's do (`LAST_EFFECT_SET_COLOR(agent, 0.25, 1.3, 2.5)` is an
 /// over-bright blue); the picker and the code show such a colour at its brightest.
-pub(crate) fn colour_field(ui: &mut Ui, id: impl std::hash::Hash, rgb: &mut [f32; 3]) -> bool {
+pub(crate) fn colour_field(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    rgb: &mut [f32; 3],
+) -> bool {
     let mut changed = false;
     let id = ui.make_persistent_id(id);
     let mut picked = rgb.map(|v| v.clamp(0.0, 1.0));
@@ -160,7 +164,7 @@ pub(crate) struct Pick {
 /// way as the classic editor's Fighters and Moves lists. Returns the index of a picked choice.
 pub(crate) fn picker(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     width: f32,
     selected_text: &str,
     choices: &[Pick],
@@ -331,7 +335,7 @@ fn bone_group(name: &str) -> (&'static str, &'static str) {
 /// Pick a bone, listed by body part with plain names. Returns true when the bone changed.
 pub(crate) fn bone_picker(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     width: f32,
     bone: &mut String,
     bones: &[String],
@@ -378,5 +382,21 @@ mod colour_code_tests {
         assert_eq!(parse_colour_code("f80"), Some([1.0, 136.0 / 255.0, 0.0]));
         assert_eq!(parse_colour_code("#ff88"), None);
         assert_eq!(parse_colour_code("#gg8800"), None);
+    }
+}
+
+/// Runs a test frame like `Context::run_ui`, dropping the texture uploads no test applies
+/// (egui panics when they are dropped unhandled).
+#[cfg(test)]
+pub(crate) trait TestFrame {
+    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput;
+}
+
+#[cfg(test)]
+impl TestFrame for egui::Context {
+    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput {
+        let mut output = self.run_ui(input, ui);
+        output.textures_delta.clear();
+        output
     }
 }

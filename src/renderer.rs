@@ -78,7 +78,8 @@ impl Camera {
         let model_view = Mat4::from_translation(self.translation)
             * rotation
             * Mat4::from_translation(-self.follow);
-        let projection = Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
+        let projection =
+            glam::camera::rh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far);
         let mvp = projection * model_view;
         CameraTransforms {
             model_view_matrix: model_view,
@@ -94,6 +95,8 @@ impl Camera {
 /// All wgpu rendering resources stored in egui's callback_resources.
 pub struct HitboxRenderState {
     pub renderer: SsbhRenderer,
+    /// What the renderer draws with (bloom on, shadows off); models are built for it.
+    render_settings: RenderSettings,
     pub shared_data: SharedRenderData,
     pub render_models: Vec<RenderModel>,
     pub model_render_options: ModelRenderOptions,
@@ -190,6 +193,7 @@ impl HitboxRenderState {
         renderer.update_render_settings(queue, &render_settings);
         Self {
             renderer,
+            render_settings,
             shared_data,
             render_models: Vec::new(),
             model_render_options: ModelRenderOptions::default(),
@@ -243,14 +247,14 @@ impl HitboxRenderState {
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
         if width == self.current_width && height == self.current_height {
             return;
         }
-        self.renderer.resize(device, width, height, 1.0);
+        self.renderer.resize(device, queue, width, height, 1.0);
         self.target.resize(device, width, height);
         self.current_width = width;
         self.current_height = height;
@@ -273,7 +277,13 @@ impl HitboxRenderState {
             eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
             return;
         }
-        let render_model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+        let render_model = RenderModel::from_folder(
+            device,
+            queue,
+            &folder,
+            &self.shared_data,
+            &self.render_settings,
+        );
         eprintln!("[MODEL] loaded from {:?}", model_dir);
         self.render_models.push(render_model);
 
@@ -383,6 +393,9 @@ impl HitboxRenderState {
                 skel,
                 None,
                 None,
+                None,
+                None,
+                None,
                 &self.shared_data,
                 frame,
             );
@@ -463,8 +476,13 @@ impl HitboxRenderState {
             self.stage_loading = None;
         }
         for load in arrived {
-            let mut model =
-                RenderModel::from_folder(device, queue, &load.folder, &self.shared_data);
+            let mut model = RenderModel::from_folder(
+                device,
+                queue,
+                &load.folder,
+                &self.shared_data,
+                &self.render_settings,
+            );
             Self::place_stage_model(
                 &mut model,
                 &load,
@@ -514,6 +532,9 @@ impl HitboxRenderState {
             parts.anim.iter().chain(std::iter::once(&root)),
             parts.folder.find_skel(),
             parts.folder.find_matl(),
+            None,
+            None,
+            None,
             parts.folder.find_hlpb(),
             shared_data,
             0.0,
@@ -595,7 +616,13 @@ impl HitboxRenderState {
         for (index, object) in objects.iter().enumerate() {
             if self.object_dirs.get(index) != Some(&object.model_dir) {
                 let folder = ModelFolder::load_folder(&object.model_dir);
-                let model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+                let model = RenderModel::from_folder(
+                    device,
+                    queue,
+                    &folder,
+                    &self.shared_data,
+                    &self.render_settings,
+                );
                 if index < self.object_dirs.len() {
                     self.render_models[index + 1] = model;
                     self.object_dirs[index] = object.model_dir.clone();
@@ -616,6 +643,9 @@ impl HitboxRenderState {
                 queue,
                 layers.iter().copied(),
                 Some(&object.skel),
+                None,
+                None,
+                None,
                 None,
                 None,
                 &self.shared_data,
@@ -727,7 +757,7 @@ pub fn compute_bone_world_matrices(
         );
         // Log bone 0's bind-pose translation
         if let Some(b0) = skel.bones.first() {
-            let m = glam::Mat4::from_cols_array_2d(&b0.transform);
+            let m = b0.transform;
             eprintln!(
                 "[BONE] bone[0] '{}' bind_trans={:?}",
                 b0.name,
@@ -747,7 +777,7 @@ pub fn compute_bone_world_matrices(
         .bones
         .iter()
         .map(|b| {
-            let m = glam::Mat4::from_cols_array_2d(&b.transform);
+            let m = b.transform;
             let (scale, rotation, translation) = m.to_scale_rotation_translation();
             BoneState {
                 translation,
@@ -849,7 +879,7 @@ pub fn compute_bone_world_matrices(
             let Ok(bind_world) = weapon_skel.calculate_world_transform(bone) else {
                 continue;
             };
-            let bind_mat = glam::Mat4::from_cols_array_2d(&bind_world);
+            let bind_mat = bind_world;
             let final_mat = attach_world * bind_mat;
             // Only insert if this bone name isn't already in the body skeleton —
             // body skeleton bones always take priority over weapon skeleton bones.
@@ -1073,7 +1103,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let default_anim_changed = self.default_anim_path != state.last_default_anim_path;
             let skel_changed = self.skel_path != state.last_skel_path;
 
-            state.resize(device, w, h);
+            state.resize(device, queue, w, h);
             state.update_camera(queue, self.width, self.height);
             state.wgpu_device = Some(device.clone());
             state.wgpu_queue = Some(queue.clone());

@@ -2436,6 +2436,8 @@ fn projectile_inputs(fighter: &str) -> Vec<NativeInput> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn projectile_picker_defaults_are_typed_and_keep_the_projectile_action() {
@@ -2523,7 +2525,7 @@ mod tests {
         .unwrap()
         .clone();
         let context = egui::Context::default();
-        let output = context.run_ui(Default::default(), |ui| {
+        let output = context.run_test_ui(Default::default(), |ui| {
             live_values_ui(ui, &values, Some(&graph), None);
         });
         let mut displayed = String::new();

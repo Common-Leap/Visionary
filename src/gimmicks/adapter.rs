@@ -510,9 +510,11 @@ fn contract_error(reason: &str) -> AdapterError {
 /// merely mentions the package name or `smash_script` revision must not grant
 /// write access to either managed source slot.
 fn verify_plugin_manifest(cargo_text: &str) -> Result<(), AdapterError> {
-    let manifest: toml::Value = cargo_text
-        .parse()
-        .map_err(|error| contract_error(&format!("Cargo.toml is not valid TOML: {error}")))?;
+    let manifest = toml::Value::Table(
+        cargo_text
+            .parse::<toml::Table>()
+            .map_err(|error| contract_error(&format!("Cargo.toml is not valid TOML: {error}")))?,
+    );
     let package_name = manifest
         .get("package")
         .and_then(toml::Value::as_table)

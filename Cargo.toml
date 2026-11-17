@@ -1,6 +1,6 @@
 [package]
 name = "visionary"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "A desktop editor for Super Smash Bros. Ultimate fighter data"
 
@@ -10,26 +10,28 @@ path = "src/main.rs"
 
 [dependencies]
 # GUI + rendering
-eframe = { version = "0.34.3", default-features = false, features = ["wgpu"] }
-egui = { version = "0.34.3" }
-egui-wgpu = "0.34.3"
-egui_extras = { version = "0.34.3", features = ["all_loaders"] }
-wgpu = "29.0.0"
-glam = "0.28.0"
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu"] }
+egui = { version = "0.37.0" }
+egui-wgpu = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["all_loaders"] }
+wgpu = "30.0.2"
+glam = "0.34.3"
 
 # SSBU file formats
-# Character rendering; effect rendering is performed live in game by slight_replica.
+# Character rendering.
 # Pin a known-compatible commit from the canonical upstream main branch.
-ssbh_wgpu = { git = "https://github.com/ScanMountGoat/ssbh_wgpu.git", rev = "f7bfb4b3bb3affcd361f80b1f63f6789ee2cc9e5" }
-ssbh_data = { version = "0.19.0", features = ["serde"] }
+ssbh_wgpu = { git = "https://github.com/ScanMountGoat/ssbh_wgpu.git", rev = "9401d2ab23bd0b6c3eaea7ac41657fba3e4610ee" }
+# The same ssbh_data ssbh_wgpu builds against, so their types are one and the same.
+ssbh_data = { git = "https://github.com/ultimate-research/ssbh_lib", rev = "c1149c2", features = ["serde"] }
 prc = { package = "prc-rs", version = "1.6" }
 motion_lib = { package = "motion_list_rs", version = "1.5" }
-nutexb = { version = "0.7", features = ["ddsfile"] }
+# The same nutexb ssbh_wgpu builds against.
+nutexb = { git = "https://github.com/jam1garner/nutexb", rev = "7db7c08", features = ["ddsfile"] }
 hash40 = "1.3"
 # `.eff` parsing, editing, and export. 1.1.4 also preserves NONE child offsets for empty
 # emitter sets, while retaining the BFRES and BNSH relocation-table fixes.
 effect_library = "1.1.4"
-vfx_runtime = { path = "../vfx-runtime" }
+eff_wgpu = { path = "../eff_wgpu" }
 # BNTX encode/decode, for importing your own PNG over an effect texture. Not published on
 # crates.io, so pin the upstream commit. `image_dds` does the BCn compression and must stay
 # on the same 0.7 line bntx builds against or the `Surface` types will not unify.
@@ -40,24 +42,24 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Async + HTTP (for ACMD fetch)
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.13", features = ["blocking", "json"] }
 
 # Utilities
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 anyhow = "1"
-rfd = "0.15"
-dirs = "5"
+rfd = "0.18"
+dirs = "7"
 tempfile = "3"
 fs2 = "0.4"
 # Parse the caller-selected plugin manifest structurally. A substring check can
 # be satisfied by a comment and is not sufficient for the generated ACMD ABI.
-toml = "0.8"
+toml = "1"
 # Parses the Rust that Visionary generates, so an export that would not compile is caught
 # before it reaches disk rather than by the user's toolchain. Already in the dependency graph
 # for the host, so this only pulls in the `full` item grammar.
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 # Not used directly — `syn` reports where a parse failed only when proc-macro2 is built with
 # span locations, and "line 41, column 8" is the whole value of that report.
 proc-macro2 = { version = "1", features = ["span-locations"] }
@@ -65,20 +67,20 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # folders, and asking a user to extract by hand is the step where the wrong nesting level ends
 # up as the mod root. Deflate and bzip2 cover what real .zip mods use; the default feature set
 # additionally pulls in encryption and several codecs no mod archive contains.
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "bzip2"] }
+zip = { version = "9.6.1", default-features = false, features = ["deflate", "bzip2"] }
 # The other half of that: GameBanana serves .7z at least as often as .zip.
-sevenz-rust2 = "0.22.2"
+sevenz-rust2 = "0.25.0"
 
 # These native window systems only exist on Linux. Keeping them out of the common eframe
 # declaration prevents Windows builds from inheriting host features they cannot use.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.34.3", default-features = false, features = ["wayland", "x11", "wgpu"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wayland", "x11", "wgpu"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 
 [build-dependencies]
-winresource = "0.1.31"
+winresource = "0.1.34"
 
 [package.metadata.winresource]
 OriginalFilename = "visionary.exe"

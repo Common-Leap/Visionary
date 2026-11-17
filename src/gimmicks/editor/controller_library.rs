@@ -168,6 +168,8 @@ fn suggested_id(source: &str, charts: Option<&BTreeMap<String, ControllerChart>>
 mod tests {
     use super::*;
     use crate::gimmicks::{behavior::BehaviorGraph, templates::Preset};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn asset() -> ControllerAsset {
         ControllerAsset::capture(
@@ -190,7 +192,7 @@ mod tests {
         let charts = original.clone();
         library.stage(asset(), Some(&charts));
         assert_eq!(library.target_id, "timer_1");
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
             library.ui(ui, "mario", "timer", Some(&charts));
             assert!(library.preview(ui).is_none());
         });

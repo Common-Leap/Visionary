@@ -233,9 +233,9 @@ pub fn root_anim(transform: glam::Mat4) -> ssbh_data::anim_data::AnimData {
                     compensate_scale: false,
                     transform_flags: TransformFlags::default(),
                     values: TrackValues::Transform(vec![Transform {
-                        scale: scale.to_array().into(),
-                        rotation: rotation.to_array().into(),
-                        translation: translation.to_array().into(),
+                        scale,
+                        rotation,
+                        translation,
                     }]),
                 }],
             }],
@@ -305,7 +305,7 @@ pub fn turn_to_preview(folder: &mut ssbh_wgpu::ModelFolder) {
             0,
             ssbh_data::skel_data::BoneData {
                 name: ROOT_BONE.to_owned(),
-                transform: turn.to_cols_array_2d(),
+                transform: turn,
                 parent_index: None,
                 billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
             },

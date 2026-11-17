@@ -16,7 +16,7 @@ use egui::{Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use super::flow::FlowPort;
 use super::model::{MoveGraph, MoveNode, NodeKind, Track};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OutputPort {
     Flow(FlowPort),
     Event,
@@ -661,7 +661,7 @@ impl CanvasState {
             }
             let response = ui.interact(
                 rect.shrink2(Vec2::new(12.0, 0.0) * self.zoom),
-                ui.id().with((&block.key, "card")),
+                ui.scope_id().with((&block.key, "card")),
                 Sense::click_and_drag(),
             );
             let internal = block.internal;
@@ -843,7 +843,7 @@ impl CanvasState {
                 let port = Rect::from_center_size(point, Vec2::splat(hit_size));
                 let response = ui.interact(
                     port,
-                    ui.id().with((&block.key, output, flow_port)),
+                    ui.scope_id().with((&block.key, output, flow_port)),
                     Sense::drag(),
                 );
                 let color = if flow_port.is_value() {
@@ -2021,6 +2021,8 @@ pub fn prune_positions(graph: &mut MoveGraph) {
 mod tests {
     use crate::move_nodes::test_support as fixture;
     use crate::move_nodes::test_support::assert_json_eq;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn removed_card_selection_and_pending_center_are_cleared_without_program_edits() {
@@ -2133,7 +2135,7 @@ mod tests {
         graph: &mut MoveGraph,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        ctx.run_ui(
+        ctx.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
                 events,
@@ -2380,6 +2382,8 @@ mod tests {
 mod story_wording_tests {
     use super::*;
     use crate::move_nodes::model::Track;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     /// Writes every vanilla move's outline to VISIONARY_STORY_OUT, one line per block.
     #[test]

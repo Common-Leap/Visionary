@@ -254,6 +254,8 @@ fn effect_calls_in_source_order(
 #[cfg(test)]
 mod source_sync_status_tests {
     use super::{effect_calls_in_source_order, source_sync_status};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn source_sync_status_distinguishes_written_and_refused_edits() {
@@ -413,6 +415,8 @@ mod source_sync_status_tests {
 mod linked_acmd_index_tests {
     use super::rebuild_linked_acmd_source_index;
     use crate::acmd_src::SourceIndex;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn successful_empty_rescan_replaces_old_index_but_failed_rescan_keeps_it() {
@@ -548,6 +552,8 @@ fn viewport_pick_position(response: &egui::Response) -> Option<egui::Pos2> {
 #[cfg(test)]
 mod viewport_pick_tests {
     use super::viewport_pick_position;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn frame(
         ctx: &egui::Context,
@@ -557,7 +563,7 @@ mod viewport_pick_tests {
         let mut picked = None;
         let mut button = egui::Rect::NOTHING;
         let mut dialog_clicked = false;
-        let _ = ctx.run_ui(
+        let _ = ctx.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -579,7 +585,7 @@ mod viewport_pick_tests {
                             dialog_clicked = response.clicked();
                         });
                 }
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let response = ui.allocate_rect(
                         ui.available_rect_before_wrap(),
                         egui::Sense::click_and_drag(),
@@ -809,6 +815,8 @@ impl TimelineCategory {
 #[cfg(test)]
 mod editor_section_copy_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn primary_editor_and_timeline_use_the_same_category_names() {
@@ -861,6 +869,8 @@ mod editor_section_copy_tests {
 #[cfg(test)]
 mod picker_state_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn effect_source_labels_use_translated_and_qualified_names() {
@@ -983,7 +993,7 @@ mod picker_state_tests {
         egui::__run_test_ui(|ui| {
             let response = egui::Panel::left("fixed_panel_geometry_test")
                 .exact_size(72.0)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     show_fixed_panel_contents(ui, "fixed_panel_geometry_contents", |ui| {
                         ui.allocate_space(egui::vec2(400.0, 20.0));
                     });
@@ -1003,7 +1013,7 @@ mod picker_state_tests {
                 .default_size(72.0)
                 .min_size(72.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     show_fixed_panel_contents(ui, "toolbar_panel_contents", |ui| {
                         ui.horizontal(|ui| {
                             for label in [
@@ -1667,6 +1677,8 @@ where
 #[cfg(test)]
 mod bone_option_tests {
     use super::acmd_bone_options;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn acmd_bone_options_include_synthetic_top_and_lowercase_skeleton_names() {
@@ -1804,14 +1816,18 @@ fn effect_source_label(source_dir: &str) -> String {
 
 /// Read the persisted open state of a collapsing header using the same parent-aware ID that the
 /// `CollapsingHeader` widget will use when it is rendered.
-fn persistent_collapsing_open(ui: &Ui, salt: impl Hash, default_open: bool) -> bool {
-    let id = egui::Id::new(("tracked_open", salt));
+fn persistent_collapsing_open(
+    ui: &Ui,
+    salt: impl Hash + std::fmt::Debug,
+    default_open: bool,
+) -> bool {
+    let id = egui::Id::unique(("tracked_open", salt));
     ui.data(|d| d.get_temp(id)).unwrap_or(default_open)
 }
 
 /// Set a [`tracked_header`]'s open state for the next time it is drawn.
-fn set_persistent_collapsing_open(ui: &Ui, salt: impl Hash, open: bool) {
-    let id = egui::Id::new(("tracked_open", salt));
+fn set_persistent_collapsing_open(ui: &Ui, salt: impl Hash + std::fmt::Debug, open: bool) {
+    let id = egui::Id::unique(("tracked_open", salt));
     if ui.data(|d| d.get_temp::<bool>(id)) != Some(open) {
         ui.data_mut(|d| d.insert_temp(id, open));
         ui.ctx().request_repaint();
@@ -1822,7 +1838,7 @@ fn set_persistent_collapsing_open(ui: &Ui, salt: impl Hash, open: bool) {
 /// egui keys its own state by the header's nested layout, which code elsewhere cannot rebuild.
 fn tracked_header<R>(
     ui: &mut Ui,
-    salt: impl Hash + Copy,
+    salt: impl Hash + std::fmt::Debug + Copy,
     header: egui::CollapsingHeader,
     default_open: bool,
     body: impl FnOnce(&mut Ui) -> R,
@@ -1846,7 +1862,11 @@ fn adaptive_scroll_height(available_height: f32, fraction: f32, minimum: f32, ma
 
 /// Render side-panel contents in the panel's current rectangle without allowing overflowing
 /// children to become part of the panel frame's measured minimum size.
-fn show_fixed_panel_contents(ui: &mut Ui, id_salt: impl Hash, add_contents: impl FnOnce(&mut Ui)) {
+fn show_fixed_panel_contents(
+    ui: &mut Ui,
+    id_salt: impl Hash + std::fmt::Debug,
+    add_contents: impl FnOnce(&mut Ui),
+) {
     let panel_rect = ui.available_rect_before_wrap();
     ui.set_min_size(panel_rect.size());
     let mut content_ui = ui.new_child(
@@ -1992,41 +2012,25 @@ fn angle_picker(ui: &mut egui::Ui, angle: &mut i32) {
     // can silently write it back on subsequent frames, corrupting the angle.
     ui.horizontal(|ui| {
         ui.label("Angle:");
-        let popup_id = ui.make_persistent_id("angle_popup");
         let btn = ui.button(format!("▾ {special_label}"));
-        if btn.clicked() {
-            #[allow(deprecated)]
-            {
-                ui.memory_mut(|m| {
-                    m.toggle_popup(popup_id);
-                });
-            }
-        }
-        #[allow(deprecated)]
-        egui::popup_below_widget(
-            ui,
-            popup_id,
-            &btn,
-            egui::PopupCloseBehavior::CloseOnClickOutside,
-            |ui| {
+        egui::Popup::from_toggle_button_response(&btn)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
                 ui.set_min_width(160.0);
                 if ui
                     .selectable_label(special_label == "Custom", "Custom (0°)")
                     .clicked()
                 {
                     *angle = 0;
-                    ui.memory_mut(|m| {
-                        m.close_popup(popup_id);
-                    });
+                    ui.close();
                 }
                 for &(name, val) in SPECIAL_ANGLES {
                     if ui.selectable_label(*angle == val, name).clicked() {
                         *angle = val;
-                        ui.memory_mut(|m| m.close_popup(popup_id));
+                        ui.close();
                     }
                 }
-            },
-        );
+            });
         ui.add(egui::DragValue::new(angle).range(0..=368).suffix("°"));
     });
 
@@ -3172,6 +3176,8 @@ fn source_preview_budget_error(
 #[cfg(test)]
 mod source_editor_discovery_tests {
     use super::{editor_source_is_excluded, source_preview_budget_error};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn playable_components_keep_their_exact_source_identities() {
@@ -9289,24 +9295,24 @@ impl VisionaryApp {
         if selected.is_some() {
             ui.ctx().request_repaint();
         }
-        egui::Panel::top("effects_page_top").show_inside(ui, |ui| {
+        egui::Panel::top("effects_page_top").show(ui, |ui| {
             self.eff_editor.page_top(ui, &self.game_link);
         });
         egui::Panel::left("effects_page_left")
             .default_size(260.0)
             .min_size(160.0)
             .resizable(true)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 self.eff_editor.page_left(ui, &self.game_link);
             });
         egui::Panel::right("effects_page_right")
             .default_size(460.0)
             .min_size(280.0)
             .resizable(true)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 self.eff_editor.page_right(ui, &self.game_link);
             });
-        egui::CentralPanel::default().show_inside(ui, |ui| self.draw_viewport(ui, frame));
+        egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
     }
 
     /// The effect files a move can draw from: the fighter's own, then the shared one.
@@ -9548,7 +9554,7 @@ impl VisionaryApp {
     /// The Effects page's switch between the selected effect alone and a move that plays it,
     /// over the top of the view.
     fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
-        egui::Area::new(egui::Id::new("effect_view_switch"))
+        egui::Area::new(egui::Id::unique("effect_view_switch"))
             .fixed_pos(rect.center_top() + egui::vec2(-110.0, 8.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -9603,7 +9609,7 @@ impl VisionaryApp {
             .map(crate::preview_stage::label)
             .unwrap_or_else(|| "No stage".to_owned());
         let before = self.preview_stage.clone();
-        egui::Area::new(egui::Id::new("preview_stage_picker"))
+        egui::Area::new(egui::Id::unique("preview_stage_picker"))
             .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
@@ -10564,11 +10570,11 @@ impl VisionaryApp {
                 .default_size(340.0)
                 .min_size(160.0)
                 .resizable(true)
-                .show_inside(ui, |ui| self.draw_viewport(ui, frame));
+                .show(ui, |ui| self.draw_viewport(ui, frame));
         }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| self.draw_move_nodes(ui));
+            .show(ui, |ui| self.draw_move_nodes(ui));
     }
 
     fn draw_live_trigger_values(&self, ui: &mut Ui) {
@@ -27142,7 +27148,7 @@ impl VisionaryApp {
                 .with_min_inner_size([380.0, 320.0]),
             |ui, class| {
                 // Draw inside a CentralPanel so the viewport gets the normal panel background.
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                 if fighter_names.is_empty() {
                     ui.colored_label(egui::Color32::GRAY, "Load a game data root first.");
                     return;
@@ -31971,7 +31977,7 @@ impl eframe::App for VisionaryApp {
 
         // Top menu bar: File / Windows / Project + status
         let t_menu = self.perf.start();
-        egui::Panel::top("menu").show_inside(ui, |ui| {
+        egui::Panel::top("menu").show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Menus contain persistent controls such as the project-name field. The default
                 // menu policy closes on every click, which steals focus from text edits before
@@ -32232,7 +32238,7 @@ impl eframe::App for VisionaryApp {
             .min_size(24.0)
             .max_size(24.0)
             .resizable(false)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(&self.state.status)
@@ -32315,7 +32321,7 @@ impl eframe::App for VisionaryApp {
                 .min_size(72.0)
                 .max_size(max_scrubber_height)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     ui.add_space(4.0);
                     self.draw_scrubber(ui);
                 });
@@ -32937,9 +32943,9 @@ impl eframe::App for VisionaryApp {
         }
 
         if self.roster.open {
-            egui::CentralPanel::default().show_inside(ui, |ui| self.roster.page(ui));
+            egui::CentralPanel::default().show(ui, |ui| self.roster.page(ui));
         } else if self.node_workspace {
-            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_node_workspace(ui, frame));
+            egui::CentralPanel::default().show(ui, |ui| self.draw_node_workspace(ui, frame));
             self.commit_current_edits();
         } else if self.eff_editor.open {
             self.draw_effects_page(ui, frame);
@@ -32950,7 +32956,7 @@ impl eframe::App for VisionaryApp {
                 .default_size(240.0)
                 .min_size(72.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     // Panel frames measure the Ui passed directly to them. Keep overflowing labels
                     // and scroll contents in an unallocated child so their intrinsic width cannot
                     // enlarge the frame after the user drags the sidebar narrower.
@@ -32966,7 +32972,7 @@ impl eframe::App for VisionaryApp {
                 .default_size(400.0)
                 .min_size(72.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     // The toolbar above the editor is intentionally a single horizontal row.
                     // Keep its overflowing buttons inside an unallocated child so the row can be
                     // clipped at a compact sidebar width instead of enlarging the Panel frame.
@@ -32983,7 +32989,7 @@ impl eframe::App for VisionaryApp {
 
             // Central viewport
             let t_central = self.perf.start();
-            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_viewport(ui, frame));
+            egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
             self.perf.end("central_viewport", t_central);
         }
 
@@ -33082,6 +33088,8 @@ fn animation_final_frame(path: &std::path::Path) -> Option<f32> {
 
 #[cfg(test)]
 mod animation_header_tests {
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     #[test]
     fn the_header_gives_the_same_final_frame_as_a_full_parse() {
         let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
@@ -33347,6 +33355,8 @@ fn draw_projected_capsule(
 #[cfg(test)]
 mod hurtbox_viewport_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn parameter_endpoints_use_complete_bone_transform() {
@@ -33494,6 +33504,8 @@ fn find_default_eyelid_nuanmb(motion_dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod default_eyelid_tests {
     use super::find_default_eyelid_nuanmb;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn default_eyelid_lookup_uses_the_selected_slot_and_ignores_case() {
@@ -33638,6 +33650,8 @@ fn move_node_live_value(value: &serde_json::Value, timer: bool) -> String {
 #[cfg(test)]
 mod move_node_live_value_tests {
     use super::move_node_live_value;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn live_values_hide_wire_encoding_and_explain_timer_units() {
@@ -36091,6 +36105,8 @@ fn save_recent_effs(list: &[PathBuf]) {
 #[cfg(test)]
 mod editor_timeline_filter_tests {
     use super::{timeline_frame_at_fraction, TimelineCategory, TimelineFilters, FIRST_GAME_FRAME};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn filters_start_with_every_editor_category_visible() {
@@ -36126,6 +36142,8 @@ mod editor_timeline_filter_tests {
 #[cfg(test)]
 mod carrier_send_state_tests {
     use super::carrier_send_reached_goal;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn populated_snapshot_requires_its_new_live_object() {
@@ -36150,6 +36168,8 @@ mod carrier_send_state_tests {
 #[cfg(test)]
 mod motion_animation_tests {
     use super::{find_motion_nuanmb, index_fighter_nuanmb};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     use std::fs::File;
     use std::path::Path;
 
@@ -36223,6 +36243,8 @@ mod motion_animation_tests {
 #[cfg(test)]
 mod fighter_forget_key_tests {
     use super::{fighter_key_matches, path_is_fighter_eff};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     use std::path::Path;
 
     #[test]
@@ -36253,6 +36275,8 @@ mod fighter_forget_key_tests {
 #[cfg(test)]
 mod window_geometry_tests {
     use super::{WindowGeometry, MIN_VISIBLE_PX, MIN_WINDOW_SIZE};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn g(x: f32, y: f32, w: f32, h: f32) -> WindowGeometry {
         WindowGeometry { x, y, w, h }
@@ -36370,6 +36394,8 @@ mod window_geometry_tests {
 mod carrier_op_selection_tests {
     use super::{carrier_stored_name, rides_the_carrier};
     use crate::mod_project::TransplantOp;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn op(donor_rel: &str, donor_name: &str, new_name: &str) -> TransplantOp {
         TransplantOp {
@@ -36479,6 +36505,8 @@ mod carrier_op_selection_tests {
 mod live_effect_capture_tests {
     use super::*;
     use crate::game_link::{CaptureLine, LuaArgWire as A};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn spawn(func: &str, frame: f32, effect: u64) -> CaptureLine {
         let flip = effect_capture_layout(func).unwrap().0;
@@ -44089,7 +44117,7 @@ mod live_effect_capture_tests {
             ..Default::default()
         };
         let mut measured = None;
-        let _ = context.run_ui(input, |ui| {
+        let _ = context.run_test_ui(input, |ui| {
             let output = timeline_scroll_area(120.0).show(ui, |ui| {
                 ui.allocate_exact_size(
                     egui::vec2(
@@ -44484,7 +44512,7 @@ mod live_effect_capture_tests {
             ..Default::default()
         };
         let mut measured = None;
-        let _ = context.run_ui(input, |ui| {
+        let _ = context.run_test_ui(input, |ui| {
             let output = hitbox_menu_scroll_area(360.0).show(ui, |ui| {
                 ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 900.0),
@@ -44564,6 +44592,8 @@ mod live_effect_capture_tests {
 #[cfg(test)]
 mod capture_branch_warning_tests {
     use super::live_capture_branch_warning;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn one_path_capture_warns_about_cached_runtime_arms() {
@@ -44603,6 +44633,8 @@ unsafe extern "C" fn effect_x(agent: &mut L2CAgentBase) {
 #[cfg(test)]
 mod export_warning_channel_tests {
     use super::{export_build_done_message, export_warning_section};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn warnings() -> Vec<String> {
         vec![
@@ -44661,6 +44693,8 @@ mod blocked_export_writes_nothing_tests {
     use super::*;
     use crate::data::{AcmdScript, AcmdStmt, EditRecord};
     use crate::mod_project::{EffMod, FighterMod, ModProjectFile};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     /// Same env var, same skip message, as every other test in this crate that needs real
     /// effect data.
@@ -44998,6 +45032,8 @@ mod blocked_export_writes_nothing_tests {
 mod effect_control_rule_tests {
     use super::VisionaryApp;
     use crate::data::EffectControl;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn native_work_effect_sources_require_the_structured_editor_even_when_preserved() {
@@ -45309,6 +45345,8 @@ mod effect_control_rule_tests {
 mod hitbox_selection_visual_tests {
     use super::{hitbox_display_color, hitbox_is_selected, hitbox_viewport_style};
     use crate::data::Hitbox;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn selection_identity_is_index_scoped() {
@@ -45340,6 +45378,8 @@ mod hitbox_selection_visual_tests {
 #[cfg(test)]
 mod effect_flip_axis_tests {
     use super::effect_flip_axis_live_value;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn measured_flip_axis_tokens_resolve_only_to_known_native_values() {
@@ -45354,6 +45394,8 @@ mod effect_flip_axis_tests {
 mod game_script_save_tests {
     use super::*;
     use crate::data::{AcmdScript, AcmdStmt, ExcuteStmt, Hitbox};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn source() -> AcmdScript {
         AcmdScript {
@@ -45444,6 +45486,8 @@ mod game_script_save_tests {
 #[cfg(test)]
 mod live_motion_hash_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn unnamed_motion_uses_its_motion_list_hash_for_live_capture() {
@@ -45479,6 +45523,8 @@ mod live_motion_hash_tests {
 #[cfg(test)]
 mod donor_capture_tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn capture(func: &str) -> crate::game_link::CaptureLine {
         crate::game_link::CaptureLine {
@@ -45657,12 +45703,14 @@ fn hitbox_menu_scroll_area(viewport_height: f32) -> egui::ScrollArea {
 
 #[cfg(test)]
 mod collapsing_id_tests {
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     #[test]
     fn a_header_opened_by_salt_draws_open() {
         let ctx = egui::Context::default();
         let mut opened = false;
         for _ in 0..3 {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = ctx.run_test_ui(Default::default(), |ui| {
                 egui::ScrollArea::both().id_salt("moves").show(ui, |ui| {
                     super::set_persistent_collapsing_open(ui, ("movecat", 3u8), true);
                     let header = egui::CollapsingHeader::new("Jabs").id_salt(("movecat", 3u8));
@@ -45681,6 +45729,8 @@ mod collapsing_id_tests {
 #[cfg(test)]
 mod spawn_random_range_tests {
     use super::spawn_with_random_ranges;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn call(extra: Option<&[&str]>) -> crate::data::EffectCall {
         crate::data::EffectCall {
@@ -45753,6 +45803,8 @@ mod spawn_random_range_tests {
 
 #[cfg(test)]
 mod effect_rotation_tests {
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     #[test]
     fn mario_forward_air_arc_turns_as_in_game() {
         // sys_attack_arc_b from Mario's forward air: rotation (-3, -11, -113), scale 1.1, and
@@ -45809,6 +45861,8 @@ mod effect_rotation_tests {
 
 #[cfg(test)]
 mod placement_offset_tests {
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     fn call(line: &str) -> crate::data::EffectCall {
         let src = format!(
             "unsafe extern \"C\" fn effect_x(agent: &mut L2CAgentBase) {{\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}"

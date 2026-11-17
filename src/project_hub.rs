@@ -1954,12 +1954,7 @@ mod tests {
             minor_version: 0,
             bones: vec![BoneData {
                 name: "root".into(),
-                transform: [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0, 0.0],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
+                transform: glam::Mat4::IDENTITY,
                 parent_index: None,
                 billboard_type: BillboardType::Disabled,
             }],
@@ -2604,12 +2599,7 @@ mod tests {
                     .iter()
                     .map(|name| BoneData {
                         name: (*name).into(),
-                        transform: [
-                            [1.0, 0.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0],
-                        ],
+                        transform: glam::Mat4::IDENTITY,
                         parent_index: None,
                         billboard_type: BillboardType::Disabled,
                     })

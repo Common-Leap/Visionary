@@ -248,6 +248,8 @@ pub(super) fn selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     #[test]
     fn missing_chart_receiver_inspector_preserves_saved_selection_when_idle() {
         let context = egui::Context::default();
@@ -257,7 +259,7 @@ mod tests {
         };
         let before = serde_json::to_value(&command).unwrap();
         for width in [280.0, 330.0] {
-            let _ = context.run_ui(
+            let _ = context.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -381,7 +383,7 @@ mod tests {
             let before = serde_json::to_value(&command).unwrap();
             for width in [280.0, 330.0] {
                 let context = egui::Context::default();
-                let output = context.run_ui(
+                let output = context.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,

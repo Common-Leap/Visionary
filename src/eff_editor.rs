@@ -2173,19 +2173,19 @@ impl EffEditor {
         // The texture of the part on the Look tab, and the game's view of the effect while one
         // is connected; with neither there is nothing to put there.
         if self.emitter_tab != EmitterTab::Attributes && link.status() != LinkStatus::Connected {
-            egui::CentralPanel::default().show_inside(ui, |ui| self.draw_emitter_editor(ui));
+            egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
             return;
         }
         egui::Panel::bottom("eff_game_panel_split")
             .resizable(true)
             .default_size(240.0)
             .min_size(60.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("eff_game_panel")
                     .show(ui, |ui| self.draw_game_panel(ui, link));
             });
-        egui::CentralPanel::default().show_inside(ui, |ui| self.draw_emitter_editor(ui));
+        egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
     }
 
     fn draw_header(&mut self, ui: &mut Ui, link: &GameLink) {
@@ -4385,6 +4385,8 @@ fn describe_form(
 mod tests {
     use super::*;
     use crate::effects::{EmitterSet, PtclFile};
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     /// A blank emitter at the version Smash's own files use, for the attribute vector.
     fn test_emitter_data() -> effect_library::EmitterData {
@@ -4859,7 +4861,11 @@ mod tests {
         let mut filter = String::new();
         egui::__run_test_ui(|ui| {
             draw_attribute_groups(ui, &mut em, &pr, &mut filter);
-            attr_rows(ui, "basics", &mut em, &pr, BASIC_ATTRS);
+            let basics: Vec<usize> = BASIC_ATTRS
+                .iter()
+                .filter_map(|id| crate::eff_attrs::index_of(id))
+                .collect();
+            attr_rows_by_index(ui, "basics", &mut em, &pr, &basics);
         });
 
         // A filter matching almost everything opens almost every group, so this pass actually

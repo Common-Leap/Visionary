@@ -919,7 +919,7 @@ fn focused_properties(ui: &mut Ui, floating: bool, add: impl FnOnce(&mut Ui)) ->
     let context = ui.ctx().clone();
     let mut open = true;
     egui::Window::new("Block properties")
-        .id(egui::Id::new("move_block_inspector"))
+        .id(egui::Id::unique("move_block_inspector"))
         .open(&mut open)
         .collapsible(false)
         .default_width(330.0)
@@ -1623,7 +1623,9 @@ pub(crate) fn native_source_options_ui(
         NativeKind::Int => "Integer",
         NativeKind::Flag => "Flag",
     };
-    let search_key = ui.id().with(("native_source_search", fighter, type_label));
+    let search_key = ui
+        .scope_id()
+        .with(("native_source_search", fighter, type_label));
     let mut query = ui.data_mut(|data| data.get_temp::<String>(search_key).unwrap_or_default());
     ui.add(
         egui::TextEdit::singleline(&mut query)
@@ -2523,9 +2525,9 @@ fn nodes_ui_body(
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
             )
             .ui(ui, |ui| {
-                let search_key = ui
-                    .id()
-                    .with(("nested_command_search", fighter, track as u8));
+                let search_key =
+                    ui.scope_id()
+                        .with(("nested_command_search", fighter, track as u8));
                 let mut search = ui
                     .data_mut(|data| data.get_temp::<String>(search_key))
                     .unwrap_or_default();
@@ -2761,7 +2763,7 @@ fn wind_command_ui(ui: &mut Ui, wind: &mut crate::data::WindboxData) {
 /// Keep each label and its value together when the inspector wraps to another row.
 fn number_field_ui(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     label: &str,
     value: &mut f32,
     speed: f64,
@@ -3980,7 +3982,7 @@ fn vector_target_label(preset: crate::data::AttackModuleVecTargetPosPreset) -> S
 
 fn vector_target_options_ui(ui: &mut Ui, preset: &mut crate::data::AttackModuleVecTargetPosPreset) {
     use crate::data::AttackModuleVecTargetPosPreset;
-    let search_id = ui.id().with("vector_target_search");
+    let search_id = ui.scope_id().with("vector_target_search");
     let mut query = ui.data_mut(|data| data.get_temp::<String>(search_id).unwrap_or_default());
     ui.add(
         egui::TextEdit::singleline(&mut query)
@@ -4055,7 +4057,7 @@ fn attack_reference_joint_ui(
     track: Track,
 ) {
     let choices = attack_reference_joint_choices(track);
-    let search_id = ui.id().with("attack_reference_joint_search");
+    let search_id = ui.scope_id().with("attack_reference_joint_search");
     let mut search = ui
         .data_mut(|data| data.get_temp::<String>(search_id))
         .unwrap_or_default();
@@ -4136,7 +4138,7 @@ fn article_motion_ui(
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show_ui(ui, |ui| {
                 let search_id =
-                    ui.id()
+                    ui.scope_id()
                         .with(("article_motion_search", symbol.as_str(), track as u8));
                 let mut search = ui
                     .data_mut(|data| data.get_temp::<String>(search_id))
@@ -5731,7 +5733,7 @@ pub(crate) fn screen_effect_preset_ui(ui: &mut Ui, preset_id: &mut String) -> bo
         .height(310.0)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
-            let search_id = ui.id().with("screen_effect_search");
+            let search_id = ui.scope_id().with("screen_effect_search");
             let mut search = ui.data_mut(|data| data.get_temp::<String>(search_id).unwrap_or_default());
             ui.add(egui::TextEdit::singleline(&mut search)
                 .hint_text("Search screens…").char_limit(128).desired_width(225.0));
@@ -6804,6 +6806,8 @@ fn native_branch_hint(ui: &mut Ui) {
 mod tests {
     use crate::move_nodes::test_support as fixture;
     use crate::move_nodes::test_support::assert_json_eq;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     use super::*;
 
@@ -6813,7 +6817,7 @@ mod tests {
         value: &mut Expr,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        context.run_ui(
+        context.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -6823,7 +6827,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let kind = expression_kind(value, &[]);
                     expression_block_ui(ui, fighter, value, &[], kind);
                 });
@@ -6944,7 +6948,7 @@ mod tests {
         guard: &mut Predicate,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        context.run_ui(
+        context.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -6955,7 +6959,7 @@ mod tests {
             },
             |ui| {
                 egui::CentralPanel::default()
-                    .show_inside(ui, |ui| guard_block_ui(ui, fighter, guard, &[]));
+                    .show(ui, |ui| guard_block_ui(ui, fighter, guard, &[]));
             },
         )
     }
@@ -7182,7 +7186,7 @@ mod tests {
                 let original = serde_json::to_value(&condition).unwrap();
                 let context = egui::Context::default();
                 for _ in 0..3 {
-                    let _ = context.run_ui(
+                    let _ = context.run_test_ui(
                         egui::RawInput {
                             screen_rect: Some(egui::Rect::from_min_size(
                                 egui::Pos2::ZERO,
@@ -7191,7 +7195,7 @@ mod tests {
                             ..Default::default()
                         },
                         |ui| {
-                            egui::CentralPanel::default().show_inside(ui, |ui| {
+                            egui::CentralPanel::default().show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     condition_picker(ui, fighter, Track::Game, &mut condition, &[])
                                 });
@@ -7239,7 +7243,7 @@ mod tests {
         let context = egui::Context::default();
         let mut condition = MoveCondition::Grounded;
         let render = |condition: &mut MoveCondition, events| {
-            context.run_ui(
+            context.run_test_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
@@ -7298,7 +7302,7 @@ mod tests {
         let context = egui::Context::default();
         let error = "bayonetta.tracks[0].nodes[1]#2: native choice FIGHTER_BAYONETTA_COSTUME_KIND_JEANNE does not match FIGHTER_INSTANCE_WORK_ID_INT_COLOR";
         let render = |events| {
-            context.run_ui(
+            context.run_test_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
@@ -7361,7 +7365,7 @@ mod tests {
             serde_json::to_value(&expression).unwrap(),
             serde_json::to_value(&guard).unwrap(),
         );
-        let _ = context.run_ui(Default::default(), |ui| {
+        let _ = context.run_test_ui(Default::default(), |ui| {
             expression_block_ui(ui, "mario", &mut expression, &[], VarType::Float);
             guard_block_ui(ui, "mario", &mut guard, &[]);
         });
@@ -7369,7 +7373,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&guard).unwrap(), before.1);
         let oversized = "x".repeat(1_048_576);
         assert!(bounded_event_label(&oversized).len() < 64);
-        let _ = context.run_ui(Default::default(), |ui| {
+        let _ = context.run_test_ui(Default::default(), |ui| {
             event_read_ui(ui, &oversized, &oversized)
         });
     }
@@ -7382,7 +7386,7 @@ mod tests {
         let context = egui::Context::default();
         let before = serde_json::to_value(&command).unwrap();
         for _ in 0..2 {
-            let _ = context.run_ui(Default::default(), |ui| {
+            let _ = context.run_test_ui(Default::default(), |ui| {
                 command_ui(ui, "mario", &mut command, CommandOptions::default())
             });
         }
@@ -7446,7 +7450,7 @@ mod tests {
         let base = BehaviorGraph::default();
         let mut position = None;
         for _ in 0..2 {
-            let output = context.run_ui(
+            let output = context.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -7475,7 +7479,7 @@ mod tests {
         let position = position.unwrap_or_else(|| panic!("button {label:?} not rendered"));
         let mut result = None;
         for pressed in [true, false] {
-            let _ = context.run_ui(
+            let _ = context.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -7531,7 +7535,7 @@ mod tests {
             view: &mut NodeEditor,
             events: Vec<egui::Event>,
         ) -> egui::FullOutput {
-            context.run_ui(
+            context.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -7778,7 +7782,7 @@ mod tests {
         let mut command = original;
         let before = serde_json::to_value(&command).unwrap();
         for _ in 0..3 {
-            let _ = context.run_ui(Default::default(), |ui| {
+            let _ = context.run_test_ui(Default::default(), |ui| {
                 effect_command_ui(ui, &mut command, &["top".into(), "haver".into()]);
             });
         }
@@ -7864,7 +7868,7 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, egui::Rect) {
         let mut bounds = egui::Rect::NOTHING;
-        let output = context.run_ui(
+        let output = context.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -7997,7 +8001,7 @@ mod tests {
         let choose = |token: &mut String, table, dereference, initial: &str, chosen: &str| {
             let context = egui::Context::default();
             let render = |token: &mut String, events| {
-                context.run_ui(
+                context.run_test_ui(
                     egui::RawInput {
                         events,
                         ..Default::default()
@@ -8082,7 +8086,7 @@ mod tests {
         call.no_finish_camera = false;
         let before = call.clone();
         let render = |call: &mut crate::data::AttackCall, events| {
-            context.run_ui(
+            context.run_test_ui(
                 egui::RawInput {
                     events,
                     ..Default::default()
@@ -8142,7 +8146,7 @@ mod tests {
             fighter: &str,
             events: Vec<egui::Event>,
         ) -> egui::FullOutput {
-            ctx.run_ui(
+            ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -8260,7 +8264,7 @@ mod tests {
         events: Vec<egui::Event>,
         render: &mut impl FnMut(&mut Ui),
     ) -> egui::FullOutput {
-        context.run_ui(
+        context.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8382,7 +8386,7 @@ mod tests {
         )];
         let before = serde_json::to_value(&view.draft).unwrap();
         for _ in 0..2 {
-            let output = context.run_ui(Default::default(), |ui| {
+            let output = context.run_test_ui(Default::default(), |ui| {
                 let mut next = 10;
                 nodes(
                     ui,
@@ -8495,7 +8499,7 @@ mod tests {
         view.draft.tracks = vec![super::super::effects::import_for_fighter("mario", &source)];
         let before = serde_json::to_value(&view.draft).unwrap();
         for _ in 0..2 {
-            let output = context.run_ui(Default::default(), |ui| {
+            let output = context.run_test_ui(Default::default(), |ui| {
                 let mut next = 10;
                 nodes(
                     ui,
@@ -8650,7 +8654,7 @@ mod tests {
                 )]),
             ],
         };
-        let _ = context.run_ui(
+        let _ = context.run_test_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -8748,7 +8752,7 @@ mod tests {
         view.canvas.selected = None;
         view.copy_selected_block("mario");
         assert!(view.block_clipboard.is_some());
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        let _ = context.run_test_ui(egui::RawInput::default(), |ui| {
             view.ui(
                 ui,
                 "cloud",
@@ -8931,7 +8935,7 @@ mod tests {
                 for track in [Track::Game, Track::Expression] {
                     let context = egui::Context::default();
                     for _ in 0..2 {
-                        let _ = context.run_ui(Default::default(), |ui| {
+                        let _ = context.run_test_ui(Default::default(), |ui| {
                             command_ui(
                                 ui,
                                 fighter,
@@ -8997,6 +9001,8 @@ mod tests {
 
 #[cfg(test)]
 mod palette_live_tests {
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
     /// Every block a user can add, for every fighter, reaches the running match.
     #[test]
     fn every_palette_block_updates_live() {

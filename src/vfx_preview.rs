@@ -1,4 +1,4 @@
-//! Effects in the 3D preview, drawn by `vfx_runtime` with the game's own shaders.
+//! Effects in the 3D preview, drawn by `eff_wgpu` with the game's own shaders.
 //!
 //! The app hands over which effect sets are out this frame (file, set name, placement and
 //! frame since spawn); this module keeps one renderer per effect file with its textures on the
@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
+use eff_wgpu::{bnsh, ptcl, render, sim, static_block, view_block};
 use glam::Mat4;
-use vfx_runtime::{bnsh, ptcl, render, sim, static_block, view_block};
 
 /// One effect set out this frame.
 #[derive(Clone, Debug)]
@@ -90,7 +90,7 @@ struct EffectFile {
     /// `None` for a texture that does not decode: its slot draws blank.
     textures: Mutex<HashMap<usize, Option<Arc<render::GpuTexture>>>>,
     samplers: HashMap<(u8, u8, u8, u32), wgpu::Sampler>,
-    meshes: HashMap<u64, vfx_runtime::mesh::Mesh>,
+    meshes: HashMap<u64, eff_wgpu::mesh::Mesh>,
 }
 
 type PipelineKey = (usize, render::RenderState, bool);
@@ -636,7 +636,7 @@ impl EffectFile {
         match job {
             Job::Pipeline((program, state, mesh)) => self.renderer.warm(program, state, mesh),
             Job::Texture(index) => {
-                let texture = vfx_runtime::texture::decode(&self.ptcl, index)
+                let texture = eff_wgpu::texture::decode(&self.ptcl, index)
                     .map(|t| Arc::new(render::upload_texture(device, queue, &t)));
                 self.textures
                     .lock()
@@ -747,7 +747,7 @@ fn load_file(
         texture_ids,
         textures: Mutex::new(textures),
         samplers: sampler_map,
-        meshes: vfx_runtime::mesh::meshes(ptcl_file),
+        meshes: eff_wgpu::mesh::meshes(ptcl_file),
         ptcl: ptcl_file.clone(),
     })
 }

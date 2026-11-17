@@ -623,7 +623,7 @@ impl NodeEditor {
                 })
                 .map_or(track, |source| source.track);
             let choices = catalog(fighter, track, &self.draft);
-            egui::Area::new(egui::Id::new("workspace_quick_add"))
+            egui::Area::new(egui::Id::unique("workspace_quick_add"))
                 .fixed_pos(position)
                 .constrain(true)
                 .order(egui::Order::Foreground)

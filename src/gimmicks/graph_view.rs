@@ -1914,12 +1914,14 @@ pub(crate) fn phase_predicate_text(value: &Predicate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     fn render(width: f32, mut draw: impl FnMut(&mut Ui)) {
         let context = egui::Context::default();
         context.memory_mut(|memory| memory.set_everything_is_visible(true));
         for _ in 0..2 {
-            let _ = context.run_ui(
+            let _ = context.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -2001,7 +2003,7 @@ mod tests {
             }
             let saved = graph.clone();
             let mut frame = |events: Vec<egui::Event>| {
-                let output = context.run_ui(
+                let output = context.run_test_ui(
                     egui::RawInput {
                         screen_rect: Some(egui::Rect::from_min_size(
                             egui::Pos2::ZERO,

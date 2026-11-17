@@ -299,6 +299,8 @@ impl GimmicksEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn controller_delete_refuses_exact_move_target_without_guessing_donor() {
@@ -419,7 +421,7 @@ mod tests {
         let link = GameLink::offline_for_test();
         for id in [MAIN, "timer_1", "charge_1", MAIN, "timer_1"] {
             editor.select_chart(id);
-            let _ = ctx.run_ui(
+            let _ = ctx.run_test_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,

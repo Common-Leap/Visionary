@@ -124,7 +124,7 @@ impl Checker {
                 }
             }
             syn::Item::Fn(item) => {
-                if item.sig.unsafety.is_some() {
+                if matches!(item.sig.safety, syn::Safety::Unsafe(_)) {
                     self.block("unsafe function");
                 }
                 if item.sig.abi.is_some() {

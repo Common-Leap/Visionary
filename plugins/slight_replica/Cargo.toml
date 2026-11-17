@@ -1,6 +1,6 @@
 [package]
 name = "slight_replica"
-version = "0.1.0"
+version = "0.3.0"
 authors = ["Visionary"]
 edition = "2021"
 description = "From-scratch Jorge SLight replica — lib_effect_viewer.nro"

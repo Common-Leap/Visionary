@@ -41,7 +41,7 @@ pub mod window;
 pub const GESTURE_AREA_SCROLL: egui::containers::scroll_area::ScrollSource =
     egui::containers::scroll_area::ScrollSource {
         scroll_bar: true,
-        drag: false,
+        drag: egui::containers::scroll_area::DragScroll::Never,
         mouse_wheel: true,
     };
 

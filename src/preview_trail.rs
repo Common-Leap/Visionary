@@ -189,11 +189,11 @@ impl PreviewTrails {
                 module: &module,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 20,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
-                }],
+                })],
             },
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -355,7 +355,11 @@ fn load_texture(
 ) -> Option<wgpu::TextureView> {
     use wgpu::util::DeviceExt;
     let nutexb = nutexb::NutexbFile::read_from_file(path).ok()?;
-    let image = image_dds::image_from_dds(&nutexb.to_dds().ok()?, 0).ok()?;
+    // nutexb and image_dds use different ddsfile releases; the file between them is the same.
+    let mut dds = Vec::new();
+    nutexb.to_dds().ok()?.write(&mut dds).ok()?;
+    let dds = image_dds::ddsfile::Dds::read(dds.as_slice()).ok()?;
+    let image = image_dds::image_from_dds(&dds, 0).ok()?;
     let texture = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -405,7 +409,10 @@ mod tests {
         };
         let path = Path::new(&root).join("effect/fighter/link/trail/tex_link_sword1.nutexb");
         let nutexb = nutexb::NutexbFile::read_from_file(&path).unwrap();
-        let image = image_dds::image_from_dds(&nutexb.to_dds().unwrap(), 0).unwrap();
+        let mut dds = Vec::new();
+        nutexb.to_dds().unwrap().write(&mut dds).unwrap();
+        let dds = image_dds::ddsfile::Dds::read(dds.as_slice()).unwrap();
+        let image = image_dds::image_from_dds(&dds, 0).unwrap();
         assert_eq!((image.width(), image.height()), (256, 256));
     }
 }

@@ -798,7 +798,7 @@ pub fn placement_layer(object: &PlacedObject) -> Option<AnimData> {
     )
     .get(&root.name)
     .copied()
-    .unwrap_or_else(|| glam::Mat4::from_cols_array_2d(&root.transform));
+    .unwrap_or(root.transform);
     let (scale, rotation, translation) = (object.placement * local).to_scale_rotation_translation();
     Some(AnimData {
         major_version: 2,
@@ -813,15 +813,9 @@ pub fn placement_layer(object: &PlacedObject) -> Option<AnimData> {
                     compensate_scale: false,
                     transform_flags: Default::default(),
                     values: TrackValues::Transform(vec![Transform {
-                        scale: ssbh_data::Vector3::new(scale.x, scale.y, scale.z),
-                        rotation: ssbh_data::Vector4::new(
-                            rotation.x, rotation.y, rotation.z, rotation.w,
-                        ),
-                        translation: ssbh_data::Vector3::new(
-                            translation.x,
-                            translation.y,
-                            translation.z,
-                        ),
+                        scale,
+                        rotation,
+                        translation,
                     }]),
                 }],
             }],
