@@ -478,6 +478,10 @@ pub struct EffEditor {
     effect_uses_ready: bool,
     /// How the view plays the selected effect.
     pub view: EffectView,
+    /// The part last picked in each effect, by effect name.
+    parts_picked: std::collections::HashMap<String, usize>,
+    /// The effect last open in each file, to open again when the file is.
+    entry_picked: std::collections::HashMap<PathBuf, String>,
     /// A move picked in the view's switch, for the app to open.
     pub open_move_request: Option<String>,
     /// The open move's motion name, to know whether it plays the selected effect.
@@ -600,6 +604,8 @@ impl Default for EffEditor {
             effect_uses: Default::default(),
             effect_uses_ready: false,
             view: EffectView::Alone,
+            parts_picked: Default::default(),
+            entry_picked: Default::default(),
             open_move_request: None,
             open_motion: None,
             entry_filter: String::new(),
@@ -1075,6 +1081,7 @@ impl EffEditor {
     }
 
     fn load_eff(&mut self, path: &Path) {
+        self.remember_picks();
         self.edit_rev += 1;
         self.load_error = None;
         self.ptcl = None;
@@ -1143,6 +1150,31 @@ impl EffEditor {
         self.texture_pool = loaded.texture_pool;
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
+        // Back on a file: the effect and part that were open in it are again.
+        if let Some(name) = self.entry_picked.get(path).cloned() {
+            if let Some(i) = self.entries.iter().position(|e| e.name == name) {
+                self.selected_entry = Some(i);
+                self.selected_emitter = self.parts_picked.get(&name).copied().unwrap_or(0);
+                self.scroll_to_selected = true;
+                self.view = if self.open_move_plays_selected() {
+                    EffectView::InMove
+                } else {
+                    EffectView::Alone
+                };
+            }
+        }
+    }
+
+    /// Note the open effect and part, to reopen them when this file or effect is.
+    fn remember_picks(&mut self) {
+        let Some(entry) = self.selected_entry.and_then(|e| self.entries.get(e)) else {
+            return;
+        };
+        self.parts_picked
+            .insert(entry.name.clone(), self.selected_emitter);
+        if let Some(path) = &self.loaded_path {
+            self.entry_picked.insert(path.clone(), entry.name.clone());
+        }
     }
 
     // ── Project integration ───────────────────────────────────────────────────
@@ -1169,6 +1201,36 @@ impl EffEditor {
     pub fn queue_edits(&mut self, edits: Vec<AuthoredEdit>) {
         self.pending_edits = Some(edits);
         self.pending_edits_push_live = true;
+    }
+
+    /// The file a queued load is about to open (relative to the export root) when nothing has
+    /// queued its edits yet. The app answers with [`Self::queue_carried_edits`], so a file
+    /// switched away from and back to opens with its edits instead of pristine.
+    pub fn load_needing_edits(&self) -> Option<String> {
+        if self.pending_edits.is_some() || self.pending_structure.is_some() {
+            return None;
+        }
+        let path = self.pending_load.as_ref()?;
+        let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    }
+
+    /// The project's edits for the file a queued load opens. Applied without sending anything
+    /// to the game: the game already has them.
+    pub fn queue_carried_edits(
+        &mut self,
+        authored: Vec<AuthoredEdit>,
+        rosters: Vec<crate::mod_project::EmitterRoster>,
+        entry_edits: Vec<crate::mod_project::EntryEdit>,
+    ) {
+        self.pending_edits = Some(authored);
+        self.pending_edits_push_live = false;
+        self.queue_structure_edits(rosters, entry_edits);
+    }
+
+    /// Whether a file is open and parsed, so its edits can be read from it.
+    pub fn has_loaded_effects(&self) -> bool {
+        self.ptcl.is_some()
     }
 
     /// Queue the project's emitter lists and spawn structures for the next load.
@@ -1771,7 +1833,7 @@ impl EffEditor {
             .collect();
         ui.horizontal(|ui| {
             if ui
-                .selectable_label(self.view == EffectView::Alone, "Alone")
+                .selectable_label(self.view == EffectView::Alone || !in_move, "Alone")
                 .on_hover_text("Play the effect by itself, over and over")
                 .clicked()
             {
@@ -2313,11 +2375,15 @@ impl EffEditor {
                 .width(260.0)
                 .height(420.0)
                 .show_ui(ui, |ui| {
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.file_filter)
                             .hint_text("Search, e.g. mario")
                             .desired_width(240.0),
                     );
+                    // Typing goes straight to the search when the list opens.
+                    if !search.has_focus() && !ui.memory(|m| m.focused().is_some()) {
+                        search.request_focus();
+                    }
                     let filter = self.file_filter.to_lowercase();
                     let files: Vec<PathBuf> = self
                         .eff_files
@@ -2337,7 +2403,10 @@ impl EffEditor {
                             .to_string();
                         let selected = self.loaded_path.as_deref() == Some(path.as_path());
                         if ui.selectable_label(selected, label).clicked() {
-                            self.load_eff(&path);
+                            // Queued, not loaded here, so the app first keeps the open file's
+                            // edits and hands this one its own.
+                            self.pending_load = Some(path.clone());
+                            self.file_filter.clear();
                             ui.close();
                         }
                     }
@@ -2411,7 +2480,7 @@ impl EffEditor {
                     egui::RichText::new(label)
                 };
                 let resp = ui.selectable_label(selected, text).on_hover_text(if broken {
-                    "EFF transplant merge output missing — check the status bar for the merge error, then transplant again"
+                    "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
                     format!("open {}'s eff with its edits applied", src.fighter)
@@ -2566,8 +2635,15 @@ impl EffEditor {
             });
         if let Some(i) = clicked {
             if self.selected_entry != Some(i) {
+                // Each effect keeps the part last picked in it for the session.
+                self.remember_picks();
                 self.selected_entry = Some(i);
-                self.selected_emitter = 0;
+                self.selected_emitter = self
+                    .entries
+                    .get(i)
+                    .and_then(|entry| self.parts_picked.get(&entry.name))
+                    .copied()
+                    .unwrap_or(0);
                 self.view = if self.open_move_plays_selected() {
                     EffectView::InMove
                 } else {
@@ -2637,6 +2713,31 @@ impl EffEditor {
                 self.use_in_move_requested = true;
             }
         });
+        // A borrowed effect says where it came from, and can be taken out again.
+        if let Some((fighter, item)) = self.current_transplant_for_entry(&entry_name) {
+            ui.horizontal_wrapped(|ui| {
+                let file = Path::new(&item.donor_file)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| item.donor_file.clone());
+                ui.label(
+                    egui::RichText::new(format!("Borrowed from {} in {file}", item.donor_name))
+                        .color(egui::Color32::from_rgb(190, 140, 255)),
+                );
+                if ui
+                    .small_button("Remove")
+                    .on_hover_text("Take this borrowed effect out of the project and the game")
+                    .clicked()
+                {
+                    self.pending_transplant_removals.push(EffTransplantRemoval {
+                        fighter,
+                        op_index: item.op_index,
+                        entry_name: item.entry_name,
+                        donor_name: item.donor_name,
+                    });
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.emitter_tab, EmitterTab::Attributes, "Look")
                 .on_hover_text("How the selected part looks and moves");
@@ -2723,8 +2824,10 @@ impl EffEditor {
         // The texture the selected emitter samples, handed to the import/export row that runs
         // after the emitter borrow ends.
         let mut texture_actions: Option<(usize, TextureInfo)> = None;
+        // Each part keeps its own place in the list: one scroll position for every effect left
+        // the next one opened halfway down, with its colours out of sight.
         egui::ScrollArea::vertical()
-            .id_salt("emitter_fields")
+            .id_salt(("emitter_fields", self.selected_entry, self.selected_emitter))
             .show(ui, |ui| {
                 // The handful of values that get changed on nearly every edit, kept at the top
                 // and out of the group tree. Each one is the SAME attribute the tree below
@@ -2853,19 +2956,25 @@ impl EffEditor {
                                     .changed();
                                 if let Some(o) = orig.get(i) {
                                     if (o.r, o.g, o.b) != (k.r, k.g, k.b) {
-                                        ui.label(
-                                            egui::RichText::new("was")
-                                                .small()
-                                                .color(egui::Color32::GRAY),
-                                        );
-                                        // A plain swatch: a disabled colour button is drawn
-                                        // dimmed, which showed white as grey.
-                                        egui::widgets::color_picker::show_color(
+                                        // The colour before the edit, as a narrow swatch: with
+                                        // a label beside it, the row outgrew the panel and
+                                        // widened it, squeezing the view. A plain swatch, as
+                                        // a disabled colour button is drawn dimmed.
+                                        let size = egui::vec2(10.0, ui.spacing().interact_size.y);
+                                        let before = egui::widgets::color_picker::show_color(
                                             ui,
                                             egui::Rgba::from_rgb(o.r, o.g, o.b),
-                                            ui.spacing().interact_size,
+                                            size,
                                         )
-                                        .on_hover_text(format!("{:.2} {:.2} {:.2}", o.r, o.g, o.b));
+                                        .interact(egui::Sense::click())
+                                        .on_hover_text(format!(
+                                            "Before your edit: {}. Click to put it back.",
+                                            crate::ui::colour_code([o.r, o.g, o.b])
+                                        ));
+                                        if before.clicked() {
+                                            (k.r, k.g, k.b) = (o.r, o.g, o.b);
+                                            changed = true;
+                                        }
                                     }
                                 }
                             });
@@ -2963,7 +3072,7 @@ impl EffEditor {
     ///             the model that comes with the whole thing
     fn draw_spawning_panel(&mut self, ui: &mut Ui, set_idx: usize, entry_name: &str) {
         egui::ScrollArea::vertical()
-            .id_salt("spawning_panel")
+            .id_salt(("spawning_panel", entry_name))
             .show(ui, |ui| {
                 self.draw_emitter_roster(ui, set_idx);
                 ui.add_space(10.0);
@@ -4155,7 +4264,7 @@ impl EffEditor {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(&entry_name).monospace());
             if transplant.is_some() {
-                ui.colored_label(egui::Color32::from_rgb(190, 140, 255), "EFF TRANSPLANT");
+                ui.colored_label(egui::Color32::from_rgb(190, 140, 255), "BORROWED");
             }
             match &kind {
                 Some(_) => ui.colored_label(egui::Color32::from_rgb(90, 220, 90), "live"),
@@ -4164,7 +4273,7 @@ impl EffEditor {
         });
         if let Some((fighter, item)) = transplant {
             let scope = if item.one_slot_slots.len() == 1 {
-                format!("one-slot c{:02}", item.one_slot_slots[0])
+                format!("skin c{:02}", item.one_slot_slots[0])
             } else if item.one_slot_slots.is_empty() {
                 "all skins".to_string()
             } else {
@@ -4186,11 +4295,8 @@ impl EffEditor {
                 .color(egui::Color32::from_rgb(190, 140, 255)),
             );
             if ui
-                .button("Remove transplant")
-                .on_hover_text(
-                    "Remove this entry from the project, rebuild the merged EFF, and unload \
-                     its runtime carrier resources immediately",
-                )
+                .button("Remove")
+                .on_hover_text("Take this borrowed effect out of the project and the game")
                 .clicked()
             {
                 self.pending_transplant_removals.push(EffTransplantRemoval {
@@ -4345,7 +4451,7 @@ impl EffEditor {
 
     fn draw_transplant_section(&mut self, ui: &mut Ui, entry_name: &str) {
         if ui
-            .button("Transplant effects")
+            .button("Borrow effects")
             .on_hover_text(format!(
                 "Copy {entry_name} or another effect into a fighter"
             ))
