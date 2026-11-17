@@ -6,8 +6,11 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
-- The upstream `ssbh_wgpu` crate provides character model, animation, skeleton,
-  and weapon rendering.
+- [`ssbh_wgpu`](https://github.com/Common-Leap/ssbh_wgpu) (a fork of
+  ScanMountGoat's, with two additions for effects) draws the fighters, their
+  objects and the stage.
+- [`eff_wgpu`](https://github.com/Common-Leap/eff_wgpu) simulates and draws the
+  effects in the preview the way the game does.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on
   crates.io provides `.eff` parsing, editing, and export.
 - The effect editor exposes the documented emitter, particle, animation,
@@ -16,11 +19,11 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 
 ## Prerequisites
 
-- A recent Rust toolchain
+- Rust, through rustup: `rust-toolchain.toml` picks the version (1.97.1)
 - The `cargo-skyline` toolchain for building the in-game plugin
 
-Cargo downloads the pinned `ssbh_wgpu` revision, `effect_library`, and the other
-Rust dependencies automatically during the build.
+Cargo downloads `ssbh_wgpu`, `eff_wgpu`, `effect_library`, and the other Rust
+dependencies automatically during the build.
 
 ## Game data
 
@@ -33,14 +36,16 @@ Keep the dumped folders beneath the same export root:
 ArcExplorer export/
 ├── fighter/
 ├── effect/
-└── ui/        (optional — needed for the Roster window)
+├── ui/        (optional — needed for the Characters page)
+├── stage/     (optional — stages to preview moves on)
+└── item/      (optional — items fighters hold in their moves)
 ```
 
 Open this export root in Visionary when prompted. The `fighter` folder provides
 character models, motion data, and parameters; the `effect` folder provides the
 `.eff` files used by the effect editor.
 
-The `ui` folder is optional and only the Roster window needs it. Dump it if you
+The `ui` folder is optional and only the Characters page needs it. Dump it if you
 want to edit the character select screen: it provides
 `ui/param/database/ui_chara_db.prc` (the roster database, which decides who
 appears on the select screen and in what order), `ui/message/` (display names),
@@ -90,12 +95,12 @@ section, and **Tell a gimmick** lets a move talk to one. The **Gimmicks** tab al
 fighter's personal parameters. Custom characters inherit their donor's controls, and costumes of
 one donor share its gimmick state.
 
-## Roster
+## Characters
 
-The **Roster** window (Windows → Roster, or File → Mod Library) manages imported mods,
-character select entries, new donor-backed characters, and shared fighter traits.
+The **Characters** page manages imported mods, character select entries, new donor-backed
+characters, and shared fighter traits.
 
-### Mod library
+### Installed mods
 
 Import compiled mods — folders, or `.zip` and `.7z` archives, many at once. Visionary finds
 the game folders inside whatever wrapper a mod ships with (`romfs/`, a folder named after the
@@ -138,7 +143,7 @@ version of everything you change. If Visionary does not have the fighter's origi
 a move you scoped, the export stops and says so rather than shipping a plugin that removes that
 move from every other costume.
 
-### Traits
+### Fighter values
 
 Weight, gravity, walk and run speeds, jump heights, landing lag, shield size, and the rest, from
 `fighter/common/param/fighter_param.prc`. Grouped and explained, with every field reachable
@@ -228,6 +233,24 @@ fighter**. Visionary removes that fighter's cached scripts, saved edits, and
 live effect previews while leaving the dumped and mod files unchanged. Use the
 **Restore** button beside the Fighters heading to show forgotten fighters
 again.
+
+## Effects page
+
+The **Effects** page (Ctrl+Shift+E) changes how the fighter's effects look.
+
+- The list on the left is every effect in the open file. Hover one to see the moves that spawn
+  it; effects no move script spawns are greyed. Search finds effects by name or by move.
+- The switch over the view plays the selected effect **Alone**, looping with the fighter
+  hidden, or **In a move** that spawns it. Picking a move there opens it.
+- The right side edits the selected effect: **Look** for one part's brightness, size, colours
+  and texture, **Parts & timing** for when each part starts and how long it lasts. Colours take
+  a picker, a colour code like `#FF8800`, or exact numbers, which may go above 1 as the game's
+  do.
+- Every edit shows in the view as you make it. **Send edits** hands them to the running game;
+  do the move again there to see them.
+
+The stage picker over the view shows moves on a stage from the dumped `stage/` folder:
+aerials in the air above it and ledge moves on its ledge.
 
 ## Eden emulator setup
 
