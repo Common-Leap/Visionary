@@ -276,6 +276,16 @@ impl ModProjectFile {
         if self.version < 4 {
             self.seed_project_fighters();
         }
+        // Older builds recorded an eff opened from outside the eff root by its absolute path.
+        // Rewrite it to the game path it stands for; one with no game path stays as it is and
+        // export refuses it.
+        for fighter in self.fighters.values_mut() {
+            if let Some(eff) = fighter.eff.as_mut() {
+                if !eff.source_rel.is_empty() && !is_mod_relative(&eff.source_rel) {
+                    eff.source_rel = eff_game_rel(std::path::Path::new(&eff.source_rel), None);
+                }
+            }
+        }
         self.version = PROJECT_VERSION;
         Ok(())
     }
@@ -918,6 +928,77 @@ pub struct TransplantOp {
     /// entry. This is how a one-slot-scoped transplant is normally authored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_entry: Option<String>,
+}
+
+/// The game path (`effect/fighter/mario/ef_mario.eff`) an eff on disk stands for — what
+/// [`EffMod::source_rel`] records and what export writes under the mod folder.
+///
+/// Relative to `root` when the file sits under it at a game path. Otherwise the path from its
+/// last `effect` folder on, so an eff opened from a mod, a download or a project `romfs/` is
+/// recorded the same way as the dump's copy. A bare `ef_<fighter>.eff` maps to that fighter's
+/// path. Anything else keeps the full path, which export then refuses rather than writes:
+/// an absolute `source_rel` once made `mod_dir.join` overwrite the user's own file.
+pub fn eff_game_rel(path: &std::path::Path, root: Option<&std::path::Path>) -> String {
+    use std::path::Component;
+    let slashed = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/");
+    let under_root = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .map(slashed);
+    if let Some(rel) = &under_root {
+        if rel.to_ascii_lowercase().starts_with("effect/") {
+            return rel.clone();
+        }
+    }
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if let Some(i) = parts
+        .iter()
+        .rposition(|p| p.eq_ignore_ascii_case("effect"))
+        .filter(|i| i + 1 < parts.len())
+    {
+        return parts[i..].join("/");
+    }
+    if let Some(rel) = under_root {
+        return rel;
+    }
+    let file = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if let Some(fighter) = file
+        .strip_prefix("ef_")
+        .and_then(|f| f.strip_suffix(".eff"))
+        .filter(|f| !f.is_empty())
+    {
+        // ef_mario_c03.eff is a one-slot file of mario's, not a fighter named mario_c03.
+        let fighter = match fighter.rsplit_once("_c") {
+            Some((name, slot))
+                if !name.is_empty()
+                    && slot.len() == 2
+                    && slot.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                name
+            }
+            _ => fighter,
+        };
+        return format!("effect/fighter/{fighter}/{file}");
+    }
+    slashed(path)
+}
+
+/// True when `source_rel` is a relative game path that stays inside whatever folder it is
+/// joined to: no drive, no root, no `..`. Export writes nothing for any other value.
+pub fn is_mod_relative(source_rel: &str) -> bool {
+    !source_rel.is_empty()
+        && !source_rel.contains(':')
+        && !source_rel.starts_with(['/', '\\'])
+        && !source_rel.split(['/', '\\']).any(|part| part == "..")
 }
 
 /// "effect/fighter/mario/ef_mario.eff" → "mario"; falls back to the file stem.
@@ -1683,5 +1764,108 @@ mod version_three_tests {
         project.project_fighters.insert(ProjectFighter::fighter("mario"));
         project.moveset_source = Some("C:/mods/my_moveset".into());
         assert!(project.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod eff_game_rel_tests {
+    use super::*;
+    use std::path::Path;
+
+    const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+
+    #[test]
+    fn an_eff_under_the_root_keeps_its_game_path() {
+        let root = Path::new("C:/dump");
+        assert_eq!(eff_game_rel(&root.join(MARIO), Some(root)), MARIO);
+    }
+
+    /// The bug: File → Open Effect File… on a mod's eff recorded `C:/mods/…/ef_mario.eff`.
+    #[test]
+    fn an_eff_outside_the_root_is_recorded_from_its_effect_folder() {
+        let root = Path::new("C:/dump");
+        for outside in [
+            "C:/Users/me/Downloads/coolmod/effect/fighter/mario/ef_mario.eff",
+            r"D:\mods\coolmod\romfs\effect\fighter\mario\ef_mario.eff",
+            "C:/dump/../elsewhere/Effect/fighter/mario/ef_mario.eff",
+        ] {
+            let rel = eff_game_rel(Path::new(outside), Some(root));
+            assert!(rel.eq_ignore_ascii_case(MARIO), "{outside} → {rel}");
+            assert!(is_mod_relative(&rel), "{outside} → {rel}");
+        }
+    }
+
+    /// A root that wraps the game folders (`<mod>/romfs`) still yields the game path.
+    #[test]
+    fn a_wrapper_under_the_root_is_dropped() {
+        let root = Path::new("C:/mod");
+        let path = root.join("romfs").join(MARIO);
+        assert_eq!(eff_game_rel(&path, Some(root)), MARIO);
+    }
+
+    #[test]
+    fn a_bare_fighter_eff_maps_to_that_fighters_path() {
+        assert_eq!(
+            eff_game_rel(Path::new("C:/Users/me/Downloads/ef_Mario.eff"), None),
+            MARIO
+        );
+        assert_eq!(
+            eff_game_rel(Path::new("C:/Users/me/Downloads/ef_mario_c03.eff"), None),
+            "effect/fighter/mario/ef_mario_c03.eff"
+        );
+    }
+
+    /// No game path to derive: kept as it is, and `is_mod_relative` says so — that is what
+    /// makes export refuse it instead of writing over it.
+    #[test]
+    fn an_eff_with_no_game_path_stays_absolute_and_unexportable() {
+        let path = Path::new("C:/Users/me/Downloads/custom.eff");
+        let rel = eff_game_rel(path, Some(Path::new("C:/dump")));
+        assert_eq!(rel, "C:/Users/me/Downloads/custom.eff");
+        assert!(!is_mod_relative(&rel));
+    }
+
+    #[test]
+    fn only_game_paths_are_mod_relative() {
+        assert!(is_mod_relative(MARIO));
+        for bad in [
+            "",
+            "C:/Users/me/ef_mario.eff",
+            r"C:\Users\me\ef_mario.eff",
+            "/home/me/ef_mario.eff",
+            r"\\server\share\ef_mario.eff",
+            "effect/../../outside.eff",
+            r"..\outside.eff",
+        ] {
+            assert!(!is_mod_relative(bad), "{bad:?} must not be exportable");
+        }
+    }
+
+    /// A project saved by an older build carries the absolute path; loading it rewrites the
+    /// path to the game path, and leaves one with no game path for export to refuse.
+    #[test]
+    fn migrate_rewrites_absolute_eff_sources() {
+        let mut project = ModProjectFile {
+            version: PROJECT_VERSION,
+            ..Default::default()
+        };
+        for (fighter, source) in [
+            (
+                "mario",
+                "C:/Users/me/mods/x/effect/fighter/mario/ef_mario.eff",
+            ),
+            ("custom", "C:/Users/me/custom.eff"),
+            ("link", "effect/fighter/link/ef_link.eff"),
+        ] {
+            project.fighters.entry(fighter.into()).or_default().eff = Some(EffMod {
+                source_rel: source.into(),
+                ..Default::default()
+            });
+        }
+        project.migrate().unwrap();
+        let source = |f: &str| project.fighters[f].eff.as_ref().unwrap().source_rel.clone();
+        assert_eq!(source("mario"), MARIO);
+        assert_eq!(source("custom"), "C:/Users/me/custom.eff");
+        assert_eq!(source("link"), "effect/fighter/link/ef_link.eff");
     }
 }
