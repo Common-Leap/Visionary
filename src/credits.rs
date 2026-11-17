@@ -191,7 +191,7 @@ impl CreditsWindow {
             |ui, class| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::from_rgb(13, 14, 24)))
-                    .show_inside(ui, |ui| {
+                    .show(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let page_width = ui.available_width();
                             let title_size = responsive_size(page_width, 26.0, 32.0);
@@ -684,6 +684,8 @@ fn default_avatar_url(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use crate::ui::TestFrame;
 
     #[test]
     fn credits_roster_has_expected_sections_and_unique_people() {
@@ -782,10 +784,10 @@ mod tests {
                 ..Default::default()
             };
             let mut measured = None;
-            let _ = context.run_ui(input, |ui| {
+            let _ = context.run_test_ui(input, |ui| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new())
-                    .show_inside(ui, |ui| {
+                    .show(ui, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let clip_rect = ui.clip_rect();
                             credits.draw_section(ui, "Support", SUPPORT);
@@ -820,7 +822,7 @@ mod tests {
             };
             let mut note_rects = Vec::new();
             let mut clip_rect = None;
-            let _ = context.run_ui(input, |ui| {
+            let _ = context.run_test_ui(input, |ui| {
                 clip_rect = Some(ui.clip_rect());
                 egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(8, 8))

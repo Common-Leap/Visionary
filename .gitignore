@@ -8,7 +8,6 @@
 **/target/
 **/__pycache__/
 **/*.py[cod]
-/research/decomp/ssbu-re/venv/
 
 # ── Copyrighted / proprietary game assets (Smash Ultimate extracts) ─────────
 # Never commit ripped shaders, effects, models, textures, or dump output.
@@ -62,15 +61,9 @@
 
 rustc-ice-*.txt
 
-# Raw research captures must remain outside the repository.
-/research/hitbox-captures/
-
-# SLight reference/decompilation is intentionally local-only. The only SLight
-# implementation eligible for commit is plugins/slight_replica/.
-/research/decomp/slight/
 /legacy/
 /tools/rust-parameter-manager/
 /test-assets/
 
-# Claude Code workspace settings
-.claude/
+# Local game research
+/research/

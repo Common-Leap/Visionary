@@ -128,10 +128,6 @@ impl CostumeFolder {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.files.is_empty()
-    }
-
     /// The files that come from somewhere other than the folder itself.
     pub fn borrowed(&self) -> impl Iterator<Item = &ResolvedFile> {
         self.files

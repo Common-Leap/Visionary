@@ -247,6 +247,10 @@ fn apply_all() {
 
 /// Push a multiplier-registry snapshot to the RPM client when the set changes
 /// (Jorge `FUN_71000936c8`).
+#[cfg(feature = "mod_plugin")]
+fn sync_to_client() {}
+
+#[cfg(not(feature = "mod_plugin"))]
 fn sync_to_client() {
     if !DIRTY_CLIENT.swap(false, Ordering::Relaxed) {
         return;

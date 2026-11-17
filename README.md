@@ -8,11 +8,14 @@ This is joobert's fork of Visionary. What it adds on top of upstream `v0.1.2` is
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
-- The `ssbh_wgpu` crate provides character model, animation, skeleton, and
-  weapon rendering. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu),
-  which adds loading a model from files in different folders (costumes that
-  share files through `config.json`) and the skeleton edit used to place a
-  thrown fighter.
+- [`ssbh_wgpu`](https://github.com/Common-Leap/ssbh_wgpu) (a fork of
+  ScanMountGoat's, with two additions for effects) draws the fighters, their
+  objects and the stage. Visionary pins [joobert's fork](https://github.com/joobert/ssbh_wgpu)
+  of it, which adds loading a model from files in different folders (costumes
+  that share files through `config.json`) and the skeleton edit that scales a
+  fighter at its root.
+- [`eff_wgpu`](https://github.com/Common-Leap/eff_wgpu) simulates and draws the
+  effects in the preview the way the game does.
 - The [`effect_library`](https://crates.io/crates/effect_library) crate on
   crates.io provides `.eff` parsing, editing, and export.
 - The effect editor exposes the documented emitter, particle, animation,
@@ -21,13 +24,13 @@ This is joobert's fork of Visionary. What it adds on top of upstream `v0.1.2` is
 
 ## Prerequisites
 
-- A recent Rust toolchain
+- Rust, through rustup: `rust-toolchain.toml` picks the version (1.97.1)
 - The `cargo-skyline` toolchain for building the in-game plugin, and for
   **Build & Deploy** of a linked moveset (see [Building and deploying your
   plugin](#building-and-deploying-your-plugin))
 
-Cargo downloads the pinned `ssbh_wgpu` revision, `effect_library`, and the other
-Rust dependencies automatically during the build.
+Cargo downloads `ssbh_wgpu`, `eff_wgpu`, `effect_library`, and the other Rust
+dependencies automatically during the build.
 
 ## Game data
 
@@ -40,7 +43,9 @@ Keep the dumped folders beneath the same export root:
 ArcExplorer export/
 ├── fighter/
 ├── effect/
-└── ui/        (optional — needed for the Roster window)
+├── ui/        (optional — needed for the Characters page)
+├── stage/     (optional — stages to preview moves on)
+└── item/      (optional — items fighters hold in their moves)
 ```
 
 On first run Visionary asks for this folder (the **ArcExplorer dump**) before anything
@@ -83,7 +88,7 @@ after the edit is undone. Right-click a fighter to **Add to project** or **Remov
 project**; the menu says why a fighter stays listed after removal (for example, it still has
 edits). Without a project the list is the flat list it always was.
 
-The `ui` folder is optional and only the Roster window needs it. Dump it if you
+The `ui` folder is optional and only the Characters page needs it. Dump it if you
 want to edit the character select screen: it provides
 `ui/param/database/ui_chara_db.prc` (the roster database, which decides who
 appears on the select screen and in what order), `ui/message/` (display names),
@@ -98,12 +103,47 @@ motion parts. This includes Kirby copy-ability animations stored in donor body
 directories, so copied specials preview with their intended animation when the
 corresponding files are present in the export.
 
-## Roster
+## Making moves and gimmicks with nodes
 
-The **Roster** window (Windows → Roster, or File → Mod Library) covers everything about a
-fighter that is not one move.
+The node system is not finished. Some blocks don't update live yet, many fighter mechanics aren't
+supported as gimmicks, and most fighters have barely been tested.
 
-### Mod library
+Open the **Move nodes** tab, or start from **Gimmicks** to work on a whole character.
+
+**Make a move**
+
+1. Pick the fighter and the move slot to replace, such as Mario's `special_n`.
+2. Under **Start a new move**, click a starter such as *Quick strike* or *Shoot a projectile*.
+   *Empty move* starts from nothing. Undo brings back what was there.
+3. Click a block to change it. Each block explains itself at the top of the panel.
+4. Add more from the list on the left. Clicking one adds it after the selected block.
+
+Blocks run left to right, and the frame ruler along the top shows when. With nothing selected,
+**What this move does** reads the whole move back in sentences. Click a line to find its block.
+An **If** block has three outputs: **Yes** and **No** say what runs for each answer, and
+**After** runs either way.
+
+**Everything updates live.** With the game connected, each finished edit reaches the match by
+itself, with no restart and no export. **● Updates live** at the top confirms it; if a block
+can't go live yet, that label names it. To keep a move, use **Project → Export Mod Folder**. The
+folder it makes is a complete mod: drop it in your mods folder and it works without the editor,
+exactly as you tested it. You don't need Rust. Keep only one copy of the plugin installed, so remove
+any other copy from Skyline's plugins folder.
+
+**Make a gimmick**
+
+The **Gimmick** section of the block list adds rules that run all the time: *When: deals damage*,
+*When: takes damage*, timers and meters. Ready-made gimmicks such as extra jumps are in the same
+section, and **Tell a gimmick** lets a move talk to one. The **Gimmicks** tab also edits a
+fighter's personal parameters. Custom characters inherit their donor's controls, and costumes of
+one donor share its gimmick state.
+
+## Characters
+
+The **Characters** page manages imported mods, character select entries, new donor-backed
+characters, and shared fighter traits.
+
+### Installed mods
 
 Import compiled mods — folders, or `.zip` and `.7z` archives, many at once. Visionary finds
 the game folders inside whatever wrapper a mod ships with (`romfs/`, a folder named after the
@@ -134,8 +174,7 @@ Visionary does not read. What the preview is authoritative about is the order.
 
 Adds a character as a **costume of an existing fighter**. It gets its own model, animations,
 effects, display name, and moveset, and you select it by choosing that fighter and then its
-costume. It does not get its own square on the select screen; see `docs/roster/PLAN.md` for the
-measurement behind that.
+costume. It does not get its own square on the select screen.
 
 Creating one makes the folders your model and animations go in and adds them to the mod
 library, so the slot is editable immediately. The panel reports what is still missing —
@@ -147,7 +186,7 @@ version of everything you change. If Visionary does not have the fighter's origi
 a move you scoped, the export stops and says so rather than shipping a plugin that removes that
 move from every other costume.
 
-### Traits
+### Fighter values
 
 Weight, gravity, walk and run speeds, jump heights, landing lag, shield size, and the rest, from
 `fighter/common/param/fighter_param.prc`. Grouped and explained, with every field reachable
@@ -189,6 +228,10 @@ the executable for native window decorations on Windows and X11.
 
 Visionary reads the dumped data from its existing location and remembers the
 selected export root for future sessions.
+
+When managing a plugin build or a separate test installation manually, set
+`VISIONARY_DISABLE_PLUGIN_AUTO_DEPLOY=1` before starting the editor. This disables
+the startup plugin rebuild/deployment check without disabling live editing.
 
 ### Editing a move
 
@@ -318,6 +361,24 @@ fighter**. Visionary removes that fighter's cached scripts, saved edits, and
 live effect previews while leaving the dumped and mod files unchanged. Use the
 **Restore** button beside the Fighters heading to show forgotten fighters
 again.
+
+## Effects page
+
+The **Effects** page (Ctrl+Shift+E) changes how the fighter's effects look.
+
+- The list on the left is every effect in the open file. Hover one to see the moves that spawn
+  it; effects no move script spawns are greyed. Search finds effects by name or by move.
+- The switch over the view plays the selected effect **Alone**, looping with the fighter
+  hidden, or **In a move** that spawns it. Picking a move there opens it.
+- The right side edits the selected effect: **Look** for one part's brightness, size, colours
+  and texture, **Parts & timing** for when each part starts and how long it lasts. Colours take
+  a picker, a colour code like `#FF8800`, or exact numbers, which may go above 1 as the game's
+  do.
+- Every edit shows in the view as you make it. **Send edits** hands them to the running game;
+  do the move again there to see them.
+
+The stage picker over the view shows moves on a stage from the dumped `stage/` folder:
+aerials in the air above it and ledge moves on its ledge.
 
 ## Eden emulator setup
 
@@ -1007,9 +1068,7 @@ transplant edits together:
 - **Export Project** writes a portable `modproject.json` and adopts its path.
   These editable files are exported separately from mod and developer files.
 - **Load Project** replaces the current project, restores every edit, and sends
-  the available live rules and effects to a connected game. Added or retimed
-  move events may ask you to perform that move once so the plugin can capture
-  the original arguments safely.
+  the available live rules and effects to a connected game.
 - **Import Mod as Project** adopts any mod folder: `ui_chara_db` diffs
   (order/visibility/row fields), `.xmsbt` names, BNTX portraits→PNG assets, and
   `fighter_param` diffs become editable; source text is copied as reference and
@@ -1099,8 +1158,3 @@ VISIONARY_MOVESETS="/path/to/Movesets" cargo test --bin visionary moveset_survey
 `VISIONARY_SURVEY_ONLY=<folder name>` limits it to one project, and
 `VISIONARY_SURVEY_PLAN=1` also prints the Build & Deploy plan each project would
 use (without building or copying anything).
-
-
-Reusable game-analysis utilities are available in `research/decomp/ssbu-re/`.
-Each tool reads its inputs from the external directory selected through
-`SSBU_DUMP_DIR`.

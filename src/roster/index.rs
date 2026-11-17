@@ -346,7 +346,7 @@ fn display_name_for(
     }
     match fighter {
         Some(fighter) => fighter.display_name.clone(),
-        None => row.name_id.clone(),
+        None => crate::data::fighter_display_name(&row.name_id),
     }
 }
 

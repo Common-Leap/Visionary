@@ -2124,7 +2124,7 @@ impl CssView {
                             sel_slot,
                         );
                     }
-                    if ui.small_button("Choose PNG…").clicked() {
+                    if ui.small_button("Choose PNG").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("PNG", &["png"])
                             .add_filter("Image", &["png", "jpg", "jpeg", "webp"])

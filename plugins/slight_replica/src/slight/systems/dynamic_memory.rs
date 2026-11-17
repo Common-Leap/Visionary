@@ -51,17 +51,6 @@ pub fn bind_effect(boid: u32, handle: u32, effect_id: u64) {
     }
 }
 
-pub fn lookup_effect(boid: u32, handle: u32) -> Option<u64> {
-    let idx = handle as usize;
-    SLOTS
-        .lock()
-        .get(&boid)?
-        .effect_slots
-        .get(idx)
-        .copied()
-        .flatten()
-}
-
 pub fn clear() {
     SLOTS.lock().clear();
 }

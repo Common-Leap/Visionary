@@ -1,0 +1,305 @@
+{
+  "initial": "active",
+  "states": [
+    {
+      "name": "active"
+    }
+  ],
+  "vars": [
+    {
+      "name": "counter",
+      "kind": "Int",
+      "initial": {
+        "Int": 0
+      }
+    },
+    {
+      "name": "__mv_e56eeb01_cooldown",
+      "kind": "Timer",
+      "initial": {
+        "Int": 3
+      }
+    },
+    {
+      "name": "__mta_finish_cooldown_36f89b32",
+      "kind": "Flag",
+      "initial": {
+        "Flag": true
+      }
+    },
+    {
+      "name": "__mta_writer_event_begin_1_39538c0c",
+      "kind": "Flag",
+      "initial": {
+        "Flag": false
+      }
+    }
+  ],
+  "transitions": [
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "Compare": {
+          "op": "Eq",
+          "left": {
+            "Const": {
+              "Int": 1
+            }
+          },
+          "right": {
+            "Const": {
+              "Int": 1
+            }
+          }
+        }
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Reset": {
+            "var": "counter"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "Compare": {
+          "op": "Eq",
+          "left": {
+            "Const": {
+              "Int": 0
+            }
+          },
+          "right": {
+            "Const": {
+              "Int": 0
+            }
+          }
+        }
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Add": {
+            "var": "counter",
+            "value": {
+              "Const": {
+                "Int": 2
+              }
+            }
+          }
+        },
+        {
+          "Set": {
+            "var": "__mv_e56eeb01_cooldown",
+            "value": {
+              "Const": {
+                "Int": 4
+              }
+            }
+          }
+        },
+        {
+          "Raise": {
+            "var": "__mta_writer_event_begin_1_39538c0c"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "Not": {
+          "Expired": "__mv_e56eeb01_cooldown"
+        }
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Raise": {
+            "var": "__mta_finish_cooldown_36f89b32"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "And": [
+          {
+            "And": [
+              {
+                "Expired": "__mv_e56eeb01_cooldown"
+              },
+              {
+                "Flag": "__mta_finish_cooldown_36f89b32"
+              }
+            ]
+          },
+          {
+            "Compare": {
+              "op": "Gte",
+              "left": {
+                "Var": "counter"
+              },
+              "right": {
+                "Const": {
+                  "Int": 0
+                }
+              }
+            }
+          }
+        ]
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Add": {
+            "var": "counter",
+            "value": {
+              "Const": {
+                "Int": 1
+              }
+            }
+          }
+        },
+        {
+          "Clear": {
+            "var": "__mta_finish_cooldown_36f89b32"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "And": [
+          {
+            "Expired": "__mv_e56eeb01_cooldown"
+          },
+          {
+            "And": [
+              {
+                "Flag": "__mta_finish_cooldown_36f89b32"
+              },
+              {
+                "Not": {
+                  "Compare": {
+                    "op": "Gte",
+                    "left": {
+                      "Var": "counter"
+                    },
+                    "right": {
+                      "Const": {
+                        "Int": 0
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Clear": {
+            "var": "__mta_finish_cooldown_36f89b32"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "And": [
+          {
+            "Flag": "__mta_writer_event_begin_1_39538c0c"
+          },
+          {
+            "Expired": "__mv_e56eeb01_cooldown"
+          }
+        ]
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Clear": {
+            "var": "__mta_finish_cooldown_36f89b32"
+          }
+        },
+        {
+          "Clear": {
+            "var": "__mta_writer_event_begin_1_39538c0c"
+          }
+        }
+      ]
+    },
+    {
+      "from": "active",
+      "to": "active",
+      "guard": {
+        "And": [
+          {
+            "Flag": "__mta_writer_event_begin_1_39538c0c"
+          },
+          {
+            "Not": {
+              "Expired": "__mv_e56eeb01_cooldown"
+            }
+          }
+        ]
+      },
+      "on_frame": true,
+      "actions": [
+        {
+          "Raise": {
+            "var": "__mta_finish_cooldown_36f89b32"
+          }
+        },
+        {
+          "Clear": {
+            "var": "__mta_writer_event_begin_1_39538c0c"
+          }
+        }
+      ]
+    }
+  ],
+  "emission_plan": {
+    "bindings": [
+      {
+        "hook": "onStockStart",
+        "transitions": [
+          0
+        ]
+      },
+      {
+        "hook": "onChargeTick",
+        "transitions": [
+          2,
+          3,
+          4
+        ]
+      }
+    ],
+    "event_bindings": [
+      {
+        "name": "begin",
+        "transitions": [
+          1,
+          5,
+          6
+        ]
+      }
+    ]
+  }
+}

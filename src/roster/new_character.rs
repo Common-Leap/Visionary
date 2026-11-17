@@ -58,6 +58,9 @@ fn range_count(range: SlotRange) -> u8 {
 
 #[derive(Default)]
 pub struct NewCharacterView {
+    /// The project has a folder on disk. A new character lives in the project, so one made
+    /// in an unsaved session would be lost while its files stayed behind.
+    pub project_saved: bool,
     donor: Option<String>,
     /// Inclusive `[start, end]` slot range. `None` until the donor is picked,
     /// at which point it is initialised to the lowest free run of [`MIN_SKINS`]
@@ -176,28 +179,34 @@ impl NewCharacterView {
                     // Flex with the window instead of forcing a 220px box.
                     let combo_w = (ui.available_width() - 110.0).clamp(140.0, 220.0);
                     let previous_donor = self.donor.clone();
-                    egui::ComboBox::from_id_salt("newchar_donor")
-                        .selected_text(
-                            self.donor
-                                .clone()
-                                .unwrap_or_else(|| "Pick a fighter…".to_string()),
-                        )
-                        .width(combo_w)
-                        .show_ui(ui, |ui| {
-                            for entry in &donors {
-                                let Some(fighter) = &entry.fighter else { continue };
-                                let is_selected = self.donor.as_deref() == Some(fighter.as_str());
-                                if ui
-                                    .selectable_label(
-                                        is_selected,
-                                        format!("{}  ({fighter})", entry.display_name),
-                                    )
-                                    .clicked()
-                                {
-                                    self.donor = Some(fighter.clone());
-                                }
-                            }
-                        });
+                    let donor_list: Vec<_> =
+                        donors.iter().filter(|entry| entry.fighter.is_some()).collect();
+                    let picks: Vec<crate::ui::Pick> = donor_list
+                        .iter()
+                        .map(|entry| crate::ui::Pick {
+                            label: entry.display_name.clone(),
+                            hover: entry.fighter.clone().unwrap_or_default(),
+                            group: None,
+                        })
+                        .collect();
+                    let selected = donor_list
+                        .iter()
+                        .position(|entry| entry.fighter == self.donor);
+                    let current = self
+                        .donor
+                        .as_deref()
+                        .and_then(|donor| {
+                            donor_list
+                                .iter()
+                                .find(|entry| entry.fighter.as_deref() == Some(donor))
+                                .map(|entry| entry.display_name.clone())
+                        })
+                        .unwrap_or_else(|| "Pick a fighter".to_string());
+                    if let Some(index) =
+                        crate::ui::picker(ui, "newchar_donor", combo_w, &current, &picks, selected)
+                    {
+                        self.donor = donor_list[index].fighter.clone();
+                    }
                     if self.donor != previous_donor {
                         // Donor changed — pick a fresh range so the form never
                         // opens with a range that crosses a taken slot. Falls
@@ -235,7 +244,7 @@ impl NewCharacterView {
                 let ready = self.donor.is_some() && !self.display_name.trim().is_empty();
                 let range_ok = self.slot_range.map(range_count).unwrap_or(0) >= MIN_SKINS;
                 let slot_taken = ready && self.slot_range_conflict(roots, index).is_some();
-                let can_create = ready && range_ok && !slot_taken;
+                let can_create = ready && range_ok && !slot_taken && self.project_saved;
                 ui.horizontal_wrapped(|ui| {
                     // One primary action: most users want the character made,
                     // not a destination decision. Quick create imports
@@ -243,7 +252,7 @@ impl NewCharacterView {
                     if ui
                         .add_enabled(
                             can_create,
-                            egui::Button::new(RichText::new("＋ Create character").strong()),
+                            egui::Button::new(RichText::new("+ Create character").strong()),
                         )
                         .on_hover_text(
                             "Files go to Visionary's authored folder and the character imports immediately",
@@ -264,7 +273,13 @@ impl NewCharacterView {
                     }
                     // The slot row above already details range problems; here
                     // is only the one-line reason the button is grey.
-                    if !ready {
+                    if !self.project_saved {
+                        ui.label(
+                            RichText::new("Save the project first (File > Save as): new characters are kept in it.")
+                                .small()
+                                .weak(),
+                        );
+                    } else if !ready {
                         ui.label(RichText::new("Pick a donor and a name.").small().weak());
                     } else if !range_ok || slot_taken {
                         ui.colored_label(
@@ -643,10 +658,10 @@ impl NewCharacterView {
                     ui.horizontal_wrapped(|ui| {
                         let mut on = targeted;
                         if ui
-                            .checkbox(&mut on, RichText::new("Edit moves").small().strong())
+                            .checkbox(&mut on, RichText::new("Move edits only change this character").small().strong())
                             .on_hover_text(format!(
-                                "Scope move edits to c{:02} of {} instead of the whole fighter",
-                                authored.slot, authored.donor,
+                                "On: moves you edit now change only this character (costume c{:02}). Off: they change every {}.",
+                                authored.slot, crate::data::fighter_display_name(&authored.donor),
                             ))
                             .changed()
                         {
@@ -658,7 +673,14 @@ impl NewCharacterView {
                                 RichText::new(format!("● c{:02} only", authored.slot)).small().strong(),
                             );
                         } else {
-                            ui.label(RichText::new("fighter-wide").small().weak());
+                            ui.label(
+                                RichText::new(format!(
+                                    "edits change every {}",
+                                    crate::data::fighter_display_name(&authored.donor)
+                                ))
+                                .small()
+                                .weak(),
+                            );
                         }
                     });
 
@@ -669,7 +691,7 @@ impl NewCharacterView {
                         .default_open(!files_done)
                         .id_salt(format!("files_{}", authored.key.as_str()))
                         .show(ui, |ui| {
-                            self.draw_files(ui, authored, project, &inv);
+                            self.draw_files(ui, roots, authored, project, &inv);
                         });
 
                     ui.add_space(6.0);
@@ -782,6 +804,7 @@ impl NewCharacterView {
     fn draw_files(
         &mut self,
         ui: &mut Ui,
+        roots: &[PathBuf],
         authored: &crate::mod_project::AuthoredEntry,
         project: &RosterMod,
         inv: &scaffold::SlotInventory,
@@ -822,8 +845,57 @@ impl NewCharacterView {
         } else {
             "empty — needs .numdlb + .nutexb".to_string()
         };
-        if let Some(path) = file_row(ui, "Model", &model_state, inv.meshes > 0, model_target) {
+        if let Some(path) = file_row(
+            ui,
+            "Model",
+            &model_state,
+            inv.meshes > 0,
+            model_target.clone(),
+        ) {
             reveal_ask = Some(path);
+        }
+        let motion_dest = authored
+            .files_root
+            .as_ref()
+            .map(|root| {
+                root.join(format!(
+                    "fighter/{}/motion/body/c{:02}",
+                    authored.donor, authored.slot
+                ))
+            })
+            .or_else(|| inv.motion_dir.clone());
+        // A new character can start as a copy of the fighter it is based on, so it works in
+        // game straight away and the user changes it from there.
+        let empty_model = inv.meshes == 0;
+        let empty_motion = inv.anims == 0;
+        if empty_model || empty_motion {
+            let donor_name = crate::data::fighter_display_name(&authored.donor);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(18.0);
+                for (kind, empty, dest) in [
+                    ("model", empty_model, model_target.clone()),
+                    ("motion", empty_motion, motion_dest.clone()),
+                ] {
+                    let Some(dest) = dest.filter(|_| empty) else {
+                        continue;
+                    };
+                    let label = if kind == "model" {
+                        format!("Start from {donor_name}'s model")
+                    } else {
+                        format!("Start from {donor_name}'s animations")
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.status = match copy_donor_costume(roots, &authored.donor, kind, &dest)
+                        {
+                            Ok(count) => format!(
+                                "Copied {count} file(s) from {donor_name} into {}",
+                                dest.display()
+                            ),
+                            Err(error) => error,
+                        };
+                    }
+                }
+            });
         }
         let anim_state = if inv.anims > 0 {
             format!(
@@ -1303,6 +1375,38 @@ fn file_row(
         }
     });
     ask
+}
+
+/// Copy the donor's first costume's `model` or `motion` body files into `dest`, skipping files
+/// already there. Returns how many were copied.
+fn copy_donor_costume(
+    roots: &[PathBuf],
+    donor: &str,
+    kind: &str,
+    dest: &std::path::Path,
+) -> Result<usize, String> {
+    let source = roots
+        .iter()
+        .map(|root| root.join(format!("fighter/{donor}/{kind}/body/c00")))
+        .find(|dir| dir.is_dir())
+        .ok_or_else(|| format!("No {kind} folder for {donor} in the game files"))?;
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(&source)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = dest.join(name);
+        if path.is_file() && !target.exists() {
+            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// The internal id a character gets, derived from its display name.

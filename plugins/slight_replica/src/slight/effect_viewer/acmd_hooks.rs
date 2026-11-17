@@ -2585,7 +2585,7 @@ unsafe fn resolve_injection_motion(
     boundary: CoroutineBoundary,
     observed_frame: f32,
 ) -> (u64, u64) {
-    let observed = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let observed = crate::slight::hitbox_viewer::acting_motion(boma);
     let boid = (*boma).battle_object_id;
     let hint = motion_hint_atomic(boid);
     let hint_has_rules = hint.is_some_and(|hint| {
@@ -3309,6 +3309,17 @@ unsafe fn inject_effect(
             continue;
         }
 
+        if inj
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !crate::slight::hitbox_viewer::guard_passes(boma, guard))
+        {
+            if let Some(mut latch) = latch {
+                latch.confirmed = true;
+                EFF_FIRED.lock().insert(key, latch);
+            }
+            continue;
+        }
         load_args(agent, &inj.args);
         let confirmed = {
             let _attempt = InjectionAttemptGuard::new(key, motion, inj.frame, rule_fingerprint);

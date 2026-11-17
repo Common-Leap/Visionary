@@ -17,10 +17,6 @@ static FIGHT_START_CBS: LazyLock<Mutex<HashMap<i32, Vec<KindCb>>>> =
 static FIGHTER_FRAME_CBS: LazyLock<Mutex<HashMap<i32, Vec<KindCb>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn add_fight_start_callback(kind: i32, cb: KindCb) {
-    FIGHT_START_CBS.lock().entry(kind).or_default().push(cb);
-}
-
 pub fn add_fighter_frame_callback(kind: i32, cb: KindCb) {
     FIGHTER_FRAME_CBS.lock().entry(kind).or_default().push(cb);
 }
@@ -263,10 +259,15 @@ pub fn on_weapon_frame() {
 
 pub fn uninstall() {
     crate::slight::systems::main_module::on_uninstall();
-    crate::slight::effect_viewer::tracker::EFFECT_TRACKER
-        .lock()
-        .clear();
-    crate::slight::effect_viewer::kinds::clear();
-    crate::slight::effect_viewer::frame_tick::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
+    {
+        crate::slight::effect_viewer::tracker::EFFECT_TRACKER
+            .lock()
+            .clear();
+        crate::slight::effect_viewer::kinds::clear();
+        crate::slight::effect_viewer::frame_tick::clear_all();
+    }
     crate::slight::agents::clear_all();
+    #[cfg(not(feature = "mod_plugin"))]
+    crate::rust_extender::debuggable_server::notify_gimmick_agents();
 }

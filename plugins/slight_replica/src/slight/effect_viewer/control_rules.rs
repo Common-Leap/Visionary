@@ -19,6 +19,9 @@ pub struct ControlInject {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlRule {
     pub motion: Option<u64>,
+    /// The fighter this rule was made for; `None` fires for anyone.
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
     pub func: String,
     #[serde(default)]
     pub args: Vec<LuaArg>,
@@ -44,6 +47,7 @@ impl ControlRule {
     fn matches(&self, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
         self.func == func
             && self.motion.map(|m| m == motion).unwrap_or(true)
+            && crate::slight::hitbox_viewer::acting_is(self.fighter_kind)
             && self.args == args
             && self.frame_start.map(|start| frame >= start).unwrap_or(true)
             && self.frame_end.map(|end| frame <= end).unwrap_or(true)
@@ -201,7 +205,9 @@ pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u6
         .iter()
         .enumerate()
         .filter(|(_, rule)| {
-            rule.inject.is_some() && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
+            rule.inject.is_some()
+                && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
+                && crate::slight::hitbox_viewer::acting_is(rule.fighter_kind)
         })
         .map(|(index, rule)| {
             (

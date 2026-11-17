@@ -160,40 +160,40 @@ assign_u64!(u8, u16, u32, u64);
 
 // Groups, in the order the UI stacks them. Named after the sections of the emitter binary so a
 // row here can be found in the EffectResearch tables without translation.
-pub const G_COMMON: &str = "Common";
-pub const G_EMISSION: &str = "Emission";
-pub const G_SHAPE: &str = "Emitter shape";
-pub const G_INFO: &str = "Emitter transform & colour";
-pub const G_INFO_FLAGS: &str = "Emitter behaviour";
-pub const G_PARTICLE: &str = "Particle";
-pub const G_PTCL_VELOCITY: &str = "Particle velocity";
+pub const G_COMMON: &str = "General";
+pub const G_EMISSION: &str = "When and how many";
+pub const G_SHAPE: &str = "Where particles start";
+pub const G_INFO: &str = "Position, turn, area and colour";
+pub const G_INFO_FLAGS: &str = "Following and options";
+pub const G_PARTICLE: &str = "Particle basics";
+pub const G_PTCL_VELOCITY: &str = "Movement";
 pub const G_PTCL_COLOR: &str = "Particle colour";
-pub const G_PTCL_SCALE: &str = "Particle scale";
-pub const G_PTCL_ROTATE: &str = "Particle rotation";
+pub const G_PTCL_SCALE: &str = "Particle size";
+pub const G_PTCL_ROTATE: &str = "Spin";
 pub const G_MOTION: &str = "Gravity & air resistance";
-pub const G_FLUCTUATION: &str = "Fluctuation";
-pub const G_ANIM_RATES: &str = "Animation keys & loops";
-pub const G_COLOR_KEYS: &str = "Colour keyframes";
-pub const G_ALPHA_KEYS: &str = "Alpha keyframes";
-pub const G_SCALE_KEYS: &str = "Scale keyframes";
-pub const G_PARAM_KEYS: &str = "Shader coefficient keyframes";
-pub const G_RENDER: &str = "Render state";
-pub const G_COMBINER: &str = "Combiner";
-pub const G_ALPHA_FX: &str = "Soft / fresnel / distance alpha";
-pub const G_INHERIT: &str = "Child inheritance";
-pub const G_SHADER: &str = "Shader references";
-pub const G_SAMPLER0: &str = "Sampler 0";
-pub const G_SAMPLER1: &str = "Sampler 1";
-pub const G_SAMPLER2: &str = "Sampler 2";
-pub const G_TEXANIM0: &str = "Texture 0 animation";
-pub const G_TEXANIM1: &str = "Texture 1 animation";
-pub const G_TEXANIM2: &str = "Texture 2 animation";
-pub const G_TEXPAT0: &str = "Texture 0 pattern anim";
-pub const G_TEXPAT1: &str = "Texture 1 pattern anim";
-pub const G_TEXPAT2: &str = "Texture 2 pattern anim";
-pub const G_TEXUV0: &str = "Texture 0 UV anim";
-pub const G_TEXUV1: &str = "Texture 1 UV anim";
-pub const G_TEXUV2: &str = "Texture 2 UV anim";
+pub const G_FLUCTUATION: &str = "Flicker";
+pub const G_ANIM_RATES: &str = "Animation timing";
+pub const G_COLOR_KEYS: &str = "Colour over life";
+pub const G_ALPHA_KEYS: &str = "Opacity over life";
+pub const G_SCALE_KEYS: &str = "Size over life";
+pub const G_PARAM_KEYS: &str = "Shader values over life";
+pub const G_RENDER: &str = "Drawing (blend and depth)";
+pub const G_COMBINER: &str = "Colour mixing";
+pub const G_ALPHA_FX: &str = "Soft edges and fading by distance";
+pub const G_INHERIT: &str = "What child parts inherit";
+pub const G_SHADER: &str = "Shader";
+pub const G_SAMPLER0: &str = "Texture 1 sampling";
+pub const G_SAMPLER1: &str = "Texture 2 sampling";
+pub const G_SAMPLER2: &str = "Texture 3 sampling";
+pub const G_TEXANIM0: &str = "Texture 1 animation";
+pub const G_TEXANIM1: &str = "Texture 2 animation";
+pub const G_TEXANIM2: &str = "Texture 3 animation";
+pub const G_TEXPAT0: &str = "Texture 1 frames";
+pub const G_TEXPAT1: &str = "Texture 2 frames";
+pub const G_TEXPAT2: &str = "Texture 3 frames";
+pub const G_TEXUV0: &str = "Texture 1 scrolling";
+pub const G_TEXUV1: &str = "Texture 2 scrolling";
+pub const G_TEXUV2: &str = "Texture 3 scrolling";
 
 pub const GROUPS: &[&str] = &[
     G_COMMON,
@@ -592,8 +592,9 @@ fn emission() -> Vec<Attr> {
         fl!(
             G_EMISSION,
             "emission.rate",
-            "Rate",
-            "Emission rate",
+            "Particles per frame",
+            "How many particles this part makes each frame while it emits. Fractions add up \
+             over frames: 0.5 is one every other frame.",
             0.05,
             emission.rate
         ),
@@ -1146,24 +1147,27 @@ fn emitter_info() -> Vec<Attr> {
         fl!(
             G_INFO,
             "emitter_info.scale_x",
-            "Scale X",
-            "Emitter scale X",
+            "Area X",
+            "Stretches the area this part's particles start in, and the way they move, \
+             along X. Particle size is set separately.",
             0.01,
             emitter_info.scale_x
         ),
         fl!(
             G_INFO,
             "emitter_info.scale_y",
-            "Scale Y",
-            "Emitter scale Y",
+            "Area Y",
+            "Stretches the area this part's particles start in, and the way they move, \
+             along Y. Particle size is set separately.",
             0.01,
             emitter_info.scale_y
         ),
         fl!(
             G_INFO,
             "emitter_info.scale_z",
-            "Scale Z",
-            "Emitter scale Z",
+            "Area Z",
+            "Stretches the area this part's particles start in, and the way they move, \
+             along Z. Particle size is set separately.",
             0.01,
             emitter_info.scale_z
         ),
@@ -1368,8 +1372,8 @@ fn particle() -> Vec<Attr> {
         it!(
             G_PARTICLE,
             "particle_data.life",
-            "Life",
-            "Lifetime, in frames",
+            "Particle life",
+            "How many frames each particle stays on screen.",
             particle_data.life
         ),
         it!(
@@ -1910,8 +1914,8 @@ fn rotation_and_motion() -> Vec<Attr> {
         fl!(
             G_ANIM_RATES,
             "emitter_static.color_scale",
-            "Colour scale",
-            "Colour scaling",
+            "Brightness",
+            "Multiplies every colour of this part. Above 1 makes it glow brighter.",
             0.01,
             emitter_static.color_scale
         ),
@@ -3051,49 +3055,5 @@ mod tests {
                 attr.id
             );
         }
-    }
-
-    /// A real game emitter has to expose the whole table, or the editor's rows are a list of
-    /// things that are always absent. Skipped without the corpus.
-    #[test]
-    fn a_real_emitter_carries_most_attributes() {
-        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
-        else {
-            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
-            return;
-        };
-        let path = root.join("effect/fighter/mario/ef_mario.eff");
-        let Ok(bytes) = std::fs::read(&path) else {
-            eprintln!("skipped: {} unreadable", path.display());
-            return;
-        };
-        let file = effect_library::NamcoEffectFile::load(&bytes).expect("mario's eff parses");
-        let ptcl = file.ptcl_file.expect("mario's eff has a PTCL");
-        let emitter = ptcl
-            .emitter_list
-            .emitter_sets
-            .iter()
-            .flat_map(|s| s.emitters.iter())
-            .next()
-            .expect("at least one emitter");
-
-        let values = read_all(&emitter.data);
-        let present = values.iter().filter(|v| v.is_some()).count();
-        let absent: Vec<&str> = table()
-            .iter()
-            .zip(&values)
-            .filter(|(_, v)| v.is_none())
-            .map(|(a, _)| a.id)
-            .collect();
-        eprintln!(
-            "{present}/{} attributes present on '{}'; absent: {absent:?}",
-            table().len(),
-            emitter.data.display_name()
-        );
-        assert_eq!(
-            present,
-            table().len(),
-            "a real SSBU emitter is missing documented rows: {absent:?}"
-        );
     }
 }

@@ -77,7 +77,7 @@ impl MotionListEditor {
         let title = format!("Motion List ({parent}/{})", self.file.file_name());
 
         egui::Window::new(title)
-            .id(Id::new("motion_list_editor"))
+            .id(Id::unique("motion_list_editor"))
             .open(&mut open)
             .resizable(true)
             .default_size([860.0, 620.0])
@@ -144,7 +144,7 @@ impl MotionListEditor {
                     );
                     changed |= hash_edit(
                         ui,
-                        Id::new("motion_path"),
+                        Id::unique("motion_path"),
                         &mut self.file.mlist.motion_path,
                         300.0,
                     );
@@ -162,10 +162,10 @@ impl MotionListEditor {
                 egui::Panel::left("motion_list_entries")
                     .resizable(true)
                     .default_size(280.0)
-                    .show_inside(ui, |ui| {
+                    .show(ui, |ui| {
                         changed |= self.entry_list(ui);
                     });
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                         changed |= self.selected_motion(ui, anim_names);
                     });
@@ -340,7 +340,7 @@ impl MotionListEditor {
                     "The motion name used by scripts like MotionModule::change_motion.",
                 );
                 let mut new_key = key;
-                if hash_edit(ui, Id::new("motion_key"), &mut new_key, f32::INFINITY) {
+                if hash_edit(ui, Id::unique("motion_key"), &mut new_key, f32::INFINITY) {
                     match rename_motion(&mut self.file.mlist, key, new_key) {
                         Ok(()) => {
                             self.selected = Some(new_key);
@@ -359,7 +359,7 @@ impl MotionListEditor {
 
                 ui.label("Game Script").on_hover_text("The ACMD game script for this motion.");
                 changed |=
-                    hash_edit(ui, Id::new("game_script"), &mut motion.game_script, f32::INFINITY);
+                    hash_edit(ui, Id::unique("game_script"), &mut motion.game_script, f32::INFINITY);
                 ui.end_row();
 
                 ui.label("Blend Frames").on_hover_text(BLEND_HELP);
@@ -411,7 +411,7 @@ impl MotionListEditor {
                     .changed();
                 ui.label("Unk");
                 changed |= anim_name_menu(ui, &mut anim.name, anim_names);
-                changed |= hash_edit(ui, Id::new(("motion_anim", i)), &mut anim.name, f32::INFINITY);
+                changed |= hash_edit(ui, Id::unique(("motion_anim", i)), &mut anim.name, f32::INFINITY);
             });
         }
         if let Some(i) = anim_to_remove {
@@ -434,7 +434,7 @@ impl MotionListEditor {
                 if ui.button("Remove").clicked() {
                     script_to_remove = Some(i);
                 }
-                changed |= hash_edit(ui, Id::new(("motion_script", i)), script, f32::INFINITY);
+                changed |= hash_edit(ui, Id::unique(("motion_script", i)), script, f32::INFINITY);
             });
         }
         if let Some(i) = script_to_remove {
@@ -554,7 +554,7 @@ fn anim_name_menu(ui: &mut Ui, name: &mut Hash40, anim_names: &[String]) -> bool
 /// Editable cancel, intangibility and interpolation fields.
 fn extra_fields(ui: &mut Ui, extra: &mut Extra) -> bool {
     let mut changed = false;
-    Grid::new(ui.id().with("motion_extra"))
+    Grid::new(ui.scope_id().with("motion_extra"))
         .num_columns(2)
         .min_col_width(LABEL_WIDTH)
         .show(ui, |ui| {
@@ -589,7 +589,7 @@ fn trailing_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
 ///
 /// Edits apply when the text box loses focus or enter is pressed.
 fn hash_edit(ui: &mut Ui, id: Id, hash: &mut Hash40, width: f32) -> bool {
-    let id = ui.id().with(id);
+    let id = ui.scope_id().with(id);
     let mut text = ui
         .data(|d| d.get_temp::<(u64, String)>(id))
         .filter(|(h, _)| *h == hash.0)

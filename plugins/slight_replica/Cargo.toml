@@ -1,6 +1,6 @@
 [package]
 name = "slight_replica"
-version = "0.1.0"
+version = "0.3.0"
 authors = ["Visionary"]
 edition = "2021"
 description = "From-scratch Jorge SLight replica — lib_effect_viewer.nro"
@@ -18,11 +18,23 @@ skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git"
 smash-arc = { git = "https://github.com/jam1garner/smash-arc", features = ["smash-runtime", "rust-zstd"] }
 # HDR PR 87 merged with 13.0.4/13.0.5 support; must match the installed libsmashline_plugin.
 smashline = { git = "https://github.com/joobert/smashline", branch = "sync/pr87" }
+smash_script = { git = "https://github.com/WuBoytH/smash-script", rev = "24c5b69b79c7d7b041c3993ecd766ceccf950c2b" }
 nnsdk = { git = "https://github.com/ultimate-research/nnsdk-rs" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 parking_lot = "0.12"
 regex-automata = "0.4"
+sha2 = { version = "0.11", default-features = false }
+
+[features]
+# The copy that ships inside an exported mod: it replays the mod's saved edits and has no
+# connection to the editor.
+exported = []
+# An exported mod whose plugin was built with its own moves and gimmicks compiled in. It
+# always runs, since no other copy has its code.
+carries_code = ["exported"]
+# The plugin inside an exported mod: only that mod's moves and gimmicks, no editor parts.
+mod_plugin = []
 
 [profile.dev]
 panic = "abort"

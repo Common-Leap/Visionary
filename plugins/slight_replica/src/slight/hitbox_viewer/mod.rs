@@ -33,6 +33,9 @@ use parking_lot::Mutex;
 use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
+mod drop_hooks;
+mod node_steps;
+pub use node_steps::{passes as guard_passes, LiveGuard};
 mod rate_hooks;
 mod sound_hooks;
 
@@ -235,6 +238,8 @@ pub const CAT_CLR_SPEED: u8 = 19;
 
 /// `SET_AIR` — an argument-less kinetic-state point. Must equal the editor's wire category.
 pub const CAT_SET_AIR: u8 = 20;
+/// A game call the user removed from a move. Keyed by the hash of the call's name.
+pub const CAT_DROP: u8 = 39;
 
 /// `KineticModule::change_kinetic` — a direct kinetic-type point. Must equal the editor's wire category.
 pub const CAT_CHANGE_KINETIC: u8 = 21;
@@ -847,7 +852,7 @@ unsafe fn record_for_boma_inner(
     {
         return;
     }
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let kind = smash::app::utility::get_kind(&mut *boma);
     let boid = (*boma).battle_object_id;
@@ -1028,10 +1033,6 @@ pub fn requeue_all() {
 /// queue means reconnecting never loads the complete history into plugin memory.
 pub fn take_archive_replay(max: usize) -> Vec<String> {
     capture_archive::take_replay(max)
-}
-
-pub fn archive_replay_active() -> bool {
-    capture_archive::replay_active()
 }
 
 /// Claim the first playback of `(kind, motion)` for one battle object and return its run id.
@@ -1277,7 +1278,7 @@ pub unsafe fn capture_tick(lua_state: u64) {
     let Some(watched) = watched else {
         return;
     };
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let end = smash::app::lua_bind::MotionModule::end_frame(boma);
 
@@ -1477,12 +1478,18 @@ pub struct InjectRule {
     /// Exact AREA_WIND family function. Omitted for attack/grab injections and old editors.
     #[serde(default)]
     pub command: Option<String>,
+    /// Condition from an If block, checked when the injection is due.
+    #[serde(default)]
+    pub guard: Option<node_steps::LiveGuard>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct HitboxRule {
     /// hash40 of the motion name ("attack_air_n").
     pub motion: u64,
+    /// The fighter this rule was made for; `None` fires for anyone playing the motion.
+    #[serde(default)]
+    pub fighter_kind: Option<i32>,
     /// Collision family this rule targets (0 attack / 1 grab / 2 wind). Old editors omit
     /// it → defaults to attack, preserving prior behavior.
     #[serde(default)]
@@ -1518,10 +1525,43 @@ pub struct HitboxRule {
     pub func: Option<String>,
 }
 
+/// The fighter whose hook is reading rules right now; -1 for anything that isn't a fighter.
+static ACTING_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Every rule lookup follows a hook reading this boma's motion, so that read names the fighter.
+pub unsafe fn note_acting(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    let kind = if smash::app::utility::get_category(&mut *boma)
+        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        smash::app::utility::get_kind(&mut *boma)
+    } else {
+        -1
+    };
+    ACTING_KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
+    note_acting(boma);
+    smash::app::lua_bind::MotionModule::motion_kind(boma)
+}
+
+/// Moves share names across fighters, so a rule only fires for the fighter it was made for.
+/// Projectiles run under their owner's rules, and Nana uses Popo's moves.
+pub fn acting_is(fighter_kind: Option<i32>) -> bool {
+    let acting = ACTING_KIND.load(std::sync::atomic::Ordering::Relaxed);
+    fighter_kind.is_none_or(|wanted| {
+        acting == -1
+            || acting == wanted
+            || (wanted == *smash::lib::lua_const::FIGHTER_KIND_POPO
+                && acting == *smash::lib::lua_const::FIGHTER_KIND_NANA)
+    })
+}
+
 impl HitboxRule {
     fn matches(&self, category: u8, motion: u64, id: u64, frame: f32) -> bool {
         self.category == category
             && self.motion == motion
+            && acting_is(self.fighter_kind)
             && self.hitbox_id.map(|h| h == id).unwrap_or(true)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
@@ -1530,6 +1570,42 @@ impl HitboxRule {
 
 static RULES: LazyLock<Mutex<Vec<HitboxRule>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static HAVE_RULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Separate from [`HAVE_RULES`]: some dropped calls run every frame for every fighter.
+static HAVE_DROPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The editor's key for a call name. **Must match the editor's `drop_key`.**
+fn drop_key(name: &str) -> u64 {
+    smash::hash40(&name.to_ascii_lowercase())
+}
+
+/// True when the user removed this game call from the move the fighter is doing now.
+pub(crate) unsafe fn dropped(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    names: &[&str],
+) -> bool {
+    if !HAVE_DROPS.load(std::sync::atomic::Ordering::Acquire) || boma.is_null() || is_injecting() {
+        return false;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return false;
+    }
+    let motion = acting_motion(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let hit = names.iter().find(|name| {
+        matches!(
+            action_for(CAT_DROP, motion, drop_key(name), frame),
+            Some((true, _))
+        )
+    });
+    if let Some(name) = hit {
+        crate::slight::diag::note(format!(
+            "dropped {name} (motion {motion:#x} frame {frame:.1})"
+        ));
+    }
+    hit.is_some()
+}
 
 /// Full-list replace (same semantics as effect spawn rules).
 pub fn set_rules(rules: Vec<HitboxRule>) {
@@ -1539,6 +1615,10 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
         *guard = rules;
     }
     HAVE_RULES.store(n != 0, std::sync::atomic::Ordering::Release);
+    HAVE_DROPS.store(
+        RULES.lock().iter().any(|rule| rule.category == CAT_DROP),
+        std::sync::atomic::Ordering::Release,
+    );
     // Categories, not just a count. "2 rule(s)" is true whether they are two hitbox rules or a
     // hitbox rule and a sound rule, and those need different answers when a live edit does
     // nothing — one says the editor never sent the family, the other says it sent it and the
@@ -1573,6 +1653,7 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
                     CAT_FT_START_ADJUST_MOTION_FRAME => "ft_start_adjust_motion_frame",
                     CAT_CLR_SPEED => "clr_speed",
                     CAT_SET_AIR => "set_air",
+                    CAT_DROP => "drop",
                     CAT_CHANGE_KINETIC => "change_kinetic",
                     CAT_KINETIC_ADD_SPEED => "kinetic_add_speed",
                     CAT_KINETIC_SUSPEND_ENERGY => "kinetic_suspend_energy",
@@ -1763,7 +1844,7 @@ macro_rules! expression_hook {
                 let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                     as *mut smash::app::BattleObjectModuleAccessor;
                 if !boma.is_null() {
-                    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                    let motion = acting_motion(boma);
                     let frame = smash::app::lua_bind::MotionModule::frame(boma);
                     if let Some((suppress, overrides)) =
                         expression_action(motion, frame, $func, &args)
@@ -1796,7 +1877,7 @@ unsafe fn hook_reverse_lr(lua_state: u64) {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             if let Some((suppress, _)) = action_for(CAT_REVERSE_LR, motion, 0, frame) {
                 if suppress {
@@ -1814,13 +1895,20 @@ unsafe fn hook_reverse_lr(lua_state: u64) {
 /// token separately and only sends a numeric replacement when the live capture can prove it.
 #[skyline::hook(replace = smash::app::sv_kinetic_energy::clear_speed)]
 unsafe fn hook_clr_speed(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::CLR_SPEED"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "CLR_SPEED", &args);
     if any_rules() {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             let Some(kind) = args.first().and_then(|arg| match arg {
                 LuaArg::Int(value) => Some(*value as f32),
@@ -1858,7 +1946,7 @@ unsafe fn hook_set_air(lua_state: u64) {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             if let Some((suppress, _)) = action_for(CAT_SET_AIR, motion, KINETIC_KEY_SET_AIR, frame)
             {
@@ -1872,11 +1960,41 @@ unsafe fn hook_set_air(lua_state: u64) {
 }
 
 /// Capture and sparsely suppress the measured argument-less direct kinetic clear point.
+/// Lets a move made from blocks stop the projectile its original script spawns.
+#[skyline::hook(replace = smash::app::lua_bind::ArticleModule::generate_article)]
+unsafe fn hook_generate_article(
+    boma: *mut smash::app::BattleObjectModuleAccessor,
+    article: i32,
+    arg3: bool,
+    arg4: i32,
+) -> u32 {
+    if any_rules()
+        && !is_injecting()
+        && smash::app::utility::get_category(&mut *boma)
+            == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        let motion = acting_motion(boma);
+        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        if let Some((true, _)) = action_for(
+            node_steps::CAT_ARTICLE_GENERATE,
+            motion,
+            article as u64,
+            frame,
+        ) {
+            crate::slight::diag::note(format!(
+                "stopped original object {article} (motion {motion:#x} frame {frame:.1})"
+            ));
+            return u32::MAX;
+        }
+    }
+    original!()(boma, article, arg3, arg4)
+}
+
 #[skyline::hook(replace = smash::app::lua_bind::KineticModule::clear_speed_all)]
 unsafe fn hook_kinetic_clear_speed_all(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
     record_for_boma(boma, "KineticModule::clear_speed_all", &[]);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         if let Some((suppress, _)) = action_for(
             CAT_KINETIC_CLEAR_SPEED_ALL,
@@ -1901,13 +2019,16 @@ unsafe fn hook_kinetic_set_consider_ground_friction(
     consider_ground_friction: bool,
     kinetic_energy_attribute: i32,
 ) {
+    if dropped(boma, &["KineticModule::set_consider_ground_friction"]) {
+        return Default::default();
+    }
     let args = [
         LuaArg::Bool(consider_ground_friction),
         LuaArg::Int(kinetic_energy_attribute as i64),
     ];
     record_for_boma(boma, "KineticModule::set_consider_ground_friction", &args);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key(
             "KineticModule::set_consider_ground_friction",
@@ -1952,13 +2073,16 @@ unsafe fn hook_change_kinetic(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     kinetic_type: i32,
 ) -> i32 {
+    if dropped(boma, &["KineticModule::change_kinetic"]) {
+        return Default::default();
+    }
     record_for_boma(
         boma,
         "KineticModule::change_kinetic",
         &[LuaArg::Int(kinetic_type as i64)],
     );
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("KineticModule::change_kinetic", &[kinetic_type as f32]);
         if let Some((suppress, overrides)) = action_for(CAT_CHANGE_KINETIC, motion, key, frame) {
@@ -1987,7 +2111,7 @@ macro_rules! kinetic_energy_hook {
         ) -> u64 {
             record_for_boma(boma, $func, &[LuaArg::Int(kinetic_energy_id as i64)]);
             if any_direct_rules(boma) {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[kinetic_energy_id as f32]);
                 if let Some((suppress, overrides)) = action_for($category, motion, key, frame) {
@@ -2040,6 +2164,9 @@ unsafe fn hook_kinetic_add_speed(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     speed: *const smash::phx::Vector3f,
 ) -> u64 {
+    if dropped(boma, &["KineticModule::add_speed"]) {
+        return Default::default();
+    }
     let Some(vector) = speed.as_ref().copied() else {
         record_for_boma(boma, "KineticModule::add_speed", &[]);
         return original!()(boma, speed);
@@ -2051,7 +2178,7 @@ unsafe fn hook_kinetic_add_speed(
     ];
     record_for_boma(boma, "KineticModule::add_speed", &args);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("KineticModule::add_speed", &[vector.x, vector.y, vector.z]);
         if let Some((suppress, overrides)) = action_for(CAT_KINETIC_ADD_SPEED, motion, key, frame) {
@@ -2089,7 +2216,7 @@ macro_rules! work_flag_hook {
         unsafe fn $hook_name(boma: *mut smash::app::BattleObjectModuleAccessor, flag: i32) {
             record_for_boma(boma, $func, &[LuaArg::Int(flag as i64)]);
             if any_direct_rules(boma) {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[flag as f32]);
                 if let Some((suppress, overrides)) =
@@ -2135,7 +2262,7 @@ macro_rules! work_transition_term_hook {
         ) {
             record_for_boma(boma, $func, &[LuaArg::Int(transition_term as i64)]);
             if any_direct_rules(boma) {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let key = numeric_point_key($func, &[transition_term as f32]);
                 if let Some((suppress, overrides)) =
@@ -2183,9 +2310,12 @@ work_transition_term_hook!(
 /// is the complete runtime identity because the operation has no value argument.
 #[skyline::hook(replace = smash::app::lua_bind::WorkModule::inc_int)]
 unsafe fn hook_work_module_inc_int(boma: *mut smash::app::BattleObjectModuleAccessor, slot: i32) {
+    if dropped(boma, &["WorkModule::inc_int"]) {
+        return Default::default();
+    }
     record_for_boma(boma, "WorkModule::inc_int", &[LuaArg::Int(slot as i64)]);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::inc_int", &[slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
@@ -2222,10 +2352,13 @@ unsafe fn hook_work_module_set_int(
     value: i32,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_int"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Int(value as i64), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_int", &args);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_int", &[value as f32, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
@@ -2266,10 +2399,13 @@ unsafe fn hook_work_module_set_int64(
     value: i64,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_int64"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Int(value), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_int64", &args);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = integer_point_key("WorkModule::set_int64", &[value, slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
@@ -2304,10 +2440,13 @@ unsafe fn hook_work_module_set_float(
     value: f32,
     slot: i32,
 ) {
+    if dropped(boma, &["WorkModule::set_float"]) {
+        return Default::default();
+    }
     let args = [LuaArg::Num(value), LuaArg::Int(slot as i64)];
     record_for_boma(boma, "WorkModule::set_float", &args);
     if any_direct_rules(boma) {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         let key = numeric_point_key("WorkModule::set_float", &[value, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
@@ -2346,13 +2485,20 @@ unsafe fn hook_work_module_set_float(
 /// a frame, while the editor refuses that fallback when several calls share the frame.
 #[skyline::hook(replace = smash::app::sv_animcmd::SET_SPEED_EX)]
 unsafe fn hook_set_speed_ex(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::SET_SPEED_EX"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 3);
     record(lua_state, "SET_SPEED_EX", &args);
     if any_rules() {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             let kind = match args.get(2) {
                 Some(LuaArg::Int(value)) => *value as u64,
@@ -2395,7 +2541,7 @@ unsafe fn hook_set_speed(lua_state: u64) {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             if let Some((suppress, overrides)) = action_for(CAT_SPEED, motion, 0, frame) {
                 if suppress {
@@ -2433,7 +2579,7 @@ unsafe fn hook_add_speed_no_limit(lua_state: u64) {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             if let Some((suppress, overrides)) =
                 action_for(CAT_ADD_SPEED_NO_LIMIT, motion, 0, frame)
@@ -2468,13 +2614,20 @@ unsafe fn hook_add_speed_no_limit(lua_state: u64) {
 /// Capture and sparsely override the verified `CORRECT` shape.
 #[skyline::hook(replace = smash::app::sv_animcmd::CORRECT)]
 unsafe fn hook_correct(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::CORRECT"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "CORRECT", &args);
     if any_rules() {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             let kind = match args.first() {
                 Some(LuaArg::Int(value)) => *value as u64,
@@ -2509,13 +2662,20 @@ unsafe fn hook_correct(lua_state: u64) {
 /// either slot.
 #[skyline::hook(replace = smash::app::sv_animcmd::FT_CATCH_STOP)]
 unsafe fn hook_ft_catch_stop(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::FT_CATCH_STOP"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 2);
     record(lua_state, "FT_CATCH_STOP", &args);
     if any_rules() {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             let numeric = args
                 .iter()
@@ -2558,13 +2718,20 @@ unsafe fn hook_ft_catch_stop(lua_state: u64) {
 /// semantic name to the value while still allowing a source-backed point to be retuned.
 #[skyline::hook(replace = smash::app::sv_animcmd::FT_START_ADJUST_MOTION_FRAME_arg1)]
 unsafe fn hook_ft_start_adjust_motion_frame(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::FT_START_ADJUST_MOTION_FRAME_arg1"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     record(lua_state, "FT_START_ADJUST_MOTION_FRAME_arg1", &args);
     if any_rules() {
         let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
-            let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+            let motion = acting_motion(boma);
             let frame = smash::app::lua_bind::MotionModule::frame(boma);
             let Some(value) = args.first().and_then(|arg| match arg {
                 LuaArg::Int(value) => Some(*value as f32),
@@ -2646,6 +2813,9 @@ unsafe fn hook_control_set_rumble(
     looped: bool,
     target: u32,
 ) {
+    if dropped(boma, &["ControlModule::set_rumble"]) {
+        return Default::default();
+    }
     let args = [
         LuaArg::Hash(kind.hash),
         LuaArg::Int(duration as i64),
@@ -2657,7 +2827,7 @@ unsafe fn hook_control_set_rumble(
     // straight to the original call; applying authored rules again can suppress or rewrite a
     // replacement that happens to share a frame and payload with another call.
     if any_direct_rules(boma) && !is_injecting() {
-        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+        let motion = acting_motion(boma);
         let frame = smash::app::lua_bind::MotionModule::frame(boma);
         if let Some((suppress, overrides)) =
             expression_action(motion, frame, "ControlModule::set_rumble", &args)
@@ -2714,6 +2884,11 @@ fn injection_fingerprint(
     for arg in &injection.args {
         hash = fnv(hash, arg.dedupe_bits());
     }
+    if let Some(guard) = &injection.guard {
+        for byte in format!("{guard:?}").bytes() {
+            hash = fnv(hash, byte as u64);
+        }
+    }
     hash
 }
 
@@ -2721,7 +2896,7 @@ fn injections_for(motion: u64) -> Vec<(u64, u8, InjectRule)> {
     let rules = RULES.lock();
     rules
         .iter()
-        .filter(|r| r.motion == motion && r.inject.is_some())
+        .filter(|r| r.motion == motion && r.inject.is_some() && acting_is(r.fighter_kind))
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
             (
@@ -2933,7 +3108,7 @@ macro_rules! attack_hook {
                     let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                         as *mut smash::app::BattleObjectModuleAccessor;
                     if !boma.is_null() {
-                        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                        let motion = acting_motion(boma);
                         let frame = smash::app::lua_bind::MotionModule::frame(boma);
                         let id = match args.first() {
                             Some(LuaArg::Int(i)) => *i as u64,
@@ -2953,6 +3128,21 @@ macro_rules! attack_hook {
                 }
             }
             original!()(lua_state);
+            let id = match args.first() {
+                Some(LuaArg::Int(id)) if (0..=7).contains(id) => Some(*id as u8),
+                Some(LuaArg::Num(id))
+                    if id.is_finite() && id.fract() == 0.0 && (0.0..=7.0).contains(id) =>
+                {
+                    Some(*id as u8)
+                }
+                _ => None,
+            };
+            if let Some(id) = id {
+                crate::slight::gimmicks::status_runtime::apply_attack_damage(
+                    smash::app::sv_system::battle_object_module_accessor(lua_state),
+                    id,
+                );
+            }
         }
     };
 }
@@ -2974,7 +3164,7 @@ unsafe fn hook_attack_fp(lua_state: u64) {
             let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let id = match args.first() {
                     Some(LuaArg::Int(value)) => *value as u64,
@@ -3065,7 +3255,7 @@ unsafe fn hook_catch(lua_state: u64) {
             let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 // CATCH's id may arrive as Int OR Num depending on how the script pushed it —
                 // accept both so grab rules actually match (Int-only missed float ids).
@@ -3204,7 +3394,7 @@ unsafe fn hook_search(lua_state: u64) {
             let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 // Same Int-or-Num tolerance `CATCH` needs: how the id arrives depends on how
                 // the script pushed it, and an Int-only read misses float ids entirely.
@@ -3254,7 +3444,7 @@ macro_rules! wind_hook {
                     let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                         as *mut smash::app::BattleObjectModuleAccessor;
                     if !boma.is_null() {
-                        let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                        let motion = acting_motion(boma);
                         let frame = smash::app::lua_bind::MotionModule::frame(boma);
                         let id = match args.first() {
                             Some(LuaArg::Int(id)) => *id as u64,
@@ -3330,7 +3520,7 @@ unsafe fn hook_attack_abs(lua_state: u64) {
             let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
-                let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+                let motion = acting_motion(boma);
                 let frame = smash::app::lua_bind::MotionModule::frame(boma);
                 let kind = match args.first() {
                     Some(LuaArg::Int(k)) => *k as u64,
@@ -3459,7 +3649,7 @@ unsafe fn hurt_action(
     {
         return false;
     }
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     // Hurtbox targets share one category, and `WHOLE_HIT`/`HIT_NODE`/`HIT_NO` do not
     // have interchangeable argument layouts.  Match the command as well as the target
@@ -3556,6 +3746,13 @@ unsafe fn hook_hit_no(lua_state: u64) {
 
 #[skyline::hook(replace = smash::app::sv_animcmd::COL_PRI)]
 unsafe fn hook_col_pri(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::COL_PRI"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 1);
     if !args.is_empty() {
         // `COL_PRI` is per fighter rather than per target, so every rule for it shares one key.
@@ -3642,7 +3839,7 @@ unsafe fn attack_mod_action(
         Some(LuaArg::Num(n)) => *n as u64,
         _ => return false,
     };
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = acting_motion(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
     let Some((suppress, overrides)) = action_for(category, motion, id, frame) else {
         return false;
@@ -3684,6 +3881,13 @@ unsafe fn hook_atk_power(lua_state: u64) {
 
 #[skyline::hook(replace = smash::app::sv_animcmd::ATK_SET_SHIELD_SETOFF_MUL)]
 unsafe fn hook_atk_set_shield_setoff_mul(lua_state: u64) {
+    if dropped(
+        smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor,
+        &["macros::ATK_SET_SHIELD_SETOFF_MUL"],
+    ) {
+        return;
+    }
     let args = read_args_exact(lua_state, 2);
     if args.len() >= 2
         && attack_mod_action(
@@ -3736,7 +3940,7 @@ pub unsafe fn inject_tick(lua_state: u64) {
     {
         return;
     }
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let motion = acting_motion(boma);
     let injections = injections_for(motion);
     if injections.is_empty() {
         return;
@@ -3755,6 +3959,23 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 || live_fingerprints.contains(fingerprint)
         });
 
+    let cancels: Vec<u64> = injections
+        .iter()
+        .filter(|(_, category, inj)| {
+            *category == node_steps::CAT_NODE_STEP
+                && inj.command.as_deref() == Some("enable_term")
+                && frame >= inj.frame
+        })
+        .filter_map(|(_, _, inj)| match inj.args.first() {
+            Some(LuaArg::Hash(symbol)) => Some(*symbol),
+            _ => None,
+        })
+        .collect();
+    if !cancels.is_empty() {
+        let _g = InjectGuard::new();
+        node_steps::follow_cancels(boma, &cancels);
+    }
+
     for (fingerprint, category, inj) in injections {
         let key = (boid, fingerprint);
         let due = frame >= inj.frame;
@@ -3766,6 +3987,29 @@ pub unsafe fn inject_tick(lua_state: u64) {
                 .unwrap_or(false)
         };
         if due && !already {
+            // The If is asked once, when its block is due, like the script's own `if`.
+            if inj
+                .guard
+                .as_ref()
+                .is_some_and(|guard| !node_steps::passes(boma, guard))
+            {
+                FIRED.lock().insert(key, (motion, frame));
+                continue;
+            }
+            if category == node_steps::CAT_NODE_STEP {
+                let mut agent = smash::lib::L2CAgent::new(lua_state);
+                let command = inj.command.as_deref().unwrap_or_default();
+                let done = {
+                    let _g = InjectGuard::new();
+                    node_steps::run(agent.lua_state_agent, boma, command, &inj.args)
+                };
+                agent.clear_lua_stack();
+                FIRED.lock().insert(key, (motion, frame));
+                crate::slight::diag::note(format!(
+                    "node step {command} done={done} (motion {motion:#x} frame {frame:.1})"
+                ));
+                continue;
+            }
             let lifecycle_command = match (category, inj.command.as_deref()) {
                 (CAT_GRAB, Some("GRAB_CLEAR_ALL")) => {
                     let _g = InjectGuard::new();
@@ -4136,6 +4380,7 @@ pub unsafe fn inject_tick(lua_state: u64) {
 }
 
 pub fn install() {
+    drop_hooks::install();
     capture_archive::init();
     skyline::install_hooks!(
         hook_attack,
@@ -4173,6 +4418,7 @@ pub fn install() {
         hook_ft_start_adjust_motion_frame,
         hook_clr_speed,
         hook_set_air,
+        hook_generate_article,
         hook_kinetic_clear_speed_all,
         hook_kinetic_set_consider_ground_friction,
         hook_change_kinetic,
