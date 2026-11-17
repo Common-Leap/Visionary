@@ -9534,6 +9534,10 @@ impl VisionaryApp {
         if self.eff_editor.view == crate::eff_editor::EffectView::Alone {
             return true;
         }
+        // A move known to play it is shown even on frames before its object comes out.
+        if self.eff_editor.open_move_plays_selected() {
+            return false;
+        }
         let facing = self.state.effect_script.facing_right_calls();
         let in_move = self
             .state
@@ -9782,11 +9786,13 @@ impl VisionaryApp {
                         || objects
                             .iter()
                             .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
-                    floor: self
-                        .state
-                        .selected_move
-                        .as_ref()
-                        .is_none_or(|m| crate::preview_floor::move_is_grounded(&m.name)),
+                    // An effect alone has no ground to stand on.
+                    floor: !alone
+                        && self
+                            .state
+                            .selected_move
+                            .as_ref()
+                            .is_none_or(|m| crate::preview_floor::move_is_grounded(&m.name)),
                     stage_shift: self.stage_shift(alone),
                     objects: objects
                         .iter()

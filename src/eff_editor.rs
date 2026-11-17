@@ -1748,8 +1748,8 @@ impl EffEditor {
             .unwrap_or_default()
     }
 
-    /// Whether the open move plays the selected effect.
-    fn open_move_plays_selected(&self) -> bool {
+    /// Whether the open move plays the selected effect, by its script or an object it makes.
+    pub fn open_move_plays_selected(&self) -> bool {
         self.open_motion.as_deref().is_some_and(|motion| {
             self.selected_uses()
                 .iter()
