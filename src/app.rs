@@ -31714,9 +31714,17 @@ impl VisionaryApp {
                 );
                 if response.dragged() || response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
+                        // A row is picked by its name or its bar; anywhere else scrubs.
                         let row_hit = if response.clicked() && pos.y >= rect.top() + 22.0 {
                             let index = ((pos.y - rect.top() - 22.0) / row_height) as usize;
-                            rows.get(index).cloned()
+                            rows.get(index)
+                                .filter(|row| {
+                                    let start = frame_x(row.start.min(total));
+                                    let end = frame_end_x(row.end.max(row.start).min(total))
+                                        .max(start + 3.0);
+                                    pos.x < grid_left || (start - 2.0..=end + 2.0).contains(&pos.x)
+                                })
+                                .cloned()
                         } else {
                             None
                         };
