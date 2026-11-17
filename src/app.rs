@@ -32180,22 +32180,34 @@ impl eframe::App for VisionaryApp {
                 egui::containers::menu::MenuButton::new("Tools")
                     .config(menu_config.clone())
                     .ui(ui, |ui| {
-                    ui.checkbox(&mut self.show_transplant, "Borrow effects")
-                        .on_hover_text("Copy an effect from another fighter into this one");
-                    ui.checkbox(&mut self.show_workspace, "Project files")
-                        .on_hover_text("The files in this project, including models and animations you add yourself");
+                    // Each item opens or closes a window; the menu closes with it, so it is
+                    // not left open over the page.
+                    let mut toggled = false;
+                    toggled |= ui
+                        .checkbox(&mut self.show_transplant, "Borrow effects")
+                        .on_hover_text("Copy an effect from another fighter into this one")
+                        .changed();
+                    toggled |= ui
+                        .checkbox(&mut self.show_workspace, "Project files")
+                        .on_hover_text("The files in this project, including models and animations you add yourself")
+                        .changed();
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
                     ui.add_enabled_ui(has_log, |ui| {
-                        ui.checkbox(&mut self.show_edit_log, "Changes")
-                            .on_hover_text("Every edit in this project");
+                        toggled |= ui
+                            .checkbox(&mut self.show_edit_log, "Changes")
+                            .on_hover_text("Every edit in this project")
+                            .changed();
                     });
                     if std::env::var_os("VISIONARY_DEBUG").is_some() {
                         ui.separator();
-                        ui.checkbox(&mut self.show_debug, "Debug overlay");
-                        ui.checkbox(&mut self.show_capture_debug, "Capture log");
+                        toggled |= ui.checkbox(&mut self.show_debug, "Debug overlay").changed();
+                        toggled |= ui.checkbox(&mut self.show_capture_debug, "Capture log").changed();
                     }
                     ui.separator();
-                    ui.checkbox(&mut self.credits.open, "Credits");
+                    toggled |= ui.checkbox(&mut self.credits.open, "Credits").changed();
+                    if toggled {
+                        ui.close();
+                    }
                 });
 
                 ui.separator();
