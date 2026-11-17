@@ -21,6 +21,7 @@ pub fn smashline_install() {
         }
     };
     skyline::println!("[SLight] Start preinstall on SSBU {game_version}");
+    skyline::println!("[SLight] plugin loader: {}", slight::loader::current().name());
     slight::smash_utils::ensure_slight_dirs();
     slight::diag::start_session();
     // The disabled set belongs in the boot log, not diag.txt: diag only flushes from the
@@ -29,8 +30,9 @@ pub fn smashline_install() {
     let _ = std::fs::write(
         format!("{}/effect_viewer_boot.txt", slight::smash_utils::ERROR_LOGS),
         format!(
-            "lib_effect_viewer v{PLUGIN_VERSION}\ngame={game_version}\nbuild={}\ndisabled={}\n",
+            "lib_effect_viewer v{PLUGIN_VERSION}\ngame={game_version}\nbuild={}\nloader={}\ndisabled={}\n",
             slight::effect_viewer::live_eff::BUILD_TAG,
+            slight::loader::current().name(),
             slight::smash_utils::disabled_subsystems(),
         ),
     );

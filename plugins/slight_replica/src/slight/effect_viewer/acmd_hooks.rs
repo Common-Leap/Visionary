@@ -3665,19 +3665,7 @@ const RESUME_COROUTINE: &[u8] = b"_ZN7lua2cpp12L2CAgentBase16resume_coroutineEiR
 const EFFECT_COMMON_CTOR: &[u8] = b"_ZN7lua2cpp29L2CFighterAnimcmdEffectCommonC1EPN3app12BattleObjectEPNS1_26BattleObjectModuleAccessorEP9lua_State\0";
 
 fn module_target(import: *const (), mangled: &[u8]) -> *const u8 {
-    // A missing import may be bound to zero even though Rust assumes function addresses
-    // are non-null. Keep the check opaque to the optimizer.
-    let import = std::hint::black_box(import);
-    if !import.is_null() {
-        return import.cast();
-    }
-    let mut addr = 0usize;
-    let rc = unsafe { skyline::nn::ro::LookupSymbol(&mut addr, mangled.as_ptr().cast()) };
-    if rc == 0 {
-        addr as *const u8
-    } else {
-        std::ptr::null()
-    }
+    crate::slight::loader::target(import, mangled)
 }
 
 // Address each hook below installs on; written just before its install call. skyline's hook
@@ -3740,21 +3728,22 @@ static MODULE_HOOKS: [ModuleHook; 4] = [
 
 fn install_module_hooks() {
     use std::sync::atomic::Ordering;
+    let loader = crate::slight::loader::current().name();
     for hook in &MODULE_HOOKS {
         if hook.installed.load(Ordering::Acquire) {
             continue;
         }
         let target = (hook.symbol)();
         if target.is_null() {
-            crate::slight::diag::note(format!("{} hook deferred (unresolved)", hook.name));
+            crate::slight::diag::note(format!("{} hook deferred (unresolved, {loader})", hook.name));
             continue;
         }
         if hook.installed.swap(true, Ordering::AcqRel) {
             continue;
         }
         unsafe { (hook.install)(target as usize) };
-        skyline::println!("[SLight] {} hook installed @ {:p}", hook.name, target);
-        crate::slight::diag::note(format!("{} hook installed", hook.name));
+        skyline::println!("[SLight] {} hook installed @ {:p} ({loader})", hook.name, target);
+        crate::slight::diag::note(format!("{} hook installed ({loader})", hook.name));
     }
 }
 
