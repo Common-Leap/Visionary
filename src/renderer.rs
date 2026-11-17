@@ -426,9 +426,8 @@ impl HitboxRenderState {
                 for (dir, anim) in picked.models {
                     let mut folder = ModelFolder::load_folder(&dir);
                     crate::preview_stage::turn_to_preview(&mut folder);
-                    let anim = anim.and_then(|path| {
-                        ssbh_data::anim_data::AnimData::from_file(path).ok()
-                    });
+                    let anim =
+                        anim.and_then(|path| ssbh_data::anim_data::AnimData::from_file(path).ok());
                     if send.send(StageModelLoad { folder, anim }).is_err() {
                         return;
                     }
@@ -481,7 +480,9 @@ impl HitboxRenderState {
 
     /// Whether a stage is shown, so the preview's own floor stays away.
     pub fn shows_stage(&self) -> bool {
-        self.stage_root.as_ref().is_some_and(|(_, stage)| stage.is_some())
+        self.stage_root
+            .as_ref()
+            .is_some_and(|(_, stage)| stage.is_some())
     }
 
     /// Hide the body meshes of the visibility groups not showing, and show again the ones

@@ -34,7 +34,10 @@ pub fn item_for_motion(motion: &str) -> Option<&'static str> {
 
 /// The item's model and skeleton, as an object the preview draws.
 pub fn load(data_root: &Path, folder: &str) -> Option<ObjectKind> {
-    load_model(&data_root.join("item").join(folder).join("model/body/c00"), folder)
+    load_model(
+        &data_root.join("item").join(folder).join("model/body/c00"),
+        folder,
+    )
 }
 
 /// A costume folder (`cNN`) of a model part: the fighter's own slot, else the first there is.

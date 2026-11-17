@@ -36,6 +36,25 @@ use crate::effects::{
 use crate::game_link::{GameLink, LinkStatus};
 use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 
+/// A move that plays an effect, as the Effects page lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoveUse {
+    /// The move in plain words, with the object that plays the effect for it if one does:
+    /// "Neutral special (fireball)".
+    pub label: String,
+    /// The move's motion name, to open it; `None` when it is not in the fighter's move list.
+    pub motion: Option<String>,
+}
+
+/// How the Effects page's view plays the selected effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectView {
+    /// By itself at the centre of the floor, looping, with the fighter hidden.
+    Alone,
+    /// In the open move, as the game plays it.
+    InMove,
+}
+
 /// Everything that decides what the texture thumbnail should show: the eff, the pool index, the
 /// replacement PNG's path and modification time, and whether raw form is selected.
 ///
@@ -455,8 +474,14 @@ pub struct EffEditor {
     entries: Vec<EffEntry>,
     /// The moves that spawn each effect (hash40 of its name), and whether every move has been
     /// read yet.
-    effect_uses: std::collections::HashMap<u64, Vec<String>>,
+    effect_uses: std::collections::HashMap<u64, Vec<MoveUse>>,
     effect_uses_ready: bool,
+    /// How the view plays the selected effect.
+    pub view: EffectView,
+    /// A move picked in the view's switch, for the app to open.
+    pub open_move_request: Option<String>,
+    /// The open move's motion name, to know whether it plays the selected effect.
+    open_motion: Option<String>,
     entry_filter: String,
     selected_entry: Option<usize>,
     selected_emitter: usize,
@@ -574,6 +599,9 @@ impl Default for EffEditor {
             entries: Vec::new(),
             effect_uses: Default::default(),
             effect_uses_ready: false,
+            view: EffectView::Alone,
+            open_move_request: None,
+            open_motion: None,
             entry_filter: String::new(),
             selected_entry: None,
             selected_emitter: 0,
@@ -1176,7 +1204,7 @@ impl EffEditor {
     /// been read (until then an effect with no moves may just not have been reached).
     pub fn set_effect_uses(
         &mut self,
-        uses: std::collections::HashMap<u64, Vec<String>>,
+        uses: std::collections::HashMap<u64, Vec<MoveUse>>,
         ready: bool,
     ) {
         self.effect_uses = uses;
@@ -1704,8 +1732,87 @@ impl EffEditor {
 
     /// The selected effect's name, as the game spawns it.
     /// The move open in the main window (its plain name), which "Use in" adds effects to.
-    pub fn set_open_move(&mut self, open_move: Option<String>) {
+    pub fn set_open_move(&mut self, open_move: Option<String>, motion: Option<String>) {
         self.open_move = open_move;
+        self.open_motion = motion;
+    }
+
+    /// The moves that play the selected effect.
+    fn selected_uses(&self) -> &[MoveUse] {
+        self.selected_entry
+            .and_then(|i| self.entries.get(i))
+            .and_then(|entry| self.effect_uses.get(&entry.hash))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Whether the open move plays the selected effect.
+    fn open_move_plays_selected(&self) -> bool {
+        self.open_motion.as_deref().is_some_and(|motion| {
+            self.selected_uses()
+                .iter()
+                .any(|found| found.motion.as_deref() == Some(motion))
+        })
+    }
+
+    /// The view's switch between the effect alone and a move that plays it. Drawn over the
+    /// view by the app.
+    pub fn draw_view_switch(&mut self, ui: &mut Ui, in_move: bool) {
+        if self.selected_entry.is_none() {
+            return;
+        }
+        let uses: Vec<MoveUse> = self
+            .selected_uses()
+            .iter()
+            .filter(|found| found.motion.is_some())
+            .cloned()
+            .collect();
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.view == EffectView::Alone, "Alone")
+                .on_hover_text("Play the effect by itself, over and over")
+                .clicked()
+            {
+                self.view = EffectView::Alone;
+            }
+            let showing_move = self.view == EffectView::InMove && in_move;
+            let current = if showing_move {
+                self.open_move.clone().unwrap_or_default()
+            } else {
+                "In a move".to_owned()
+            };
+            ui.add_enabled_ui(!uses.is_empty(), |ui| {
+                let combo = egui::ComboBox::from_id_salt("effect_view_move")
+                    .selected_text(egui::RichText::new(current).color(if showing_move {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().text_color()
+                    }))
+                    .height(360.0)
+                    .show_ui(ui, |ui| {
+                        for found in &uses {
+                            let here = showing_move
+                                && found.motion.as_deref() == self.open_motion.as_deref();
+                            if ui.selectable_label(here, &found.label).clicked() {
+                                self.view = EffectView::InMove;
+                                if self.open_motion != found.motion {
+                                    self.open_move_request = found.motion.clone();
+                                }
+                            }
+                        }
+                    });
+                combo
+                    .response
+                    .on_hover_text("Play a move that spawns this effect, as it plays in the game");
+            })
+            .response
+            .on_disabled_hover_text(if self.effect_uses_ready {
+                "No move script spawns this effect. The game may spawn it from code \
+                 the editor can't read."
+            } else {
+                "Still reading the moves"
+            });
+        });
     }
 
     /// The emitter (index in the selected effect's set) the view draws alone, if any.
@@ -1995,6 +2102,8 @@ impl EffEditor {
         self.selected_entry = self.entries.iter().position(|e| e.name == want);
         self.selected_emitter = 0;
         self.scroll_to_selected = true;
+        // Opened from a move's effect row: show it in that move.
+        self.view = EffectView::InMove;
     }
 
     /// Per-frame work while the Effects page is open: scan the files, and apply a queued load
@@ -2055,6 +2164,10 @@ impl EffEditor {
 
     /// The selected effect's emitters, with its texture and the game's live values below.
     pub fn page_right(&mut self, ui: &mut Ui, link: &GameLink) {
+        if self.selected_entry.is_none() {
+            ui.weak("Pick an effect on the left to change how it looks.");
+            return;
+        }
         egui::Panel::bottom("eff_game_panel_split")
             .resizable(true)
             .default_size(240.0)
@@ -2069,8 +2182,6 @@ impl EffEditor {
 
     fn draw_header(&mut self, ui: &mut Ui, link: &GameLink) {
         ui.horizontal_wrapped(|ui| {
-            crate::ui::game_connection(ui, link.status());
-            ui.separator();
             // The ONLY send control, in the header so it is reachable from every panel. A
             // second copy used to sit in the game panel reporting none of the phases below it,
             // so whichever one you happened to be looking at decided how much you were told
@@ -2356,58 +2467,72 @@ impl EffEditor {
                     filter.is_empty()
                         || entry.name.to_lowercase().contains(&filter)
                         || uses.get(&entry.hash).is_some_and(|moves| {
-                            moves.iter().any(|m| m.to_lowercase().contains(&filter))
+                            moves
+                                .iter()
+                                .any(|m| m.label.to_lowercase().contains(&filter))
                         })
                 };
                 if !self.entries.iter().any(|entry| matches(entry)) {
-                    ui.weak(if self.entries.is_empty() { "Open an effect file above to see its effects" } else { "No matching effects" });
+                    ui.weak(if self.entries.is_empty() {
+                        "Open an effect file above to see its effects"
+                    } else {
+                        "No matching effects"
+                    });
                 }
                 for (i, entry) in self.entries.iter().enumerate() {
                     if !matches(entry) {
                         continue;
                     }
                     ui.horizontal(|ui| {
-                        let live = link.is_live(entry.hash);
-                        let dot = if live {
-                            egui::Color32::from_rgb(90, 220, 90)
-                        } else {
-                            egui::Color32::DARK_GRAY
-                        };
-                        ui.colored_label(dot, "●")
-                            .on_hover_text(if live {
-                                "Seen spawning in game"
+                        // Whether the game has spawned it, only while there is a game to ask.
+                        if link.status() == LinkStatus::Connected {
+                            let live = link.is_live(entry.hash);
+                            let dot = if live {
+                                egui::Color32::from_rgb(90, 220, 90)
                             } else {
-                                "Not seen in game yet — trigger the move in training mode"
+                                egui::Color32::DARK_GRAY
+                            };
+                            ui.colored_label(dot, "●").on_hover_text(if live {
+                                "Seen spawning in the game"
+                            } else {
+                                "Not seen in the game yet. Do the move in training mode."
                             });
+                        }
                         let selected = self.selected_entry == Some(i);
                         // An edited entry is tinted rather than badged: the list is narrow, a
                         // word of text per row would push the names out of view, and this is
                         // the one thing you need to find again after scrolling away.
                         let text = egui::RichText::new(&entry.name).monospace();
+                        let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
                         let text = if edited_sets.contains(&entry.set_idx) {
                             text.color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
+                        } else if unused {
+                            text.weak()
                         } else {
                             text
                         };
-                        let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
-                        let response = ui.selectable_label(selected, text).on_hover_text(
-                            if unused {
-                                "No move script of this fighter spawns it. It may come from \
-                                 status code, an item or another fighter.\nRight-click to copy \
-                                 the name"
-                                    .to_owned()
-                            } else if edited_sets.contains(&entry.set_idx) {
-                                format!(
-                                    "hash40 0x{:010x}\nhas unsent changes\nright-click to copy the name",
-                                    entry.hash
-                                )
+                        let response = ui.selectable_label(selected, text).on_hover_text({
+                            let plays = match uses.get(&entry.hash) {
+                                Some(moves) => format!(
+                                    "Plays in: {}",
+                                    moves
+                                        .iter()
+                                        .map(|m| m.label.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                None if unused => "No move script spawns it. The game may \
+                                                       spawn it from code the editor can't read."
+                                    .to_owned(),
+                                None => "Reading the moves…".to_owned(),
+                            };
+                            let edited = if edited_sets.contains(&entry.set_idx) {
+                                "\nHas unsent changes"
                             } else {
-                                format!(
-                                    "hash40 0x{:010x}\nright-click to copy the name",
-                                    entry.hash
-                                )
-                            },
-                        );
+                                ""
+                            };
+                            format!("{plays}{edited}\nRight-click to copy the name")
+                        });
                         // The entry name is what goes into an ACMD `EFFECT` call, and the list
                         // is the only place it appears in full — the label is truncated once
                         // the panel is narrow, so retyping it from the screen is not an option.
@@ -2431,39 +2556,17 @@ impl EffEditor {
                             self.scroll_to_selected = false;
                         }
                     });
-                    // The moves that spawn it, under its name: the names are the game's, the
-                    // moves are what a person knows the effect by.
-                    let used = match uses.get(&entry.hash) {
-                        Some(moves) if moves.len() > 3 => {
-                            format!("{} +{} more", moves[..3].join(", "), moves.len() - 3)
-                        }
-                        Some(moves) => moves.join(", "),
-                        None => String::new(),
-                    };
-                    if !used.is_empty() {
-                        let all = uses
-                            .get(&entry.hash)
-                            .map(|moves| moves.join("\n"))
-                            .unwrap_or_default();
-                        ui.horizontal(|ui| {
-                            ui.add_space(18.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(used)
-                                        .small()
-                                        .color(egui::Color32::GRAY),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(all);
-                        });
-                    }
                 }
             });
         if let Some(i) = clicked {
             if self.selected_entry != Some(i) {
                 self.selected_entry = Some(i);
                 self.selected_emitter = 0;
+                self.view = if self.open_move_plays_selected() {
+                    EffectView::InMove
+                } else {
+                    EffectView::Alone
+                };
                 // The shared override store keeps per-kind forms — nothing to re-seed.
             }
         }
@@ -2506,7 +2609,7 @@ impl EffEditor {
                 } else {
                     format!("{emitter_count} parts")
                 })
-                    .color(egui::Color32::LIGHT_GRAY),
+                .color(egui::Color32::LIGHT_GRAY),
             );
             reset_entry = ui
                 .small_button("Reset effect")
@@ -2681,7 +2784,7 @@ impl EffEditor {
                         for (i, k) in keys.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 let mut rgb = [k.r, k.g, k.b];
-                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                if crate::ui::colour_field(ui, ("colour_key", label, i), &mut rgb) {
                                     k.r = rgb[0];
                                     k.g = rgb[1];
                                     k.b = rgb[2];

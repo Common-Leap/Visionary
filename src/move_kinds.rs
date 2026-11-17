@@ -497,6 +497,8 @@ pub fn plain_name(name: &str) -> String {
             "escape" => "dodge",
             "guard" => "shield",
             "appeal" => "taunt",
+            "win" => "victory pose",
+            "entry" => "entrance",
             "damage" => "hurt",
             "lr" => "sideways",
             other => other,

@@ -79,15 +79,71 @@ pub(crate) fn search_field(ui: &mut Ui, id: &str, query: &mut String, hint: &str
     });
 }
 
-pub(crate) fn game_connection(ui: &mut Ui, status: crate::game_link::LinkStatus) {
-    use crate::game_link::LinkStatus;
-    let (color, label) = match status {
-        LinkStatus::Connected => (egui::Color32::from_rgb(90, 220, 90), "Game connected"),
-        LinkStatus::Connecting => (egui::Color32::YELLOW, "Connecting…"),
-        LinkStatus::Disconnected => (egui::Color32::from_rgb(220, 90, 90), "Game offline"),
+/// A colour: the picker, its colour code (`#FF8800`), and R G B numbers for exact values. The
+/// numbers go above 1 as the game's do (`LAST_EFFECT_SET_COLOR(agent, 0.25, 1.3, 2.5)` is an
+/// over-bright blue); the picker and the code show such a colour at its brightest.
+pub(crate) fn colour_field(ui: &mut Ui, id: impl std::hash::Hash, rgb: &mut [f32; 3]) -> bool {
+    let mut changed = false;
+    let id = ui.make_persistent_id(id);
+    let mut picked = rgb.map(|v| v.clamp(0.0, 1.0));
+    if ui.color_edit_button_rgb(&mut picked).changed() {
+        *rgb = picked;
+        changed = true;
+    }
+    // The code being typed is kept while the box has focus, so a half-typed code is not
+    // replaced by the colour's own on the next frame.
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| colour_code(*rgb));
+    let response = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .id(id)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(64.0),
+        )
+        .on_hover_text("Colour code, like #FF8800");
+    if response.has_focus() {
+        if response.changed() {
+            if let Some(code) = parse_colour_code(&text) {
+                *rgb = code;
+                changed = true;
+            }
+        }
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    for (value, name) in rgb.iter_mut().zip(["R ", "G ", "B "]) {
+        changed |= ui
+            .add(
+                egui::DragValue::new(value)
+                    .speed(0.01)
+                    .range(0.0..=100.0)
+                    .max_decimals(3)
+                    .prefix(name),
+            )
+            .changed();
+    }
+    changed
+}
+
+/// `#RRGGBB` for a colour, each channel at most 1.
+pub(crate) fn colour_code(rgb: [f32; 3]) -> String {
+    let [r, g, b] = rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+/// Reads `#RRGGBB`, `RRGGBB` or `#RGB`.
+pub(crate) fn parse_colour_code(text: &str) -> Option<[f32; 3]> {
+    let hex = text.trim().trim_start_matches('#');
+    let hex: String = match hex.len() {
+        3 => hex.chars().flat_map(|c| [c, c]).collect(),
+        6 => hex.to_owned(),
+        _ => return None,
     };
-    ui.colored_label(color, "●");
-    ui.label(label);
+    let channel = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?].map(|v| v as f32 / 255.0))
 }
 
 /// One choice in a [`picker`].
@@ -304,5 +360,23 @@ pub(crate) fn bone_picker(
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod colour_code_tests {
+    use super::*;
+
+    #[test]
+    fn colour_codes_read_and_write() {
+        assert_eq!(colour_code([1.0, 0.5333, 0.0]), "#FF8800");
+        assert_eq!(colour_code([2.5, -1.0, 0.0]), "#FF0000");
+        assert_eq!(
+            parse_colour_code("#ff8800"),
+            Some([1.0, 136.0 / 255.0, 0.0])
+        );
+        assert_eq!(parse_colour_code("f80"), Some([1.0, 136.0 / 255.0, 0.0]));
+        assert_eq!(parse_colour_code("#ff88"), None);
+        assert_eq!(parse_colour_code("#gg8800"), None);
     }
 }

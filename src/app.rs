@@ -1032,7 +1032,12 @@ mod picker_state_tests {
 enum TimelineSelection {
     Hitbox(usize),
     Effect(usize),
-    Command { family: String, site: usize },
+    /// Shown only: a spawn inside a facing branch, which the timeline does not edit.
+    Seen,
+    Command {
+        family: String,
+        site: usize,
+    },
 }
 
 /// A sound command's plain name, or `None` for one this table does not know.
@@ -2128,7 +2133,7 @@ fn angle_picker(ui: &mut egui::Ui, angle: &mut i32) {
 /// not bone local space. For these we only use the bone's translation.
 /// Effect-kind id for the game link: hash40 of the lowercase effect name, or the literal
 /// hash for names ACMD parsing left unresolved ("0x…").
-fn effect_name_hash(name: &str) -> u64 {
+pub(crate) fn effect_name_hash(name: &str) -> u64 {
     if let Some(hex) = name.strip_prefix("0x") {
         if let Ok(h) = u64::from_str_radix(hex, 16) {
             return h;
@@ -9482,49 +9487,72 @@ impl VisionaryApp {
                 }
             }
         }
-        // On the Effects page, the selected effect plays from the move's first frame at the
-        // fighter's feet when the move itself does not spawn it, so any effect can be seen.
-        if self.eff_editor.open {
-            let selected = self.eff_editor.selected_entry_name().map(str::to_owned);
-            let in_move = |name: &str| {
-                self.state
-                    .effects
-                    .iter()
-                    .chain(facing.iter())
-                    .any(|ec| ec.effect_name.eq_ignore_ascii_case(name))
-                    || objects.iter().any(|object| {
-                        object
-                            .kind
-                            .effects
-                            .iter()
-                            .any(|effect| effect.name.eq_ignore_ascii_case(name))
-                    })
-            };
-            if let (Some(name), Some((_, file))) = (selected, self.effect_editor_draw_path()) {
-                if !in_move(&name) {
-                    let at = bones_at(FIRST_GAME_FRAME)
-                        .get("top")
-                        .map(|m| glam::Mat4::from_translation(m.col(3).truncate()))
-                        .unwrap_or(glam::Mat4::IDENTITY);
-                    // Played on its own clock, over and over, so it can be seen moving
-                    // whatever frame the move's timeline is on.
-                    let clock = (self.effect_loop_started.elapsed().as_secs_f32() * 60.0) as usize;
-                    let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
-                    out.push(crate::vfx_preview::EffectDraw {
-                        file,
-                        solo: solo_for(&name),
-                        name,
-                        placements: vec![at],
-                        kill_at: None,
-                        colour,
-                        particle_colour: [1.0; 4],
-                        ink: None,
-                        looping: Some(clock),
-                    });
-                }
+        // On the Effects page with the effect alone, it is all the view draws: at the centre of
+        // the floor, on its own clock, over and over.
+        if self.effect_alone(objects) {
+            out.clear();
+            if let (Some(name), Some((_, file))) = (
+                self.eff_editor.selected_entry_name().map(str::to_owned),
+                self.effect_editor_draw_path(),
+            ) {
+                let clock = (self.effect_loop_started.elapsed().as_secs_f32() * 60.0) as usize;
+                let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
+                out.push(crate::vfx_preview::EffectDraw {
+                    file,
+                    solo: solo_for(&name),
+                    name,
+                    placements: vec![glam::Mat4::IDENTITY],
+                    kill_at: None,
+                    colour,
+                    particle_colour: [1.0; 4],
+                    ink: None,
+                    looping: Some(clock),
+                });
             }
         }
         out
+    }
+
+    /// Whether the Effects page shows its selected effect alone: picked so, or the open move
+    /// does not play it (the move's own effects, or its objects').
+    fn effect_alone(&self, objects: &[crate::article_preview::PlacedObject]) -> bool {
+        if !self.eff_editor.open {
+            return false;
+        }
+        let Some(name) = self.eff_editor.selected_entry_name() else {
+            return false;
+        };
+        if self.eff_editor.view == crate::eff_editor::EffectView::Alone {
+            return true;
+        }
+        let facing = self.state.effect_script.facing_right_calls();
+        let in_move = self
+            .state
+            .effects
+            .iter()
+            .chain(facing.iter())
+            .any(|ec| ec.effect_name.eq_ignore_ascii_case(name))
+            || objects.iter().any(|object| {
+                object
+                    .kind
+                    .effects
+                    .iter()
+                    .any(|effect| effect.name.eq_ignore_ascii_case(name))
+            });
+        !in_move
+    }
+
+    /// The Effects page's switch between the selected effect alone and a move that plays it,
+    /// over the top of the view.
+    fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
+        egui::Area::new(egui::Id::new("effect_view_switch"))
+            .fixed_pos(rect.center_top() + egui::vec2(-110.0, 8.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    self.eff_editor.draw_view_switch(ui, !alone);
+                });
+            });
     }
 
     /// The stage picker over the preview's top-left corner.
@@ -9625,6 +9653,13 @@ impl VisionaryApp {
                         .map(|m| m.col(3).truncate())
                         .unwrap_or(glam::Vec3::ZERO);
                     rs.camera.follow = glam::Vec3::new(root.x, 0.0, root.z);
+                    if self.eff_editor.open
+                        && self.eff_editor.view == crate::eff_editor::EffectView::Alone
+                        && self.eff_editor.selected_entry_name().is_some()
+                    {
+                        // Centred low, on the floor the effect plays on.
+                        rs.camera.follow = glam::Vec3::new(0.0, -6.0, 0.0);
+                    }
                     // Left drag: pan in camera plane (left/right + up/down)
                     if response.dragged_by(egui::PointerButton::Primary) {
                         let delta = response.drag_delta();
@@ -9654,6 +9689,7 @@ impl VisionaryApp {
 
             // Paint the animated character and its objects. Circle overlays are drawn below by egui.
             let objects = self.preview_objects(frame);
+            let alone = self.effect_alone(&objects);
             if !self.object_loads.is_empty() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
@@ -9700,10 +9736,15 @@ impl VisionaryApp {
                             self.state.current_frame,
                         )
                     },
-                    trails: self.preview_trails(frame),
-                    hide_body: objects
-                        .iter()
-                        .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
+                    trails: if alone {
+                        Vec::new()
+                    } else {
+                        self.preview_trails(frame)
+                    },
+                    hide_body: alone
+                        || objects
+                            .iter()
+                            .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
                     floor: self
                         .state
                         .selected_move
@@ -9711,6 +9752,7 @@ impl VisionaryApp {
                         .is_none_or(|m| crate::preview_floor::move_is_grounded(&m.name)),
                     objects: objects
                         .iter()
+                        .filter(|_| !alone)
                         .filter_map(|object| {
                             Some(crate::renderer::ObjectDraw {
                                 model_dir: object.kind.model_dir.clone()?,
@@ -9724,10 +9766,14 @@ impl VisionaryApp {
                 },
             );
             ui.painter().add(callback);
+            if self.eff_editor.open && self.eff_editor.selected_entry_name().is_some() {
+                self.draw_effect_view_switch(ui, rect, alone);
+            }
 
-            // Draw hitbox spheres as projected 2D circles
+            // Draw hitbox spheres as projected 2D circles. Not on the Effects page, which
+            // shows the picture alone.
             let frame_num = self.state.current_frame;
-            if let Some(wgpu_state) = frame.wgpu_render_state() {
+            if let Some(wgpu_state) = frame.wgpu_render_state().filter(|_| !self.eff_editor.open) {
                 let renderer = wgpu_state.renderer.read();
                 if let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() {
                     // The WGPU model callback runs after egui builds these overlays, so
@@ -15939,24 +15985,11 @@ impl VisionaryApp {
                                         // 0..=1 picker would silently dim to 1. The picker
                                         // handles the ordinary case and the drags handle the
                                         // rest, so neither costs the other anything.
-                                        let mut picked = [
-                                            rgba[0].clamp(0.0, 1.0),
-                                            rgba[1].clamp(0.0, 1.0),
-                                            rgba[2].clamp(0.0, 1.0),
-                                        ];
-                                        if ui.color_edit_button_rgb(&mut picked).changed() {
-                                            rgba[0] = picked[0];
-                                            rgba[1] = picked[1];
-                                            rgba[2] = picked[2];
+                                        let mut picked = [rgba[0], rgba[1], rgba[2]];
+                                        if crate::ui::colour_field(ui, "flash_colour", &mut picked) {
+                                            rgba[..3].copy_from_slice(&picked);
                                             changed = true;
                                             respawn_needed = true;
-                                        }
-                                        for v in rgba[..3].iter_mut() {
-                                            if ui.add(egui::DragValue::new(v).speed(0.01)).changed()
-                                            {
-                                                changed = true;
-                                                respawn_needed = true;
-                                            }
                                         }
                                     });
                                     match pristine.as_ref().and_then(|p| p.color.as_ref()) {
@@ -16436,22 +16469,9 @@ impl VisionaryApp {
                                         respawn_needed = true;
                                     }
                                     if let Some(tint) = ec.tint.as_mut() {
-                                        // Unclamped drags beside a clamped picker, for the same
-                                        // reason the FLASH row above does it: the corpus writes
-                                        // `LAST_EFFECT_SET_COLOR(agent, 0.25, 1.3, 2.5)`, whose
-                                        // green and blue a 0..=1 picker would silently dim.
-                                        let mut picked = tint.map(|v| v.clamp(0.0, 1.0));
-                                        if ui.color_edit_button_rgb(&mut picked).changed() {
-                                            *tint = picked;
+                                        if crate::ui::colour_field(ui, "tint", tint) {
                                             changed = true;
                                             respawn_needed = true;
-                                        }
-                                        for v in tint.iter_mut() {
-                                            if ui.add(egui::DragValue::new(v).speed(0.01)).changed()
-                                            {
-                                                changed = true;
-                                                respawn_needed = true;
-                                            }
                                         }
                                     } else {
                                         egui::widgets::color_picker::show_color(
@@ -16508,18 +16528,9 @@ impl VisionaryApp {
                                         respawn_needed = true;
                                     }
                                     if let Some(tint) = ec.particle_tint.as_mut() {
-                                        let mut picked = tint.map(|v| v.clamp(0.0, 1.0));
-                                        if ui.color_edit_button_rgb(&mut picked).changed() {
-                                            *tint = picked;
+                                        if crate::ui::colour_field(ui, "particle_tint", tint) {
                                             changed = true;
                                             respawn_needed = true;
-                                        }
-                                        for v in tint.iter_mut() {
-                                            if ui.add(egui::DragValue::new(v).speed(0.01)).changed()
-                                            {
-                                                changed = true;
-                                                respawn_needed = true;
-                                            }
                                         }
                                     } else {
                                         ui.label(
@@ -29387,8 +29398,8 @@ impl VisionaryApp {
         });
     }
 
-    /// Keep the Effects page's "used by" index for the fighter whose effects are open (the
-    /// selected fighter for the shared file), scanning its moves in the background.
+    /// Keep the Effects page's "plays in" index for the fighter whose effects are open (the
+    /// selected fighter for the shared file), scanning its scripts in the background.
     fn poll_effect_uses(&mut self, ctx: &egui::Context) {
         let selected = self
             .state
@@ -29405,58 +29416,48 @@ impl VisionaryApp {
         } else {
             return;
         };
+        // The moves a use names are this fighter's: resolved again when its move list arrives.
+        let moves_known = self.move_list.len();
         let index = &mut self.effect_uses;
         if index.fighter != fighter {
             *index = EffectUseIndex {
-                rx: Some(spawn_move_effect_scan(&fighter)),
+                rx: Some(crate::effect_uses::spawn_scan(&fighter)),
                 fighter,
                 uses: HashMap::new(),
+                resolved_with: usize::MAX,
             };
             self.eff_editor.set_effect_uses(HashMap::new(), false);
         }
-        let Some(rx) = &index.rx else {
-            return;
-        };
+        let mut finished = index.rx.is_none();
         let mut changed = false;
-        let mut finished = false;
-        loop {
-            match rx.try_recv() {
-                Ok(UseScanMsg::Move(motion, calls)) => {
-                    let name = crate::move_kinds::plain_name(&motion);
-                    for call in calls
+        if let Some(rx) = &index.rx {
+            while let Ok((uses, done)) = rx.try_recv() {
+                index.uses = uses;
+                changed = true;
+                finished |= done;
+            }
+            if finished {
+                index.rx = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+        if changed || index.resolved_with != moves_known {
+            index.resolved_with = moves_known;
+            let resolved = index
+                .uses
+                .iter()
+                .map(|(hash, uses)| {
+                    let mut moves: Vec<crate::eff_editor::MoveUse> = uses
                         .iter()
-                        .filter(|c| c.color.is_none() && c.control.is_none())
-                    {
-                        let moves = index
-                            .uses
-                            .entry(effect_name_hash(&call.effect_name))
-                            .or_default();
-                        if !moves.contains(&name) {
-                            moves.push(name.clone());
-                            changed = true;
-                        }
-                    }
-                }
-                Ok(UseScanMsg::Total(_)) => {}
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
-        }
-        if finished {
-            index.rx = None;
-            for moves in index.uses.values_mut() {
-                moves.sort();
-            }
-        }
-        if changed || finished {
-            self.eff_editor
-                .set_effect_uses(index.uses.clone(), finished);
-        }
-        if !finished {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                        .map(|found| move_use(found, &self.move_list))
+                        .collect();
+                    moves.sort_by(|a, b| a.label.cmp(&b.label));
+                    moves.dedup();
+                    (*hash, moves)
+                })
+                .collect();
+            self.eff_editor.set_effect_uses(resolved, finished);
         }
     }
 
@@ -31367,6 +31368,7 @@ impl VisionaryApp {
                 self.state.selected_effect_call = Some(*index);
                 self.primary_tab = PrimaryEditorTab::Effects;
             }
+            TimelineSelection::Seen => {}
             TimelineSelection::Command { family, site } => {
                 self.selected_command = Some((family.clone(), *site));
                 if family == "hurtbox" {
@@ -31425,6 +31427,10 @@ impl VisionaryApp {
                 self.state.playing = false;
             }
             ui.label(format!("Frame {current} / {total}"));
+            // The Effects page's timeline lists only effects.
+            if self.eff_editor.open {
+                return;
+            }
             ui.separator();
             ui.weak("Show");
             for category in [
@@ -31466,10 +31472,65 @@ impl VisionaryApp {
             save_timeline_filters(self.timeline_filters);
         }
 
+        // The Effects page's timeline lists the move's effects, not its body flashes, with the
+        // open effect's spawns in colour and the rest greyed.
+        let effects_page = self.eff_editor.open;
+        let open_effect = self.eff_editor.selected_entry_name().map(str::to_owned);
         let rows: Vec<TimelineRow> = self
             .timeline_rows(total)
             .into_iter()
-            .filter(|row| self.timeline_filters.shows(row.category))
+            .filter(|row| {
+                if !effects_page {
+                    return self.timeline_filters.shows(row.category);
+                }
+                match row.selection {
+                    TimelineSelection::Effect(i) => self
+                        .state
+                        .effects
+                        .get(i)
+                        .is_some_and(|ec| ec.color.is_none() && ec.control.is_none()),
+                    _ => false,
+                }
+            })
+            .map(|mut row| {
+                if let (true, TimelineSelection::Effect(i), Some(open)) =
+                    (effects_page, &row.selection, open_effect.as_deref())
+                {
+                    let this = self
+                        .state
+                        .effects
+                        .get(*i)
+                        .is_some_and(|ec| ec.effect_name.eq_ignore_ascii_case(open));
+                    if !this {
+                        row.color = Color32::from_gray(90);
+                    }
+                }
+                row
+            })
+            .chain(
+                // Spawns the preview plays from the right-facing branch of the script.
+                effects_page
+                    .then(|| self.state.effect_script.facing_right_calls())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|ec| ec.color.is_none() && ec.control.is_none())
+                    .map(|ec| TimelineRow {
+                        category: TimelineCategory::Effects,
+                        selection: TimelineSelection::Seen,
+                        label: effect_call_display_name(&ec),
+                        start: ec.active_start,
+                        end: ec.active_end.max(ec.active_start + 1).min(total),
+                        seek_frame: ec.active_start,
+                        color: if open_effect
+                            .as_deref()
+                            .is_none_or(|open| ec.effect_name.eq_ignore_ascii_case(open))
+                        {
+                            Color32::from_rgb(255, 220, 0)
+                        } else {
+                            Color32::from_gray(90)
+                        },
+                    }),
+            )
             .collect();
         let row_height = SCRUBBER_ROW_HEIGHT;
         let label_width = (ui.available_width() * 0.22).clamp(110.0, 180.0);
@@ -31479,7 +31540,11 @@ impl VisionaryApp {
         if rows.is_empty() {
             // Say which: a filter hiding events is fixed by changing the filters; a move with
             // no events at all (its actions are in the fighter's code) has nothing to show.
-            if self.timeline_rows(total).is_empty() {
+            if self.state.selected_move.is_none() {
+                ui.weak("Pick a move to play it here.");
+            } else if effects_page {
+                ui.weak("This move spawns no effects from its script.");
+            } else if self.timeline_rows(total).is_empty() {
                 ui.weak(
                     "This move has nothing on its timeline. Drag along the frame bar to scrub.",
                 );
@@ -31564,6 +31629,7 @@ impl VisionaryApp {
                             hitbox_is_selected(self.selected_hitbox, *i)
                         }
                         TimelineSelection::Effect(i) => self.state.selected_effect_call == Some(*i),
+                        TimelineSelection::Seen => false,
                         TimelineSelection::Command { family, site } => self
                             .selected_command
                             .as_ref()
@@ -32207,8 +32273,11 @@ impl eframe::App for VisionaryApp {
             timeline_row_count,
             (ui.available_height() * 0.55).max(100.0),
         );
-        // The Characters page has no move to scrub through.
-        if !self.roster.open {
+        // The Characters page has no move to scrub through, nor does an effect shown alone.
+        let effect_alone = self.eff_editor.open
+            && self.eff_editor.view == crate::eff_editor::EffectView::Alone
+            && self.eff_editor.selected_entry_name().is_some();
+        if !self.roster.open && !effect_alone {
             egui::Panel::bottom("scrubber")
                 .default_size(180.0)
                 .min_size(72.0)
@@ -32338,13 +32407,17 @@ impl eframe::App for VisionaryApp {
                         == Some(crate::mod_project::fighter_from_source_rel(&rel).as_str())
             })
         };
+        let open_move = self.state.selected_move.as_ref().filter(|_| usable);
         self.eff_editor.set_open_move(
-            self.state
-                .selected_move
-                .as_ref()
-                .filter(|_| usable)
-                .map(|m| crate::move_kinds::plain_name(&m.name)),
+            open_move.map(|m| crate::move_kinds::plain_name(&m.name)),
+            open_move.map(|m| m.name.clone()),
         );
+        // A move picked in the view's switch.
+        if let Some(motion) = self.eff_editor.open_move_request.take() {
+            if let Some(entry) = self.move_list.iter().find(|m| m.name == motion).cloned() {
+                self.select_move(entry);
+            }
+        }
         self.eff_editor.update(&ctx, &self.game_link);
         if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
             if let Some(name) = self.eff_editor.selected_entry_name().map(str::to_owned) {
@@ -35147,8 +35220,40 @@ fn spawn_move_effect_scan(fighter: &str) -> std::sync::mpsc::Receiver<UseScanMsg
 #[derive(Default)]
 struct EffectUseIndex {
     fighter: String,
-    rx: Option<std::sync::mpsc::Receiver<UseScanMsg>>,
-    uses: HashMap<u64, Vec<String>>,
+    rx: Option<std::sync::mpsc::Receiver<(crate::effect_uses::Uses, bool)>>,
+    uses: crate::effect_uses::Uses,
+    /// How many moves the fighter's list had when the uses were last named.
+    resolved_with: usize,
+}
+
+/// A use as the Effects page lists it: the move in plain words, and the motion that opens it.
+fn move_use(
+    found: &crate::effect_uses::EffectUse,
+    moves: &[MoveEntry],
+) -> crate::eff_editor::MoveUse {
+    let motion = found.script.as_deref().and_then(|script| {
+        moves
+            .iter()
+            .find(|m| crate::effect_uses::script_is_for_motion(script, &m.name))
+            .map(|m| m.name.clone())
+    });
+    let move_name = motion
+        .clone()
+        .or_else(|| {
+            found
+                .script
+                .as_deref()
+                .map(crate::effect_uses::pascal_to_snake)
+        })
+        .map(|name| crate::move_kinds::plain_name(&name));
+    let object = found.object.as_deref().map(crate::move_kinds::plain_name);
+    let label = match (move_name, object) {
+        (Some(name), Some(object)) => format!("{name} ({})", object.to_lowercase()),
+        (Some(name), None) => name,
+        (None, Some(object)) => object,
+        (None, None) => String::new(),
+    };
+    crate::eff_editor::MoveUse { label, motion }
 }
 
 struct UseScan {
