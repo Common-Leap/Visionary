@@ -16,10 +16,10 @@ const TRAINING_CURVE: [u8; 16] = [
 /// The LUT as RGBA8 texels, 16x16x16 with red varying fastest.
 pub fn training_lut() -> Vec<u8> {
     let mut texels = Vec::with_capacity(16 * 16 * 16 * 4);
-    for b in 0..16 {
-        for g in 0..16 {
-            for r in 0..16 {
-                texels.extend([TRAINING_CURVE[r], TRAINING_CURVE[g], TRAINING_CURVE[b], 255]);
+    for b in TRAINING_CURVE {
+        for g in TRAINING_CURVE {
+            for r in TRAINING_CURVE {
+                texels.extend([r, g, b, 255]);
             }
         }
     }
@@ -74,8 +74,8 @@ mod tests {
         assert_eq!(cell(10, 0, 0), [176, 0, 0]);
         assert_eq!(cell(15, 15, 15), [255, 255, 255]);
         assert_eq!(cell(3, 7, 12), [46, 121, 209]);
-        for i in 0..16 {
-            assert!((curve(i as f32 / 15.0) * 255.0 - TRAINING_CURVE[i] as f32).abs() < 1e-3);
+        for (i, value) in TRAINING_CURVE.iter().enumerate() {
+            assert!((curve(i as f32 / 15.0) * 255.0 - *value as f32).abs() < 1e-3);
         }
     }
 

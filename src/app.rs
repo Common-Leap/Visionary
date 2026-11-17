@@ -3608,6 +3608,10 @@ pub struct VisionaryApp {
     perf: FrameProfiler,
 }
 
+/// An effect file rebuilt with the page's edits: its draw path and bytes (`None` for the file
+/// on disk).
+type EffectBuild = (PathBuf, Option<std::sync::Arc<Vec<u8>>>);
+
 /// Effect files rebuilt with the project's effect edits, so the 3D preview shows what the game
 /// will. The rebuild is the exporter's own (`rebuild_eff_bytes`) and runs on a thread a moment
 /// after the last edit.
@@ -3619,7 +3623,7 @@ struct EffectPreviewBuild {
     /// An edit is waiting for a rebuild: one starts as soon as none is running, so the preview
     /// follows within a couple of frames and a drag never queues more than one.
     due: bool,
-    running: Option<std::sync::mpsc::Receiver<(PathBuf, Option<std::sync::Arc<Vec<u8>>>)>>,
+    running: Option<std::sync::mpsc::Receiver<EffectBuild>>,
     /// Draw path to the edited bytes, or `None` for "back to the file on disk".
     overrides: HashMap<PathBuf, Option<std::sync::Arc<Vec<u8>>>>,
 }
@@ -31553,27 +31557,29 @@ impl VisionaryApp {
             })
             .chain(
                 // Spawns the preview plays from the right-facing branch of the script.
-                effects_page
-                    .then(|| self.state.effect_script.facing_right_calls())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|ec| ec.color.is_none() && ec.control.is_none())
-                    .map(|ec| TimelineRow {
-                        category: TimelineCategory::Effects,
-                        selection: TimelineSelection::Seen,
-                        label: effect_call_display_name(&ec),
-                        start: ec.active_start,
-                        end: ec.active_end.max(ec.active_start + 1).min(total),
-                        seek_frame: ec.active_start,
-                        color: if open_effect
-                            .as_deref()
-                            .is_none_or(|open| ec.effect_name.eq_ignore_ascii_case(open))
-                        {
-                            Color32::from_rgb(255, 220, 0)
-                        } else {
-                            Color32::from_gray(90)
-                        },
-                    }),
+                if effects_page {
+                    self.state.effect_script.facing_right_calls()
+                } else {
+                    Default::default()
+                }
+                .into_iter()
+                .filter(|ec| ec.color.is_none() && ec.control.is_none())
+                .map(|ec| TimelineRow {
+                    category: TimelineCategory::Effects,
+                    selection: TimelineSelection::Seen,
+                    label: effect_call_display_name(&ec),
+                    start: ec.active_start,
+                    end: ec.active_end.max(ec.active_start + 1).min(total),
+                    seek_frame: ec.active_start,
+                    color: if open_effect
+                        .as_deref()
+                        .is_none_or(|open| ec.effect_name.eq_ignore_ascii_case(open))
+                    {
+                        Color32::from_rgb(255, 220, 0)
+                    } else {
+                        Color32::from_gray(90)
+                    },
+                }),
             )
             .collect();
         let row_height = SCRUBBER_ROW_HEIGHT;

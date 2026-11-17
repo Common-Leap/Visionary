@@ -303,95 +303,6 @@ pub fn group_of(name: &str) -> MoveGroup {
     MoveGroup::Other
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Named examples land where a person would look for them.
-    ///
-    /// Each of these is an arm that an earlier arm would have swallowed, so this is the ordering
-    /// of `group_of` under test rather than its contents. Reordering the function passes every
-    /// other check in this file.
-    #[test]
-    fn the_arms_are_ordered_so_the_specific_case_wins() {
-        // `attack_air_*` before `attack*`.
-        assert_eq!(group_of("attack_air_n"), MoveGroup::Aerial);
-        assert_eq!(group_of("attack_s4_s"), MoveGroup::Smash);
-        assert_eq!(group_of("attack_s3_s"), MoveGroup::Tilt);
-        assert_eq!(group_of("attack_11"), MoveGroup::Jab);
-        assert_eq!(group_of("attack_100"), MoveGroup::Jab);
-        // Both spellings are real ParamLabels entries. Matching only the underscored one put
-        // every jab in the game into `Other`.
-        assert_eq!(group_of("attack11"), MoveGroup::Jab);
-        assert_eq!(group_of("attack100end"), MoveGroup::Jab);
-        assert_eq!(group_of("attack_dash"), MoveGroup::DashAttack);
-        // A copied special before Specials, and Kirby's own before that.
-        assert_eq!(group_of("cloud_special_n"), MoveGroup::CopySpecial);
-        assert_eq!(group_of("cloud_special_air_n"), MoveGroup::CopySpecial);
-        assert_eq!(group_of("special_n_start"), MoveGroup::Special);
-        // An item's flag-hoisting "special" is not a copy ability.
-        assert_eq!(group_of("item_special_flag_hoist"), MoveGroup::Item);
-        // Weapon movesets before `item_`, and before Movement for the `_dash` ones.
-        assert_eq!(group_of("bat_swing_dash"), MoveGroup::Item);
-        assert_eq!(group_of("scope_air_rapid_empty_fly2"), MoveGroup::Item);
-        assert_eq!(group_of("shoot_legs_dash_f"), MoveGroup::Item);
-        assert_eq!(group_of("item_light_get"), MoveGroup::Item);
-        // Matched by shape, not by name. These five are the ones a hand-written weapon list got
-        // wrong — `lip_stick`, not `lipstick` — so they are pinned individually.
-        assert_eq!(group_of("lip_stick_swing4"), MoveGroup::Item);
-        assert_eq!(group_of("fire_bar_swing3"), MoveGroup::Item);
-        assert_eq!(group_of("kill_sword_swing1_common"), MoveGroup::Item);
-        assert_eq!(group_of("sword_swing_dash"), MoveGroup::Item);
-        assert_eq!(group_of("death_scythe_swing4_charge"), MoveGroup::Item);
-        // Movement, including the brake forms that end in a side.
-        assert_eq!(group_of("walk_middle"), MoveGroup::Movement);
-        assert_eq!(group_of("run_brake_r"), MoveGroup::Movement);
-        assert_eq!(group_of("turn_run_brake"), MoveGroup::Movement);
-        // The families D1 actually needs.
-        assert_eq!(group_of("landing_air_f"), MoveGroup::JumpLand);
-        assert_eq!(group_of("down_bound_d"), MoveGroup::Damage);
-        assert_eq!(group_of("passive_wall"), MoveGroup::Damage);
-        assert_eq!(group_of("appeal_s_l"), MoveGroup::Presentation);
-        assert_eq!(group_of("entry_l"), MoveGroup::Presentation);
-        assert_eq!(group_of("swim_drown"), MoveGroup::Situational);
-        assert_eq!(group_of("squat_wait_item"), MoveGroup::Idle);
-    }
-
-    /// Case and whitespace do not decide a group.
-    ///
-    /// Move names reach this from two places — `ParamLabels.csv` and a live capture's motion hash
-    /// resolution — and they have disagreed on case before.
-    #[test]
-    fn grouping_is_case_insensitive() {
-        assert_eq!(group_of("AttackAirN"), group_of("attackairn"));
-        assert_eq!(group_of("  walk_middle  "), MoveGroup::Movement);
-    }
-
-    /// An unresolved hash is not silently swallowed.
-    ///
-    /// A motion whose label the dump does not carry shows as `0x…`, and it must still appear in
-    /// the list. Hiding it is exactly the failure this module was written to undo.
-    #[test]
-    fn an_unnamed_motion_still_gets_a_group() {
-        assert_eq!(group_of("0x00000b1a8c28e7"), MoveGroup::Other);
-    }
-
-    #[test]
-    fn every_move_list_section_has_explanatory_hover_text() {
-        for group in MoveGroup::ORDER
-            .into_iter()
-            .chain(std::iter::once(MoveGroup::Other))
-        {
-            assert!(!group.label().trim().is_empty(), "{group:?} has no label");
-            assert!(
-                group.description().split_whitespace().count() >= 4,
-                "{} does not explain its contents",
-                group.label()
-            );
-        }
-    }
-}
-
 /// The plain name of a move, such as "Forward smash" for `attack_s4_s`.
 pub fn plain_name(name: &str) -> String {
     let stripped = if name.len() > 3 {
@@ -509,4 +420,93 @@ pub fn plain_name(name: &str) -> String {
     letters.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(letters).collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Named examples land where a person would look for them.
+    ///
+    /// Each of these is an arm that an earlier arm would have swallowed, so this is the ordering
+    /// of `group_of` under test rather than its contents. Reordering the function passes every
+    /// other check in this file.
+    #[test]
+    fn the_arms_are_ordered_so_the_specific_case_wins() {
+        // `attack_air_*` before `attack*`.
+        assert_eq!(group_of("attack_air_n"), MoveGroup::Aerial);
+        assert_eq!(group_of("attack_s4_s"), MoveGroup::Smash);
+        assert_eq!(group_of("attack_s3_s"), MoveGroup::Tilt);
+        assert_eq!(group_of("attack_11"), MoveGroup::Jab);
+        assert_eq!(group_of("attack_100"), MoveGroup::Jab);
+        // Both spellings are real ParamLabels entries. Matching only the underscored one put
+        // every jab in the game into `Other`.
+        assert_eq!(group_of("attack11"), MoveGroup::Jab);
+        assert_eq!(group_of("attack100end"), MoveGroup::Jab);
+        assert_eq!(group_of("attack_dash"), MoveGroup::DashAttack);
+        // A copied special before Specials, and Kirby's own before that.
+        assert_eq!(group_of("cloud_special_n"), MoveGroup::CopySpecial);
+        assert_eq!(group_of("cloud_special_air_n"), MoveGroup::CopySpecial);
+        assert_eq!(group_of("special_n_start"), MoveGroup::Special);
+        // An item's flag-hoisting "special" is not a copy ability.
+        assert_eq!(group_of("item_special_flag_hoist"), MoveGroup::Item);
+        // Weapon movesets before `item_`, and before Movement for the `_dash` ones.
+        assert_eq!(group_of("bat_swing_dash"), MoveGroup::Item);
+        assert_eq!(group_of("scope_air_rapid_empty_fly2"), MoveGroup::Item);
+        assert_eq!(group_of("shoot_legs_dash_f"), MoveGroup::Item);
+        assert_eq!(group_of("item_light_get"), MoveGroup::Item);
+        // Matched by shape, not by name. These five are the ones a hand-written weapon list got
+        // wrong — `lip_stick`, not `lipstick` — so they are pinned individually.
+        assert_eq!(group_of("lip_stick_swing4"), MoveGroup::Item);
+        assert_eq!(group_of("fire_bar_swing3"), MoveGroup::Item);
+        assert_eq!(group_of("kill_sword_swing1_common"), MoveGroup::Item);
+        assert_eq!(group_of("sword_swing_dash"), MoveGroup::Item);
+        assert_eq!(group_of("death_scythe_swing4_charge"), MoveGroup::Item);
+        // Movement, including the brake forms that end in a side.
+        assert_eq!(group_of("walk_middle"), MoveGroup::Movement);
+        assert_eq!(group_of("run_brake_r"), MoveGroup::Movement);
+        assert_eq!(group_of("turn_run_brake"), MoveGroup::Movement);
+        // The families D1 actually needs.
+        assert_eq!(group_of("landing_air_f"), MoveGroup::JumpLand);
+        assert_eq!(group_of("down_bound_d"), MoveGroup::Damage);
+        assert_eq!(group_of("passive_wall"), MoveGroup::Damage);
+        assert_eq!(group_of("appeal_s_l"), MoveGroup::Presentation);
+        assert_eq!(group_of("entry_l"), MoveGroup::Presentation);
+        assert_eq!(group_of("swim_drown"), MoveGroup::Situational);
+        assert_eq!(group_of("squat_wait_item"), MoveGroup::Idle);
+    }
+
+    /// Case and whitespace do not decide a group.
+    ///
+    /// Move names reach this from two places — `ParamLabels.csv` and a live capture's motion hash
+    /// resolution — and they have disagreed on case before.
+    #[test]
+    fn grouping_is_case_insensitive() {
+        assert_eq!(group_of("AttackAirN"), group_of("attackairn"));
+        assert_eq!(group_of("  walk_middle  "), MoveGroup::Movement);
+    }
+
+    /// An unresolved hash is not silently swallowed.
+    ///
+    /// A motion whose label the dump does not carry shows as `0x…`, and it must still appear in
+    /// the list. Hiding it is exactly the failure this module was written to undo.
+    #[test]
+    fn an_unnamed_motion_still_gets_a_group() {
+        assert_eq!(group_of("0x00000b1a8c28e7"), MoveGroup::Other);
+    }
+
+    #[test]
+    fn every_move_list_section_has_explanatory_hover_text() {
+        for group in MoveGroup::ORDER
+            .into_iter()
+            .chain(std::iter::once(MoveGroup::Other))
+        {
+            assert!(!group.label().trim().is_empty(), "{group:?} has no label");
+            assert!(
+                group.description().split_whitespace().count() >= 4,
+                "{} does not explain its contents",
+                group.label()
+            );
+        }
+    }
 }

@@ -367,6 +367,22 @@ pub(crate) fn bone_picker(
     }
 }
 
+/// Runs a test frame like `Context::run_ui`, dropping the texture uploads no test applies
+/// (egui panics when they are dropped unhandled).
+#[cfg(test)]
+pub(crate) trait TestFrame {
+    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput;
+}
+
+#[cfg(test)]
+impl TestFrame for egui::Context {
+    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput {
+        let mut output = self.run_ui(input, ui);
+        output.textures_delta.clear();
+        output
+    }
+}
+
 #[cfg(test)]
 mod colour_code_tests {
     use super::*;
@@ -382,21 +398,5 @@ mod colour_code_tests {
         assert_eq!(parse_colour_code("f80"), Some([1.0, 136.0 / 255.0, 0.0]));
         assert_eq!(parse_colour_code("#ff88"), None);
         assert_eq!(parse_colour_code("#gg8800"), None);
-    }
-}
-
-/// Runs a test frame like `Context::run_ui`, dropping the texture uploads no test applies
-/// (egui panics when they are dropped unhandled).
-#[cfg(test)]
-pub(crate) trait TestFrame {
-    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput;
-}
-
-#[cfg(test)]
-impl TestFrame for egui::Context {
-    fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput {
-        let mut output = self.run_ui(input, ui);
-        output.textures_delta.clear();
-        output
     }
 }

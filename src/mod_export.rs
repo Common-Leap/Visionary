@@ -312,14 +312,16 @@ fn drop_unchanged_scripts(
             let sound = crate::acmd::parse_sound_script(&body);
             let expression = crate::acmd::parse_expression_script(&body);
             let effect = crate::acmd::parse_effect_script(&body);
-            let mut graph = MoveGraph::default();
-            graph.tracks = [Track::Game, Track::Sound, Track::Expression]
-                .into_iter()
-                .zip([&game, &sound, &expression])
-                .map(|(track, script)| {
-                    crate::move_nodes::timeline::import_for_fighter(fighter, track, script)
-                })
-                .collect();
+            let mut graph = MoveGraph {
+                tracks: [Track::Game, Track::Sound, Track::Expression]
+                    .into_iter()
+                    .zip([&game, &sound, &expression])
+                    .map(|(track, script)| {
+                        crate::move_nodes::timeline::import_for_fighter(fighter, track, script)
+                    })
+                    .collect(),
+                ..MoveGraph::default()
+            };
             graph
                 .tracks
                 .push(crate::move_nodes::effects::import_for_fighter(

@@ -5305,13 +5305,11 @@ fn parse_fixed_jostle_area_call(line: &str) -> Option<ExcuteStmt> {
         .and_then(|body| body.strip_suffix(");"))
     {
         (body, true)
-    } else if let Some(body) = line
-        .strip_prefix("FighterAreaModuleImpl::enable_fix_jostle_area(")
-        .and_then(|body| body.strip_suffix(");"))
-    {
-        (body, false)
     } else {
-        return None;
+        let body = line
+            .strip_prefix("FighterAreaModuleImpl::enable_fix_jostle_area(")
+            .and_then(|body| body.strip_suffix(");"))?;
+        (body, false)
     };
 
     let args = tokenize_args(body);
@@ -5610,13 +5608,11 @@ fn parse_article_native_call(line: &str) -> Option<ExcuteStmt> {
         .and_then(|body| body.strip_suffix(");"))
     {
         (body, false)
-    } else if let Some(body) = line
-        .strip_prefix("ArticleModule::shoot_exist(")
-        .and_then(|body| body.strip_suffix(");"))
-    {
-        (body, true)
     } else {
-        return None;
+        let body = line
+            .strip_prefix("ArticleModule::shoot_exist(")
+            .and_then(|body| body.strip_suffix(");"))?;
+        (body, true)
     };
     let args = tokenize_args(body);
     let [receiver, symbol, target, tail] = args.as_slice() else {

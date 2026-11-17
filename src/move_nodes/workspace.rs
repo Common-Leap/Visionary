@@ -1315,10 +1315,8 @@ fn hitbox_after_insert_point(nodes: &mut [MoveNode], id: u32) {
                     // Reserve IDs active on either possible path.
                     active.extend(other);
                 }
-                NodeKind::Repeat { count, body, .. } if *count > 0 => {
-                    if scan(body, id, active) {
-                        return true;
-                    }
+                NodeKind::Repeat { count, body, .. } if *count > 0 && scan(body, id, active) => {
+                    return true;
                 }
                 _ => {}
             }

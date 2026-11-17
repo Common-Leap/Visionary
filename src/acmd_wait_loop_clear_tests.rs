@@ -135,13 +135,12 @@ fn shape(stmts: &[AcmdStmt]) -> Vec<String> {
     for stmt in stmts {
         match stmt {
             AcmdStmt::Frame(frame) => out.push(format!("F{frame}")),
-            AcmdStmt::Excute(commands) => {
+            AcmdStmt::Excute(commands)
                 if commands
                     .iter()
-                    .any(|command| matches!(command, ExcuteStmt::Attack(_)))
-                {
-                    out.push("HIT".into());
-                }
+                    .any(|command| matches!(command, ExcuteStmt::Attack(_))) =>
+            {
+                out.push("HIT".into());
             }
             _ => {}
         }

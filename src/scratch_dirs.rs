@@ -120,6 +120,18 @@ pub fn app_scratch_dir(prefix: &str) -> anyhow::Result<tempfile::TempDir> {
         })
 }
 
+/// Replace a file the running game may be reading: write a sibling, then rename it over the
+/// old one, so a reader sees the old file or the new one and never half of either.
+pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    std::fs::write(&partial, bytes)?;
+    std::fs::rename(&partial, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&partial);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,16 +400,4 @@ mod tests {
             violations.join("\n  ")
         );
     }
-}
-
-/// Replace a file the running game may be reading: write a sibling, then rename it over the
-/// old one, so a reader sees the old file or the new one and never half of either.
-pub fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut partial = path.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    std::fs::write(&partial, bytes)?;
-    std::fs::rename(&partial, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&partial);
-    })
 }

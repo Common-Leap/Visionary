@@ -848,7 +848,7 @@ mod tests {
         };
         let (ahead, up) = flight.offset(10.0, 8.0);
         assert!(ahead > 13.0 && ahead < 14.0, "{ahead}");
-        assert!(up < 0.0 && up >= -8.0, "{up}");
+        assert!((-8.0..0.0).contains(&up), "{up}");
         // Long after it would have fallen through, it is still at or above the ground.
         let lowest = (0..70)
             .map(|frame| flight.offset(frame as f32, 8.0).1)

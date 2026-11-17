@@ -390,6 +390,7 @@ impl VfxPreview {
 
     /// Simulate and upload every effect for this frame. `view` and `projection` are the
     /// preview camera's (world to camera, camera to clip).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,

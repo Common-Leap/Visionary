@@ -2478,7 +2478,7 @@ impl EffEditor {
                                 .any(|m| m.label.to_lowercase().contains(&filter))
                         })
                 };
-                if !self.entries.iter().any(|entry| matches(entry)) {
+                if !self.entries.iter().any(&matches) {
                     ui.weak(if self.entries.is_empty() {
                         "Open an effect file above to see its effects"
                     } else {
@@ -4383,6 +4383,13 @@ fn describe_form(
     }
 }
 
+/// An edit happened: there is something unsent, and the preview is out of date. A free
+/// function over the two fields so it can run while an emitter is mutably borrowed.
+fn touch(dirty_at: &mut Option<Instant>, edit_rev: &mut u64) {
+    *dirty_at = Some(Instant::now());
+    *edit_rev += 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4930,11 +4937,4 @@ mod tests {
         assert!(editor.pending_edits.is_some());
         assert!(editor.pending_edits_push_live);
     }
-}
-
-/// An edit happened: there is something unsent, and the preview is out of date. A free
-/// function over the two fields so it can run while an emitter is mutably borrowed.
-fn touch(dirty_at: &mut Option<Instant>, edit_rev: &mut u64) {
-    *dirty_at = Some(Instant::now());
-    *edit_rev += 1;
 }
