@@ -3547,6 +3547,8 @@ pub struct VisionaryApp {
     preview_stage: Option<String>,
     /// The stages the data folder has, for the picker, and the folder they were read from.
     preview_stages: (Option<PathBuf>, Vec<String>),
+    /// The ledges of the stage shown, by stage name.
+    preview_ledges: (String, Vec<[f32; 2]>),
     /// Which moves spawn each effect, for the Effects page list.
     effect_uses: EffectUseIndex,
     /// When the Effects page's looping play of the open effect started.
@@ -3988,6 +3990,7 @@ impl VisionaryApp {
                 .map(|name| name.trim().to_owned())
                 .filter(|name| !name.is_empty()),
             preview_stages: (None, Vec::new()),
+            preview_ledges: (String::new(), Vec::new()),
             effect_uses: EffectUseIndex::default(),
             effect_loop_started: std::time::Instant::now(),
             effect_loop_for: None,
@@ -9555,6 +9558,26 @@ impl VisionaryApp {
             });
     }
 
+    /// How far the stage moves under the fighter so the open move is done where the game does
+    /// it: aerials above the ground, ledge moves from the left ledge. An effect alone stands on
+    /// the ground.
+    fn stage_shift(&mut self, alone: bool) -> glam::Vec3 {
+        let Some(stage) = self.preview_stage.clone() else {
+            return glam::Vec3::ZERO;
+        };
+        let Some(root) = self.state.data_root.clone() else {
+            return glam::Vec3::ZERO;
+        };
+        if self.preview_ledges.0 != stage {
+            self.preview_ledges = (stage.clone(), crate::preview_stage::ledges(&root, &stage));
+        }
+        let spot = match self.state.selected_move.as_ref() {
+            Some(m) if !alone => crate::preview_stage::spot(&m.name),
+            _ => crate::preview_stage::Spot::Ground,
+        };
+        crate::preview_stage::stage_shift(spot, &self.preview_ledges.1)
+    }
+
     /// The stage picker over the preview's top-left corner.
     fn draw_stage_picker(&mut self, ui: &mut Ui, rect: egui::Rect) {
         let root = self.state.data_root.clone();
@@ -9652,7 +9675,16 @@ impl VisionaryApp {
                         .or_else(|| bones.get("trans"))
                         .map(|m| m.col(3).truncate())
                         .unwrap_or(glam::Vec3::ZERO);
-                    rs.camera.follow = glam::Vec3::new(root.x, 0.0, root.z);
+                    // In the air over a stage, a little lower, to keep the ground in view.
+                    let lift = if self.preview_stage.is_some()
+                        && self.state.selected_move.as_ref().is_some_and(|m| {
+                            crate::preview_stage::spot(&m.name) == crate::preview_stage::Spot::Air
+                        }) {
+                        crate::preview_stage::AIR_HEIGHT * 0.5
+                    } else {
+                        0.0
+                    };
+                    rs.camera.follow = glam::Vec3::new(root.x, -lift, root.z);
                     if self.eff_editor.open
                         && self.eff_editor.view == crate::eff_editor::EffectView::Alone
                         && self.eff_editor.selected_entry_name().is_some()
@@ -9750,6 +9782,7 @@ impl VisionaryApp {
                         .selected_move
                         .as_ref()
                         .is_none_or(|m| crate::preview_floor::move_is_grounded(&m.name)),
+                    stage_shift: self.stage_shift(alone),
                     objects: objects
                         .iter()
                         .filter(|_| !alone)

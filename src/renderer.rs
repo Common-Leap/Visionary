@@ -126,6 +126,10 @@ pub struct HitboxRenderState {
     stage_root: Option<(std::path::PathBuf, Option<String>)>,
     /// The picked stage's models, drawn after the fighter and its objects.
     stage_models: Vec<RenderModel>,
+    /// What each stage model was placed from, to place it again when the stage shifts.
+    stage_parts: Vec<StageModelLoad>,
+    /// How far the stage is shifted under the fighter, in game space.
+    stage_shift: glam::Vec3,
     /// Stage model folders being read on a thread, arriving one at a time.
     stage_loading: Option<std::sync::Mutex<std::sync::mpsc::Receiver<StageModelLoad>>>,
     /// The stage floor under grounded moves, and its colour as stored in the scene.
@@ -213,6 +217,8 @@ impl HitboxRenderState {
             },
             stage_root: None,
             stage_models: Vec::new(),
+            stage_parts: Vec::new(),
+            stage_shift: glam::Vec3::ZERO,
             stage_loading: None,
             trails: crate::preview_trail::PreviewTrails::new(
                 device,
@@ -400,6 +406,7 @@ impl HitboxRenderState {
         }
         self.stage_root = key;
         self.stage_models.clear();
+        self.stage_parts.clear();
         self.stage_loading = None;
         let Some(root) = data_root else {
             return;
@@ -458,14 +465,12 @@ impl HitboxRenderState {
         for load in arrived {
             let mut model =
                 RenderModel::from_folder(device, queue, &load.folder, &self.shared_data);
-            model.apply_anims(
+            Self::place_stage_model(
+                &mut model,
+                &load,
+                self.stage_shift,
                 queue,
-                load.anim.iter(),
-                load.folder.find_skel(),
-                load.folder.find_matl(),
-                load.folder.find_hlpb(),
                 &self.shared_data,
-                0.0,
             );
             // The layer Inkling's ink paints onto the stage draws black with no ink on it.
             for mesh in model.meshes.iter_mut() {
@@ -474,8 +479,56 @@ impl HitboxRenderState {
                 }
             }
             self.stage_models.push(model);
+            // Only what placing needs is kept; the meshes and textures are on the GPU.
+            self.stage_parts.push(StageModelLoad {
+                folder: ModelFolder {
+                    skels: load.folder.skels,
+                    matls: load.folder.matls,
+                    hlpbs: load.folder.hlpbs,
+                    meshes: Vec::new(),
+                    meshexes: Vec::new(),
+                    modls: Vec::new(),
+                    adjs: Vec::new(),
+                    anims: Vec::new(),
+                    nutexbs: Vec::new(),
+                    xmbs: Vec::new(),
+                },
+                anim: load.anim,
+            });
         }
         more
+    }
+
+    /// Place a stage model: its own placing animation, with its root holding the turn into
+    /// preview space and the shift for the move.
+    fn place_stage_model(
+        model: &mut RenderModel,
+        parts: &StageModelLoad,
+        shift: glam::Vec3,
+        queue: &wgpu::Queue,
+        shared_data: &SharedRenderData,
+    ) {
+        let root = crate::preview_stage::root_anim(crate::preview_stage::root_transform(shift));
+        model.apply_anims(
+            queue,
+            parts.anim.iter().chain(std::iter::once(&root)),
+            parts.folder.find_skel(),
+            parts.folder.find_matl(),
+            parts.folder.find_hlpb(),
+            shared_data,
+            0.0,
+        );
+    }
+
+    /// Shift the stage under the fighter (game space), placing its models again if it moved.
+    fn shift_stage(&mut self, shift: glam::Vec3, queue: &wgpu::Queue) {
+        if (shift - self.stage_shift).length() < 1e-4 {
+            return;
+        }
+        self.stage_shift = shift;
+        for (model, parts) in self.stage_models.iter_mut().zip(&self.stage_parts) {
+            Self::place_stage_model(model, parts, shift, queue, &self.shared_data);
+        }
     }
 
     /// Whether a stage is shown, so the preview's own floor stays away.
@@ -979,6 +1032,8 @@ pub struct ViewportCallback {
     pub hidden_nodes: std::collections::HashSet<u64>,
     /// The fighter has turned into one of its objects (Inkling's squid): its body is not drawn.
     pub hide_body: bool,
+    /// How far the stage moves, in game space, to put the fighter where the move is done.
+    pub stage_shift: glam::Vec3,
 }
 
 /// One object model to draw, already animated and placed.
@@ -1046,6 +1101,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let anim_ms = t_anim.elapsed().as_secs_f64() * 1000.0;
             let t_obj = std::time::Instant::now();
             state.update_objects(device, queue, &self.objects);
+            state.shift_stage(self.stage_shift, queue);
             if state.collect_stage_models(device, queue) {
                 self.repaint
                     .request_repaint_after(std::time::Duration::from_millis(30));

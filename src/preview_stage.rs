@@ -136,6 +136,113 @@ fn shown_in_normal_play(stage: &str, set: &str) -> bool {
     !(stage == "end" && set.starts_with("floating"))
 }
 
+/// Where on the stage a move is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spot {
+    /// On the ground at the stage's centre.
+    Ground,
+    /// In the air above it, at about the height of a short hop.
+    Air,
+    /// Hanging from the stage's left ledge, facing the stage.
+    Ledge,
+}
+
+/// How high above the ground the preview does an aerial: about a short hop.
+pub const AIR_HEIGHT: f32 = 15.0;
+
+/// Where a move (by motion name) is done.
+pub fn spot(motion: &str) -> Spot {
+    if motion.starts_with("cliff") {
+        Spot::Ledge
+    } else if crate::preview_floor::move_is_grounded(motion) {
+        Spot::Ground
+    } else {
+        Spot::Air
+    }
+}
+
+/// The stage's ledges, as game-space (x, y), from its level data (`param/<stage>_00.lvd`).
+/// Each ledge is a `CLIFF` entry of a collision: the entry, then its position.
+pub fn ledges(data_root: &Path, stage: &str) -> Vec<[f32; 2]> {
+    let param = data_root.join("stage").join(stage).join("normal/param");
+    let lvd = std::fs::read_dir(&param)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "lvd"))
+        .min();
+    lvd.and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| cliff_positions(&bytes))
+        .unwrap_or_default()
+}
+
+/// The positions of the `CLIFF` entries in an LVD file. A cliff starts with its tag (type 3,
+/// version 4), then the common entry (223 bytes), then its x and y, big endian.
+fn cliff_positions(lvd: &[u8]) -> Vec<[f32; 2]> {
+    const TAG: &[u8] = b"\x03\x04\x01\x01\x77\x35\xBB\x75\x00\x00\x00\x02";
+    const ENTRY: usize = 223;
+    let float = |at: usize| -> Option<f32> {
+        Some(f32::from_be_bytes(lvd.get(at..at + 4)?.try_into().ok()?))
+    };
+    lvd.windows(TAG.len())
+        .enumerate()
+        .filter(|(_, window)| *window == TAG)
+        .filter_map(|(at, _)| {
+            let pos = at + TAG.len() + ENTRY + 1;
+            Some([float(pos)?, float(pos + 4)?])
+        })
+        .filter(|[x, y]| x.is_finite() && y.is_finite())
+        .collect()
+}
+
+/// How far the stage moves, in game space, so the fighter (always at the origin) is where the
+/// move is done: on the ground, in the air above it, or on the left ledge.
+pub fn stage_shift(spot: Spot, ledges: &[[f32; 2]]) -> glam::Vec3 {
+    let left = ledges.iter().copied().min_by(|a, b| a[0].total_cmp(&b[0]));
+    let ground = left.map_or(0.0, |[_, y]| y);
+    match (spot, left) {
+        (Spot::Ledge, Some([x, y])) => glam::Vec3::new(-x, -y, 0.0),
+        (Spot::Air, _) => glam::Vec3::new(0.0, -ground - AIR_HEIGHT, 0.0),
+        _ => glam::Vec3::new(0.0, -ground, 0.0),
+    }
+}
+
+/// The preview-space transform of a stage's root for a shift in game space.
+pub fn root_transform(shift: glam::Vec3) -> glam::Mat4 {
+    glam::Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2) * glam::Mat4::from_translation(shift)
+}
+
+/// The stage's root bone, which carries the turn into preview space and the shift for a move.
+pub const ROOT_BONE: &str = "VisionaryStageTurn";
+
+/// An animation that holds the stage's root at `transform`.
+pub fn root_anim(transform: glam::Mat4) -> ssbh_data::anim_data::AnimData {
+    use ssbh_data::anim_data::*;
+    let (scale, rotation, translation) = transform.to_scale_rotation_translation();
+    AnimData {
+        major_version: 2,
+        minor_version: 0,
+        final_frame_index: 0.0,
+        groups: vec![GroupData {
+            group_type: GroupType::Transform,
+            nodes: vec![NodeData {
+                name: ROOT_BONE.to_owned(),
+                tracks: vec![TrackData {
+                    name: "Transform".to_owned(),
+                    compensate_scale: false,
+                    transform_flags: TransformFlags::default(),
+                    values: TrackValues::Transform(vec![Transform {
+                        scale: scale.to_array().into(),
+                        rotation: rotation.to_array().into(),
+                        translation: translation.to_array().into(),
+                    }]),
+                }],
+            }],
+        }],
+    }
+}
+
 /// The stage's normal light set: `light00_set`, `light00` or `light_light` when there is one
 /// (Final Destination has several for its changing backgrounds), else the first.
 fn light_file(dir: &Path) -> Option<PathBuf> {
@@ -155,12 +262,12 @@ fn light_file(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The stage's space turned to the preview's: a stage runs left to right along the game's X,
-/// and the preview has the fighter facing +Z (model = Ry(-90) * game). Meshes with no parent
-/// bone have their vertices turned; a skeleton gets a new root carrying the turn, so bones,
-/// their animations and the meshes hung on them follow. Skinned vertices are turned too, which
-/// keeps them in step with the turned bind pose.
+/// and the preview has the fighter facing +Z (model = Ry(-90) * game). The skeleton gets a new
+/// root bone carrying the turn (and later the stage's shift for a move, by [`root_anim`]), and
+/// every mesh hangs from it: meshes with no bone are bound to it, and skinned vertices are
+/// turned to stay in step with the turned bind pose. A stage with no skeleton gets one.
 pub fn turn_to_preview(folder: &mut ssbh_wgpu::ModelFolder) {
-    let turn = glam::Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+    let turn = root_transform(glam::Vec3::ZERO);
     let turn_vector = |data: &mut ssbh_data::mesh_data::VectorData| {
         use ssbh_data::mesh_data::VectorData;
         let rotate = |x: f32, z: f32| (-z, x);
@@ -178,10 +285,40 @@ pub fn turn_to_preview(folder: &mut ssbh_wgpu::ModelFolder) {
             VectorData::Vector2(_) => {}
         }
     };
+    if folder.find_skel().is_none() {
+        folder.skels.retain(|(name, _)| name != "model.nusktb");
+        folder.skels.push((
+            "model.nusktb".to_owned(),
+            Some(ssbh_data::skel_data::SkelData {
+                major_version: 1,
+                minor_version: 0,
+                bones: Vec::new(),
+            }),
+        ));
+    }
+    for (_, skel) in folder.skels.iter_mut() {
+        let Some(skel) = skel else { continue };
+        for bone in skel.bones.iter_mut() {
+            bone.parent_index = Some(bone.parent_index.map_or(0, |parent| parent + 1));
+        }
+        skel.bones.insert(
+            0,
+            ssbh_data::skel_data::BoneData {
+                name: ROOT_BONE.to_owned(),
+                transform: turn.to_cols_array_2d(),
+                parent_index: None,
+                billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
+            },
+        );
+    }
     for (_, mesh) in folder.meshes.iter_mut() {
         let Some(mesh) = mesh else { continue };
         for object in mesh.objects.iter_mut() {
             if !object.parent_bone_name.is_empty() {
+                continue;
+            }
+            if object.bone_influences.is_empty() {
+                object.parent_bone_name = ROOT_BONE.to_owned();
                 continue;
             }
             for attribute in object
@@ -194,24 +331,6 @@ pub fn turn_to_preview(folder: &mut ssbh_wgpu::ModelFolder) {
                 turn_vector(&mut attribute.data);
             }
         }
-    }
-    for (_, skel) in folder.skels.iter_mut() {
-        let Some(skel) = skel else { continue };
-        if skel.bones.is_empty() {
-            continue;
-        }
-        for bone in skel.bones.iter_mut() {
-            bone.parent_index = Some(bone.parent_index.map_or(0, |parent| parent + 1));
-        }
-        skel.bones.insert(
-            0,
-            ssbh_data::skel_data::BoneData {
-                name: "VisionaryStageTurn".to_owned(),
-                transform: turn.to_cols_array_2d(),
-                parent_index: None,
-                billboard_type: ssbh_data::skel_data::BillboardType::Disabled,
-            },
-        );
     }
 }
 
@@ -229,6 +348,44 @@ mod tests {
             "landscape_change_darkspace_main_set"
         ));
         assert!(!shown_in_normal_play("battlefield", "transition_temporary"));
+    }
+
+    #[test]
+    fn moves_are_done_where_the_game_does_them() {
+        let ledges = [[-80.0, 0.0], [80.0, 0.0]];
+        assert_eq!(spot("cliff_wait"), Spot::Ledge);
+        assert_eq!(spot("attack_air_f"), Spot::Air);
+        assert_eq!(spot("attack_s4_s"), Spot::Ground);
+        assert_eq!(
+            stage_shift(Spot::Ledge, &ledges),
+            glam::Vec3::new(80.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            stage_shift(Spot::Air, &ledges),
+            glam::Vec3::new(0.0, -AIR_HEIGHT, 0.0)
+        );
+        assert_eq!(stage_shift(Spot::Ground, &[]), glam::Vec3::ZERO);
+        // The stage's ledge, turned into the preview, lands under the fighter.
+        let ledge = root_transform(stage_shift(Spot::Ledge, &ledges))
+            .transform_point3(glam::Vec3::new(-80.0, 0.0, 0.0));
+        assert!(ledge.length() < 1e-4, "{ledge}");
+    }
+
+    /// Needs VISIONARY_DATA_ROOT with Battlefield extracted; skipped otherwise.
+    #[test]
+    fn battlefield_ledges_come_from_its_level_data() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT") else {
+            return;
+        };
+        let found = ledges(Path::new(&root), "battlefield");
+        if found.is_empty() {
+            return;
+        }
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.iter().any(|[x, _]| (x + 80.0).abs() < 0.1),
+            "{found:?}"
+        );
     }
 
     #[test]
