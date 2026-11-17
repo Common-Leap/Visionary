@@ -4,6 +4,10 @@
 //! it, has files for it in `romfs/`, or links a moveset with scripts for it. This module is the
 //! pure logic for that: scanning the project's `romfs/`, pointing a fighter's paths into it, and
 //! naming the reasons a row belongs.
+//!
+//! A moveset's scripts and a fighter's edits count for the fighter's own row, except when the
+//! moveset installs that agent only on chosen costumes (`.set_costume(…)`): then they belong to
+//! the project's slot character on those costumes, as Empoleon's do on Falco's c80–c87.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -164,8 +168,51 @@ pub struct MembershipInputs<'a> {
     pub romfs_slots: &'a BTreeMap<String, BTreeSet<u8>>,
     pub moveset_fighters: &'a BTreeSet<String>,
     /// Fighters with edits right now, by name (any case). Edits are kept per fighter and
-    /// shared by its slot characters, so they count for the fighter's own row only.
+    /// shared by its slot characters, so they count for the rows [`script_owners`] names.
     pub has_edits: &'a BTreeSet<String>,
+    /// Fighters the linked moveset installs only on chosen costume slots
+    /// ([`SourceIndex::costume_gated`]).
+    pub costume_gated: &'a BTreeSet<String>,
+}
+
+/// The rows a fighter's scripts and edits belong to: its own row, unless the linked moveset
+/// installs that fighter's agent only on chosen costumes (`Agent::new("falco")
+/// .set_costume(…)`), in which case they are the slot characters this project is about. Those
+/// are the characters it added or has `romfs/` files for: Empoleon on Falco's c80–c87, never
+/// another mod's character on the same fighter. With none, the fighter's own row holds the
+/// slots, so it keeps them.
+pub fn script_owners(
+    name: &str,
+    all_rows: &[FighterEntry],
+    inputs: &MembershipInputs,
+) -> Vec<ProjectFighter> {
+    let gated = inputs
+        .costume_gated
+        .iter()
+        .any(|fighter| fighter.eq_ignore_ascii_case(name));
+    if gated {
+        let romfs = inputs.romfs_slots.get(&name.to_lowercase());
+        let characters: Vec<ProjectFighter> = all_rows
+            .iter()
+            .filter(|row| row.name.eq_ignore_ascii_case(name))
+            .filter_map(|row| {
+                let character = row.custom_name.as_ref()?;
+                let key = ProjectFighter::character(&row.name, character);
+                let in_project = inputs.added.contains(&key)
+                    || romfs.is_some_and(|slots| row.slots.iter().any(|s| slots.contains(s)));
+                in_project.then_some(key)
+            })
+            .collect();
+        if !characters.is_empty() {
+            return characters;
+        }
+    }
+    vec![ProjectFighter::fighter(
+        &all_rows
+            .iter()
+            .find(|row| row.custom_name.is_none() && row.name.eq_ignore_ascii_case(name))
+            .map_or(name, |row| row.name.as_str()),
+    )]
 }
 
 /// The reasons `entry` belongs in the project's list, in [`MembershipReason`] order; empty
@@ -197,15 +244,16 @@ pub fn membership(
             reasons.push(MembershipReason::RomfsFiles);
         }
     }
-    if own_row && inputs.moveset_fighters.contains(&entry.name) {
+    let scripted = inputs.moveset_fighters.contains(&entry.name);
+    let edited = inputs
+        .has_edits
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&entry.name));
+    let owns = (scripted || edited) && script_owners(&entry.name, all_rows, inputs).contains(&key);
+    if owns && scripted {
         reasons.push(MembershipReason::MovesetScripts);
     }
-    if own_row
-        && inputs
-            .has_edits
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(&entry.name))
-    {
+    if owns && edited {
         reasons.push(MembershipReason::HasEdits);
     }
     reasons
@@ -258,8 +306,9 @@ pub fn link_target(project_open: bool) -> LinkTarget {
     }
 }
 
-/// Add each fighter that `project` edits now but did not in `previously_edited` to `set`, and
-/// return the fighters it edits now (pass them back in on the next build).
+/// Add the rows of each fighter that `project` edits now but did not in `previously_edited` to
+/// `set`, and return the fighters it edits now (pass them back in on the next build). `owners`
+/// names a fighter's rows; see [`script_owners`].
 ///
 /// Only the first edit adds: a fighter the user removed from the project while it still has
 /// edits stays removed (it stays listed through [`MembershipReason::HasEdits`]). Never removes
@@ -268,12 +317,31 @@ pub fn absorb_edited_fighters(
     set: &mut BTreeSet<ProjectFighter>,
     previously_edited: &BTreeSet<String>,
     project: &ModProjectFile,
+    owners: impl Fn(&str) -> Vec<ProjectFighter>,
 ) -> BTreeSet<String> {
     let edited = edited_fighters(project);
     for name in edited.difference(previously_edited) {
-        set.insert(ProjectFighter::fighter(name));
+        set.extend(owners(name));
     }
     edited
+}
+
+/// Point the fighter rows a v1–v3 project was seeded with ([`ModProjectFile::migrate`]) at the
+/// rows that own their edits now that the fighter list and moveset are known: Empoleon's edits
+/// were seeded as Falco's own row. Character rows are left as they are.
+pub fn reassign_seeded_fighters(
+    set: &mut BTreeSet<ProjectFighter>,
+    owners: impl Fn(&str) -> Vec<ProjectFighter>,
+) {
+    let seeded: Vec<ProjectFighter> =
+        set.iter().filter(|row| row.character.is_none()).cloned().collect();
+    for row in seeded {
+        let rows = owners(&row.name);
+        if !rows.contains(&row) {
+            set.remove(&row);
+            set.extend(rows);
+        }
+    }
 }
 
 /// The slot characters `roster` authors, as project rows.
@@ -308,6 +376,19 @@ pub fn edited_fighters(project: &ModProjectFile) -> BTreeSet<String> {
         .filter(|(_, fighter)| fighter.has_edits())
         .map(|(name, _)| name.clone())
         .collect()
+}
+
+/// The moveset crate a project folder is itself, when it is one: a `Cargo.toml` whose crate has
+/// ACMD scripts. Used for a project that records no link, which before projects recorded one
+/// was every project kept inside its moveset.
+pub fn workspace_moveset(dir: &Path) -> Option<PathBuf> {
+    if !dir.join("Cargo.toml").is_file() {
+        return None;
+    }
+    SourceIndex::build(dir)
+        .ok()
+        .filter(SourceIndex::has_scripts)
+        .map(|_| dir.to_path_buf())
 }
 
 /// Re-open a loaded project's moveset link with `build`. Returns the path to keep, the index
@@ -461,6 +542,16 @@ mod tests {
         moveset: &[&str],
         edits: &[&str],
     ) -> Vec<Vec<MembershipReason>> {
+        run_gated(added, romfs, moveset, edits, &[])
+    }
+
+    fn run_gated(
+        added: &[ProjectFighter],
+        romfs: &[(&str, &[u8])],
+        moveset: &[&str],
+        edits: &[&str],
+        gated: &[&str],
+    ) -> Vec<Vec<MembershipReason>> {
         let added: BTreeSet<_> = added.iter().cloned().collect();
         let romfs_slots: BTreeMap<_, _> = romfs
             .iter()
@@ -468,11 +559,13 @@ mod tests {
             .collect();
         let moveset_fighters: BTreeSet<_> = moveset.iter().map(|s| s.to_string()).collect();
         let has_edits: BTreeSet<_> = edits.iter().map(|s| s.to_string()).collect();
+        let costume_gated: BTreeSet<_> = gated.iter().map(|s| s.to_string()).collect();
         let inputs = MembershipInputs {
             added: &added,
             romfs_slots: &romfs_slots,
             moveset_fighters: &moveset_fighters,
             has_edits: &has_edits,
+            costume_gated: &costume_gated,
         };
         let rows = rows();
         rows.iter().map(|r| membership(r, &rows, &inputs)).collect()
@@ -569,11 +662,13 @@ mod tests {
         let romfs_slots = BTreeMap::from([("mario".to_string(), BTreeSet::from([0u8]))]);
         let moveset_fighters = BTreeSet::new();
         let has_edits = BTreeSet::new();
+        let costume_gated = BTreeSet::new();
         let inputs = MembershipInputs {
             added: &added,
             romfs_slots: &romfs_slots,
             moveset_fighters: &moveset_fighters,
             has_edits: &has_edits,
+            costume_gated: &costume_gated,
         };
         let rows = vec![entry("Mario", None, 0..8)];
         assert_eq!(
@@ -591,6 +686,90 @@ mod tests {
             .insert("attack11".into(), Default::default());
     }
 
+    fn own_row(name: &str) -> Vec<ProjectFighter> {
+        vec![ProjectFighter::fighter(name)]
+    }
+
+    /// Empoleon: `Agent::new("pacman").set_costume(…)` stands in for `Agent::new("falco")
+    /// .set_costume(…)`. Scripts and edits on a costume-gated agent are the slot character's;
+    /// the fighter's own row is not in the project for them.
+    #[test]
+    fn costume_gated_moveset_belongs_to_the_slot_character() {
+        let got = run_gated(&[], &[("pacman", &[40, 41])], &["pacman"], &["pacman"], &["pacman"]);
+        assert!(got[1].is_empty(), "own row: {:?}", got[1]);
+        assert_eq!(
+            got[2],
+            vec![
+                MembershipReason::RomfsFiles,
+                MembershipReason::MovesetScripts,
+                MembershipReason::HasEdits,
+            ]
+        );
+        // An added character counts as the project's without any romfs files.
+        let got = run_gated(
+            &[ProjectFighter::character("pacman", "Shy Guy")],
+            &[],
+            &["pacman"],
+            &[],
+            &["pacman"],
+        );
+        assert!(got[1].is_empty());
+        assert_eq!(got[2], vec![MembershipReason::Added, MembershipReason::MovesetScripts]);
+    }
+
+    /// Gated, but the project names no character on that fighter (its slots are not split off,
+    /// or the character's mod is not this project's): the own row holds the slots and keeps them.
+    #[test]
+    fn costume_gated_without_a_project_character_stays_on_the_own_row() {
+        let got = run_gated(&[], &[], &["pacman"], &["pacman"], &["pacman"]);
+        assert_eq!(
+            got[1],
+            vec![MembershipReason::MovesetScripts, MembershipReason::HasEdits]
+        );
+        assert!(got[2].is_empty());
+        // romfs files on the fighter's own slots only do not make Shy Guy the project's.
+        let got = run_gated(&[], &[("pacman", &[3])], &["pacman"], &[], &["pacman"]);
+        assert_eq!(
+            got[1],
+            vec![MembershipReason::RomfsFiles, MembershipReason::MovesetScripts]
+        );
+        assert!(got[2].is_empty());
+    }
+
+    #[test]
+    fn first_edit_on_a_gated_fighter_adds_the_character() {
+        let rows = rows();
+        let added = BTreeSet::new();
+        let romfs_slots = BTreeMap::from([("pacman".to_string(), BTreeSet::from([40u8]))]);
+        let empty = BTreeSet::new();
+        let gated = BTreeSet::from(["pacman".to_string()]);
+        let inputs = MembershipInputs {
+            added: &added,
+            romfs_slots: &romfs_slots,
+            moveset_fighters: &empty,
+            has_edits: &empty,
+            costume_gated: &gated,
+        };
+        let mut set = BTreeSet::new();
+        let mut project = crate::mod_project::ModProjectFile::default();
+        edited(&mut project, "pacman");
+        absorb_edited_fighters(&mut set, &BTreeSet::new(), &project, |name| {
+            script_owners(name, &rows, &inputs)
+        });
+        assert_eq!(set, BTreeSet::from([ProjectFighter::character("pacman", "Shy Guy")]));
+
+        // A v3 file seeded the fighter's own row from the same edits.
+        let mut seeded = BTreeSet::from([ProjectFighter::fighter("pacman"), ProjectFighter::fighter("mario")]);
+        reassign_seeded_fighters(&mut seeded, |name| script_owners(name, &rows, &inputs));
+        assert_eq!(
+            seeded,
+            BTreeSet::from([
+                ProjectFighter::fighter("mario"),
+                ProjectFighter::character("pacman", "Shy Guy"),
+            ])
+        );
+    }
+
     #[test]
     fn editing_adds_fighter_and_survives_undo() {
         let mut set = BTreeSet::new();
@@ -598,12 +777,12 @@ mod tests {
         edited(&mut project, "fox");
         // Built but unedited: not a member.
         project.fighters.entry("mario".into()).or_default();
-        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project);
+        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project, own_row);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
         assert_eq!(edited_now, BTreeSet::from(["fox".to_string()]));
         // The edit is undone; the next build still keeps fox.
         project.fighters.clear();
-        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project, own_row);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
         assert!(edited_now.is_empty());
     }
@@ -635,17 +814,17 @@ mod tests {
         let mut set = BTreeSet::new();
         let mut project = crate::mod_project::ModProjectFile::default();
         edited(&mut project, "fox");
-        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project);
+        let edited_now = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project, own_row);
         // "Remove from project" while fox still has edits.
         set.remove(&ProjectFighter::fighter("fox"));
-        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project, own_row);
         assert!(set.is_empty());
         assert_eq!(edited_now, BTreeSet::from(["fox".to_string()]));
         // Undone and edited again: that is a new edit, so fox joins again.
         project.fighters.clear();
-        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project);
+        let edited_now = absorb_edited_fighters(&mut set, &edited_now, &project, own_row);
         edited(&mut project, "fox");
-        absorb_edited_fighters(&mut set, &edited_now, &project);
+        absorb_edited_fighters(&mut set, &edited_now, &project, own_row);
         assert_eq!(set, BTreeSet::from([ProjectFighter::fighter("fox")]));
     }
 
@@ -667,6 +846,23 @@ mod tests {
             loaded.project_fighters,
             BTreeSet::from([ProjectFighter::fighter("ghost")])
         );
+    }
+
+    /// Empoleon keeps `modproject.json` in the moveset crate itself and never recorded a link.
+    #[test]
+    fn a_project_inside_its_moveset_crate_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src/emperte")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "mod emperte;\npub fn main() { let a = &mut Agent::new(\"falco\"); emperte::install(a); }\n").unwrap();
+        assert_eq!(workspace_moveset(dir.path()), None, "a crate with no scripts is not a moveset");
+        std::fs::write(
+            dir.path().join("src/emperte/mod.rs"),
+            "unsafe extern \"C\" fn game_attackhi3(agent: &mut L2CAgentBase) {}\npub fn install(agent: &mut Agent) { agent.acmd(\"game_attackhi3\", game_attackhi3, Priority::Low); }\n",
+        )
+        .unwrap();
+        assert_eq!(workspace_moveset(dir.path()), Some(dir.path().to_path_buf()));
+        assert_eq!(workspace_moveset(&dir.path().join("src")), None, "no Cargo.toml there");
     }
 
     #[test]

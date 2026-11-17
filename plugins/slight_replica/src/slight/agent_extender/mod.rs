@@ -81,10 +81,11 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
         crate::slight::effect_viewer::effect_reload::pump_asset_carrier(boma);
         crate::slight::effect_viewer::acmd_hooks::pump_carrier_follows(boma);
     }
-    // Live hitbox injection still runs from the per-agent callback. Effect/control retiming is
-    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, not from this
-    // status callback.
+    // Live hitbox injection runs from the per-agent callback. Effect/control retiming is
+    // dispatched from the effect ACMD's call/frame/wait boundaries in acmd_hooks, and from here
+    // for any frame no boundary reaches (see `acmd_hooks::inject_tick`).
     crate::slight::hitbox_viewer::inject_tick(lua_state);
+    crate::slight::effect_viewer::acmd_hooks::inject_tick(lua_state);
     // End-of-motion watch: tells the editor when a captured move's script has finished, so
     // its auto "live fetch" adopts the WHOLE script instead of the first few frames.
     crate::slight::hitbox_viewer::capture_tick(lua_state);

@@ -287,6 +287,11 @@ pub const CAT_WORK_MODULE_INC_INT: u8 = 35;
 /// Direct `MotionModule::set_frame_partial` point. Must equal the editor's wire category.
 pub const CAT_MOTION_MODULE_SET_FRAME_PARTIAL: u8 = 36;
 
+/// The script's grab clear — `grab!(agent, *MA_MSC_CMD_GRAB_CLEAR_ALL)` or a direct
+/// `GrabModule::clear_all`. Must equal the editor's wire category. Its own category rather than
+/// `CAT_GRAB`, whose rules are keyed by box id and would otherwise match a `CATCH` on the frame.
+pub const CAT_GRAB_CLEAR: u8 = 37;
+
 /// Targetless rule key for `SET_AIR`. Must equal `game_link::KINETIC_KEY_SET_AIR`.
 const KINETIC_KEY_SET_AIR: u64 = u64::MAX - 2;
 
@@ -1549,6 +1554,7 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
                 let name = match *c {
                     CAT_ATTACK => "attack",
                     CAT_GRAB => "grab",
+                    CAT_GRAB_CLEAR => "grab_clear",
                     CAT_WIND => "wind",
                     CAT_HURT => "hurt",
                     CAT_ABS => "abs",
@@ -3085,6 +3091,62 @@ unsafe fn hook_catch(lua_state: u64) {
     original!()(lua_state);
 }
 
+/// Whether a grab clear on this fighter's current frame is one the editor moved away.
+///
+/// The editor's own replacement clear runs under an [`InjectGuard`] and is never suppressed, so
+/// a box that still ends on the suppressed frame can be ended there by the editor.
+unsafe fn grab_clear_suppressed(boma: *mut smash::app::BattleObjectModuleAccessor) -> bool {
+    if boma.is_null() || !any_rules() || is_injecting() {
+        return false;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
+        return false;
+    }
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let hit = action_for(CAT_GRAB_CLEAR, motion, 0, frame).is_some_and(|(suppress, _)| suppress);
+    if hit {
+        crate::slight::diag::note(format!(
+            "grab clear suppressed (motion {motion:#x} frame {frame:.1})"
+        ));
+    }
+    hit
+}
+
+/// `sv_module_access::grab` — the msc command `grab!` sends. Only `MA_MSC_CMD_GRAB_CLEAR_ALL`
+/// ends a box's active window; the other commands pass straight through.
+#[skyline::hook(replace = smash::app::sv_module_access::grab)]
+unsafe fn hook_grab(lua_state: u64) {
+    let args = read_args_typed(lua_state, 2);
+    let command = match args.first() {
+        Some(LuaArg::Int(i)) => *i,
+        Some(LuaArg::Num(n)) => *n as i64,
+        _ => -1,
+    };
+    if command == *smash::lib::lua_const::MA_MSC_CMD_GRAB_CLEAR_ALL as i64 {
+        record(lua_state, "GRAB_CLEAR_ALL", &[]);
+        let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+            as *mut smash::app::BattleObjectModuleAccessor;
+        if grab_clear_suppressed(boma) {
+            return;
+        }
+    }
+    original!()(lua_state);
+}
+
+/// `GrabModule::clear_all` as a moveset writes it directly. The engine also calls this from
+/// status code, so it is not recorded; a suppress rule is narrowed to the move's motion and the
+/// one frame the script's clear ran on.
+#[skyline::hook(replace = smash::app::lua_bind::GrabModule::clear_all)]
+unsafe fn hook_grab_clear_all(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    if grab_clear_suppressed(boma) {
+        return;
+    }
+    original!()(boma)
+}
+
 // ── SEARCH (detection volume) hook ───────────────────────────────────────────
 
 /// Rewrite a `SEARCH` call's geometry in place.
@@ -4087,6 +4149,8 @@ pub fn install() {
         hook_wind_2nd_arg10,
         hook_erase_wind,
         hook_attack_clear_all,
+        hook_grab,
+        hook_grab_clear_all,
         hook_attack_abs,
         hook_hit_node,
         hook_hit_no,

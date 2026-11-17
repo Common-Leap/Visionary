@@ -46,6 +46,7 @@ mod renderer;
 mod roster;
 mod scratch_dirs;
 mod source_style;
+mod source_timing;
 mod sources;
 mod texture_import;
 mod ui;

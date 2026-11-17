@@ -733,6 +733,11 @@ pub const CAT_WORK_MODULE_INC_INT: u8 = 35;
 /// Wire category for direct `MotionModule::set_frame_partial` point overrides.
 pub const CAT_MOTION_MODULE_SET_FRAME_PARTIAL: u8 = 36;
 
+/// Wire category for suppressing a script's grab clear (`grab!` → `sv_module_access::grab` with
+/// `MA_MSC_CMD_GRAB_CLEAR_ALL`, or `GrabModule::clear_all`). **Must equal the plugin's value.**
+/// Not the grab category: those rules key on a box id, and the clear has none.
+pub const CAT_GRAB_CLEAR: u8 = 37;
+
 /// The wire category a modifier's rules go out under.
 pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
     match kind {
@@ -4435,6 +4440,23 @@ mod tests {
             (CAT_FT_START_ADJUST_MOTION_FRAME, CAT_CORRECT),
         ] {
             assert_ne!(category, other, "new point categories must not collide");
+        }
+    }
+
+    #[test]
+    fn the_grab_clear_category_matches_the_plugin() {
+        let module = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
+        )
+        .expect("read hitbox_viewer");
+        assert!(module.contains(&format!("pub const CAT_GRAB_CLEAR: u8 = {CAT_GRAB_CLEAR};")));
+        assert!(module.contains("replace = smash::app::sv_module_access::grab)"));
+        assert!(module.contains("replace = smash::app::lua_bind::GrabModule::clear_all)"));
+        // Installed, not just declared.
+        assert!(module.contains("hook_grab,") && module.contains("hook_grab_clear_all,"));
+        for other in [0, 1, 2, 3, 4, CAT_SEARCH, CAT_ATTACK_FP, CAT_MOTION_MODULE_SET_FRAME_PARTIAL] {
+            assert_ne!(CAT_GRAB_CLEAR, other, "CAT_GRAB_CLEAR collides with {other}");
         }
     }
 

@@ -825,7 +825,7 @@ fn parse_excute_block(lines: &[&str]) -> Vec<ExcuteStmt> {
         }
         // GrabModule and AttackModule clear different things, so they are different
         // statements. Matching `clear_all` alone re-emitted a grab clear as an attack clear.
-        if line.contains("GrabModule::clear_all") {
+        if is_grab_clear_all(line) {
             stmts.push(ExcuteStmt::GrabClearAll);
             continue;
         }
@@ -3587,7 +3587,14 @@ pub(crate) fn attack_mod_num(value: f32) -> String {
     num(value)
 }
 
-fn parse_attack_clear(line: &str) -> Option<u32> {
+/// Whether `line` ends every grab box: `GrabModule::clear_all`, or the msc command vanilla
+/// scripts and most movesets write instead, `grab!(agent, *MA_MSC_CMD_GRAB_CLEAR_ALL)`.
+pub(crate) fn is_grab_clear_all(line: &str) -> bool {
+    line.contains("GrabModule::clear_all")
+        || line.contains("grab!(") && line.contains("MA_MSC_CMD_GRAB_CLEAR_ALL")
+}
+
+pub(crate) fn parse_attack_clear(line: &str) -> Option<u32> {
     let start = line.find("AttackModule::clear(")? + "AttackModule::clear(".len();
     let end = line[start..].find(')')? + start;
     tokenize_args(&line[start..end])

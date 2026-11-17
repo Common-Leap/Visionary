@@ -353,7 +353,7 @@ pub fn raw_trail_line(line: &str) -> Option<MacroSite> {
 /// The scanners walk byte by byte, so `i` can land inside a multi-byte character — a
 /// non-ASCII identifier in the user's code is enough. A continuation byte can never start
 /// any of these, and returning early keeps the `&text[i..]` below from panicking on it.
-fn skip_trivia(text: &str, i: usize) -> Option<usize> {
+pub(crate) fn skip_trivia(text: &str, i: usize) -> Option<usize> {
     if !text.is_char_boundary(i) {
         return None;
     }
@@ -648,6 +648,11 @@ pub struct SourceIndex {
     pub scales: HashMap<String, crate::fighter_scale::SourceScales>,
     /// A `fighter_param` `scale` the moveset overrides through `param_config`.
     pub param_scale: Option<f32>,
+    /// Fighters the crate installs only on chosen costume slots: every `Agent::new("falco")`
+    /// it builds is narrowed with `.set_costume(…)`. Empoleon plays on Falco's c80–c87 this
+    /// way, so its scripts are that slot character's, and vanilla Falco's own slots keep the
+    /// game's. See [`scan_agent_gating`].
+    pub costume_gated: HashSet<String>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -784,9 +789,19 @@ impl SourceIndex {
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
         let mut facts = ProjectFacts::default();
+        // Fighter → (constructions narrowed to costumes, constructions that are not).
+        let mut gating: HashMap<String, (usize, usize)> = HashMap::new();
         for (file, text) in sources.iter().chain(&context) {
             for function in scan_acmd_functions(text) {
                 *facts.definitions.entry(function.name).or_default() += 1;
+            }
+            for (fighter, gated) in scan_agent_gating(text) {
+                let counts = gating.entry(fighter).or_default();
+                if gated {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
             }
             let names = scan_fighter_names(text);
             for name in &names {
@@ -873,8 +888,20 @@ impl SourceIndex {
         index.param_scale = crate::fighter_scale::param_config_scale(
             sources.iter().map(|(_, text)| text.as_str()),
         );
+        // One agent for every costume is enough to make the fighter's own slots modded too.
+        index.costume_gated = gating
+            .into_iter()
+            .filter(|(_, (gated, ungated))| *gated > 0 && *ungated == 0)
+            .map(|(fighter, _)| fighter)
+            .collect();
         index.files = files;
         Ok(index)
+    }
+
+    /// Whether the crate installs `fighter`'s scripts only on chosen costume slots.
+    #[cfg(test)]
+    pub fn is_costume_gated(&self, fighter: &str) -> bool {
+        self.costume_gated.contains(&normalize_fighter(fighter))
     }
 
     /// Total number of indexed scripts, across every fighter.
@@ -1592,6 +1619,116 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
         i = close + 1;
     }
     routes
+}
+
+/// Each `Agent::new("…")` in `text`, with whether it is narrowed to costume slots:
+/// `.set_costume(…)` in the constructor's own chain, or called later on the variable it was
+/// bound to, directly (`agent.set_costume(…)`) or through a rebinding (`let agent =
+/// agent.set_costume(…);`, Empoleon's spelling). `common` hooks every fighter and is skipped.
+///
+/// A costume list handed in through a function parameter is not followed; the agent then
+/// reads as ungated, which keeps the fighter's own slots credited, as before.
+fn scan_agent_gating(text: &str) -> Vec<(String, bool)> {
+    let text = &without_comments(text);
+    let boundaries = statement_boundaries(text);
+    // `(receiver, offset)` for each `.set_costume(` call.
+    let gated_receivers: Vec<(&str, usize)> = {
+        let mut receivers = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = text[search..].find(".set_costume(") {
+            let at = search + rel;
+            search = at + 1;
+            let head = text[statement_start(&boundaries, at)..at].trim_start();
+            let head = head
+                .strip_prefix("let ")
+                .and_then(|rest| rest.split_once('=').map(|(_, value)| value))
+                .unwrap_or(head)
+                .trim_start();
+            let head = head.strip_prefix("&mut").unwrap_or(head).trim_start();
+            let head = head.strip_prefix('&').unwrap_or(head).trim_start();
+            let head = head.strip_prefix('*').unwrap_or(head).trim_start();
+            let end = ident_end(head, 0);
+            if end > 0 {
+                receivers.push((&head[..end], at));
+            }
+        }
+        receivers
+    };
+    let mut found = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("Agent::new(") {
+        let at = search + rel;
+        search = at + "Agent::new(".len();
+        let Some(fighter) = agent_literal(&text[at..]) else {
+            continue;
+        };
+        if fighter.is_empty() || fighter == "common" {
+            continue;
+        }
+        let end = chain_end(text, at);
+        let mut gated = text[at..end].contains(".set_costume(");
+        if !gated {
+            let head = text[statement_start(&boundaries, at)..at].trim();
+            if let Some(binding) = head.strip_prefix("let ") {
+                let binding = binding.trim_start();
+                let binding = binding.strip_prefix("mut ").unwrap_or(binding).trim_start();
+                let name_end = ident_end(binding, 0);
+                // Only later in the binding's own block: another function's `agent` is not it.
+                let scope = at..block_end(text, at);
+                gated = name_end > 0
+                    && gated_receivers.iter().any(|(receiver, offset)| {
+                        *receiver == &binding[..name_end] && scope.contains(offset)
+                    });
+            }
+        }
+        found.push((fighter, gated));
+    }
+    found
+}
+
+/// The `}` closing the block `start` sits in, or the end of `text`.
+fn block_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
+}
+
+/// Where the expression starting at `start` ends: its `;`, the `}` closing the block it is
+/// the tail of, or the end of `text`.
+fn chain_end(text: &str, start: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' if depth == 0 => return i,
+            b'}' => depth -= 1,
+            b';' if depth == 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    text.len()
 }
 
 /// Visionary names fighters after the dump folder (`mario`); ACMD attributes and
@@ -2783,7 +2920,7 @@ fn resolve_shared_body(
 }
 
 /// The offset of the `;` ending the statement that starts at `start`, at bracket depth 0.
-fn statement_end(text: &str, start: usize) -> Option<usize> {
+pub(crate) fn statement_end(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = start;
@@ -3331,7 +3468,12 @@ struct Replacement {
 }
 
 /// Rewrite `text` with every replacement applied. Spans must not overlap.
-fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
+fn apply(text: &str, edits: Vec<Replacement>) -> String {
+    apply_mapped(text, edits).0
+}
+
+/// [`apply`], with where each offset of `text` that no edit covers lands in the result.
+fn apply_mapped(text: &str, mut edits: Vec<Replacement>) -> (String, impl Fn(usize) -> usize) {
     // An empty span is an argument a project helper fixes (see `scan_macro_sites`): the value
     // lives in the helper's body, not at this call, so writing here would add an argument.
     edits.retain(|edit| {
@@ -3344,6 +3486,9 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
     edits.sort_by_key(|e| e.span.start);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
+    // (end of an applied span in `text`, total growth up to and including it)
+    let mut shifts: Vec<(usize, isize)> = Vec::new();
+    let mut growth = 0isize;
     for edit in edits {
         if edit.span.start < cursor {
             continue; // overlapping — the earlier edit wins
@@ -3351,9 +3496,16 @@ fn apply(text: &str, mut edits: Vec<Replacement>) -> String {
         out.push_str(&text[cursor..edit.span.start]);
         out.push_str(&edit.value);
         cursor = edit.span.end;
+        growth += edit.value.len() as isize - edit.span.len() as isize;
+        shifts.push((edit.span.end, growth));
     }
     out.push_str(&text[cursor..]);
-    out
+    let map = move |at: usize| {
+        let before = shifts.partition_point(|(end, _)| *end <= at);
+        let growth = before.checked_sub(1).map_or(0, |i| shifts[i].1);
+        (at as isize + growth) as usize
+    };
+    (out, map)
 }
 
 /// Format a float the way ACMD source spells one, and only if it actually differs.
@@ -3437,7 +3589,7 @@ fn bool_edit(text: &str, span: &Range<usize>, new: bool) -> Option<Replacement> 
 }
 
 /// `2.0`, `0.75`, `-1.5` — always with a decimal point, since these slots are floats.
-fn format_float(value: f32) -> String {
+pub(crate) fn format_float(value: f32) -> String {
     let mut text = format!("{value:.4}");
     while text.ends_with('0') && !text.ends_with(".0") {
         text.pop();
@@ -4305,6 +4457,22 @@ fn canonicalize_effect_call_for_source(
             }
         }
     }
+    // A stop the editor never set is written with the defaults (see `acmd::emit_spawn_stop`),
+    // which the parser then reads back as set. Compare both as the line the source holds; a
+    // call with no stop has neither.
+    let trail = call.trail_command.is_some() || call.spawn_func == "AFTER_IMAGE_ON" || call.raw_line.is_some();
+    let stopped = call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME;
+    if stopped && trail {
+        call.trail_off = Some(call.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT));
+    } else if stopped && call.follows_bone {
+        let (fade, detach) = crate::data::EFFECT_OFF_KIND_DEFAULT;
+        call.off_fade = Some(call.off_fade.unwrap_or(fade));
+        call.off_detach = Some(call.off_detach.unwrap_or(detach));
+    }
+    if !stopped {
+        call.off_fade = None;
+        call.off_detach = None;
+    }
     call.offset = call.offset.map(source_compare_float);
     call.rotation = call.rotation.map(source_compare_float);
     call.scale = source_compare_float(call.scale);
@@ -4375,9 +4543,30 @@ pub fn rewrite_effect_calls(
         return Ok((text.to_string(), report));
     }
 
-    let (mut timing_moves, timing_skipped) =
+    let (mut timing_moves, mut timing_skipped) =
         plan_effect_timing_moves(text, label, &script, &pristine, &edited, &ordinals, &sites);
-    report.skipped.extend(timing_skipped);
+    // The block mover above needs a flat `frame` script with each spawn alone in its block.
+    // When it refuses, every retime goes through the line mover instead, which follows `wait`s
+    // and moves just the spawn's own lines; its refusal keeps the block mover's reasons.
+    let line_retimes: Vec<usize> = if timing_skipped.is_empty() || edited.len() != pristine.len() {
+        Vec::new()
+    } else {
+        pristine
+            .iter()
+            .zip(&edited)
+            .enumerate()
+            .filter(|(_, (before, after))| {
+                before.active_start != after.active_start || before.active_end != after.active_end
+            })
+            .filter(|(_, (before, after))| structural_identity_matches(before, after))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    if line_retimes.is_empty() {
+        report.skipped.append(&mut timing_skipped);
+    } else {
+        timing_moves.clear();
+    }
     // Timing moves are only valid for a one-to-one list whose call identity stays the same.
     // Otherwise a rename/disable/add/remove could still carry a previously approved block move
     // through the value-writing pass and leave a partial structural edit in the source.
@@ -4623,9 +4812,67 @@ pub fn rewrite_effect_calls(
     }
 
     let value_count = edits.len();
-    let valued = apply(text, edits.clone());
-    let moved =
-        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits);
+    let (valued, map) = apply_mapped(text, edits.clone());
+    let moved = if line_retimes.is_empty() {
+        apply_effect_timing_moves(text, &timing_moves, &pristine, &ordinals, &sites, &edits)
+    } else {
+        let retimed: Option<Vec<crate::source_timing::EffectRetimed>> = line_retimes
+            .iter()
+            .map(|&index| {
+                let ordinal = *ordinals.get(index)?;
+                let spawn = sites.get(ordinal)?;
+                let mut calls = vec![map(spawn.span.start)..map(spawn.span.end)];
+                if let Some(modifiers) = modifier_sites.get(ordinal) {
+                    let mut extra: Vec<&MacroSite> = [
+                        &modifiers.rate,
+                        &modifiers.work_int,
+                        &modifiers.camera_offset,
+                        &modifiers.tint,
+                        &modifiers.particle_tint,
+                        &modifiers.alpha,
+                        &modifiers.scale_w,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    extra.sort_by_key(|site| site.span.start);
+                    calls.extend(extra.iter().map(|site| map(site.span.start)..map(site.span.end)));
+                }
+                Some(crate::source_timing::EffectRetimed {
+                    calls,
+                    before: &pristine[index],
+                    after: &edited[index],
+                })
+            })
+            .collect();
+        let result = retimed
+            .ok_or_else(|| "a retimed effect has no source call".to_string())
+            .and_then(|retimed| {
+                let spawns: Vec<Range<usize>> =
+                    sites.iter().map(|site| map(site.span.start)..map(site.span.end)).collect();
+                crate::source_timing::retime_effects(&valued, &spawns, &edited, &retimed)
+            });
+        match result {
+            Ok(updated) => {
+                timing_moves = line_retimes
+                    .iter()
+                    .map(|&index| EffectTimingMove {
+                        call_index: index,
+                        new_start: edited[index].active_start,
+                        new_end: edited[index].active_end,
+                        move_start: pristine[index].active_start != edited[index].active_start,
+                        move_end: pristine[index].active_end != edited[index].active_end,
+                    })
+                    .collect();
+                Some(updated)
+            }
+            Err(reason) => {
+                report.skipped.append(&mut timing_skipped);
+                report.skipped.push(format!("{label}: the effect retime was not written — {reason}"));
+                Some(valued.clone())
+            }
+        }
+    };
     let (updated, moved_count) = match moved {
         Some(updated) => {
             let count = timing_moves
@@ -4648,13 +4895,66 @@ pub fn rewrite_effect_calls(
     // conditional, loop, or opaque statement makes the insertion context ambiguous;
     // leave it alone and explain why rather than placing a new spawn in the wrong arm.
     let mut updated = updated;
-    let additions_allowed = effect_source_is_flat(&script.stmts);
-    if edited.len() > pristine.len() && !additions_allowed {
-        report.skipped.push(format!(
-            "{label}: added effect spawns are inside a source with a branch, loop, wait, or opaque statement — source syncing cannot choose their execution context"
-        ));
+    let flat = effect_source_is_flat(&script.stmts);
+    // The frame-block inserter below reads only `frame(…)`. A script stepped by `wait` — most of
+    // them — goes through the timeline-following inserter instead, which is also what a retime
+    // uses, so an added effect lands on the same frame either way.
+    let mut additions_allowed = flat;
+    if edited.len() > pristine.len() && !flat {
+        let mut timed: Vec<crate::source_timing::EffectAddition> = Vec::new();
+        let mut written = 0usize;
+        let mut with_helpers = updated.clone();
+        for call in edited.iter().skip(pristine.len()) {
+            if call.disabled {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn is disabled — source syncing does not invent a disabled source call"
+                ));
+                continue;
+            }
+            // A copy of a spawn that sat in a condition carries that condition only as verbatim
+            // context lines, not as a guard; which arm the copy belongs in is unknown.
+            if call.leading.iter().chain(&call.trailing).any(|line| line.contains('{')) {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn copies one inside a condition in the source — source syncing cannot choose its execution context"
+                ));
+                continue;
+            }
+            let lines = crate::acmd::effect_call_insert_lines(call);
+            if lines.is_empty() {
+                report.skipped.push(format!(
+                    "{label}: an added effect spawn has no source representation — source syncing left it unchanged"
+                ));
+                continue;
+            }
+            ensure_effect_helpers(&mut with_helpers, call);
+            written += lines.len();
+            timed.push(crate::source_timing::EffectAddition {
+                frame: call.active_start,
+                lines,
+                guard: call.guard.clone(),
+            });
+            if let Some(stop) = crate::acmd::effect_call_stop_insert_line(call) {
+                written += 1;
+                timed.push(crate::source_timing::EffectAddition {
+                    frame: call.active_end.max(call.active_start),
+                    lines: vec![stop],
+                    guard: None,
+                });
+            }
+        }
+        match crate::source_timing::add_effects(&with_helpers, &timed) {
+            Ok(text) => {
+                updated = text;
+                report.changed += written;
+                // The read-back below checks these exactly as it checks the flat path's.
+                additions_allowed = true;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: the added effect spawns were not written — {reason}"
+            )),
+        }
     }
-    if edited.len() > pristine.len() && additions_allowed {
+    if edited.len() > pristine.len() && flat {
         let mut additions: Vec<&crate::data::EffectCall> =
             edited.iter().skip(pristine.len()).collect();
         additions.sort_by_key(|call| call.active_start);
@@ -4718,7 +5018,26 @@ pub fn rewrite_effect_calls(
     }
     if report.skipped.is_empty() {
         let reparsed = crate::acmd::parse_effect_script(&updated).to_effect_calls();
-        if effect_call_set_signature(&reparsed) != effect_call_set_signature(&edited) {
+        // A line move re-wraps a spawn that sat in a condition, so the lines around it — kept on
+        // each call as provenance, not as anything an export reads back — are its own now.
+        let signature = |calls: &[crate::data::EffectCall]| {
+            if line_retimes.is_empty() {
+                return effect_call_set_signature(calls);
+            }
+            let bare: Vec<crate::data::EffectCall> = calls
+                .iter()
+                .cloned()
+                .map(|mut call| {
+                    // Structure moves with the spawn; what still acts on it must not.
+                    call.leading.clear();
+                    call.trailing
+                        .retain(|line| crate::source_timing::touches_last_effect(line));
+                    call
+                })
+                .collect();
+            effect_call_set_signature(&bare)
+        };
+        if signature(&reparsed) != signature(&edited) {
             // Do not return a source move that failed its own semantic read-back. Value edits are
             // still safe to keep, but the timing operation is refused as one batch so a future
             // parser/source-shape change cannot leave only half of a retime on disk.
@@ -5464,6 +5783,8 @@ pub fn rewrite_hitboxes(
 
     let mut report = SyncReport::default();
     let mut edits = Vec::new();
+    // Ordinary hitboxes whose frames changed, moved once their values are written.
+    let mut retimed: Vec<(usize, Range<usize>)> = Vec::new();
     // Hitboxes are keyed by id + part, which is what the game uses to tell them apart and
     // what stays stable across a retime. Two calls sharing a key in one script would be
     // ambiguous, so those are reported rather than guessed at.
@@ -5519,6 +5840,10 @@ pub fn rewrite_hitboxes(
                 ));
                 continue;
             };
+            if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
+            {
+                retimed.push((position, macro_site.span.clone()));
+            }
             let (call_edits, missing) = attack_abs_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
                 report.skipped.push(format!(
@@ -5579,11 +5904,7 @@ pub fn rewrite_hitboxes(
             };
             if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end
             {
-                report.skipped.push(format!(
-                    "{label}: ATTACK_FP hitbox {} was retimed — its frames are the block it sits \
-                     in, not arguments, so source syncing cannot move it",
-                    before.id
-                ));
+                retimed.push((position, macro_site.span.clone()));
             }
             let (call_edits, missing) = attack_fp_edits(text, macro_site, before, hitbox);
             if !missing.is_empty() {
@@ -5669,15 +5990,11 @@ pub fn rewrite_hitboxes(
             ));
             continue;
         };
-        // A hitbox's frames are the `frame(...)` block it sits in and the `ATTACK_CLEAR` that
-        // ends it, not arguments of the call — so a retime is reported. The values it also
-        // changed are still worth writing, so this does not skip the call.
+        // A hitbox's frames are the `frame(...)` block it sits in and the clear that ends it,
+        // not arguments of the call. It moves through [`crate::source_timing`] once its values
+        // are written, which are written either way.
         if before.active_start != hitbox.active_start || before.active_end != hitbox.active_end {
-            report.skipped.push(format!(
-                "{label}: hitbox {} was retimed — its frames are the block it sits in, not \
-                 arguments, so source syncing cannot move it",
-                before.id
-            ));
+            retimed.push((position, macro_site.span.clone()));
         }
         let (call_edits, missing) = if is_grab {
             catch_edits(text, macro_site, before, hitbox)
@@ -5699,7 +6016,33 @@ pub fn rewrite_hitboxes(
     }
 
     report.changed = edits.len();
-    Ok((apply(text, edits), report))
+    let (written, map) = apply_mapped(text, edits);
+    if retimed.is_empty() {
+        return Ok((written, report));
+    }
+    let moved: Vec<crate::source_timing::Retimed> = retimed
+        .iter()
+        .map(|(position, call)| crate::source_timing::Retimed {
+            position: *position,
+            call: map(call.start)..map(call.end),
+            before: &pristine[*position],
+            after: &edited[*position],
+        })
+        .collect();
+    match crate::source_timing::retime_hitboxes(&written, pristine, &moved) {
+        Ok(timed) => {
+            report.changed += moved.len();
+            Ok((timed, report))
+        }
+        Err(reason) => {
+            let ids: Vec<String> = moved.iter().map(|m| m.before.id.to_string()).collect();
+            report.skipped.push(format!(
+                "{label}: hitbox {} was retimed, but its frames were left as they are — {reason}",
+                ids.join(", ")
+            ));
+            Ok((written, report))
+        }
+    }
 }
 
 /// Sync edited hitboxes for one move back into the project source on disk.
@@ -10096,7 +10439,7 @@ fn frame_literal(line: &str) -> Option<f32> {
     line[comma + 1..end].trim().parse().ok()
 }
 
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
+pub(crate) fn matching_brace(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
@@ -11767,6 +12110,106 @@ name = \"empoleon\"
         }
     }
 
+    /// Empoleon installs Falco's agent narrowed to its own costumes, through a rebinding:
+    /// `let agent = agent.set_costume(…)`. Its scripts are Empoleon's slots', not Falco's own,
+    /// wherever the folder is linked — the gating is read from the crate root above it.
+    #[test]
+    fn a_costume_narrowed_agent_marks_its_fighter_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Cargo.toml",
+            "[package]
+name = \"empoleon\"
+
+[lib]
+crate-type = [\"cdylib\"]
+",
+        );
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            r#"mod emperte;
+pub fn main() {
+    // let other = Agent::new("mario").set_costume(all.to_vec());
+    let agent_emperte = &mut Agent::new("falco");
+    let agent_emperte = agent_emperte.set_costume(costume.to_vec());
+    emperte::install(agent_emperte);
+    agent_emperte.install();
+    Agent::new("falco_cannon").install();
+}
+"#,
+        );
+        write(
+            tmp.path(),
+            "src/emperte/mod.rs",
+            r#"unsafe extern "C" fn game_attackairb(agent: &mut L2CAgentBase) {}
+pub fn install(agent: &mut Agent) {
+    agent.acmd("game_attackairb", game_attackairb, Priority::Low);
+}
+"#,
+        );
+        for linked in ["", "src", "src/emperte"] {
+            let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
+            assert!(index.is_costume_gated("falco"), "linked at {linked:?}");
+            assert!(index.is_costume_gated("fighter_falco"), "attribute spelling");
+            assert!(!index.is_costume_gated("falco_cannon"), "linked at {linked:?}");
+            assert!(!index.is_costume_gated("mario"), "a commented-out line is not code");
+            assert!(index.script("falco", "game_attackairb").is_some(), "linked at {linked:?}");
+        }
+    }
+
+    #[test]
+    fn costume_gating_reads_chains_and_stays_inside_the_binding() {
+        let gating = scan_agent_gating(
+            r#"pub fn a() {
+    Agent::new("falco")
+        .set_costume(costume.to_vec())
+        .acmd("game_attack11", attack11, Priority::Low)
+        .install();
+}
+pub fn b() {
+    let agent = &mut Agent::new("mario");
+    agent.install();
+}
+pub fn c() {
+    let agent = &mut Agent::new("luigi");
+    agent.set_costume(slots);
+    agent.install();
+}
+pub fn d() -> Agent { Agent::new("pikachu").set_costume(slots) }
+pub fn e() { let x = Agent::new("common"); x.set_costume(slots); }
+"#,
+        );
+        assert_eq!(
+            gating,
+            vec![
+                ("falco".to_string(), true),
+                ("mario".to_string(), false),
+                ("luigi".to_string(), true),
+                ("pikachu".to_string(), true),
+            ]
+        );
+    }
+
+    /// One agent for every costume beside a narrowed one modifies the fighter's own slots too.
+    #[test]
+    fn an_ungated_agent_beside_a_gated_one_is_not_costume_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "acmd.rs",
+            r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {}
+pub fn install() {
+    Agent::new("falco").set_costume(slots).acmd("game_attack11", game_attack11, Priority::Low).install();
+    Agent::new("falco").on_start(start).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(!index.is_costume_gated("falco"));
+    }
+
     /// A project whose functions are named for the mod, not the script, has to read the same
     /// as one that follows the convention. The registration is what says which script the
     /// function is, and the merged body has to carry that name — the parsers split a body by
@@ -13017,8 +13460,10 @@ visionary_set_speed(agent, 9, 10);
         );
     }
 
+    /// A spawn added between two `wait` points lands on its own frame: the wait is split around
+    /// it, so the later spawn still runs on the frame it did.
     #[test]
-    fn adding_an_effect_between_wait_points_is_refused_before_it_can_rewind_timeline() {
+    fn adding_an_effect_between_wait_points_splits_the_wait() {
         let text = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -13041,17 +13486,14 @@ visionary_set_speed(agent, 9, 10);
         edited.push(added);
 
         let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
-        assert_eq!(
-            updated, text,
-            "a wait cannot safely be split by a new frame block"
-        );
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|message| message.contains("wait")),
-            "the unsafe insertion must be explained: {report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}
+{updated}");
+        assert_eq!(updated.matches("wait(agent.lua_state_agent, 1.0);").count(), 2, "{updated}");
+        let calls = crate::acmd::parse_effect_script(&updated).to_effect_calls();
+        let frame_of = |name: &str| calls.iter().find(|c| c.effect_name == name).map(|c| c.active_start);
+        assert_eq!(frame_of("sys_first"), Some(5));
+        assert_eq!(frame_of("sys_between"), Some(6));
+        assert_eq!(frame_of("sys_second"), Some(7));
     }
 
     #[test]
@@ -14612,7 +15054,7 @@ pub fn install(agent: &mut smashline::Agent) {
     }
 
     #[test]
-    fn effect_timing_moves_refuse_nonflat_blocks_collisions_and_unrelated_lines() {
+    fn effect_timing_moves_refuse_branches_and_loops_but_move_a_spawn_on_its_own() {
         let branch = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {
@@ -14670,16 +15112,14 @@ pub fn install(agent: &mut smashline::Agent) {
         let pristine = crate::acmd::parse_effect_script(collision).to_effect_calls();
         let mut edited = pristine.clone();
         edited[0].active_start = 10;
+        // A frame that already has a block is no longer a refusal: the line mover appends the
+        // spawn to it, after what that frame already spawns.
         let (after, report) =
             rewrite_effect_calls(collision, "collision", &pristine, &edited).unwrap();
-        assert_eq!(after, collision);
-        assert!(
-            report
-                .skipped
-                .iter()
-                .any(|note| note.contains("occupied frame block")),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_effect_script(&after).to_effect_calls();
+        assert!(moved.iter().all(|call| call.active_start == 10), "{after}");
+        assert!(after.find("sys_late") < after.find("sys_attack"), "{after}");
 
         let unrelated = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
@@ -14693,15 +15133,13 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(pristine.len(), 1);
         let mut edited = pristine.clone();
         edited[0].active_start = 8;
+        // The spawn moves on its own; the unrelated line keeps the frame it runs on.
         let (after, report) =
             rewrite_effect_calls(unrelated, "unrelated", &pristine, &edited).unwrap();
-        assert_eq!(after, unrelated);
-        assert!(
-            report.skipped.iter().any(|note| {
-                note.contains("unrelated source lines") || note.contains("opaque source statement")
-            }),
-            "{report:?}"
-        );
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let frame_eight = after.find("frame(agent.lua_state_agent, 8.0);").expect("a frame-8 block");
+        assert!(after.find("COL_PRI").unwrap() < frame_eight, "{after}");
+        assert!(after.find("sys_attack").unwrap() > frame_eight, "{after}");
     }
 
     #[test]
@@ -14864,9 +15302,10 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text.replace("10.0, 361", "12.5, 361"));
     }
 
-    /// A hitbox's frames are the block it sits in, not arguments of its call.
+    /// A hitbox's frames are the block it sits in, not arguments of its call: a retime moves
+    /// the call to the block on its new frame, carrying the values edited with it.
     #[test]
-    fn retiming_a_hitbox_is_reported_rather_than_written() {
+    fn retiming_a_hitbox_moves_its_call_with_its_new_values() {
         let text = r#"unsafe extern "C" fn game_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 5.0);
     if macros::is_excute(agent) {
@@ -14880,10 +15319,25 @@ pub fn install(agent: &mut smashline::Agent) {
         edited[0].damage = 12.0;
 
         let (after, report) = rewrite_hitboxes(text, "t", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let moved = crate::acmd::parse_acmd_script(&after).to_hitboxes();
+        assert_eq!((moved[0].active_start, moved[0].damage), (9, 12.0), "{after}");
+        assert!(after.contains("frame(agent.lua_state_agent, 9.0);"), "{after}");
+
+        // Timing that runs through a loop is not restructured: the retime is reported, and the
+        // damage it was bundled with still lands.
+        let looped = text
+            .replace("    frame(agent.lua_state_agent, 5.0);\n", "    for _ in 0..2 {\n    wait(agent.lua_state_agent, 5.0);\n")
+            .replace("    }\n}\n", "    }\n    }\n}\n");
+        let pristine = crate::acmd::parse_acmd_script(&looped).to_hitboxes();
+        let mut edited = pristine.clone();
+        edited[0].active_start += 1;
+        edited[0].damage = 12.0;
+        let (after, report) = rewrite_hitboxes(&looped, "t", &pristine, &edited).unwrap();
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("retimed"), "{report:?}");
-        // The retime is refused, but the damage it was bundled with still lands.
+        assert!(report.skipped[0].contains("retimed") && report.skipped[0].contains("loop"), "{report:?}");
         assert!(after.contains("12.0, 361"), "{after}");
+        assert!(after.contains("wait(agent.lua_state_agent, 5.0);"), "{after}");
     }
 
     /// kirby/ThrowHi's `ATTACK_IGNORE_THROW`, which the archive writes without the capsule

@@ -146,6 +146,65 @@ fn effect_source_timing_matches(
 /// snapshot; it is never installed as a live baseline. A source call must have one best owner.
 /// Ambiguous or missing owners are refused so a repeated sync cannot retune a neighbouring
 /// repeated call by position.
+/// The editor's hitboxes in the order the source now lists them, for the position-paired writer.
+///
+/// The first sync reads a source whose order is the pristine list's. A retime that was written
+/// moves call lines, so the next read of the source lists them differently, and pairing by
+/// position then matched one hitbox's values against another's call — a damage tweak after a
+/// retime came back as "renumbered" or "retimed". Each source hitbox is paired with the editor
+/// hitbox of its family, id and part whose frames it has: its original ones (not yet written) or
+/// its edited ones (already written). Anything that does not pair exactly once keeps the old
+/// positional pairing, which is what the writer expects when the source is untouched.
+fn hitboxes_in_source_order(
+    source: &[crate::data::Hitbox],
+    pristine: &[crate::data::Hitbox],
+    edited: &[crate::data::Hitbox],
+) -> Vec<crate::data::Hitbox> {
+    let identity = |h: &crate::data::Hitbox| (h.category, h.func.clone(), h.id, h.part);
+    // A throw or search box is paired by its start alone. No script call ends one, and the
+    // parser lets a same-id `ATTACK` close it, so moving that attack moves its end on paper.
+    let frames = |h: &crate::data::Hitbox| {
+        let fixed = h.category == crate::data::CAT_ABS || h.category == crate::data::CAT_SEARCH;
+        (h.active_start, if fixed { 0 } else { h.active_end })
+    };
+    let positional = source.len() == pristine.len()
+        && source
+            .iter()
+            .zip(pristine)
+            .all(|(s, p)| identity(s) == identity(p) && frames(s) == frames(p));
+    if positional || pristine.len() > edited.len() {
+        return edited.to_vec();
+    }
+    let mut used = vec![false; edited.len()];
+    let mut ordered = Vec::with_capacity(edited.len());
+    for from_source in source {
+        let candidates: Vec<usize> = (0..pristine.len())
+            .filter(|&i| !used[i] && identity(&edited[i]) == identity(from_source))
+            .filter(|&i| {
+                frames(&pristine[i]) == frames(from_source) || frames(&edited[i]) == frames(from_source)
+            })
+            .collect();
+        // Several candidates are fine when they are interchangeable: the first unused one.
+        let Some(&index) = candidates.first() else {
+            return edited.to_vec();
+        };
+        used[index] = true;
+        let mut paired = edited[index].clone();
+        // An untouched throw or search box takes the source's end, which moved only on paper.
+        let fixed = paired.category == crate::data::CAT_ABS || paired.category == crate::data::CAT_SEARCH;
+        if fixed && paired.active_end == pristine[index].active_end {
+            paired.active_end = from_source.active_end;
+        }
+        ordered.push(paired);
+    }
+    if used[..pristine.len()].iter().any(|u| !u) {
+        return edited.to_vec();
+    }
+    // Hitboxes past the pristine list are additions, which the writer reports after the rest.
+    ordered.extend(edited[pristine.len()..].iter().cloned());
+    ordered
+}
+
 fn effect_calls_in_source_order(
     source: &[crate::data::EffectCall],
     pristine: &[crate::data::EffectCall],
@@ -254,6 +313,106 @@ fn effect_calls_in_source_order(
 #[cfg(test)]
 mod source_sync_status_tests {
     use super::{effect_calls_in_source_order, source_sync_status};
+
+    const ATTACK_TAIL: &str = "50, 90, 0, 50, 3.5, 7.5, 0.5, 0.0, None, None, None, 1.2, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_POS, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_L, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);";
+
+    /// Empoleon's utilt: the late hit is reached by `wait(2)`.
+    fn utilt() -> String {
+        let attack = |id: u32, damage: &str| {
+            format!("macros::ATTACK(agent, {id}, 0, Hash40::new(\"top\"), {damage}, {ATTACK_TAIL}")
+        };
+        format!(
+            "unsafe extern \"C\" fn game_attackhi3(agent: &mut L2CAgentBase) {{
+    frame(agent.lua_state_agent, 11.0);
+    if macros::is_excute(agent) {{
+        {}
+        {}
+    }}
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {{
+        {}
+        {}
+    }}
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {{
+        AttackModule::clear_all(agent.module_accessor);
+    }}
+}}
+",
+            attack(0, "12.5"),
+            attack(1, "12.5"),
+            attack(0, "7.4"),
+            attack(1, "8.9")
+        )
+    }
+
+    /// Retime, sync, then tweak a value and sync again: the second sync reads a source whose
+    /// lines moved, and must still pair each hitbox with its own call.
+    #[test]
+    fn a_sync_after_a_written_retime_pairs_hitboxes_with_their_own_calls() {
+        let source = utilt();
+        let pristine = crate::acmd::parse_acmd_script(&source).to_hitboxes();
+        let mut edited = pristine.clone();
+        // The late hit comes out a frame earlier; the early one ends where it now starts.
+        edited[2].active_start = 12;
+        edited[3].active_start = 12;
+        edited[0].active_end = 11;
+        edited[1].active_end = 11;
+        let (first, report) = crate::acmd_src::rewrite_hitboxes(&source, "t", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{first}");
+
+        // Now a damage tweak on the late hit's id-1 box, against the rewritten file.
+        edited[3].damage = 10.0;
+        let baseline = crate::acmd::parse_acmd_script(&first).to_hitboxes();
+        let ordered = super::hitboxes_in_source_order(&baseline, &pristine, &edited);
+        let (second, report) = crate::acmd_src::rewrite_hitboxes(&first, "t", &baseline, &ordered).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{second}");
+        assert_eq!(report.changed, 1, "only the damage: {second}");
+        let late = crate::acmd::parse_acmd_script(&second)
+            .to_hitboxes()
+            .into_iter()
+            .find(|h| h.id == 1 && h.active_start == 12)
+            .unwrap();
+        assert_eq!(late.damage, 10.0, "{second}");
+
+        // An untouched source keeps the plain positional pairing.
+        assert_eq!(super::hitboxes_in_source_order(&pristine, &pristine, &edited), edited);
+    }
+
+    /// A hitbox read from the moveset needs no capture to be injected live after a retime: the
+    /// source gave every value, and the Lua types are fixed.
+    #[test]
+    fn a_source_hitbox_injects_live_without_a_capture() {
+        let pristine = crate::acmd::parse_acmd_script(&utilt()).to_hitboxes();
+        let args = super::VisionaryApp::build_attack_args(&pristine[2], None).expect("built from source");
+        assert_eq!(args.len(), 36);
+        assert!(matches!(args[3], crate::game_link::LuaArgWire::Num(d) if (d - 7.4).abs() < 1e-4));
+        assert!(matches!(args[12], crate::game_link::LuaArgWire::Nil), "no capsule end");
+        // An unresolvable constant still needs a capture rather than sending a zero.
+        let mut unknown = pristine[2].clone();
+        unknown.sound_attr = "*SOME_PROJECT_CONSTANT".into();
+        assert!(super::VisionaryApp::build_attack_args(&unknown, None).is_none());
+    }
+
+    /// A spawn read from the moveset carries its whole tail, so a retime previews live without
+    /// a capture; one with no known tail still waits for one.
+    #[test]
+    fn a_source_effect_retime_injects_live_without_a_capture() {
+        let source = "unsafe extern \"C\" fn effect_attackhi3(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 10.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new(\"sys_attack_arc\"), Hash40::new(\"top\"), 0, 12, 0, 0, 0, 0, 1.0, true);
+    }
+}
+";
+        let mut call = crate::acmd::parse_effect_script(source).to_effect_calls().remove(0);
+        assert!(call.extra_args.is_some());
+        call.active_start = 12;
+        let hash = hash40::hash40("sys_attack_arc").0;
+        assert!(super::VisionaryApp::build_effect_inject_from_captures(&call, &[], Some(hash), 0).is_some());
+        call.extra_args = None;
+        assert!(super::VisionaryApp::build_effect_inject_from_captures(&call, &[], Some(hash), 0).is_none());
+    }
 
     #[test]
     fn source_sync_status_distinguishes_written_and_refused_edits() {
@@ -3388,6 +3547,9 @@ pub struct VisionaryApp {
     /// The fighters `acmd_src` has scripts for, cached for `row_membership`, which runs per
     /// row per frame. Refreshed wherever `acmd_src` is replaced.
     acmd_src_fighters: BTreeSet<String>,
+    /// The fighters `acmd_src` installs only on chosen costume slots, refreshed with
+    /// `acmd_src_fighters`. Their scripts and edits belong to the project's slot characters.
+    acmd_src_costume_gated: BTreeSet<String>,
     /// The fighters the last `build_project` found edits for. A fighter joins
     /// `project_fighters` only when it first appears here, so removing an edited fighter
     /// sticks; `row_membership` reports these as "has edits".
@@ -3746,6 +3908,7 @@ impl VisionaryApp {
             project_moveset: None,
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
+            acmd_src_costume_gated: BTreeSet::new(),
             edited_fighters: BTreeSet::new(),
             authored_characters: BTreeSet::new(),
             last_saved_snapshot: None,
@@ -3903,8 +4066,22 @@ impl VisionaryApp {
             romfs_slots: &self.project_romfs_slots,
             moveset_fighters: &self.acmd_src_fighters,
             has_edits: &self.edited_fighters,
+            costume_gated: &self.acmd_src_costume_gated,
         };
         crate::project_scope::membership(entry, &self.state.fighters, &inputs)
+    }
+
+    /// The project rows `fighter`'s scripts and edits belong to: Empoleon's row for a moveset
+    /// that installs Falco's agent only on Empoleon's costumes, the fighter's own row otherwise.
+    fn script_owner_rows(&self, fighter: &str) -> Vec<crate::mod_project::ProjectFighter> {
+        let inputs = crate::project_scope::MembershipInputs {
+            added: &self.project_fighters,
+            romfs_slots: &self.project_romfs_slots,
+            moveset_fighters: &self.acmd_src_fighters,
+            has_edits: &self.edited_fighters,
+            costume_gated: &self.acmd_src_costume_gated,
+        };
+        crate::project_scope::script_owners(fighter, &self.state.fighters, &inputs)
     }
 
     fn project_fighter_key(&self, idx: usize) -> Option<crate::mod_project::ProjectFighter> {
@@ -3939,6 +4116,11 @@ impl VisionaryApp {
             .acmd_src
             .as_ref()
             .map(crate::project_scope::moveset_fighters)
+            .unwrap_or_default();
+        self.acmd_src_costume_gated = self
+            .acmd_src
+            .as_ref()
+            .map(|index| index.costume_gated.iter().cloned().collect())
             .unwrap_or_default();
     }
 
@@ -5127,6 +5309,8 @@ impl VisionaryApp {
                 self.acmd_src = Some(index);
                 self.acmd_src_problem = None;
                 self.refresh_acmd_src_fighters();
+                // What the previous moveset said about a move nobody edited is not this one's.
+                self.drop_unedited_move_sources();
                 // An open project records its own link; the global one is for browsing
                 // without a project and is left alone.
                 match crate::project_scope::link_target(self.project_path.is_some()) {
@@ -5826,12 +6010,21 @@ impl VisionaryApp {
             .acmd_src
             .as_ref()
             .map(|index| crate::project_helpers::scope(std::sync::Arc::clone(&index.helpers)));
+        // The buffer is its own baseline: once a mirror has moved a retimed hitbox, pairing the
+        // editor's original pristine list with that text would try to move it a second time.
+        let mut baseline = crate::acmd::parse_acmd_script(&buffer.text).to_hitboxes();
+        self.normalize_hitbox_bones(&mut baseline);
+        let edited_hitboxes = hitboxes_in_source_order(
+            &baseline,
+            &self.state.hitboxes_pristine,
+            &self.state.hitboxes,
+        );
         let outcome = if buffer.is_game_script() {
             match crate::acmd_src::rewrite_hitboxes(
                 &buffer.text,
                 &label,
-                &self.state.hitboxes_pristine,
-                &self.state.hitboxes,
+                &baseline,
+                &edited_hitboxes,
             ) {
                 Ok((updated, mut report)) => {
                     match crate::acmd_src::rewrite_reverse_lr(
@@ -6339,7 +6532,25 @@ impl VisionaryApp {
     }
 
     /// Write the editor's hitbox and effect-spawn edits for the open move back into source.
+    /// [`Self::sync_edits_to_source_for_row`], with the status naming the row being edited. The
+    /// writers name the agent (`falco/attack_hi3`), which is right for the code and wrong for a
+    /// person editing Empoleon, who reads it as the sync having gone to vanilla Falco.
     fn sync_edits_to_source(&mut self) {
+        self.sync_edits_to_source_for_row();
+        let row = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .and_then(|entry| entry.custom_name.clone().map(|name| (entry.name.clone(), name)));
+        if let Some((agent, character)) = row {
+            self.state.status = self
+                .state
+                .status
+                .replace(&format!("{agent}/"), &format!("{character}/"));
+        }
+    }
+
+    fn sync_edits_to_source_for_row(&mut self) {
         if self.acmd_src.is_none() {
             return;
         }
@@ -6466,12 +6677,17 @@ impl VisionaryApp {
             .is_some()
         {
             ran = true;
+            let edited_hitboxes = hitboxes_in_source_order(
+                &source_hitboxes_pristine,
+                &self.state.hitboxes_pristine,
+                &self.state.hitboxes,
+            );
             match crate::acmd_src::sync_hitboxes(
                 &index,
                 &fighter,
                 &move_name,
                 &source_hitboxes_pristine,
-                &self.state.hitboxes,
+                &edited_hitboxes,
             ) {
                 Ok(report) => {
                     changed += report.changed;
@@ -8127,6 +8343,35 @@ impl VisionaryApp {
                 ui.selectable_value(&mut view, SourceView::Split, "Side by side");
             });
             ui.separator();
+
+            // The fighter's own row is open, but the moveset installs these scripts only on a
+            // slot character's costumes: say whose they are before anyone edits them as Falco's.
+            let gated_characters = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .filter(|entry| entry.custom_name.is_none())
+                .map(|entry| {
+                    self.script_owner_rows(&entry.name)
+                        .into_iter()
+                        .filter_map(|row| row.character)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|characters| !characters.is_empty());
+            if let Some(characters) = gated_characters {
+                let base = fighter_display_name(&fighter);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This moveset installs {fighter}'s scripts only on {}'s costume slots \
+                         (set_costume); {base}'s own slots play the game's. Edits made here \
+                         change {}.",
+                        characters.join(", "),
+                        characters.join(", "),
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 190, 90)),
+                );
+            }
 
             // Everything that needs `&self` is resolved before the buffer is borrowed
             // mutably below — closures capturing both would not borrow-check.
@@ -17165,6 +17410,37 @@ impl VisionaryApp {
         picked
     }
 
+    /// Whether the move under `key` (`fighter/move`) holds an edit of any category.
+    fn move_has_edits(&self, key: &str) -> bool {
+        let Some((fighter, move_name)) = key.split_once('/') else {
+            return false;
+        };
+        self.state
+            .edit_log
+            .entries
+            .get(fighter)
+            .is_some_and(|moves| moves.contains_key(move_name))
+            || self.state.effect_call_edits.get(key).is_some_and(|edits| !edits.is_empty())
+            || self.state.effect_call_full.contains_key(key)
+            || self.state.sound_script_edits.contains_key(key)
+            || self.state.expression_script_edits.contains_key(key)
+    }
+
+    /// Forget the source snapshots of moves that were only looked at.
+    ///
+    /// A snapshot is the baseline an edit was made against, which is worth keeping. One for a
+    /// move nobody edited is only a record of what some source said once, and keeping it made
+    /// it outlive that source: browse Falco with Shy Guy's moveset linked and Shy Guy's jab was
+    /// saved as `falco/attack_12`, then loaded into Empoleon's project as Falco's jab.
+    fn drop_unedited_move_sources(&mut self) {
+        let keys: Vec<String> = self.move_source_cache.keys().cloned().collect();
+        for key in keys {
+            if !self.move_has_edits(&key) {
+                self.move_source_cache.remove(&key);
+            }
+        }
+    }
+
     /// Key for `effect_call_edits`: fighter-scoped so moves with the same name on
     /// different fighters don't collide ("mario/attack_air_n").
     fn move_key(fighter: &str, move_name: &str) -> String {
@@ -18527,6 +18803,10 @@ impl VisionaryApp {
             let Some((fighter, move_name)) = key.split_once('/') else {
                 continue;
             };
+            // Only an edited move's baseline is worth saving; see `drop_unedited_move_sources`.
+            if !self.move_has_edits(key) {
+                continue;
+            }
             project
                 .fighters
                 .entry(fighter.to_string())
@@ -18614,10 +18894,16 @@ impl VisionaryApp {
         }
         // A fighter's first edit adds it to the project, and it stays after the edit is undone:
         // recorded on `self`, which outlives this build, then copied into the file.
+        let edited_now = crate::project_scope::edited_fighters(&project);
+        let owners: HashMap<String, Vec<crate::mod_project::ProjectFighter>> = edited_now
+            .difference(&self.edited_fighters)
+            .map(|name| (name.clone(), self.script_owner_rows(name)))
+            .collect();
         self.edited_fighters = crate::project_scope::absorb_edited_fighters(
             &mut self.project_fighters,
             &self.edited_fighters,
             &project,
+            |name| owners.get(name).cloned().unwrap_or_default(),
         );
         self.authored_characters = crate::project_scope::absorb_authored_characters(
             &mut self.project_fighters,
@@ -20948,6 +21234,8 @@ impl VisionaryApp {
                 return;
             }
         };
+        // A file from before v4 has its fighter list seeded by `migrate`, from edits alone.
+        let seeded = project.version < 4;
         // Before anything reads the project: bring it to the current format, and refuse a file
         // written by a newer build. Loading one of those would present it as complete and then
         // re-save it with whatever this build cannot read silently removed.
@@ -20997,10 +21285,13 @@ impl VisionaryApp {
         // (a fighter the user removed while it had edits stays removed).
         self.edited_fighters = crate::project_scope::edited_fighters(&project);
         self.authored_characters = crate::project_scope::authored_characters(&project.roster);
-        let (moveset, index, problem) = crate::project_scope::moveset_on_load(
-            project.moveset_source.take().map(PathBuf::from),
-            crate::acmd_src::SourceIndex::build,
-        );
+        // A project saved before projects recorded their moveset, or one never linked, that lives
+        // in the moveset's own crate (`Empoleon-Moveset/modproject.json`) is about that crate.
+        let stored = project.moveset_source.take().map(PathBuf::from).or_else(|| {
+            path.parent().and_then(crate::project_scope::workspace_moveset)
+        });
+        let (moveset, index, problem) =
+            crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
         self.project_moveset = moveset;
         self.acmd_src = index;
         self.acmd_src_problem = problem;
@@ -21013,6 +21304,15 @@ impl VisionaryApp {
         // move into this one. The selection is restored below.
         self.clear_fighter_selection();
         self.reindex_fighters();
+        // The seeding knew only fighter names. With the rows and the moveset known, edits on a
+        // costume-gated agent go to the slot character (Empoleon), not Falco's own row.
+        if seeded {
+            let mut rows = self.project_fighters.clone();
+            crate::project_scope::reassign_seeded_fighters(&mut rows, |name| {
+                self.script_owner_rows(name)
+            });
+            self.project_fighters = rows;
+        }
         if let Some(relative) = previously_loaded_eff {
             let base = self.resolve_eff_source(&relative);
             if base.is_file() {
@@ -21034,6 +21334,16 @@ impl VisionaryApp {
         let mut n_eff = 0;
         for (fighter, mut fm) in project.fighters {
             for (move_name, snapshot) in &fm.move_sources {
+                // A snapshot of a move with no edit is browsing provenance, possibly from
+                // another moveset linked at the time; it is not a baseline for anything.
+                let edited = fm.acmd.contains_key(move_name)
+                    || fm.effect_calls.get(move_name).is_some_and(|edits| !edits.is_empty())
+                    || fm.effect_calls_full.contains_key(move_name)
+                    || fm.sound_scripts.contains_key(move_name)
+                    || fm.expression_scripts.contains_key(move_name);
+                if !edited {
+                    continue;
+                }
                 self.move_source_cache
                     .insert(Self::move_key(&fighter, move_name), snapshot.clone());
             }
@@ -23261,6 +23571,14 @@ impl VisionaryApp {
                 }) {
                     hb.active_end = end.max(hb.active_start);
                 }
+            } else if line.func == "GRAB_CLEAR_ALL" {
+                let end = Self::motion_to_script_frame(line.frame).saturating_sub(1);
+                for hb in hitboxes
+                    .iter_mut()
+                    .filter(|h| h.category == 1 && h.active_end == u32::MAX)
+                {
+                    hb.active_end = end.max(hb.active_start);
+                }
             } else if line.func == "AREA_WIND_ERASE" {
                 let Some(id) = line.args.first().and_then(|arg| arg.as_i64()) else {
                     continue;
@@ -24500,6 +24818,8 @@ impl VisionaryApp {
                 None => missing_donor = true,
             }
         }
+        let (grab_clears, grab_cut_short) = Self::grab_clear_rules(motion, &pristine, &current);
+        rules.extend(grab_clears);
 
         if rules.is_empty() {
             self.hitbox_rules_store.remove(&mv_key);
@@ -24517,6 +24837,10 @@ impl VisionaryApp {
             self.state.status =
                 "Added/retimed hitbox needs live capture args — perform the move in game once."
                     .into();
+        } else if grab_cut_short {
+            self.state.status = "Grab boxes ending on different frames: in game, one grab clear \
+                                 ends every grab box, so the longer one ends with the shorter."
+                .into();
         }
     }
 
@@ -28551,6 +28875,7 @@ impl VisionaryApp {
                     incomplete.insert(key.clone());
                 }
             }
+            rules.extend(Self::grab_clear_rules(motion, pristine, current).0);
             if rules.is_empty() {
                 self.hitbox_rules_store.remove(&key);
             } else {
@@ -28732,12 +29057,61 @@ impl VisionaryApp {
     /// Full 36-slot ATTACK arg vector for injection: donor capture args (exact tail) with
     /// the modeled slots overwritten from the Hitbox. Without a donor: None (template
     /// injection is too risky — masks/flags would be guesses).
+    /// The Lua type of each of `ATTACK`'s 36 arguments as the game pushes them, measured from
+    /// captures: `i` integer, `n` number, `b` bool, `x` nil (the absent capsule end).
+    const ATTACK_ARG_TYPES: &'static str = "iiininiinnnnxxxnniibnnnbbbbbiiibiiii";
+
+    /// A typed `ATTACK` argument vector holding zeros, standing in for a capture. Every slot it
+    /// has is one [`Self::build_attack_args`] then writes from the hitbox, so nothing of it
+    /// reaches the game.
+    fn attack_arg_template() -> Vec<crate::game_link::LuaArgWire> {
+        use crate::game_link::LuaArgWire as A;
+        Self::ATTACK_ARG_TYPES
+            .chars()
+            .map(|kind| match kind {
+                'i' => A::Int(0),
+                'n' => A::Num(0.0),
+                'b' => A::Bool(false),
+                _ => A::Nil,
+            })
+            .collect()
+    }
+
     fn build_attack_args(
         h: &crate::data::Hitbox,
         donor: Option<&crate::game_link::CaptureLine>,
     ) -> Option<Vec<crate::game_link::LuaArgWire>> {
         use crate::game_link::LuaArgWire as A;
-        let mut args = donor.filter(|d| d.args.len() >= 36)?.args.clone();
+        // A hitbox read from the moveset's own source knows every argument; only the Lua type
+        // of each came from a capture, and that layout is fixed. Without a capture the template
+        // stands in, provided every named constant resolves — a slot left at the template's
+        // zero would send a value the script never wrote.
+        let mut args = match donor {
+            Some(donor) => donor.args.clone(),
+            None => {
+                use crate::param_labels as pl;
+                let resolved = [
+                    pl::encode_const(pl::SETOFF_KIND, &h.setoff_kind),
+                    pl::encode_const(pl::LR_CHECK, &h.lr_check),
+                    pl::encode_const(pl::SITUATION_MASK, &h.situation_mask),
+                    pl::encode_const(pl::CATEGORY_MASK, &h.category_mask),
+                    pl::encode_const(pl::PART_MASK, &h.part_mask),
+                    pl::encode_const(pl::SOUND_LEVEL, &h.sound_level),
+                    pl::encode_const(pl::SOUND_ATTR, &h.sound_attr),
+                    pl::encode_const(pl::ATTACK_REGION, &h.attack_region),
+                ]
+                .iter()
+                .all(Option::is_some)
+                    && pl::encode_collision_attr(&h.collision_attr).is_some();
+                if !resolved || h.category != 0 || h.func != "ATTACK" {
+                    return None;
+                }
+                Self::attack_arg_template()
+            }
+        };
+        if args.len() < 36 {
+            return None;
+        }
         args[0] = A::Int(h.id as i64);
         args[1] = A::Int(h.part as i64);
         args[2] = A::Hash(hash40::hash40(&h.bone_name.to_lowercase()).0);
@@ -28988,8 +29362,8 @@ impl VisionaryApp {
         if h.active_end >= 9999 {
             return None;
         }
+        // Grab boxes are not ended one at a time: `grab_clear_rules` ends them per move.
         let (command, args) = match h.category {
-            1 => ("GRAB_CLEAR_ALL", Vec::new()),
             2 => ("AREA_WIND_ERASE", vec![A::Int(h.id as i64)]),
             _ => return None,
         };
@@ -28999,6 +29373,66 @@ impl VisionaryApp {
             args,
             command: Some(command.into()),
         })
+    }
+
+    /// Live rules that end a move's grab boxes on their edited frames.
+    ///
+    /// The script has no per-box grab clear: one `grab!(…GRAB_CLEAR_ALL)` ends every box, so
+    /// ends are compared as the set of frames a clear runs on. A clear the script runs where no
+    /// box ends any more is suppressed; a frame a box now ends on with no clear gets one
+    /// injected. Lengthening a grab used to do nothing in game because the script's clear still
+    /// ran on the old frame.
+    ///
+    /// The second value is true when a box would be cut short by a clear that ends another, which
+    /// a single clear-all cannot avoid.
+    fn grab_clear_rules(
+        motion: u64,
+        pristine: &[crate::data::Hitbox],
+        current: &[crate::data::Hitbox],
+    ) -> (Vec<crate::game_link::HitboxRuleWire>, bool) {
+        let clears = |list: &[crate::data::Hitbox]| -> std::collections::BTreeSet<u32> {
+            list.iter()
+                .filter(|h| h.category == 1 && h.active_end < 9999)
+                .map(|h| h.active_end.saturating_add(1))
+                .collect()
+        };
+        let (was, now) = (clears(pristine), clears(current));
+        let mut rules = Vec::new();
+        for &frame in was.difference(&now) {
+            let (frame_start, frame_end) = Self::rule_frame_window(frame);
+            rules.push(crate::game_link::HitboxRuleWire {
+                motion,
+                category: crate::game_link::CAT_GRAB_CLEAR,
+                hitbox_id: Some(0),
+                suppress: true,
+                frame_start,
+                frame_end,
+                overrides: None,
+                inject: None,
+                func: None,
+            });
+        }
+        for &frame in now.difference(&was) {
+            rules.push(crate::game_link::HitboxRuleWire {
+                motion,
+                category: crate::game_link::wire_category(1),
+                hitbox_id: None,
+                suppress: false,
+                frame_start: None,
+                frame_end: None,
+                overrides: None,
+                inject: Some(crate::game_link::InjectRuleWire {
+                    frame: Self::script_to_motion_frame(frame),
+                    args: Vec::new(),
+                    command: Some("GRAB_CLEAR_ALL".into()),
+                }),
+                func: None,
+            });
+        }
+        let cut_short = current.iter().filter(|h| h.category == 1).any(|h| {
+            now.iter().any(|&frame| h.active_start < frame && frame <= h.active_end)
+        });
+        (rules, cut_short)
     }
 
     // ── EFF Transplant Studio ─────────────────────────────────────────────────
@@ -32718,7 +33152,13 @@ impl VisionaryApp {
         // A REPLACEMENT still refuses without its donor. The call it replaces exists in the
         // script, so its captured arguments are knowable, and inventing them instead would make
         // the live preview differ from what the export writes.
-        if donor_hash.is_some() && donor.is_none() {
+        //
+        // A spawn read from the linked source is the exception: its whole tail was parsed from
+        // the call itself, so the panel's tail is the script's and nothing is invented.
+        let authored_tail_known = crate::acmd::effect_spawn_layout(&ec.spawn_func)
+            .and_then(|layout| authored_effect_spawn_tail(ec, layout))
+            .is_some();
+        if donor_hash.is_some() && donor.is_none() && !authored_tail_known {
             return None;
         }
         let (func, args) = build_effect_spawn_args(
@@ -32727,7 +33167,7 @@ impl VisionaryApp {
             new_hash,
             // An addition has no authored original whose captured arguments are the truth, so
             // the panel's own tail is what the export will write and what live must play.
-            donor_hash.is_none(),
+            donor_hash.is_none() || donor.is_none(),
         )?;
         Some(crate::game_link::SpawnInjectWire {
             frame: Self::script_to_motion_frame(ec.active_start),
@@ -46275,10 +46715,56 @@ mod live_effect_capture_tests {
         assert_eq!(args[7], A::Num(3.0));
         assert_eq!(args[8], A::Num(-2.0));
 
-        let end = VisionaryApp::collision_end_injection(&grab).unwrap();
+        // A grab's end is a move-level clear, not one carried by the box.
+        assert!(VisionaryApp::collision_end_injection(&grab).is_none());
+        let (rules, cut_short) = VisionaryApp::grab_clear_rules(0x1234, &[], &[grab]);
+        assert!(!cut_short);
+        assert_eq!(rules.len(), 1);
+        let end = rules[0].inject.as_ref().unwrap();
         assert_eq!(end.command.as_deref(), Some("GRAB_CLEAR_ALL"));
         assert_eq!(end.frame, VisionaryApp::script_to_motion_frame(6));
         assert!(end.args.is_empty());
+    }
+
+    fn grab_spanning(start: u32, end: u32) -> Hitbox {
+        Hitbox { category: 1, active_start: start, active_end: end, ..Default::default() }
+    }
+
+    #[test]
+    fn lengthening_a_grab_moves_the_scripts_clear_in_game() {
+        let (rules, cut_short) = VisionaryApp::grab_clear_rules(
+            0x1234,
+            &[grab_spanning(7, 8)],
+            &[grab_spanning(7, 12)],
+        );
+        assert!(!cut_short);
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        let suppress = rules.iter().find(|r| r.suppress).unwrap();
+        assert_eq!(suppress.category, crate::game_link::CAT_GRAB_CLEAR);
+        assert_eq!(suppress.hitbox_id, Some(0));
+        let at_9 = VisionaryApp::script_to_motion_frame(9);
+        assert!(suppress.frame_start.unwrap() <= at_9 && at_9 <= suppress.frame_end.unwrap());
+        let inject = rules.iter().find_map(|r| r.inject.as_ref()).unwrap();
+        assert_eq!(inject.command.as_deref(), Some("GRAB_CLEAR_ALL"));
+        assert_eq!(inject.frame, VisionaryApp::script_to_motion_frame(13));
+    }
+
+    #[test]
+    fn an_unchanged_grab_end_sends_no_clear_rules() {
+        let grab = grab_spanning(7, 8);
+        let (rules, _) =
+            VisionaryApp::grab_clear_rules(0x1234, &[grab.clone()], &[grab]);
+        assert!(rules.is_empty(), "{rules:?}");
+    }
+
+    #[test]
+    fn a_grab_still_out_past_another_ones_clear_is_flagged() {
+        let (_, cut_short) = VisionaryApp::grab_clear_rules(
+            0x1234,
+            &[grab_spanning(7, 8), grab_spanning(7, 8)],
+            &[grab_spanning(7, 8), grab_spanning(7, 12)],
+        );
+        assert!(cut_short);
     }
 
     #[test]
