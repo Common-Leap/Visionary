@@ -2,7 +2,7 @@
 
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
-This is joobert's fork of Visionary. What it adds on top of upstream `v0.1.2` is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list).
+This is joobert's fork of Visionary. It is based on upstream `v0.3.0`, and what it adds on top is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list).
 
 ## Components
 
@@ -323,14 +323,14 @@ The toolbar in the viewport's top-left corner holds the display options:
   wraps them in, so a helper that leaves one out leaves that scale alone.
   Branches that only run on the results screen or on entry are skipped. Hover
   the label to see each value and the line it came from.
-- **Thrown fighter** appears on throws. It shows a second fighter (Mario by
-  default; any indexed fighter or any fighter in the vanilla dump) whose `rot`
-  bone sits on the thrower's `throw` bone, playing its own thrown animation.
+- **Thrown fighter** picks the opponent the preview holds in grabs and throws
+  (on by default). Choose any indexed fighter or any fighter in the vanilla dump,
+  and its costume slot. On throws it plays that costume's own thrown animation:
   **Auto** matches the throw's direction (`throw_f` → `thrown_f`), or the
   thrower's own set when the victim has one (`shizue_special_s_thrown_f`). The
   game also picks a `_dx`, `_big` or `_girl` variant depending on the thrower.
-  Visionary doesn't detect that yet, so choose it from the list. The victim
-  copies the throw bone's full transform, scale included.
+  Visionary doesn't detect that yet, so choose it from the list. Turning it off
+  hides the opponent.
 - **Model** and **Motion** notes appear when the shown costume borrows files.
   Visionary loads each costume the way ARCropolis does: the folder's own file
   first, then a `config.json` share (`share-to-vanilla` or `share-to-added`),
@@ -340,7 +340,7 @@ The toolbar in the viewport's top-left corner holds the display options:
 
 ### Motion List
 
-**Windows → Motion List** (ported from SSBH Editor) edits every field of the
+**Tools → Motion list** (ported from SSBH Editor) edits every field of the
 selected fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game
 and other scripts, up to three animations picked from the folder's `.nuanmb`
 files, flags, blend frames, cancel frames and intangibility frames. Motions can
@@ -440,7 +440,7 @@ built, the send indicator stops at once and says which file is missing.
 By default Visionary reads ACMD scripts from an online archive of the *vanilla*
 scripts. If you have already modded a move, that is not the code your game runs.
 
-Open **Windows → ACMD Source** and link the Rust project that builds your
+Open **File → Your source code** and link the Rust project that builds your
 plugin — the folder holding its `Cargo.toml`. Visionary recursively scans its
 Rust source files, so scripts can stay in their existing modules and filenames;
 you do not need to create a specially named aggregate file. It joins

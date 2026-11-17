@@ -2,7 +2,7 @@
 
 Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion List editor, a thrown-fighter preview, in-game fighter scale, model checks before asset previews, SSBH Editor-style camera controls and a Settings window. Visionary now reads real-world moveset source much more faithfully and loads costumes the way ARCropolis does. Fixes scrambled character select alongside roster mods, misplaced helper and out-of-order bones, incomplete recolour costumes, and live effect previews that timed out against a mod-only root.
 
-> Visionary v0.1.2 → v1.3. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
+> Fork 0.3.1, on top of Visionary v0.3.0. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
 
 ## New features
 
@@ -24,7 +24,7 @@ A frame data line above the collision list for the selected move, recalculated a
 
 ### Motion List editor
 
-Ported from SSBH Editor. **Windows → Motion List** edits the selected fighter's `motion_list.yml` or `motion_list.bin`.
+Ported from SSBH Editor. **Tools → Motion list** edits the selected fighter's `motion_list.yml` or `motion_list.bin`.
 
 - Motion kinds, game and other scripts, up to three animations picked from the folder's `.nuanmb` files, flags, blend frames, cancel frames and intangibility frames
 - Add, duplicate, delete and rename motions; save as either format
@@ -55,7 +55,7 @@ Ported from SSBH Editor. **Windows → Motion List** edits the selected fighter'
 
 - **Helper bones and material animations** — `model.nuhlpb` and `model.numatb` are applied, so `H_` helpers move the mesh and glows, colour changes and eye swaps play
 - **ARCropolis costume loading** — each file resolves from the costume folder, then `config.json` `share-to-vanilla` / `share-to-added` (followed through chains), then the vanilla dump. A toolbar note lists borrowed files and their sources
-- **Thrown fighter** — on throws, a second fighter (Mario by default, any indexed or vanilla fighter) hangs from the thrower's `throw` bone by its `rot` bone and plays its thrown animation. **Auto** matches the throw direction or the thrower's own thrown set; `_dx` / `_big` / `_girl` variants are picked from the list
+- **Thrown fighter** — picks the fighter and costume upstream's grab/throw opponent shows (Mario by default, any indexed or vanilla fighter). On throws it plays that costume's thrown animation: **Auto** matches the throw direction or the thrower's own thrown set; `_dx` / `_big` / `_girl` variants are picked from the list
 - **In-game scale** — `fighter_param` scale or its `param_config` override, then `ModelModule::set_scale`, `AttackModule::set_attack_scale` and `GrabModule::set_size_mul` from the moveset's `on_line` callback. Hitboxes and grabs take their own scale; a toolbar label shows each value and its source line
 - **SSBH Editor camera** — left drag orbits, right or middle drag pans with the model following the pointer, scroll zooms, and **⟲** resets to the side view
 

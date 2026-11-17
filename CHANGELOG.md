@@ -1,11 +1,15 @@
-# Visionary Changelog (v1.3)
+# Visionary Changelog (v0.3.1)
+
+This fork is now built on Visionary v0.3.0, so everything new there (Move nodes, Gimmicks,
+the Effects page, effects drawn in the preview, stages, objects and the grab opponent) is
+included. The notes below are what the fork adds on top.
 
 ## Highlights
 
 - **Frame data at a glance.** Pick a move and see its startup, active frames, when you can act
   again, landing lag, and how safe it is on shield. Hover any number to see where it came from.
 - **New Motion List editor.** Edit a fighter's motion list (animations, cancel frames,
-  intangibility and more) without leaving Visionary. Find it under **Windows → Motion List**.
+  intangibility and more) without leaving Visionary. Find it under **Tools → Motion list**.
 - **Your mod's code, read properly.** Visionary understands far more of the ways people write
   movesets, so your moves show what your mod actually does instead of falling back to vanilla.
 

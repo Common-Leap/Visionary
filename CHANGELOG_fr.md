@@ -2,8 +2,10 @@
 
 Changes in this fork (joobert/Visionary) relative to upstream Visionary by Common Leap.
 
-The fork branches from upstream tag **`v0.1.2`** (`e7df465`, "Autosave project edits and
-harden effect/hitbox source sync", 2026-09-17). Everything below landed on top of it.
+The fork branched from upstream tag **`v0.1.2`** (`e7df465`, "Autosave project edits and
+harden effect/hitbox source sync", 2026-09-17) and has since merged upstream **`v0.3.0`**.
+Everything below is what the fork adds; where the merge changed one of these, the entry says
+so.
 For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle ground, see
 [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
 
@@ -57,7 +59,7 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
 
 ## Motion List editor (new)
 
-- **Windows → Motion List**, ported from SSBH Editor, edits every field of the selected
+- **Tools → Motion list**, ported from SSBH Editor, edits every field of the selected
   fighter's `motion_list.yml` or `motion_list.bin`: motion kinds, game and other scripts, up to
   three animations picked from the folder's `.nuanmb` files, flags, blend frames, cancel frames
   and intangibility frames. Motions can be added, duplicated, deleted and renamed, and the list
@@ -74,9 +76,11 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   `config.json` `share-to-vanilla` / `share-to-added` entry (followed through chains), then the
   vanilla dump. Model, weapon skeletons, move-list animations, eyelid animation and motion list
   all use it. A toolbar note lists borrowed files and their sources.
-- **Thrown fighter.** On throws, a second fighter (Mario by default, or any indexed or vanilla
-  fighter) is drawn with its `rot` bone on the thrower's `throw` bone, playing its thrown
-  animation. **Auto** matches the throw direction or the thrower's own thrown set.
+- **Thrown fighter.** Picks the fighter and costume slot upstream's grab/throw opponent shows
+  (Mario by default, or any indexed or vanilla fighter); on throws it plays that costume's
+  thrown animation. **Auto** matches the throw direction or the thrower's own thrown set.
+  Since the v0.3.0 merge it drives upstream's opponent (hung by the hip, also in grabs) instead
+  of a separate model placed through the `rot` bone, and the victim's own scale is not applied.
 - **Game scale.** Fighters are drawn at the scale the game gives them: `fighter_param` scale or a
   `param_config` override, then `ModelModule::set_scale`, `AttackModule::set_attack_scale` and
   `GrabModule::set_size_mul` read from the moveset's `on_line` callback (through helpers,
