@@ -1042,8 +1042,6 @@ mod picker_state_tests {
 enum TimelineSelection {
     Hitbox(usize),
     Effect(usize),
-    /// Shown only: a spawn inside a facing branch, which the timeline does not edit.
-    Seen,
     Command {
         family: String,
         site: usize,
@@ -1088,7 +1086,22 @@ fn sound_words(id: &str) -> String {
 }
 
 /// An effect name as words: `sys_attack_line` reads "Attack line", `mario_fb_shoot` "Fb shoot".
+/// The live check for a spawn in one arm of the script's facing test.
+fn facing_live_guard(ec: &crate::data::EffectCall) -> Option<crate::game_link::LiveGuard> {
+    use crate::game_link::LiveGuard;
+    crate::data::facing_arm_of(ec.guard.as_deref()).map(|left| {
+        if left {
+            LiveGuard::FacingLeft
+        } else {
+            LiveGuard::Not(Box::new(LiveGuard::FacingLeft))
+        }
+    })
+}
+
 fn effect_words(name: &str) -> String {
+    if let Some((name, facing)) = name.split_once(" (facing ") {
+        return format!("{} (facing {facing}", effect_words(name));
+    }
     if !name.contains('_') || name.contains(' ') {
         return name.to_string();
     }
@@ -1631,13 +1644,26 @@ fn fighter_picks(fighters: &[crate::data::FighterEntry]) -> Vec<crate::ui::Pick>
         .collect()
 }
 
+/// Moves in the order players think of them: neutral, forward/side, back, up, down, then the rest.
+fn move_list_order(name: &str) -> (u8, String) {
+    let rank = match name.split(' ').next().unwrap_or("") {
+        "Neutral" => 0,
+        "Forward" | "Side" => 1,
+        "Back" => 2,
+        "Up" => 3,
+        "Down" => 4,
+        _ => 5,
+    };
+    (rank, name.to_string())
+}
+
 /// Every move as a picker choice under its move family, with the move-list index of each choice.
 fn move_picks(moves: &[MoveEntry]) -> (Vec<crate::ui::Pick>, Vec<usize>) {
     let mut order: Vec<usize> = (0..moves.len()).collect();
     order.sort_by_key(|&i| {
         (
             crate::move_kinds::group_of(&moves[i].name),
-            format_move_name(&moves[i].name),
+            move_list_order(&format_move_name(&moves[i].name)),
         )
     });
     let picks = order
@@ -2725,6 +2751,15 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
 }
 
 fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
+    let name = effect_call_display_name_unfaced(call);
+    match crate::data::facing_arm_of(call.guard.as_deref()) {
+        Some(true) => format!("{name} (facing left)"),
+        Some(false) => format!("{name} (facing right)"),
+        None => name,
+    }
+}
+
+fn effect_call_display_name_unfaced(call: &crate::data::EffectCall) -> String {
     if let Some(control) = &call.control {
         return match control {
             crate::data::EffectControl::DetachKind { effect_name, unk } => {
@@ -2762,10 +2797,20 @@ fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
             }
         };
     }
-    // A colour command has no graphic, so the command itself is its name. Falling through to
-    // the spawn branches would label every one of them with an empty string.
+    // A colour command has no graphic, so what it does to the fighter is its name. Falling
+    // through to the spawn branches would label every one of them with an empty string.
     if call.color.is_some() {
-        return call.spawn_func.clone();
+        return match call.spawn_func.as_str() {
+            "FLASH" => "Fighter flash",
+            "FLASH_FRM" => "Fighter flash, fading",
+            "BURN_COLOR" => "Fighter glow",
+            "BURN_COLOR_FRAME" => "Fighter glow, fading",
+            "BURN_COLOR_NORMAL" => "Fighter glow ends",
+            "START_INFO_FLASH_EYE" => "Eye flash",
+            "COL_NORMAL" => "Fighter color back to normal",
+            other => other,
+        }
+        .into();
     }
     match call
         .effect_name_alt
@@ -8493,7 +8538,7 @@ impl VisionaryApp {
                     groups[idx].push(m.clone());
                 }
                 for group in &mut groups {
-                    group.sort_by_cached_key(|m| format_move_name(&m.name));
+                    group.sort_by_cached_key(|m| move_list_order(&format_move_name(&m.name)));
                 }
 
                 let selected_group = self
@@ -9471,9 +9516,13 @@ impl VisionaryApp {
                 });
             }
         };
-        // Calls inside facing branches are not on the timeline; the preview faces right.
-        let facing = self.state.effect_script.facing_right_calls();
-        for ec in self.state.effects.iter().chain(facing.iter()) {
+        // The preview faces right, so the facing-left arm of a facing test never plays.
+        for ec in self
+            .state
+            .effects
+            .iter()
+            .filter(|ec| crate::data::facing_arm_of(ec.guard.as_deref()) != Some(true))
+        {
             // An effect draws until its particles are gone, as in game; the preview simulates
             // at most 600 frames of it.
             if ec.disabled
@@ -9615,12 +9664,10 @@ impl VisionaryApp {
         if self.eff_editor.open_move_plays_selected() {
             return false;
         }
-        let facing = self.state.effect_script.facing_right_calls();
         let in_move = self
             .state
             .effects
             .iter()
-            .chain(facing.iter())
             .any(|ec| ec.effect_name.eq_ignore_ascii_case(name))
             || objects.iter().any(|object| {
                 object
@@ -17961,7 +18008,7 @@ impl VisionaryApp {
                     })
                     .unwrap_or_default();
                 rules.iter().cloned().map(move |mut rule| {
-                    if let Some(inject) = rule.inject.as_mut() {
+                    if let Some(inject) = rule.inject.as_mut().filter(|inject| inject.guard.is_none()) {
                         inject.guard = guards
                             .iter()
                             .find(|(frame, _)| *frame == inject.frame)
@@ -29497,7 +29544,7 @@ impl VisionaryApp {
                     uses.push(RedirectUse {
                         move_key: key.clone(),
                         call_idx: i,
-                        label: redirect_label(key, c.active_start),
+                        label: redirect_label(key, c),
                         selected: true,
                     });
                 }
@@ -29511,7 +29558,7 @@ impl VisionaryApp {
                         uses.push(RedirectUse {
                             move_key: mv_key.clone(),
                             call_idx: i,
-                            label: redirect_label(&mv_key, c.active_start),
+                            label: redirect_label(&mv_key, c),
                             selected: true,
                         });
                     }
@@ -29790,7 +29837,7 @@ impl VisionaryApp {
                         .map(|(i, c)| RedirectUse {
                             move_key: key.clone(),
                             call_idx: i,
-                            label: redirect_label(&key, c.active_start),
+                            label: redirect_label(&key, c),
                             selected: true,
                         })
                         .collect();
@@ -30180,7 +30227,22 @@ impl VisionaryApp {
         let mut missing_capture = false;
         let mut unsupported_work_int = false;
         let mut unsupported_flip_axis = false;
+        // A changed arm of a facing test replaces the spawn whichever way the fighter faces, so
+        // both arms at that frame are sent as their own spawns, each guarded by its facing.
+        let facing_frames: std::collections::BTreeSet<u32> = effects
+            .iter()
+            .enumerate()
+            .filter(|(i, ec)| {
+                crate::data::facing_arm_of(ec.guard.as_deref()).is_some()
+                    && pristines.get(*i) != Some(*ec)
+            })
+            .filter_map(|(i, _)| pristines.get(i).map(|p| p.active_start))
+            .collect();
         for (i, ec) in effects.iter().enumerate() {
+            let facing_pair_changed = crate::data::facing_arm_of(ec.guard.as_deref()).is_some()
+                && pristines
+                    .get(i)
+                    .is_some_and(|p| facing_frames.contains(&p.active_start));
             let pristine = pristines.get(i);
             let spawn_frame = pristine.map(|p| p.active_start).unwrap_or(ec.active_start);
             let hash = effect_name_hash(&ec.effect_name);
@@ -30453,14 +30515,15 @@ impl VisionaryApp {
             let reattached = pristine
                 .map(|p| !p.bone_name.eq_ignore_ascii_case(&ec.bone_name))
                 .unwrap_or(false);
-            let swapped = pristine
-                .map(|p| {
-                    orig_hash != hash
-                        || p.effect_name_alt != ec.effect_name_alt
-                        || p.spawn_func != ec.spawn_func
-                        || p.flip_axis != ec.flip_axis
-                })
-                .unwrap_or(true);
+            let swapped = facing_pair_changed
+                || pristine
+                    .map(|p| {
+                        orig_hash != hash
+                            || p.effect_name_alt != ec.effect_name_alt
+                            || p.spawn_func != ec.spawn_func
+                            || p.flip_axis != ec.flip_axis
+                    })
+                    .unwrap_or(true);
             if (retimed || swapped || reattached) && ec.work_int.is_some() {
                 // A retimed injection replays the spawn call, but not the separate WorkModule
                 // assignment that followed it in source. Without a verified runtime Work ID
@@ -30959,11 +31022,15 @@ impl VisionaryApp {
     ) -> usize {
         let target_hash = effect_name_hash(&target.effect_name);
         let target_is_trail = effect_call_is_trail(target);
+        // Only one arm of a facing test runs, so the other arm's spawns never came first.
+        let target_arm = crate::data::facing_arm_of(target.guard.as_deref());
         pristines
             .iter()
             .take(index)
             .filter(|call| {
-                !call.disabled
+                let arm = crate::data::facing_arm_of(call.guard.as_deref());
+                (arm.is_none() || target_arm.is_none() || arm == target_arm)
+                    && !call.disabled
                     && call.control.is_none()
                     && call.color.is_none()
                     && effect_call_is_trail(call) == target_is_trail
@@ -31055,7 +31122,7 @@ impl VisionaryApp {
                 frame: Self::script_to_motion_frame(ec.active_start),
                 func: command.to_string(),
                 args,
-                guard: None,
+                guard: facing_live_guard(ec),
             });
         }
         let spawns = captures
@@ -31092,7 +31159,7 @@ impl VisionaryApp {
             frame: Self::script_to_motion_frame(ec.active_start),
             func,
             args,
-            guard: None,
+            guard: facing_live_guard(ec),
         })
     }
 
@@ -31678,7 +31745,6 @@ impl VisionaryApp {
                 self.state.selected_effect_call = Some(*index);
                 self.primary_tab = PrimaryEditorTab::Effects;
             }
-            TimelineSelection::Seen => {}
             TimelineSelection::Command { family, site } => {
                 self.selected_command = Some((family.clone(), *site));
                 if family == "hurtbox" {
@@ -31821,32 +31887,6 @@ impl VisionaryApp {
                 }
                 row
             })
-            .chain(
-                // Spawns the preview plays from the right-facing branch of the script.
-                if effects_page {
-                    self.state.effect_script.facing_right_calls()
-                } else {
-                    Default::default()
-                }
-                .into_iter()
-                .filter(|ec| ec.color.is_none() && ec.control.is_none())
-                .map(|ec| TimelineRow {
-                    category: TimelineCategory::Effects,
-                    selection: TimelineSelection::Seen,
-                    label: effect_call_display_name(&ec),
-                    start: ec.active_start,
-                    end: ec.active_end.max(ec.active_start + 1).min(total),
-                    seek_frame: ec.active_start,
-                    color: if open_effect
-                        .as_deref()
-                        .is_none_or(|open| ec.effect_name.eq_ignore_ascii_case(open))
-                    {
-                        Color32::from_rgb(255, 220, 0)
-                    } else {
-                        Color32::from_gray(90)
-                    },
-                }),
-            )
             .collect();
         let row_height = SCRUBBER_ROW_HEIGHT;
         let label_width = (ui.available_width() * 0.22).clamp(110.0, 180.0);
@@ -31945,7 +31985,6 @@ impl VisionaryApp {
                             hitbox_is_selected(self.selected_hitbox, *i)
                         }
                         TimelineSelection::Effect(i) => self.state.selected_effect_call == Some(*i),
-                        TimelineSelection::Seen => false,
                         TimelineSelection::Command { family, site } => self
                             .selected_command
                             .as_ref()
@@ -35650,11 +35689,20 @@ fn unswitchable_uses(
 }
 
 /// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
-fn redirect_label(move_key: &str, frame: u32) -> String {
+fn redirect_label(move_key: &str, call: &crate::data::EffectCall) -> String {
     let motion = move_key
         .split_once('/')
         .map_or(move_key, |(_, motion)| motion);
-    format!("{}, frame {frame}", crate::move_kinds::plain_name(motion))
+    let facing = match crate::data::facing_arm_of(call.guard.as_deref()) {
+        Some(true) => ", facing left",
+        Some(false) => ", facing right",
+        None => "",
+    };
+    format!(
+        "{}, frame {}{facing}",
+        crate::move_kinds::plain_name(motion),
+        call.active_start
+    )
 }
 
 /// Which moves of a fighter spawn each effect (by hash40 of its name), read from every move

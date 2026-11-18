@@ -344,3 +344,273 @@ mod tests {
         assert_eq!(whole.preserved_block_count, 1);
     }
 }
+
+/// Editable versus preserved across the vanilla corpus. Ignored: it reads the pinned dump,
+/// `VISIONARY_CORPUS` (default `~/.cache/builds/ssbu_scripts/SSBU-Dumped-Scripts/smashline`
+/// at `crate::acmd::DUMP_REV`). Run with `cargo test corpus_census -- --ignored --nocapture`.
+#[cfg(test)]
+mod census {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// What a preserved item is, for ranking: its callee, or the head of its block.
+    fn key(text: &str) -> String {
+        let text = text.trim();
+        let callee: String = text
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '!'))
+            .collect();
+        if callee.len() > 2 {
+            return callee;
+        }
+        text.chars().take(48).collect()
+    }
+
+    fn stmt_text(stmt: &crate::data::AcmdStmt) -> String {
+        use crate::data::AcmdStmt;
+        match stmt {
+            AcmdStmt::RawBlock { header, .. } => format!("block {}", key(header)),
+            AcmdStmt::Raw(line) => key(line),
+            other => key(&format!("{other:?}")),
+        }
+    }
+
+    fn excute_text(stmt: &crate::data::ExcuteStmt) -> String {
+        match stmt {
+            crate::data::ExcuteStmt::Raw(line) => key(line),
+            other => format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("").into(),
+        }
+    }
+
+    fn effect_text(stmt: &crate::data::EffectMacro) -> String {
+        match stmt {
+            crate::data::EffectMacro::Raw(line) => key(line),
+            other => format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("").into(),
+        }
+    }
+
+    /// The untyped lines inside a preserved block, which are what typing would have to cover.
+    fn inner(
+        stmt: &crate::data::AcmdStmt,
+        ranking: &mut BTreeMap<String, u64>,
+        samples: &mut BTreeMap<String, String>,
+    ) {
+        use crate::data::{AcmdStmt, ExcuteStmt};
+        let mut note = |line: &str| {
+            let key = format!("in  {}", key(line));
+            samples.entry(key.clone()).or_insert_with(|| line.chars().take(300).collect());
+            *ranking.entry(key).or_default() += 1;
+        };
+        match stmt {
+            AcmdStmt::Raw(line) => note(line),
+            AcmdStmt::Excute(commands) => {
+                for command in commands {
+                    if let ExcuteStmt::Raw(line) = command {
+                        note(line);
+                    }
+                }
+            }
+            AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
+                for stmt in body {
+                    inner(stmt, ranking, samples);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk(nodes: &[MoveNode], ranking: &mut BTreeMap<String, u64>, samples: &mut BTreeMap<String, String>) {
+        for node in nodes {
+            match &node.kind {
+                NodeKind::MixedExecute { commands } => {
+                    for command in commands {
+                        if let MoveCommand::Preserved(command) = command {
+                            let key = format!("cmd {}", excute_text(command));
+                            samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
+                            *ranking.entry(key).or_default() += 1;
+                        }
+                    }
+                }
+                NodeKind::MixedEffectExecute { commands, .. } => {
+                    for command in commands {
+                        if let super::super::model::EffectCommandSlot::Preserved(command) = command {
+                            let key = format!("cmd {}", effect_text(command));
+                            samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
+                            *ranking.entry(key).or_default() += 1;
+                        }
+                    }
+                }
+                NodeKind::Preserved { statement } => {
+                    inner(statement, ranking, samples);
+                    let key = format!("blk {}", stmt_text(statement));
+                    samples.entry(key.clone()).or_insert_with(|| format!("{statement:?}").chars().take(300).collect());
+                    *ranking.entry(key).or_default() += 1;
+                }
+                NodeKind::Repeat { body, .. } => walk(body, ranking, samples),
+                NodeKind::Branch { then_nodes, else_nodes, .. } => {
+                    walk(then_nodes, ranking, samples);
+                    walk(else_nodes, ranking, samples);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn corpus_census() {
+        let root = std::env::var_os("VISIONARY_CORPUS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap()
+                    .join(".cache/builds/ssbu_scripts/SSBU-Dumped-Scripts/smashline")
+            });
+        let (mut functions, mut editable) = (0u64, 0u64);
+        let (mut commands, mut blocks, mut opaque) = (0u64, 0u64, 0u64);
+        let mut ranking = BTreeMap::new();
+        let mut samples = BTreeMap::new();
+        let mut dirs: Vec<_> = std::fs::read_dir(&root).expect("corpus").flatten().collect();
+        dirs.sort_by_key(|entry| entry.path());
+        for package in dirs {
+            let Some(fighter) = package
+                .file_name()
+                .to_string_lossy()
+                .strip_prefix("lua2cpp_")
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let mut agents: Vec<_> = std::fs::read_dir(package.path()).unwrap().flatten().collect();
+            agents.sort_by_key(|entry| entry.path());
+            for agent in agents {
+                let mut files: Vec<_> = std::fs::read_dir(agent.path()).unwrap().flatten().collect();
+                files.sort_by_key(|entry| entry.path());
+                for file in files {
+                    let Ok(text) = std::fs::read_to_string(file.path()) else {
+                        continue;
+                    };
+                    for function in text.split("unsafe extern \"C\" fn ").skip(1) {
+                        let body = format!("unsafe extern \"C\" fn {function}");
+                        let track = if function.starts_with("game_") {
+                            Track::Game
+                        } else if function.starts_with("effect_") {
+                            Track::Effect
+                        } else if function.starts_with("sound_") {
+                            Track::Sound
+                        } else if function.starts_with("expression_") {
+                            Track::Expression
+                        } else {
+                            continue;
+                        };
+                        let imported = match track {
+                            Track::Effect => super::super::effects::import_for_fighter(
+                                &fighter,
+                                &crate::acmd::parse_effect_script(&body),
+                            ),
+                            _ => {
+                                let parsed = match track {
+                                    Track::Game => crate::acmd::parse_acmd_script(&body),
+                                    Track::Sound => crate::acmd::parse_sound_script(&body),
+                                    _ => crate::acmd::parse_expression_script(&body),
+                                };
+                                super::super::timeline::import_for_fighter(&fighter, track, &parsed)
+                            }
+                        };
+                        let summary = track_summary(&imported);
+                        functions += 1;
+                        if summary.preserved_block_count == 0
+                            && summary.preserved_command_count == 0
+                            && summary.opaque_source_line_count == 0
+                        {
+                            editable += 1;
+                        }
+                        commands += summary.preserved_command_count;
+                        blocks += summary.preserved_block_count;
+                        opaque += summary.opaque_source_line_count;
+                        walk(&imported.nodes, &mut ranking, &mut samples);
+                    }
+                }
+            }
+        }
+        println!(
+            "CENSUS functions {functions} fully_editable {editable} preserved_commands {commands} preserved_blocks {blocks} opaque_lines {opaque}"
+        );
+        let mut ranked: Vec<_> = ranking.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (name, count) in ranked.iter().take(80) {
+            println!("RANK {count:>6} {name}\n       {}", samples.get(name).map_or("", String::as_str));
+        }
+        assert!(functions > 70_000, "corpus incomplete: {functions} functions");
+    }
+
+    /// Every vanilla effect script with a facing test: both arms reach the flat call list, and
+    /// writing that list back gives Rust that parses and reads back to the same calls.
+    #[test]
+    #[ignore]
+    fn facing_effects_round_trip() {
+        let root = dirs::home_dir()
+            .unwrap()
+            .join(".cache/builds/ssbu_scripts/SSBU-Dumped-Scripts/smashline");
+        let (mut checked, mut spawns) = (0, 0);
+        let mut failures = Vec::new();
+        for package in std::fs::read_dir(&root).unwrap().flatten() {
+            for agent in std::fs::read_dir(package.path()).into_iter().flatten().flatten() {
+                for file in std::fs::read_dir(agent.path()).into_iter().flatten().flatten() {
+                    let Ok(text) = std::fs::read_to_string(file.path()) else { continue };
+                    for function in text.split("unsafe extern \"C\" fn ").skip(1) {
+                        // Decompiler-broken conditions (`L2CValue::operator`) never wrote back.
+                        if !function.starts_with("effect_")
+                            || !function.contains(crate::data::FACING_LEFT_GUARD)
+                            || function.contains("methodlib::")
+                        {
+                            continue;
+                        }
+                        let body = format!("unsafe extern \"C\" fn {function}");
+                        // A dump that is not Rust to begin with cannot be expected to write back.
+                        if syn::parse_file(&body).is_err() {
+                            continue;
+                        }
+                        let script = crate::acmd::parse_effect_script(&body);
+                        let (calls, residue) = script.to_effect_calls_and_residue();
+                        let facing: Vec<_> = calls
+                            .iter()
+                            .filter(|call| crate::data::facing_arm_of(call.guard.as_deref()).is_some())
+                            .collect();
+                        let name = format!("{}", file.path().display());
+                        spawns += facing.len();
+                        checked += 1;
+                        let written = crate::acmd::preview_effect_fn(&calls, "x", &[], &residue);
+                        if let Err(error) = syn::parse_file(&written) {
+                            failures.push(format!("{name}: does not parse: {error}\n{written}"));
+                            continue;
+                        }
+                        let again = crate::acmd::parse_effect_script(&written).to_effect_calls();
+                        // The writer orders spawns by frame; the dump sometimes does not.
+                        let key = |calls: &[crate::data::EffectCall]| -> Vec<_> {
+                            let mut keys: Vec<_> = calls
+                                .iter()
+                                .map(|c| (c.effect_name.clone(), c.active_start, c.guard.clone(), c.rotation.map(f32::to_bits)))
+                                .collect();
+                            keys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                            keys
+                        };
+                        if key(&again) != key(&calls) {
+                            failures.push(format!("{name}: reads back differently\n{written}"));
+                        }
+                    }
+                }
+            }
+        }
+        println!("FACING {checked} scripts, {spawns} facing spawns, {} failures", failures.len());
+        for failure in failures.iter().take(10) {
+            println!("{failure}\n");
+        }
+        // Three dumps put an `else {` after an unrelated block; they wrote back broken before
+        // facing tests were read too, and still do.
+        let known = ["trail/AppealHiR.txt", "trail/AppealHiL.txt", "bayonetta/AttackAirN.txt"];
+        failures.retain(|failure| !known.iter().any(|name| failure.contains(name)));
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+        assert!(spawns > 1000, "only {spawns} facing spawns reached the flat list");
+    }
+}

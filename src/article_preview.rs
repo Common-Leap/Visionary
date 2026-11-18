@@ -184,6 +184,7 @@ fn object_effects_as_written(body: &str) -> Vec<ObjectEffect> {
     if !parsed.is_empty() {
         return parsed
             .into_iter()
+            .filter(|call| crate::data::facing_arm_of(call.guard.as_deref()) != Some(true))
             .map(|call| ObjectEffect {
                 name: call.effect_name,
                 bone: call.bone_name,
@@ -1113,16 +1114,21 @@ mod tests {
 }
 }"#;
         let script = crate::acmd::parse_effect_script(body);
-        assert!(script
+        let calls: Vec<_> = script
             .to_effect_calls()
+            .into_iter()
+            .filter(|call| call.effect_name == "mario_fb_shoot")
+            .collect();
+        assert_eq!(calls.len(), 2);
+        let arms: Vec<_> = calls
             .iter()
-            .all(|call| call.effect_name != "mario_fb_shoot"));
-        let extra = script.facing_right_calls();
-        assert_eq!(extra.len(), 1);
-        assert_eq!(extra[0].effect_name, "mario_fb_shoot");
-        assert_eq!(extra[0].bone_name, "havel");
-        assert_eq!(extra[0].rotation, [0.0, -45.0, 0.0]);
-        assert_eq!(extra[0].active_start, 13);
+            .map(|call| crate::data::facing_arm_of(call.guard.as_deref()))
+            .collect();
+        assert_eq!(arms, [Some(true), Some(false)]);
+        assert_eq!(calls[1].bone_name, "havel");
+        assert_eq!(calls[0].rotation, [0.0, 45.0, 0.0]);
+        assert_eq!(calls[1].rotation, [0.0, -45.0, 0.0]);
+        assert!(calls.iter().all(|call| call.active_start == 13));
     }
 
     #[test]
