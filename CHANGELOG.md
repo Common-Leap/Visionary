@@ -4,6 +4,27 @@ This fork is now built on Visionary v0.3.0, so everything new there (Move nodes,
 the Effects page, effects drawn in the preview, stages, objects and the grab opponent) is
 included. The notes below are what the fork adds on top.
 
+## New in 0.3.1
+
+- **Built on Visionary 0.3.0.** Everything in the official 0.3.0 release is here, together
+  with everything this fork adds.
+- **Game version 13.0.5 works too.** The in-game plugin checks whether you're on 13.0.4 or
+  13.0.5 and uses the right addresses for it. On any other version it stays off and says so,
+  instead of misbehaving.
+- **Boots with the Ozone plugin loader.** The plugin no longer stops the game from starting
+  under Ozone.
+- **Move a hitbox in time in your own code.** Moving a hitbox to another frame now moves it in
+  your linked moveset's code as well. Scripts timed with loops or branches are left alone, and
+  you're told why.
+- **Grabs end where you set them.** Making a grab last longer now works in game, and the status
+  line warns you when one grab box is cut short by another.
+- **Effects on any frame.** An effect you move, add or stop on a frame where the script doesn't
+  stop now plays in game.
+- **Pick who you're grabbing.** Grabs and throws hold the fighter and costume you pick in the
+  viewport toolbar. Turn off **Thrown fighter** to hide them.
+- **Project files are now version 8.** Visionary opens projects from the official release and
+  from older versions of this fork. Older versions of Visionary can't open a version 8 project.
+
 ## Highlights
 
 - **Frame data at a glance.** Pick a move and see its startup, active frames, when you can act
@@ -34,8 +55,8 @@ included. The notes below are what the fork adds on top.
   that used to snap to the floor (like Mario's jaw) are fixed.
 - **Recolours and shared costumes work.** Costumes that borrow files from other costumes or from
   the base game now load completely, just like they do in game.
-- **See who's being thrown.** On throws, a second fighter is drawn being held and thrown.
-  It's Mario by default, but you can pick anyone.
+- **See who's being grabbed and thrown.** In grabs and throws, a second fighter is drawn being
+  held and thrown. It's Mario by default, but you can pick anyone and any costume.
 - **True-to-game size.** Characters that a mod makes bigger or smaller are drawn at that size,
   hitboxes included.
 - **New camera controls.** Left drag to orbit, right or middle drag to pan, scroll to zoom. The
@@ -79,3 +100,7 @@ included. The notes below are what the fork adds on top.
   alongside roster mods.
 - On Windows, the black console window is now hidden unless you turn it on in Settings, and
   builds no longer flash console windows.
+- Exporting no longer overwrites the original file of an effect you opened from outside your
+  game dump.
+- The stage picker no longer covers the viewport toolbar.
+- Some tooltips had big gaps in the middle of their text. They read normally now.

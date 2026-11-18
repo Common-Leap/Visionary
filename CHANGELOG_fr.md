@@ -9,6 +9,64 @@ so.
 For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle ground, see
 [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
 
+## 0.3.1: merging upstream v0.3.0
+
+- **Merge.** Upstream `v0.3.0` (Move nodes, Gimmicks, the Effects page, effect drawing in the
+  preview, stages, objects, the grab/throw opponent) is merged. Where both sides changed the
+  same thing:
+  - *Camera:* the fork's controls (left drag orbits, right or middle drag pans, ⟲ resets),
+    plus upstream's camera following the fighter and double-click back to the side view.
+  - *Thrown fighter:* the fork's picker drives upstream's opponent in grabs and throws, instead
+    of a separate model placed through the `rot` bone. It is on by default, and the victim's own
+    scale is not applied. When the picked costume has no model or motion it falls back to
+    Mario, then the fighter itself.
+  - *Execute blocks:* upstream recognises `if macros::is_excute(agent) {` exactly. The fork also
+    accepts one-line blocks and any agent name, so those movesets keep typed hitboxes and
+    effects. Upstream's lexical block-end search mapped byte offsets back to lines by counting
+    `\n`, which drifted after a `/* … */` comment spanning lines; it now maps offsets to the
+    line entries.
+  - *Grab clears:* `grab!(…GRAB_CLEAR_ALL)` stays a `NativeCall` and is kept as written on
+    export; the timeline still ends grab boxes on it.
+  - *Live injection:* a hitbox whose constants don't resolve still waits for a capture rather
+    than sending a zero. For effects, upstream's capture-free path is used.
+  - *Project version:* `PROJECT_VERSION` is 8. Upstream went from v3 to v7, so v4 only comes
+    from the fork. v1–v3 and v7 files are seeded with project fighters from their edits; v4 and
+    v8 files keep their own list. Upstream's legacy loader (`legacy_move_triggers`) dropped
+    `project_fighters` and `moveset_source`; it now passes them through.
+  - *ssbh_wgpu:* the fork depends on `joobert/ssbh_wgpu` rev `6702cb4`, built on Common-Leap's
+    fork with two commits: `ModelFolder::load_files` (costume file lists) and the skeleton edit
+    hook in `apply_anims_with_skel_edit` (fighter scale at the root bones).
+- **SSBU 13.0.5.** `offsets.rs` holds each main-executable offset for 13.0.4 and 13.0.5. The
+  plugin detects the build before installing any hook and stays off on any other version. The
+  boot log records `game=`, `loader=` and `copy=`. Upstream's gimmick hooks (damage capture and
+  commit, incoming hit, cloud resource, live parameters) check the game's bytes or digests
+  before patching, so on 13.0.5 they turn off rather than patch the wrong address.
+- **Ozone.** The coroutine and `L2CFighterAnimcmdEffectCommon` hooks resolve their target
+  through the bound import or `nn::ro::LookupSymbol` and install when a `lua2cpp` module
+  loads, never on a null address. Ozone binds imports immediately and aborted on the old
+  null import. The plugin builds against the smashline branch with PR 87 merged (`137aeb7`;
+  the earlier `c510441` was force-pushed away).
+- **Source retiming** (`source_timing.rs`). Moving a hitbox in time in a linked moveset
+  moves its call to the execute block at the new frame, or makes one by splitting a `wait`,
+  and re-parses the result to check every hitbox's timing. Scripts timed through loops or
+  branches are refused.
+- **Grab clears.** A grab ends at one move-level clear. A lengthened grab suppresses the
+  script's clear and injects one on the edited frame (wire category 37), and the status line
+  warns when one grab is cut short by another's clear.
+- **Effects between script frames.** `acmd_hooks::inject_tick` runs from the fighter's
+  `StatusLine::Main` callback and fires effects retimed, added or stopped on frames no ACMD
+  `frame`/`wait` reaches, on the first tick at or past the target (motion rates can step over
+  the ±0.5 window). The shared latch makes it a no-op for a target a boundary already fired.
+- **Effect export.** An eff opened from outside the eff root was recorded by its absolute
+  path, and export's `mod_dir.join` then overwrote the user's file. It is now recorded by its
+  game path (from its `effect/` folder or `ef_<fighter>.eff` name), old absolute sources are
+  rewritten on load, and export refuses any `source_rel` that is still not a game path.
+- **Fixes in the merged build.** The stage picker and the viewport toolbar were both drawn in
+  the viewport's top-left corner. The picker now sits under the toolbar, and the Effects page's
+  view switch moves down when the toolbar reaches it. Five string literals had a lost line
+  continuation, leaving a run of spaces in their text. The source-reading tests fold CRLF, so
+  they pass on a Windows checkout.
+
 ## Moveset source (ACMD Source window)
 
 - **Read movesets as they are written.** Only files reached through the crate's `mod` tree

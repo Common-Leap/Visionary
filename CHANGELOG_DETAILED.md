@@ -4,6 +4,19 @@ Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion
 
 > Fork 0.3.1, on top of Visionary v0.3.0. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
 
+## New in 0.3.1
+
+- **Visionary v0.3.0 merged** — Move nodes, Gimmicks, the Effects page, effects in the preview, stages, objects and the grab opponent, with this fork's features carried on top
+- **SSBU 13.0.5** — the plugin detects 13.0.4 or 13.0.5 before installing any hook and reads every main-executable offset from that build's table; any other version leaves it off with a log line. The boot log records `game=` and `loader=`. Upstream's gimmick hooks check the game's own bytes before patching and turn off where they don't match
+- **Ozone** — the four `lua2cpp_common` hooks install once their symbols resolve, never on a null import, so the game boots under Ozone
+- **Source retiming** — moving a hitbox in time in a linked moveset moves its call to the execute block at the new frame (or makes one, splitting a `wait`), then re-parses to check every hitbox's timing. Scripts timed through loops or branches are refused
+- **Grab clears** — a grab ends at one move-level clear (`GrabModule::clear_all` or `grab!(…GRAB_CLEAR_ALL)`). A lengthened grab suppresses the script's clear and injects one on the edited frame, and the status line warns when one grab is cut short by another's clear. `grab!` forms are kept as written on export
+- **Effects between script frames** — effects retimed, added or stopped on a frame no ACMD `frame`/`wait` reaches fire from the fighter's per-frame status line; a shared latch stops a target firing twice
+- **Grab and throw opponent** — the **Thrown fighter** picker (fighter, costume, thrown motion) drives the opponent in grabs and throws. It is on by default, and falls back to Mario, then the fighter itself, when the picked costume has no model or motion
+- **Execute blocks** — one-line blocks and any agent name (`if macros::is_excute(fighter) { … }`) parse as typed hitboxes and effects, and a `/* … */` comment spanning lines no longer misplaces block ends
+- **Live hitboxes** — a hitbox with a constant Visionary can't resolve waits for a live capture instead of sending a zero
+- **Project version 8** — v1–v3 files and Common-Leap v7 files get their fighter list built from their edits; a fork v4 or v8 file keeps its own. The project loader keeps the fighter list and linked moveset. Builds older than this refuse a v8 file rather than dropping its sections
+
 ## New features
 
 ### Frame data
@@ -111,6 +124,10 @@ With no dump set, the left panel shows "Step 1 — your game dump" and **Choose 
 - With several SD roots, Visionary uses the one the game wrote to most recently
 
 ## Bug fixes
+
+- **Effect export overwrote its source** — an eff opened from outside the dump was saved by its absolute path, and export joined that onto the mod folder, writing over the original file. Effects are now recorded by their game path, old absolute sources are rewritten on load, and export refuses any that is still absolute
+- **Stage picker over the viewport toolbar** — both were drawn in the viewport's top-left corner. The picker now sits under the toolbar, and the Effects page's view switch moves down when the toolbar reaches it
+- **Broken tooltip text** — five tooltips and status messages had a run of spaces in the middle where a line continuation was lost
 
 - **Character select scrambled with roster mods** — the in-game plugin registered a "no-op" ARCropolis probe on `ui_chara_db.prc`. ARCropolis keeps one callback per file, so it replaced the loader roster mods patch through. The probe is removed, and the unmeasured roster heap patch stays disabled; CSS order changes apply on the next menu load
 - **Misplaced bones** — hitbox, hurtbox and effect positions now come from the same skeleton evaluation that skins the mesh, so they follow helper bones, and bones listed before their parent (Mario's jaw and lips) are no longer drawn at the origin
