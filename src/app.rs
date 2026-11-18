@@ -3844,6 +3844,17 @@ pub struct VisionaryApp {
     /// Transplant studio: entry pool across every eff under the export root.
     effect_pool: Option<crate::effect_pool::EffectPool>,
     show_transplant: bool,
+    /// Bring the borrow window in front on the next frame: it is its own OS window, and the
+    /// main window covers it whenever that is clicked.
+    focus_transplant: bool,
+    /// The borrow window's effect list, grouped by source, for the pool progress and search
+    /// it was made for, with every source the pool holds.
+    #[allow(clippy::type_complexity)]
+    transplant_groups: Option<(
+        ((usize, usize), String),
+        Vec<String>,
+        Vec<crate::effect_pool::EffectSourceGroup>,
+    )>,
     transplant_search: String,
     /// Open/closed source sections captured immediately before transplant search mode began.
     transplant_expansion_before_search: Option<BTreeMap<String, bool>>,
@@ -3958,6 +3969,8 @@ pub struct VisionaryApp {
     preview_stages: (Option<PathBuf>, Vec<String>),
     /// The ledges of the stage shown, by stage name.
     preview_ledges: (String, Vec<[f32; 2]>),
+    /// The open move the Moves list last scrolled to, so a move opened from elsewhere is shown.
+    move_revealed: Option<u64>,
     /// Which moves spawn each effect, for the Effects page list.
     effect_uses: EffectUseIndex,
     /// When the Effects page's looping play of the open effect started.
@@ -4402,6 +4415,8 @@ impl VisionaryApp {
             pending_capture: None,
             effect_pool: None,
             show_transplant: false,
+            focus_transplant: false,
+            transplant_groups: None,
             transplant_search: String::new(),
             transplant_expansion_before_search: None,
             transplant_search_opened: BTreeSet::new(),
@@ -4456,6 +4471,7 @@ impl VisionaryApp {
                 .filter(|name| !name.is_empty()),
             preview_stages: (None, Vec::new()),
             preview_ledges: (String::new(), Vec::new()),
+            move_revealed: None,
             effect_uses: EffectUseIndex::default(),
             effect_loop_started: std::time::Instant::now(),
             effect_loop_for: None,
@@ -9131,16 +9147,16 @@ impl VisionaryApp {
                                 // Every op here is a transplant; the slot list, when
                                 // present, is the one-slot scoping riding on top of it.
                                 let operation = if os.one_slot_slots.len() == 1 {
-                                    format!("one-slot transplant c{:02}", os.one_slot_slots[0])
+                                    format!("Borrowed for skin c{:02}", os.one_slot_slots[0])
                                 } else {
-                                    "EFF transplant".to_string()
+                                    "Borrowed".to_string()
                                 };
                                 ui.horizontal(|ui| {
                                     ui.add_space(24.0);
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "{operation}: {} ← {}",
-                                            os.new_entry_name, os.src_set_name,
+                                            "{operation}: {} as {}",
+                                            os.src_set_name, os.new_entry_name,
                                         ))
                                         .small()
                                         .color(egui::Color32::from_rgb(190, 160, 255)),
@@ -9860,6 +9876,17 @@ impl VisionaryApp {
                     }
                     self.move_search_opened.clear();
                     self.move_search_touched.clear();
+                }
+
+                // A move opened any other way (a resumed project, the Effects page, a link)
+                // is shown in the list: its group opens and the row scrolls into view.
+                let open_move = self.state.selected_move.as_ref().map(|m| m.hash);
+                if open_move != self.move_revealed && !move_searching {
+                    if let Some(group) = selected_group {
+                        set_persistent_collapsing_open(ui, ("movecat", group), true);
+                        center_selected_move = true;
+                    }
+                    self.move_revealed = open_move;
                 }
 
                 if groups.iter().all(Vec::is_empty) {
@@ -19039,6 +19066,7 @@ impl VisionaryApp {
                                         self.transplant_new_name = format!("{name}{}", crate::mod_project::TRANSPLANT_SUFFIX);
                                         self.transplant_target = Some(fighter.clone());
                                         self.show_transplant = true;
+                                        self.focus_transplant = true;
                                     }
                                 }
                                 None => {
@@ -23731,6 +23759,11 @@ impl VisionaryApp {
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
+        // Effect edits and borrowed effects from a saved project have not been sent to the game
+        // in this session, so Send edits says so.
+        if n_eff > 0 || !self.eff_mods.is_empty() {
+            self.eff_editor.mark_unsent();
+        }
         // Load adopts the path: later edits autosave here.
         let snapshot = Self::snapshot_for_dirty(&self.build_project());
         self.project_path = Some(path.to_path_buf());
@@ -30086,6 +30119,12 @@ impl VisionaryApp {
             self.transplant_placement = None;
             return;
         }
+        if std::mem::take(&mut self.focus_transplant) {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of("eff_transplant"),
+                egui::ViewportCommand::Focus,
+            );
+        }
         if self.effect_pool.is_none() {
             self.effect_pool = Some(crate::effect_pool::EffectPool::new(
                 self.eff_editor.export_root().to_path_buf(),
@@ -30240,7 +30279,7 @@ impl VisionaryApp {
                     }
                     if scanning {
                         ui.label(
-                            egui::RichText::new(format!("scanning effs… {done}/{total}"))
+                            egui::RichText::new(format!("Reading effect files… {done}/{total}"))
                                 .small()
                                 .color(egui::Color32::GRAY),
                         );
@@ -30253,16 +30292,13 @@ impl VisionaryApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("Transplanted effects ({}):", recorded.len()))
+                            egui::RichText::new(format!("Borrowed effects ({}):", recorded.len()))
                                 .strong()
                                 .small(),
                         );
                         if ui
-                            .small_button("Clear this fighter")
-                            .on_hover_text(
-                                "Remove every transplanted effect listed above from this fighter \
-                                 and unload them from the game",
-                            )
+                            .small_button("Remove all")
+                            .on_hover_text("Take every effect listed here out of the project and the game")
                             .clicked()
                         {
                             clear_ops = true;
@@ -30270,12 +30306,12 @@ impl VisionaryApp {
                     });
                     for (i, op) in recorded.iter().enumerate() {
                         let scope = if op.one_slot_slots.len() == 1 {
-                            format!("one-slot transplant, c{:02}", op.one_slot_slots[0])
+                            format!("skin c{:02}", op.one_slot_slots[0])
                         } else if op.one_slot_slots.is_empty() {
-                            "EFF transplant, all skins".to_string()
+                            "all skins".to_string()
                         } else {
                             format!(
-                                "skin-scoped transplant: {}",
+                                "skins {}",
                                 op.one_slot_slots
                                     .iter()
                                     .map(|s| format!("c{s:02}"))
@@ -30287,7 +30323,7 @@ impl VisionaryApp {
                             if ui
                                 .small_button("Remove")
                                 .on_hover_text(
-                                    "Remove this transplant and immediately rebuild the live carrier",
+                                    "Take this borrowed effect out of the project and the game",
                                 )
                                 .clicked()
                             {
@@ -30295,7 +30331,7 @@ impl VisionaryApp {
                             }
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} → {} ({scope})",
+                                    "{} as {}, {scope}",
                                     op.src_set_name, op.new_entry_name
                                 ))
                                 .small(),
@@ -30343,7 +30379,7 @@ impl VisionaryApp {
                     ui.label("Skins:");
                     if ui
                         .selectable_label(self.one_slot_slots.is_empty(), "All skins")
-                        .on_hover_text("Transplant into the base EFF for every skin")
+                        .on_hover_text("Every skin gets the borrowed effect")
                         .clicked()
                     {
                         self.one_slot_slots.clear();
@@ -30401,28 +30437,36 @@ impl VisionaryApp {
                 } else {
                     slot_grid(ui, &mut self.one_slot_slots);
                 }
-                if !self.one_slot_slots.is_empty() {
+                // One line either way, so picking a skin does not move everything below it.
+                if self.one_slot_slots.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Every skin gets it as a new effect. Next you pick the moves that \
+                             play it.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                } else {
                     let selected_skin_count = self.one_slot_slots.len();
                     // One selected slot is the classic one-slot; several is the same
                     // transplant, just scoped to more than one costume.
-                    let scope_term = if selected_skin_count == 1 {
-                        "One-slot transplant"
-                    } else {
-                        "Skin-scoped transplant"
-                    };
+                    let skins = if selected_skin_count == 1 { "this skin" } else { "these skins" };
                     ui.label(
                         egui::RichText::new(format!(
-                            "{scope_term}: the donor REPLACES a chosen entry in place (all its \
-                             uses switch on those costumes, no redirect step) and exports as \
-                             ef_<fighter>_cXX.eff — loading costume-specific EFF files in-game \
-                             requires costume-specific EFF loading support."
+                            "On {skins}, it replaces one of the fighter's effects everywhere \
+                             that effect plays."
                         ))
                         .small()
-                        .color(egui::Color32::from_rgb(200, 200, 120)),
+                        .color(egui::Color32::GRAY),
+                    )
+                    .on_hover_text(
+                        "It is saved in an effect file of their own (ef_<fighter>_cXX.eff), \
+                         which the game only loads with per-skin effect file support.",
                     );
                 }
                 let Some(target) = &target else {
-                    ui.colored_label(egui::Color32::GRAY, "Pick a target fighter.");
+                    ui.colored_label(egui::Color32::GRAY, "Pick a fighter to borrow into.");
                     return;
                 };
                 crate::ui::search_field(ui, "transplant_search", &mut self.transplant_search, "Search effects");
@@ -30439,20 +30483,32 @@ impl VisionaryApp {
                     .take(6)
                     .collect();
 
-                let results = pool.search(&self.transplant_search, 200);
-                let mut source_groups = pool.search_grouped("");
-                let source_dirs: Vec<String> = source_groups
-                    .iter()
-                    .map(|group| group.source_dir.clone())
-                    .collect();
-                if !q.is_empty() {
-                    for group in &mut source_groups {
-                        group
-                            .entries
-                            .retain(|(_, name)| name.to_lowercase().contains(&q));
+                // Only the live matches need the pool searched by name.
+                let results = if live_matches.is_empty() {
+                    Vec::new()
+                } else {
+                    pool.search(&self.transplant_search, 200)
+                };
+                // Grouping every effect of every file took most of a frame, every frame the
+                // window was open: kept until the files read or the search change.
+                let groups_key = (pool.progress(), q.clone());
+                let (source_dirs, source_groups) = match self.transplant_groups.take() {
+                    Some((key, dirs, groups)) if key == groups_key => (dirs, groups),
+                    _ => {
+                        let mut groups = pool.search_grouped("");
+                        let dirs: Vec<String> =
+                            groups.iter().map(|group| group.source_dir.clone()).collect();
+                        if !q.is_empty() {
+                            for group in &mut groups {
+                                group
+                                    .entries
+                                    .retain(|(_, name)| name.to_lowercase().contains(&q));
+                            }
+                            groups.retain(|group| !group.entries.is_empty());
+                        }
+                        (dirs, groups)
                     }
-                    source_groups.retain(|group| !group.entries.is_empty());
-                }
+                };
                 let mut source_label_counts: HashMap<String, usize> = HashMap::new();
                 for group in &source_groups {
                     *source_label_counts
@@ -30587,7 +30643,7 @@ impl VisionaryApp {
                                         );
                                 } else {
                                     self.state.status = format!(
-                                        "Couldn't locate the eff file holding '{name}' — let the eff scan finish."
+                                        "Still reading the effect files. Try {name} again in a moment."
                                     );
                                 }
                             }
@@ -30684,9 +30740,10 @@ impl VisionaryApp {
                             .on_hover_text(&group.source_dir);
                     }
                     if source_groups.is_empty() {
-                        ui.colored_label(egui::Color32::GRAY, "No matches (yet).");
+                        ui.colored_label(egui::Color32::GRAY, "No effects match.");
                     }
                     });
+                self.transplant_groups = Some((groups_key, source_dirs, source_groups));
 
                 ui.separator();
                 // One-slot scoping selected: the transplant REPLACES an existing entry on
@@ -30697,11 +30754,11 @@ impl VisionaryApp {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or(&rel);
-                    ui.label(format!("Donor: {donor}  ({donor_file})"))
+                    ui.label(format!("Borrowing {donor} from {donor_file}"))
                         .on_hover_text(&rel);
                     if !one_slot_mode {
                         ui.horizontal(|ui| {
-                            ui.label("New entry name:");
+                            ui.label(format!("Name in {target}:"));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.transplant_new_name)
                                     .desired_width(ui.available_width().min(320.0)),
@@ -30715,8 +30772,8 @@ impl VisionaryApp {
                         if crate::mod_project::is_reserved_entry_name(&self.transplant_new_name) {
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "'{}' is reserved for edited-effect clones — pick another \
-                                     name.",
+                                    "Names starting with {} are Visionary's own. Pick \
+                                     another.",
                                     crate::mod_project::EDIT_CLONE_PREFIX
                                 ))
                                 .small()
@@ -30724,26 +30781,15 @@ impl VisionaryApp {
                             );
                         }
                     }
-                    let cross = !rel.contains(&format!("/{target}/"));
-                    if cross {
-                        ui.label(
-                            egui::RichText::new(
-                                "EFF transplant: only this effect and its referenced textures, \
-                                 primitives, and shaders are copied into runtime storage.",
-                            )
-                            .small()
-                            .color(egui::Color32::from_rgb(200, 200, 120)),
-                        );
-                    }
                     if one_slot_mode {
                         ui.label(
-                            egui::RichText::new(format!("Replaces which {target} effect?"))
+                            egui::RichText::new(format!("Which of {target}'s effects does it replace?"))
                                 .strong()
                                 .small(),
                         );
                         ui.add(
                             egui::TextEdit::singleline(&mut self.transplant_replace_search)
-                                .hint_text("filter target entries…")
+                                .hint_text("Search")
                                 .desired_width(f32::INFINITY),
                         );
                         let filt = self.transplant_replace_search.to_lowercase();
@@ -30751,16 +30797,16 @@ impl VisionaryApp {
                             .id_salt("transplant_replace_list")
                             .max_height(adaptive_scroll_height(
                                 ui.available_height(),
-                                0.28,
-                                96.0,
-                                260.0,
+                                0.5,
+                                160.0,
+                                440.0,
                             ))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 if own_entries.is_empty() {
                                     ui.colored_label(
                                         egui::Color32::GRAY,
-                                        "Target entries not scanned yet — wait for the eff scan.",
+                                        "Still reading the effect files.",
                                     );
                                 }
                                 for name in own_entries
@@ -30773,15 +30819,6 @@ impl VisionaryApp {
                                     }
                                 }
                             });
-                    } else {
-                        ui.label(
-                            egui::RichText::new(
-                                "EFF transplanting previews the merged EFF immediately, then lets \
-                                 you choose which spawns redirect to the transplanted copy.",
-                            )
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        );
                     }
                     let selected_skin_count = self.one_slot_slots.len();
                     let (valid, button_label) = if one_slot_mode {
@@ -30789,12 +30826,13 @@ impl VisionaryApp {
                             self.transplant_replace.is_some(),
                             if selected_skin_count == 1 {
                                 format!(
-                                    "One-slot transplant over {} + preview",
-                                    self.transplant_replace.as_deref().unwrap_or("…")
+                                    "Replace {} on skin c{:02}",
+                                    self.transplant_replace.as_deref().unwrap_or("…"),
+                                    self.one_slot_slots.first().copied().unwrap_or_default()
                                 )
                             } else {
                                 format!(
-                                    "Transplant {} into selected skins + preview",
+                                    "Replace {} on {selected_skin_count} skins",
                                     self.transplant_replace.as_deref().unwrap_or("…")
                                 )
                             },
@@ -30805,7 +30843,7 @@ impl VisionaryApp {
                                 && !crate::mod_project::is_reserved_entry_name(
                                     &self.transplant_new_name,
                                 ),
-                            format!("Transplant into {target} + preview"),
+                            format!("Borrow into {target}"),
                         )
                     };
                     if ui.add_enabled(valid, egui::Button::new(button_label)).clicked() {
@@ -30859,9 +30897,7 @@ impl VisionaryApp {
                     e.transplants.clear();
                 }
             }
-            change_status = Some(format!(
-                "Removed {n} transplanted effect(s) across all fighters and refreshed the game"
-            ));
+            change_status = Some(format!("Removed {n} borrowed effect(s) from every fighter"));
         } else if clear_foreign_edits {
             // Remove every spawn edit that references a foreign effect (the other stale-donor
             // source). Keep sys_/own-fighter edits + Removes; drop now-empty move entries.
@@ -30886,9 +30922,7 @@ impl VisionaryApp {
                 .retain(|_, edits| !edits.is_empty());
             self.push_effect_rules();
             self.push_effect_aliases();
-            change_status = Some(format!(
-                "Removed {removed} foreign spawn-edit donor(s) from the game"
-            ));
+            change_status = Some(format!("{removed} move(s) play their own effects again"));
         } else if let Some(f) = target.as_ref() {
             if clear_ops {
                 if let Some(e) = self.eff_mods.get_mut(f) {
@@ -30902,9 +30936,7 @@ impl VisionaryApp {
                         changed_fighters.push(f.clone());
                     }
                 }
-                change_status = Some(format!(
-                    "Removed all transplanted effects from {f} and refreshed the game"
-                ));
+                change_status = Some(format!("Removed every borrowed effect from {f}"));
             } else if let Some(i) = remove_op {
                 if let Some(e) = self.eff_mods.get_mut(f) {
                     if i < e.transplants.len() {
@@ -30912,7 +30944,7 @@ impl VisionaryApp {
                         removed_spawn_names.push((f.clone(), removed.new_entry_name.clone()));
                         changed_fighters.push(f.clone());
                         change_status = Some(format!(
-                            "Removed transplanted effect '{}' from {f} and refreshed the game",
+                            "Removed borrowed effect {} from {f}",
                             removed.new_entry_name
                         ));
                     }
@@ -31038,7 +31070,7 @@ impl VisionaryApp {
     fn remove_transplant_from_editor(&mut self, request: crate::eff_editor::EffTransplantRemoval) {
         let Some(eff) = self.eff_mods.get_mut(&request.fighter) else {
             self.state.status = format!(
-                "Couldn't remove '{}': its transplant record is no longer present",
+                "Couldn't remove {}: it isn't borrowed any more",
                 request.entry_name
             );
             return;
@@ -31065,7 +31097,7 @@ impl VisionaryApp {
         };
         let Some(remove_index) = remove_index else {
             self.state.status = format!(
-                "Couldn't remove '{}': its transplant record changed",
+                "Couldn't remove {}: it changed. Try again.",
                 request.entry_name
             );
             return;
@@ -31079,7 +31111,7 @@ impl VisionaryApp {
         self.refresh_transplant_preview(&request.fighter);
         self.eff_editor.mark_unsent();
         self.state.status = format!(
-            "Removed transplanted effect '{}' from {} — press Send to game to apply it there",
+            "Removed borrowed effect {} from {}. Send edits to take it out of the game too.",
             request.entry_name, request.fighter
         );
     }
@@ -31131,7 +31163,7 @@ impl VisionaryApp {
                 self.eff_editor.set_merged_overlay(&src_path, None);
                 let _ = std::fs::remove_file(&tmp);
                 self.state.status = format!(
-                    "EFF transplant preview failed: couldn't read '{}': {e}",
+                    "Couldn't show the borrowed effect: couldn't read '{}': {e}",
                     src_path.display()
                 );
                 return None;
@@ -31149,7 +31181,7 @@ impl VisionaryApp {
                     self.eff_editor.set_merged_overlay(&src_path, None);
                     let _ = std::fs::remove_file(&tmp);
                     self.state.status = format!(
-                        "EFF transplant preview failed writing '{}': {e}",
+                        "Couldn't show the borrowed effect: couldn't write '{}': {e}",
                         tmp.display()
                     );
                     return None;
@@ -31160,7 +31192,7 @@ impl VisionaryApp {
             Err(e) => {
                 self.eff_editor.set_merged_overlay(&src_path, None);
                 let _ = std::fs::remove_file(&tmp);
-                self.state.status = format!("EFF transplant merge failed: {e}");
+                self.state.status = format!("Couldn't borrow the effect: {e}");
                 None
             }
         }
@@ -31173,7 +31205,7 @@ impl VisionaryApp {
         let Some((base, _tmp)) = self.build_merged_preview(fighter) else {
             if !eff.transplants.is_empty() {
                 self.state.status =
-                    "EFF transplant recorded, but the target EFF isn't on disk to preview — export to apply.".into();
+                    "Borrowed. The fighter's effect file isn't in the game files, so it shows after Export mod.".into();
             }
             return;
         };
@@ -31187,7 +31219,7 @@ impl VisionaryApp {
                 .unwrap_or_else(|| op.new_entry_name.clone());
             self.eff_editor.queue_select(&focus);
         }
-        self.state.status = format!("EFF transplant applied — previewing merged EFF for {fighter}");
+        self.state.status = format!("Borrowed into {fighter}");
     }
 
     /// Push the full live-alias list to the plugin: every transplant op maps its
@@ -32055,15 +32087,15 @@ impl VisionaryApp {
                 carrier_dropped_textures.join(", ")
             );
         } else if carrier_added && !carrier_authored.is_empty() {
-            let names: Vec<&str> = carrier_authored
-                .iter()
-                .map(|c| c.set_name.as_str())
-                .collect();
+            let sent = if self.game_link.status() == crate::game_link::LinkStatus::Connected {
+                "Sent to the game"
+            } else {
+                "Goes to the game when it connects"
+            };
             self.state.status = format!(
-                "Live carrier sent: {} transplant(s) + {} edited effect(s) [{}]",
+                "{sent}: {} borrowed and {} edited effect(s)",
                 carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
                 carrier_authored.len(),
-                names.join(", ")
             );
         } else if carrier_added && !carrier_dropped_edits.is_empty() {
             // The carrier shipped, but every edit in it was dropped. Saying nothing here would
@@ -32297,12 +32329,10 @@ impl VisionaryApp {
             self.deploy_live_eff(&fighter);
         }
         let note = match (edits, transplants) {
-            (0, 0) => format!("{fighter}: cleared — the live carrier is dropped"),
-            (0, t) => format!("{fighter}: {t} transplant(s) queued onto the live carrier"),
-            (e, 0) => format!("{fighter}: {e} emitter edit(s) queued onto the live carrier"),
-            (e, t) => format!(
-                "{fighter}: {e} emitter edit(s) + {t} transplant(s) queued onto the live carrier"
-            ),
+            (0, 0) => format!("{fighter}: the game plays its own effects again"),
+            (0, t) => format!("{fighter}: sending {t} borrowed effect(s)"),
+            (e, 0) => format!("{fighter}: sending {e} edited part(s)"),
+            (e, t) => format!("{fighter}: sending {e} edited part(s) and {t} borrowed effect(s)"),
         };
         self.state.status = note.clone();
         note
@@ -32451,7 +32481,7 @@ impl VisionaryApp {
                     uses.push(RedirectUse {
                         move_key: key.clone(),
                         call_idx: i,
-                        label: format!("{key} — frame {} on {}", c.active_start, c.bone_name),
+                        label: redirect_label(key, c.active_start),
                         selected: true,
                     });
                 }
@@ -32465,10 +32495,7 @@ impl VisionaryApp {
                         uses.push(RedirectUse {
                             move_key: mv_key.clone(),
                             call_idx: i,
-                            label: format!(
-                                "{mv_key} — frame {} on {}",
-                                c.active_start, c.bone_name
-                            ),
+                            label: redirect_label(&mv_key, c.active_start),
                             selected: true,
                         });
                     }
@@ -32476,6 +32503,7 @@ impl VisionaryApp {
             }
         }
         self.redirect_prompt = Some(RedirectPrompt {
+            fighter: fighter.to_string(),
             donor_name: donor.to_string(),
             new_name: new_name.to_string(),
             uses,
@@ -32500,6 +32528,37 @@ impl VisionaryApp {
 
     /// Keep the Effects page's "plays in" index for the fighter whose effects are open (the
     /// selected fighter for the shared file), scanning its scripts in the background.
+    /// Before the Effects page opens another file (or reloads this one), fold the open file's
+    /// edits into the project and hand the next file its own. The editor parses files pristine;
+    /// without this, switching to another file and back showed the effects unedited, and the
+    /// next sync wrote that empty diff over the project.
+    fn carry_eff_edits_across_load(&mut self) {
+        let Some(next) = self.eff_editor.load_needing_edits() else {
+            return;
+        };
+        if self.eff_editor.has_loaded_effects() {
+            self.sync_eff_mods_from_editor();
+        }
+        let fighter = crate::mod_project::fighter_from_source_rel(&next);
+        let same_file = |source: &str| {
+            std::path::Path::new(source).file_name() == std::path::Path::new(&next).file_name()
+        };
+        let (authored, rosters, entry_edits) = self
+            .eff_mods
+            .get(&fighter)
+            .filter(|eff| eff.source_rel.is_empty() || same_file(&eff.source_rel))
+            .map(|eff| {
+                (
+                    eff.authored.clone(),
+                    eff.rosters.clone(),
+                    eff.entry_edits.clone(),
+                )
+            })
+            .unwrap_or_default();
+        self.eff_editor
+            .queue_carried_edits(authored, rosters, entry_edits);
+    }
+
     fn poll_effect_uses(&mut self, ctx: &egui::Context) {
         let selected = self
             .state
@@ -32518,6 +32577,8 @@ impl VisionaryApp {
         };
         // The moves a use names are this fighter's: resolved again when its move list arrives.
         let moves_known = self.move_list.len();
+        let open_key = self.current_move_key();
+        let open_key = open_key.as_ref();
         let index = &mut self.effect_uses;
         if index.fighter != fighter {
             *index = EffectUseIndex {
@@ -32525,6 +32586,7 @@ impl VisionaryApp {
                 fighter,
                 uses: HashMap::new(),
                 resolved_with: usize::MAX,
+                edited_sig: 0,
             };
             self.eff_editor.set_effect_uses(HashMap::new(), false);
         }
@@ -32542,21 +32604,105 @@ impl VisionaryApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
         }
-        if changed || index.resolved_with != moves_known {
+        // Spawns the project added or pointed at another effect count too: a borrowed effect
+        // redirected into three moves is used by them, though no game script names it.
+        let prefix = format!("{}/", index.fighter);
+        let edited: Vec<(u64, String)> = self
+            .state
+            .effect_call_edits
+            .iter()
+            .filter_map(|(key, edits)| Some((key.strip_prefix(&prefix)?, edits)))
+            .flat_map(|(motion, edits)| {
+                edits.iter().filter_map(move |edit| match &edit.op {
+                    crate::data::EffectCallOp::Modify(call)
+                    | crate::data::EffectCallOp::Add(call) => {
+                        Some((effect_name_hash(&call.effect_name), motion.to_owned()))
+                    }
+                    crate::data::EffectCallOp::Remove => None,
+                })
+            })
+            .collect();
+        // And a spawn the project pointed elsewhere or removed no longer plays the original:
+        // once a move spawns no copy of it, it stops listing that move.
+        let full = &self.state.effect_call_full;
+        let open_calls = &self.state.effects;
+        let gone: Vec<(u64, String)> = self
+            .state
+            .effect_call_edits
+            .iter()
+            .filter_map(|(key, edits)| Some((key, key.strip_prefix(&prefix)?, edits)))
+            .flat_map(|(key, motion, edits)| {
+                edits.iter().filter_map(move |edit| {
+                    let before = effect_name_hash(&edit.pristine.as_ref()?.effect_name);
+                    let after = match &edit.op {
+                        crate::data::EffectCallOp::Modify(call) => {
+                            Some(effect_name_hash(&call.effect_name))
+                        }
+                        crate::data::EffectCallOp::Remove => None,
+                        crate::data::EffectCallOp::Add(_) => return None,
+                    };
+                    let calls = if open_key == Some(key) {
+                        Some(open_calls)
+                    } else {
+                        full.get(key)
+                    };
+                    let still_spawned = calls.is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| effect_name_hash(&call.effect_name) == before)
+                    });
+                    (after != Some(before) && !still_spawned).then(|| (before, motion.to_owned()))
+                })
+            })
+            .collect();
+        let edited_sig = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            edited.hash(&mut hasher);
+            gone.hash(&mut hasher);
+            hasher.finish()
+        };
+        if changed || index.resolved_with != moves_known || index.edited_sig != edited_sig {
             index.resolved_with = moves_known;
-            let resolved = index
+            index.edited_sig = edited_sig;
+            let mut resolved: HashMap<u64, Vec<crate::eff_editor::MoveUse>> = index
                 .uses
                 .iter()
                 .map(|(hash, uses)| {
-                    let mut moves: Vec<crate::eff_editor::MoveUse> = uses
+                    let moves = uses
                         .iter()
+                        .filter(|found| {
+                            // The move's own script spawned it; an object it makes still may.
+                            found.object.is_some()
+                                || !found.script.as_deref().is_some_and(|script| {
+                                    gone.iter().any(|(gone_hash, motion)| {
+                                        gone_hash == hash
+                                            && crate::effect_uses::script_is_for_motion(
+                                                script, motion,
+                                            )
+                                    })
+                                })
+                        })
                         .map(|found| move_use(found, &self.move_list))
-                        .collect();
-                    moves.sort_by(|a, b| a.label.cmp(&b.label));
-                    moves.dedup();
+                        .collect::<Vec<_>>();
                     (*hash, moves)
                 })
+                .filter(|(_, moves)| !moves.is_empty())
                 .collect();
+            for (hash, motion) in edited {
+                let known = self.move_list.iter().any(|m| m.name == motion);
+                resolved
+                    .entry(hash)
+                    .or_default()
+                    .push(crate::eff_editor::MoveUse {
+                        label: crate::move_kinds::plain_name(&motion),
+                        motion: known.then_some(motion),
+                    });
+            }
+            for moves in resolved.values_mut() {
+                moves.sort_by(|a, b| a.label.cmp(&b.label));
+                moves.dedup();
+            }
             self.eff_editor.set_effect_uses(resolved, finished);
         }
     }
@@ -32604,7 +32750,20 @@ impl VisionaryApp {
                     {
                         continue;
                     }
-                    let key = format!("{fighter}/{mv}");
+                    // The scan names scripts ("attack_s4"); edits and the moves list go by
+                    // motion ("attack_s4_s"), so a redirect keyed by the script never reached
+                    // the move.
+                    let motion = self
+                        .move_list
+                        .iter()
+                        .find(|m| {
+                            crate::effect_uses::script_is_for_motion(
+                                &crate::acmd::move_name_to_pascal(&mv),
+                                &m.name,
+                            )
+                        })
+                        .map_or(mv, |m| m.name.clone());
+                    let key = format!("{fighter}/{motion}");
                     if self.state.effect_call_full.contains_key(&key) {
                         continue; // captured/opened already — its uses are listed
                     }
@@ -32615,7 +32774,7 @@ impl VisionaryApp {
                         .map(|(i, c)| RedirectUse {
                             move_key: key.clone(),
                             call_idx: i,
-                            label: format!("{key} — frame {} on {}", c.active_start, c.bone_name),
+                            label: redirect_label(&key, c.active_start),
                             selected: true,
                         })
                         .collect();
@@ -32650,23 +32809,24 @@ impl VisionaryApp {
             return;
         };
         let mut action: Option<bool> = None; // Some(true)=apply, Some(false)=skip
-        egui::Window::new("Redirect spawns to the transplanted effect?")
+        egui::Window::new("Use the borrowed effect?")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
+                ui.set_max_width(360.0);
                 ui.label(format!(
-                    "'{}' was copied as '{}'. Choose which existing spawns should use the \
-                     new effect (unchecked ones keep the original):",
-                    prompt.donor_name, prompt.new_name
+                    "{} is now borrowed as {}. These moves play {}. Ticked ones will play the \
+                     borrowed copy instead; the rest keep the original.",
+                    prompt.donor_name, prompt.new_name, prompt.donor_name
                 ));
                 ui.add_space(4.0);
                 if let Some(scan) = &self.use_scan {
                     ui.label(
                         egui::RichText::new(if scan.total > 0 {
-                            format!("Scanning every move script… {}/{}", scan.done, scan.total)
+                            format!("Reading the moves… {}/{}", scan.done, scan.total)
                         } else {
-                            "Scanning every move script…".to_string()
+                            "Reading the moves…".to_string()
                         })
                         .small()
                         .color(egui::Color32::LIGHT_BLUE),
@@ -32674,15 +32834,28 @@ impl VisionaryApp {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(150));
                 }
+                // Moves the Effects page knows play it but whose spawn this can't point
+                // elsewhere: inside a left/right facing check, or played by an object.
+                let others =
+                    if self.use_scan.is_none() && self.effect_uses.fighter == prompt.fighter {
+                        unswitchable_uses(
+                            &self.effect_uses.uses,
+                            effect_name_hash(&prompt.donor_name),
+                            &prompt.uses,
+                            &self.move_list,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                 if prompt.uses.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::GRAY,
-                        if self.use_scan.is_some() {
-                            "No uses found yet — the scan is still running."
-                        } else {
-                            "No known uses — retarget calls later in the Visual effects tab."
-                        },
-                    );
+                    let none = if self.use_scan.is_some() {
+                        "No moves found yet. Still reading them."
+                    } else if others.is_empty() {
+                        "No move plays it. Add it to a move from its Visual effects tab."
+                    } else {
+                        "No move here can be switched to it yet."
+                    };
+                    ui.colored_label(egui::Color32::GRAY, none);
                 } else {
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
@@ -32692,16 +32865,30 @@ impl VisionaryApp {
                             }
                         });
                 }
+                if !others.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "These moves play it too, but can't be switched yet. The spawn is \
+                             inside a left/right facing check, or comes from an object the move \
+                             makes:",
+                        )
+                        .weak(),
+                    );
+                    for label in others {
+                        ui.label(egui::RichText::new(format!("  {label}")).weak());
+                    }
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let any = prompt.uses.iter().any(|u| u.selected);
                     if ui
-                        .add_enabled(any, egui::Button::new("Redirect selected"))
+                        .add_enabled(any, egui::Button::new("Use in ticked moves"))
                         .clicked()
                     {
                         action = Some(true);
                     }
-                    if ui.button("Keep all on the original").clicked() {
+                    if ui.button("Not now").clicked() {
                         action = Some(false);
                     }
                 });
@@ -32710,8 +32897,12 @@ impl VisionaryApp {
             Some(true) => {
                 let prompt = self.redirect_prompt.take().unwrap();
                 self.apply_redirects(&prompt);
+                self.focus_transplant = true;
             }
-            Some(false) => self.redirect_prompt = None,
+            Some(false) => {
+                self.redirect_prompt = None;
+                self.focus_transplant = true;
+            }
             None => {}
         }
     }
@@ -32821,9 +33012,8 @@ impl VisionaryApp {
         // match the export (a fresh copy is content-identical to its donor).
         self.push_effect_aliases();
         self.state.status = format!(
-            "Redirected {n} spawn(s) from '{}' to '{}' — live in-game via donor alias; \
-             export bakes the real entry",
-            prompt.donor_name, prompt.new_name
+            "{n} spawn(s) now play {} instead of {}",
+            prompt.new_name, prompt.donor_name
         );
     }
 
@@ -34510,6 +34700,22 @@ impl VisionaryApp {
         }
     }
 
+    /// Whether the timeline lists this row: the filters pick on the move pages, and the
+    /// Effects page lists the move's effect spawns only.
+    fn timeline_row_shown(&self, row: &TimelineRow) -> bool {
+        if !self.eff_editor.open {
+            return self.timeline_filters.shows(row.category);
+        }
+        match row.selection {
+            TimelineSelection::Effect(i) => self
+                .state
+                .effects
+                .get(i)
+                .is_some_and(|ec| ec.color.is_none() && ec.control.is_none()),
+            _ => false,
+        }
+    }
+
     fn draw_scrubber(&mut self, ui: &mut Ui) {
         let total = self.timeline_total_frames();
         if total == 0 {
@@ -34579,19 +34785,7 @@ impl VisionaryApp {
         let rows: Vec<TimelineRow> = self
             .timeline_rows(total)
             .into_iter()
-            .filter(|row| {
-                if !effects_page {
-                    return self.timeline_filters.shows(row.category);
-                }
-                match row.selection {
-                    TimelineSelection::Effect(i) => self
-                        .state
-                        .effects
-                        .get(i)
-                        .is_some_and(|ec| ec.color.is_none() && ec.control.is_none()),
-                    _ => false,
-                }
-            })
+            .filter(|row| self.timeline_row_shown(row))
             .map(|mut row| {
                 if let (true, TimelineSelection::Effect(i), Some(open)) =
                     (effects_page, &row.selection, open_effect.as_deref())
@@ -35240,10 +35434,17 @@ impl eframe::App for VisionaryApp {
                     // Each item opens or closes a window; the menu closes with it, so it is
                     // not left open over the page.
                     let mut toggled = false;
-                    toggled |= ui
-                        .checkbox(&mut self.show_transplant, "Borrow effects")
+                    // Opens the borrow window, or brings it in front when it is already open
+                    // behind this one; its own close button closes it.
+                    if ui
+                        .button("Borrow effects")
                         .on_hover_text("Copy an effect from another fighter into this one")
-                        .changed();
+                        .clicked()
+                    {
+                        self.show_transplant = true;
+                        self.focus_transplant = true;
+                        toggled = true;
+                    }
                     toggled |= ui
                         .checkbox(&mut self.show_workspace, "Project files")
                         .on_hover_text("The files in this project, including models and animations you add yourself")
@@ -35414,6 +35615,8 @@ Click to see the code, or link your own project"),
         let timeline_row_count = if total == 0 {
             0
         } else {
+            // Counted as the move pages show them, on the Effects page too, so the view keeps
+            // its size when switching between them.
             self.timeline_rows(total)
                 .into_iter()
                 .filter(|row| self.timeline_filters.shows(row.category))
@@ -35423,19 +35626,25 @@ Click to see the code, or link your own project"),
             timeline_row_count,
             (ui.available_height() * 0.55).max(100.0),
         );
-        // The Characters page has no move to scrub through, nor does an effect shown alone.
-        let effect_alone = self.eff_editor.open
-            && self.eff_editor.view == crate::eff_editor::EffectView::Alone
-            && self.eff_editor.selected_entry_name().is_some();
-        if !self.roster.open && !effect_alone {
+        // The Characters page has no move to scrub through, nor does an effect shown alone. The
+        // panel stays for an effect alone, so the view does not jump in size when it is picked.
+        let effect_alone = self.effect_alone(&[]);
+        if !self.roster.open {
+            // Sized to the rows each frame: a panel the user could resize kept the height of
+            // the last short move, so a longer one showed a single row until dragged open.
             egui::Panel::bottom("scrubber")
-                .default_size(180.0)
-                .min_size(72.0)
-                .max_size(max_scrubber_height)
-                .resizable(true)
+                .exact_size(max_scrubber_height)
+                .resizable(false)
                 .show(ui, |ui| {
                     ui.add_space(4.0);
-                    self.draw_scrubber(ui);
+                    if effect_alone {
+                        ui.weak(
+                            "The effect plays by itself on a loop. Pick a move at the top of the \
+                             view to see it in that move.",
+                        );
+                    } else {
+                        self.draw_scrubber(ui);
+                    }
                 });
         }
         self.perf.end("scrubber", t);
@@ -35562,12 +35771,46 @@ Click to see the code, or link your own project"),
             open_move.map(|m| crate::move_kinds::plain_name(&m.name)),
             open_move.map(|m| m.name.clone()),
         );
-        // A move picked in the view's switch.
+        // The Effects page's own character and move pickers.
+        if !self
+            .eff_editor
+            .fighter_choices
+            .iter()
+            .map(|(name, _)| name)
+            .eq(self.state.fighters.iter().map(|f| &f.name))
+        {
+            self.eff_editor.fighter_choices = self
+                .state
+                .fighters
+                .iter()
+                .map(|f| (f.name.clone(), f.display_name.clone()))
+                .collect();
+        }
+        self.eff_editor.open_fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.clone());
+        if !self
+            .eff_editor
+            .move_choices
+            .iter()
+            .eq(self.move_list.iter().map(|m| &m.name))
+        {
+            self.eff_editor.move_choices = self.move_list.iter().map(|m| m.name.clone()).collect();
+        }
+        if let Some(name) = self.eff_editor.fighter_request.take() {
+            if let Some(i) = self.state.fighters.iter().position(|f| f.name == name) {
+                self.select_fighter(i);
+            }
+        }
+        // A move picked in the view's switch or the page's move picker.
         if let Some(motion) = self.eff_editor.open_move_request.take() {
             if let Some(entry) = self.move_list.iter().find(|m| m.name == motion).cloned() {
                 self.select_move(entry);
             }
         }
+        self.carry_eff_edits_across_load();
         self.eff_editor.update(&ctx, &self.game_link);
         if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
             if let Some(name) = self.eff_editor.selected_entry_name().map(str::to_owned) {
@@ -35587,6 +35830,7 @@ Click to see the code, or link your own project"),
         }
         if std::mem::take(&mut self.eff_editor.transplant_requested) {
             self.show_transplant = true;
+            self.focus_transplant = true;
         }
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
@@ -38284,6 +38528,7 @@ struct RedirectUse {
 
 /// The "which uses go to the new effect?" prompt state.
 struct RedirectPrompt {
+    fighter: String,
     donor_name: String,
     new_name: String,
     uses: Vec<RedirectUse>,
@@ -38395,6 +38640,44 @@ fn spawn_move_effect_scan(fighter: &str) -> std::sync::mpsc::Receiver<UseScanMsg
     rx
 }
 
+/// The moves the uses index says play `hash` that the borrow question has no spawn to switch
+/// for, in plain words.
+fn unswitchable_uses(
+    index: &crate::effect_uses::Uses,
+    hash: u64,
+    offered: &[RedirectUse],
+    moves: &[MoveEntry],
+) -> Vec<String> {
+    let mut out: Vec<String> = index
+        .get(&hash)
+        .into_iter()
+        .flatten()
+        .filter(|found| {
+            found.object.is_some()
+                || !found.script.as_deref().is_some_and(|script| {
+                    offered.iter().any(|u| {
+                        u.move_key.split_once('/').is_some_and(|(_, motion)| {
+                            crate::effect_uses::script_is_for_motion(script, motion)
+                        })
+                    })
+                })
+        })
+        .map(|found| move_use(found, moves).label)
+        .filter(|label| !label.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
+fn redirect_label(move_key: &str, frame: u32) -> String {
+    let motion = move_key
+        .split_once('/')
+        .map_or(move_key, |(_, motion)| motion);
+    format!("{}, frame {frame}", crate::move_kinds::plain_name(motion))
+}
+
 /// Which moves of a fighter spawn each effect (by hash40 of its name), read from every move
 /// script in the background.
 #[derive(Default)]
@@ -38404,6 +38687,8 @@ struct EffectUseIndex {
     uses: crate::effect_uses::Uses,
     /// How many moves the fighter's list had when the uses were last named.
     resolved_with: usize,
+    /// The project's own spawns of the fighter's effects when the uses were last named.
+    edited_sig: u64,
 }
 
 /// A use as the Effects page lists it: the move in plain words, and the motion that opens it.
