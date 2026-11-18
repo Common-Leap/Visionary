@@ -3708,6 +3708,12 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// Reads a source file with CRLF folded to LF, so the needles below also match a
+    /// Windows checkout.
+    fn read_source(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+        std::fs::read_to_string(path).map(|text| text.replace("\r\n", "\n"))
+    }
+
     #[test]
     fn a_rule_carries_the_fighter_from_its_store_key() {
         use super::ForFighter;
@@ -4524,7 +4530,7 @@ mod tests {
 
     #[test]
     fn capture_debug_window_uses_only_character_kinds_present_in_the_cache() {
-        let app = std::fs::read_to_string(
+        let app = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
         )
         .expect("read the desktop app");
@@ -4861,7 +4867,7 @@ mod tests {
     fn plugin_sound_hooks_source() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer/sound_hooks.rs");
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        read_source(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     /// The plugin's copy of the sound arity table still says what the editor's says.
@@ -4930,7 +4936,7 @@ mod tests {
         let source = plugin_sound_hooks_source();
         assert!(source.contains("pub(super) fn normalize_injection_args"));
         assert!(source.contains("*arg = LuaArg::Int(hash as i64)"));
-        let inject_tick = std::fs::read_to_string(
+        let inject_tick = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -4947,7 +4953,7 @@ mod tests {
     /// the common check.
     #[test]
     fn the_plugin_tags_common_agent_captures_instead_of_dropping_them() {
-        let hooks = std::fs::read_to_string(
+        let hooks = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -4970,7 +4976,7 @@ mod tests {
             "record and the injection boundary must run before the common check, not inside it"
         );
 
-        let capture = std::fs::read_to_string(
+        let capture = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -5029,7 +5035,7 @@ mod tests {
     /// game never made.
     #[test]
     fn the_plugin_resumes_a_capture_claim_held_by_the_same_object() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -5060,7 +5066,7 @@ mod tests {
     /// The archive is durable and unbounded; only the live delivery queue remains in memory.
     #[test]
     fn the_plugin_archives_capture_history_and_skips_no_destination_serialization() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -5073,7 +5079,7 @@ mod tests {
             "capture history must be archived instead of dropping complete old runs"
         );
 
-        let archive = std::fs::read_to_string(
+        let archive = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/capture_archive.rs"),
         )
@@ -5086,7 +5092,7 @@ mod tests {
         );
 
         let server =
-            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            read_source(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
                 "plugins/slight_replica/src/rust_extender/debugging/debuggable_server/mod.rs",
             ))
             .expect("read the plugin's debuggable server");
@@ -5105,7 +5111,7 @@ mod tests {
     /// one held motion frame while the per-agent completion callback touches the same state.
     #[test]
     fn the_plugin_capture_cache_never_parks_a_game_worker() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -5169,7 +5175,7 @@ mod tests {
             "reporting a capture failure must remain fixed-size, atomic, and non-blocking"
         );
 
-        let facade = std::fs::read_to_string(
+        let facade = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/main_smash/facades/debuggable_server.rs"),
         )
@@ -5180,7 +5186,7 @@ mod tests {
             "capture outcomes must leave hook workers through the throttled facade"
         );
 
-        let archive = std::fs::read_to_string(
+        let archive = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/capture_archive.rs"),
         )
@@ -5193,7 +5199,7 @@ mod tests {
             "archive handoff from a capture hook must drop under contention instead of waiting"
         );
 
-        let server = std::fs::read_to_string(
+        let server = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/rust_extender/net/simple_server.rs"),
         )
@@ -5212,7 +5218,7 @@ mod tests {
     /// skip its native-query path entirely when no structural retime exists.
     #[test]
     fn the_plugin_acmd_scheduler_never_parks_without_live_retimes() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -5258,7 +5264,7 @@ mod tests {
     /// direct capture and rule, including `AttackModule::clear_all`.
     #[test]
     fn direct_acmd_calls_do_not_depend_on_an_expired_coroutine_guard() {
-        let source = std::fs::read_to_string(
+        let source = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -5302,7 +5308,7 @@ mod tests {
     fn the_plugin_does_not_patch_collision_dispatch() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/systems/skyline_hook.rs");
-        let source = std::fs::read_to_string(&path)
+        let source = read_source(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         for needle in [
             "COLLISION_HOOK mode=disabled reason=unused-and-unsafe",
@@ -5329,7 +5335,7 @@ mod tests {
 
         let diag_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/diag.rs");
-        let diag_source = std::fs::read_to_string(&diag_path)
+        let diag_source = read_source(&diag_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", diag_path.display()));
         for needle in [
             "static COLLISION_HITS: AtomicU64",
@@ -5366,7 +5372,7 @@ mod tests {
     fn the_plugin_effect_kill_hook_preserves_the_native_return() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer/mod.rs");
-        let source = std::fs::read_to_string(&path)
+        let source = read_source(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let start = source
             .find("fn hook_kill(")
@@ -5400,7 +5406,7 @@ mod tests {
     fn the_motion_rate_category_and_override_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(
             module.contains(&format!(
                 "pub const CAT_MOTION_RATE: u8 = {CAT_MOTION_RATE};"
@@ -5426,7 +5432,7 @@ mod tests {
             "the plugin's HbOverrides has no motion_rate field to deserialise into"
         );
 
-        let hooks = std::fs::read_to_string(root.join("rate_hooks.rs")).expect("read rate_hooks");
+        let hooks = read_source(root.join("rate_hooks.rs")).expect("read rate_hooks");
         assert!(
             hooks.contains("replace = smash::app::sv_animcmd::FT_MOTION_RATE"),
             "the plugin no longer hooks sv_animcmd::FT_MOTION_RATE"
@@ -5537,7 +5543,7 @@ mod tests {
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer");
-        let rules = std::fs::read_to_string(root.join("spawn_rules.rs"))
+        let rules = read_source(root.join("spawn_rules.rs"))
             .expect("read the plugin's spawn rules");
         assert!(
             rules.contains("pub camera_offset: Option<f32>,")
@@ -5548,7 +5554,7 @@ mod tests {
                 && rules.contains("pub fn scale_w_for"),
             "the plugin no longer exposes the camera-flat rule field and lookup"
         );
-        let hooks = std::fs::read_to_string(root.join("acmd_hooks.rs"))
+        let hooks = read_source(root.join("acmd_hooks.rs"))
             .expect("read the plugin's ACMD hooks");
         assert!(
             hooks.contains(
@@ -5617,11 +5623,11 @@ mod tests {
         // optional field is absent.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer/spawn_rules.rs");
-        let plugin = std::fs::read_to_string(root).expect("read plugin spawn rules");
+        let plugin = read_source(root).expect("read plugin spawn rules");
         assert!(plugin.contains("#[serde(default)]\n    pub color_inject: Option<SpawnInject>"));
         assert!(plugin.contains("#[serde(default)]\n    pub stop_func: Option<String>"));
 
-        let hooks = std::fs::read_to_string(
+        let hooks = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/acmd_hooks.rs"),
         )
@@ -5736,7 +5742,7 @@ mod tests {
             "wait-boundary injection must run after the script reaches its target"
         );
 
-        let spawn_rules = std::fs::read_to_string(
+        let spawn_rules = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/spawn_rules.rs"),
         )
@@ -5745,7 +5751,7 @@ mod tests {
         assert!(spawn_rules.contains("PENDING_RULES"));
         assert!(spawn_rules.contains("pub fn service_pending"));
 
-        let control_rules = std::fs::read_to_string(
+        let control_rules = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/effect_viewer/control_rules.rs"),
         )
@@ -5753,7 +5759,7 @@ mod tests {
         assert!(control_rules.contains("PENDING_RULES"));
         assert!(control_rules.contains("pub fn service_pending"));
 
-        let server = std::fs::read_to_string(
+        let server = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/rust_extender/net/simple_server.rs"),
         )
@@ -5761,13 +5767,13 @@ mod tests {
         assert!(server.contains("apply_timing_rules_from_network"));
 
         let debugger =
-            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            read_source(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
                 "plugins/slight_replica/src/rust_extender/debugging/debuggable_server/mod.rs",
             ))
             .expect("read plugin debug server");
         assert!(debugger.contains("pub fn apply_timing_rules_from_network"));
 
-        let agent_extender = std::fs::read_to_string(
+        let agent_extender = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/agent_extender/mod.rs"),
         )
@@ -5775,7 +5781,9 @@ mod tests {
         assert!(agent_extender.contains("StatusLine::Main"));
         assert!(agent_extender.contains("hitbox_viewer::inject_tick"));
         assert!(!agent_extender.contains("StatusLine::Post"));
-        assert!(!agent_extender.contains("acmd_hooks::inject_tick"));
+        // Effects whose frame no ACMD boundary reaches are fired from the same Main callback;
+        // the shared latch keeps a boundary and this tick from firing one target twice.
+        assert!(agent_extender.contains("acmd_hooks::inject_tick"));
     }
 
     #[test]
@@ -5784,12 +5792,12 @@ mod tests {
         // here for the CPU-match regression: every agent receives a Main callback, but only one
         // stable fighter is allowed to run the complete global fighter/weapon dispatch.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let extender = std::fs::read_to_string(
+        let extender = read_source(
             root.join("plugins/slight_replica/src/slight/agent_extender/mod.rs"),
         )
         .expect("read plugin agent extender");
         let agents =
-            std::fs::read_to_string(root.join("plugins/slight_replica/src/slight/agents.rs"))
+            read_source(root.join("plugins/slight_replica/src/slight/agents.rs"))
                 .expect("read plugin agent registry");
 
         assert!(agents.contains("pub fn is_frame_driver(boid: u32) -> bool"));
@@ -5899,9 +5907,9 @@ mod tests {
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer");
-        let rules = std::fs::read_to_string(root.join("control_rules.rs"))
+        let rules = read_source(root.join("control_rules.rs"))
             .expect("read the plugin's effect control rules");
-        let hooks = std::fs::read_to_string(root.join("acmd_hooks.rs"))
+        let hooks = read_source(root.join("acmd_hooks.rs"))
             .expect("read the plugin's ACMD hooks");
         assert!(
             rules.contains("pub struct ControlRule")
@@ -5920,7 +5928,7 @@ mod tests {
     fn the_sound_wire_category_matches_the_plugin() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
-        let source = std::fs::read_to_string(path).expect("read the plugin's hitbox_viewer");
+        let source = read_source(path).expect("read the plugin's hitbox_viewer");
         assert!(
             source.contains(&format!("pub const CAT_SOUND: u8 = {CAT_SOUND};")),
             "plugin's CAT_SOUND disagrees with the editor's {CAT_SOUND}"
@@ -6009,7 +6017,7 @@ mod tests {
     fn the_expression_category_and_hooks_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_EXPRESSION: u8 = {CAT_EXPRESSION};")));
         assert!(module.contains("pub expression_args: Option<Vec<LuaArg>>,"));
         assert!(module.contains("CAT_EXPRESSION => match inj.command.as_deref()"));
@@ -6043,7 +6051,7 @@ mod tests {
     fn the_reverse_lr_category_and_hook_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_REVERSE_LR: u8 = {CAT_REVERSE_LR};")));
         assert!(module.contains("replace = smash::app::sv_animcmd::REVERSE_LR"));
         assert!(module.contains("hook_reverse_lr"));
@@ -6071,7 +6079,7 @@ mod tests {
     fn the_set_speed_ex_category_and_hook_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!("pub const CAT_SPEED_EX: u8 = {CAT_SPEED_EX};")));
         assert!(module.contains("SET_SPEED_EX"));
         assert!(module.contains("hook_set_speed_ex"));
@@ -6093,7 +6101,7 @@ mod tests {
     fn the_speed_addition_and_correction_categories_match_the_plugin() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         assert!(module.contains(&format!(
             "pub const CAT_ADD_SPEED_NO_LIMIT: u8 = {CAT_ADD_SPEED_NO_LIMIT};"
         )));
@@ -6144,7 +6152,7 @@ mod tests {
 
     #[test]
     fn the_grab_clear_category_matches_the_plugin() {
-        let module = std::fs::read_to_string(
+        let module = read_source(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("plugins/slight_replica/src/slight/hitbox_viewer/mod.rs"),
         )
@@ -6200,9 +6208,9 @@ mod tests {
     fn kinetic_point_categories_and_overrides_match_plugin_wire_fields() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
-        let module = std::fs::read_to_string(root.join("mod.rs")).expect("read hitbox_viewer");
+        let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
         let rate_hooks =
-            std::fs::read_to_string(root.join("rate_hooks.rs")).expect("read rate hooks");
+            read_source(root.join("rate_hooks.rs")).expect("read rate hooks");
         assert!(module.contains(&format!("pub const CAT_CLR_SPEED: u8 = {CAT_CLR_SPEED};")));
         assert!(module.contains(&format!("pub const CAT_SET_AIR: u8 = {CAT_SET_AIR};")));
         assert!(module.contains(&format!(
