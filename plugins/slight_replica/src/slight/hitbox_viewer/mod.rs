@@ -3861,6 +3861,10 @@ unsafe fn hook_hit_reset_all(lua_state: u64) {
 static FIRED: LazyLock<Mutex<HashMap<(u32, u64), (u64, f32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// boid → the motion with added blocks it played last frame, and that frame.
+static LAST_PLAYED: LazyLock<Mutex<HashMap<u32, (u64, f32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Called every frame per agent (agent_extender line callback) with the AGENT'S lua state.
 pub unsafe fn inject_tick(lua_state: u64) {
     if !any_rules() {
@@ -3878,13 +3882,45 @@ pub unsafe fn inject_tick(lua_state: u64) {
     {
         return;
     }
-    let motion = acting_motion(boma);
-    let injections = injections_for(motion);
+    let mut motion = acting_motion(boma);
+    let mut injections = injections_for(motion);
+    // Some moves play over the body as a part animation (Steve swings his tool on the upper
+    // body while the whole-body motion stays "wait"); blocks added to them follow that part.
+    let mut part: Option<i32> = None;
     if injections.is_empty() {
+        // Only the upper-body set: every fighter has it, and other indices run past the end of
+        // the part list on fighters with fewer sets.
+        for index in [*smash::lib::lua_const::FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY] {
+            let partial = smash::app::lua_bind::MotionModule::motion_kind_partial(boma, index);
+            if partial != 0 && partial != motion {
+                let found = injections_for(partial);
+                if !found.is_empty() {
+                    motion = partial;
+                    injections = found;
+                    part = Some(index);
+                    break;
+                }
+            }
+        }
+    }
+    let boid = (*boma).battle_object_id;
+    if injections.is_empty() {
+        // Leaving the move rearms its blocks for the next time it plays.
+        LAST_PLAYED.lock().remove(&boid);
         return;
     }
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let boid = (*boma).battle_object_id;
+    let frame = match part {
+        Some(index) => smash::app::lua_bind::MotionModule::frame_partial(boma, index),
+        None => smash::app::lua_bind::MotionModule::frame(boma),
+    };
+    // A move that starts again (or a different one) rearms every block, including frame 0 ones.
+    let restarted = LAST_PLAYED
+        .lock()
+        .insert(boid, (motion, frame))
+        .is_none_or(|(last_motion, last_frame)| last_motion != motion || frame < last_frame);
+    if restarted {
+        FIRED.lock().retain(|(fired_boid, _), _| *fired_boid != boid);
+    }
     let live_fingerprints: HashSet<u64> = injections
         .iter()
         .map(|(fingerprint, _, _)| *fingerprint)
