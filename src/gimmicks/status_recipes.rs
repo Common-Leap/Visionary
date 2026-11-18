@@ -421,7 +421,7 @@ fn steer_projectile(fighter: &str) -> Result<BehaviorGraph, String> {
                 .next()
                 .map(|entry| entry.symbol)
         })
-        .ok_or_else(|| format!("{fighter} has no owned projectile"))?;
+        .ok_or_else(|| "This fighter has no projectile of its own.".to_string())?;
     let stick =
         |axis: serde_json::Value| serde_json::json!({"Mul": [axis, {"Const": {"Float": 2.0}}]});
     let alive =
@@ -448,7 +448,7 @@ fn steer_projectile(fighter: &str) -> Result<BehaviorGraph, String> {
 fn fill_meter_on_hit(fighter: &str) -> Result<BehaviorGraph, String> {
     let resource = super::resource_commands::Resource::for_fighter(fighter)
         .next()
-        .ok_or_else(|| format!("{fighter} has no native resource gauge"))?;
+        .ok_or_else(|| "This fighter has no built-in meter to fill.".to_string())?;
     serde_json::from_value(serde_json::json!({
         "initial": "Ready", "states": [{"name": "Ready"}], "vars": [],
         "transitions": [{

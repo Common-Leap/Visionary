@@ -177,8 +177,11 @@ fn group_for(label: &str, track: Track) -> &'static str {
 }
 
 fn catalog(fighter: &str, track: Track, draft: &MoveGraph) -> Vec<Entry> {
+    // Rare variants that would share a name with a common block stay out of the palette;
+    // they still load from scripts and can be typed in a Code block.
     let mut result: Vec<_> = node_choices_for_fighter(track, fighter)
         .into_iter()
+        .filter(|(kind, _)| !matches!(kind, 64 | 65 | 76 | 106 | 114))
         .map(|(kind, label)| Entry {
             label: plain::block_name(label).into(),
             group: group_for(label, track),

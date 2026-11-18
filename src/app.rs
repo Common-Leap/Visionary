@@ -1072,7 +1072,32 @@ fn sound_func_words(func: &str) -> Option<&'static str> {
 /// A sound command as the timeline names it: what it does, then the sound itself.
 fn sound_row_label(call: &crate::data::SoundCall) -> String {
     let verb = sound_func_words(&call.func).unwrap_or(&call.func);
-    format!("{verb} {}", call.sounds.join(" / "))
+    let names: Vec<String> = call.sounds.iter().map(|s| sound_words(s)).collect();
+    format!("{verb} \"{}\"", names.join(" / "))
+}
+
+/// A sound id as words: `se_common_punch_kick_swing_m` reads "punch kick swing m".
+fn sound_words(id: &str) -> String {
+    let id = id.trim_matches('"');
+    let rest = id
+        .strip_prefix("se_common_")
+        .or_else(|| id.strip_prefix("se_").map(|r| r.split_once('_').map_or(r, |(_, r)| r)))
+        .or_else(|| id.strip_prefix("vc_").map(|r| r.split_once('_').map_or(r, |(_, r)| r)))
+        .unwrap_or(id);
+    rest.replace('_', " ")
+}
+
+/// An effect name as words: `sys_attack_line` reads "Attack line", `mario_fb_shoot` "Fb shoot".
+fn effect_words(name: &str) -> String {
+    if !name.contains('_') || name.contains(' ') {
+        return name.to_string();
+    }
+    let rest = name.split_once('_').map_or(name, |(_, rest)| rest);
+    let mut words = rest.replace('_', " ");
+    if let Some(first) = words.get(0..1).map(str::to_ascii_uppercase) {
+        words.replace_range(0..1, &first);
+    }
+    words
 }
 
 /// A feedback command as the timeline names it.
@@ -8445,7 +8470,7 @@ impl VisionaryApp {
             .max_height(half)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // Group the (filtered) moves into the familiar move families, preserving order.
+                // Group the (filtered) moves into the familiar move families, sorted by name.
                 use crate::move_kinds::MoveGroup;
                 let order: Vec<MoveGroup> = MoveGroup::ORDER
                     .iter()
@@ -8466,6 +8491,9 @@ impl VisionaryApp {
                         .position(|o| *o == g)
                         .unwrap_or(order.len() - 1);
                     groups[idx].push(m.clone());
+                }
+                for group in &mut groups {
+                    group.sort_by_cached_key(|m| format_move_name(&m.name));
                 }
 
                 let selected_group = self
@@ -10715,6 +10743,30 @@ impl VisionaryApp {
             .get(&fighter.name)
             .cloned()
             .unwrap_or_default();
+        // Hitboxes changed in the classic editor show here too, the way export writes them.
+        let current_game = game_script_for_edits(&self.state.script, &self.state.hitboxes);
+        // A saved graph wins over the scripts, so fold classic hitbox edits into its action lane.
+        if self.state.script.to_hitboxes() != self.state.hitboxes {
+            if let Some(graph) = self
+                .move_graphs
+                .get_mut(&fighter.name)
+                .and_then(|graphs| graphs.get_mut(&move_entry.name))
+            {
+                let game = crate::move_nodes::timeline::import_for_fighter(
+                    &fighter.name,
+                    crate::move_nodes::model::Track::Game,
+                    &current_game,
+                );
+                graph
+                    .tracks
+                    .retain(|track| track.track != crate::move_nodes::model::Track::Game);
+                graph.tracks.insert(0, game);
+                crate::move_nodes::canvas::prune_positions(graph);
+                self.state.hitboxes = current_game.to_hitboxes();
+                self.state.script = current_game.clone();
+                self.node_editor.reload_move();
+            }
+        }
         let siblings = self
             .move_graphs
             .get(&fighter.name)
@@ -10757,8 +10809,6 @@ impl VisionaryApp {
             &self.state.source_script,
             &self.state.expression_script,
         );
-        // Hitboxes changed in the classic editor show here too, the way export writes them.
-        let current_game = game_script_for_edits(&self.state.script, &self.state.hitboxes);
         let graph = self.node_editor.workspace_ui(
             ui,
             &fighter.name,
@@ -12170,7 +12220,7 @@ impl VisionaryApp {
         // macros, in different scripts, travelling on different live-edit channels.
         editor_section_heading_with_badge(
             ui,
-            "Animation timing",
+            "Animation speed",
             "FT_MOTION_RATE scales how fast the whole ANIMATION advances from that frame on — \
              not the speed of an effect, which is the Rate field on each effect spawn. A rate \
              BELOW 1 makes the move play faster, not slower: the engine advances 1/rate motion \
@@ -13896,7 +13946,7 @@ impl VisionaryApp {
     fn draw_speed_ex_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_speed_ex_events();
         let section = PointSection {
-            title: "Set kinetic-reserve velocity",
+            title: "Set movement speed",
             description: "SET_SPEED_EX replaces x/y velocity in one named kinetic-energy reserve. A reserve is one engine movement component; its authored name stays visible while x and y are editable.",
             color: egui::Color32::from_rgb(110, 190, 255),
             command: "SET_SPEED_EX",
@@ -13919,7 +13969,7 @@ impl VisionaryApp {
     fn draw_add_speed_no_limit_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_add_speed_no_limit_events();
         let section = PointSection {
-            title: "Add unrestricted velocity",
+            title: "Push past the speed limit",
             description: "ADD_SPEED_NO_LIMIT adds x/y velocity without the ordinary speed limit at this point. X and y are editable; the call's placement remains structural.",
             color: egui::Color32::from_rgb(90, 220, 180),
             command: "ADD_SPEED_NO_LIMIT",
@@ -13937,7 +13987,7 @@ impl VisionaryApp {
     fn draw_correct_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_correct_events();
         let section = PointSection {
-            title: "Ground correction mode",
+            title: "Ground snap",
             description: "CORRECT selects how the fighter is aligned or corrected against ground and air geometry at this point. The exact named mode stays as authored source text.",
             color: egui::Color32::from_rgb(255, 205, 120),
             command: "CORRECT",
@@ -13955,7 +14005,7 @@ impl VisionaryApp {
     fn draw_ft_catch_stop_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_ft_catch_stop_events();
         let section = PointSection {
-            title: "Catch stop",
+            title: "Stop sliding into the grab",
             description: "FT_CATCH_STOP is the engine's two-value catch-stop command. The exact gameplay role of each value is not decoded, so they stay honestly labeled arg1 and arg2 instead of receiving guessed names.",
             color: egui::Color32::from_rgb(220, 155, 245),
             command: "FT_CATCH_STOP",
@@ -13973,7 +14023,7 @@ impl VisionaryApp {
     fn draw_ft_start_adjust_motion_frame_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_ft_start_adjust_motion_frame_events();
         let section = PointSection {
-            title: "Motion-frame adjustment",
+            title: "Line up the animation",
             description: "FT_START_ADJUST_MOTION_FRAME_arg1 carries one measured numeric value. Its more specific gameplay meaning is not decoded, so the editor preserves the native name and avoids inventing a misleading label.",
             color: egui::Color32::from_rgb(130, 220, 245),
             command: "FT_START_ADJUST_MOTION_FRAME_arg1",
@@ -13992,7 +14042,7 @@ impl VisionaryApp {
     fn draw_motion_module_set_rate_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_motion_module_set_rate_events();
         let section = PointSection {
-            title: "Animation playback rate",
+            title: "Animation speed",
             description: "MotionModule::set_rate directly sets the animation's playback rate at this conditional script point. Only the numeric value is edited; its frame and execution condition remain intact.",
             color: egui::Color32::from_rgb(170, 205, 255),
             command: "MotionModule::set_rate",
@@ -14011,7 +14061,7 @@ impl VisionaryApp {
     fn draw_motion_module_set_rate_partial_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_motion_module_set_rate_partial_events();
         let section = PointSection {
-            title: "Partial animation playback rate",
+            title: "Body part animation speed",
             description: "MotionModule::set_rate_partial changes only one named animation part. The numeric rate is editable; the authored part name, frame, and execution context stay intact.",
             color: egui::Color32::from_rgb(170, 220, 190),
             command: "MotionModule::set_rate_partial",
@@ -14115,7 +14165,7 @@ impl VisionaryApp {
             .script
             .to_motion_module_set_helper_calculation_events();
         let section = PointSection {
-            title: "Helper animation calculation",
+            title: "Animation helper",
             description: "MotionModule::set_helper_calculation turns the engine's helper-animation calculation on or off at this conditional script point. Its exact visible effect depends on the move; only the proven boolean is editable.",
             color: egui::Color32::from_rgb(180, 225, 190),
             command: "MotionModule::set_helper_calculation",
@@ -14137,7 +14187,7 @@ impl VisionaryApp {
     fn draw_clr_speed_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_clr_speed_events();
         let section = PointSection {
-            title: "Clear one kinetic velocity",
+            title: "Stop one kind of movement",
             description: "CLR_SPEED clears the velocity stored in one named kinetic-energy reserve, which is one engine movement component. The authored reserve name stays as source text.",
             color: egui::Color32::from_rgb(245, 125, 175),
             command: "CLR_SPEED",
@@ -14164,7 +14214,7 @@ impl VisionaryApp {
     fn draw_change_kinetic_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_change_kinetic_events();
         let section = PointSection {
-            title: "Movement mode",
+            title: "Movement type",
             description: "KineticModule::change_kinetic selects the fighter's engine movement mode, which determines the set of movement rules and energies currently in use. The authored mode name stays as source text.",
             color: egui::Color32::from_rgb(255, 190, 120),
             command: "KineticModule::change_kinetic",
@@ -14188,7 +14238,7 @@ impl VisionaryApp {
     fn draw_kinetic_energy_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_kinetic_energy_events();
         let section = PointSection {
-            title: "Movement component state",
+            title: "Turn a movement part on or off",
             description: "Enables, disables, suspends, or resumes one kinetic energy: an engine movement component such as gravity, player control, or animation-driven motion. The authored component name stays as source text.",
             color: egui::Color32::from_rgb(205, 160, 255),
             command: "KineticModule energy",
@@ -14210,7 +14260,7 @@ impl VisionaryApp {
     fn draw_kinetic_add_speed_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_kinetic_add_speed_events();
         let section = PointSection {
-            title: "Add kinetic velocity",
+            title: "Add speed",
             description: "KineticModule::add_speed adds the shown x/y vector directly to movement velocity. The supported source form has z = 0.0; the receiver and frame stay unchanged.",
             color: egui::Color32::from_rgb(120, 190, 255),
             command: "KineticModule::add_speed",
@@ -14238,7 +14288,7 @@ impl VisionaryApp {
         ui.separator();
         editor_command_subsection_heading(
             ui,
-            "Clear all kinetic velocity",
+            "Stop all movement",
             "KineticModule::clear_speed_all clears velocity from every kinetic movement component at this point. This editor changes the call's presence and frame; the viewport does not simulate the transition.",
             egui::Color32::from_rgb(150, 220, 180),
             "KineticModule::clear_speed_all",
@@ -14596,7 +14646,7 @@ impl VisionaryApp {
     fn draw_work_module_inc_int_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_work_module_inc_int_events();
         let section = PointSection {
-            title: "Increment stored counter",
+            title: "Count up a move value",
             description: "WorkModule::inc_int adds one to a named integer stored by the game for this fighter. Scripts use these slots for counters and other move or status state; the authored slot name identifies the exact value.",
             color: egui::Color32::from_rgb(220, 190, 140),
             command: "WorkModule::inc_int",
@@ -14697,7 +14747,7 @@ impl VisionaryApp {
         ui.separator();
         editor_command_subsection_heading(
             ui,
-            "Switch to air state",
+            "Leave the ground",
             "SET_AIR marks the fighter as airborne and switches to the corresponding kinetic state at this point. This editor changes the call's presence and frame; the viewport does not simulate the transition.",
             egui::Color32::from_rgb(170, 200, 255),
             "SET_AIR",
@@ -31312,17 +31362,17 @@ impl VisionaryApp {
         let mut rows = Vec::new();
         for (index, hb) in self.state.hitboxes.iter().enumerate() {
             let kind = match hb.category {
-                1 => "Grab",
-                2 => "Wind",
+                1 => "Grab box",
+                2 => "Wind box",
                 crate::data::CAT_ABS => "Throw damage",
-                crate::data::CAT_SEARCH => "Detection",
-                crate::data::CAT_ATTACK_FP => "ATTACK_FP",
-                _ => "Attack",
+                crate::data::CAT_SEARCH => "Detection box",
+                crate::data::CAT_ATTACK_FP => "Fixed-point hit",
+                _ => "Hitbox",
             };
             rows.push(TimelineRow {
                 category: TimelineCategory::Collisions,
                 selection: TimelineSelection::Hitbox(index),
-                label: format!("{kind} #{}", hb.id),
+                label: format!("{kind} {}", hb.id),
                 start: hb.active_start,
                 end: hb.active_end.min(total),
                 seek_frame: hb.active_start,
@@ -31387,7 +31437,7 @@ impl VisionaryApp {
                 "attack_mod",
                 event.site,
                 event.frame,
-                format!("{} #{}", event.kind.macro_name(), event.id),
+                format!("Change hitbox {}", event.id),
                 TimelineCategory::Collisions,
                 Color32::from_rgb(240, 150, 210),
             );
@@ -31396,7 +31446,7 @@ impl VisionaryApp {
             rows.push(TimelineRow {
                 category: TimelineCategory::Effects,
                 selection: TimelineSelection::Effect(index),
-                label: effect_call_display_name(effect),
+                label: effect_words(&effect_call_display_name(effect)),
                 start: effect.active_start,
                 end: if effect.follows_bone {
                     effect.active_end.min(total)
@@ -31438,7 +31488,7 @@ impl VisionaryApp {
                 "speed_ex",
                 event.site,
                 event.frame,
-                "Set kinetic-reserve velocity",
+                "Set movement speed",
             );
         }
         for event in self.state.script.to_speed_events() {
@@ -31449,32 +31499,32 @@ impl VisionaryApp {
                 "add_speed_no_limit",
                 event.site,
                 event.frame,
-                "Add unrestricted velocity",
+                "Push past the speed limit",
             );
         }
         for event in self.state.script.to_correct_events() {
-            push_motion("correct", event.site, event.frame, "Ground correction mode");
+            push_motion("correct", event.site, event.frame, "Ground snap");
         }
         for event in self.state.script.to_ft_catch_stop_events() {
-            push_motion("ft_catch_stop", event.site, event.frame, "Catch stop");
+            push_motion("ft_catch_stop", event.site, event.frame, "Stop sliding into the grab");
         }
         for event in self.state.script.to_ft_start_adjust_motion_frame_events() {
             push_motion(
                 "ft_start_adjust",
                 event.site,
                 event.frame,
-                "Motion-frame adjustment",
+                "Line up the animation",
             );
         }
         for (site, frame, _) in self.state.script.motion_rate_sites() {
-            push_motion("motion_rate", site, frame as u32, "Animation timing");
+            push_motion("motion_rate", site, frame as u32, "Animation speed");
         }
         for event in self.state.script.to_motion_module_set_rate_events() {
             push_motion(
                 "motion_module_rate",
                 event.site,
                 event.frame,
-                "Animation playback rate",
+                "Animation speed",
             );
         }
         for event in self
@@ -31486,7 +31536,7 @@ impl VisionaryApp {
                 "motion_helper",
                 event.site,
                 event.frame,
-                "Helper animation calculation",
+                "Animation helper",
             );
         }
         for event in self.state.script.to_motion_module_set_rate_partial_events() {
@@ -31494,7 +31544,7 @@ impl VisionaryApp {
                 "motion_rate_partial",
                 event.site,
                 event.frame,
-                "Partial animation playback rate",
+                "Body part animation speed",
             );
         }
         for event in self.state.script.to_clr_speed_events() {
@@ -31502,21 +31552,21 @@ impl VisionaryApp {
                 "clear_speed",
                 event.site,
                 event.frame,
-                "Clear one kinetic velocity",
+                "Stop one kind of movement",
             );
         }
         for event in self.state.script.to_set_air_events() {
-            push_motion("set_air", event.site, event.frame, "Switch to air state");
+            push_motion("set_air", event.site, event.frame, "Leave the ground");
         }
         for event in self.state.script.to_change_kinetic_events() {
-            push_motion("change_kinetic", event.site, event.frame, "Movement mode");
+            push_motion("change_kinetic", event.site, event.frame, "Movement type");
         }
         for event in self.state.script.to_kinetic_energy_events() {
             push_motion(
                 "kinetic_energy",
                 event.site,
                 event.frame,
-                "Movement component state",
+                "Turn a movement part on or off",
             );
         }
         for event in self.state.script.to_kinetic_add_speed_events() {
@@ -31524,7 +31574,7 @@ impl VisionaryApp {
                 "kinetic_add_speed",
                 event.site,
                 event.frame,
-                "Add kinetic velocity",
+                "Add speed",
             );
         }
         for event in self.state.script.to_kinetic_clear_speed_all_events() {
@@ -31532,7 +31582,7 @@ impl VisionaryApp {
                 "kinetic_clear_speed",
                 event.site,
                 event.frame,
-                "Clear all kinetic velocity",
+                "Stop all movement",
             );
         }
         for event in self
@@ -31548,14 +31598,18 @@ impl VisionaryApp {
             );
         }
         for event in self.state.script.to_work_flag_events() {
-            push_motion("work_flag", event.site, event.frame, "Work flag");
+            let words = crate::move_nodes::plain::call_words(
+                event.call.func(),
+                std::slice::from_ref(&event.call.flag),
+            );
+            push_motion("work_flag", event.site, event.frame, &words);
         }
         for event in self.state.script.to_work_transition_term_events() {
             push_motion(
                 "work_transition",
                 event.site,
                 event.frame,
-                "Allowed state transition",
+                "Allow or block the next action",
             );
         }
         for event in self.state.script.to_work_module_inc_int_events() {
@@ -31563,11 +31617,11 @@ impl VisionaryApp {
                 "work_inc_int",
                 event.site,
                 event.frame,
-                "Increment stored counter",
+                "Count up a move value",
             );
         }
         for event in self.state.script.to_work_module_set_events() {
-            push_motion("work_set", event.site, event.frame, "Stored script value");
+            push_motion("work_set", event.site, event.frame, "Set a move value");
         }
         let audio_color = Color32::from_rgb(150, 210, 180);
         for event in &self.state.sounds {

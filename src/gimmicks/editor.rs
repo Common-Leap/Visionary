@@ -402,11 +402,20 @@ impl GimmicksEditor {
                     self.pending_setup = None;
                     if self.base.is_none() { self.base = Some(super::view::load_base(data.roots, &context.fighter)); }
                     let base = match self.base.as_ref() { Some(BaseState::Present(tree)) => Some(tree), _ => None };
-                    match read_text(&path).and_then(|text| super::blueprint::GimmickBlueprint::decode(&text)).and_then(|blueprint| {
+                    let text = read_text(&path);
+                    match text.clone().and_then(|text| super::blueprint::GimmickBlueprint::decode(&text)).and_then(|blueprint| {
                         let prepared = blueprint.prepare(&context.fighter, base)?;
                         Ok((blueprint.name, prepared))
                     }) {
-                        Ok(prepared) => self.pending_setup = Some(prepared), Err(error) => self.status = error,
+                        Ok(prepared) => self.pending_setup = Some(prepared),
+                        // Files saved as rules only by older versions load into the rules.
+                        Err(error) => match text.and_then(|text| BehaviorTemplate::decode(&text)).and_then(|template| {
+                            let graph = template.instantiate(&context.fighter)?;
+                            Ok((template.name, graph))
+                        }) {
+                            Ok(pending) => self.pending = Some(pending),
+                            Err(_) => self.status = error,
+                        },
                     }
                 }
             }
@@ -721,9 +730,11 @@ impl GimmicksEditor {
         link: &GameLink,
         recipes: Option<&BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     ) {
+        if graphs.get(fighter).is_none_or(BehaviorGraph::is_empty) {
+            ui.weak("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Start from a ready-made one, or build the rules in Move nodes.");
+        }
         // Every way to fill the controller from somewhere else lives in one menu; each stages
         // a confirmation below instead of replacing the graph immediately.
-        let has_graph = graphs.get(fighter).is_some_and(|graph| !graph.is_empty());
         ui.menu_button("Start from", |ui| {
             ui.menu_button("Preset", |ui| {
                 for preset in Preset::ALL {
@@ -734,10 +745,17 @@ impl GimmicksEditor {
                 }
                 ui.separator();
                 for defense in super::status_recipes::Defense::ALL {
-                    if ui.button(defense.label()).on_hover_text(defense.hover()).clicked() {
-                        match defense.graph(fighter) {
-                            Ok(graph) => self.pending = Some((defense.label().to_string(), graph)),
-                            Err(error) => self.status = error,
+                    // Ones this fighter can't use stay listed, greyed out with the reason.
+                    let graph = defense.graph(fighter);
+                    let reason = graph.as_ref().err().cloned().unwrap_or_default();
+                    if ui
+                        .add_enabled(graph.is_ok(), egui::Button::new(defense.label()))
+                        .on_hover_text(defense.hover())
+                        .on_disabled_hover_text(reason)
+                        .clicked()
+                    {
+                        if let Ok(graph) = graph {
+                            self.pending = Some((defense.label().to_string(), graph));
                         }
                         ui.close();
                     }
@@ -770,50 +788,9 @@ impl GimmicksEditor {
                     });
                 });
             }
-            ui.separator();
-            if ui.button("Import template").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Gimmick template", &["json"])
-                    .pick_file()
-                {
-                    self.pending = None;
-                    match read_template(&path).and_then(|template| {
-                        let graph = template.instantiate(fighter)?;
-                        Ok((template.name, graph))
-                    }) {
-                        Ok(pending) => self.pending = Some(pending),
-                        Err(error) => self.status = error,
-                    }
-                }
-                ui.close();
-            }
-            if ui.add_enabled(has_graph, egui::Button::new("Export template")).clicked() {
-                if let Some(graph) = graphs.get(fighter) {
-                    match BehaviorTemplate::from_graph(
-                        &format!("{fighter} behavior"),
-                        Some(fighter),
-                        graph.clone(),
-                    ) {
-                        Ok(template) => {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Gimmick template", &["json"])
-                                .set_file_name(format!("{fighter}-gimmick.json"))
-                                .save_file()
-                            {
-                                self.status = match write_template(&path, &template) {
-                                    Ok(()) => format!("Template saved to {}", path.display()),
-                                    Err(error) => error,
-                                };
-                            }
-                        }
-                        Err(error) => self.status = error,
-                    }
-                }
-                ui.close();
-            }
         })
         .response
-        .on_hover_text("Fill this controller from a preset, another character or a template file. You confirm before anything is replaced.");
+        .on_hover_text("Fill this gimmick from a ready-made one or another character. You confirm before anything is replaced.");
         if let Some((name, _)) = &self.pending {
             let mut apply = false;
             let mut cancel = false;
@@ -2310,10 +2287,6 @@ fn param_control(ui: &mut Ui, value: &mut ParamValue) -> bool {
     }
 }
 
-fn read_template(path: &Path) -> Result<BehaviorTemplate, String> {
-    BehaviorTemplate::decode(&read_text(path)?)
-}
-
 fn read_text(path: &Path) -> Result<String, String> {
     let mut text = String::new();
     std::fs::File::open(path)
@@ -2322,11 +2295,6 @@ fn read_text(path: &Path) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|error| error.to_string())?;
     Ok(text)
-}
-
-fn write_template(path: &Path, template: &BehaviorTemplate) -> Result<(), String> {
-    let text = template.encode()?;
-    write_text(path, &text)
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), String> {
