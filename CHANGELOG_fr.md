@@ -3,13 +3,13 @@
 Changes in this fork (joobert/Visionary) relative to upstream Visionary by Common Leap.
 
 The fork branched from upstream tag **`v0.1.2`** (`e7df465`, "Autosave project edits and
-harden effect/hitbox source sync", 2026-09-17) and has since merged upstream **`v0.3.0`**.
+harden effect/hitbox source sync", 2026-09-17) and has since merged upstream **`v0.3.0`** and **`v0.3.1`**.
 Everything below is what the fork adds; where the merge changed one of these, the entry says
 so.
 For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle ground, see
 [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
 
-## 0.3.1: merging upstream v0.3.0
+## 0.3.1: merging upstream v0.3.0 and v0.3.1
 
 - **Merge.** Upstream `v0.3.0` (Move nodes, Gimmicks, the Effects page, effect drawing in the
   preview, stages, objects, the grab/throw opponent) is merged. Where both sides changed the
@@ -36,6 +36,12 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   - *ssbh_wgpu:* the fork depends on `joobert/ssbh_wgpu` rev `6702cb4`, built on Common-Leap's
     fork with two commits: `ModelFolder::load_files` (costume file lists) and the skeleton edit
     hook in `apply_anims_with_skel_edit` (fighter scale at the root bones).
+- **v0.3.1.** Upstream's two Effects page commits (edits carried across file and page
+  switches, character and move pickers, borrowed uses that follow redirects) merged without
+  conflict. Two fits on top: the character picker keys rows by `name` plus `custom_name`,
+  since a mod character on a fighter's slots is its own row with that fighter's name; and
+  `load_needing_edits` returns `eff_game_rel` like `loaded_rel`, so an eff opened from outside
+  the dump is handed its edits by the game path the project records.
 - **SSBU 13.0.5.** `offsets.rs` holds each main-executable offset for 13.0.4 and 13.0.5. The
   plugin detects the build before installing any hook and stays off on any other version. The
   boot log records `game=`, `loader=` and `copy=`. Upstream's gimmick hooks (damage capture and
@@ -63,7 +69,7 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   rewritten on load, and export refuses any `source_rel` that is still not a game path.
 - **Fixes in the merged build.** The stage picker and the viewport toolbar were both drawn in
   the viewport's top-left corner. The picker now sits under the toolbar, and the Effects page's
-  view switch moves down when the toolbar reaches it. Five string literals had a lost line
+  view switch moves down when the toolbar reaches it. Six string literals had a lost line
   continuation, leaving a run of spaces in their text. The source-reading tests fold CRLF, so
   they pass on a Windows checkout.
 

@@ -2,11 +2,11 @@
 
 Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion List editor, a thrown-fighter preview, in-game fighter scale, model checks before asset previews, SSBH Editor-style camera controls and a Settings window. Visionary now reads real-world moveset source much more faithfully and loads costumes the way ARCropolis does. Fixes scrambled character select alongside roster mods, misplaced helper and out-of-order bones, incomplete recolour costumes, and live effect previews that timed out against a mod-only root.
 
-> Fork 0.3.1, on top of Visionary v0.3.0. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
+> Fork 0.3.1, on top of Visionary v0.3.1. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
 
 ## New in 0.3.1
 
-- **Visionary v0.3.0 merged** — Move nodes, Gimmicks, the Effects page, effects in the preview, stages, objects and the grab opponent, with this fork's features carried on top
+- **Visionary v0.3.1 merged** — Move nodes, Gimmicks, the Effects page (with v0.3.1's character and move pickers and edits kept across file switches), effects in the preview, stages, objects and the grab opponent, with this fork's features carried on top
 - **SSBU 13.0.5** — the plugin detects 13.0.4 or 13.0.5 before installing any hook and reads every main-executable offset from that build's table; any other version leaves it off with a log line. The boot log records `game=` and `loader=`. Upstream's gimmick hooks check the game's own bytes before patching and turn off where they don't match
 - **Ozone** — the four `lua2cpp_common` hooks install once their symbols resolve, never on a null import, so the game boots under Ozone
 - **Source retiming** — moving a hitbox in time in a linked moveset moves its call to the execute block at the new frame (or makes one, splitting a `wait`), then re-parses to check every hitbox's timing. Scripts timed through loops or branches are refused
@@ -127,7 +127,8 @@ With no dump set, the left panel shows "Step 1 — your game dump" and **Choose 
 
 - **Effect export overwrote its source** — an eff opened from outside the dump was saved by its absolute path, and export joined that onto the mod folder, writing over the original file. Effects are now recorded by their game path, old absolute sources are rewritten on load, and export refuses any that is still absolute
 - **Stage picker over the viewport toolbar** — both were drawn in the viewport's top-left corner. The picker now sits under the toolbar, and the Effects page's view switch moves down when the toolbar reaches it
-- **Broken tooltip text** — five tooltips and status messages had a run of spaces in the middle where a line continuation was lost
+- **Broken tooltip text** — six tooltips and status messages had a run of spaces in the middle where a line continuation was lost
+- **Effects page character picker** — picking a mod character on another fighter's slots (Shy Guy on Pac-Man) opened the fighter; the picker now tells the two apart
 
 - **Character select scrambled with roster mods** — the in-game plugin registered a "no-op" ARCropolis probe on `ui_chara_db.prc`. ARCropolis keeps one callback per file, so it replaced the loader roster mods patch through. The probe is removed, and the unmeasured roster heap patch stays disabled; CSS order changes apply on the next menu load
 - **Misplaced bones** — hitbox, hurtbox and effect positions now come from the same skeleton evaluation that skins the mesh, so they follow helper bones, and bones listed before their parent (Mario's jaw and lips) are no longer drawn at the origin
