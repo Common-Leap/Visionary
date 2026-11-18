@@ -484,6 +484,20 @@ pub struct EffEditor {
     entry_picked: std::collections::HashMap<PathBuf, String>,
     /// A move picked in the view's switch, for the app to open.
     pub open_move_request: Option<String>,
+    /// The characters the header's picker offers, as (folder name, display name).
+    pub fighter_choices: Vec<(String, String)>,
+    /// The open character's folder name.
+    pub open_fighter: Option<String>,
+    /// The open character's moves, by motion name.
+    pub move_choices: Vec<String>,
+    /// A character picked in the header, for the app to open.
+    pub fighter_request: Option<String>,
+    fighter_filter: String,
+    move_filter: String,
+    /// List only the effects the open move plays.
+    only_open_move: bool,
+    /// A move just picked in the header: once it is open, show one of its effects in it.
+    show_in_picked_move: Option<String>,
     /// The open move's motion name, to know whether it plays the selected effect.
     open_motion: Option<String>,
     entry_filter: String,
@@ -607,6 +621,14 @@ impl Default for EffEditor {
             parts_picked: Default::default(),
             entry_picked: Default::default(),
             open_move_request: None,
+            fighter_choices: Vec::new(),
+            open_fighter: None,
+            move_choices: Vec::new(),
+            fighter_request: None,
+            fighter_filter: String::new(),
+            move_filter: String::new(),
+            only_open_move: false,
+            show_in_picked_move: None,
             open_motion: None,
             entry_filter: String::new(),
             selected_entry: None,
@@ -2207,6 +2229,7 @@ impl EffEditor {
         if self.pending_select.is_some() {
             self.apply_pending_select();
         }
+        self.settle_picked_move();
 
         // No auto-apply: `eff_dirty_at` only marks "there are unsent changes" for the Send
         // button; nothing is uploaded to the game until the user asks. The 3D preview follows
@@ -2347,10 +2370,214 @@ impl EffEditor {
             }
         });
 
-        // Which file: the project's edited ones first, then any of the game's.
+        // Which character and move, then which file: the project's edited ones first, then
+        // any of the game's.
+        ui.horizontal_wrapped(|ui| {
+            self.draw_fighter_picker(ui);
+            ui.add_space(8.0);
+            self.draw_move_picker(ui);
+        });
         ui.horizontal_wrapped(|ui| {
             self.draw_file_picker(ui);
         });
+    }
+
+    fn draw_fighter_picker(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("Character").strong());
+        let current = self
+            .open_fighter
+            .as_ref()
+            .and_then(|open| self.fighter_choices.iter().find(|(name, _)| name == open))
+            .map(|(_, shown)| shown.clone())
+            .unwrap_or_else(|| "Pick one".to_owned());
+        egui::ComboBox::from_id_salt("eff_fighter_combo")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .selected_text(current)
+            .width(170.0)
+            .height(420.0)
+            .show_ui(ui, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.fighter_filter)
+                        .hint_text("Search characters")
+                        .desired_width(200.0),
+                );
+                if !search.has_focus() && !ui.memory(|m| m.focused().is_some()) {
+                    search.request_focus();
+                }
+                // Enter picks the first match.
+                let mut enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let filter = self.fighter_filter.trim().to_lowercase();
+                let mut picked = None;
+                let mut any = false;
+                for (name, shown) in &self.fighter_choices {
+                    if !filter.is_empty()
+                        && !shown.to_lowercase().contains(&filter)
+                        && !name.contains(&filter)
+                    {
+                        continue;
+                    }
+                    any = true;
+                    let open = self.open_fighter.as_deref() == Some(name.as_str());
+                    if ui.selectable_label(open, shown).clicked() || std::mem::take(&mut enter) {
+                        if !open {
+                            picked = Some(name.clone());
+                        }
+                        ui.close();
+                    }
+                }
+                if !any {
+                    ui.weak("No matching characters");
+                }
+                if let Some(name) = picked {
+                    self.fighter_request = Some(name);
+                    self.fighter_filter.clear();
+                    self.only_open_move = false;
+                }
+            })
+            .inner
+            .is_none()
+            // A search left behind when the list closed would greet the next opening.
+            .then(|| self.fighter_filter.clear());
+    }
+
+    fn draw_move_picker(&mut self, ui: &mut Ui) {
+        ui.label(egui::RichText::new("Move").strong());
+        let current = self.open_move.clone().unwrap_or_else(|| "None".to_owned());
+        let plays: std::collections::HashSet<String> = self
+            .selected_uses()
+            .iter()
+            .filter_map(|found| found.motion.clone())
+            .collect();
+        let marked = egui::Color32::from_rgb(0x70, 0xC0, 0xF0);
+        let response = ui.add_enabled_ui(!self.move_choices.is_empty(), |ui| {
+            egui::ComboBox::from_id_salt("eff_move_combo")
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .selected_text(current)
+                .width(190.0)
+                .height(460.0)
+                .show_ui(ui, |ui| {
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut self.move_filter)
+                            .hint_text("Search moves")
+                            .desired_width(220.0),
+                    );
+                    if !search.has_focus() && !ui.memory(|m| m.focused().is_some()) {
+                        search.request_focus();
+                    }
+                    if !plays.is_empty() {
+                        ui.label(
+                            egui::RichText::new("● plays the selected effect")
+                                .small()
+                                .color(marked),
+                        );
+                    }
+                    let mut enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let filter = self.move_filter.trim().to_lowercase();
+                    use crate::move_kinds::MoveGroup;
+                    let order: Vec<MoveGroup> = MoveGroup::ORDER
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(MoveGroup::Other))
+                        .collect();
+                    let mut groups: Vec<Vec<(String, String)>> = vec![Vec::new(); order.len()];
+                    for motion in &self.move_choices {
+                        let label = crate::move_kinds::plain_name(motion);
+                        if !filter.is_empty()
+                            && !label.to_lowercase().contains(&filter)
+                            && !motion.contains(&filter)
+                        {
+                            continue;
+                        }
+                        let group = crate::move_kinds::group_of(motion);
+                        let at = order
+                            .iter()
+                            .position(|g| *g == group)
+                            .unwrap_or(order.len() - 1);
+                        groups[at].push((motion.clone(), label));
+                    }
+                    if groups.iter().all(Vec::is_empty) {
+                        ui.weak("No matching moves");
+                    }
+                    let mut picked = None;
+                    for (group, moves) in order.iter().zip(&groups) {
+                        if moves.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(group.label()).small().strong());
+                        for (motion, label) in moves {
+                            let open = self.open_motion.as_deref() == Some(motion.as_str());
+                            let text = if plays.contains(motion) {
+                                egui::RichText::new(format!("● {label}")).color(marked)
+                            } else {
+                                egui::RichText::new(label)
+                            };
+                            if ui.selectable_label(open, text).clicked()
+                                || std::mem::take(&mut enter)
+                            {
+                                picked = Some(motion.clone());
+                                ui.close();
+                            }
+                        }
+                    }
+                    if let Some(motion) = picked {
+                        self.move_filter.clear();
+                        self.only_open_move = true;
+                        if self.open_motion.as_deref() != Some(motion.as_str()) {
+                            self.open_move_request = Some(motion.clone());
+                        }
+                        self.show_in_picked_move = Some(motion);
+                    }
+                })
+        });
+        if response.inner.inner.is_none() {
+            self.move_filter.clear();
+        }
+        response
+            .response
+            .on_disabled_hover_text("Pick a character first");
+    }
+
+    /// The effects of this file the open move plays, by its script or an object it makes.
+    fn in_open_move(&self, entry: &EffEntry) -> bool {
+        self.open_motion.as_deref().is_some_and(|motion| {
+            self.effect_uses.get(&entry.hash).is_some_and(|moves| {
+                moves
+                    .iter()
+                    .any(|found| found.motion.as_deref() == Some(motion))
+            })
+        })
+    }
+
+    /// Once a move picked in the header is open, show it with one of its effects: the selected
+    /// one if the move plays it, or else the first it plays.
+    fn settle_picked_move(&mut self) {
+        let Some(motion) = self.show_in_picked_move.clone() else {
+            return;
+        };
+        if self.open_motion.as_deref() != Some(motion.as_str()) || self.entries.is_empty() {
+            return;
+        }
+        if self.open_move_plays_selected() {
+            self.view = EffectView::InMove;
+            self.show_in_picked_move = None;
+            return;
+        }
+        let first = self
+            .entries
+            .iter()
+            .position(|entry| self.in_open_move(entry));
+        match first {
+            Some(i) => {
+                self.select_entry(i);
+                self.scroll_to_selected = true;
+                self.view = EffectView::InMove;
+                self.show_in_picked_move = None;
+            }
+            // Wait for the uses to arrive; once they have, this move plays none of the file's.
+            None if self.effect_uses_ready => self.show_in_picked_move = None,
+            None => {}
+        }
     }
 
     fn draw_file_picker(&mut self, ui: &mut Ui) {
@@ -2410,7 +2637,10 @@ impl EffEditor {
                             ui.close();
                         }
                     }
-                });
+                })
+                .inner
+                .is_none()
+                .then(|| self.file_filter.clear());
         }
         egui::containers::menu::MenuButton::new("Game files").ui(ui, |ui| {
             ui.label(egui::RichText::new(self.export_root.display().to_string()).small())
@@ -2519,6 +2749,21 @@ impl EffEditor {
             &mut self.entry_filter,
             "Search effects or moves…",
         );
+        if let Some(open_move) = self
+            .open_move
+            .clone()
+            .filter(|_| self.open_motion.is_some())
+        {
+            let count = self.entries.iter().filter(|e| self.in_open_move(e)).count();
+            ui.horizontal(|ui| {
+                ui.toggle_value(
+                    &mut self.only_open_move,
+                    format!("Only in {open_move} ({count})"),
+                )
+                .on_hover_text("List only the effects this move plays");
+            });
+        }
+        let only_move = self.only_open_move && self.open_motion.is_some();
         let filter = self.entry_filter.trim().to_lowercase();
         let transplant_entries: std::collections::HashMap<String, EffTransplant> = self
             .current_edit_source()
@@ -2538,18 +2783,27 @@ impl EffEditor {
                 // A search finds an effect by its name or by a move that spawns it ("forward
                 // smash" lists that move's effects).
                 let uses = &self.effect_uses;
+                let open_motion = self.open_motion.as_deref();
+                let in_move = |entry: &EffEntry| {
+                    uses.get(&entry.hash).is_some_and(|moves| {
+                        moves.iter().any(|m| m.motion.as_deref() == open_motion)
+                    })
+                };
                 let matches = |entry: &EffEntry| {
-                    filter.is_empty()
-                        || entry.name.to_lowercase().contains(&filter)
-                        || uses.get(&entry.hash).is_some_and(|moves| {
-                            moves
-                                .iter()
-                                .any(|m| m.label.to_lowercase().contains(&filter))
-                        })
+                    (!only_move || in_move(entry))
+                        && (filter.is_empty()
+                            || entry.name.to_lowercase().contains(&filter)
+                            || uses.get(&entry.hash).is_some_and(|moves| {
+                                moves
+                                    .iter()
+                                    .any(|m| m.label.to_lowercase().contains(&filter))
+                            }))
                 };
                 if !self.entries.iter().any(&matches) {
                     ui.weak(if self.entries.is_empty() {
                         "Open an effect file above to see its effects"
+                    } else if only_move {
+                        "This move plays none of this file's effects"
                     } else {
                         "No matching effects"
                     });
@@ -2634,24 +2888,30 @@ impl EffEditor {
                 }
             });
         if let Some(i) = clicked {
-            if self.selected_entry != Some(i) {
-                // Each effect keeps the part last picked in it for the session.
-                self.remember_picks();
-                self.selected_entry = Some(i);
-                self.selected_emitter = self
-                    .entries
-                    .get(i)
-                    .and_then(|entry| self.parts_picked.get(&entry.name))
-                    .copied()
-                    .unwrap_or(0);
-                self.view = if self.open_move_plays_selected() {
-                    EffectView::InMove
-                } else {
-                    EffectView::Alone
-                };
-                // The shared override store keeps per-kind forms — nothing to re-seed.
-            }
+            self.select_entry(i);
         }
+    }
+
+    /// Open an effect of the list, on the part last picked in it, in the open move when that
+    /// move plays it.
+    fn select_entry(&mut self, i: usize) {
+        if self.selected_entry == Some(i) {
+            return;
+        }
+        // Each effect keeps the part last picked in it for the session.
+        self.remember_picks();
+        self.selected_entry = Some(i);
+        self.selected_emitter = self
+            .entries
+            .get(i)
+            .and_then(|entry| self.parts_picked.get(&entry.name))
+            .copied()
+            .unwrap_or(0);
+        self.view = if self.open_move_plays_selected() {
+            EffectView::InMove
+        } else {
+            EffectView::Alone
+        };
     }
 
     fn draw_emitter_editor(&mut self, ui: &mut Ui) {

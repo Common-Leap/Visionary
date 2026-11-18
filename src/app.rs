@@ -29451,6 +29451,7 @@ impl VisionaryApp {
             }
         }
         self.redirect_prompt = Some(RedirectPrompt {
+            fighter: fighter.to_string(),
             donor_name: donor.to_string(),
             new_name: new_name.to_string(),
             uses,
@@ -29524,6 +29525,8 @@ impl VisionaryApp {
         };
         // The moves a use names are this fighter's: resolved again when its move list arrives.
         let moves_known = self.move_list.len();
+        let open_key = self.current_move_key();
+        let open_key = open_key.as_ref();
         let index = &mut self.effect_uses;
         if index.fighter != fighter {
             *index = EffectUseIndex {
@@ -29567,10 +29570,44 @@ impl VisionaryApp {
                 })
             })
             .collect();
+        // And a spawn the project pointed elsewhere or removed no longer plays the original:
+        // once a move spawns no copy of it, it stops listing that move.
+        let full = &self.state.effect_call_full;
+        let open_calls = &self.state.effects;
+        let gone: Vec<(u64, String)> = self
+            .state
+            .effect_call_edits
+            .iter()
+            .filter_map(|(key, edits)| Some((key, key.strip_prefix(&prefix)?, edits)))
+            .flat_map(|(key, motion, edits)| {
+                edits.iter().filter_map(move |edit| {
+                    let before = effect_name_hash(&edit.pristine.as_ref()?.effect_name);
+                    let after = match &edit.op {
+                        crate::data::EffectCallOp::Modify(call) => {
+                            Some(effect_name_hash(&call.effect_name))
+                        }
+                        crate::data::EffectCallOp::Remove => None,
+                        crate::data::EffectCallOp::Add(_) => return None,
+                    };
+                    let calls = if open_key == Some(key) {
+                        Some(open_calls)
+                    } else {
+                        full.get(key)
+                    };
+                    let still_spawned = calls.is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| effect_name_hash(&call.effect_name) == before)
+                    });
+                    (after != Some(before) && !still_spawned).then(|| (before, motion.to_owned()))
+                })
+            })
+            .collect();
         let edited_sig = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             edited.hash(&mut hasher);
+            gone.hash(&mut hasher);
             hasher.finish()
         };
         if changed || index.resolved_with != moves_known || index.edited_sig != edited_sig {
@@ -29582,10 +29619,23 @@ impl VisionaryApp {
                 .map(|(hash, uses)| {
                     let moves = uses
                         .iter()
+                        .filter(|found| {
+                            // The move's own script spawned it; an object it makes still may.
+                            found.object.is_some()
+                                || !found.script.as_deref().is_some_and(|script| {
+                                    gone.iter().any(|(gone_hash, motion)| {
+                                        gone_hash == hash
+                                            && crate::effect_uses::script_is_for_motion(
+                                                script, motion,
+                                            )
+                                    })
+                                })
+                        })
                         .map(|found| move_use(found, &self.move_list))
-                        .collect();
+                        .collect::<Vec<_>>();
                     (*hash, moves)
                 })
+                .filter(|(_, moves)| !moves.is_empty())
                 .collect();
             for (hash, motion) in edited {
                 let known = self.move_list.iter().any(|m| m.name == motion);
@@ -29648,7 +29698,20 @@ impl VisionaryApp {
                     {
                         continue;
                     }
-                    let key = format!("{fighter}/{mv}");
+                    // The scan names scripts ("attack_s4"); edits and the moves list go by
+                    // motion ("attack_s4_s"), so a redirect keyed by the script never reached
+                    // the move.
+                    let motion = self
+                        .move_list
+                        .iter()
+                        .find(|m| {
+                            crate::effect_uses::script_is_for_motion(
+                                &crate::acmd::move_name_to_pascal(&mv),
+                                &m.name,
+                            )
+                        })
+                        .map_or(mv, |m| m.name.clone());
+                    let key = format!("{fighter}/{motion}");
                     if self.state.effect_call_full.contains_key(&key) {
                         continue; // captured/opened already — its uses are listed
                     }
@@ -29719,15 +29782,28 @@ impl VisionaryApp {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_millis(150));
                 }
+                // Moves the Effects page knows play it but whose spawn this can't point
+                // elsewhere: inside a left/right facing check, or played by an object.
+                let others =
+                    if self.use_scan.is_none() && self.effect_uses.fighter == prompt.fighter {
+                        unswitchable_uses(
+                            &self.effect_uses.uses,
+                            effect_name_hash(&prompt.donor_name),
+                            &prompt.uses,
+                            &self.move_list,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                 if prompt.uses.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::GRAY,
-                        if self.use_scan.is_some() {
-                            "No moves found yet. Still reading them."
-                        } else {
-                            "No move plays it. Add it to a move from its Visual effects tab."
-                        },
-                    );
+                    let none = if self.use_scan.is_some() {
+                        "No moves found yet. Still reading them."
+                    } else if others.is_empty() {
+                        "No move plays it. Add it to a move from its Visual effects tab."
+                    } else {
+                        "No move here can be switched to it yet."
+                    };
+                    ui.colored_label(egui::Color32::GRAY, none);
                 } else {
                     egui::ScrollArea::vertical()
                         .max_height(220.0)
@@ -29736,6 +29812,20 @@ impl VisionaryApp {
                                 ui.checkbox(&mut u.selected, &u.label);
                             }
                         });
+                }
+                if !others.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "These moves play it too, but can't be switched yet. The spawn is \
+                             inside a left/right facing check, or comes from an object the move \
+                             makes:",
+                        )
+                        .weak(),
+                    );
+                    for label in others {
+                        ui.label(egui::RichText::new(format!("  {label}")).weak());
+                    }
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -32601,7 +32691,40 @@ impl eframe::App for VisionaryApp {
             open_move.map(|m| crate::move_kinds::plain_name(&m.name)),
             open_move.map(|m| m.name.clone()),
         );
-        // A move picked in the view's switch.
+        // The Effects page's own character and move pickers.
+        if !self
+            .eff_editor
+            .fighter_choices
+            .iter()
+            .map(|(name, _)| name)
+            .eq(self.state.fighters.iter().map(|f| &f.name))
+        {
+            self.eff_editor.fighter_choices = self
+                .state
+                .fighters
+                .iter()
+                .map(|f| (f.name.clone(), f.display_name.clone()))
+                .collect();
+        }
+        self.eff_editor.open_fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.clone());
+        if !self
+            .eff_editor
+            .move_choices
+            .iter()
+            .eq(self.move_list.iter().map(|m| &m.name))
+        {
+            self.eff_editor.move_choices = self.move_list.iter().map(|m| m.name.clone()).collect();
+        }
+        if let Some(name) = self.eff_editor.fighter_request.take() {
+            if let Some(i) = self.state.fighters.iter().position(|f| f.name == name) {
+                self.select_fighter(i);
+            }
+        }
+        // A move picked in the view's switch or the page's move picker.
         if let Some(motion) = self.eff_editor.open_move_request.take() {
             if let Some(entry) = self.move_list.iter().find(|m| m.name == motion).cloned() {
                 self.select_move(entry);
@@ -35309,6 +35432,7 @@ struct RedirectUse {
 
 /// The "which uses go to the new effect?" prompt state.
 struct RedirectPrompt {
+    fighter: String,
     donor_name: String,
     new_name: String,
     uses: Vec<RedirectUse>,
@@ -35418,6 +35542,36 @@ fn spawn_move_effect_scan(fighter: &str) -> std::sync::mpsc::Receiver<UseScanMsg
         }
     });
     rx
+}
+
+/// The moves the uses index says play `hash` that the borrow question has no spawn to switch
+/// for, in plain words.
+fn unswitchable_uses(
+    index: &crate::effect_uses::Uses,
+    hash: u64,
+    offered: &[RedirectUse],
+    moves: &[MoveEntry],
+) -> Vec<String> {
+    let mut out: Vec<String> = index
+        .get(&hash)
+        .into_iter()
+        .flatten()
+        .filter(|found| {
+            found.object.is_some()
+                || !found.script.as_deref().is_some_and(|script| {
+                    offered.iter().any(|u| {
+                        u.move_key.split_once('/').is_some_and(|(_, motion)| {
+                            crate::effect_uses::script_is_for_motion(script, motion)
+                        })
+                    })
+                })
+        })
+        .map(|found| move_use(found, moves).label)
+        .filter(|label| !label.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
