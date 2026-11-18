@@ -165,7 +165,7 @@ impl GimmicksEditor {
             });
             let extra = selected != MAIN;
             if ui.add_enabled(extra, egui::Button::new("Duplicate").small())
-                .on_hover_text("Copy the selected additional controller's applied graph and layout. Unapplied drafts are not copied.")
+                .on_hover_text("Copy this gimmick. Rules you have not applied yet are not copied.")
                 .clicked() {
                 command = Some(ChartCommand::Duplicate);
             }
@@ -182,10 +182,10 @@ impl GimmicksEditor {
         }
         if let Some(id) = self.pending_chart_delete.clone() {
             ui.group(|ui| {
-                ui.label(format!("Delete controller {id}?"));
-                ui.weak("Removes its applied graph, layout and unapplied draft. Other controllers stay unchanged.");
+                ui.label(format!("Delete gimmick {id}?"));
+                ui.weak("Removes its rules. Other gimmicks stay as they are.");
                 ui.horizontal(|ui| {
-                    if ui.button("Delete controller").clicked() {
+                    if ui.button("Delete gimmick").clicked() {
                         command = Some(ChartCommand::Remove(id));
                     }
                     if ui.button("Cancel").clicked() { self.pending_chart_delete = None; }
@@ -198,7 +198,7 @@ impl GimmicksEditor {
                     let result = can_remove_chart(&id, data.recipes).and_then(|()| {
                         data.controller_charts
                             .get_mut(fighter)
-                            .ok_or_else(|| "No additional controllers to delete".into())
+                            .ok_or_else(|| "No extra gimmicks to delete".into())
                             .and_then(|charts| {
                                 crate::gimmicks::controller_edit::remove(charts, &id)
                             })
@@ -268,7 +268,7 @@ impl GimmicksEditor {
                 Ok(id) => {
                     self.select_chart(&id);
                     self.status =
-                        "Controllers saved; compatible live preview updates automatically.".into();
+                        "Saved. It runs in the game right away when the game is connected.".into();
                 }
                 Err(error) => self.status = error,
             }

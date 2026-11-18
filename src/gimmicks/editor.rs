@@ -368,7 +368,7 @@ impl GimmicksEditor {
             .map_or(0, BTreeMap::len);
         if additional_count > 0 {
             self.pending_setup = None;
-            ui.weak(format!("{additional_count} additional controller{}", if additional_count == 1 { "" } else { "s" }))
+            ui.weak(format!("{additional_count} more gimmick{}", if additional_count == 1 { "" } else { "s" }))
                 .on_hover_text("Live updates need the Visionary plugin in the game. Exported mods include every gimmick.");
         }
         ui.horizontal_wrapped(|ui| {
@@ -376,7 +376,7 @@ impl GimmicksEditor {
             let setup_hint = if setup_available {
                 "Export only this donor's authored personal values, behavior, and meters as a reusable setup. No base-game files are included."
             } else {
-                "This character has additional controllers. Save the project to retain them; the current setup format cannot include them."
+                "This character has more than one gimmick. Save the project to keep them; a gimmick file holds only one."
             };
             if ui.add_enabled(setup_available, egui::Button::new("Save gimmick to a file")).on_hover_text(setup_hint).clicked() {
                 let empty = ParamMod::default();
@@ -732,13 +732,23 @@ impl GimmicksEditor {
     ) {
         if graphs.get(fighter).is_none_or(BehaviorGraph::is_empty) {
             ui.weak("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Start from a ready-made one, or build the rules in Move nodes.");
+        } else if let Some(graph) = graphs.get(fighter) {
+            let names: Vec<&str> = graph.states.iter().map(|state| state.name.as_str()).collect();
+            let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+            ui.weak(format!(
+                "Has {} ({}), {} and {}.",
+                plural(names.len(), "stage"),
+                names.join(", "),
+                plural(graph.vars.len(), "value"),
+                plural(graph.transitions.len(), "rule"),
+            ));
         }
         // Every way to fill the controller from somewhere else lives in one menu; each stages
         // a confirmation below instead of replacing the graph immediately.
         ui.menu_button("Start from", |ui| {
             ui.menu_button("Preset", |ui| {
                 for preset in Preset::ALL {
-                    if ui.button(preset.label()).clicked() {
+                    if ui.button(preset.label()).on_hover_text(preset.hover()).clicked() {
                         self.pending = Some((preset.label().to_string(), preset.graph()));
                         ui.close();
                     }
@@ -796,9 +806,12 @@ impl GimmicksEditor {
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Use {name}?"));
+                if let Some(about) = preset_about(name) {
+                    ui.weak(about);
+                }
                 if graphs.get(fighter).is_some_and(|graph| !graph.is_empty()) {
                     ui.weak(
-                        "This replaces the selected controller's saved graph and unapplied draft.",
+                        "This replaces the rules this gimmick has now.",
                     );
                 }
                 ui.horizontal(|ui| {
@@ -813,9 +826,7 @@ impl GimmicksEditor {
                 {
                     Ok(graph) => {
                         graphs.insert(fighter.to_string(), graph);
-                        self.status =
-                            "Controller saved; supported live preview updates automatically."
-                                .into();
+                        self.status = "Added. It runs in the game right away when the game is connected.".into();
                     }
                     Err(error) => self.status = error,
                 }
@@ -923,7 +934,7 @@ impl GimmicksEditor {
             Ok(applied) => {
                 graphs.insert(fighter.into(), applied.graph.clone());
                 self.preview.clear();
-                self.status = "Timer updated; live preview synchronizes automatically.".into();
+                self.status = "Timer changed. The game picks it up right away.".into();
                 applied.graph
             }
             Err(error) => {
@@ -939,6 +950,9 @@ impl GimmicksEditor {
             .iter()
             .filter(|agent| agent.category == 0 && agent.fighter.as_deref() == Some(fighter))
             .collect();
+        if players.is_empty() {
+            return;
+        }
         if self
             .action_test_boid
             .is_some_and(|boid| !players.iter().any(|agent| agent.boid == boid))
@@ -949,7 +963,7 @@ impl GimmicksEditor {
             self.action_test_boid = Some(players[0].boid);
         }
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Test actions on");
+            ui.weak("Try its actions on");
             egui::ComboBox::from_id_salt(("controller_test_player", fighter))
                 .selected_text(
                     players
@@ -969,9 +983,6 @@ impl GimmicksEditor {
                         );
                     }
                 });
-            if players.is_empty() {
-                ui.weak("Start a match with this fighter to test objects.");
-            }
         });
     }
 
@@ -2513,4 +2524,18 @@ mod tests {
             "private values should be collapsed: {displayed}"
         );
     }
+}
+
+/// What a ready-made gimmick does, looked up by the name it was staged under.
+fn preset_about(name: &str) -> Option<String> {
+    Preset::ALL
+        .into_iter()
+        .find(|preset| preset.label() == name)
+        .map(|preset| preset.hover().to_string())
+        .or_else(|| {
+            super::status_recipes::Defense::ALL
+                .into_iter()
+                .find(|defense| defense.label() == name)
+                .map(|defense| defense.hover())
+        })
 }

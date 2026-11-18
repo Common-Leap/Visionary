@@ -89,7 +89,7 @@ impl ControllerLibrary {
                 }
                 ui.close();
             }
-        }).response.on_hover_text("Reuse an additional controller's applied graph and card layout. Main and unapplied edits are not copied. Native character resources keep their exact ownership.");
+        }).response.on_hover_text("Reuse a gimmick from the library. Rules you have not applied yet are not copied.");
     }
 
     /// Render outside the toolbar so the preview has the field's full width.
@@ -103,16 +103,16 @@ impl ControllerLibrary {
                     ui.weak(format!("from {} / {}", asset.donor_fighter(), asset.source_chart_id()));
                 });
                 let graph = &asset.chart().graph;
-                ui.weak(format!("{} states · {} variables · {} named events", graph.states.len(), graph.vars.len(), graph.emission_plan.event_bindings.len()));
+                ui.weak(format!("{} states · {} values", graph.states.len(), graph.vars.len()));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Controller ID");
+                    ui.label("Name");
                     ui.add(egui::TextEdit::singleline(&mut self.target_id).desired_width(180.0).char_limit(48));
-                    if ui.button("Add controller").on_hover_text("Validate the complete character, then add this applied controller. Existing controllers are never replaced. Compatible live preview updates automatically.").clicked() {
+                    if ui.button("Add gimmick").on_hover_text("Adds this as one more gimmick; the ones you have stay. It runs in the game right away.").clicked() {
                         requested = Some((asset.clone(), self.target_id.clone()));
                     }
                     cancel = ui.small_button("Cancel").clicked();
                 });
-                ui.weak("New independent state; native identifiers are not remapped. Save the project after adding.");
+                ui.weak("It keeps its own values. Save the project after adding.");
             });
         }
         if cancel {
@@ -141,7 +141,7 @@ fn capture(
         fighter,
         selected,
         selected,
-        source.ok_or("Select an additional controller first")?,
+        source.ok_or("Pick a gimmick first")?,
     )
 }
 

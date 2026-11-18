@@ -551,8 +551,8 @@ impl NodeEditor {
                 };
                 if ui.add_enabled(can_add, egui::Button::new("Add node"))
                     .on_disabled_hover_text(if self.add_kind == 101 {
-                        "Add a Named event to an additional controller in Gimmicks → Behavior first."
-                    } else { "Add a named event receiver in a character controller first. The timed block selects a declared event; it cannot dispatch an unknown name." })
+                        "Add a Named event to a gimmick in Gimmicks first."
+                    } else { "Add a Named event to a gimmick in Gimmicks first, then this block can send it." })
                     .clicked() {
                     let Some(kind) = self.make_node(self.add_kind, fighter, next, current_track) else { return; };
                     self.draft.tracks[self.track]
