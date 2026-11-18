@@ -1261,16 +1261,19 @@ impl EffEditor {
         self.pending_edits_push_live = true;
     }
 
-    /// The file a queued load is about to open (relative to the export root) when nothing has
-    /// queued its edits yet. The app answers with [`Self::queue_carried_edits`], so a file
-    /// switched away from and back to opens with its edits instead of pristine.
+    /// The file a queued load is about to open (its game path, as [`Self::loaded_rel`] records
+    /// it) when nothing has queued its edits yet. The app answers with
+    /// [`Self::queue_carried_edits`], so a file switched away from and back to opens with its
+    /// edits instead of pristine.
     pub fn load_needing_edits(&self) -> Option<String> {
         if self.pending_edits.is_some() || self.pending_structure.is_some() {
             return None;
         }
         let path = self.pending_load.as_ref()?;
-        let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        Some(crate::mod_project::eff_game_rel(
+            path,
+            Some(&self.export_root),
+        ))
     }
 
     /// The project's edits for the file a queued load opens. Applied without sending anything
@@ -2706,7 +2709,9 @@ impl EffEditor {
                 None => "Vanilla game files: not set".to_string(),
             };
             ui.label(egui::RichText::new(vanilla_label).small()).on_hover_text(
-                "The unmodded ArcExplorer export. Live edits ride a carrier built on a vanilla                  assist effect file, which a mod's romfs does not contain, so this stays set even                  when the folder above points at your mod.",
+                "The unmodded ArcExplorer export. Live edits ride a carrier built on a vanilla \
+                 assist effect file, which a mod's romfs does not contain, so this stays set even \
+                 when the folder above points at your mod.",
             );
             if ui.button("Change vanilla folder").clicked() {
                 let mut dialog =

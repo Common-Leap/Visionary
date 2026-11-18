@@ -35771,26 +35771,27 @@ Click to see the code, or link your own project"),
             open_move.map(|m| crate::move_kinds::plain_name(&m.name)),
             open_move.map(|m| m.name.clone()),
         );
-        // The Effects page's own character and move pickers.
+        // The Effects page's own character and move pickers. Keyed by row, not fighter name: a
+        // mod character on a fighter's slots (Shy Guy on Pac-Man) is its own row with that name.
         if !self
             .eff_editor
             .fighter_choices
             .iter()
-            .map(|(name, _)| name)
-            .eq(self.state.fighters.iter().map(|f| &f.name))
+            .map(|(key, _)| key.clone())
+            .eq(self.state.fighters.iter().map(fighter_pick_key))
         {
             self.eff_editor.fighter_choices = self
                 .state
                 .fighters
                 .iter()
-                .map(|f| (f.name.clone(), f.display_name.clone()))
+                .map(|f| (fighter_pick_key(f), f.display_name.clone()))
                 .collect();
         }
         self.eff_editor.open_fighter = self
             .state
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
-            .map(|f| f.name.clone());
+            .map(fighter_pick_key);
         if !self
             .eff_editor
             .move_choices
@@ -35799,8 +35800,13 @@ Click to see the code, or link your own project"),
         {
             self.eff_editor.move_choices = self.move_list.iter().map(|m| m.name.clone()).collect();
         }
-        if let Some(name) = self.eff_editor.fighter_request.take() {
-            if let Some(i) = self.state.fighters.iter().position(|f| f.name == name) {
+        if let Some(key) = self.eff_editor.fighter_request.take() {
+            if let Some(i) = self
+                .state
+                .fighters
+                .iter()
+                .position(|f| fighter_pick_key(f) == key)
+            {
                 self.select_fighter(i);
             }
         }
@@ -38668,6 +38674,15 @@ fn unswitchable_uses(
     out.sort();
     out.dedup();
     out
+}
+
+/// The Effects page's key for one fighter row: its name, plus the mod character it is when it
+/// is one, since that row shares the fighter's name.
+fn fighter_pick_key(fighter: &crate::data::FighterEntry) -> String {
+    match &fighter.custom_name {
+        Some(character) => format!("{}/{character}", fighter.name),
+        None => fighter.name.clone(),
+    }
 }
 
 /// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
