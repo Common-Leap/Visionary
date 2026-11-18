@@ -1,4 +1,3 @@
-mod legacy_move_triggers;
 // Unified mod project: every edit the toolkit makes — hitboxes/ACMD scripts, effect-call
 // (spawn) edits, authored .eff value edits, effect transplants — in one serializable file.
 // This file travels WITH exported mods so a mod can be re-opened for further editing.
@@ -36,7 +35,6 @@ pub struct MoveSourceSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(try_from = "legacy_move_triggers::Project")]
 pub struct ModProjectFile {
     pub version: u32,
     pub name: String,
