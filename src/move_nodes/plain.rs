@@ -690,11 +690,14 @@ fn hitbox(damage: f32, size: f32) -> NodeKind {
 }
 
 /// The action blocks of a starter. `first_id` numbers them; `shot` is the fighter's spawn block.
+/// `length` is the move's animation length: a starter longer than it is squeezed to fit, so
+/// its hits land before the move ends.
 pub fn starter_nodes(
     starter: Starter,
     first_id: u32,
     speed: NodeKind,
     shot: Option<NodeKind>,
+    length: Option<f32>,
 ) -> Vec<MoveNode> {
     let end = || NodeKind::Execute {
         commands: vec![crate::data::ExcuteStmt::ClearAll],
@@ -729,6 +732,26 @@ pub fn starter_nodes(
         ],
         Starter::Shoot => shot.map_or_else(Vec::new, |shot| vec![frame(10.0), shot]),
     };
+    let span: f32 = kinds
+        .iter()
+        .map(|kind| match kind {
+            NodeKind::Frame { frame } => *frame,
+            NodeKind::Wait { frames } => *frames,
+            _ => 0.0,
+        })
+        .sum();
+    let scale = length
+        .filter(|length| *length > 2.0 && span > *length - 1.0)
+        .map_or(1.0, |length| (length - 1.0) / span);
+    let kinds = kinds.into_iter().map(|kind| match kind {
+        NodeKind::Frame { frame } => NodeKind::Frame {
+            frame: (frame * scale).round().max(1.0),
+        },
+        NodeKind::Wait { frames } => NodeKind::Wait {
+            frames: (frames * scale).round().max(1.0),
+        },
+        other => other,
+    });
     kinds
         .into_iter()
         .zip(first_id..)

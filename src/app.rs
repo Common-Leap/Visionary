@@ -10850,6 +10850,7 @@ impl VisionaryApp {
             .set_controller_charts(&fighter.name, &base, &controller_charts);
         self.node_editor
             .set_playhead(self.state.current_frame as f32, self.state.playing);
+        self.node_editor.set_move_length(self.state.total_frames);
         self.node_editor.set_source_script(
             &fighter.name,
             &move_entry.name,
@@ -11373,10 +11374,22 @@ impl VisionaryApp {
                             if !fetched {
                                 ui.weak("Nothing loaded yet — use Move › Reload source.");
                             } else if self.move_has_no_script {
-                                ui.weak(
+                                // Measured in game: Steve's jab swings the forward tilt
+                                // animation on his upper body and never plays this one.
+                                let steve_jab = self.state.selected_move.as_ref().is_some_and(|m| {
+                                    m.name.starts_with("attack_1")
+                                }) && self
+                                    .state
+                                    .selected_fighter
+                                    .and_then(|i| self.state.fighters.get(i))
+                                    .is_some_and(|f| f.name == "pickel");
+                                ui.weak(if steve_jab {
+                                    "Steve's jab plays Forward tilt in the game, not this \
+                                     animation. Edit Forward tilt to change his jab."
+                                } else {
                                     "The game gives this move no script; its actions come from \
-                                     the fighter's own code. Anything you add here gives it one.",
-                                );
+                                     the fighter's own code. Anything you add here gives it one."
+                                });
                             } else {
                                 ui.weak("This move has no hitboxes.");
                                 let plural = |n: usize, one: &str, many: &str| {
@@ -11466,7 +11479,9 @@ impl VisionaryApp {
                                     "●"
                                 };
                                 let bone = crate::ui::bone_label(&hb.bone_name);
-                                let frames = if hb.active_start == hb.active_end {
+                                // Decompiled scripts sometimes step the frame backwards, so an end can
+                                // land before its start; it is still a one-frame hitbox then.
+                                let frames = if hb.active_end <= hb.active_start {
                                     format!("frame {}", hb.active_start)
                                 } else if hb.active_end >= 9999 {
                                     format!("from frame {}", hb.active_start)

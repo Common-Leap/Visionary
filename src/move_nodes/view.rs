@@ -41,6 +41,7 @@ pub struct NodeEditor {
     add_kind: usize,
     palette_query: String,
     joint_options: Vec<String>,
+    move_length: Option<f32>,
     controller_charts: BTreeMap<String, crate::mod_project::ControllerChart>,
     controller_events: super::chart_event_view::EventChoices,
     controller_values: super::character_values::Choices,
@@ -185,6 +186,10 @@ impl NodeEditor {
         }
     }
 
+    /// The open move's animation length in frames, for fitting starters.
+    pub fn set_move_length(&mut self, frames: u32) {
+        self.move_length = (frames > 0).then_some(frames as f32);
+    }
     pub fn set_toolbar_rect(&mut self, rect: egui::Rect) {
         self.toolbar_rect = Some(rect);
     }
