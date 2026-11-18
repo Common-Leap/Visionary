@@ -10627,11 +10627,13 @@ impl VisionaryApp {
         Some((name, dir))
     }
 
-    /// The stand-in opponent a grab or throw holds, posed for the open move: Mario, as the
-    /// training stage's usual partner, or the fighter itself when Mario is not installed.
+    /// The opponent a grab or throw holds, posed for the open move: the fighter and costume
+    /// picked in the viewport toolbar, else Mario, as the training stage's usual partner, or the
+    /// fighter itself when Mario is not installed.
     fn preview_opponent_kind(
         &mut self,
     ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
+        use crate::preview_opponent::{load, load_animated, victim_motion};
         // The viewport toolbar's "Thrown fighter" toggle shows or hides the opponent.
         if !self.thrown_victim.enabled {
             return None;
@@ -10639,26 +10641,31 @@ impl VisionaryApp {
         // A throw with a fighter picked there plays that costume's thrown animation.
         if let Some((model_dir, anim)) = self.picked_thrown_animation() {
             let key = format!("opponent/{}/{}", model_dir.display(), anim.display());
-            return self
-                .object_kinds
-                .entry(key)
-                .or_insert_with(|| {
-                    crate::preview_opponent::load_animated(&model_dir, &anim)
-                        .map(std::sync::Arc::new)
-                })
-                .clone();
+            if let Some(kind) = self.cached_object_kind(key, || load_animated(&model_dir, &anim)) {
+                return Some(kind);
+            }
         }
-        let picked = self.thrown_victim.fighter.clone();
-        let motion = self
-            .state
-            .selected_move
-            .as_ref()
-            .and_then(|m| crate::preview_opponent::victim_motion(&m.name))?;
+        let motion = victim_motion(&self.state.selected_move.as_ref()?.name)?;
+        // Grabs (and throws the picker found no thrown motion for) hold the picked costume too,
+        // so the fighter doesn't swap between grab and throw.
+        let picked_costume = self
+            .victim_cache()
+            .filter(|cache| !cache.model_files.is_empty())
+            .map(|cache| (cache.model_dir.clone(), cache.motion_dir.clone()));
+        if let Some((model_dir, motion_dir)) = picked_costume {
+            let key = format!("opponent/{}/{motion}", model_dir.display());
+            if let Some(kind) =
+                self.cached_object_kind(key, || load(&model_dir, &motion_dir, motion))
+            {
+                return Some(kind);
+            }
+        }
+        let picked = &self.thrown_victim.fighter;
         let opponent = self
             .state
             .fighters
             .iter()
-            .find(|f| f.name == picked && f.custom_name.is_none())
+            .find(|f| f.name == *picked && f.custom_name.is_none())
             .or_else(|| self.state.fighters.iter().find(|f| f.name == "mario"))
             .or_else(|| {
                 self.state
@@ -10667,12 +10674,21 @@ impl VisionaryApp {
             })?
             .clone();
         let key = format!("opponent/{}/{motion}", opponent.name);
+        self.cached_object_kind(key, || {
+            load(&opponent.model_dir, &opponent.motion_dir, motion)
+        })
+    }
+
+    /// The object kind cached under `key`, loading it the first time. A failed load is cached
+    /// too, so it is not retried every frame.
+    fn cached_object_kind(
+        &mut self,
+        key: String,
+        load: impl FnOnce() -> Option<crate::article_preview::ObjectKind>,
+    ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
         self.object_kinds
             .entry(key)
-            .or_insert_with(|| {
-                crate::preview_opponent::load(&opponent.model_dir, &opponent.motion_dir, motion)
-                    .map(std::sync::Arc::new)
-            })
+            .or_insert_with(|| load().map(std::sync::Arc::new))
             .clone()
     }
 
@@ -11145,8 +11161,14 @@ impl VisionaryApp {
     /// The Effects page's switch between the selected effect alone and a move that plays it,
     /// over the top of the view.
     fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
+        let left = rect.center().x - 110.0;
+        // Below the viewport toolbar when it reaches this far across.
+        let top = self
+            .viewport_toolbar_rect
+            .filter(|toolbar| toolbar.right() > left)
+            .map_or(rect.top() + 8.0, |toolbar| toolbar.bottom() + 6.0);
         egui::Area::new(egui::Id::unique("effect_view_switch"))
-            .fixed_pos(rect.center_top() + egui::vec2(-110.0, 8.0))
+            .fixed_pos(egui::pos2(left, top))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -11175,7 +11197,7 @@ impl VisionaryApp {
         crate::preview_stage::stage_shift(spot, &self.preview_ledges.1)
     }
 
-    /// The stage picker over the preview's top-left corner.
+    /// The stage picker at the preview's top-left, under the viewport toolbar.
     fn draw_stage_picker(&mut self, ui: &mut Ui, rect: egui::Rect) {
         let root = self.state.data_root.clone();
         if self.preview_stages.0 != root {
@@ -11200,8 +11222,12 @@ impl VisionaryApp {
             .map(crate::preview_stage::label)
             .unwrap_or_else(|| "No stage".to_owned());
         let before = self.preview_stage.clone();
+        // Under the viewport toolbar (last frame's rect), which holds the same corner.
+        let top = self
+            .viewport_toolbar_rect
+            .map_or(rect.top() + 8.0, |toolbar| toolbar.bottom() + 6.0);
         egui::Area::new(egui::Id::unique("preview_stage_picker"))
-            .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+            .fixed_pos(egui::pos2(rect.left() + 8.0, top))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::ComboBox::from_id_salt("preview_stage_combo")
@@ -16533,6 +16559,7 @@ impl VisionaryApp {
             self.victim_cache = Some(VictimCache {
                 key,
                 model_dir,
+                motion_dir,
                 model_files: model.model_files(),
                 motions,
             });
@@ -16870,10 +16897,10 @@ impl VisionaryApp {
                     if ui
                         .add_enabled(camera_moved, egui::Button::new("⟲"))
                         .on_hover_text(
-                            "Reset view: back to the side view. Left drag orbits, right or                              middle drag pans, scroll zooms.",
+                            "Reset view: back to the side view. Left drag orbits, right or middle drag pans, scroll zooms.",
                         )
                         .on_disabled_hover_text(
-                            "Left drag orbits, right or middle drag pans, scroll zooms. This                              button returns to the side view.",
+                            "Left drag orbits, right or middle drag pans, scroll zooms. This button returns to the side view.",
                         )
                         .clicked()
                     {
@@ -35224,7 +35251,7 @@ impl eframe::App for VisionaryApp {
                     toggled |= ui
                         .checkbox(&mut self.show_motion_list, "Motion list")
                         .on_hover_text(
-                            "Edit the selected fighter's motion_list.yml or motion_list.bin:                              motion kinds, scripts, animations, flags, and cancel and                              intangibility frames",
+                            "Edit the selected fighter's motion_list.yml or motion_list.bin: motion kinds, scripts, animations, flags, and cancel and intangibility frames",
                         )
                         .changed();
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
@@ -38996,6 +39023,8 @@ struct VictimCache {
     key: (String, u8),
     /// The victim costume's body model folder.
     model_dir: PathBuf,
+    /// The victim costume's body motion folder, for the capture animations grabs hold it in.
+    motion_dir: PathBuf,
     model_files: Vec<(String, PathBuf)>,
     /// `(motion name, animation)` of every thrown motion in the victim's motion list, by name.
     motions: Vec<(String, PathBuf)>,

@@ -154,7 +154,7 @@ pub fn hint_text(hint: &ModHint) -> String {
         }
         ModHint::NotVanilla => {
             format!(
-                "is missing {CARRIER_BASE_REL}, a file every full dump has, so it won't be                  used to fill in files a partial romfs copy leaves out"
+                "is missing {CARRIER_BASE_REL}, a file every full dump has, so it won't be used to fill in files a partial romfs copy leaves out"
             )
         }
     }

@@ -606,7 +606,7 @@ impl ScriptConflict {
             .collect();
         if crates.len() > 1 {
             return format!(
-                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you                  build instead of the folder holding all of them",
+                "{}: {} is defined by {} separate crates ({}) — link the folder of the one you build instead of the folder holding all of them",
                 self.fighter,
                 self.script,
                 crates.len(),
