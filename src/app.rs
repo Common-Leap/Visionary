@@ -829,6 +829,41 @@ impl TimelineCategory {
 }
 
 #[cfg(test)]
+mod move_clock_tests {
+    use super::MoveClock;
+
+    /// Mario's up air as the game has it: 0.75 ticks per frame from the start, back to 1 at 9.
+    #[test]
+    fn motion_rate_sets_ticks_per_frame_from_its_frame_on() {
+        let script = crate::acmd::parse_acmd_script(
+            r#"unsafe extern "C" fn game_attackairhi(agent: &mut L2CAgentBase) {
+    macros::FT_MOTION_RATE(agent, 0.75);
+    frame(agent.lua_state_agent, 9.0);
+    macros::FT_MOTION_RATE(agent, 1.0);
+}"#,
+        );
+        let clock = MoveClock::new(&script);
+        assert_eq!(clock.ticks_per_frame(1), 0.75);
+        assert_eq!(clock.ticks_per_frame(8), 0.75);
+        assert_eq!(clock.ticks_per_frame(9), 1.0);
+        assert_eq!(clock.ticks_between(1, 9), 6.0);
+        assert_eq!(clock.ticks_between(9, 12), 3.0);
+    }
+
+    /// 0.25 is four frames a tick: an effect lives a quarter as many frames, and one at 2.0
+    /// gets two ticks per frame.
+    #[test]
+    fn effects_count_game_ticks_not_animation_frames() {
+        let fast = MoveClock(vec![(0.0, 0.25)]);
+        assert_eq!(fast.frames_by_tick(1, 9), vec![1, 5, 9]);
+        let slow = MoveClock(vec![(0.0, 2.0)]);
+        assert_eq!(slow.frames_by_tick(1, 3), vec![1, 1, 2, 2, 3]);
+        let plain = MoveClock(Vec::new());
+        assert_eq!(plain.frames_by_tick(4, 7), vec![4, 5, 6, 7]);
+    }
+}
+
+#[cfg(test)]
 mod editor_section_copy_tests {
     use super::*;
     #[allow(unused_imports)]
@@ -1186,6 +1221,51 @@ impl TimelineFilters {
 const EFFECT_ROTATION_AXIS_LABELS: [&str; 3] = ["X", "Y", "Z"];
 
 /// Convert a game-frame playhead to the zero-based frame index stored in `.nuanmb` animations.
+/// Game ticks (1/60 s each) per animation frame from each frame on. `FT_MOTION_RATE(x)` is
+/// inverted: x is ticks per frame, so 0.25 plays four times faster.
+struct MoveClock(Vec<(f32, f32)>);
+
+impl MoveClock {
+    fn new(script: &crate::data::AcmdScript) -> Self {
+        Self(
+            script
+                .motion_rate_sites()
+                .into_iter()
+                .map(|(_, at, rate)| (at, if rate.is_finite() && rate > 0.0 { rate } else { 1.0 }))
+                .collect(),
+        )
+    }
+
+    fn ticks_per_frame(&self, frame: u32) -> f32 {
+        self.0
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= frame as f32)
+            .map_or(1.0, |(_, rate)| *rate)
+    }
+
+    /// Ticks from the start of `from` to the start of `to`.
+    fn ticks_between(&self, from: u32, to: u32) -> f32 {
+        (from..to).map(|frame| self.ticks_per_frame(frame)).sum()
+    }
+
+    /// The frame showing `ticks` after the start of `from`, one per tick: what a game-time
+    /// clock (an effect's particles) sees of the move's frames.
+    fn frames_by_tick(&self, from: u32, to: u32) -> Vec<u32> {
+        let mut frames = vec![from];
+        let (mut frame, mut into) = (from, 0.0f32);
+        while frame < to {
+            into += 1.0;
+            while frame < to && into >= self.ticks_per_frame(frame) - 1e-4 {
+                into -= self.ticks_per_frame(frame);
+                frame += 1;
+            }
+            frames.push(frame.min(to));
+        }
+        frames
+    }
+}
+
 fn animation_frame_for_game_frame(frame: u32) -> f32 {
     crate::data::script_to_motion_frame(frame)
 }
@@ -9467,6 +9547,7 @@ impl VisionaryApp {
         objects: &[crate::article_preview::PlacedObject],
     ) -> Vec<crate::vfx_preview::EffectDraw> {
         let frame_num = self.state.current_frame;
+        let clock = MoveClock::new(&self.state.script);
         let Some(wgpu_state) = frame.wgpu_render_state() else {
             return Vec::new();
         };
@@ -9544,10 +9625,11 @@ impl VisionaryApp {
             {
                 continue;
             }
-            // Killed by the move (`EFFECT_OFF_KIND`) on its end frame.
+            // Killed by the move (`EFFECT_OFF_KIND`) on its end frame, counted in game ticks
+            // like the particles themselves.
             let kill_at = (ec.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
                 && ec.active_end > ec.active_start)
-                .then(|| (ec.active_end - ec.active_start) as usize);
+                .then(|| clock.ticks_between(ec.active_start, ec.active_end).round() as usize);
             let (offset, euler) = spawn_with_random_ranges(ec);
             let offset = placement_offset(ec, offset);
             let rotation = effect_rotation(euler);
@@ -9571,11 +9653,12 @@ impl VisionaryApp {
             };
             // A following effect rides its bone every frame; any other stays where it was
             // spawned, as the game places it once.
+            // One placement per game tick since the spawn.
+            let ticks = clock.frames_by_tick(ec.active_start, frame_num);
             let placements: Option<Vec<glam::Mat4>> = if ec.follows_bone {
-                (ec.active_start..=frame_num).map(place).collect()
+                ticks.into_iter().map(place).collect()
             } else {
-                place(ec.active_start)
-                    .map(|at| vec![at; (frame_num - ec.active_start + 1) as usize])
+                place(ec.active_start).map(|at| vec![at; ticks.len()])
             };
             if let Some(placements) = placements {
                 push(&ec.effect_name, placements, kill_at, Some(ec));
@@ -32201,8 +32284,20 @@ impl eframe::App for VisionaryApp {
         // Advance playback
         if self.state.playing {
             let now = std::time::Instant::now();
-            let elapsed = now.duration_since(self.last_frame_time).as_secs_f32();
-            if elapsed >= 1.0 / 24.0 {
+            // The game's 60 ticks a second, each frame lasting as many ticks as the move's
+            // animation speed gives it.
+            let clock = MoveClock::new(&self.state.script);
+            let step = |frame: u32| clock.ticks_per_frame(frame) / 60.0;
+            let mut elapsed = now.duration_since(self.last_frame_time).as_secs_f32();
+            if elapsed > 0.25 {
+                // Stalled (a load, a dialog): carry on from here rather than racing to catch up.
+                self.last_frame_time = now;
+                elapsed = 0.0;
+            }
+            while elapsed >= step(self.state.current_frame) {
+                let spent = step(self.state.current_frame);
+                elapsed -= spent;
+                self.last_frame_time += std::time::Duration::from_secs_f32(spent);
                 if self.state.total_frames > 0 {
                     self.state.current_frame =
                         if self.state.current_frame >= self.state.total_frames {
@@ -32214,11 +32309,10 @@ impl eframe::App for VisionaryApp {
                     // Keep the timeline moving even when only live capture data is loaded.
                     self.state.current_frame = (self.state.current_frame + 1).min(9999);
                 }
-                self.last_frame_time = now;
             }
             // Keep character animation and timeline overlays moving during playback.
-            let next = std::time::Duration::from_secs_f32((1.0 / 24.0 - elapsed).max(0.0));
-            ctx.request_repaint_after(next);
+            let next = (step(self.state.current_frame) - elapsed).max(0.0);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(next));
         }
 
         // History is captured only after background loading and playback have settled.  This
