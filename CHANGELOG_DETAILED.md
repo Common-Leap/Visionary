@@ -2,9 +2,9 @@
 
 Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion List editor, a thrown-fighter preview, in-game fighter scale, model checks before asset previews, SSBH Editor-style camera controls and a Settings window. Visionary now reads real-world moveset source much more faithfully and loads costumes the way ARCropolis does. Fixes scrambled character select alongside roster mods, misplaced helper and out-of-order bones, incomplete recolour costumes, and live effect previews that timed out against a mod-only root.
 
-> Fork 0.3.1, on top of Visionary v0.3.1. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
+> Fork 0.3.2, on top of Visionary v0.3.1. Supports Eden, yuzu, Ryujinx, sudachi, suyu, citron and torzu.
 
-## New in 0.3.1
+## New in 0.3.2
 
 - **Visionary v0.3.1 merged** — Move nodes, Gimmicks, the Effects page (with v0.3.1's character and move pickers and edits kept across file switches), effects in the preview, stages, objects and the grab opponent, with this fork's features carried on top
 - **SSBU 13.0.5** — the plugin detects 13.0.4 or 13.0.5 before installing any hook and reads every main-executable offset from that build's table; any other version leaves it off with a log line. The boot log records `game=` and `loader=`. Upstream's gimmick hooks check the game's own bytes before patching and turn off where they don't match

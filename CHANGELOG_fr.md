@@ -9,7 +9,7 @@ so.
 For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle ground, see
 [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
 
-## 0.3.1: merging upstream v0.3.0 and v0.3.1
+## 0.3.2: merging upstream v0.3.0 and v0.3.1
 
 - **Merge.** Upstream `v0.3.0` (Move nodes, Gimmicks, the Effects page, effect drawing in the
   preview, stages, objects, the grab/throw opponent) is merged. Where both sides changed the

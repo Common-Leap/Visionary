@@ -1,10 +1,10 @@
-# Visionary Changelog (v0.3.1)
+# Visionary Changelog (v0.3.2)
 
 This fork is now built on Visionary v0.3.1, so everything new there (Move nodes, Gimmicks,
 the Effects page with its character and move pickers, effects drawn in the preview, stages,
 objects and the grab opponent) is included. The notes below are what the fork adds on top.
 
-## New in 0.3.1
+## New in 0.3.2
 
 - **Built on Visionary 0.3.1.** Everything in the official 0.3.1 release is here, together
   with everything this fork adds.
