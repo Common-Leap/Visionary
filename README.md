@@ -293,8 +293,29 @@ expression edits and reloads the loaded source or capture baseline.
 
 ### Viewport
 
-The camera works like SSBH Editor's: left drag orbits the model, right or middle
-drag pans so the model follows the pointer, and scroll zooms.
+The camera works like SSBH Studio's. It turns about whatever is centred in the
+view, so something you pan to stays centred while you orbit. With the default
+**SSBH** navigation, left drag orbits, right or middle drag pans so the model
+follows the pointer, and scroll zooms. **Blender** navigation (in Settings) orbits
+with middle drag, pans with Shift + middle drag and zooms with Ctrl + middle drag;
+**Emulate 3 button mouse** lets Alt + left drag stand in for the middle button.
+Double-click turns back to the default angle.
+
+With the pointer over the viewport:
+
+- Numpad **1**, **3** and **7** look from the front, right and top; with **Ctrl**,
+  from the opposite side. Numpad **9** turns to the opposite of the current view.
+- **Home** frames the fighter, and **Period** the selected hitbox (or the fighter
+  when none is selected).
+- The arrow keys pan.
+
+The orientation widget in the top-right corner shows which way the camera looks:
+click an axis ball (or a cube face) to look along it, again to look from the other
+side, or drag it to orbit. The cube's arrows turn a quarter turn. Settings picks
+the axes, the cube, or neither.
+
+A red X line and a blue Z line on the ground mark the world axes through the
+origin, where the fighter starts.
 
 The toolbar in the viewport's top-left corner holds the display options:
 
@@ -304,16 +325,23 @@ The toolbar in the viewport's top-left corner holds the display options:
     a terminal it logs there; otherwise a console opens only while this is on.
     Its close button is removed, since closing it would end Visionary.
   - **Interface scale**, kept in step with **Ctrl +/-**.
-  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**
-    and **Bloom**.
+  - **Background** colour (SSBH Editor's dark grey by default), **Floor grid**,
+    **World axes** and **Bloom**.
   - **Enable helper bones**, which applies the model's `model.nuhlpb`, as the
     game does. Helper bones (`H_` elbow, knee and similar helpers) then move
     the mesh and any hitbox, hurtbox or effect placed on them. It is on by
     default. A move's material animations (glows, colour changes, eye swaps)
     always play.
-  - **Camera**: translation, rotation and field of view, with **⟲ Reset view**.
-- **⟲** beside the gear returns the camera to the default side view. It is
-  disabled while the camera is already there.
+  - **Camera**: mouse navigation, the orientation widget, translation, rotation,
+    field of view, near and far clip, **⟲ Reset view**, **Save as default** (the
+    view the camera starts at and resets to) and **Reset default** (back to the
+    built-in side view).
+  - **Camera animation**: a `.nuanmb` with a camera in it (a Final Smash or stage
+    camera, from the fighter's `camera/` folder) that the viewport camera plays
+    along the timeline. **Play camera animation** turns it off without clearing
+    the file. It isn't saved between sessions.
+- **⟲** beside the gear returns the camera to the default view. It is disabled
+  while the camera is already there.
 - **Scale** appears when the fighter isn't drawn at 1.0. The fighter starts at
   its `fighter_param` `scale` (or the moveset's `param_config` override of it).
   A linked moveset's frame callback (`on_line`) wins over that:

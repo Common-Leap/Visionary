@@ -8,7 +8,7 @@ Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion
 
 ### Changed from 0.3.1
 
-- **Camera drag** — left drag orbits and right or middle drag pans with the model following the pointer (0.3.1 had them the other way round). Scroll zooms, double-click returns to the side view, the camera still follows the fighter, and **⟲** resets the view
+- **Camera drag** — left drag orbits and right or middle drag pans with the model following the pointer (0.3.1 had them the other way round). Scroll zooms, double-click returns to the side view, the camera still follows the fighter, and **⟲** resets the view. Settings offers Blender navigation instead
 - **Project version 8** — projects saved by 0.3.2 are version 8 and carry the project's fighter list and linked moveset. Every earlier version loads; v1–v3 and v7 files get their fighter list built from their edits, v4 and v8 files keep their own. 0.3.1 and older refuse a v8 file with an "Update Visionary" message rather than dropping its sections
 - **Grab and throw opponent** — chosen with the toolbar's **Thrown fighter** picker (fighter, costume, thrown motion). It is on by default, and falls back to Mario, then the fighter itself, when the picked costume has no model or motion. The opponent's own fighter scale is not applied
 
@@ -77,13 +77,23 @@ Ported from SSBH Editor. **Tools → Motion list** edits the selected fighter's 
 - **Thrown animations** — on throws the opponent plays its costume's thrown animation: **Auto** matches the throw direction or the thrower's own thrown set; `_dx` / `_big` / `_girl` variants are picked from the list. Slot-character rows are not offered as opponents
 - **In-game scale** — `fighter_param` scale or its `param_config` override, then `ModelModule::set_scale`, `AttackModule::set_attack_scale` and `GrabModule::set_size_mul` from the moveset's `on_line` callback. Hitboxes and grabs take their own scale; a toolbar label shows each value and its source line
 
+### Camera (from SSBH Studio)
+
+- **Orbit about a target** — the camera turns about the point centred in the view; panning and framing move that point, so whatever is centred stays centred while orbiting
+- **Navigation schemes** — **SSBH** (left drag orbits, right or middle drag pans) or **Blender** (middle drag orbits, Shift + middle pans, Ctrl + middle zooms); **Emulate 3 button mouse** maps Alt + left drag to the middle button
+- **Keys** with the pointer over the viewport — numpad 1, 3 and 7 look from the front, right and top, Ctrl for the opposite side, 9 flips the view; Home frames the fighter's bones and Period the selected hitbox (the fighter when none is); the arrow keys pan
+- **Zoom** — scroll moves 0.2% of the distance per scroll unit, so far views zoom as quickly as near ones, and never passes the target
+- **Orientation widget** — axis balls (Blender style) or a shaded cube with turn arrows in the viewport's top right corner, below the toolbar when it reaches the corner. Click an axis or face to look along it (again for the opposite side), drag to orbit; **Hidden** removes it
+- **World axes** — a red X and a blue Z line through the origin on the ground, about 1.5 pixels wide at any zoom, fading with distance and depth tested against the scene; drawn by Visionary, not the floor grid shader
+- **Camera animation** — a `.nuanmb` with a `gya_camera` or `camera_stage` transform (Final Smash and stage cameras) plays along the timeline through ssbh_wgpu's `animate_camera`. Moving the camera by hand holds it off for that frame; **Play camera animation** releases it without clearing the file. Not saved with preferences
+
 ### Settings window
 
 The viewport's **⚙** opens **Settings**, saved to `preferences.json` in the config directory.
 
 - **Show console window** (Windows), **Interface scale** kept in step with Ctrl +/-
-- **Background** colour (SSBH Editor's dark grey by default), **Floor grid**, **Bloom** and **Enable helper bones**
-- **Camera** translation, rotation and field of view, with **⟲ Reset view**
+- **Background** colour (SSBH Editor's dark grey by default), **Floor grid**, **World axes**, **Bloom** and **Enable helper bones**
+- **Camera** — mouse navigation, orientation widget, translation, rotation, field of view, near and far clip, **⟲ Reset view**, **Save as default** (the view the camera starts at and resets to) and **Reset default**, and the camera animation
 
 ### Model checks
 

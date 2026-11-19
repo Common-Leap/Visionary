@@ -5873,6 +5873,7 @@ dependencies = [
  "image",
  "image_dds",
  "motion_list_rs",
+ "naga",
  "nutexb",
  "prc-rs",
  "proc-macro2",

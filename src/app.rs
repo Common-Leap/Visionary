@@ -2878,7 +2878,7 @@ fn effect_off_kind_flags(ui: &mut egui::Ui, fade: &mut bool, detach: &mut bool) 
 }
 
 /// Put the viewport camera back on the default side view.
-fn reset_viewport_camera(frame: &eframe::Frame) {
+fn reset_viewport_camera(frame: &eframe::Frame, home: &crate::renderer::CameraView) {
     if let Some(wgpu_state) = frame.wgpu_render_state() {
         if let Some(rs) = wgpu_state
             .renderer
@@ -2886,7 +2886,32 @@ fn reset_viewport_camera(frame: &eframe::Frame) {
             .callback_resources
             .get_mut::<HitboxRenderState>()
         {
-            rs.camera = crate::renderer::Camera::default();
+            rs.camera = crate::renderer::Camera::from_view(home);
+        }
+    }
+}
+
+/// A sphere around `points`: the centre of their bounds, reaching each corner.
+fn bounding_sphere(points: impl Iterator<Item = glam::Vec3>) -> Option<(glam::Vec3, f32)> {
+    let (min, max) = points.fold(None, |bounds: Option<(glam::Vec3, glam::Vec3)>, p| {
+        Some(bounds.map_or((p, p), |(min, max)| (min.min(p), max.max(p))))
+    })?;
+    Some(((min + max) * 0.5, ((max - min) * 0.5).length().max(1.0)))
+}
+
+/// How the mouse moves the camera in `scheme`, for hover text.
+fn navigation_hint(preferences: &crate::preferences::Preferences) -> &'static str {
+    match preferences.navigation_scheme {
+        crate::preferences::NavigationScheme::Ssbh => {
+            "Left drag orbits, right or middle drag pans, scroll zooms"
+        }
+        crate::preferences::NavigationScheme::Blender
+            if preferences.emulate_three_button_mouse =>
+        {
+            "Middle (or Alt + left) drag orbits, add Shift to pan or Ctrl to zoom; scroll zooms"
+        }
+        crate::preferences::NavigationScheme::Blender => {
+            "Middle drag orbits, Shift + middle pans, Ctrl + middle zooms, scroll zooms"
         }
     }
 }
@@ -3736,6 +3761,20 @@ pub struct VisionaryApp {
     /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
     /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
     viewport_toolbar_rect: Option<egui::Rect>,
+    /// A Blender-style camera drag in progress, decided when it started.
+    nav_drag: Option<crate::viewport_navigation::NavDrag>,
+    /// The fighter's bounding sphere and the selected hitbox's, in world space, from the last
+    /// overlay pass: what Home and Period frame.
+    fighter_sphere: Option<(glam::Vec3, f32)>,
+    selection_sphere: Option<(glam::Vec3, f32)>,
+    /// A camera animation (`.nuanmb`) the viewport camera plays along the timeline while
+    /// `camera_anim_on`, and why the last one picked could not be used.
+    camera_anim: Option<(PathBuf, std::sync::Arc<ssbh_data::anim_data::AnimData>)>,
+    camera_anim_on: bool,
+    camera_anim_error: Option<String>,
+    /// Whether the saved default view is on the camera yet. The renderer makes its camera
+    /// with the built-in view, before it can read Settings.
+    camera_home_applied: bool,
     /// Where the shown model's and motion's borrowed files come from, for the viewport toolbar.
     /// Empty when both folders hold all their own files.
     viewport_file_sources: Vec<ViewportFileSource>,
@@ -4367,6 +4406,13 @@ impl VisionaryApp {
             preferences,
             settings_open: false,
             viewport_toolbar_rect: None,
+            nav_drag: None,
+            fighter_sphere: None,
+            selection_sphere: None,
+            camera_anim: None,
+            camera_anim_on: true,
+            camera_anim_error: None,
+            camera_home_applied: false,
             viewport_file_sources: Vec::new(),
             model_report: None,
             thrown_victim: load_thrown_victim(),
@@ -11339,35 +11385,78 @@ impl VisionaryApp {
                     } else {
                         0.0
                     };
-                    rs.camera.follow = glam::Vec3::new(root.x, -lift, root.z);
-                    if self.eff_editor.open
-                        && self.eff_editor.view == crate::eff_editor::EffectView::Alone
-                        && self.eff_editor.selected_entry_name().is_some()
+                    let home = self.preferences.home_camera();
+                    if !self.camera_home_applied {
+                        rs.camera = crate::renderer::Camera::from_view(&home);
+                        self.camera_home_applied = true;
+                    }
+                    // A camera animation places the camera in the world itself.
+                    let animated = self.camera_anim_on && self.camera_anim.is_some();
+                    rs.camera.follow = if animated
+                        || (self.eff_editor.open
+                            && self.eff_editor.view == crate::eff_editor::EffectView::Alone
+                            && self.eff_editor.selected_entry_name().is_some())
                     {
-                        rs.camera.follow = glam::Vec3::ZERO;
-                    }
-                    // SSBH Editor's controls: left drag orbits, right (or middle) drag pans,
-                    // scroll zooms. Double-click: back to the side view.
-                    if response.dragged_by(egui::PointerButton::Primary) {
-                        let delta = response.drag_delta();
-                        rs.camera.rotate(delta.x, delta.y);
-                        ctx.request_repaint();
-                    }
-                    if response.dragged_by(egui::PointerButton::Secondary)
-                        || response.dragged_by(egui::PointerButton::Middle)
-                    {
-                        let delta = response.drag_delta();
-                        rs.camera.pan(delta.x, delta.y, h);
-                        ctx.request_repaint();
-                    }
+                        glam::Vec3::ZERO
+                    } else {
+                        glam::Vec3::new(root.x, -lift, root.z)
+                    };
+                    // SSBH Studio's controls, in the scheme picked in Settings.
+                    let controls = crate::viewport_navigation::Controls {
+                        scheme: self.preferences.navigation_scheme,
+                        emulate_three_button_mouse: self.preferences.emulate_three_button_mouse,
+                    };
+                    let keyboard = response.hovered() && !ctx.egui_wants_keyboard_input();
+                    let nav_drag = &mut self.nav_drag;
+                    let (mut moved, frame_request) = ui.input(|input| {
+                        crate::viewport_navigation::navigate(
+                            &mut rs.camera,
+                            &response,
+                            input,
+                            controls,
+                            h,
+                            nav_drag,
+                            keyboard,
+                        )
+                    });
+                    // Double-click: back to the default angle, keeping the zoom.
                     if response.double_clicked() {
-                        rs.camera.reset_turn();
-                        ctx.request_repaint();
+                        rs.camera.reset_turn(&home);
+                        moved = true;
                     }
-                    // Scroll: zoom
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll != 0.0 && response.hovered() {
-                        rs.camera.zoom(scroll * 0.05);
+                    if let Some(request) = frame_request {
+                        let sphere = match request {
+                            crate::viewport_navigation::FrameRequest::Selection => {
+                                self.selection_sphere.or(self.fighter_sphere)
+                            }
+                            crate::viewport_navigation::FrameRequest::All => self.fighter_sphere,
+                        };
+                        let (center, radius) = sphere.unwrap_or((
+                            rs.camera.follow + glam::Vec3::new(0.0, 8.0, 0.0),
+                            12.0,
+                        ));
+                        rs.camera.frame(center, radius);
+                        moved = true;
+                    }
+                    if let Some((_, anim)) = self.camera_anim.as_ref().filter(|_| animated) {
+                        // Moving the camera by hand holds the animation off for that frame,
+                        // so a drag starts from where the animation had it.
+                        if !moved {
+                            let anim_frame =
+                                animation_frame_for_game_frame(self.state.current_frame)
+                                    .clamp(0.0, anim.final_frame_index.max(0.0));
+                            if let Some(values) = ssbh_wgpu::animation::camera::animate_camera(
+                                anim,
+                                anim_frame,
+                                rs.camera.fov_y,
+                                rs.camera.near,
+                                rs.camera.far,
+                            ) {
+                                rs.camera.apply_animation(&values);
+                            }
+                        }
+                    }
+                    if moved {
                         ctx.request_repaint();
                     }
                 }
@@ -11477,6 +11566,9 @@ impl VisionaryApp {
                             .iter()
                             .map(|(k, m)| (k.clone(), m.col(3).truncate()))
                             .collect();
+                    // What Home frames, and Period when no hitbox is selected.
+                    self.fighter_sphere = bounding_sphere(bone_positions.values().copied());
+                    self.selection_sphere = None;
 
                     if self.show_debug {
                         let mut names: Vec<&String> = bone_positions.keys().collect();
@@ -11834,6 +11926,12 @@ impl VisionaryApp {
                         let launch_center = capsule_world_end
                             .map(|world_end| (world_pos + world_end) * 0.5)
                             .unwrap_or(world_pos);
+                        if selected {
+                            let half_length = capsule_world_end
+                                .map_or(0.0, |world_end| (world_end - world_pos).length() * 0.5);
+                            self.selection_sphere =
+                                Some((launch_center, world_radius + half_length));
+                        }
 
                         let label_pos = draw_projected_capsule(
                             ui.painter(),
@@ -12097,6 +12195,7 @@ impl VisionaryApp {
                 }
             }
             self.draw_viewport_toolbar(ui, rect, frame);
+            self.draw_orientation_widget(ui, rect, frame);
         } else {
             self.viewport_toolbar_rect = None;
             let [r, g, b] = self.preferences.viewport_color;
@@ -16806,6 +16905,11 @@ impl VisionaryApp {
                 });
                 ui.checkbox(&mut self.preferences.floor_grid, "Floor grid")
                     .on_hover_text("A grid on the ground plane (y = 0) under the fighter.");
+                ui.checkbox(&mut self.preferences.world_axes, "World axes")
+                    .on_hover_text(
+                        "A red X line and a blue Z line through the origin on the ground, \
+                         where the fighter starts.",
+                    );
                 ui.checkbox(&mut self.preferences.bloom, "Bloom")
                     .on_hover_text("The game's glow around bright and emissive materials.");
                 let response = ui.add_enabled(
@@ -16826,15 +16930,13 @@ impl VisionaryApp {
 
                 ui.separator();
                 ui.label(RichText::new("Camera").strong());
-                ui.label(
-                    RichText::new("Left drag orbits · right or middle drag pans · scroll zooms")
-                        .small()
-                        .weak(),
-                );
+                self.draw_navigation_settings(ui);
+                ui.label(RichText::new(navigation_hint(&self.preferences)).small().weak());
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
                         let camera = &mut rs.camera;
+                        let home = self.preferences.home_camera();
                         egui::Grid::new("settings_camera").num_columns(4).show(ui, |ui| {
                             ui.label("Translation");
                             for value in [
@@ -16874,24 +16976,239 @@ impl VisionaryApp {
                                 camera.fov_y = degrees.to_radians();
                             }
                             ui.end_row();
+                            ui.label("Near clip").on_hover_text("The nearest distance drawn.");
+                            let far = camera.far;
+                            ui.add(
+                                egui::DragValue::new(&mut camera.near)
+                                    .range(0.001..=far)
+                                    .speed(0.05),
+                            );
+                            ui.end_row();
+                            ui.label("Far clip").on_hover_text("The farthest distance drawn.");
+                            let near = camera.near;
+                            ui.add(
+                                egui::DragValue::new(&mut camera.far)
+                                    .range(near..=f32::MAX)
+                                    .speed(100.0),
+                            );
+                            ui.end_row();
                         });
                         camera.translation.z = camera.translation.z.min(-1.0);
-                        if ui
-                            .add_enabled(!camera.is_default(), egui::Button::new("⟲ Reset view"))
-                            .on_hover_text("Back to the side view")
-                            .clicked()
-                        {
-                            *camera = crate::renderer::Camera::default();
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!camera.is_at(&home), egui::Button::new("⟲ Reset view"))
+                                .on_hover_text("Back to the default view")
+                                .clicked()
+                            {
+                                *camera = crate::renderer::Camera::from_view(&home);
+                            }
+                            if ui
+                                .add_enabled(
+                                    !camera.is_at(&home),
+                                    egui::Button::new("Save as default"),
+                                )
+                                .on_hover_text(
+                                    "Start at this view, and come back to it with ⟲ and a \
+                                     double-click",
+                                )
+                                .clicked()
+                            {
+                                self.preferences.default_camera = Some(camera.view());
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.preferences.default_camera.is_some(),
+                                    egui::Button::new("Reset default"),
+                                )
+                                .on_hover_text("Go back to the built-in side view as the default")
+                                .clicked()
+                            {
+                                self.preferences.default_camera = None;
+                                *camera = crate::renderer::Camera::default();
+                            }
+                        });
                     } else {
                         ui.weak("Load a fighter to adjust the camera.");
                     }
                 }
+                self.draw_camera_animation_settings(ui);
             });
         self.settings_open = open;
         if self.preferences != before {
             self.preferences.save();
             ctx.request_repaint();
+        }
+    }
+
+    /// Settings: which mouse buttons move the camera, and the orientation widget's style.
+    fn draw_navigation_settings(&mut self, ui: &mut Ui) {
+        use crate::preferences::{NavigationScheme, NavigationWidget};
+        let preferences = &mut self.preferences;
+        egui::Grid::new("settings_navigation").num_columns(2).show(ui, |ui| {
+            ui.label("Mouse navigation").on_hover_text(
+                "SSBH: left drag orbits, right or middle drag pans.\nBlender: middle drag \
+                 orbits, Shift + middle pans, Ctrl + middle zooms.",
+            );
+            egui::ComboBox::from_id_salt("settings_navigation_scheme")
+                .selected_text(match preferences.navigation_scheme {
+                    NavigationScheme::Ssbh => "SSBH",
+                    NavigationScheme::Blender => "Blender",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut preferences.navigation_scheme,
+                        NavigationScheme::Ssbh,
+                        "SSBH",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_scheme,
+                        NavigationScheme::Blender,
+                        "Blender",
+                    );
+                });
+            ui.end_row();
+            ui.label("Orientation widget").on_hover_text(
+                "The gizmo in the viewport's top right corner. Click an axis or face to look \
+                 along it, drag it to orbit.",
+            );
+            egui::ComboBox::from_id_salt("settings_navigation_widget")
+                .selected_text(match preferences.navigation_widget {
+                    NavigationWidget::Axes => "Axes",
+                    NavigationWidget::Cube => "Cube",
+                    NavigationWidget::Hidden => "Hidden",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Axes,
+                        "Axes (Blender)",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Cube,
+                        "Cube",
+                    );
+                    ui.selectable_value(
+                        &mut preferences.navigation_widget,
+                        NavigationWidget::Hidden,
+                        "Hidden",
+                    );
+                });
+            ui.end_row();
+        });
+        ui.add_enabled(
+            preferences.navigation_scheme == NavigationScheme::Blender,
+            egui::Checkbox::new(
+                &mut preferences.emulate_three_button_mouse,
+                "Emulate 3 button mouse",
+            ),
+        )
+        .on_hover_text("Use Alt + left drag in place of the middle button, for trackpads and two-button mice.")
+        .on_disabled_hover_text("Available with Blender mouse navigation.");
+    }
+
+    /// Settings: a camera animation (`.nuanmb`, such as a Final Smash camera) for the viewport
+    /// camera to play along the timeline.
+    fn draw_camera_animation_settings(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Camera animation");
+            match &self.camera_anim {
+                Some((path, _)) => {
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    ui.label(RichText::new(name).monospace())
+                        .on_hover_text(path.display().to_string());
+                }
+                None => {
+                    ui.weak("none");
+                }
+            }
+            if ui.button("Choose…").clicked() {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Camera animation", &["nuanmb"])
+                    .set_title("Choose a camera animation");
+                // The fighter's own cameras sit in fighter/<name>/camera/.
+                let camera_dir = self
+                    .current_model_dir
+                    .as_ref()
+                    .and_then(|dir| dir.ancestors().nth(3))
+                    .map(|fighter| fighter.join("camera"))
+                    .filter(|dir| dir.is_dir());
+                if let Some(dir) = camera_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    self.load_camera_animation(path);
+                }
+            }
+            if ui
+                .add_enabled(self.camera_anim.is_some(), egui::Button::new("Clear"))
+                .clicked()
+            {
+                self.camera_anim = None;
+                self.camera_anim_error = None;
+            }
+        });
+        ui.add_enabled(
+            self.camera_anim.is_some(),
+            egui::Checkbox::new(&mut self.camera_anim_on, "Play camera animation"),
+        )
+        .on_hover_text(
+            "The viewport camera follows the animation along the timeline. Turn it off to move \
+             the camera freely again without clearing the file.",
+        );
+        if let Some(error) = &self.camera_anim_error {
+            ui.colored_label(Color32::from_rgb(220, 120, 90), error);
+        }
+    }
+
+    fn load_camera_animation(&mut self, path: PathBuf) {
+        match ssbh_data::anim_data::AnimData::from_file(&path) {
+            Ok(anim) => {
+                let has_camera = ssbh_wgpu::animation::camera::animate_camera(
+                    &anim, 0.0, 0.5, 1.0, 400_000.0,
+                )
+                .is_some();
+                if has_camera {
+                    self.camera_anim = Some((path, std::sync::Arc::new(anim)));
+                    self.camera_anim_on = true;
+                    self.camera_anim_error = None;
+                } else {
+                    self.camera_anim_error = Some(format!(
+                        "{} has no camera (a gya_camera or camera_stage transform).",
+                        path.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                self.camera_anim_error = Some(format!("Could not read {}: {error}", path.display()));
+            }
+        }
+    }
+
+    /// The axis balls or cube in the viewport's top right corner (Settings picks which).
+    fn draw_orientation_widget(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+        let style = self.preferences.navigation_widget;
+        if style == crate::preferences::NavigationWidget::Hidden {
+            return;
+        }
+        let Some(wgpu_state) = frame.wgpu_render_state() else {
+            return;
+        };
+        let mut renderer = wgpu_state.renderer.write();
+        let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() else {
+            return;
+        };
+        if crate::orientation_widget::orientation_widget(
+            ui,
+            viewport,
+            self.viewport_toolbar_rect,
+            style,
+            &mut rs.camera,
+        ) {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -16913,25 +17230,29 @@ impl VisionaryApp {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    let home = self.preferences.home_camera();
                     let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
                         wgpu_state
                             .renderer
                             .read()
                             .callback_resources
                             .get::<HitboxRenderState>()
-                            .is_some_and(|rs| !rs.camera.is_default())
+                            .is_some_and(|rs| !rs.camera.is_at(&home))
                     });
+                    let hint = navigation_hint(&self.preferences);
                     if ui
                         .add_enabled(camera_moved, egui::Button::new("⟲"))
-                        .on_hover_text(
-                            "Reset view: back to the side view. Left drag orbits, right or middle drag pans, scroll zooms.",
-                        )
-                        .on_disabled_hover_text(
-                            "Left drag orbits, right or middle drag pans, scroll zooms. This button returns to the side view.",
-                        )
+                        .on_hover_text(format!(
+                            "Reset view: back to the default view. {hint}. Numpad 1, 3 and 7 \
+                             look from the front, right and top; Home frames the fighter and \
+                             Period the selected hitbox."
+                        ))
+                        .on_disabled_hover_text(format!(
+                            "{hint}. This button returns to the default view."
+                        ))
                         .clicked()
                     {
-                        reset_viewport_camera(frame);
+                        reset_viewport_camera(frame, &home);
                         ui.ctx().request_repaint();
                     }
                     let scales = self.viewport_scales();

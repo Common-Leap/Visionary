@@ -15,23 +15,24 @@ fn synthetic_top_matrix(bones: &std::collections::HashMap<String, glam::Mat4>) -
         .unwrap_or(glam::Mat4::IDENTITY)
 }
 
-pub struct Camera {
-    pub translation: Vec3,
-    pub rotation: Vec3,
-    /// The point the camera keeps centred: the fighter's position over the ground, so a move
-    /// that carries the fighter forward (a dash attack, a slide) stays in view.
-    pub follow: Vec3,
+/// A camera placement as Settings edits it and saves it as the default view. The view matrix
+/// is translation * rotation (XYZ Euler angles), as in SSBH Editor and SSBH Studio.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CameraView {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 3],
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
 }
 
-impl Default for Camera {
+impl Default for CameraView {
+    /// The side view of a fighter standing at the origin.
     fn default() -> Self {
         Self {
-            translation: Vec3::new(0.0, -8.0, -60.0),
-            follow: Vec3::ZERO,
-            rotation: Vec3::new(0.0, std::f32::consts::FRAC_PI_2, 0.0),
+            translation: [0.0, -8.0, -60.0],
+            rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
             fov_y: 30f32.to_radians(),
             near: 1.0,
             far: 400_000.0,
@@ -39,53 +40,141 @@ impl Default for Camera {
     }
 }
 
+pub struct Camera {
+    pub translation: Vec3,
+    pub rotation: Vec3,
+    /// The point the camera keeps centred: the fighter's position over the ground, so a move
+    /// that carries the fighter forward (a dash attack, a slide) stays in view.
+    pub follow: Vec3,
+    /// The point orbiting and view snaps turn about, relative to `follow`. Panning and
+    /// framing move it, so whatever is centred stays centred while turning (SSBH Studio).
+    pub target: Vec3,
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self::from_view(&CameraView::default())
+    }
+}
+
+/// The camera's rotation matrix for XYZ Euler angles.
+pub fn camera_rotation(rotation: Vec3) -> Mat4 {
+    Mat4::from_euler(glam::EulerRot::XYZ, rotation.x, rotation.y, rotation.z)
+}
+
 impl Camera {
-    /// Orbit the model, as SSBH Editor's left drag does: horizontal drags turn about the
-    /// vertical axis, vertical drags tilt.
-    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
-        self.rotation.x += delta_y * 0.01;
-        self.rotation.y += delta_x * 0.01;
+    pub fn from_view(view: &CameraView) -> Self {
+        let mut camera = Self {
+            translation: Vec3::from(view.translation),
+            rotation: Vec3::from(view.rotation),
+            follow: Vec3::ZERO,
+            target: Vec3::ZERO,
+            fov_y: view.fov_y,
+            near: view.near,
+            far: view.far,
+        };
+        camera.target = camera.centred_point();
+        camera
     }
 
-    /// Pan in the view plane so the model follows the pointer, as SSBH Editor's right drag
-    /// does. The viewport height and vertical field of view convert pixels to world units at
-    /// the model's distance.
+    /// This placement, without the fighter it follows.
+    pub fn view(&self) -> CameraView {
+        CameraView {
+            translation: self.translation.to_array(),
+            rotation: self.rotation.to_array(),
+            fov_y: self.fov_y,
+            near: self.near,
+            far: self.far,
+        }
+    }
+
+    /// The point straight ahead at the depth of the view origin, relative to `follow`.
+    fn centred_point(&self) -> Vec3 {
+        camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(Vec3::new(-self.translation.x, -self.translation.y, 0.0))
+    }
+
+    /// Turns to `rotation` while keeping `target` where it appears on screen.
+    pub fn turn_to(&mut self, rotation: Vec3) {
+        let view = camera_rotation(self.rotation).transform_vector3(self.target) + self.translation;
+        self.rotation = rotation;
+        self.translation = view - camera_rotation(rotation).transform_vector3(self.target);
+    }
+
+    /// Orbit like dragging the scene: right turns right, up tilts up.
+    pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
+        self.turn_to(self.rotation + Vec3::new(delta_y * 0.01, delta_x * 0.01, 0.0));
+    }
+
+    /// Moves the view by `shift` in view space, keeping `target` at the view centre.
+    pub fn pan_view(&mut self, shift: Vec3) {
+        self.translation += shift;
+        self.target -= camera_rotation(self.rotation)
+            .inverse()
+            .transform_vector3(shift);
+    }
+
+    /// Pan in the view plane so the model follows the pointer. The viewport height and
+    /// vertical field of view convert pixels to world units at the model's distance.
     pub fn pan(&mut self, delta_x: f32, delta_y: f32, viewport_height: f32) {
         let factor = self.fov_y.sin() * self.translation.z.abs() / viewport_height.max(1.0);
-        self.translation.x += delta_x * factor;
-        self.translation.y -= delta_y * factor;
+        self.pan_view(Vec3::new(delta_x * factor, -delta_y * factor, 0.0));
     }
 
-    /// Whether the camera has moved away from the default side view.
-    pub fn is_default(&self) -> bool {
-        let default = Self::default();
-        self.translation.abs_diff_eq(default.translation, 1e-4)
-            && self.rotation.abs_diff_eq(default.rotation, 1e-4)
-            && (self.fov_y - default.fov_y).abs() < 1e-4
+    /// Zooms in by `amount`, scaled by distance so far views zoom as quickly as near ones.
+    /// Never zooms through the point being looked at.
+    pub fn zoom(&mut self, amount: f32) {
+        let delta = amount * self.translation.z.abs();
+        self.translation.z = (self.translation.z + delta).min(-1.0);
     }
 
-    /// Back to the side view, keeping the zoom.
-    pub fn reset_turn(&mut self) {
-        self.rotation = Camera::default().rotation;
+    /// Points the camera at a sphere (in world space) without changing its angle.
+    pub fn frame(&mut self, center: Vec3, radius: f32) {
+        let center = center - self.follow;
+        let half_fov = (self.fov_y * 0.5).max(0.05);
+        let distance = radius.max(1.0) / half_fov.sin() * 1.1;
+        self.translation =
+            Vec3::new(0.0, 0.0, -distance) - camera_rotation(self.rotation).transform_vector3(center);
+        self.target = center;
     }
 
-    /// Zoom: move along Z axis.
-    pub fn zoom(&mut self, delta: f32) {
-        let speed = self.translation.z.abs() * 0.1;
-        self.translation.z += delta * speed;
-        self.translation.z = self.translation.z.min(-1.0);
+    /// Whether the camera sits at `view`.
+    pub fn is_at(&self, view: &CameraView) -> bool {
+        self.translation.abs_diff_eq(Vec3::from(view.translation), 1e-4)
+            && self.rotation.abs_diff_eq(Vec3::from(view.rotation), 1e-4)
+            && (self.fov_y - view.fov_y).abs() < 1e-4
+    }
+
+    /// Back to `view`'s angle, keeping the zoom and what is centred.
+    pub fn reset_turn(&mut self, view: &CameraView) {
+        self.turn_to(Vec3::from(view.rotation));
+    }
+
+    /// Takes one frame of a camera animation. Its view matrix is rotation * translation *
+    /// scale; it is decomposed into this camera's translation * rotation, as SSBH Studio does,
+    /// so the overlays and effects project through the same camera.
+    pub fn apply_animation(&mut self, values: &ssbh_wgpu::animation::camera::CameraAnimValues) {
+        let model_view = Mat4::from_quat(values.rotation)
+            * Mat4::from_translation(values.translation)
+            * Mat4::from_scale(values.scale);
+        let (_, rotation, translation) = model_view.to_scale_rotation_translation();
+        self.translation = translation;
+        self.rotation = rotation.to_euler(glam::EulerRot::XYZ).into();
+        self.fov_y = values.fov_y_radians;
+        self.near = values.near_clip;
+        self.far = values.far_clip;
+        self.follow = Vec3::ZERO;
+        self.target = self.centred_point();
     }
 
     pub fn transforms(&self, width: f32, height: f32) -> CameraTransforms {
         let aspect = if height > 0.0 { width / height } else { 1.0 };
-        let rotation = Mat4::from_euler(
-            glam::EulerRot::XYZ,
-            self.rotation.x,
-            self.rotation.y,
-            self.rotation.z,
-        );
         let model_view = Mat4::from_translation(self.translation)
-            * rotation
+            * camera_rotation(self.rotation)
             * Mat4::from_translation(-self.follow);
         let projection =
             glam::camera::rh::proj::directx::perspective(self.fov_y, aspect, self.near, self.far);
@@ -162,6 +251,9 @@ pub struct HitboxRenderState {
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
+    /// The X and Z lines through the origin on the ground, while Settings shows them.
+    axes: crate::preview_axes::PreviewAxes,
+    world_axes: bool,
     /// Body meshes hidden for a visibility set, to show again when the set switches back.
     set_hidden: std::collections::HashSet<usize>,
     /// Where the models and effects are drawn before going on screen.
@@ -265,6 +357,13 @@ impl HitboxRenderState {
                 ssbh_wgpu::DEPTH_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
+            axes: crate::preview_axes::PreviewAxes::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::DEPTH_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            world_axes: true,
             set_hidden: std::collections::HashSet::new(),
             floor_color: {
                 let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
@@ -276,7 +375,8 @@ impl HitboxRenderState {
         }
     }
 
-    /// Viewport preferences from the Settings window: background, floor grid, and bloom.
+    /// Viewport preferences from the Settings window: background, floor grid, world axes and
+    /// bloom.
     pub fn apply_preferences(
         &mut self,
         queue: &wgpu::Queue,
@@ -294,6 +394,7 @@ impl HitboxRenderState {
             a,
         });
         self.model_render_options.draw_floor_grid = preferences.floor_grid;
+        self.world_axes = preferences.world_axes;
         if self.render_settings.render_bloom != preferences.bloom {
             self.render_settings.render_bloom = preferences.bloom;
             self.renderer
@@ -1665,6 +1766,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }
+            let axes = state.world_axes.then_some(&state.axes);
+            if let Some(axes) = axes {
+                axes.update(queue, t.mvp_matrix, t.camera_pos);
+            }
             // The stage's models are drawn with the fighter's, in one list for the renderer;
             // they go back to their own list afterwards.
             let fighter_models = state.render_models.len();
@@ -1698,6 +1803,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     });
                     if let Some(floor) = floor {
                         floor.draw(&mut pass);
+                    }
+                    if let Some(axes) = axes {
+                        axes.draw(&mut pass);
                     }
                     vfx.paint(&mut pass);
                     trails.draw(&mut pass);

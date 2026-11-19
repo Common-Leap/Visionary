@@ -149,13 +149,37 @@ a middle ground, see [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
   `GrabModule::set_size_mul` read from the moveset's `on_line` callback (through helpers,
   skipping results-screen and entry branches). Hitbox and grab sizes take their own scale; a
   toolbar label shows each value and where it came from.
-- **Camera like SSBH Editor.** Left drag orbits, right or middle drag pans with the model
-  following the pointer, scroll zooms. A reset button beside the gear returns to the default
-  side view. This swaps 0.3.1's drag buttons; see Changed from 0.3.1.
+- **Camera from SSBH Studio.** `renderer::Camera` keeps a `target` (relative to `follow`):
+  `turn_to` rotates while holding the target's view position, `pan_view` moves it with the
+  view, `frame` solves the translation that puts a world sphere straight ahead at
+  `radius / sin(fov / 2) * 1.1`, and `zoom` scales by distance (clamped at z = -1). The view
+  matrix stays translation * rotation * `-follow`. `viewport_navigation` holds the SSBH and
+  Blender schemes (a Blender drag's mode is fixed at `drag_started_by`), three-button emulation,
+  arrow-key panning, numpad views and the Period / Home frame requests; the app answers those
+  with the selected hitbox's or the fighter's bone bounds, recorded in the overlay pass. This
+  swaps 0.3.1's drag buttons; see Changed from 0.3.1.
+- **Orientation widget** (`orientation_widget.rs`, ported from SSBH Studio). Axis balls or a
+  cube with turn arrows in an `egui::Area` at the viewport's top right, placed below
+  `viewport_toolbar_rect` when the toolbar reaches it and clamped inside the viewport. Being an
+  Area, it takes its own clicks, so they don't pick a hitbox underneath.
+- **World axes** (`preview_axes.rs`). A full-screen triangle whose fragments intersect their
+  view ray with y = 0 and keep pixels within 1.5 pixels (`fwidth`) of x = 0 or z = 0, faded
+  like SSBH Studio's grid. Drawn after the floor in the scene pass with premultiplied blending,
+  depth tested without writing, at a depth pulled 0.1% toward the eye so the opaque floor at the
+  same height doesn't hide it. `naga` is a dev-dependency (the version wgpu already builds) to
+  validate the WGSL in a test.
+- **Camera animation.** `ssbh_wgpu::animation::camera::animate_camera` samples the picked
+  `.nuanmb` at the timeline's animation frame (clamped to its last frame); `apply_animation`
+  decomposes its rotation * translation * scale view into the camera's translation and XYZ
+  Euler rotation and zeroes `follow`, so overlays and effects project through the same camera.
+  A manual move holds it off for that frame. Session state, not a preference.
 - **Settings window.** The gear opens **Settings**, saved to `preferences.json` in the config
   directory: show console window, interface scale (kept in step with Ctrl +/-), viewport
-  background colour (SSBH Editor's dark grey by default), floor grid, bloom, helper bones, and a
-  Camera section with translation, rotation, field of view and reset.
+  background colour (SSBH Editor's dark grey by default), floor grid, world axes, bloom, helper
+  bones, and a Camera section: navigation scheme, three-button emulation, orientation widget
+  style, translation, rotation, field of view, near and far clip, reset, **Save as default**
+  (`default_camera`, applied on the first viewport frame and by ⟲ and double-click) and
+  **Reset default**, and the camera animation.
 
 ## Asset preview
 

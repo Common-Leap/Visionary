@@ -12,7 +12,7 @@ The node system is still unfinished, so keep backups of your projects.
 
 - **The camera drags the other way round.** Left drag now turns around the fighter, and right
   or middle drag pans. Scroll still zooms, double-click still goes back to the side view, and
-  the new ⟲ button resets the view.
+  the new ⟲ button resets the view. Prefer Blender's buttons? Pick them in Settings.
 - **Project files are now version 8.** 0.3.2 opens projects from every earlier version, but
   0.3.1 and older can't open a project once 0.3.2 has saved it. They say so and ask you to
   update rather than opening it.
@@ -58,16 +58,29 @@ The node system is still unfinished, so keep backups of your projects.
 
 - **Better-looking models.** Elbows, knees and other helper bones now move like they do in game,
   and glow, colour and eye-swap animations play.
-- **Hitboxes in the right place.** Hitboxes, hurtboxes and effects follow helper bones too. Bones
-  that used to snap to the floor (like Mario's jaw) are fixed.
 - **Recolours and shared costumes work.** Costumes that borrow files from other costumes or from
   the base game now load completely, just like they do in game.
 - **Thrown animations.** On throws, the fighter being thrown plays its costume's own thrown
   animation. **Auto** picks the one that matches the throw.
 - **True-to-game size.** Characters that a mod makes bigger or smaller are drawn at that size,
   hitboxes included.
+- **Camera controls from SSBH Studio.** The camera turns around whatever is in the middle of
+  the view, so something you pan to stays put while you orbit. Numpad 1, 3 and 7 look from the
+  front, right and top (with Ctrl, from the other side; 9 flips the view), Home frames the
+  fighter, Period frames the selected hitbox, and the arrow keys pan.
+- **Blender navigation.** In Settings, switch to middle drag to orbit, Shift + middle drag to
+  pan and Ctrl + middle drag to zoom. **Emulate 3 button mouse** lets Alt + left drag stand in
+  for the middle button on a trackpad.
+- **Orientation widget.** Axis balls in the viewport's top right corner show which way you're
+  looking. Click one to look along it, or drag them to orbit. Settings can show a cube with turn
+  arrows instead, or hide it.
+- **World axes.** A red X line and a blue Z line through the origin on the ground show where
+  the fighter starts.
+- **Camera animations.** Pick a camera animation (like a Final Smash camera) in Settings, and
+  the viewport camera plays it along the timeline.
 - **Settings window.** Click the ⚙ gear to change the interface size, background colour, floor
-  grid, bloom, helper bones and camera. Your choices are remembered.
+  grid, world axes, bloom, helper bones and camera, including how close and how far it draws,
+  and save the current view as the one it starts at. Your choices are remembered.
 
 ### Projects and setup
 
@@ -109,18 +122,6 @@ The node system is still unfinished, so keep backups of your projects.
   game dump (with **Open effect file** or **Browse for ef_….eff**).
 - On Windows, the black console window is now hidden unless you turn it on in Settings, and
   builds no longer flash console windows.
-
-### Known limits
-
-- Only a few fighters have been played much: Mario, Cloud, Hero, Joker, Little Mac, Inkling,
-  Steve, Villager, Rosalina, Ice Climbers and Donkey Kong. Most other fighters' mechanics aren't
-  recreated yet.
-- Some effects may not match the game exactly, and throws were only checked roughly.
-- Villager's Lloid Rocket and Steve's minecart aren't drawn in the preview.
-- The borrow window can't yet switch effects played inside a facing check or from an object a
-  move makes (like Mario's fireball). It lists those moves so you can see them.
-- A few rare node blocks (Final Smash cameras, some attack settings) don't update live yet. The
-  top bar names them.
 
 ## 0.3.1
 
@@ -175,6 +176,18 @@ Mostly about effects and the 3D preview.
 - Gimmicks can run on chosen costumes only. Cancel, slow down and remove blocks now do what they
   say, and every block updates live.
 - New characters start from the donor's model and animations.
+
+### Known limits
+
+- Only a few fighters have been played much: Mario, Cloud, Hero, Joker, Little Mac, Inkling,
+  Steve, Villager, Rosalina, Ice Climbers and Donkey Kong. Most other fighters' mechanics aren't
+  recreated yet.
+- Some effects may not match the game exactly, and throws were only checked roughly.
+- Villager's Lloid Rocket and Steve's minecart aren't drawn in the preview.
+- The borrow window can't yet switch effects played inside a facing check or from an object a
+  move makes (like Mario's fireball). It lists those moves so you can see them.
+- A few rare node blocks (Final Smash cameras, some attack settings) don't update live yet. The
+  top bar names them.
 
 ## 0.2.1
 
