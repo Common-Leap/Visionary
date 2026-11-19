@@ -1,13 +1,11 @@
 # Visionary Changelog (v0.3.2)
 
-This fork is now built on Visionary v0.3.1, so everything new there (Move nodes, Gimmicks,
-the Effects page with its character and move pickers, effects drawn in the preview, stages,
-objects and the grab opponent) is included. The notes below are what the fork adds on top.
+This fork is now built on Visionary v0.3.1. **New in 0.3.2** is what this fork adds,
+**New from Visionary 0.2.0 to 0.3.1** is everything the official releases added since the
+fork's last version, and the sections after that are the fork's earlier features.
 
 ## New in 0.3.2
 
-- **Built on Visionary 0.3.1.** Everything in the official 0.3.1 release is here, together
-  with everything this fork adds.
 - **Game version 13.0.5 works too.** The in-game plugin checks whether you're on 13.0.4 or
   13.0.5 and uses the right addresses for it. On any other version it stays off and says so,
   instead of misbehaving.
@@ -24,6 +22,98 @@ objects and the grab opponent) is included. The notes below are what the fork ad
   viewport toolbar. Turn off **Thrown fighter** to hide them.
 - **Project files are now version 8.** Visionary opens projects from the official release and
   from older versions of this fork. Older versions of Visionary can't open a version 8 project.
+
+## New from Visionary 0.2.0 to 0.3.1
+
+The node system is still unfinished upstream, so keep backups of your projects.
+
+### Move nodes
+
+- **A new Move nodes tab.** Pick a move slot and build the move out of blocks, starting empty
+  or from a starter like Quick strike, Heavy hit, Lunge forward and hit, or Shoot a projectile.
+  A 3D preview sits next to the graph, and a panel reads the whole move back in plain words.
+- **If blocks** let a move check things while it runs, like being on the ground, a button
+  being held, or a gimmick value.
+- **Edits update live in the match.** No apply button, restart or export, and new hitboxes
+  don't need you to do the move first. A few rare blocks (Final Smash cameras, some attack
+  settings) aren't live yet; the top bar names them.
+- **Make a move that grabs** with a Go to another action block set to catch. Cancel, slow down
+  and remove blocks do what they say, and there's a Code block. Blocks can show their own code.
+- Every fighter's values from the game are in the block list, so more can be checked and
+  changed from a move.
+- Live move edits stay on the fighter you made them for. Editing Cloud's neutral special no
+  longer changes Joker's too.
+
+### Gimmicks
+
+- **Character gimmicks.** Build rules that run all the time (when you deal or take damage,
+  timers, meters), or start from a ready-made one like extra jumps. Moves can talk to them, and
+  adding a rule makes a gimmick for it if there isn't one.
+- Rules can change fighter resources on a hit: Cloud's Limit, Hero's MP, Joker's Rebel Gauge,
+  Little Mac's KO meter (a full one gives the real KO Uppercut) and Inkling's ink.
+- **Partner control.** Rules can make Nana use her neutral special and change Nana's and Luma's
+  damage. Setting Luma's state to dead removes her.
+- **Steve rules.** Hits can earn materials and upgrade a tool's tier mid-match.
+- Gimmicks can run on chosen costumes only.
+- Fixed Nana's hits being ignored, which made Ice Climbers gimmicks only work some of the time.
+
+### Effects page
+
+- **Edit effects.** Pick an effect, change how it looks and see it in the preview as you edit.
+  Play it alone or in any move that spawns it, and send it to the game when it's connected.
+- **Character and Move pickers** at the top. The move list marks the moves that play the
+  selected effect, and picking a move lists only that move's effects.
+- **Colours** take a picker, a colour code like #FF8800, or exact numbers. The old colour stays
+  as a small swatch you can click to put it back. Each spawn's colour, opacity and rate can be
+  changed from the move too.
+- Each effect file opens again on the effect and part you last had open, and each part keeps
+  its own scroll position.
+- **Borrowing effects** from other files: the borrow window uses plainer words, has a bigger
+  list of effects to replace, can move to another monitor, and no longer slows the app down. A
+  borrowed effect you put in moves is no longer greyed out, the Effects page shows where it
+  came from with a Remove button, and the original stops listing moves you switched away.
+- New effects can be added to moves that have no effect script; the missing function is made
+  in your linked source.
+
+### Preview
+
+- **Effects drawn the way the game draws them**, with its own shaders, textures, glow and
+  colours. They follow the fighter's bones, fade when killed and hide behind the fighter.
+- **The objects a move uses** are shown: projectiles and their flight, boomerangs coming back,
+  held and crafted weapons, items, Link's bow, Inkling's roller and squid, and the opponent in
+  grabs and throws (picked with this fork's **Thrown fighter**).
+- **Weapon swing trails.**
+- **A stage picker.** Moves play on the stage, aerials above the ground and ledge moves on the
+  ledge.
+- The camera follows the fighter, and double-clicking goes back to the side view. Dragging works
+  as in this fork: left drag turns, right or middle drag pans.
+- The preview no longer stutters when picking fighters or moves, and the timeline keeps its
+  height across pages and moves.
+
+### Exporting and the app
+
+- **Exported mods don't need Rust or Visionary.** An exported mod carries the rules you tested
+  live and builds its own plugin named after the mod. Keep only one copy of the plugin
+  installed: add the mod's own plugin.nro to the mod folder. With Rust and the plugin source,
+  it still compiles like before.
+- Live editing, Export mod and Export source code no longer mix files.
+- Moves with no script can be edited, and the script a move really runs is the one loaded.
+- One top bar switches between the Classic editor, Move nodes, Gimmicks, Effects and
+  Characters, and fighters, moves, bones and actions have searchable, grouped pickers.
+- New characters start from the donor's model and animations.
+- Plainer words across the Classic editor, the node screen and block properties.
+- A failed live read no longer makes ARCropolis panic, and the Tools menu closes when you open
+  one of its windows.
+
+### Still rough upstream
+
+- Only a few fighters have been played much: Mario, Cloud, Hero, Joker, Little Mac, Inkling,
+  Steve, Villager, Rosalina, Ice Climbers and Donkey Kong. Most other fighters' mechanics aren't
+  recreated yet.
+- Some effects may not match the game exactly, and throws were only checked roughly.
+- Villager's Lloid Rocket and Steve's minecart aren't drawn in the preview.
+- The borrow window can't yet switch effects played inside a facing check or from an object a
+  move makes (like Mario's fireball). It lists those moves so you can see them.
 
 ## Highlights
 

@@ -6,7 +6,7 @@ Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion
 
 ## New in 0.3.2
 
-- **Visionary v0.3.1 merged** — Move nodes, Gimmicks, the Effects page (with v0.3.1's character and move pickers and edits kept across file switches), effects in the preview, stages, objects and the grab opponent, with this fork's features carried on top
+- **Visionary v0.3.1 merged** — upstream v0.2.0 through v0.3.1, listed in full below, with this fork's features carried on top. Where both changed the same thing, the fork's camera drag controls and its Thrown fighter picker are kept, and upstream's camera follow and double-click reset are added
 - **SSBU 13.0.5** — the plugin detects 13.0.4 or 13.0.5 before installing any hook and reads every main-executable offset from that build's table; any other version leaves it off with a log line. The boot log records `game=` and `loader=`. Upstream's gimmick hooks check the game's own bytes before patching and turn off where they don't match
 - **Ozone** — the four `lua2cpp_common` hooks install once their symbols resolve, never on a null import, so the game boots under Ozone
 - **Source retiming** — moving a hitbox in time in a linked moveset moves its call to the execute block at the new frame (or makes one, splitting a `wait`), then re-parses to check every hitbox's timing. Scripts timed through loops or branches are refused
@@ -16,6 +16,56 @@ Adds per-move frame data, one-click Build & Deploy for linked movesets, a Motion
 - **Execute blocks** — one-line blocks and any agent name (`if macros::is_excute(fighter) { … }`) parse as typed hitboxes and effects, and a `/* … */` comment spanning lines no longer misplaces block ends
 - **Live hitboxes** — a hitbox with a constant Visionary can't resolve waits for a live capture instead of sending a zero
 - **Project version 8** — v1–v3 files and Common-Leap v7 files get their fighter list built from their edits; a fork v4 or v8 file keeps its own. The project loader keeps the fighter list and linked moveset. Builds older than this refuse a v8 file rather than dropping its sections
+
+## From Visionary v0.2.0–v0.3.1
+
+### Move nodes
+- **Move nodes tab** — build a move slot out of blocks, empty or from a starter (Quick strike, Heavy hit, Lunge forward and hit, Shoot a projectile), with a 3D preview beside the graph and a plain-words read-back of the whole move
+- **If blocks** — check being on the ground, a held button or a gimmick value while the move runs
+- **Live updates** — node edits reach the match without apply, restart or export, and new hitboxes don't need the move done first. Rare blocks (Final Smash cameras, hitbox size, reaction time, shake) aren't live yet and are named in the top bar
+- **Actions** — Go to another action set to catch makes a move that grabs; cancel, slow down and remove blocks work; a Code block, and blocks can show their own code. About 45 more game calls update live
+- **Values** — every fighter's game values are in the block list
+- **Fix** — live move edits matched only the move name, so editing Cloud's neutral special also changed Joker's. Edits now stay on their fighter
+- **Fix** — a line in the game's own script blocked every edit to Inkling's jab
+
+### Gimmicks
+- **Character gimmicks** — always-on rules (on dealing or taking damage, timers, meters) or ready-made ones like extra jumps; moves can message them, and adding a rule or Tell a gimmick makes the gimmick when it's missing
+- **Resources on hit** — Cloud's Limit, Hero's MP, Joker's Rebel Gauge, Little Mac's KO meter (a full one gives the real KO Uppercut), Inkling's ink
+- **Partner control** — Nana's neutral special, Nana's and Luma's damage, and Luma's state (dead removes her)
+- **Steve** — hits earn materials and upgrade a tool's tier
+- **Costume scoping** — a gimmick can run on chosen costumes only
+- **Fix** — Nana's hits were ignored, so Ice Climbers gimmicks only worked some of the time
+
+### Effects page
+- **Effect editing** — edit an effect's look with the preview updating as you go; play it alone or in a move that spawns it, and send it to a connected game
+- **Character and Move pickers** — searchable (Enter picks the first match), the move list marks moves that play the selected effect, and picking a move lists only its effects
+- **Colours** — picker, colour code (#FF8800) or exact numbers, with the pre-edit colour as a swatch that restores it; each spawn's colour, opacity and rate can be changed from the move
+- **Kept state** — edits survive switching files, pages and the borrow window (saving no longer writes unedited effects over the project); each file reopens on its last effect and part, and each part keeps its scroll position
+- **Borrowing** — plainer words, a larger replacement list, movable to another monitor, no per-frame rebuild; a borrowed effect used in moves isn't greyed out and can play in them; "Borrowed from" with Remove; the original stops listing moves switched away from it; redirects reach moves whose script name differs from the move name (forward smash)
+- **New spawns in script-less moves** — the missing effect function is made in the linked source
+
+### Preview
+- **Game-accurate effects** — the game's shaders, textures, glow and colours; effects follow bones, fade when killed and are hidden behind the fighter
+- **Objects** — projectiles and their flight, returning boomerangs, held and crafted weapons, items, Link's bow, Inkling's roller and squid, and the grab/throw opponent (driven by the fork's Thrown fighter picker)
+- **Weapon swing trails**
+- **Stage picker** — moves play on the stage, aerials above the ground, ledge moves on the ledge
+- **Camera** — follows the fighter, double-click returns to the side view; drag controls are the fork's
+- **Smoothness** — no stutter when picking fighters or moves; the timeline keeps its height across pages and moves
+
+### Export and app
+- **Self-contained exports** — no Rust or Visionary needed; the mod carries the rules tested live and builds its own plugin named after the mod (install only one plugin copy). With Rust and the plugin source it still compiles
+- **Separate outputs** — live editing, Export mod and Export source code no longer mix files
+- **Script-less moves** — editable, and the script a move really runs is the one loaded
+- **Navigation** — one top bar for Classic editor, Move nodes, Gimmicks, Effects and Characters; searchable, grouped pickers for fighters, moves, bones and actions
+- **New characters** — start from the donor's model and animations
+- **Fixes** — a failed live read no longer panics ARCropolis; the Tools menu closes when one of its windows opens
+
+### Known limits upstream
+- Played mostly on Mario, Cloud, Hero, Joker, Little Mac, Inkling, Steve, Villager, Rosalina, Ice Climbers and Donkey Kong; most other fighters' mechanics aren't recreated
+- A Grab box block alone doesn't catch anyone (use Go to another action → catch); Villager's pocket storing and firing, Steve's mining and tool breaking, and Isabelle are untested
+- Some effects may not match the game exactly; throws were checked only roughly
+- Villager's Lloid Rocket and Steve's minecart aren't drawn
+- The borrow question can't yet switch effects inside a facing check or spawned by an object (Mario's fireball); it lists those moves
 
 ## New features
 
