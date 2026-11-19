@@ -21,6 +21,7 @@ use crate::mod_project::{ParamMod, RosterMod};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RosterTab {
+    Project,
     Library,
     CharacterSelect,
     NewCharacter,
@@ -28,7 +29,8 @@ pub enum RosterTab {
 }
 
 impl RosterTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::Project,
         Self::Library,
         Self::CharacterSelect,
         Self::NewCharacter,
@@ -37,6 +39,7 @@ impl RosterTab {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Project => "This project",
             Self::Library => "Installed mods",
             Self::CharacterSelect => "Character select",
             Self::NewCharacter => "New character",
@@ -46,6 +49,10 @@ impl RosterTab {
 
     fn description(self) -> &'static str {
         match self {
+            Self::Project => {
+                "This project's characters: which parts you changed and which still come from \
+                 the game. Drop model, animation or effect files here to add them."
+            }
             Self::Library => {
                 "Compiled mods Visionary reads fighters, skins, and effects from. Later mods in \
                  the list win any file two mods both provide."
@@ -67,6 +74,7 @@ impl RosterTab {
 
     fn badge_count(self, window: &RosterWindow) -> Option<usize> {
         match self {
+            Self::Project => None,
             Self::Library => {
                 let conflicts = window
                     .library
@@ -234,7 +242,7 @@ impl Default for RosterWindow {
             behavior_layouts: Default::default(),
             controller_charts: Default::default(),
             meters: Default::default(),
-            tab: RosterTab::Library,
+            tab: RosterTab::Project,
             status: String::new(),
             import: None,
             notes: Vec::new(),
@@ -539,8 +547,14 @@ impl RosterWindow {
     }
 
     /// The Characters page, drawn in the main window.
-    pub fn page(&mut self, ui: &mut Ui) {
+    /// Draw the page; true when "This project" is showing, which the app draws below.
+    pub fn page(&mut self, ui: &mut Ui) -> bool {
         self.ui_contents(ui);
+        self.tab == RosterTab::Project
+    }
+
+    pub fn focus_project(&mut self) {
+        self.tab = RosterTab::Project;
     }
 
     fn ui_contents(&mut self, ui: &mut Ui) {
@@ -562,6 +576,9 @@ impl RosterWindow {
         // are the focus, not this.
         self.draw_top_bar(ui);
         ui.add_space(8.0);
+        if self.tab == RosterTab::Project {
+            return;
+        }
 
         // Content — one outer vertical scroll. Horizontal scrolling lives
         // inside the CSS grid only; the traits tab draws into this scroll
@@ -578,6 +595,7 @@ impl RosterWindow {
                     .show(ui, |ui| {
                         ui.set_max_width((ui.available_width() - 4.0).max(400.0));
                         match self.tab {
+                            RosterTab::Project => {}
                             RosterTab::Library => self.draw_library(ui),
                             RosterTab::CharacterSelect => {
                                 let roots = self.roots.clone();
