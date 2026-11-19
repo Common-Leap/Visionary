@@ -50,6 +50,9 @@ pub fn blender_drag(modifiers: egui::Modifiers) -> NavDrag {
 /// own (so drags start in it and overlays on top of it are left alone) and `keyboard` says
 /// whether keys may move the camera: the pointer is over the viewport and no text field has
 /// focus. Returns whether the camera moved, and any framing the keys asked for.
+///
+/// `input` must be a copy taken outside `Context::input`: `response`'s drag checks lock the
+/// input again, and calling this inside an input closure can hang the app mid-drag.
 pub fn navigate(
     camera: &mut Camera,
     response: &egui::Response,

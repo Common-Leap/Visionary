@@ -11408,17 +11408,18 @@ impl VisionaryApp {
                     };
                     let keyboard = response.hovered() && !ctx.egui_wants_keyboard_input();
                     let nav_drag = &mut self.nav_drag;
-                    let (mut moved, frame_request) = ui.input(|input| {
-                        crate::viewport_navigation::navigate(
-                            &mut rs.camera,
-                            &response,
-                            input,
-                            controls,
-                            h,
-                            nav_drag,
-                            keyboard,
-                        )
-                    });
+                    // A copy, not a closure: the drag checks on `response` read the input
+                    // themselves, and doing that inside `ui.input` can deadlock.
+                    let input = ui.input(|input| input.clone());
+                    let (mut moved, frame_request) = crate::viewport_navigation::navigate(
+                        &mut rs.camera,
+                        &response,
+                        &input,
+                        controls,
+                        h,
+                        nav_drag,
+                        keyboard,
+                    );
                     // Double-click: back to the default angle, keeping the zoom.
                     if response.double_clicked() {
                         rs.camera.reset_turn(&home);
