@@ -694,6 +694,8 @@ fn rename_carrier_texture(path: &Path, name: &str) -> anyhow::Result<()> {
 #[derive(Debug, Clone)]
 pub struct CarrierBundle {
     pub files: Vec<WorkspaceAssetFile>,
+    /// Animations the game files lack, played still in the preview.
+    pub still_animations: usize,
     pub vanilla_motion_used: Vec<String>,
     pub omitted_swing: bool,
     pub stripped_lod_meshes: usize,
@@ -928,7 +930,17 @@ pub fn prepare_carrier_assets(
         validate_animation_bones(model_animation, &skeleton_bones, "model.nuanmb")?;
     }
 
-    let prepared_motions = crate::carrier_motion::prepare(&motion_files)?;
+    std::fs::create_dir_all(output_dir)?;
+    let still = output_dir.join("visionary_still.nuanmb");
+    AnimData {
+        major_version: 2,
+        minor_version: 1,
+        final_frame_index: 0.0,
+        groups: Vec::new(),
+    }
+    .write_to_file(&still)
+    .map_err(|error| anyhow::anyhow!("writing a still animation: {error}"))?;
+    let prepared_motions = crate::carrier_motion::prepare(&motion_files, Some(&still))?;
     for (name, path) in &prepared_motions.files {
         checked_asset_size(path, name)?;
         if workspace_motion.values().any(|source| source == path) {
@@ -1146,6 +1158,7 @@ pub fn prepare_carrier_assets(
     outputs.sort_by(|left, right| left.game_path.cmp(&right.game_path));
     Ok(CarrierBundle {
         files: outputs,
+        still_animations: prepared_motions.stand_ins,
         vanilla_motion_used,
         omitted_swing,
         stripped_lod_meshes,

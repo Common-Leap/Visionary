@@ -19748,6 +19748,7 @@ impl VisionaryApp {
         };
         let crate::project_hub::CarrierBundle {
             files: staged,
+            still_animations,
             vanilla_motion_used,
             omitted_swing,
             stripped_lod_meshes,
@@ -19793,6 +19794,11 @@ impl VisionaryApp {
                 }
                 if omitted_swing {
                     notes.push("no swing.prc on this fighter".to_owned());
+                }
+                if still_animations > 0 {
+                    notes.push(format!(
+                        "{still_animations} animation(s) the game files lack stand still"
+                    ));
                 }
                 if stripped_lod_meshes > 0 {
                     notes.push(format!(
