@@ -896,7 +896,7 @@ impl RosterWindow {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .small_button(RichText::new(" ✕ ").small())
+                                .small_button(RichText::new("Remove").small())
                                 .on_hover_text("Remove this mod from the library")
                                 .clicked()
                             {
@@ -1048,7 +1048,7 @@ impl RosterWindow {
         let total: usize = by_fighter.values().map(|list| list.len()).sum();
         if total == 0 {
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(130, 225, 150), "✓");
+                ui.colored_label(Color32::from_rgb(130, 225, 150), "●");
                 ui.label(
                     RichText::new("No file conflicts between enabled mods.")
                         .small()

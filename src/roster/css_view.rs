@@ -1003,7 +1003,7 @@ impl CssView {
             painter.text(
                 egui::pos2(rect.max.x - 5.0 * zoom, rect.max.y - 5.0 * zoom),
                 egui::Align2::RIGHT_BOTTOM,
-                "✓",
+                "●",
                 egui::FontId::proportional(9.0 * zoom),
                 Color32::WHITE,
             );
@@ -2268,7 +2268,7 @@ impl CssView {
                     .desired_width(130.0)
                     .hint_text("Find a character…"),
             );
-            if !self.bulk_filter.is_empty() && ui.small_button(RichText::new("✕").small()).clicked()
+            if !self.bulk_filter.is_empty() && ui.small_button(RichText::new("x").small()).clicked()
             {
                 self.bulk_filter.clear();
                 resp.request_focus();
@@ -2367,7 +2367,7 @@ impl CssView {
                         .hint_text("Find a character…"),
                 );
                 if !self.off_roster_filter.is_empty()
-                    && ui.small_button(RichText::new("✕").small()).clicked()
+                    && ui.small_button(RichText::new("x").small()).clicked()
                 {
                     self.off_roster_filter.clear();
                     resp.request_focus();

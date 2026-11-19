@@ -370,7 +370,7 @@ impl NewCharacterView {
         } else {
             ui.colored_label(
                 Color32::from_rgb(130, 225, 150),
-                RichText::new(format!("✓ c{:02}…c{:02} all free", range.0, range.1)).small(),
+                RichText::new(format!("c{:02}…c{:02} all free", range.0, range.1)).small(),
             );
         }
 
@@ -740,7 +740,7 @@ impl NewCharacterView {
                 ui.horizontal_wrapped(|ui| {
                     chip(
                         ui,
-                        format!("{} Files", if files_done { "✓" } else { "○" }),
+                        format!("{} Files", if files_done { "●" } else { "◇" }),
                         files_done,
                     );
                     ui.label(RichText::new("→").small().weak());
@@ -748,15 +748,15 @@ impl NewCharacterView {
                         ui,
                         format!(
                             "{} Moves {moves_done_count}/{}",
-                            if moves_done { "✓" } else { "○" },
+                            if moves_done { "●" } else { "◇" },
                             scaffold::MOVESET_TEMPLATE.len()
                         ),
                         moves_done,
                     );
                     ui.label(RichText::new("→").small().weak());
-                    chip(ui, format!("{} Look", if look_done { "✓" } else { "○" }), look_done);
+                    chip(ui, format!("{} Look", if look_done { "●" } else { "◇" }), look_done);
                     ui.label(RichText::new("→").small().weak());
-                    chip(ui, format!("{} Ship", if ready { "✓" } else { "○" }), ready);
+                    chip(ui, format!("{} Ship", if ready { "●" } else { "◇" }), ready);
                 });
                 ui.add_space(2.0);
                 if !files_done {
@@ -971,7 +971,7 @@ impl NewCharacterView {
         if readiness.is_ready() {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("✓")
+                    RichText::new("●")
                         .small()
                         .color(Color32::from_rgb(130, 225, 150)),
                 );
@@ -1351,7 +1351,7 @@ fn file_row(
     let mut ask = None;
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new(if done { "✓" } else { "○" })
+            RichText::new(if done { "●" } else { "◇" })
                 .small()
                 .strong()
                 .color(if done {
