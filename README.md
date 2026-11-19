@@ -2,7 +2,7 @@
 
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
-This is joobert's fork of Visionary. It is based on upstream `v0.3.0`, and what it adds on top is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list).
+What changed is written up three ways: [CHANGELOG.md](CHANGELOG.md) (patch notes for every release), [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md) (features and fixes in more depth) and [CHANGELOG_fr.md](CHANGELOG_fr.md) (the full technical list for the latest release).
 
 ## Components
 

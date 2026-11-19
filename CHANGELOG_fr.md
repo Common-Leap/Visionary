@@ -1,50 +1,42 @@
 # Changelog
 
-Changes in this fork (joobert/Visionary) relative to upstream Visionary by Common Leap.
+Everything Visionary 0.3.2 changes relative to 0.3.1, in full technical detail. Entries cover
+what is new and, where 0.3.1 already had something, how it now behaves differently.
+For plain-language patch notes and the earlier releases, see [CHANGELOG.md](CHANGELOG.md); for
+a middle ground, see [CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
 
-The fork branched from upstream tag **`v0.1.2`** (`e7df465`, "Autosave project edits and
-harden effect/hitbox source sync", 2026-09-17) and has since merged upstream **`v0.3.0`** and **`v0.3.1`**.
-Everything below is what the fork adds; where the merge changed one of these, the entry says
-so.
-For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle ground, see
-[CHANGELOG_DETAILED.md](CHANGELOG_DETAILED.md).
+## Changed from 0.3.1
 
-## 0.3.2: merging upstream v0.3.0 and v0.3.1
+- **Camera.** Left drag orbits and right or middle drag pans (0.3.1 panned on left drag and
+  orbited on right or middle). The camera still follows the fighter, double-click still turns
+  back to the side view, and ⟲ resets the whole view.
+- **Grab and throw opponent.** The **Thrown fighter** picker chooses the fighter and costume
+  the opponent shows in grabs and throws, hung by the hip as before. It is on by default, and
+  the victim's own scale is not applied. When the picked costume has no model or motion it
+  falls back to Mario, then the fighter itself.
+- **Execute blocks.** 0.3.1 recognised `if macros::is_excute(agent) {` exactly. One-line blocks
+  and any agent name are now accepted too, so those movesets keep typed hitboxes and effects.
+  The lexical block-end search mapped byte offsets back to lines by counting `\n`, which
+  drifted after a `/* … */` comment spanning lines; it now maps offsets to the line entries.
+- **Grab clears.** `grab!(…GRAB_CLEAR_ALL)` stays a `NativeCall` and is kept as written on
+  export; the timeline still ends grab boxes on it.
+- **Live injection.** A hitbox whose constants don't resolve waits for a capture rather than
+  sending a zero. Effects keep the capture-free path.
+- **Project version.** `PROJECT_VERSION` is 8 (was 7). v8 adds `project_fighters` and
+  `moveset_source` (see Project fighters below). v1–v3 and v7 files are seeded with project
+  fighters from their edits; v4 files, written only by development builds, and v8 files keep
+  their own list. The legacy loader (`legacy_move_triggers`) passes both fields through. 0.3.1
+  refuses a v8 file with its "Update Visionary" error.
+- **Effects page pickers.** The Character picker keys rows by `name` plus `custom_name`, since a
+  slot character (below) is its own row with its base fighter's name. `load_needing_edits`
+  returns `eff_game_rel` like `loaded_rel`, so an eff opened from outside the dump is handed its
+  edits by the game path the project records.
 
-- **Merge.** Upstream `v0.3.0` (Move nodes, Gimmicks, the Effects page, effect drawing in the
-  preview, stages, objects, the grab/throw opponent) is merged. Where both sides changed the
-  same thing:
-  - *Camera:* the fork's controls (left drag orbits, right or middle drag pans, ⟲ resets),
-    plus upstream's camera following the fighter and double-click back to the side view.
-  - *Thrown fighter:* the fork's picker drives upstream's opponent in grabs and throws, instead
-    of a separate model placed through the `rot` bone. It is on by default, and the victim's own
-    scale is not applied. When the picked costume has no model or motion it falls back to
-    Mario, then the fighter itself.
-  - *Execute blocks:* upstream recognises `if macros::is_excute(agent) {` exactly. The fork also
-    accepts one-line blocks and any agent name, so those movesets keep typed hitboxes and
-    effects. Upstream's lexical block-end search mapped byte offsets back to lines by counting
-    `\n`, which drifted after a `/* … */` comment spanning lines; it now maps offsets to the
-    line entries.
-  - *Grab clears:* `grab!(…GRAB_CLEAR_ALL)` stays a `NativeCall` and is kept as written on
-    export; the timeline still ends grab boxes on it.
-  - *Live injection:* a hitbox whose constants don't resolve still waits for a capture rather
-    than sending a zero. For effects, upstream's capture-free path is used.
-  - *Project version:* `PROJECT_VERSION` is 8. Upstream went from v3 to v7, so v4 only comes
-    from the fork. v1–v3 and v7 files are seeded with project fighters from their edits; v4 and
-    v8 files keep their own list. Upstream's legacy loader (`legacy_move_triggers`) dropped
-    `project_fighters` and `moveset_source`; it now passes them through.
-  - *ssbh_wgpu:* the fork depends on `joobert/ssbh_wgpu` rev `6702cb4`, built on Common-Leap's
-    fork with two commits: `ModelFolder::load_files` (costume file lists) and the skeleton edit
-    hook in `apply_anims_with_skel_edit` (fighter scale at the root bones).
-- **v0.3.1.** Upstream's two Effects page commits (edits carried across file and page
-  switches, character and move pickers, borrowed uses that follow redirects) merged without
-  conflict. Two fits on top: the character picker keys rows by `name` plus `custom_name`,
-  since a mod character on a fighter's slots is its own row with that fighter's name; and
-  `load_needing_edits` returns `eff_game_rel` like `loaded_rel`, so an eff opened from outside
-  the dump is handed its edits by the game path the project records.
+## Game versions and loaders
+
 - **SSBU 13.0.5.** `offsets.rs` holds each main-executable offset for 13.0.4 and 13.0.5. The
   plugin detects the build before installing any hook and stays off on any other version. The
-  boot log records `game=`, `loader=` and `copy=`. Upstream's gimmick hooks (damage capture and
+  boot log records `game=`, `loader=` and `copy=`. The gimmick hooks (damage capture and
   commit, incoming hit, cloud resource, live parameters) check the game's bytes or digests
   before patching, so on 13.0.5 they turn off rather than patch the wrong address.
 - **Ozone.** The coroutine and `L2CFighterAnimcmdEffectCommon` hooks resolve their target
@@ -52,6 +44,9 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   loads, never on a null address. Ozone binds imports immediately and aborted on the old
   null import. The plugin builds against the smashline branch with PR 87 merged (`137aeb7`;
   the earlier `c510441` was force-pushed away).
+
+## Timing edits in linked source
+
 - **Source retiming** (`source_timing.rs`). Moving a hitbox in time in a linked moveset
   moves its call to the execute block at the new frame, or makes one by splitting a `wait`,
   and re-parses the result to check every hitbox's timing. Scripts timed through loops or
@@ -63,15 +58,20 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   `StatusLine::Main` callback and fires effects retimed, added or stopped on frames no ACMD
   `frame`/`wait` reaches, on the first tick at or past the target (motion rates can step over
   the ±0.5 window). The shared latch makes it a no-op for a target a boundary already fired.
-- **Effect export.** An eff opened from outside the eff root was recorded by its absolute
-  path, and export's `mod_dir.join` then overwrote the user's file. It is now recorded by its
-  game path (from its `effect/` folder or `ef_<fighter>.eff` name), old absolute sources are
-  rewritten on load, and export refuses any `source_rel` that is still not a game path.
-- **Fixes in the merged build.** The stage picker and the viewport toolbar were both drawn in
-  the viewport's top-left corner. The picker now sits under the toolbar, and the Effects page's
-  view switch moves down when the toolbar reaches it. Six string literals had a lost line
-  continuation, leaving a run of spaces in their text. The source-reading tests fold CRLF, so
-  they pass on a Windows checkout.
+
+## Effect export
+
+- An eff opened from outside the eff root (**Open effect file**, **Browse for ef_….eff**) was
+  recorded by its absolute path, and export's `mod_dir.join` then overwrote the user's file. It
+  is now recorded by its game path (from its `effect/` folder or `ef_<fighter>.eff` name), old
+  absolute sources are rewritten on load, and export refuses any `source_rel` that is still not
+  a game path.
+- The live carrier's vanilla folder (`vanilla_root`, **Vanilla game files** on the Effects
+  page) is remembered apart from the eff root; see Emulator and live preview.
+
+## Tests
+
+- The source-reading tests fold CRLF, so they pass on a Windows checkout.
 
 ## Moveset source (ACMD Source window)
 
@@ -140,11 +140,10 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   `config.json` `share-to-vanilla` / `share-to-added` entry (followed through chains), then the
   vanilla dump. Model, weapon skeletons, move-list animations, eyelid animation and motion list
   all use it. A toolbar note lists borrowed files and their sources.
-- **Thrown fighter.** Picks the fighter and costume slot upstream's grab/throw opponent shows
+- **Thrown fighter.** Picks the fighter and costume slot the grab/throw opponent shows
   (Mario by default, or any indexed or vanilla fighter); on throws it plays that costume's
-  thrown animation. **Auto** matches the throw direction or the thrower's own thrown set.
-  Since the v0.3.0 merge it drives upstream's opponent (hung by the hip, also in grabs) instead
-  of a separate model placed through the `rot` bone, and the victim's own scale is not applied.
+  thrown animation. **Auto** matches the throw direction or the thrower's own thrown set. See
+  Changed from 0.3.1 for how it drives the opponent.
 - **Game scale.** Fighters are drawn at the scale the game gives them: `fighter_param` scale or a
   `param_config` override, then `ModelModule::set_scale`, `AttackModule::set_attack_scale` and
   `GrabModule::set_size_mul` read from the moveset's `on_line` callback (through helpers,
@@ -152,7 +151,7 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   toolbar label shows each value and where it came from.
 - **Camera like SSBH Editor.** Left drag orbits, right or middle drag pans with the model
   following the pointer, scroll zooms. A reset button beside the gear returns to the default
-  side view.
+  side view. This swaps 0.3.1's drag buttons; see Changed from 0.3.1.
 - **Settings window.** The gear opens **Settings**, saved to `preferences.json` in the config
   directory: show console window, interface scale (kept in step with Ctrl +/-), viewport
   background colour (SSBH Editor's dark grey by default), floor grid, bloom, helper bones, and a
@@ -187,19 +186,19 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
   (internal name plus the character name for slot characters). Right-click Add to / Remove
   from project (with the reason when a rule keeps it in), an **Add fighter…** picker, and a
   fighter picker in New Project. Import Mod as Project seeds the imported fighters.
-- **`modproject.json` v4.** `project_fighters: BTreeSet<ProjectFighter>` (`name` plus optional `character`) and `moveset_source: Option<String>`,
-  both `#[serde(default)]`; v1-v3 still load. `migrate()` seeds a v1-v3 project's
-  `project_fighters` from edited fighters and authored `RosterMod` entries; a v4 file's list is
-  kept as saved. `moveset_source` is relative to the workspace when
+- **`modproject.json` v8.** `project_fighters: BTreeSet<ProjectFighter>` (`name` plus
+  optional `character`) and `moveset_source: Option<String>`, both `#[serde(default)]`; every
+  earlier version still loads. `migrate()` seeds a v1–v3 or v7 project's `project_fighters`
+  from edited fighters and authored `RosterMod` entries; a v4 or v8 file's list is kept as
+  saved. `moveset_source` is relative to the workspace when
   the crate is inside it, absolute otherwise; Save As re-expresses it for the new location.
   Distribution copies never carry an absolute `moveset_source`.
 - **Project `romfs/` as an index root.** It overrides the dump and reference mods for any file
   it provides, in the fighter list and in previews (models, motions, params, icons). Effects
   are not overlaid (`apply_romfs_overlay` leaves `effect_dir` alone and `reindex_fighters`
-  looks for effect folders in the shared roots only): the eff editor's saved `source_rel`
-  falls back to an absolute path outside the dump, and export would write it back over the
-  romfs file. Between
-  the dump and reference mods the first-root-wins rule is unchanged.
+  looks for effect folders in the shared roots only), so effect edits keep resolving against
+  the dump and an export never writes over a romfs file. Between the dump and reference mods
+  the first-root-wins rule is unchanged.
 - **Per-project moveset link.** Opening a project re-links its crate. Linking with a project
   open writes the project only; the global `acmd_source` changes only in Browse without
   project. A project with no link shows "not linked" with a one-click "Use <global crate>".
@@ -219,8 +218,8 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
 
 - SD detection also probes sudachi, suyu, citron and torzu, and picks the SD root the game wrote
   to most recently instead of the first one found.
-- The live effect carrier is built from a separate **Vanilla dump** root (set in the Eff Editor)
-  rather than the eff root, resolving the carrier base and each donor per file across roots.
+- The live effect carrier is built from a separate vanilla root (**Vanilla game files** on the
+  Effects page) rather than the eff root, resolving the carrier base and each donor per file across roots.
   When the carrier can't be built, the send indicator stops immediately with the reason instead
   of timing out.
 
@@ -240,10 +239,11 @@ For plain-language patch notes, see [CHANGELOG.md](CHANGELOG.md); for a middle g
 
 ## Dependencies
 
-- `ssbh_wgpu` moved from ScanMountGoat's upstream (`f7bfb4b`) to
-  [joobert/ssbh_wgpu](https://github.com/joobert/ssbh_wgpu) (`592d0d1`), which adds
-  `ModelFolder::load_files` (models from files in different folders) and
-  `apply_anims_with_skel_edit` (the thrown-fighter placement).
+- `ssbh_wgpu` moved from [Common-Leap/ssbh_wgpu](https://github.com/Common-Leap/ssbh_wgpu)
+  (`c7ccdb4`) to [joobert/ssbh_wgpu](https://github.com/joobert/ssbh_wgpu) (`6702cb4`), which is
+  `c7ccdb4` plus two commits: `ModelFolder::load_files` (costume models from files in different
+  folders) and the skeleton edit hook in `apply_anims_with_skel_edit` (fighter scale at the
+  root bones).
 - Added `serde_yaml` for `motion_list.yml`.
 
 ## Tooling and docs
