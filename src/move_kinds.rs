@@ -178,8 +178,15 @@ pub fn group_of(name: &str) -> MoveGroup {
 
     // Before the `special` arms: a copied special is `<donor>_special_*`, and testing for
     // `contains("special")` first would file every one of them under Specials.
+    // Every fighter also has `fall_special` (helpless fall) and reactions to being caught by
+    // someone else's special (`shizue_special_s_thrown_f`, `jack_special_hi_pulled`); neither is
+    // a copy, and on Mario they were the whole group.
     if let Some(rest) = n.split_once("_special") {
-        if !n.starts_with("special") && !rest.0.is_empty() && !n.starts_with("item_") {
+        if n.contains("_thrown") || n.contains("_pulled") {
+            return MoveGroup::Damage;
+        }
+        let own = n.starts_with("special") || n.starts_with("item_") || n.starts_with("fall");
+        if !own && !n.starts_with("landing") && !rest.0.is_empty() {
             return MoveGroup::CopySpecial;
         }
     }
@@ -448,6 +455,12 @@ mod tests {
         assert_eq!(group_of("cloud_special_n"), MoveGroup::CopySpecial);
         assert_eq!(group_of("cloud_special_air_n"), MoveGroup::CopySpecial);
         assert_eq!(group_of("special_n_start"), MoveGroup::Special);
+        // Mario's whole "copied specials" group was these: his own helpless fall, and being
+        // caught by Isabelle's or Joker's special.
+        assert_eq!(group_of("fall_special_b"), MoveGroup::JumpLand);
+        assert_eq!(group_of("landing_fall_special"), MoveGroup::JumpLand);
+        assert_eq!(group_of("shizue_special_s_thrown_f_big"), MoveGroup::Damage);
+        assert_eq!(group_of("jack_special_hi_pulled"), MoveGroup::Damage);
         // An item's flag-hoisting "special" is not a copy ability.
         assert_eq!(group_of("item_special_flag_hoist"), MoveGroup::Item);
         // Weapon movesets before `item_`, and before Movement for the `_dash` ones.

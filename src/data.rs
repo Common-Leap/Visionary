@@ -1091,11 +1091,11 @@ impl HurtboxStatus {
     /// "intangible" while another calls it "XLU".
     pub(crate) fn label(self) -> String {
         match self {
-            Self::Normal => "NORMAL".to_string(),
-            Self::Invincible => "INVINCIBLE".to_string(),
-            Self::Xlu => "XLU (INTANGIBLE)".to_string(),
-            Self::Off => "OFF".to_string(),
-            Self::Unknown(raw) => format!("UNKNOWN ({raw:#x})"),
+            Self::Normal => "normal".to_string(),
+            Self::Invincible => "invincible".to_string(),
+            Self::Xlu => "intangible".to_string(),
+            Self::Off => "off".to_string(),
+            Self::Unknown(raw) => format!("unknown ({raw:#x})"),
         }
     }
 
@@ -10729,11 +10729,11 @@ mod tests {
 
     #[test]
     fn hurtbox_status_labels_are_explicit_and_unknown_values_are_not_guessed() {
-        assert_eq!(HurtboxStatus::Normal.label(), "NORMAL");
-        assert_eq!(HurtboxStatus::Invincible.label(), "INVINCIBLE");
-        assert_eq!(HurtboxStatus::Xlu.label(), "XLU (INTANGIBLE)");
-        assert_eq!(HurtboxStatus::Off.label(), "OFF");
-        assert_eq!(HurtboxStatus::Unknown(7).label(), "UNKNOWN (0x7)");
+        assert_eq!(HurtboxStatus::Normal.label(), "normal");
+        assert_eq!(HurtboxStatus::Invincible.label(), "invincible");
+        assert_eq!(HurtboxStatus::Xlu.label(), "intangible");
+        assert_eq!(HurtboxStatus::Off.label(), "off");
+        assert_eq!(HurtboxStatus::Unknown(7).label(), "unknown (0x7)");
         assert_eq!(HurtboxStatus::Unknown(7).source_token(), None);
     }
 

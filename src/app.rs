@@ -455,7 +455,7 @@ enum PrimaryEditorTab {
 impl PrimaryEditorTab {
     fn title(self) -> &'static str {
         match self {
-            Self::Collisions => "Collisions",
+            Self::Collisions => "Hitboxes",
             Self::Hurtboxes => "Hurtboxes",
             Self::MotionState => "Motion & state",
             Self::AudioFeedback => "Sound & feedback",
@@ -468,16 +468,16 @@ impl PrimaryEditorTab {
     fn description(self) -> &'static str {
         match self {
             Self::Collisions => {
-                "Attack, grab, detection, wind, throw-damage, and active-hitbox commands for the selected move."
+                "Hitboxes, grab boxes, wind boxes and the other boxes this move uses to touch opponents."
             }
             Self::Hurtboxes => {
-                "Parameter-defined hurtbox capsules, intangibility, invincibility, OFF states, and damage-reaction armor for the selected move."
+                "Where this fighter can be hit during the move: invincibility, intangibility and armor."
             }
             Self::MotionState => {
-                "Facing, velocity, kinetic, animation-timing, ground/air, and stored script-state commands from the move's game_ script."
+                "Facing, speed, movement, animation speed, ground or air, and the switches the move turns on and off."
             }
             Self::AudioFeedback => {
-                "Sounds plus camera shake, controller rumble, and the supported animation controls from the move's sound_ and expression_ scripts."
+                "Sounds, camera shake, controller rumble and face or hand animations for this move."
             }
             Self::Effects => VISUAL_EFFECTS_DESCRIPTION,
             Self::Nodes => "Timed move nodes and named custom triggers sharing character gimmick state. Import, edit and apply complete scripts without flattening source branches.",
@@ -486,8 +486,20 @@ impl PrimaryEditorTab {
     }
 }
 
+/// Said when some edits can reach the running game only after it has played the move once.
+fn live_limit_status(waiting: usize) -> String {
+    format!(
+        "Changed. {waiting} of these changes reach the running game after it plays the move \
+         once while connected; export keeps them all."
+    )
+}
+
+/// Said after an edit the export writes into the mod.
+const EDIT_KEPT: &str =
+    "Changed. The game picks it up right away when connected; export the mod to keep it.";
+
 const VISUAL_EFFECTS_DESCRIPTION: &str =
-    "Particle spawns, trails, model or screen colour changes, and effect-control commands from the selected move's effect_ script.";
+    "Particles, trails, colour flashes and other visual effects for this move.";
 const WORK_FLAGS_DESCRIPTION: &str =
     "Work flags are named on/off switches stored by the game for this fighter. Move and status scripts use them to remember or signal conditions such as enabling a combo or marking a move phase; the flag's authored name identifies its exact purpose.";
 
@@ -696,8 +708,6 @@ struct PointSection<'a, C> {
     description: &'a str,
     color: Color32,
     command: &'a str,
-    /// Names the family in the "edit staged" status line.
-    label: &'a str,
     stmt: fn(&mut crate::data::AcmdScript, usize) -> Option<&mut C>,
     push: fn(&mut VisionaryApp),
 }
@@ -714,6 +724,12 @@ fn drag_pair(ui: &mut Ui, a: &mut f32, b: &mut f32, [prefix_a, prefix_b]: [&str;
 }
 
 /// A single-line authored-token editor; whether it changed to a non-empty token.
+/// "Frame 4: Turn on "next jab allowed"", the way the timeline names the same call.
+fn point_words(ui: &mut Ui, frame: u32, func: &str, token: &str) {
+    let words = crate::move_nodes::plain::call_words(func, &[token.to_string()]);
+    ui.label(format!("Frame {frame}: {words}"));
+}
+
 fn token_edit(ui: &mut Ui, token: &mut String, width: f32, hint: &str) -> bool {
     let edit = egui::TextEdit::singleline(token)
         .desired_width(width)
@@ -785,7 +801,7 @@ enum TimelineCategory {
 impl TimelineCategory {
     fn title(self) -> &'static str {
         match self {
-            Self::Collisions => "Collisions",
+            Self::Collisions => "Hitboxes",
             Self::Hurtboxes => "Hurtboxes",
             Self::Effects => "Visual effects",
             Self::MotionState => "Motion & state",
@@ -796,17 +812,17 @@ impl TimelineCategory {
     fn description(self) -> &'static str {
         match self {
             Self::Collisions => {
-                "Show or hide attack, grab, detection, wind, throw-damage, and active-hitbox events on the timeline."
+                "Show or hide hitbox, grab box and wind box rows on the timeline."
             }
             Self::Hurtboxes => {
-                "Show or hide hurtbox status, intangibility, invincibility, reset, and damage-reaction armor events on the timeline."
+                "Show or hide invincibility, intangibility and armor rows on the timeline."
             }
-            Self::Effects => "Show or hide visual-effect and effect-control events on the timeline.",
+            Self::Effects => "Show or hide visual effect rows on the timeline.",
             Self::MotionState => {
-                "Show or hide movement, kinetic, animation-timing, and stored state events on the timeline."
+                "Show or hide movement, animation speed and switch rows on the timeline."
             }
             Self::AudioFeedback => {
-                "Show or hide sound, camera, rumble, and expression animation events on the timeline."
+                "Show or hide sound, camera, rumble and face animation rows on the timeline."
             }
         }
     }
@@ -833,13 +849,9 @@ mod editor_section_copy_tests {
             assert!(category.description().split_whitespace().count() >= 8);
         }
         assert_eq!(PrimaryEditorTab::Hurtboxes.title(), "Hurtboxes");
-        assert!(PrimaryEditorTab::Hurtboxes
-            .description()
-            .contains("damage-reaction armor"));
+        assert!(PrimaryEditorTab::Hurtboxes.description().contains("armor"));
         assert_eq!(TimelineCategory::Hurtboxes.title(), "Hurtboxes");
-        assert!(TimelineCategory::Hurtboxes
-            .description()
-            .contains("damage-reaction armor"));
+        assert!(TimelineCategory::Hurtboxes.description().contains("armor"));
         assert_eq!(TimelineCategory::Effects.title(), "Visual effects");
     }
 
@@ -1085,7 +1097,6 @@ fn sound_words(id: &str) -> String {
     rest.replace('_', " ")
 }
 
-/// An effect name as words: `sys_attack_line` reads "Attack line", `mario_fb_shoot` "Fb shoot".
 /// The live check for a spawn in one arm of the script's facing test.
 fn facing_live_guard(ec: &crate::data::EffectCall) -> Option<crate::game_link::LiveGuard> {
     use crate::game_link::LiveGuard;
@@ -1098,6 +1109,7 @@ fn facing_live_guard(ec: &crate::data::EffectCall) -> Option<crate::game_link::L
     })
 }
 
+/// An effect name as words: `sys_attack_line` reads "Attack line", `mario_fb_shoot` "Fb shoot".
 fn effect_words(name: &str) -> String {
     if let Some((name, facing)) = name.split_once(" (facing ") {
         return format!("{} (facing {facing}", effect_words(name));
@@ -2166,7 +2178,7 @@ fn angle_picker(ui: &mut egui::Ui, angle: &mut i32) {
     // Description for special angles
     if is_special {
         let desc = match *angle {
-            361 => "Horizontal at low KB, diagonal at high KB",
+            361 => "Sideways when knockback is low, diagonal when high",
             363 => "Matches attacker movement, no speed mod",
             365 => "Matches attacker movement, 50% speed",
             366 => "Pull + momentum, no speed cap",
@@ -3855,9 +3867,9 @@ macro_rules! point_capture_fns {
 /// category, the status label, and what an unrepresentable point needs.
 macro_rules! point_rule_pushers {
     ($($name:ident: $key:literal, $rules_for:ident, $pristine:ident, $events:ident,
-        $limit:literal, $label:literal, $need:literal;)*) => {$(
+        $limit:literal;)*) => {$(
         fn $name(&mut self) {
-            let limits = Some(($limit, $label, $need));
+            let limits = Some($limit);
             self.push_point_rules($key, limits, |app, motion| {
                 let captures = app.captures_for_selected_fighter(motion);
                 let shown = app.state.script.$events();
@@ -7590,7 +7602,7 @@ impl VisionaryApp {
                         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 65, 85)))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("⧉  Roster").small().strong().color(Color32::from_rgb(160, 200, 240)));
+                                ui.label(RichText::new("Roster").small().strong().color(Color32::from_rgb(160, 200, 240)));
                                 ui.label(
                                     RichText::new(format!(
                                         "{total} edit{}",
@@ -10083,7 +10095,7 @@ impl VisionaryApp {
                                     ui.painter().text(
                                         label_pos + egui::vec2(5.0, -5.0),
                                         egui::Align2::LEFT_BOTTOM,
-                                        format!("HIT_NO #{} · {}", volume.index, status.label()),
+                                        format!("{} · {}", crate::ui::bone_label(&volume.bone_name), status.label()),
                                         egui::FontId::monospace(10.0),
                                         Color32::WHITE,
                                     );
@@ -11129,10 +11141,9 @@ impl VisionaryApp {
                     if ui
                         .add_enabled(!self.fetching_acmd, egui::Button::new(btn_text))
                         .on_hover_text(
-                            "Reload this move's ACMD scripts from the linked project or local \
-                             GitHub cache — hitboxes, hurtboxes, effects, sounds, and expression. \
-                             Moves load automatically when selected; use this after changing the \
-                             source on disk or retrying a failed fetch.",
+                            "Read this move's scripts again from your project or the game's copy. \
+                             Moves load by themselves when picked; use this after changing the \
+                             files on disk or when loading failed.",
                         )
                         .clicked()
                     {
@@ -11146,8 +11157,8 @@ impl VisionaryApp {
                     if ui
                         .add_enabled(has_capture, egui::Button::new("Load live capture"))
                         .on_hover_text(
-                            "Load this move's hitboxes + effects from the live game capture \
-                             (exact values; perform the move in game to capture it)",
+                            "Use the hitboxes and effects recorded from the game (exact values; \
+                             do the move in the game to record it)",
                         )
                         .clicked()
                     {
@@ -11157,17 +11168,16 @@ impl VisionaryApp {
                     if ui
                         .add_enabled(has_capture, egui::Button::new("Forget capture"))
                         .on_hover_text(
-                            "Forget the locked live-ACMD snapshots. Each move is captured from its \
-                             first playback only; clear when you intentionally want to \
-                             record a fresh set.",
+                            "Forget what was recorded from the game. Each move is recorded the first \
+                             time it plays; forget it to record it again.",
                         )
                         .clicked()
                     {
                         ui.close();
                         self.game_link.clear_captures();
                         self.forget_current_move_capture();
-                        self.state.status = "Cleared the live capture — perform the move again \
-                                             to record a clean run."
+                        self.state.status = "Forgot the recording. Do the move in the game again \
+                                             to record it."
                             .into();
                     }
                     ui.separator();
@@ -11177,7 +11187,7 @@ impl VisionaryApp {
                             egui::Button::new("Reset move edits"),
                         )
                         .on_hover_text(
-                            "Discard this move's collision, motion, effect, sound, and expression edits and restore the loaded source or capture baseline",
+                            "Undo every edit to this move and go back to how it was loaded",
                         )
                         .clicked()
                     {
@@ -11187,7 +11197,7 @@ impl VisionaryApp {
                 });
             });
             if matches!(self.primary_tab, PrimaryEditorTab::Collisions)
-                && ui.add_enabled(self.state.selected_move.is_some(), egui::Button::new("Add collision")).clicked()
+                && ui.add_enabled(self.state.selected_move.is_some(), egui::Button::new("Add hitbox")).clicked()
             {
                 self.show_add_hitbox = !self.show_add_hitbox;
             }
@@ -11228,8 +11238,8 @@ impl VisionaryApp {
             ui.group(|ui| {
                 editor_subsection_heading(
                     ui,
-                    "New collision",
-                    "Create an attack, grab, or wind area beginning at the current game frame. More properties become available after it is selected.",
+                    "New hitbox",
+                    "Add a hitbox, grab box or wind box starting at the current frame. Pick it afterwards to change more of it.",
                 );
                 ui.horizontal(|ui| {
                     ui.label("Type:");
@@ -11275,13 +11285,13 @@ impl VisionaryApp {
                 if self.add_hitbox_category == 0 {
                     ui.add(egui::Slider::new(&mut self.add_damage, 0.0..=50.0).text("Damage"));
                     angle_picker(ui, &mut self.add_angle);
-                    ui.add(egui::Slider::new(&mut self.add_kb_base, 0..=200).text("KB Base"));
-                    ui.add(egui::Slider::new(&mut self.add_kb_scaling, 0..=200).text("KB Scaling"));
+                    ui.add(egui::Slider::new(&mut self.add_kb_base, 0..=200).text("Base knockback"));
+                    ui.add(egui::Slider::new(&mut self.add_kb_scaling, 0..=200).text("Knockback growth"));
                 }
                 let add_label = match self.add_hitbox_category {
-                    1 => "Add Grab Box",
-                    2 => "Add Wind Box",
-                    _ => "Add Attack Hitbox",
+                    1 => "Add grab box",
+                    2 => "Add wind box",
+                    _ => "Add hitbox",
                 };
                 if ui.button(add_label).clicked() {
                     let next_id = self
@@ -11746,7 +11756,7 @@ impl VisionaryApp {
                                 // ── Attack-only combat fields ────────────────────────
                                 if hb.category == 0 {
                                     ui.horizontal(|ui| {
-                                ui.label("Macro:");
+                                ui.label("Kind:");
                                 egui::ComboBox::from_id_salt("edit_attack_func")
                                     .selected_text(&hb.func)
                                     .show_ui(ui, |ui| {
@@ -11766,9 +11776,9 @@ impl VisionaryApp {
                             );
                                     wide_slider_f32(ui, &mut hb.damage, 0.0..=50.0, "Damage");
                                     angle_picker(ui, &mut hb.angle);
-                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "KB Base");
-                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "KB Scaling");
-                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Fixed KB");
+                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "Base knockback");
+                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "Knockback growth");
+                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Set knockback");
                                 }
 
                                 // ATTACK_FP keeps its own complete payload and has no proven bone-local
@@ -11781,9 +11791,9 @@ impl VisionaryApp {
                         );
                                     wide_slider_f32(ui, &mut hb.damage, 0.0..=50.0, "Damage");
                                     angle_picker(ui, &mut hb.angle);
-                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "KB Base");
-                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "KB Scaling");
-                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Fixed KB");
+                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "Base knockback");
+                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "Knockback growth");
+                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Set knockback");
                                     editor_collapsing(
                                         ui,
                                         "Editable hit behavior",
@@ -11841,9 +11851,9 @@ impl VisionaryApp {
                                 if hb.category == crate::data::CAT_ABS {
                                     wide_slider_f32(ui, &mut hb.damage, 0.0..=50.0, "Damage");
                                     angle_picker(ui, &mut hb.angle);
-                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "KB Base");
-                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "KB Scaling");
-                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Fixed KB");
+                                    wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "Base knockback");
+                                    wide_slider_i32(ui, &mut hb.kb_scaling, 0..=200, "Knockback growth");
+                                    wide_slider_i32(ui, &mut hb.fkb, 0..=200, "Set knockback");
                                     wide_slider_f32(ui, &mut hb.hitlag_mult, 0.0..=5.0, "Hitlag");
                                     lr_check_combo(ui, &mut hb.lr_check, "abs_lr_check");
                                     editor_collapsing(
@@ -12009,7 +12019,7 @@ impl VisionaryApp {
                                     editor_collapsing(
                                         ui,
                                         "Shape & position",
-                                        "The collision's bone-local offset, size, and optional second endpoint. A second endpoint turns the sphere into a capsule.",
+                                        "Where the hitbox sits on its bone and how big it is. Give it a second point to stretch the ball into a pill shape.",
                                         |ui| {
                                         wide_slider_f32(
                                             ui,
@@ -12424,7 +12434,7 @@ impl VisionaryApp {
                         };
                         ui.colored_label(color, if active { "◆" } else { "◇" });
                         ui.label(format!(
-                            "f{} · {}",
+                            "Frame {} · {}",
                             event.frame,
                             sound_func_words(&event.call.func).unwrap_or(&event.call.func)
                         ))
@@ -12551,7 +12561,7 @@ impl VisionaryApp {
                         .sound_script_edits
                         .insert(key, self.state.sound_script.clone());
                 }
-                self.state.status = "Sound structural edit staged — generated export and linked-source sync preserve the complete sound_ tree, and live replay uses safe suppress/inject rules when the call shape is measurable.".into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_sound_rules();
             }
         }
@@ -12602,7 +12612,7 @@ impl VisionaryApp {
             self.state.status = if structural_live_supported {
                 "Move updated.".into()
             } else {
-                "Sound structural edit staged for export/source sync; its symbolic or malformed tail is not safe to replay live, so the original sound remains active.".into()
+                "Changed for the export. This sound can't change in the running game, so the game keeps playing the old one until you export.".into()
             };
         }
     }
@@ -13277,9 +13287,7 @@ impl VisionaryApp {
                     "Saved. {unrepresentable} rumble or camera block(s) will update live after you perform the move in game once."
                 )
             } else {
-                format!(
-                    "Expression edit staged, but {unrepresentable} camera/rumble, {partial_unrepresentable} partial-rate, and {frame_unrepresentable} partial-frame call(s) need a safe live identity or numeric/hash value"
-                )
+                live_limit_status(unrepresentable + partial_unrepresentable + frame_unrepresentable)
             };
         }
     }
@@ -13340,7 +13348,7 @@ impl VisionaryApp {
                             },
                             if active { "◆" } else { "◇" },
                         );
-                        ui.label(format!("f{} · {}", event.frame, event.call.part_kind));
+                        ui.label(format!("Frame {} · {}", event.frame, event.call.part_kind));
                         ui.add(
                             egui::DragValue::new(&mut rate)
                                 .speed(0.05)
@@ -13382,7 +13390,7 @@ impl VisionaryApp {
                             },
                             if active { "◆" } else { "◇" },
                         );
-                        ui.label(format!("f{} · {}", event.frame, event.call.part_kind));
+                        ui.label(format!("Frame {} · {}", event.frame, event.call.part_kind));
                         let mut changed = ui
                             .add(
                                 egui::DragValue::new(&mut seek)
@@ -13427,7 +13435,7 @@ impl VisionaryApp {
                         if active { "◆" } else { "◇" },
                     );
                     ui.add(
-                        egui::Label::new(format!("f{} · {}", event.frame, event.source)).truncate(),
+                        egui::Label::new(format!("Frame {} · {}", event.frame, event.source)).truncate(),
                     )
                     .on_hover_text(event.source);
                 });
@@ -13447,7 +13455,7 @@ impl VisionaryApp {
                         .insert(key, self.state.expression_script.clone());
                 }
                 self.state.status =
-                    "Expression MotionModule::set_rate_partial edit staged — live replacement is sent only when its exact native (part kind, pristine rate, frame) capture identity is unique; otherwise export or sync it into the linked source project."
+                    EDIT_KEPT
                         .into();
                 self.push_expression_motion_module_set_rate_partial_rules();
             }
@@ -13473,7 +13481,7 @@ impl VisionaryApp {
                         .insert(key, self.state.expression_script.clone());
                 }
                 self.state.status =
-                    "Expression MotionModule::set_frame_partial edit staged — live replacement is sent only when its exact native (part kind, pristine seek frame, frame) identity is unique; otherwise export or sync it into the linked source project."
+                    EDIT_KEPT
                         .into();
                 self.push_expression_motion_module_set_frame_partial_rules();
             }
@@ -13507,7 +13515,7 @@ impl VisionaryApp {
                 .iter()
                 .any(|occurrence| occurrence.frame == self.state.current_frame);
             let frame_label = if occurrences.len() == 1 {
-                format!("f{}", event.frame)
+                format!("Frame {}", event.frame)
             } else {
                 let first = occurrences
                     .first()
@@ -13688,7 +13696,7 @@ impl VisionaryApp {
             edit = reset_edit;
         }
 
-        ui.menu_button("+ Add expression call", |ui| {
+        ui.menu_button("+ Add rumble or shake", |ui| {
             for (label, call) in [
                 (
                     "Hit rumble",
@@ -13738,7 +13746,7 @@ impl VisionaryApp {
                         .insert(key, self.state.expression_script.clone());
                 }
                 self.state.status =
-                    "Expression edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                         .into();
                 self.push_expression_rules();
             }
@@ -13789,7 +13797,7 @@ impl VisionaryApp {
                         .expression_script_edits
                         .insert(key, self.state.expression_script.clone());
                 }
-                self.state.status = "Expression structural edit staged — live replay suppresses the measured base call and injects the typed edited call when safe; generated export keeps the complete expression_ tree, and linked-source sync reports structural operations.".into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_expression_rules();
             }
         }
@@ -13831,7 +13839,7 @@ impl VisionaryApp {
                     },
                     if active { "◆" } else { "◇" },
                 );
-                ui.label(format!("f{}", event.frame));
+                ui.label(format!("Frame {}", event.frame));
                 if ui
                     .small_button("Move here")
                     .on_hover_text("Move this facing reversal to the current playhead frame.")
@@ -13913,7 +13921,7 @@ impl VisionaryApp {
                             &self.state.script.to_work_module_set_events(),
                         ));
                 self.state.status = if destination.is_some() {
-                    "REVERSE_LR edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                 } else {
                     "REVERSE_LR removed — export or sync to apply the structural edit."
                 }
@@ -13974,10 +13982,7 @@ impl VisionaryApp {
         if let Some((site, call)) = edit {
             if let Some(target) = (section.stmt)(&mut self.state.script, site) {
                 *target = call;
-                self.state.status = format!(
-                    "{} edit staged — export or sync it into the linked source project.",
-                    section.label
-                );
+                self.state.status = EDIT_KEPT.into();
                 (section.push)(self);
             }
         }
@@ -13990,12 +13995,11 @@ impl VisionaryApp {
             description: "SET_SPEED replaces the fighter's x/y velocity at this point. X and y are editable; moving or replacing the source call remains a structural edit.",
             color: egui::Color32::from_rgb(245, 170, 110),
             command: "SET_SPEED",
-            label: "SET_SPEED",
             stmt: crate::data::AcmdScript::set_speed_stmt_mut,
             push: Self::push_speed_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "])
         });
     }
@@ -14012,12 +14016,11 @@ impl VisionaryApp {
             description: "SET_SPEED_EX replaces x/y velocity in one named kinetic-energy reserve. A reserve is one engine movement component; its authored name stays visible while x and y are editable.",
             color: egui::Color32::from_rgb(110, 190, 255),
             command: "SET_SPEED_EX",
-            label: "SET_SPEED_EX",
             stmt: crate::data::AcmdScript::speed_ex_stmt_mut,
             push: Self::push_speed_ex_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             let changed = drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "]);
             ui.colored_label(
                 egui::Color32::from_gray(150),
@@ -14035,12 +14038,11 @@ impl VisionaryApp {
             description: "ADD_SPEED_NO_LIMIT adds x/y velocity without the ordinary speed limit at this point. X and y are editable; the call's placement remains structural.",
             color: egui::Color32::from_rgb(90, 220, 180),
             command: "ADD_SPEED_NO_LIMIT",
-            label: "ADD_SPEED_NO_LIMIT",
             stmt: crate::data::AcmdScript::add_speed_no_limit_stmt_mut,
             push: Self::push_add_speed_no_limit_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "])
         });
     }
@@ -14053,12 +14055,11 @@ impl VisionaryApp {
             description: "CORRECT selects how the fighter is aligned or corrected against ground and air geometry at this point. The exact named mode stays as authored source text.",
             color: egui::Color32::from_rgb(255, 205, 120),
             command: "CORRECT",
-            label: "CORRECT",
             stmt: crate::data::AcmdScript::correct_stmt_mut,
             push: Self::push_correct_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             token_edit(ui, &mut call.kind, 260.0, "*GROUND_CORRECT_KIND_…")
         });
     }
@@ -14071,12 +14072,11 @@ impl VisionaryApp {
             description: "FT_CATCH_STOP is the engine's two-value catch-stop command. The exact gameplay role of each value is not decoded, so they stay honestly labeled arg1 and arg2 instead of receiving guessed names.",
             color: egui::Color32::from_rgb(220, 155, 245),
             command: "FT_CATCH_STOP",
-            label: "FT_CATCH_STOP",
             stmt: crate::data::AcmdScript::ft_catch_stop_stmt_mut,
             push: Self::push_ft_catch_stop_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             drag_pair(ui, &mut call.arg1, &mut call.arg2, ["arg1 ", "arg2 "])
         });
     }
@@ -14089,12 +14089,11 @@ impl VisionaryApp {
             description: "FT_START_ADJUST_MOTION_FRAME_arg1 carries one measured numeric value. Its more specific gameplay meaning is not decoded, so the editor preserves the native name and avoids inventing a misleading label.",
             color: egui::Color32::from_rgb(130, 220, 245),
             command: "FT_START_ADJUST_MOTION_FRAME_arg1",
-            label: "FT_START_ADJUST_MOTION_FRAME_arg1",
             stmt: crate::data::AcmdScript::ft_start_adjust_motion_frame_stmt_mut,
             push: Self::push_ft_start_adjust_motion_frame_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             let value = egui::DragValue::new(&mut call.value).speed(0.05);
             ui.add(value.prefix("value ")).changed()
         });
@@ -14108,12 +14107,11 @@ impl VisionaryApp {
             description: "MotionModule::set_rate directly sets the animation's playback rate at this conditional script point. Only the numeric value is edited; its frame and execution condition remain intact.",
             color: egui::Color32::from_rgb(170, 205, 255),
             command: "MotionModule::set_rate",
-            label: "MotionModule::set_rate",
             stmt: crate::data::AcmdScript::motion_module_set_rate_stmt_mut,
             push: Self::push_motion_module_set_rate_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             let rate = egui::DragValue::new(&mut call.rate).speed(0.05);
             ui.add(rate.range(0.0..=100.0).prefix("rate ")).changed()
         });
@@ -14127,12 +14125,11 @@ impl VisionaryApp {
             description: "MotionModule::set_rate_partial changes only one named animation part. The numeric rate is editable; the authored part name, frame, and execution context stay intact.",
             color: egui::Color32::from_rgb(170, 220, 190),
             command: "MotionModule::set_rate_partial",
-            label: "MotionModule::set_rate_partial",
             stmt: crate::data::AcmdScript::motion_module_set_rate_partial_stmt_mut,
             push: Self::push_motion_module_set_rate_partial_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{} {}", event.frame, event.call.part_kind));
+            ui.label(format!("Frame {} {}", event.frame, event.call.part_kind));
             let rate = egui::DragValue::new(&mut call.rate).speed(0.05);
             ui.add(rate.range(0.0..=100.0).prefix("rate ")).changed()
         });
@@ -14178,7 +14175,7 @@ impl VisionaryApp {
                         },
                         if active { "◆" } else { "◇" },
                     );
-                    ui.label(format!("f{} {}", event.frame, event.call.part_kind));
+                    ui.label(format!("Frame {} {}", event.frame, event.call.part_kind));
                     let mut changed = ui
                         .add(
                             egui::DragValue::new(&mut seek)
@@ -14213,7 +14210,7 @@ impl VisionaryApp {
                     || sync != crate::data::MotionModuleSetFramePartialCall::OMITTED_SYNC)
                     .then_some(sync);
                 self.state.status =
-                    "MotionModule::set_frame_partial edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                         .into();
                 self.push_motion_module_set_frame_partial_rules();
             }
@@ -14231,12 +14228,11 @@ impl VisionaryApp {
             description: "MotionModule::set_helper_calculation turns the engine's helper-animation calculation on or off at this conditional script point. Its exact visible effect depends on the move; only the proven boolean is editable.",
             color: egui::Color32::from_rgb(180, 225, 190),
             command: "MotionModule::set_helper_calculation",
-            label: "MotionModule::set_helper_calculation",
             stmt: crate::data::AcmdScript::motion_module_set_helper_calculation_stmt_mut,
             push: Self::push_motion_module_set_helper_calculation_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             ui.checkbox(&mut call.enabled, "enabled").changed()
         });
     }
@@ -14253,12 +14249,11 @@ impl VisionaryApp {
             description: "CLR_SPEED clears the velocity stored in one named kinetic-energy reserve, which is one engine movement component. The authored reserve name stays as source text.",
             color: egui::Color32::from_rgb(245, 125, 175),
             command: "CLR_SPEED",
-            label: "CLR_SPEED",
             stmt: crate::data::AcmdScript::clr_speed_stmt_mut,
             push: Self::push_clr_speed_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             token_edit(
                 ui,
                 &mut call.kinetic_kind,
@@ -14280,7 +14275,6 @@ impl VisionaryApp {
             description: "KineticModule::change_kinetic selects the fighter's engine movement mode, which determines the set of movement rules and energies currently in use. The authored mode name stays as source text.",
             color: egui::Color32::from_rgb(255, 190, 120),
             command: "KineticModule::change_kinetic",
-            label: "change_kinetic",
             stmt: crate::data::AcmdScript::change_kinetic_stmt_mut,
             push: |app| {
                 app.push_change_kinetic_rules();
@@ -14289,7 +14283,7 @@ impl VisionaryApp {
             },
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             token_edit(ui, &mut call.kinetic_type, 280.0, "*FIGHTER_KINETIC_TYPE_…")
         });
     }
@@ -14304,13 +14298,12 @@ impl VisionaryApp {
             description: "Enables, disables, suspends, or resumes one kinetic energy: an engine movement component such as gravity, player control, or animation-driven motion. The authored component name stays as source text.",
             color: egui::Color32::from_rgb(205, 160, 255),
             command: "KineticModule energy",
-            label: "KineticModule energy",
             stmt: crate::data::AcmdScript::kinetic_energy_stmt_mut,
             push: Self::push_kinetic_energy_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
             let func = event.call.func().trim_start_matches("KineticModule::");
-            ui.label(format!("f{} {func}", event.frame));
+            ui.label(format!("Frame {} {func}", event.frame));
             let hint = "*FIGHTER_KINETIC_ENERGY_ID_…";
             token_edit(ui, &mut call.kinetic_energy_id, 280.0, hint)
         });
@@ -14326,12 +14319,11 @@ impl VisionaryApp {
             description: "KineticModule::add_speed adds the shown x/y vector directly to movement velocity. The supported source form has z = 0.0; the receiver and frame stay unchanged.",
             color: egui::Color32::from_rgb(120, 190, 255),
             command: "KineticModule::add_speed",
-            label: "KineticModule::add_speed",
             stmt: crate::data::AcmdScript::kinetic_add_speed_stmt_mut,
             push: Self::push_kinetic_add_speed_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{}", event.frame));
+            ui.label(format!("Frame {}", event.frame));
             let changed = drag_pair(ui, &mut call.speed_x, &mut call.speed_y, ["x ", "y "]);
             ui.colored_label(egui::Color32::from_gray(150), "z 0.0");
             changed
@@ -14368,7 +14360,7 @@ impl VisionaryApp {
                     },
                     if active { "◆" } else { "◇" },
                 );
-                ui.label(format!("f{}", event.frame));
+                ui.label(format!("Frame {}", event.frame));
                 if ui
                     .small_button("Move here")
                     .on_hover_text("Move this clear_speed_all point to the current playhead frame.")
@@ -14456,7 +14448,7 @@ impl VisionaryApp {
                             &self.state.script.to_work_module_set_events(),
                         ));
                 self.state.status = if destination.is_some() {
-                    "KineticModule::clear_speed_all edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                 } else {
                     "KineticModule::clear_speed_all removed — export or sync to apply the structural edit."
                 }
@@ -14504,7 +14496,7 @@ impl VisionaryApp {
                         },
                         if active { "◆" } else { "◇" },
                     );
-                    ui.label(format!("f{}", event.frame));
+                    ui.label(format!("Frame {}", event.frame));
                     let mut changed = ui
                         .checkbox(&mut consider_ground_friction, "consider ground friction")
                         .changed();
@@ -14563,7 +14555,7 @@ impl VisionaryApp {
                 if !kinetic_energy_attribute.trim().is_empty() {
                     call.consider_ground_friction = consider_ground_friction;
                     call.kinetic_energy_attribute = kinetic_energy_attribute;
-                    self.state.status = "set_consider_ground_friction edit staged — export or sync it into the linked source project.".into();
+                    self.state.status = EDIT_KEPT.into();
                     self.push_kinetic_set_consider_ground_friction_rules();
                 }
             }
@@ -14642,7 +14634,7 @@ impl VisionaryApp {
                             &self.state.script.to_work_module_set_events(),
                         ));
                 self.state.status = if destination.is_some() {
-                    "set_consider_ground_friction edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                 } else {
                     "set_consider_ground_friction removed — export or sync to apply the structural edit."
                 }
@@ -14662,19 +14654,16 @@ impl VisionaryApp {
     fn draw_work_flag_section(&mut self, ui: &mut Ui) {
         let events = self.state.script.to_work_flag_events();
         let section = PointSection {
-            title: "Work flags",
+            title: "Switches",
             description: WORK_FLAGS_DESCRIPTION,
             color: egui::Color32::from_rgb(235, 190, 120),
             command: "WorkModule::on_flag / off_flag",
-            label: "WorkModule flag",
             stmt: crate::data::AcmdScript::work_flag_stmt_mut,
             push: Self::push_work_flag_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            let func = event.call.func().trim_start_matches("WorkModule::");
-            ui.label(format!("f{} {func}", event.frame));
-            let hint = "*FIGHTER_STATUS_WORK_ID_FLAG_…";
-            token_edit(ui, &mut call.flag, 280.0, hint)
+            point_words(ui, event.frame, event.call.func(), &call.flag);
+            token_edit(ui, &mut call.flag, 150.0, "*FIGHTER_STATUS_WORK_ID_FLAG_…")
         });
     }
 
@@ -14690,15 +14679,13 @@ impl VisionaryApp {
             description: "Transition terms are named state changes the engine may consider, such as a particular cancel or movement transition. These commands enable or disable one term or a related group at this point.",
             color: egui::Color32::from_rgb(205, 170, 235),
             command: "WorkModule transition term / group",
-            label: "WorkModule transition-term",
             stmt: crate::data::AcmdScript::work_transition_term_stmt_mut,
             push: Self::push_work_transition_term_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            let func = event.call.func().trim_start_matches("WorkModule::");
-            ui.label(format!("f{} {func}", event.frame));
+            point_words(ui, event.frame, event.call.func(), &call.transition_term);
             let hint = "*FIGHTER_STATUS_TRANSITION_TERM_ID_…";
-            token_edit(ui, &mut call.transition_term, 300.0, hint)
+            token_edit(ui, &mut call.transition_term, 150.0, hint)
         });
     }
 
@@ -14712,13 +14699,12 @@ impl VisionaryApp {
             description: "WorkModule::inc_int adds one to a named integer stored by the game for this fighter. Scripts use these slots for counters and other move or status state; the authored slot name identifies the exact value.",
             color: egui::Color32::from_rgb(220, 190, 140),
             command: "WorkModule::inc_int",
-            label: "WorkModule::inc_int",
             stmt: crate::data::AcmdScript::work_module_inc_int_stmt_mut,
             push: Self::push_work_module_inc_int_rules,
         };
         self.draw_point_section(ui, events, section, |ui, event, call| {
-            ui.label(format!("f{} inc_int", event.frame));
-            token_edit(ui, &mut call.slot, 280.0, "*FIGHTER_STATUS_WORK_INT_…")
+            point_words(ui, event.frame, "inc_int", &call.slot);
+            token_edit(ui, &mut call.slot, 150.0, "*FIGHTER_STATUS_WORK_INT_…")
         });
     }
 
@@ -14756,7 +14742,7 @@ impl VisionaryApp {
                         if active { "◆" } else { "◇" },
                     );
                     ui.label(format!(
-                        "f{} {}",
+                        "Frame {} {}",
                         event.frame,
                         event.call.func().trim_start_matches("WorkModule::")
                     ));
@@ -14792,7 +14778,7 @@ impl VisionaryApp {
                 call.value = value;
                 call.slot = slot;
                 self.state.status =
-                    "WorkModule value edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                         .into();
                 self.push_work_module_set_rules();
             }
@@ -14827,7 +14813,7 @@ impl VisionaryApp {
                     },
                     if active { "◆" } else { "◇" },
                 );
-                ui.label(format!("f{}", event.frame));
+                ui.label(format!("Frame {}", event.frame));
                 if ui
                     .small_button("Move here")
                     .on_hover_text("Move this SET_AIR point to the current playhead frame.")
@@ -14907,7 +14893,7 @@ impl VisionaryApp {
                             &self.state.script.to_work_module_set_events(),
                         ));
                 self.state.status = if destination.is_some() {
-                    "SET_AIR edit staged — export or sync it into the linked source project."
+                    EDIT_KEPT
                 } else {
                     "SET_AIR removed — export or sync to apply the structural edit."
                 }
@@ -14966,7 +14952,7 @@ impl VisionaryApp {
                     },
                     if active { "◆" } else { "◇" },
                 );
-                ui.label(format!("f{} · hitbox", m.frame));
+                ui.label(format!("Frame {} · hitbox", m.frame));
 
                 let mut id = m.id;
                 let mut value = m.value;
@@ -15021,7 +15007,7 @@ impl VisionaryApp {
             .any(|volume| matches!(volume.shape, crate::data::HurtboxShape::Capsule));
         let response = ui.add_enabled(
             available,
-            egui::Checkbox::new(&mut self.show_hurtboxes, "Hurtboxes in viewport"),
+            egui::Checkbox::new(&mut self.show_hurtboxes, "Show hurtboxes on the model"),
         );
         if response.changed() {
             save_hurtbox_visibility(self.show_hurtboxes);
@@ -15110,13 +15096,13 @@ impl VisionaryApp {
         ui.separator();
         editor_section_heading_with_badge(
             ui,
-            "Parameter hurtboxes",
-            "Select a real capsule from the fighter parameter file, then author the status and the one-based frame range where it applies. Reapplying a range replaces that capsule's previous editor range instead of stacking duplicate HIT_NO commands.",
+            "Hurtboxes",
+            "The fighter's own hurtboxes. Pick one, choose what it does, and set the frames. Setting it again replaces the earlier frames.",
             egui::Color32::from_rgb(215, 215, 215),
             "select · edit · apply range",
         );
         ui.small(
-            "Workflow: select a capsule, choose its status, enter Start and End frames, then click Apply / replace range. The capsule's parameter default is restored on the following frame.",
+            "Pick a hurtbox, choose what it does and for which frames, then click Apply. It goes back to normal the frame after.",
         );
 
         let events = self.state.script.to_hurtbox_events();
@@ -15135,7 +15121,7 @@ impl VisionaryApp {
                     );
                     let selected = self.selected_hurtbox == Some(*index);
                     // The status, and the default only when this frame differs from it.
-                    let status_words = status.label().to_lowercase();
+                    let status_words = status.label();
                     let label = if status == volume.default_status {
                         format!(
                             "{} · {}",
@@ -15147,7 +15133,7 @@ impl VisionaryApp {
                             "{} · {} (usually {})",
                             crate::ui::bone_label(&volume.bone_name),
                             status_words,
-                            volume.default_status.label().to_lowercase()
+                            volume.default_status.label()
                         )
                     };
                     let response = ui.selectable_label(selected, label);
@@ -15155,7 +15141,7 @@ impl VisionaryApp {
                         self.selected_hurtbox = Some(*index);
                     }
                     response.on_hover_text(format!(
-                        "Parameter list index {} on bone {}. Current status: {}. Default: {}. Click to author a frame range.",
+                        "Hurtbox {} on bone {}. Now: {}. Usually: {}. Click to change it for some frames.",
                         volume.index,
                         volume.bone_name,
                         status.label(),
@@ -15165,7 +15151,7 @@ impl VisionaryApp {
             });
 
         let Some(index) = self.selected_hurtbox else {
-            ui.weak("Select a capsule above or click one in the viewport.");
+            ui.weak("Pick a hurtbox above or click one on the model.");
             return;
         };
         let Some(volume) = self.hurtbox_volumes.get(index).cloned() else {
@@ -15175,9 +15161,8 @@ impl VisionaryApp {
 
         ui.group(|ui| {
             ui.label(format!(
-                "Selected HIT_NO #{} · bone {} · default {}",
-                volume.index,
-                volume.bone_name,
+                "{} hurtbox · usually {}",
+                crate::ui::bone_label(&volume.bone_name),
                 volume.default_status.label()
             ));
             ui.horizontal_wrapped(|ui| {
@@ -15210,20 +15195,20 @@ impl VisionaryApp {
                         .range(FIRST_GAME_FRAME..=9999),
                 );
                 if ui
-                    .button("Apply / replace range")
+                    .button("Apply")
                     .on_hover_text(
-                        "Set this capsule's status from Start through End. Applying again replaces the previous range for this capsule. The parameter default is restored on the next frame.",
+                        "Use this on these frames. Applying again replaces the frames set before.",
                     )
                     .clicked()
                 {
                     let start = self.hurtbox_edit_start.max(FIRST_GAME_FRAME);
                     let end = self.hurtbox_edit_end.max(start);
                     let Some(status_token) = self.hurtbox_edit_status.source_token() else {
-                        self.state.status = "Unknown hurtbox statuses cannot be authored safely.".into();
+                        self.state.status = "Pick what the hurtbox does first.".into();
                         return;
                     };
                     let Some(default_token) = volume.default_status.source_token() else {
-                        self.state.status = "This parameter capsule has an unknown default status; its range was not authored.".into();
+                        self.state.status = "This hurtbox has a setting Visionary does not know, so it was left alone.".into();
                         return;
                     };
                     let target = crate::data::HurtTarget::Group(volume.index as i64);
@@ -15238,7 +15223,7 @@ impl VisionaryApp {
                     self.state.total_frames = self.state.total_frames.max(end);
                     self.push_hurtbox_rules();
                     self.state.status = format!(
-                        "HIT_NO #{} set to {} on frames {}–{}; previous editor range replaced and restored to {} on frame {}.",
+                        "Hurtbox {} is {} on frames {}–{} and back to {} on frame {}.",
                         volume.index,
                         self.hurtbox_edit_status.label(),
                         start,
@@ -15249,19 +15234,19 @@ impl VisionaryApp {
                 }
             });
             ui.small(
-                "Known states: NORMAL (ordinary), INVINCIBLE (cannot be hit), XLU / INTANGIBLE (collision disabled), OFF (volume hidden).",
+                "Normal: can be hit. Invincible: hits connect but do nothing. Intangible: hits pass through. Off: no hurtbox.",
             );
         });
 
         ui.group(|ui| {
             editor_section_heading_with_badge(
                 ui,
-                "Fighter-wide damage reaction",
-                "Armor and no-reaction modes apply to the fighter as a whole, not only to the selected capsule. Choose a mode and author the one-based range here.",
+                "Armor for the whole fighter",
+                "Armor and similar modes cover the whole fighter, not one hurtbox. Choose a mode and the frames here.",
                 egui::Color32::from_rgb(210, 105, 255),
                 "all capsules",
             );
-            ui.small("This is separate from the selected capsule's NORMAL / INVINCIBLE / XLU / OFF status.");
+            ui.small("This is separate from the hurtbox settings above.");
             ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("parameter_hurtbox_condition_mode")
                     .selected_text(damage_no_reaction_mode_label(
@@ -15293,9 +15278,9 @@ impl VisionaryApp {
                         .range(FIRST_GAME_FRAME..=9999),
                 );
                 if ui
-                    .button("Apply / replace armor range")
+                    .button("Apply armor")
                     .on_hover_text(
-                        "Apply the selected damage-reaction mode for this one-based frame range. Applying again replaces the previous editor range; normal reaction is restored on the following frame.",
+                        "Use this armor on these frames. Applying again replaces the frames set before.",
                     )
                     .clicked()
                 {
@@ -15332,23 +15317,23 @@ impl VisionaryApp {
                     );
                 }
             });
-            ui.small("The colored armor outline overlays every active parameter hurtbox during the selected range. Normal reaction is restored automatically on the next frame.");
+            ui.small("Armor shows as a coloured outline on every hurtbox for these frames and ends by itself the frame after.");
         });
     }
 
     fn draw_hurtbox_section(&mut self, ui: &mut Ui) {
         ui.separator();
-        let response = egui::CollapsingHeader::new("Advanced authored hurtbox commands")
+        let response = egui::CollapsingHeader::new("Hurtbox lines in the script")
             .id_salt("advanced_hurtbox_commands")
             .default_open(false)
             .show(ui, |ui| {
                 ui.small(
-                    "Use Parameter hurtboxes above for new capsule ranges. Expand this section only to inspect or edit existing HIT_NODE, HIT_NO, WHOLE_HIT, reset, priority, and damage-reaction source commands.",
+                    "The hurtbox lines this move's script already has. Use the list above for new changes.",
                 );
                 self.draw_hurtbox_state_editor(ui);
             });
         response.header_response.on_hover_text(
-            "Advanced source-level hurtbox commands. New parameter capsule ranges belong in the editor above so repeated edits replace one range instead of stacking commands.",
+            "The hurtbox lines this move's script already has. Use the list above for new changes.",
         );
     }
 
@@ -15725,7 +15710,7 @@ impl VisionaryApp {
                                 let selected = self.state.selected_effect_call == Some(i);
                                 let display_name = format!(
                                     "{} · {}",
-                                    effect_call_display_name(effect),
+                                    effect_words(&effect_call_display_name(effect)),
                                     if effect.follows_bone && effect.ends_early() {
                                         format!(
                                             "frames {}-{}",
@@ -15735,7 +15720,7 @@ impl VisionaryApp {
                                         format!("frame {}", effect.active_start)
                                     }
                                 );
-                                let mut text = egui::RichText::new(display_name).monospace();
+                                let mut text = egui::RichText::new(display_name);
                                 if effect.disabled {
                                     text = text.strikethrough().color(egui::Color32::DARK_GRAY);
                                 }
@@ -15753,23 +15738,26 @@ impl VisionaryApp {
                                         )
                                     } else if effect.follows_bone && !effect.ends_early() {
                                         format!(
-                                            "{} · bone {} · f{} onward",
+                                            "{} {} · bone {} · frame {} onward",
                                             effect.spawn_func,
+                                            effect.effect_name,
                                             effect.bone_name,
                                             effect.active_start,
                                         )
                                     } else if effect.follows_bone {
                                         format!(
-                                            "{} · bone {} · f{}-{}",
+                                            "{} {} · bone {} · frames {}-{}",
                                             effect.spawn_func,
+                                            effect.effect_name,
                                             effect.bone_name,
                                             effect.active_start,
                                             effect.active_end
                                         )
                                     } else {
                                         format!(
-                                            "{} · bone {} · frame {}",
+                                            "{} {} · bone {} · frame {}",
                                             effect.spawn_func,
+                                            effect.effect_name,
                                             effect.bone_name,
                                             effect.active_start
                                         )
@@ -15804,7 +15792,7 @@ impl VisionaryApp {
             // Two buttons rather than one with a picker: a spawn and a colour command share
             // the list and nothing else, so which one is being added decides every field.
             let add_color = ui
-                .small_button("+ Add colour command")
+                .small_button("+ Add colour flash")
                 .on_hover_text(
                     "Tint the fighter's model or the screen flash on this frame. A colour \
                      command has no graphic, joint, or position.",
@@ -15871,7 +15859,7 @@ impl VisionaryApp {
                 self.push_effect_rules();
             }
 
-            if ui.small_button("+ Add effect call").clicked() {
+            if ui.small_button("+ Add effect").clicked() {
                 self.pending_capture = None;
                 self.add_effect_call("sys_hit_elec", current);
             }
@@ -15896,7 +15884,7 @@ impl VisionaryApp {
                 ui.separator();
                 editor_subsection_heading(
                     ui,
-                    "Selected effect event",
+                    "This effect",
                     "Settings for the selected particle spawn, trail, colour change, or effect-control command. Only fields represented by its exact source command are shown.",
                 );
                 let pristine = self.state.effects_pristine.get(i).cloned();
@@ -15969,14 +15957,14 @@ impl VisionaryApp {
                                 ui.end_row();
 
                                 if let Some(effect_name_alt) = ec.effect_name_alt.as_mut() {
-                                    ui.label("Flip effect");
+                                    ui.label("Facing left");
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(effect_name_alt)
                                                 .desired_width(140.0),
                                         )
                                         .on_hover_text(
-                                            "Alternate graphic selected by the ACMD flip command",
+                                            "The effect used instead when the fighter faces the other way",
                                         )
                                         .changed();
                                     if let Some(p) = &pristine {
@@ -15994,11 +15982,7 @@ impl VisionaryApp {
                                 }
                             }
 
-                            ui.label(if is_color || is_control {
-                                "Command"
-                            } else {
-                                "Spawn command"
-                            });
+                            ui.label("Kind");
                             // Owned, because the colour arm below writes the picked command back
                             // into the very field this reads.
                             let spawn_command = effect_spawn_command_name(ec);
@@ -16445,7 +16429,7 @@ impl VisionaryApp {
                                 ui.end_row();
 
                                 if let Some(axis) = ec.flip_axis.as_mut() {
-                                    ui.label("Flip axis/control");
+                                    ui.label("Mirror axis");
                                     changed |= ui
                                         .add(
                                             egui::TextEdit::singleline(axis)
@@ -16528,7 +16512,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16573,7 +16557,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16621,7 +16605,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16739,7 +16723,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16784,7 +16768,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16843,7 +16827,7 @@ impl VisionaryApp {
                                         }
                                     } else {
                                         ui.label(
-                                            egui::RichText::new("(script default)")
+                                            egui::RichText::new("(as the game has it)")
                                                 .small()
                                                 .color(egui::Color32::GRAY),
                                         );
@@ -16928,7 +16912,7 @@ impl VisionaryApp {
                                     }
                                 } else {
                                     ui.label(
-                                        egui::RichText::new("(one-shot)")
+                                        egui::RichText::new("(plays once)")
                                             .small()
                                             .color(egui::Color32::GRAY),
                                     );
@@ -17126,7 +17110,7 @@ impl VisionaryApp {
                         self.push_effect_rules();
                     }
                     if ui
-                        .small_button("⧉ Duplicate")
+                        .small_button("Duplicate")
                         .on_hover_text("Add a copy of this spawn as a new effect call")
                         .clicked()
                     {
@@ -18412,7 +18396,7 @@ impl VisionaryApp {
         self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
         self.hitbox_dirty_at = None;
         self.refresh_current_live_rules();
-        self.state.status = "Restored this move to its loaded source or capture baseline.".into();
+        self.state.status = "This move is back to how it was loaded.".into();
     }
 
     /// Put this move's saved sound script back over the freshly parsed one, if there is one.
@@ -21487,72 +21471,55 @@ impl VisionaryApp {
     point_rule_pushers! {
         push_speed_rules: "speed", speed_rules_for,
             speed_pristine, to_speed_events,
-            "SET_SPEED", "SET_SPEED",
-            "a live capture and an unambiguous frame";
+            "SET_SPEED";
         push_speed_ex_rules: "speed_ex", speed_ex_rules_for,
             speed_ex_pristine, to_speed_ex_events,
-            "SET_SPEED_EX", "SET_SPEED_EX",
-            "a numeric live capture or an unambiguous frame";
+            "SET_SPEED_EX";
         push_add_speed_no_limit_rules: "add_speed_no_limit", add_speed_no_limit_rules_for,
             add_speed_no_limit_pristine, to_add_speed_no_limit_events,
-            "ADD_SPEED_NO_LIMIT", "ADD_SPEED_NO_LIMIT",
-            "a live capture and an unambiguous frame";
+            "ADD_SPEED_NO_LIMIT";
         push_correct_rules: "correct", correct_rules_for,
             correct_pristine, to_correct_events,
-            "CORRECT", "CORRECT",
-            "a numeric live capture and numeric replacement kind";
+            "CORRECT";
         push_ft_catch_stop_rules: "ft_catch_stop", ft_catch_stop_rules_for,
             ft_catch_stop_pristine, to_ft_catch_stop_events,
-            "FT_CATCH_STOP", "FT_CATCH_STOP",
-            "a numeric live capture and a unique argument pair";
+            "FT_CATCH_STOP";
         push_ft_start_adjust_motion_frame_rules: "ft_start_adjust_motion_frame", ft_start_adjust_motion_frame_rules_for,
             ft_start_adjust_motion_frame_pristine, to_ft_start_adjust_motion_frame_events,
-            "FT_START_ADJUST_MOTION_FRAME_arg1", "FT_START_ADJUST_MOTION_FRAME_arg1",
-            "a numeric live capture and a unique value";
+            "FT_START_ADJUST_MOTION_FRAME_arg1";
         push_motion_module_set_rate_rules: "motion_module_set_rate", motion_module_set_rate_rules_for,
             motion_module_set_rate_pristine, to_motion_module_set_rate_events,
-            "MotionModule::set_rate", "MotionModule::set_rate",
-            "a numeric live capture, a unique same-frame rate, and a positive live replacement";
+            "MotionModule::set_rate";
         push_motion_module_set_helper_calculation_rules: "motion_module_set_helper_calculation", motion_module_set_helper_calculation_rules_for,
             motion_module_set_helper_calculation_pristine, to_motion_module_set_helper_calculation_events,
-            "MotionModule::set_helper_calculation", "MotionModule::set_helper_calculation",
-            "a boolean live capture and a unique same-frame value";
+            "MotionModule::set_helper_calculation";
         push_clr_speed_rules: "clr_speed", clr_speed_rules_for,
             clr_speed_pristine, to_clr_speed_events,
-            "CLR_SPEED", "CLR_SPEED",
-            "a numeric live capture, a numeric replacement, and a unique frame/key";
+            "CLR_SPEED";
         push_change_kinetic_rules: "change_kinetic", change_kinetic_rules_for,
             change_kinetic_pristine, to_change_kinetic_events,
-            "change_kinetic", "change_kinetic",
-            "a numeric live capture, a numeric replacement, and a unique frame/key";
+            "change_kinetic";
         push_kinetic_energy_rules: "kinetic_energy", kinetic_energy_rules_for,
             kinetic_energy_pristine, to_kinetic_energy_events,
-            "KineticModule energy", "KineticModule energy",
-            "a numeric live capture, a numeric replacement, and a unique frame/key";
+            "KineticModule energy";
         push_kinetic_add_speed_rules: "kinetic_add_speed", kinetic_add_speed_rules_for,
             kinetic_add_speed_pristine, to_kinetic_add_speed_events,
-            "KineticModule::add_speed", "KineticModule::add_speed",
-            "a unique zero-z live capture and unchanged frame";
+            "KineticModule::add_speed";
         push_work_module_inc_int_rules: "work_module_inc_int", work_module_inc_int_rules_for,
             work_module_inc_int_pristine, to_work_module_inc_int_events,
-            "WorkModule::inc_int", "WorkModule::inc_int",
-            "a numeric slot capture, a numeric replacement, and a unique same-frame slot key";
+            "WorkModule::inc_int";
         push_work_flag_rules: "work_flag", work_flag_rules_for,
             work_flag_pristine, to_work_flag_events,
-            "WorkModule flag", "WorkModule flag",
-            "a numeric live capture, a numeric replacement, and a unique same-frame operation/flag key";
+            "WorkModule flag";
         push_work_transition_term_rules: "work_transition_term", work_transition_term_rules_for,
             work_transition_term_pristine, to_work_transition_term_events,
-            "WorkModule transition term", "WorkModule transition-term",
-            "a numeric live capture, a numeric replacement, and a unique same-frame operation/term key";
+            "WorkModule transition term";
         push_work_module_set_rules: "work_module_set", work_module_set_rules_for,
             work_module_set_pristine, to_work_module_set_events,
-            "WorkModule value", "WorkModule value",
-            "a numeric live capture, a numeric value and slot replacement, and a unique same-frame operation/value/slot key";
+            "WorkModule value";
         push_kinetic_set_consider_ground_friction_rules: "kinetic_set_consider_ground_friction", kinetic_set_consider_ground_friction_rules_for,
             kinetic_set_consider_ground_friction_pristine, to_kinetic_set_consider_ground_friction_events,
-            "set_consider_ground_friction", "set_consider_ground_friction",
-            "a numeric live capture/attribute for live rules";
+            "set_consider_ground_friction";
     }
 
     point_rule_pushers! {
@@ -21807,7 +21774,7 @@ impl VisionaryApp {
             self.load_from_capture();
             return;
         }
-        self.state.status = "Capturing live ACMD — waiting for the move to finish…".into();
+        self.state.status = "Recording the move from the game. Waiting for it to finish…".into();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
@@ -24466,12 +24433,12 @@ impl VisionaryApp {
     }
 
     /// Store one point family's live rules for the current move under `{move}#{key}` and resend
-    /// the rule union. With `limits = (category, label, need)`, points the live path cannot
+    /// the rule union. With `limits = Some(category)`, points the live path cannot
     /// represent are noted as a replay limit and explained in the status bar.
     fn push_point_rules(
         &mut self,
         key: &str,
-        limits: Option<(&str, &str, &str)>,
+        limits: Option<&str>,
         build: impl FnOnce(&Self, u64) -> (Vec<crate::game_link::HitboxRuleWire>, usize),
     ) {
         let Some(mv_key) = self.current_move_key() else {
@@ -24494,12 +24461,9 @@ impl VisionaryApp {
         }
         let all: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&all);
-        if let Some((category, label, need)) =
-            limits.filter(|_| unrepresentable > 0 && !sent_as_steps)
-        {
+        if let Some(category) = limits.filter(|_| unrepresentable > 0 && !sent_as_steps) {
             self.note_live_replay_capture_limit(category);
-            self.state.status =
-                format!("{label} edit staged, but {unrepresentable} point(s) need {need}");
+            self.state.status = live_limit_status(unrepresentable);
         }
     }
 
@@ -25208,9 +25172,7 @@ impl VisionaryApp {
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
-            self.state.status = format!(
-                "MotionModule::set_frame_partial edit staged, but {unrepresentable} point(s) need a numeric part/frame live capture and a unique same-frame key"
-            );
+            self.state.status = live_limit_status(unrepresentable);
         }
     }
 
@@ -25251,9 +25213,7 @@ impl VisionaryApp {
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
-            self.state.status = format!(
-                "Expression partial-frame edit staged, but {unrepresentable} point(s) need an exact numeric part/frame capture and a unique same-frame native key"
-            );
+            self.state.status = live_limit_status(unrepresentable);
         }
     }
 
@@ -25562,9 +25522,7 @@ impl VisionaryApp {
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
-            self.state.status = format!(
-                "MotionModule::set_rate_partial edit staged, but {unrepresentable} point(s) need a numeric part/rate live capture, a unique same-frame key, and a positive live replacement"
-            );
+            self.state.status = live_limit_status(unrepresentable);
         }
     }
 
@@ -25605,9 +25563,7 @@ impl VisionaryApp {
         self.game_link.send_hitbox_rules(&all);
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
-            self.state.status = format!(
-                "Expression partial-rate edit staged, but {unrepresentable} point(s) need an exact numeric part/rate capture, a unique same-frame native key, and a positive live replacement"
-            );
+            self.state.status = live_limit_status(unrepresentable);
         }
     }
 
@@ -40637,7 +40593,7 @@ mod live_effect_capture_tests {
         added.active_start = 7;
         added.offset = [1.5, -2.0, 0.25];
         added.scale = 1.5;
-        // What the "+ Add effect call" button writes, and what the export emits.
+        // What the "+ Add effect" button writes, and what the export emits.
         added.extra_args = Some(vec!["true".into()]);
 
         let inject = VisionaryApp::build_effect_inject_from_captures(&added, &[], None, 0)
