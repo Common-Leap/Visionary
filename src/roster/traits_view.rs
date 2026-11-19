@@ -37,6 +37,11 @@ pub struct TraitsView {
 
 impl TraitsView {
     /// Drop the loaded file. Called when the library changes, since a mod may now provide it.
+    /// Show `key`'s values next.
+    pub fn select(&mut self, key: RosterKey) {
+        self.selected = Some(key);
+    }
+
     pub fn invalidate(&mut self) {
         self.loaded = None;
         self.load_error = None;
@@ -63,10 +68,10 @@ impl TraitsView {
                 .inner_margin(egui::Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("◈  Pick a character").size(13.0).strong());
+                        ui.label(RichText::new("Pick a character").size(13.0).strong());
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Choose a fighter above to edit its fighter-wide values — weight, speed, jumps, shield and more.")
+                            RichText::new("Choose a fighter above to change its weight, speed, jumps, shield and more.")
                                 .small()
                                 .weak(),
                         );
@@ -154,13 +159,13 @@ impl TraitsView {
                     ui.separator();
                     ui.scope(|ui| {
                         ui.set_width(190.0);
-                        crate::ui::search_field(ui, "traits_search", &mut self.filter, "Search values…");
+                        crate::ui::search_field(ui, "traits_search", &mut self.filter, "Search values");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 count > 0,
-                                egui::Button::new(RichText::new("  ↺ Reset all  ").small()),
+                                egui::Button::new(RichText::new("Reset all").small()),
                             )
                             .on_hover_text("Return every value to the game's own")
                             .clicked()
@@ -187,7 +192,7 @@ impl TraitsView {
             ui.colored_label(Color32::from_rgb(120, 185, 235), "ⓘ");
             ui.label(
                 RichText::new(
-                    "Edits are saved with your project and included when you export — no separate apply step.",
+                    "Saved with the project and exported with it.",
                 )
                 .small()
                 .weak(),
@@ -230,7 +235,6 @@ impl TraitsView {
         if !self.status.is_empty() {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(120, 185, 235), "●");
                 ui.label(RichText::new(&self.status).small().weak());
             });
         }
@@ -257,7 +261,7 @@ impl TraitsView {
                             );
                         }
                         ui.label(
-                            RichText::new(format!("{} fighter(s) have edits", params.len()))
+                            RichText::new(format!("{} fighters changed", params.len()))
                                 .small()
                                 .weak(),
                         );
@@ -306,7 +310,7 @@ impl TraitsView {
                     ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{display_name} is a costume of {donor} — these values belong to {donor} as a whole."
+                            "{display_name} is a costume of {donor}. These values belong to {donor} as a whole."
                         ))
                         .strong(),
                     );
@@ -529,7 +533,7 @@ impl TraitsView {
                     }
                     if is_edited {
                         if ui
-                            .small_button(RichText::new(" ↺ ").small())
+                            .small_button(RichText::new("Reset").small())
                             .on_hover_text("Return to the game's value")
                             .clicked()
                         {

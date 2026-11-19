@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
+mod project_page;
+
 /// Whether the game has reached the terminal state requested by a carrier send.
 ///
 /// A populated snapshot needs a newly disk-loaded, spawned carrier. An empty snapshot is a
@@ -1433,6 +1435,11 @@ fn adopt_captured_expressions(
         .expression_script
         .to_motion_module_set_frame_partial_events();
     true
+}
+
+/// Whether two parsed scripts say the same thing.
+fn same_script(a: &crate::data::AcmdScript, b: &crate::data::AcmdScript) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
 
 fn resolve_sound_state(
@@ -3558,6 +3565,15 @@ pub struct VisionaryApp {
     /// Newest change time of the project's files for that skin, checked about once a second.
     skin_files_stamp: Option<Option<std::time::SystemTime>>,
     skin_files_checked: Option<std::time::Instant>,
+    /// The open effect file when it comes from the project or a picked folder, and when it
+    /// last changed, so a change made in another tool reloads it.
+    effect_file_stamp: Option<(PathBuf, Option<std::time::SystemTime>)>,
+    /// Preview playback speed in game frames a second; 60 is the game's.
+    playback_fps: f32,
+    /// The project's characters and part folders, with the project folder they were read from.
+    project_parts_cache: Option<(PathBuf, crate::project_parts::ProjectParts)>,
+    /// The card and part open on the Project page.
+    project_open_part: Option<(String, crate::project_parts::Part)>,
     workspace_asset_cache_root: Option<PathBuf>,
     workspace_asset_reclaimed: u64,
     /// Fresh generation for disk-staged model/motion carrier snapshots. Timestamp-seeded on send
@@ -4110,6 +4126,10 @@ impl VisionaryApp {
             workspace_copy_rx: None,
             workspace_asset_sent_slot: None,
             preview_skin: None,
+            effect_file_stamp: None,
+            playback_fps: 60.0,
+            project_parts_cache: None,
+            project_open_part: None,
             skin_files_stamp: None,
             skin_files_checked: None,
             workspace_asset_cache_root: None,
@@ -4277,6 +4297,20 @@ impl VisionaryApp {
     /// Falls back to the export-root path when nothing exists, preserving the previous
     /// behaviour (and the previous error message) for genuinely missing files.
     fn resolve_eff_source(&self, source_rel: &str) -> PathBuf {
+        // The project's own copy, or a folder picked for the effects, comes before the game.
+        if let Some((workspace, parts)) = &self.project_parts_cache {
+            let rel = source_rel.replace('\\', "/");
+            let picked = match rel.strip_prefix("effect/fighter/").and_then(|rest| rest.split_once('/')) {
+                Some((fighter, rest)) => parts.link(fighter, crate::project_parts::Part::Effects, 0).map(|dir| dir.join(rest)),
+                None => rel
+                    .strip_prefix("effect/")
+                    .and_then(|rest| Some(parts.link(crate::project_parts::OTHER_EFFECTS, crate::project_parts::Part::Effects, 0)?.join(rest))),
+            };
+            let own = crate::project_hub::workspace_romfs(workspace).join(&rel);
+            if let Some(found) = picked.into_iter().chain([own]).find(|path| path.is_file()) {
+                return found;
+            }
+        }
         let primary = self.eff_editor.export_root().join(source_rel);
         if primary.exists() {
             return primary;
@@ -4844,6 +4878,9 @@ impl VisionaryApp {
 
         // The desktop no longer simulates or renders particles. Keep the selected fighter's
         // effect file queued for the editor; live preview is provided by slight_replica in game.
+        let eff_rel = format!("effect/fighter/{0}/ef_{0}.eff", fighter.name);
+        let own_eff = Some(self.resolve_eff_source(&eff_rel))
+            .filter(|path| *path != self.eff_editor.export_root().join(&eff_rel) && path.is_file());
         let eff_path = fighter
             .effect_dir
             .as_ref()
@@ -4857,9 +4894,15 @@ impl VisionaryApp {
                 })
             })
             .filter(|path| path.exists());
-        self.current_eff_path = eff_path.clone();
-        if let Some(path) = eff_path {
-            self.eff_editor.queue_load(&path);
+        if let Some(path) = own_eff {
+            // The project's effect file, or one in a folder picked for it, stands for the game's.
+            self.current_eff_path = Some(path.clone());
+            self.eff_editor.load_as(&path, eff_rel);
+        } else {
+            self.current_eff_path = eff_path.clone();
+            if let Some(path) = eff_path {
+                self.eff_editor.queue_load(&path);
+            }
         }
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
@@ -9731,7 +9774,7 @@ impl VisionaryApp {
                 self.eff_editor.selected_entry_name().map(str::to_owned),
                 self.effect_editor_draw_path(),
             ) {
-                let clock = (self.effect_loop_started.elapsed().as_secs_f32() * 60.0) as usize;
+                let clock = (self.effect_loop_started.elapsed().as_secs_f32() * self.playback_fps) as usize;
                 let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
                 out.push(crate::vfx_preview::EffectDraw {
                     file,
@@ -10755,6 +10798,7 @@ impl VisionaryApp {
                     .range(1..=self.state.total_frames.max(1))
                     .prefix("Frame "),
             );
+            self.playback_speed_slider(ui);
             ui.toggle_value(&mut self.node_preview, "3D")
                 .on_hover_text("Show the character beside the graph");
             ui.menu_button("Live values", |ui| self.draw_live_trigger_values(ui))
@@ -11028,9 +11072,14 @@ impl VisionaryApp {
                     );
                 }
                 crate::move_nodes::model::Track::Sound => {
+                    // A graph always rebuilds the sound track; keep it only when it changes it.
+                    let unchanged = !self.state.sound_script_edits.contains_key(&key)
+                        && same_script(&script, &self.state.sound_script);
                     self.state.sounds = script.to_sound_events();
                     self.state.sound_script = script.clone();
-                    self.state.sound_script_edits.insert(key.clone(), script);
+                    if !unchanged {
+                        self.state.sound_script_edits.insert(key.clone(), script);
+                    }
                 }
                 crate::move_nodes::model::Track::Expression => {
                     self.state.expressions = script.to_expression_events();
@@ -18494,10 +18543,14 @@ impl VisionaryApp {
     /// baseline it sets meaningful — [`resolve_sound_state`] derives that from what it is given.
     /// Move load is the only caller, and it assigns the parse immediately before.
     fn apply_saved_sound_edits_to_current(&mut self) {
-        let saved = self
-            .current_move_key()
-            .and_then(|key| self.state.sound_script_edits.get(&key))
-            .cloned();
+        let key = self.current_move_key();
+        // Older projects stored every graph's sound track, changed or not.
+        if let Some(key) = &key {
+            if self.state.sound_script_edits.get(key).is_some_and(|edit| same_script(edit, &self.state.sound_script)) {
+                self.state.sound_script_edits.remove(key);
+            }
+        }
+        let saved = key.and_then(|key| self.state.sound_script_edits.get(&key)).cloned();
         let (script, shown, baseline) = resolve_sound_state(&self.state.sound_script, saved);
         self.state.sound_script = script;
         self.state.sounds = shown;
@@ -19865,7 +19918,16 @@ impl VisionaryApp {
             }
             self.state.status = message;
         }
-        self.reload_changed_skin_files();
+        self.project_parts();
+        // Files changed by other tools are looked for once a second.
+        if self
+            .skin_files_checked
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1))
+        {
+            self.skin_files_checked = Some(std::time::Instant::now());
+            self.reload_changed_effect_file();
+            self.reload_changed_skin_files();
+        }
     }
 
     /// The model folder a skin shows: the project's own copy when it has one, else the last
@@ -19888,9 +19950,19 @@ impl VisionaryApp {
             }
         };
         if let Some(workspace) = self.project_path.as_ref().and_then(|path| path.parent()) {
-            let dir = crate::project_hub::workspace_romfs(workspace).join(&relative);
-            if complete(&dir) {
-                return Some((dir, "this project".into()));
+            let romfs = crate::project_hub::workspace_romfs(workspace).join(&relative);
+            if let Ok((model, motion)) =
+                crate::project_hub::workspace_fighter_slot_dirs(workspace, fighter, slot)
+            {
+                let dir = if part == "model" { model } else { motion };
+                if complete(&dir) {
+                    let from = if dir == romfs {
+                        "this project".to_owned()
+                    } else {
+                        format!("your folder {}", dir.file_name().unwrap_or_default().to_string_lossy())
+                    };
+                    return Some((dir, from));
+                }
             }
         }
         self.all_roots().iter().rev().find_map(|root| {
@@ -19925,7 +19997,11 @@ impl VisionaryApp {
             .map(|root| root.join(&relative))
             .collect();
         if let Some(workspace) = self.project_path.as_ref().and_then(|path| path.parent()) {
-            layers.push(crate::project_hub::workspace_romfs(workspace).join(&relative));
+            if let Ok((model, _)) =
+                crate::project_hub::workspace_fighter_slot_dirs(workspace, fighter, slot)
+            {
+                layers.push(model);
+            }
         }
         layers.retain(|dir| dir.is_dir());
         if layers.len() < 2 {
@@ -19968,23 +20044,12 @@ impl VisionaryApp {
         ) else {
             return;
         };
-        if self
-            .skin_files_checked
-            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
-        {
-            return;
-        }
-        self.skin_files_checked = Some(std::time::Instant::now());
         let Ok((model, motion)) =
             crate::project_hub::workspace_fighter_slot_dirs(&workspace, &fighter, slot)
         else {
             return;
         };
-        let newest = [model, motion]
-            .iter()
-            .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
-            .filter_map(|entry| entry.metadata().ok()?.modified().ok())
-            .max();
+        let newest = [model, motion].iter().filter_map(|dir| crate::project_parts::newest_change(dir)).max();
         // The first look only records what is there; any later difference is a change.
         let before = self.skin_files_stamp.replace(newest);
         if before.is_none() || before == Some(newest) {
@@ -20005,7 +20070,7 @@ impl VisionaryApp {
             .find(|entry| entry.name.eq_ignore_ascii_case(&fighter))
             .map_or(fighter.clone(), |entry| entry.display_name.clone());
         self.state.status = format!(
-            "Files for {shown} c{slot:02} changed; reloaded the preview{}.",
+            "Reloaded {shown} c{slot:02} in the preview{}.",
             if sent { " and the game" } else { "" }
         );
     }
@@ -20032,16 +20097,23 @@ impl VisionaryApp {
             } else if extension == "prc" {
                 crate::project_hub::import_swing_prc(workspace, fighter, slot, &path)
                     .map(|_| "swing.prc".to_owned())
-            } else if extension == "eff" {
-                let dir = crate::project_hub::workspace_romfs(workspace)
-                    .join("effect/fighter")
-                    .join(fighter);
+            } else if extension == "eff" || extension == "nus3audio" || extension == "nus3bank" {
+                let parts = crate::project_parts::ProjectParts::load(workspace);
+                let part = if extension == "eff" {
+                    crate::project_parts::Part::Effects
+                } else {
+                    crate::project_parts::Part::Sounds
+                };
+                let mut dir = parts.dir(workspace, fighter, part, slot).unwrap_or_default();
+                if part == crate::project_parts::Part::Sounds && parts.link(fighter, part, slot).is_none() {
+                    dir = dir.join(crate::project_parts::sound_target(&name));
+                }
                 std::fs::create_dir_all(&dir)
                     .and_then(|()| std::fs::copy(&path, dir.join(&name)))
-                    .map(|_| format!("{name} to the effects"))
+                    .map(|_| format!("{name} to the {}", part.title().to_lowercase()))
                     .map_err(anyhow::Error::from)
             } else {
-                Err(anyhow::anyhow!("not a model, animation, swing or effect file"))
+                Err(anyhow::anyhow!("not a model, animation, swing, effect or sound file"))
             };
             match result {
                 Ok(what) => done.push(what),
@@ -20053,459 +20125,6 @@ impl VisionaryApp {
             (true, false) => format!("Nothing added. {}", refused.join("; ")),
             (false, false) => format!("Added {}. Not added: {}", done.join(", "), refused.join("; ")),
         };
-    }
-
-    /// One row of Model / Animations / Effects / Scripts: where it comes from.
-    fn character_part_row(ui: &mut Ui, part: &str, from: &str, words: &str) {
-        ui.horizontal(|ui| {
-            ui.add_sized([96.0, 18.0], egui::Label::new(egui::RichText::new(part).strong()));
-            let colour = match from {
-                "this project" => egui::Color32::from_rgb(120, 200, 140),
-                "the game" => egui::Color32::GRAY,
-                _ => egui::Color32::from_rgb(125, 190, 235),
-            };
-            ui.colored_label(colour, format!("From {from}"));
-            ui.weak(words);
-        });
-    }
-
-    /// Characters > This project: the open project's characters, what of each is edited and
-    /// what still comes from the game, and where to put more.
-    fn draw_project_characters(&mut self, ui: &mut Ui) {
-        enum WorkspaceAction {
-            CopyBaseFiles,
-            CopyBaseModel,
-            CopyBaseCharacter,
-            ImportModelFolder,
-            ImportModelFiles,
-            ImportAnimations,
-            ImportSwing,
-            Send,
-            Stop,
-            Reveal,
-        }
-
-        let workspace = self
-            .project_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        let fighter = self
-            .state
-            .selected_fighter
-            .and_then(|index| self.state.fighters.get(index))
-            .map(|entry| {
-                (
-                    entry.name.clone(),
-                    entry.display_name.clone(),
-                    entry.slots.clone(),
-                    entry.base_slot(),
-                )
-            });
-        if let Some((_, _, slots, base_slot)) = &fighter {
-            if !slots.contains(&self.workspace_asset_slot) {
-                self.workspace_asset_slot = *base_slot;
-            }
-        }
-        let mut action = None;
-        {
-                if let Some(dir) = &workspace {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Open project folder").clicked() {
-                            if let Err(error) = crate::roster::reveal::reveal(dir) {
-                                self.state.status = error.to_string();
-                            }
-                        }
-                        if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base game files")).on_disabled_hover_text("Choose a base game folder from File, or wait for the current copy to finish.").clicked() {
-                            action = Some(WorkspaceAction::CopyBaseFiles);
-                        }
-                    });
-                    ui.weak("Copy files into romfs/, edit them, then export your mod.");
-                } else {
-                    if ui.button("Open or create a project").clicked() {
-                        self.project_hub.show = true;
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if let Some((_, display, slots, _)) = &fighter {
-                        ui.label(display);
-                        egui::ComboBox::from_id_salt("workspace_asset_slot")
-                            .selected_text(format!("c{:02}", self.workspace_asset_slot))
-                            .width(58.0)
-                            .show_ui(ui, |ui| {
-                                for slot in slots {
-                                    ui.selectable_value(
-                                        &mut self.workspace_asset_slot,
-                                        *slot,
-                                        format!("c{slot:02}"),
-                                    );
-                                }
-                            });
-                    }
-                });
-                if let Some((name, _, _, _)) = &fighter {
-                    let slot = self.workspace_asset_slot;
-                    self.show_skin(name, slot);
-                    let lower = name.to_ascii_lowercase();
-                    let model = self.skin_folder(name, "model", slot);
-                    let motion = self.skin_folder(name, "motion", slot);
-                    let from = |found: &Option<(PathBuf, String)>| {
-                        found.as_ref().map_or("the game".to_owned(), |(_, from)| from.clone())
-                    };
-                    let scripts = self.state.edit_log.entries.get(&lower).map_or(0, HashMap::len);
-                    let nodes = self.move_graphs.get(&lower).map_or(0, BTreeMap::len);
-                    let effects = self.eff_mods.contains_key(&lower);
-                    ui.add_space(4.0);
-                    Self::character_part_row(ui, "Model", &from(&model), "");
-                    Self::character_part_row(ui, "Animations", &from(&motion), "");
-                    Self::character_part_row(
-                        ui,
-                        "Effects",
-                        if effects { "this project" } else { "the game" },
-                        if effects { "effect changes saved in the project" } else { "" },
-                    );
-                    Self::character_part_row(
-                        ui,
-                        "Scripts",
-                        if scripts + nodes > 0 { "this project" } else { "the game" },
-                        &format!(
-                            "{scripts} move(s) edited, {nodes} with nodes · on top of {}",
-                            self.acmd_src
-                                .as_ref()
-                                .map_or("the game's scripts".to_owned(), |index| index.root.display().to_string())
-                        ),
-                    );
-                    ui.weak("The preview shows this skin. Drop model, animation, swing or effect files on this page to add them to it.");
-                    let dropped: Vec<PathBuf> = ui.ctx().input(|input| {
-                        input.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect()
-                    });
-                    if !dropped.is_empty() {
-                        if let Some(workspace) = &workspace {
-                            self.import_dropped_files(workspace, name, slot, dropped);
-                        } else {
-                            self.state.status = "Open or create a project before adding files.".into();
-                        }
-                    }
-                    ui.add_space(4.0);
-                }
-                match (&workspace, &fighter) {
-                    (Some(workspace), Some((fighter, _, _, _))) => {
-                        let inventory = crate::project_hub::workspace_asset_inventory(
-                            workspace,
-                            fighter,
-                            self.workspace_asset_slot,
-                        )
-                        .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} model file{} · {} animation{} · swing.prc {}",
-                                inventory.model_files.len(),
-                                if inventory.model_files.len() == 1 { "" } else { "s" },
-                                inventory.animations.len(),
-                                if inventory.animations.len() == 1 { "" } else { "s" },
-                                if inventory.swing_prc { "ready" } else { "not added" },
-                            ))
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        );
-                        let asset_status = self.game_link.asset_bundle_status();
-                        if asset_status.target == fighter.to_ascii_lowercase()
-                            && asset_status.generation == self.workspace_asset_generation
-                            && self.workspace_asset_sent_slot == Some(self.workspace_asset_slot)
-                        {
-                            let message = format!("Model preview in the game: {} · {}/{} files loaded",
-                                if asset_status.ready { "preview ready" }
-                                else if asset_status.phase == "ready" { "waiting for the game" }
-                                else { &asset_status.phase },
-                                asset_status.served, asset_status.staged);
-                            ui.label(
-                                egui::RichText::new(message)
-                                    .small()
-                                    .color(egui::Color32::from_rgb(125, 190, 235)),
-                            );
-                        }
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base character")).on_hover_text("Copy this costume's base model AND animations (all model/motion parts, motion_list.bin, swing.prc) into romfs/ for editing; keep existing edits").clicked() {
-                                action = Some(WorkspaceAction::CopyBaseCharacter);
-                            }
-                            if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base model")).on_hover_text("Copy the complete base game model and textures for this costume; keep existing edits").clicked() {
-                                action = Some(WorkspaceAction::CopyBaseModel);
-                            }
-                            if ui.button("Model folder").on_hover_text(
-                                "Copy a complete model folder into this project's selected fighter/costume",
-                            ).clicked() {
-                                action = Some(WorkspaceAction::ImportModelFolder);
-                            }
-                            if ui.button("Model files").on_hover_text(
-                                "Copy selected model, material, skeleton, helper, or texture files",
-                            ).clicked() {
-                                action = Some(WorkspaceAction::ImportModelFiles);
-                            }
-                            if ui.button("Animations").on_hover_text(
-                                "Copy one or more .nuanmb files into the selected motion folder",
-                            ).clicked() {
-                                action = Some(WorkspaceAction::ImportAnimations);
-                            }
-                            if ui.button("swing.prc").on_hover_text(
-                                "Copy a .prc file into the selected motion folder as swing.prc",
-                            ).clicked() {
-                                action = Some(WorkspaceAction::ImportSwing);
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add_enabled(
-                                    inventory.total_files() > 0,
-                                    egui::Button::new("Reload asset preview"),
-                                )
-                                .on_hover_text(
-                                    "Show the changed model and animations on the fighter in the running game. The fighter must not hold an item while it loads.",
-                                )
-                                .clicked()
-                            {
-                                action = Some(WorkspaceAction::Send);
-                            }
-                            if ui.button("Open slot folder").on_hover_text("Open this costume's project copies (romfs/fighter/… — the files you edit) in your file manager").clicked() {
-                                action = Some(WorkspaceAction::Reveal);
-                            }
-                            if ui.button("Stop preview").clicked() {
-                                action = Some(WorkspaceAction::Stop);
-                            }
-                        });
-                        ui.label(
-                            egui::RichText::new(
-                                "Edit the project copies, then reload to preview. Stop restores the original model.",
-                            )
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        );
-                        egui::CollapsingHeader::new("How to preview a model edit")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                for step in [
-                                    "1. Start Visionary before the game. Enable Visionary Live Assets in ARCropolis and restart the game after the first installation; later edits reload within the match.",
-                                    "2. Import the model, texture, animation, or swing files you changed. Missing files use the selected costume's vanilla model and motion folders, including motion_list.bin.",
-                                    "3. Connect in Training Mode and press Reload asset preview with the fighter's ordinary item slot empty. The preview follows the fighter's current animation and frame; the item slot is released after construction.",
-                                    "4. Edit the imported copies, then reload again. Stop preview restores the original model. Don't call an Alucard assist trophy during a preview.",
-                                    "The preview changes appearance and swing physics; the fighter's gameplay collision and attacks remain unchanged. Export mod keeps the original file names.",
-                                ] {
-                                    ui.label(egui::RichText::new(step).small());
-                                }
-                            });
-                    }
-                    (None, _) => {
-                        ui.label(
-                            egui::RichText::new(
-                                "Open or create a project before importing iteration files.",
-                            )
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        );
-                    }
-                    (_, None) => {
-                        ui.label(
-                            egui::RichText::new(
-                                "Select a fighter to choose its model and motion paths.",
-                            )
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        );
-                    }
-                }
-
-                ui.add_space(6.0);
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(380.0)
-                    .show(ui, |ui| {
-                        if let Some(dir) = &workspace {
-                            crate::ui::file_tree(ui, dir);
-                        }
-                    });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Open or create a project").clicked() {
-                        self.project_hub.show = true;
-                    }
-                });
-        }
-
-        if matches!(
-            action,
-            Some(
-                WorkspaceAction::CopyBaseFiles
-                    | WorkspaceAction::CopyBaseModel
-                    | WorkspaceAction::CopyBaseCharacter
-            )
-        ) {
-            let (Some(workspace), Some(root)) = (&workspace, &self.state.data_root) else {
-                self.state.status = "Choose a base game folder from File first.".into();
-                return;
-            };
-            let sources = if matches!(action, Some(WorkspaceAction::CopyBaseCharacter)) {
-                let Some((fighter, _, _, _)) = &fighter else {
-                    return;
-                };
-                let slot = self.workspace_asset_slot;
-                match crate::project_hub::collect_base_character_files(root, fighter, slot) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        self.state.status = format!("Could not read base character: {error:#}");
-                        return;
-                    }
-                }
-            } else if matches!(action, Some(WorkspaceAction::CopyBaseModel)) {
-                let Some((fighter, _, _, _)) = &fighter else {
-                    return;
-                };
-                let folder = root
-                    .join("fighter")
-                    .join(fighter)
-                    .join("model/body")
-                    .join(format!("c{:02}", self.workspace_asset_slot));
-                match std::fs::read_dir(&folder).and_then(|entries| {
-                    entries
-                        .filter_map(|entry| match entry {
-                            Ok(entry) if entry.path().is_file() => Some(Ok(entry.path())),
-                            Ok(_) => None,
-                            Err(error) => Some(Err(error)),
-                        })
-                        .collect::<std::io::Result<Vec<_>>>()
-                }) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        self.state.status = format!("Could not read base model: {error}");
-                        return;
-                    }
-                }
-            } else {
-                let Some(files) = rfd::FileDialog::new()
-                    .set_title("Copy base game files into project")
-                    .set_directory(root)
-                    .pick_files()
-                else {
-                    return;
-                };
-                files
-            };
-            let workspace = workspace.clone();
-            let root = root.clone();
-            let (sender, receiver) = std::sync::mpsc::channel();
-            self.workspace_copy_rx = Some(receiver);
-            self.state.status = "Copying base game files…".into();
-            std::thread::spawn(move || {
-                let result = crate::project_hub::copy_base_files(&workspace, &root, &sources)
-                    .map_err(|error| format!("{error:#}"));
-                let _ = sender.send(result);
-            });
-            return;
-        }
-
-        let (Some(action), Some(workspace), Some((fighter, _, _, _))) =
-            (action, workspace, fighter)
-        else {
-            return;
-        };
-        let slot = self.workspace_asset_slot;
-        let result: anyhow::Result<Vec<std::path::PathBuf>> = match action {
-            WorkspaceAction::CopyBaseFiles
-            | WorkspaceAction::CopyBaseModel
-            | WorkspaceAction::CopyBaseCharacter => unreachable!(),
-            WorkspaceAction::ImportModelFolder => {
-                let Some(source) = rfd::FileDialog::new()
-                    .set_title("Choose model folder")
-                    .pick_folder()
-                else {
-                    return;
-                };
-                crate::project_hub::import_model_folder(&workspace, &fighter, slot, &source)
-            }
-            WorkspaceAction::ImportModelFiles => {
-                let Some(sources) = rfd::FileDialog::new()
-                    .set_title("Choose model files")
-                    .add_filter(
-                        "Smash model files",
-                        crate::project_hub::MODEL_ASSET_EXTENSIONS,
-                    )
-                    .pick_files()
-                else {
-                    return;
-                };
-                crate::project_hub::import_model_files(&workspace, &fighter, slot, &sources)
-            }
-            WorkspaceAction::ImportAnimations => {
-                let Some(sources) = rfd::FileDialog::new()
-                    .set_title("Choose animations")
-                    .add_filter("Smash animation", &["nuanmb"])
-                    .pick_files()
-                else {
-                    return;
-                };
-                crate::project_hub::import_animation_files(&workspace, &fighter, slot, &sources)
-            }
-            WorkspaceAction::ImportSwing => {
-                let Some(source) = rfd::FileDialog::new()
-                    .set_title("Choose swing.prc")
-                    .add_filter("Swing parameters", &["prc"])
-                    .pick_file()
-                else {
-                    return;
-                };
-                crate::project_hub::import_swing_prc(&workspace, &fighter, slot, &source)
-                    .map(|path| vec![path])
-            }
-            WorkspaceAction::Send => {
-                self.send_workspace_asset_bundle(&workspace, &fighter, slot);
-                return;
-            }
-            WorkspaceAction::Stop => {
-                let generation = self.next_workspace_asset_generation();
-                self.game_link
-                    .send_asset_bundle(&crate::game_link::AssetBundleWire {
-                        generation,
-                        target: String::new(),
-                        files: Vec::new(),
-                    });
-                self.state.status = "Asset preview stop queued.".into();
-                return;
-            }
-            WorkspaceAction::Reveal => {
-                let (model, _) = match crate::project_hub::workspace_fighter_slot_dirs(
-                    &workspace, &fighter, slot,
-                ) {
-                    Ok(paths) => paths,
-                    Err(error) => {
-                        self.state.status = format!("Could not open slot folder: {error:#}");
-                        return;
-                    }
-                };
-                let slot_root = model
-                    .parent()
-                    .and_then(std::path::Path::parent)
-                    .and_then(std::path::Path::parent)
-                    .unwrap_or(&model);
-                match crate::roster::reveal::reveal(slot_root) {
-                    Ok(()) => self.state.status = format!("Opened {}", slot_root.display()),
-                    Err(error) => {
-                        self.state.status =
-                            format!("Could not open {}: {error:#}", slot_root.display())
-                    }
-                }
-                return;
-            }
-        };
-        match result {
-            Ok(files) => {
-                self.state.status = format!(
-                    "Imported {} file{} for {fighter} c{slot:02}; ready to send or export.",
-                    files.len(),
-                    if files.len() == 1 { "" } else { "s" }
-                );
-            }
-            Err(error) => self.state.status = format!("Asset import failed: {error:#}"),
-        }
     }
 
     /// Export one directly installable ARCropolis mod folder. The generated Skyline plugin
@@ -20870,6 +20489,20 @@ impl VisionaryApp {
                         }
                     }
                     Err(e) => errors.push(format!("workspace overlay failed: {e:#}")),
+                }
+            }
+            // Folders picked for a part ship at that part's place in the game.
+            for (folder, target) in crate::project_parts::ProjectParts::load(&workspace).shipped_folders() {
+                match crate::project_parts::ship_folder(&folder, &target, &dest) {
+                    Ok((copied, kept)) => {
+                        if copied > 0 {
+                            report.push(format!("{copied} file(s) from {} to {}", folder.display(), target.display()));
+                        }
+                        for path in kept {
+                            errors.push(format!("{path}: kept the file the export built over the one in {}", folder.display()));
+                        }
+                    }
+                    Err(e) => errors.push(format!("{}: {e:#}", folder.display())),
                 }
             }
         }
@@ -29583,7 +29216,7 @@ impl VisionaryApp {
         // the pristine source bytes replaces the previously merged resident file and makes
         // removal take effect immediately instead of leaving the old live payload staged.
         let root = self.eff_editor.export_root().to_path_buf();
-        let src = root.join(&eff.source_rel);
+        let src = self.resolve_eff_source(&eff.source_rel);
         let Ok(bytes) = std::fs::read(&src) else {
             self.state.status = format!("Live deploy: source eff missing ({})", src.display());
             return false;
@@ -29595,6 +29228,11 @@ impl VisionaryApp {
                 return false;
             }
         };
+        self.serve_live_eff(fighter, &eff.source_rel, &merged)
+    }
+
+    /// Stage `bytes` as the game's `source_rel` effect file for the fighter's next match.
+    fn serve_live_eff(&mut self, fighter: &str, source_rel: &str, merged: &[u8]) -> bool {
         // The `ultimate/` validation this used to do inline now lives in `emulator_sd_root`,
         // which is what every SD-writing path in the editor goes through.
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
@@ -29608,7 +29246,7 @@ impl VisionaryApp {
             return false;
         }
         let fname = format!("ef_{fighter}_merged.eff");
-        if let Err(e) = crate::scratch_dirs::replace_file(&dir.join(&fname), &merged) {
+        if let Err(e) = crate::scratch_dirs::replace_file(&dir.join(&fname), merged) {
             self.state.status = format!("Live deploy write failed: {e}");
             return false;
         }
@@ -29629,7 +29267,7 @@ impl VisionaryApp {
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
-        let arc_path = eff.source_rel.to_lowercase();
+        let arc_path = source_rel.to_lowercase();
         entries.retain(|e| e.get("path").and_then(|p| p.as_str()) != Some(arc_path.as_str()));
         entries.push(serde_json::json!({ "path": arc_path, "file": fname }));
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
@@ -32112,6 +31750,16 @@ impl VisionaryApp {
         }
     }
 
+    /// How fast the preview plays, up to the game's own 60 frames a second.
+    fn playback_speed_slider(&mut self, ui: &mut Ui) {
+        ui.add(
+            egui::Slider::new(&mut self.playback_fps, 1.0..=60.0)
+                .integer()
+                .suffix(" fps"),
+        )
+        .on_hover_text("How fast the preview plays. 60 is the game's speed; lower plays in slow motion.");
+    }
+
     fn draw_scrubber(&mut self, ui: &mut Ui) {
         let total = self.timeline_total_frames();
         if total == 0 {
@@ -32129,6 +31777,7 @@ impl VisionaryApp {
                 self.state.playing = false;
             }
             ui.label(format!("Frame {current} / {total}"));
+            self.playback_speed_slider(ui);
             // The Effects page's timeline lists only effects.
             if self.eff_editor.open {
                 return;
@@ -32543,9 +32192,10 @@ impl eframe::App for VisionaryApp {
             // The game's 60 ticks a second, each frame lasting as many ticks as the move's
             // animation speed gives it.
             let clock = MoveClock::new(&self.state.script);
-            let step = |frame: u32| clock.ticks_per_frame(frame) / 60.0;
+            let fps = self.playback_fps.clamp(1.0, 60.0);
+            let step = |frame: u32| clock.ticks_per_frame(frame) / fps;
             let mut elapsed = now.duration_since(self.last_frame_time).as_secs_f32();
-            if elapsed > 0.25 {
+            if elapsed > 0.25_f32.max(2.0 * step(self.state.current_frame)) {
                 // Stalled (a load, a dialog): carry on from here rather than racing to catch up.
                 self.last_frame_time = now;
                 elapsed = 0.0;
@@ -32694,8 +32344,8 @@ impl eframe::App for VisionaryApp {
                     self.open_effects_page();
                 }
                 if ui
-                    .selectable_label(self.roster.open, egui::RichText::new("Characters").strong())
-                    .on_hover_text("Installed mods, the character select screen, new characters and fighter values")
+                    .selectable_label(self.roster.open, egui::RichText::new("Project").strong())
+                    .on_hover_text("This project's characters and each part you change: moves, effects, sounds, model, animations, values and select screen")
                     .clicked()
                 {
                     self.roster.open = true;
@@ -32818,15 +32468,6 @@ impl eframe::App for VisionaryApp {
                     {
                         self.show_transplant = true;
                         self.focus_transplant = true;
-                        toggled = true;
-                    }
-                    if ui
-                        .button("Project files")
-                        .on_hover_text("The files in this project, including models and animations you add yourself")
-                        .clicked()
-                    {
-                        self.roster.open = true;
-                        self.roster.focus_project();
                         toggled = true;
                     }
                     let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
@@ -33661,7 +33302,7 @@ impl eframe::App for VisionaryApp {
                     egui::ScrollArea::vertical()
                         .id_salt("project_characters")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| self.draw_project_characters(ui));
+                        .show(ui, |ui| self.draw_project_page(ui));
                 }
             });
         } else if self.node_workspace {

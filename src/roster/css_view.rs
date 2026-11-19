@@ -339,7 +339,7 @@ impl CssView {
                 .inner_margin(egui::Margin::symmetric(14, 14))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("◇  The stage is empty").size(13.0).strong());
+                        ui.label(RichText::new("The stage is empty").size(13.0).strong());
                         ui.add_space(4.0);
                         ui.label(
                             RichText::new(
@@ -437,7 +437,6 @@ impl CssView {
             ui.add_space(6.0);
             ui.separator();
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(120, 185, 235), "●");
                 ui.label(RichText::new(&self.status).small().weak());
             });
         }
@@ -472,7 +471,7 @@ impl CssView {
                 );
                 ui.add_space(10.0);
                 if ui
-                    .add(egui::Button::new(RichText::new("⟳ Look again").strong()))
+                    .add(egui::Button::new(RichText::new("Look again").strong()))
                     .clicked()
                 {
                     self.attempted = false;
@@ -494,111 +493,70 @@ impl CssView {
         } else {
             visible_len
         };
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let off_label = if self.show_off_roster {
-                        format!("▣ Off-roster ({off_len})")
-                    } else {
-                        format!("▢ Off-roster ({off_len})")
-                    };
-                    if ui
-                        .selectable_label(self.show_off_roster, RichText::new(off_label).small())
-                        .on_hover_text("Characters not on the select screen — restore them here")
-                        .clicked()
-                    {
-                        self.show_off_roster = !self.show_off_roster;
-                        if self.show_off_roster {
-                            self.focus_off_roster = true;
-                        }
-                    }
-                    let bulk_label = if self.show_bulk_names {
-                        "▣ Names"
-                    } else {
-                        "▢ Names"
-                    };
-                    if ui
-                        .selectable_label(self.show_bulk_names, RichText::new(bulk_label).small())
-                        .on_hover_text("Edit display names for every visible entry in one table")
-                        .clicked()
-                    {
-                        self.show_bulk_names = !self.show_bulk_names;
-                        if self.show_bulk_names {
-                            self.focus_names = true;
-                        }
-                    }
-                    ui.separator();
-
-                    ui.scope(|ui| {
-                        ui.set_width(150.0);
-                        crate::ui::search_field(
-                            ui,
-                            "roster_search",
-                            &mut self.grid_filter,
-                            "Find character…",
-                        );
-                    });
-
-                    ui.separator();
-
-                    // One destructive-adjacent action: Hide. Restoring happens
-                    // in the off-roster list; clearing a single entry's edits
-                    // happens in its detail panel.
-                    let has_selection = !self.selected.is_empty();
-                    let can_hide =
-                        has_selection && visible_len.saturating_sub(self.selected.len()) >= 8;
-                    if ui
-                        .add_enabled(can_hide, egui::Button::new(RichText::new("Hide").small()))
-                        .on_hover_text(if can_hide {
-                            "Hide the selected characters (restore them below)"
-                        } else if !has_selection {
-                            "Select a character first"
-                        } else {
-                            "The select screen needs at least 8 fighters"
-                        })
-                        .clicked()
-                    {
-                        self.pending_hide = true;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let changes = project.order.len() + project.hidden.len();
-                        if ui
-                            .add_enabled(
-                                changes > 0,
-                                egui::Button::new(RichText::new("↺ Reset").small()),
-                            )
-                            .on_hover_text("Clear all position/visibility edits")
-                            .clicked()
-                        {
-                            project.order.clear();
-                            project.hidden.clear();
-                            self.order_drafts.clear();
-                            self.status = "Roster positions reset.".into();
-                        }
-
-                        if changes > 0 {
-                            ui.colored_label(
-                                Color32::from_rgb(240, 200, 120),
-                                format!("{changes} change{}", if changes == 1 { "" } else { "s" }),
-                            );
-                        } else if filtering {
-                            ui.label(
-                                RichText::new(format!("{shown_len} of {visible_len} on screen"))
-                                    .small()
-                                    .weak(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new(format!("{visible_len} on screen"))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                    });
-                });
+        let look = crate::ui::look(ui);
+        let toggle = |on: bool| on.then_some(look.accent);
+        ui.horizontal_wrapped(|ui| {
+            if crate::ui::act(ui, look, &format!("Hidden characters ({off_len})"), toggle(self.show_off_roster))
+                .on_hover_text("Characters not on the select screen. Bring them back here.")
+                .clicked()
+            {
+                self.show_off_roster = !self.show_off_roster;
+                if self.show_off_roster {
+                    self.focus_off_roster = true;
+                }
+            }
+            if crate::ui::act(ui, look, "Edit names", toggle(self.show_bulk_names))
+                .on_hover_text("Every shown character's name in one table")
+                .clicked()
+            {
+                self.show_bulk_names = !self.show_bulk_names;
+                if self.show_bulk_names {
+                    self.focus_names = true;
+                }
+            }
+            ui.scope(|ui| {
+                ui.set_width(200.0);
+                crate::ui::search_field(ui, "roster_search", &mut self.grid_filter, "Find a character");
             });
+            // Hiding is the one change made from here. Restoring happens in the hidden list;
+            // clearing one entry's edits happens in its own panel.
+            let has_selection = !self.selected.is_empty();
+            let can_hide = has_selection && visible_len.saturating_sub(self.selected.len()) >= 8;
+            if ui
+                .add_enabled_ui(can_hide, |ui| crate::ui::act(ui, look, "Hide selected", None))
+                .inner
+                .on_hover_text(if can_hide {
+                    "Take the selected characters off the select screen"
+                } else if !has_selection {
+                    "Select a character first"
+                } else {
+                    "The select screen needs at least 8 fighters"
+                })
+                .clicked()
+            {
+                self.pending_hide = true;
+            }
+            let changes = project.order.len() + project.hidden.len();
+            if ui
+                .add_enabled_ui(changes > 0, |ui| crate::ui::act(ui, look, "Reset order", None))
+                .inner
+                .on_hover_text("Undo every move and hide")
+                .clicked()
+            {
+                project.order.clear();
+                project.hidden.clear();
+                self.order_drafts.clear();
+                self.status = "Select screen order reset.".into();
+            }
+            let count = if changes > 0 {
+                format!("{changes} changed")
+            } else if filtering {
+                format!("{shown_len} of {visible_len} shown")
+            } else {
+                format!("{visible_len} characters")
+            };
+            ui.label(RichText::new(count).color(if changes > 0 { look.accent } else { look.dim }));
+        });
     }
 
     // Eight traversal args (ui, roots, index, project, …) is the shape of
@@ -813,7 +771,7 @@ impl CssView {
         if self.selected.len() > 1 {
             ui.label(
                 RichText::new(format!(
-                    "{} selected — drag any to move as a group, Hide acts on all",
+                    "{} selected. Drag any to move as a group, Hide acts on all",
                     self.selected.len()
                 ))
                 .small()
@@ -1045,7 +1003,7 @@ impl CssView {
             (None, _) => {
                 ui.label(
                     RichText::new(
-                        "No fighter behind this entry — it can be reordered and renamed but has no moveset.",
+                        "No fighter behind this entry. It can be reordered and renamed but has no moveset.",
                     )
                     .small()
                     .weak(),
@@ -1123,7 +1081,7 @@ impl CssView {
             }
         }
         self.status = format!(
-            "Moved {} to position {}. {applied} entr{} now differ from the game's order — saved with your project, included on next export.",
+            "Moved {} to position {}. {applied} entr{} now differ from the game's order. Saved with your project, included on next export.",
             entries[from].display_name,
             entries[to].css_order.unwrap_or(0),
             if applied == 1 { "y" } else { "ies" }
@@ -1191,7 +1149,7 @@ impl CssView {
             }
         }
         self.status = format!(
-            "Moved {} fighters as a group — {} position{} updated.",
+            "Moved {} fighters as a group. {} position{} updated.",
             group.len(),
             applied,
             if applied == 1 { "" } else { "s" }
@@ -1306,7 +1264,7 @@ impl CssView {
             }
             if is_edited {
                 if ui
-                    .small_button("↺")
+                    .small_button("Reset")
                     .on_hover_text("Use the game's name")
                     .clicked()
                 {
@@ -1403,7 +1361,7 @@ impl CssView {
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                 ui.label(
-                    RichText::new("No roster row — add from off-roster or the New Character tab.")
+                    RichText::new("No roster row. Add from off-roster or the New Character tab.")
                         .small()
                         .weak(),
                 );
@@ -1429,7 +1387,7 @@ impl CssView {
         let has_detail = !variants.is_empty();
         if has_detail && ui.small_button("Clear detailed variants").clicked() {
             project.name_variants.remove(&entry.key);
-            self.status = "Cleared detailed name variants — now using Display for all.".into();
+            self.status = "Cleared detailed name variants. Now using Display for all.".into();
             return;
         }
         egui::Grid::new(format!("detailed_names_{}", entry.key.as_str()))
@@ -1501,7 +1459,7 @@ impl CssView {
         if slots.is_empty() {
             ui.label(
                 RichText::new(format!(
-                    "No costume slots found on disk for {fighter} — dump its fighter folder to work skins individually."
+                    "No costume slots found on disk for {fighter}. Dump its fighter folder to work skins individually."
                 ))
                 .small()
                 .weak(),
@@ -1518,7 +1476,7 @@ impl CssView {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(
-                    "M model · A anims · E effect · P portrait — dim = missing, hover for counts",
+                    "M model · A anims · E effect · P portrait. Dim = missing, hover for counts",
                 )
                 .small()
                 .weak(),
@@ -1589,7 +1547,7 @@ impl CssView {
                             if inv.has_motion_list {
                                 ", motion_list.bin present"
                             } else {
-                                " — NO motion_list.bin, the game will not find them"
+                                ". NO motion_list.bin, the game will not find them"
                             }
                         )
                     } else {
@@ -1603,7 +1561,7 @@ impl CssView {
                     if inv.has_effect {
                         "own effect file for this slot".to_string()
                     } else {
-                        "no effect file — uses the donor's".to_string()
+                        "no effect file. Uses the donor's".to_string()
                     },
                 );
                 slot_dot(
@@ -1615,7 +1573,7 @@ impl CssView {
                     } else if inv.has_portrait {
                         "portrait file on disk".to_string()
                     } else {
-                        "no portrait yet — pick one in Images below".to_string()
+                        "no portrait yet. Pick one in Images below".to_string()
                     },
                 );
                 let mut edit = current;
@@ -1726,7 +1684,7 @@ impl CssView {
             }
             if project.order.contains_key(&key)
                 && ui
-                    .small_button("↺")
+                    .small_button("Reset")
                     .on_hover_text("Use the game's position")
                     .clicked()
             {
@@ -1744,7 +1702,7 @@ impl CssView {
             }
             OrderAfter::Drop => {}
             OrderAfter::Sentinel => {
-                self.status = "99 is the Random slot — pick another position.".into();
+                self.status = "99 is the Random slot. Pick another position.".into();
                 self.order_drafts.insert(key, draft);
             }
             OrderAfter::Invalid(text) => {
@@ -1770,7 +1728,7 @@ impl CssView {
             ui.label(RichText::new("Costumes offered").small().weak());
             if ui
                 .add(egui::DragValue::new(&mut color).range(1..=64).speed(1))
-                .on_hover_text("8 is vanilla — higher needs a slot-expansion mod")
+                .on_hover_text("8 is vanilla. Higher needs a slot-expansion mod")
                 .changed()
             {
                 patch.color_num = if Some(color) == db_color {
@@ -1812,7 +1770,7 @@ impl CssView {
                     RichText::new("edited").small(),
                 );
                 if ui
-                    .small_button("↺")
+                    .small_button("Reset")
                     .on_hover_text("Use the game's save slot")
                     .clicked()
                 {
@@ -1959,7 +1917,7 @@ impl CssView {
                         _ => {
                             ui.vertical(|ui| {
                                 ui.label(
-                                    RichText::new("no game file — custom only").small().weak(),
+                                    RichText::new("no game file. Custom only").small().weak(),
                                 );
                             });
                         }
@@ -1978,7 +1936,7 @@ impl CssView {
                 ui.image((id, px * (200.0 / longest)));
                 ui.label(
                     RichText::new(format!(
-                        "game {kind} c{slot:02} — pick a PNG below to replace"
+                        "game {kind} c{slot:02}. Pick a PNG below to replace"
                     ))
                     .small()
                     .weak(),
@@ -1990,7 +1948,7 @@ impl CssView {
                 // means the file is absent, not broken.
                 ui.label(
                     RichText::new(format!(
-                        "No {kind} c{slot:02} anywhere yet — pick a PNG below"
+                        "No {kind} c{slot:02} anywhere yet. Pick a PNG below"
                     ))
                     .small()
                     .weak(),
@@ -2003,7 +1961,7 @@ impl CssView {
             }
         }
         ui.label(
-            RichText::new("Change skins in the rows below — the stage follows.")
+            RichText::new("Change skins in the rows below. The stage follows.")
                 .small()
                 .weak(),
         );
@@ -2017,7 +1975,7 @@ impl CssView {
         roots: &[PathBuf],
     ) {
         ui.label(
-            RichText::new("One portrait per skin: pick the costume, then its PNG. Preview fix only changes this editor's preview — Upload fix changes the exported bytes so the game shows what you saw here.")
+            RichText::new("One portrait per skin: pick the costume, then its PNG. Preview fix only changes this editor's preview. Upload fix changes the exported bytes so the game shows what you saw here.")
                 .small()
                 .weak(),
         );
@@ -2266,7 +2224,7 @@ impl CssView {
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.bulk_filter)
                     .desired_width(130.0)
-                    .hint_text("Find a character…"),
+                    .hint_text("Find a character"),
             );
             if !self.bulk_filter.is_empty() && ui.small_button(RichText::new("x").small()).clicked()
             {
@@ -2326,7 +2284,7 @@ impl CssView {
                         }
                         if is_edited {
                             if ui
-                                .small_button(RichText::new("↺").small())
+                                .small_button(RichText::new("Reset").small())
                                 .on_hover_text("Use the game's name for this entry")
                                 .clicked()
                             {
@@ -2364,7 +2322,7 @@ impl CssView {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.off_roster_filter)
                         .desired_width(130.0)
-                        .hint_text("Find a character…"),
+                        .hint_text("Find a character"),
                 );
                 if !self.off_roster_filter.is_empty()
                     && ui.small_button(RichText::new("x").small()).clicked()
@@ -2445,7 +2403,7 @@ impl CssView {
                         };
                         let row = ui.horizontal(|ui| {
                             ui.label(RichText::new(elide(&name, 24)).small().strong())
-                                .on_hover_text(format!("{key} — double-click to restore"));
+                                .on_hover_text(format!("{key}. Double-click to restore"));
                             ui.label(RichText::new(detail).small().weak());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -2488,7 +2446,7 @@ impl CssView {
                         let row = ui.horizontal(|ui| {
                             ui.label(RichText::new(elide(&name, 24)).small().strong())
                                 .on_hover_text(if has_row {
-                                    format!("{key} — double-click to add")
+                                    format!("{key}. Double-click to add")
                                 } else {
                                     key.as_str().to_string()
                                 });
@@ -2516,7 +2474,7 @@ impl CssView {
                                     } else if ui
                                         .small_button(RichText::new("New character →").small())
                                         .on_hover_text(
-                                            "This fighter has no select-screen row — create it as a new character",
+                                            "This fighter has no select-screen row. Create it as a new character",
                                         )
                                         .clicked()
                                     {
@@ -2562,9 +2520,9 @@ impl CssView {
                 .by_key(key)
                 .map(|e| e.display_name.as_str())
                 .unwrap_or("Selection");
-            format!("{name} hidden — restore it from the off-roster list below.")
+            format!("{name} hidden. Restore it from the off-roster list below.")
         } else {
-            format!("{count} fighters hidden — restore them from the off-roster list below.")
+            format!("{count} fighters hidden. Restore them from the off-roster list below.")
         };
     }
 }

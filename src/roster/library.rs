@@ -128,7 +128,7 @@ pub fn detect_arc_root(base: &Path) -> Result<(PathBuf, RootDetection)> {
     }
 
     bail!(
-        "no fighter/, effect/, or ui/ folder found under {} — is this an Arcropolis-style mod?",
+        "no fighter/, effect/, or ui/ folder found under {}. Is this an Arcropolis-style mod?",
         base.display()
     )
 }

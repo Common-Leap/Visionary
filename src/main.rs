@@ -37,6 +37,7 @@ mod preview_stage;
 mod preview_trail;
 mod preview_visibility;
 mod project_hub;
+mod project_parts;
 mod renderer;
 mod roster;
 mod scratch_dirs;

@@ -428,6 +428,8 @@ pub struct EffEditor {
     scan_error: Option<String>,
 
     loaded_path: Option<PathBuf>,
+    /// Game paths of files opened from outside the game folder. See [`Self::load_as`].
+    game_paths: std::collections::HashMap<PathBuf, String>,
     /// Base eff path → merged (transplants applied) file to ACTUALLY parse when that base
     /// is opened. Makes the merged view character-centric: picking ef_kirby.eff shows
     /// kirby WITH its transplants, wherever it's opened from.
@@ -597,6 +599,7 @@ impl Default for EffEditor {
             file_filter: String::new(),
             scan_error: None,
             loaded_path: None,
+            game_paths: Default::default(),
             merged_overlays: std::collections::HashMap::new(),
             loaded_is_merged: false,
             edit_sources: Vec::new(),
@@ -1203,9 +1206,25 @@ impl EffEditor {
 
     /// Loaded eff path relative to the export root (project `source_rel`).
     pub fn loaded_rel(&self) -> Option<String> {
-        let path = self.loaded_path.as_ref()?;
+        Some(self.game_path_of(self.loaded_path.as_ref()?))
+    }
+
+    /// The game path a file on disk stands for: its name inside the game folder, or the one
+    /// it was given when opened from a project or a folder the author picked.
+    fn game_path_of(&self, path: &Path) -> String {
+        if let Some(rel) = self.game_paths.get(path) {
+            return rel.clone();
+        }
         let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        rel.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Open `path` as the game's `rel` (e.g. `effect/fighter/pickel/ef_pickel.eff`), so edits
+    /// to an effect file kept outside the game folder are keyed and exported as that file.
+    /// Opens it again even when it is already open, as a changed file needs.
+    pub fn load_as(&mut self, path: &Path, rel: String) {
+        self.game_paths.insert(path.to_path_buf(), rel);
+        self.pending_load = Some(path.to_path_buf());
     }
 
     pub fn export_root(&self) -> &Path {
@@ -1232,9 +1251,7 @@ impl EffEditor {
         if self.pending_edits.is_some() || self.pending_structure.is_some() {
             return None;
         }
-        let path = self.pending_load.as_ref()?;
-        let rel = path.strip_prefix(&self.export_root).unwrap_or(path);
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        Some(self.game_path_of(self.pending_load.as_ref()?))
     }
 
     /// The project's edits for the file a queued load opens. Applied without sending anything

@@ -39,36 +39,11 @@ impl RosterTab {
 
     fn title(self) -> &'static str {
         match self {
-            Self::Project => "This project",
+            Self::Project => "Characters",
             Self::Library => "Installed mods",
-            Self::CharacterSelect => "Character select",
+            Self::CharacterSelect => "Select screen",
             Self::NewCharacter => "New character",
             Self::Traits => "Fighter values",
-        }
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Project => {
-                "This project's characters: which parts you changed and which still come from \
-                 the game. Drop model, animation or effect files here to add them."
-            }
-            Self::Library => {
-                "Compiled mods Visionary reads fighters, skins, and effects from. Later mods in \
-                 the list win any file two mods both provide."
-            }
-            Self::CharacterSelect => {
-                "The character select screen as the game will build it. Drag a portrait to reorder — \
-                 changes are saved with your project and included when you export a mod."
-            }
-            Self::NewCharacter => {
-                "Add a character to the roster as a costume slot on a donor fighter, and get a \
-                 place to put your own model, animations, and moveset."
-            }
-            Self::Traits => {
-                "Fighter-wide values stored in the character's parameter files — weight, \
-                 gravity, run speed, air acceleration, jumps, shield, and the rest."
-            }
         }
     }
 
@@ -201,6 +176,8 @@ pub struct RosterWindow {
     /// editor is currently open.
     pub meters: std::collections::BTreeMap<String, Vec<crate::gimmicks::meter::MeterBinding>>,
     tab: RosterTab,
+    /// Portraits for the Characters cards.
+    card_portraits: super::icons::PortraitCache,
     status: String,
     import: Option<ImportJob>,
     notes: Vec<ImportNote>,
@@ -243,6 +220,7 @@ impl Default for RosterWindow {
             controller_charts: Default::default(),
             meters: Default::default(),
             tab: RosterTab::Project,
+            card_portraits: Default::default(),
             status: String::new(),
             import: None,
             notes: Vec::new(),
@@ -454,6 +432,55 @@ impl RosterWindow {
         self.tab = RosterTab::Traits;
     }
 
+    /// Show one fighter's values.
+    pub fn focus_traits_for(&mut self, fighter: &str) {
+        self.tab = RosterTab::Traits;
+        self.traits.select(super::RosterKey::fighter(fighter));
+    }
+
+    /// Show the installed mods.
+    pub fn focus_library(&mut self) {
+        self.tab = RosterTab::Library;
+    }
+
+    /// A character's select screen portrait for `slot`, with any picture the project gives it.
+    pub fn portrait(
+        &mut self,
+        ctx: &egui::Context,
+        key: &super::RosterKey,
+        fighter: &str,
+        slot: u8,
+    ) -> Option<egui::TextureHandle> {
+        let name_id = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map(|entry| entry.name_id.clone())
+            .or_else(|| self.index.by_key(key)?.name_id.clone())
+            .or_else(|| {
+                let entries = self.index.sorted();
+                let entry = entries.iter().find(|entry| entry.fighter.as_deref() == Some(fighter))?;
+                entry.name_id.clone()
+            })
+            // The Ice Climbers' select screen row is named for the pair, not either climber.
+            .unwrap_or_else(|| match fighter {
+                "popo" | "nana" => "ice_climber".to_owned(),
+                _ => fighter.to_owned(),
+            });
+        let picked = self
+            .project
+            .ui_images
+            .get(key)
+            .and_then(|images| super::ui_images::find_override(images, "chara_1", slot, slot))
+            .map(|picked| PathBuf::from(&picked.png_path));
+        let roots = self.roots.clone();
+        self.card_portraits
+            .get_with_gamma(ctx, &roots, &name_id, slot, true, picked.as_deref())?
+            .ok()
+            .cloned()
+    }
+
     /// Show the character select tab next time the window draws.
     pub fn focus_character_select(&mut self) {
         self.tab = RosterTab::CharacterSelect;
@@ -549,12 +576,9 @@ impl RosterWindow {
     /// The Characters page, drawn in the main window.
     /// Draw the page; true when "This project" is showing, which the app draws below.
     pub fn page(&mut self, ui: &mut Ui) -> bool {
+        self.card_portraits.begin_frame();
         self.ui_contents(ui);
         self.tab == RosterTab::Project
-    }
-
-    pub fn focus_project(&mut self) {
-        self.tab = RosterTab::Project;
     }
 
     fn ui_contents(&mut self, ui: &mut Ui) {
@@ -568,25 +592,39 @@ impl RosterWindow {
                 font.size *= 1.18;
             }
             style.spacing.item_spacing.y = (style.spacing.item_spacing.y + 1.0).max(5.0);
+            // Small and faint text stay readable: no hint-grey, nothing under 13 px.
+            if let Some(small) = style.text_styles.get_mut(&egui::TextStyle::Small) {
+                small.size = small.size.max(13.0);
+            }
+            let look = crate::ui::look(ui);
+            let style = ui.style_mut();
+            style.visuals.weak_text_color = Some(look.dim);
+            style.visuals.widgets.noninteractive.fg_stroke.color = look.text;
         }
         // One slim top bar: tabs with badges, edit count, and (only when
         // there is something to ship) what an export will contain. The old
         // layout stacked a title card, a metrics row, and a tab-description
         // line above the actual workspace — the grid and the editor below
         // are the focus, not this.
-        self.draw_top_bar(ui);
-        ui.add_space(8.0);
         if self.tab == RosterTab::Project {
             return;
         }
+        let look = crate::ui::look(ui);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, look.page);
+        ui.add_space(4.0);
+        self.draw_top_bar(ui, look);
+        ui.add_space(10.0);
 
         // Content — one outer vertical scroll. Horizontal scrolling lives
         // inside the CSS grid only; the traits tab draws into this scroll
         // directly so two nested vertical scrollers never fight. Content-drag
         // scrolling is off here: the CSS tab owns reorder and marquee drags,
         // and a panning scroll area eats those (and sloppy clicks with them).
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 8))
+        egui::Frame::new()
+            .fill(look.card)
+            .stroke(egui::Stroke::new(1.5, look.edge))
+            .corner_radius(14.0)
+            .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("roster_main_scroll")
@@ -639,26 +677,32 @@ impl RosterWindow {
 
         if !self.status.is_empty() {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(120, 185, 235), "●");
-                ui.label(RichText::new(&self.status).small().weak());
-            });
+            ui.label(RichText::new(&self.status).color(look.text));
         }
     }
 
-    fn draw_top_bar(&mut self, ui: &mut Ui) {
+    /// The page title, a way back to the project, and the other pages.
+    fn draw_top_bar(&mut self, ui: &mut Ui, look: crate::ui::Look) {
         ui.horizontal_wrapped(|ui| {
+            if crate::ui::act(ui, look, "Project", None).clicked() {
+                self.tab = RosterTab::Project;
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new(self.tab.title()).size(30.0).strong().color(look.text));
+            ui.add_space(12.0);
             for tab in RosterTab::ALL {
+                if tab == RosterTab::Project || tab == self.tab {
+                    continue;
+                }
                 let mut text = tab.title().to_string();
                 if let Some(n) = tab.badge_count(self) {
                     text.push_str(&format!(" ({n})"));
                 }
-                ui.selectable_value(&mut self.tab, tab, text)
-                    .on_hover_text(tab.description());
+                if crate::ui::act(ui, look, &text, None).clicked() {
+                    self.tab = tab;
+                }
             }
         });
-        ui.label(RichText::new(self.tab.description()).small().weak());
-        ui.separator();
     }
 
     /// Carry out what the new-character tab asked for.
@@ -784,7 +828,7 @@ impl RosterWindow {
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "Importing {} of {} — {}",
+                                    "Importing {} of {}. {}",
                                     job.done + 1,
                                     job.total,
                                     job.current
@@ -908,14 +952,14 @@ impl RosterWindow {
                                     index + 1 < self.library.mods.len(),
                                     egui::Button::new(RichText::new(" ▼ ").small()),
                                 )
-                                .on_hover_text("Later in load order — wins more conflicts")
+                                .on_hover_text("Later in load order. Wins more conflicts")
                                 .clicked()
                             {
                                 move_later = Some(id);
                             }
                             if ui
                                 .add_enabled(index > 0, egui::Button::new(RichText::new(" ▲ ").small()))
-                                .on_hover_text("Earlier in load order — wins fewer conflicts")
+                                .on_hover_text("Earlier in load order. Wins fewer conflicts")
                                 .clicked()
                             {
                                 move_earlier = Some(id);
@@ -1048,7 +1092,6 @@ impl RosterWindow {
         let total: usize = by_fighter.values().map(|list| list.len()).sum();
         if total == 0 {
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(130, 225, 150), "●");
                 ui.label(
                     RichText::new("No file conflicts between enabled mods.")
                         .small()
@@ -1064,7 +1107,7 @@ impl RosterWindow {
                     ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{total} file(s) provided by more than one enabled mod — later in load order wins."
+                            "{total} file(s) provided by more than one enabled mod. Later in load order wins."
                         ))
                         .small()
                         .strong(),
@@ -1137,7 +1180,7 @@ impl RosterWindow {
                     ui.colored_label(Color32::from_rgb(240, 140, 140), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{} project edit(s) with no matching character — kept, not discarded. Re-enable the mod that provided it to restore them.",
+                            "{} project edit(s) with no matching character. Kept, not discarded. Re-enable the mod that provided it to restore them.",
                             self.index.stale_overrides.len()
                         ))
                         .small()
@@ -1149,7 +1192,7 @@ impl RosterWindow {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("•").small().weak());
                         ui.label(
-                            RichText::new(format!("{} — {}", stale.key, stale.kind.describe()))
+                            RichText::new(format!("{}. {}", stale.key, stale.kind.describe()))
                                 .small()
                                 .weak(),
                         );
@@ -1211,7 +1254,7 @@ impl RosterWindow {
                         Ok(detail) => ui.horizontal(|ui| {
                             ui.colored_label(Color32::from_rgb(130, 225, 150), "✔");
                             ui.label(
-                                RichText::new(format!("{} — {detail}", note.source))
+                                RichText::new(format!("{}. {detail}", note.source))
                                     .small()
                                     .weak(),
                             );
@@ -1219,7 +1262,7 @@ impl RosterWindow {
                         Err(error) => ui.horizontal(|ui| {
                             ui.colored_label(Color32::from_rgb(240, 140, 140), "✘");
                             ui.label(
-                                RichText::new(format!("{} — {error}", note.source))
+                                RichText::new(format!("{}. {error}", note.source))
                                     .small()
                                     .weak(),
                             );
@@ -1234,7 +1277,7 @@ impl RosterWindow {
 
     fn start_import(&mut self, paths: Vec<PathBuf>) {
         if self.import.is_some() {
-            self.status = "An import is already running — wait for it to finish.".into();
+            self.status = "An import is already running. Wait for it to finish.".into();
             return;
         }
         if paths.is_empty() {

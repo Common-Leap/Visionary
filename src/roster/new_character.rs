@@ -154,7 +154,6 @@ impl NewCharacterView {
         } else if !self.status.is_empty() {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(130, 225, 150), "●");
                 ui.label(RichText::new(&self.status).small().weak());
             });
         }
@@ -252,7 +251,7 @@ impl NewCharacterView {
                     if ui
                         .add_enabled(
                             can_create,
-                            egui::Button::new(RichText::new("+ Create character").strong()),
+                            egui::Button::new(RichText::new("Create character").strong()),
                         )
                         .on_hover_text(
                             "Files go to Visionary's authored folder and the character imports immediately",
@@ -264,7 +263,7 @@ impl NewCharacterView {
                     if ui
                         .add_enabled(
                             can_create,
-                            egui::Button::new(RichText::new("Custom folder…").small()),
+                            egui::Button::new(RichText::new("Custom folder").small()),
                         )
                         .on_hover_text("Pick where this character's files go")
                         .clicked()
@@ -305,7 +304,7 @@ impl NewCharacterView {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("Costume slots").small().strong());
                 ui.label(
-                    RichText::new("Pick a fighter first — slots appear after.")
+                    RichText::new("Pick a fighter first. Slots appear after.")
                         .small()
                         .weak(),
                 );
@@ -330,7 +329,7 @@ impl NewCharacterView {
                         .prefix("c")
                         .speed(1),
                 )
-                .on_hover_text("First costume slot — c00–c07 are the donor's own");
+                .on_hover_text("First costume slot. C00–c07 are the donor's own");
             ui.label(RichText::new("×").small().weak());
             let count_resp = ui
                 .add(
@@ -339,7 +338,7 @@ impl NewCharacterView {
                         .suffix(" skins")
                         .speed(1),
                 )
-                .on_hover_text(format!("How many costumes — at least {MIN_SKINS}"));
+                .on_hover_text(format!("How many costumes. At least {MIN_SKINS}"));
             if start_resp.changed() || count_resp.changed() {
                 // saturating_add caps at 255 by type; end >= start always.
                 let end = start.saturating_add(count.saturating_sub(1));
@@ -357,7 +356,7 @@ impl NewCharacterView {
             ui.colored_label(
                 Color32::from_rgb(240, 200, 120),
                 RichText::new(format!(
-                    "No room for {MIN_SKINS} skins from c{:02} — pick a lower first slot.",
+                    "No room for {MIN_SKINS} skins from c{:02}. Pick a lower first slot.",
                     range.0
                 ))
                 .small(),
@@ -370,7 +369,7 @@ impl NewCharacterView {
         } else {
             ui.colored_label(
                 Color32::from_rgb(130, 225, 150),
-                RichText::new(format!("c{:02}…c{:02} all free", range.0, range.1)).small(),
+                RichText::new(format!("c{:02} to c{:02} all free", range.0, range.1)).small(),
             );
         }
 
@@ -380,7 +379,7 @@ impl NewCharacterView {
             let next_btn = ui
                 .add_enabled(
                     next.is_some(),
-                    egui::Button::new(RichText::new("Next free block →").small()),
+                    egui::Button::new(RichText::new("Next free block").small()),
                 )
                 .on_hover_text(if next.is_some() {
                     "Jump to the next clear block of this size"
@@ -402,7 +401,7 @@ impl NewCharacterView {
                 })
                 .small(),
             )
-            .on_hover_text("Show every slot — grey means taken");
+            .on_hover_text("Show every slot. Grey means taken");
         });
 
         // ── The map, only on request ──────────────────────────────
@@ -495,7 +494,7 @@ impl NewCharacterView {
                     || entry.slots.iter().any(|s| *s >= range.0 && *s <= range.1))
         }) {
             self.error = Some(format!(
-                "{display_name} overlaps a character already in the project on {donor} — pick a free range."
+                "{display_name} overlaps a character already in the project on {donor}. Pick a free range."
             ));
             return NewCharacterAction::None;
         }
@@ -558,10 +557,10 @@ impl NewCharacterView {
                 .inner_margin(egui::Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("◇  No characters yet").strong());
+                        ui.label(RichText::new("No characters yet").strong());
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new("Create one above — it lands here with its next step.")
+                            RichText::new("Characters you create show here and on the Project page.")
                                 .small()
                                 .weak(),
                         );
@@ -587,7 +586,7 @@ impl NewCharacterView {
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("◈  {}", authored.display_name)).strong());
+                        ui.label(RichText::new(authored.display_name.as_str()).strong());
                         ui.label(
                             RichText::new(format!(
                                 "c{:02} of {} · {}",
@@ -670,7 +669,7 @@ impl NewCharacterView {
                         if targeted {
                             ui.colored_label(
                                 Color32::from_rgb(130, 225, 150),
-                                RichText::new(format!("● c{:02} only", authored.slot)).small().strong(),
+                                RichText::new(format!("c{:02} only", authored.slot)).small().strong(),
                             );
                         } else {
                             ui.label(
@@ -740,23 +739,16 @@ impl NewCharacterView {
                 ui.horizontal_wrapped(|ui| {
                     chip(
                         ui,
-                        format!("{} Files", if files_done { "●" } else { "◇" }),
+                        "Files".to_owned(),
                         files_done,
                     );
-                    ui.label(RichText::new("→").small().weak());
                     chip(
                         ui,
-                        format!(
-                            "{} Moves {moves_done_count}/{}",
-                            if moves_done { "●" } else { "◇" },
-                            scaffold::MOVESET_TEMPLATE.len()
-                        ),
+                        format!("Moves {moves_done_count}/{}", scaffold::MOVESET_TEMPLATE.len()),
                         moves_done,
                     );
-                    ui.label(RichText::new("→").small().weak());
-                    chip(ui, format!("{} Look", if look_done { "●" } else { "◇" }), look_done);
-                    ui.label(RichText::new("→").small().weak());
-                    chip(ui, format!("{} Ship", if ready { "●" } else { "◇" }), ready);
+                    chip(ui, "Look".to_owned(), look_done);
+                    chip(ui, "Ship".to_owned(), ready);
                 });
                 ui.add_space(2.0);
                 if !files_done {
@@ -773,7 +765,7 @@ impl NewCharacterView {
                                 .weak(),
                         );
                         if ui
-                            .small_button(RichText::new("Finish look →").small())
+                            .small_button(RichText::new("Finish look").small())
                             .clicked()
                         {
                             *result = ExistingAction::GotoCss(authored.key.clone());
@@ -789,7 +781,7 @@ impl NewCharacterView {
                     );
                 } else if ready {
                     ui.label(
-                        RichText::new("Ready to export — Project → Export Mod Folder.")
+                        RichText::new("Ready to export. Export mod.")
                             .small()
                             .strong()
                             .color(Color32::from_rgb(130, 225, 150)),
@@ -843,7 +835,7 @@ impl NewCharacterView {
         let model_state = if inv.meshes > 0 {
             format!("{} mesh, {} texture(s)", inv.meshes, inv.textures)
         } else {
-            "empty — needs .numdlb + .nutexb".to_string()
+            "empty. Needs .numdlb + .nutexb".to_string()
         };
         if let Some(path) = file_row(
             ui,
@@ -904,11 +896,11 @@ impl NewCharacterView {
                 if inv.has_motion_list {
                     ""
                 } else {
-                    " — NO motion_list.bin"
+                    ". NO motion_list.bin"
                 }
             )
         } else {
-            "empty — needs .nuanmb + motion_list.bin".to_string()
+            "empty. Needs .nuanmb + motion_list.bin".to_string()
         };
         if let Some(path) = file_row(
             ui,
@@ -925,7 +917,7 @@ impl NewCharacterView {
             if inv.has_effect {
                 "own slot effect present"
             } else {
-                "optional — plays the donor's without one"
+                "optional. Plays the donor's without one"
             },
             inv.has_effect,
             effect_target,
@@ -936,9 +928,9 @@ impl NewCharacterView {
             ui,
             "Portrait",
             if portrait_png.is_some() {
-                "picked — see Character Select → Images"
+                "picked. See Select screen > Images"
             } else {
-                "optional — pick one in Character Select → Images"
+                "optional. Pick one in Select screen > Images"
             },
             portrait_png.is_some() || inv.has_portrait,
             portrait_png,
@@ -976,7 +968,7 @@ impl NewCharacterView {
                         .color(Color32::from_rgb(130, 225, 150)),
                 );
                 ui.label(
-                    RichText::new("Ready — model, animations, and name are all in place.")
+                    RichText::new("Ready. Model, animations, and name are all in place.")
                         .small()
                         .color(Color32::from_rgb(170, 210, 180)),
                 );
@@ -1018,7 +1010,7 @@ impl NewCharacterView {
         });
         ui.label(
             RichText::new(format!(
-                "The rest still play {}'s version — normal until you change them.",
+                "The rest still play {}'s version. Normal until you change them.",
                 authored.donor
             ))
             .small()
@@ -1108,7 +1100,7 @@ impl NewCharacterView {
         let span = if first == last {
             format!("c{first:02}")
         } else {
-            format!("c{first:02}…c{last:02} ({} skins)", scaffolded.slots.len())
+            format!("c{first:02} to c{last:02} ({} skins)", scaffolded.slots.len())
         };
         self.status = format!(
             "Created {display_name} as costume {span} of {}: {} folder(s). Put your model and \
@@ -1330,7 +1322,7 @@ fn slot_chip(
     let end = slot.saturating_add(count.saturating_sub(1));
     let hover = match status.taken_label() {
         Some(owner) => format!("c{slot:02}: {owner}"),
-        None => format!("Move block here (c{slot:02}…c{end:02})"),
+        None => format!("Move block here (c{slot:02} to c{end:02})"),
     };
     let resp = ui.add(button).on_hover_text(hover);
     if resp.clicked() && free {
@@ -1350,17 +1342,8 @@ fn file_row(
 ) -> Option<PathBuf> {
     let mut ask = None;
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(if done { "●" } else { "◇" })
-                .small()
-                .strong()
-                .color(if done {
-                    Color32::from_rgb(130, 225, 150)
-                } else {
-                    ui.visuals().weak_text_color()
-                }),
-        );
-        ui.label(RichText::new(name).small().strong());
+        let colour = if done { Color32::from_rgb(130, 225, 150) } else { ui.visuals().strong_text_color() };
+        ui.label(RichText::new(name).small().strong().color(colour));
         ui.label(RichText::new(detail).small().weak());
         if let Some(path) = target {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

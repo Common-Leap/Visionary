@@ -172,10 +172,12 @@ pub fn workspace_romfs(workspace: &Path) -> PathBuf {
 }
 
 /// Copy selected dump files into their game-relative editing paths. Existing edits win.
+/// A file under a game folder in `picked` goes to the folder picked for it instead.
 pub fn copy_base_files(
     workspace: &Path,
     data_root: &Path,
     sources: &[PathBuf],
+    picked: &[(PathBuf, PathBuf)],
 ) -> anyhow::Result<(usize, usize)> {
     let root = data_root.canonicalize()?;
     let mut files = Vec::new();
@@ -199,8 +201,15 @@ pub fn copy_base_files(
     let mut copied = 0;
     let mut skipped = 0;
     for (source, relative) in files {
-        let destination = overlay.join(&relative);
-        let mut parent = overlay.clone();
+        let (base, relative) = picked
+            .iter()
+            .find_map(|(game_dir, folder)| {
+                Some((folder.clone(), relative.strip_prefix(game_dir).ok()?.to_path_buf()))
+            })
+            .unwrap_or((overlay.clone(), relative));
+        std::fs::create_dir_all(&base)?;
+        let destination = base.join(&relative);
+        let mut parent = base;
         for component in relative.parent().unwrap_or(Path::new("")).components() {
             parent.push(component);
             if parent.exists() {
@@ -289,6 +298,13 @@ pub fn collect_base_character_files(
 
 /// Files that make up one fighter model folder. A model edit normally needs more than the
 /// `.numdlb`: material, skeleton, shader, helper, and texture files all travel together.
+/// A file sent to the game and the game path it replaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceAssetFile {
+    pub workspace_path: PathBuf,
+    pub game_path: String,
+}
+
 pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
     "adjb",
     "lvd",
@@ -306,30 +322,6 @@ pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
     "xmb",
 ];
 
-/// A canonical file in the workspace overlay and the game path it will replace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceAssetFile {
-    pub workspace_path: PathBuf,
-    pub game_path: String,
-}
-
-/// Compact inventory shown in Project Files for the selected fighter/costume.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WorkspaceAssetInventory {
-    pub model_files: Vec<String>,
-    pub animations: Vec<String>,
-    pub swing_prc: bool,
-    pub motion_list: bool,
-}
-
-impl WorkspaceAssetInventory {
-    pub fn total_files(&self) -> usize {
-        self.model_files.len()
-            + self.animations.len()
-            + usize::from(self.swing_prc)
-            + usize::from(self.motion_list)
-    }
-}
 
 fn fighter_component(fighter: &str) -> anyhow::Result<String> {
     let fighter = fighter.trim().to_ascii_lowercase();
@@ -400,11 +392,17 @@ pub fn workspace_fighter_slot_dirs(
     slot: u8,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let fighter = fighter_component(fighter)?;
-    let slot = format!("c{slot:02}");
-    let base = workspace_romfs(workspace).join("fighter").join(fighter);
+    let costume = format!("c{slot:02}");
+    let base = workspace_romfs(workspace).join("fighter").join(&fighter);
+    // A folder the author picked for the model or the animations stands in for the project's
+    // own copy, so adding, previewing and sending all use it.
+    let parts = crate::project_parts::ProjectParts::load(workspace);
+    let picked = |part| parts.link(&fighter, part, slot).map(Path::to_path_buf);
     Ok((
-        base.join("model").join("body").join(&slot),
-        base.join("motion").join("body").join(slot),
+        picked(crate::project_parts::Part::Model)
+            .unwrap_or_else(|| base.join("model").join("body").join(&costume)),
+        picked(crate::project_parts::Part::Animations)
+            .unwrap_or_else(|| base.join("motion").join("body").join(costume)),
     ))
 }
 
@@ -1337,73 +1335,6 @@ pub fn import_swing_prc(
     Ok(destination)
 }
 
-/// Scan the canonical model/motion folders. This is deliberately derived from files instead of
-/// serialized state: editing a file in Blender or an animation tool is visible immediately.
-pub fn workspace_asset_inventory(
-    workspace: &Path,
-    fighter: &str,
-    slot: u8,
-) -> anyhow::Result<WorkspaceAssetInventory> {
-    let mut inventory = WorkspaceAssetInventory::default();
-    for file in workspace_asset_files(workspace, fighter, slot)? {
-        let name = file.game_path.rsplit('/').next().unwrap_or_default();
-        if file.game_path.contains("/model/") {
-            inventory.model_files.push(name.to_owned());
-        } else {
-            match name {
-                "swing.prc" => inventory.swing_prc = true,
-                "motion_list.bin" => inventory.motion_list = true,
-                name if name.ends_with(".nuanmb") => inventory.animations.push(name.to_owned()),
-                _ => {}
-            }
-        }
-    }
-    Ok(inventory)
-}
-
-/// Every imported asset plus the lowercase game path the plugin/export consumes.
-pub fn workspace_asset_files(
-    workspace: &Path,
-    fighter: &str,
-    slot: u8,
-) -> anyhow::Result<Vec<WorkspaceAssetFile>> {
-    let fighter = fighter_component(fighter)?;
-    let (model_dir, motion_dir) = workspace_fighter_slot_dirs(workspace, &fighter, slot)?;
-    let mut files = Vec::new();
-    for (directory, area, accepts) in [
-        (&model_dir, "model", is_model_asset as fn(&Path) -> bool),
-        (&motion_dir, "motion", |path: &Path| {
-            is_animation_asset(path)
-                || path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.eq_ignore_ascii_case("swing.prc")
-                            || name.eq_ignore_ascii_case("motion_list.bin")
-                    })
-        }),
-    ] {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-            if !accepts(&path)
-                || !std::fs::symlink_metadata(&path)
-                    .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
-            {
-                continue;
-            }
-            let name = asset_file_name(&path)?;
-            files.push(WorkspaceAssetFile {
-                workspace_path: path,
-                game_path: format!("fighter/{fighter}/{area}/body/c{slot:02}/{name}"),
-            });
-        }
-    }
-    files.sort_by(|left, right| left.game_path.cmp(&right.game_path));
-    Ok(files)
-}
-
 /// Whether an overlay contains at least one regular, non-symlink file.
 pub fn workspace_romfs_has_files(workspace: &Path) -> bool {
     let overlay = workspace_romfs(workspace);
@@ -1678,13 +1609,13 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, b"base model").unwrap();
         assert_eq!(
-            copy_base_files(&workspace, &dump, std::slice::from_ref(&source)).unwrap(),
+            copy_base_files(&workspace, &dump, std::slice::from_ref(&source), &[]).unwrap(),
             (1, 0)
         );
         let edited = workspace_romfs(&workspace).join(relative);
         std::fs::write(&edited, b"edited model").unwrap();
         assert_eq!(
-            copy_base_files(&workspace, &dump, &[source]).unwrap(),
+            copy_base_files(&workspace, &dump, &[source], &[]).unwrap(),
             (0, 1)
         );
         let export = dir.path().join("export");
@@ -1708,7 +1639,7 @@ mod tests {
         std::fs::write(&inside, b"inside").unwrap();
         std::fs::write(&outside, b"outside").unwrap();
         let workspace = dir.path().join("project");
-        assert!(copy_base_files(&workspace, &dump, &[inside, outside]).is_err());
+        assert!(copy_base_files(&workspace, &dump, &[inside, outside], &[]).is_err());
         assert!(!workspace.exists());
     }
 
@@ -1748,7 +1679,7 @@ mod tests {
         // The collected set round-trips through the existing copy path.
         let workspace = dir.path().join("project");
         assert_eq!(
-            copy_base_files(&workspace, &dump, &files).unwrap(),
+            copy_base_files(&workspace, &dump, &files, &[]).unwrap(),
             (wanted.len(), 0)
         );
         for rel in wanted {
@@ -1777,7 +1708,7 @@ mod tests {
         let source = dump.join("fighter/model.bin");
         std::fs::write(&source, b"model").unwrap();
         std::os::unix::fs::symlink(&outside, workspace_romfs(&workspace).join("fighter")).unwrap();
-        assert!(copy_base_files(&workspace, &dump, &[source]).is_err());
+        assert!(copy_base_files(&workspace, &dump, &[source], &[]).is_err());
         assert!(!outside.join("model.bin").exists());
     }
 
@@ -1914,40 +1845,6 @@ mod tests {
             b"animation"
         );
         assert_eq!(std::fs::read(motion.join("swing.prc")).unwrap(), b"swing");
-        let inventory = workspace_asset_inventory(&workspace, "pickel", 12).unwrap();
-        assert_eq!(inventory.model_files.len(), 3);
-        assert_eq!(inventory.animations, vec!["attackairn.nuanmb"]);
-        assert!(inventory.swing_prc);
-        assert_eq!(inventory.total_files(), 5);
-    }
-
-    #[test]
-    fn workspace_asset_manifest_uses_lowercase_canonical_game_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        let source_model = dir.path().join("MODEL.NUMSHB");
-        let source_anim = dir.path().join("Run.NUANMB");
-        let source_swing = dir.path().join("physics.prc");
-        std::fs::write(&source_model, b"shader").unwrap();
-        std::fs::write(&source_anim, b"run").unwrap();
-        std::fs::write(&source_swing, b"physics").unwrap();
-        import_model_files(&workspace, "Kirby", 3, &[source_model]).unwrap();
-        import_animation_files(&workspace, "Kirby", 3, &[source_anim]).unwrap();
-        import_swing_prc(&workspace, "Kirby", 3, &source_swing).unwrap();
-
-        let paths: Vec<String> = workspace_asset_files(&workspace, "KIRBY", 3)
-            .unwrap()
-            .into_iter()
-            .map(|file| file.game_path)
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "fighter/kirby/model/body/c03/model.numshb",
-                "fighter/kirby/motion/body/c03/run.nuanmb",
-                "fighter/kirby/motion/body/c03/swing.prc",
-            ]
-        );
     }
 
     fn write_carrier_fixture(workspace: &Path) {
