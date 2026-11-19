@@ -2320,10 +2320,10 @@ fn validate_command(fighter: Option<&str>, command: &ExcuteStmt) -> Result<(), S
             }
         }
         ExcuteStmt::AttackModuleSetIndexed { id, arg3, arg4, .. }
-            if !(0..=3).contains(id) || !*arg3 || *arg4 =>
+            if !(0..=7).contains(id) || !*arg3 || *arg4 =>
         {
             return Err(
-                "indexed AttackModule setters only accept measured IDs 0–3 with true, false tails"
+                "indexed AttackModule setters only accept measured IDs 0–7 with true, false tails"
                     .into(),
             );
         }
@@ -6263,7 +6263,7 @@ mod tests {
             },
             ExcuteStmt::AttackModuleSetIndexed {
                 kind: AttackModuleSetIndexedKind::ForceReaction,
-                id: 4,
+                id: 8,
                 arg3: true,
                 arg4: false,
             },

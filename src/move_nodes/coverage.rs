@@ -369,8 +369,17 @@ mod census {
     fn stmt_text(stmt: &crate::data::AcmdStmt) -> String {
         use crate::data::AcmdStmt;
         match stmt {
+            AcmdStmt::RawBlock { header, body } if header.contains("is_excute") => format!(
+                "block is_excute[{}]",
+                body.iter().map(stmt_text).collect::<Vec<_>>().join(",")
+            ),
             AcmdStmt::RawBlock { header, .. } => format!("block {}", key(header)),
             AcmdStmt::Raw(line) => key(line),
+            // Which command keeps a whole `is_excute` block preserved.
+            AcmdStmt::Excute(commands) => format!(
+                "Excute[{}]",
+                commands.iter().map(excute_text).collect::<Vec<_>>().join(",")
+            ),
             other => key(&format!("{other:?}")),
         }
     }
@@ -419,11 +428,42 @@ mod census {
         }
     }
 
+    fn note_raw(line: Option<String>, ranking: &mut BTreeMap<String, u64>, samples: &mut BTreeMap<String, String>) {
+        if let Some(line) = line {
+            let line = line.trim_start_matches("SourceLine { source: \"").to_owned();
+            let key = format!("raw {}", key(&line));
+            samples.entry(key.clone()).or_insert_with(|| line.chars().take(300).collect());
+            *ranking.entry(key).or_default() += 1;
+        }
+    }
+
     fn walk(nodes: &[MoveNode], ranking: &mut BTreeMap<String, u64>, samples: &mut BTreeMap<String, String>) {
+        fn raw_line(command: &crate::data::ExcuteStmt) -> Option<String> {
+            match command {
+                crate::data::ExcuteStmt::NativeCall(call) => call.source_line.as_ref().map(|l| format!("{l:?}")),
+                _ => None,
+            }
+        }
         for node in nodes {
             match &node.kind {
+                NodeKind::BareCommand { command } => note_raw(raw_line(command), ranking, samples),
+                NodeKind::Execute { commands } => {
+                    for command in commands {
+                        note_raw(raw_line(command), ranking, samples);
+                    }
+                }
+                NodeKind::EffectExecute { commands } => {
+                    for command in commands {
+                        if let crate::data::EffectMacro::NativeCall(call) = command {
+                            note_raw(call.source_line.as_ref().map(|l| format!("{l:?}")), ranking, samples);
+                        }
+                    }
+                }
                 NodeKind::MixedExecute { commands } => {
                     for command in commands {
+                        if let MoveCommand::Editable(command) = command {
+                            note_raw(raw_line(command), ranking, samples);
+                        }
                         if let MoveCommand::Preserved(command) = command {
                             let key = format!("cmd {}", excute_text(command));
                             samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
@@ -433,6 +473,12 @@ mod census {
                 }
                 NodeKind::MixedEffectExecute { commands, .. } => {
                     for command in commands {
+                        if let super::super::model::EffectCommandSlot::Editable(
+                            crate::data::EffectMacro::NativeCall(call),
+                        ) = command
+                        {
+                            note_raw(call.source_line.as_ref().map(|l| format!("{l:?}")), ranking, samples);
+                        }
                         if let super::super::model::EffectCommandSlot::Preserved(command) = command {
                             let key = format!("cmd {}", effect_text(command));
                             samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
@@ -467,8 +513,9 @@ mod census {
                     .join(".cache/builds/ssbu_scripts/SSBU-Dumped-Scripts/smashline")
             });
         let (mut functions, mut editable) = (0u64, 0u64);
-        let (mut commands, mut blocks, mut opaque) = (0u64, 0u64, 0u64);
-        let mut ranking = BTreeMap::new();
+        let (mut commands, mut blocks, mut opaque, mut broken) = (0u64, 0u64, 0u64, 0u64);
+        let mut ranking: BTreeMap<String, u64> = BTreeMap::new();
+        let mut sole: BTreeMap<String, u64> = BTreeMap::new();
         let mut samples = BTreeMap::new();
         let mut dirs: Vec<_> = std::fs::read_dir(&root).expect("corpus").flatten().collect();
         dirs.sort_by_key(|entry| entry.path());
@@ -519,6 +566,12 @@ mod census {
                         };
                         let summary = track_summary(&imported);
                         functions += 1;
+                        // A dump that is not Rust (decompiler `L2CValue::operator` conditions,
+                        // stray `else`) cannot compile however it is typed; rank only the rest.
+                        if syn::parse_file(&body).is_err() {
+                            broken += 1;
+                            continue;
+                        }
                         if summary.preserved_block_count == 0
                             && summary.preserved_command_count == 0
                             && summary.opaque_source_line_count == 0
@@ -528,18 +581,33 @@ mod census {
                         commands += summary.preserved_command_count;
                         blocks += summary.preserved_block_count;
                         opaque += summary.opaque_source_line_count;
-                        walk(&imported.nodes, &mut ranking, &mut samples);
+                        // Which single kind of item is all that keeps this function from being
+                        // fully editable: typing that kind flips the function.
+                        let mut own = BTreeMap::new();
+                        walk(&imported.nodes, &mut own, &mut samples);
+                        let blockers: Vec<_> = own.keys().filter(|key| !key.starts_with("in ")).collect();
+                        if let [only] = blockers.as_slice() {
+                            *sole.entry((*only).clone()).or_default() += 1;
+                        }
+                        for (key, count) in own {
+                            *ranking.entry(key).or_default() += count;
+                        }
                     }
                 }
             }
         }
         println!(
-            "CENSUS functions {functions} fully_editable {editable} preserved_commands {commands} preserved_blocks {blocks} opaque_lines {opaque}"
+            "CENSUS functions {functions} not_rust {broken} fully_editable {editable} preserved_commands {commands} preserved_blocks {blocks} opaque_lines {opaque}"
         );
         let mut ranked: Vec<_> = ranking.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         for (name, count) in ranked.iter().take(80) {
             println!("RANK {count:>6} {name}\n       {}", samples.get(name).map_or("", String::as_str));
+        }
+        let mut sole: Vec<_> = sole.into_iter().collect();
+        sole.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (name, count) in sole.iter().take(40) {
+            println!("SOLE {count:>6} {name}");
         }
         assert!(functions > 70_000, "corpus incomplete: {functions} functions");
     }

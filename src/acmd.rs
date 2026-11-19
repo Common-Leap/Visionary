@@ -4937,7 +4937,7 @@ fn parse_attack_module_set_indexed_call(line: &str) -> Option<ExcuteStmt> {
         return None;
     }
     let id = id_token.parse::<i32>().ok()?;
-    if !(0..=3).contains(&id) || id.to_string() != id_token.as_str() {
+    if !(0..=7).contains(&id) || id.to_string() != id_token.as_str() {
         return None;
     }
     Some(ExcuteStmt::AttackModuleSetIndexed {
@@ -10839,7 +10839,7 @@ pub(crate) mod tests {
         AttackModule::set_no_finish_camera(agent.module_accessor, 3, true, false);
         AttackModule::set_force_reaction(agent.module_accessor, 1, true, false);
         AttackModule::set_force_reaction(agent.module_accessor, 2, true, false);
-        AttackModule::set_force_reaction(agent.module_accessor, 4, true, false);
+        AttackModule::set_force_reaction(agent.module_accessor, 8, true, false);
         AttackModule::set_no_finish_camera(agent.module_accessor, 01, true, false);
         AttackModule::set_no_finish_camera(agent.module_accessor, 0, false, false);
         AttackModule::set_no_finish_camera(agent.module_accessor, 0, true, true);

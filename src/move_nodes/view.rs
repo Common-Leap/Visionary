@@ -4369,7 +4369,7 @@ fn native_command_ui(
                 egui::ComboBox::from_id_salt("native_attack_indexed_id")
                     .selected_text(id.to_string())
                     .show_ui(ui, |ui| {
-                        for value in 0..=3 {
+                        for value in 0..=7 {
                             ui.selectable_value(id, value, value.to_string());
                         }
                     });
