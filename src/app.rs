@@ -19910,6 +19910,42 @@ impl VisionaryApp {
         })
     }
 
+    /// The skin's model as the game assembles it: the game's files, then each mod's, then the
+    /// project's, later ones replacing earlier ones by name. A mod usually ships only the files
+    /// it changed and leans on the game's textures for the rest; loading its folder alone drew
+    /// the cape mod nearly black.
+    fn merged_skin_model(&self, fighter: &str, slot: u8) -> Option<PathBuf> {
+        let relative = PathBuf::from("fighter")
+            .join(fighter)
+            .join("model/body")
+            .join(format!("c{slot:02}"));
+        let mut layers: Vec<PathBuf> = self
+            .all_roots()
+            .iter()
+            .map(|root| root.join(&relative))
+            .collect();
+        if let Some(workspace) = self.project_path.as_ref().and_then(|path| path.parent()) {
+            layers.push(crate::project_hub::workspace_romfs(workspace).join(&relative));
+        }
+        layers.retain(|dir| dir.is_dir());
+        if layers.len() < 2 {
+            return layers.pop();
+        }
+        let merged = crate::scratch_dirs::app_storage_root()
+            .join("skin_preview")
+            .join(format!("{fighter}_c{slot:02}"));
+        let _ = std::fs::remove_dir_all(&merged);
+        std::fs::create_dir_all(&merged).ok()?;
+        for layer in &layers {
+            for entry in std::fs::read_dir(layer).ok()?.flatten() {
+                if entry.path().is_file() {
+                    std::fs::copy(entry.path(), merged.join(entry.file_name())).ok()?;
+                }
+            }
+        }
+        merged.join("model.numdlb").is_file().then_some(merged)
+    }
+
     /// Show `slot` of `fighter` in the preview, and watch the project's copy of it.
     fn show_skin(&mut self, fighter: &str, slot: u8) {
         let wanted = Some((fighter.to_owned(), slot));
@@ -19918,7 +19954,7 @@ impl VisionaryApp {
         }
         self.preview_skin = wanted;
         self.skin_files_stamp = None;
-        if let Some((dir, _)) = self.skin_folder(fighter, "model", slot) {
+        if let Some(dir) = self.merged_skin_model(fighter, slot) {
             self.pending_model_load = Some(dir);
         }
     }
@@ -19954,10 +19990,8 @@ impl VisionaryApp {
         if before.is_none() || before == Some(newest) {
             return;
         }
-        if let Some((dir, from)) = self.skin_folder(&fighter, "model", slot) {
-            if from == "this project" {
-                self.pending_model_load = Some(dir);
-            }
+        if let Some(dir) = self.merged_skin_model(&fighter, slot) {
+            self.pending_model_load = Some(dir);
         }
         let sent = self.game_link.asset_bundle_status().target == fighter.to_ascii_lowercase()
             && self.workspace_asset_sent_slot == Some(slot);
