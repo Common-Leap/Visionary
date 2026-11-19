@@ -2412,6 +2412,21 @@ fn projectile_inputs(fighter: &str) -> Vec<NativeInput> {
         .collect()
 }
 
+
+/// What a ready-made gimmick does, looked up by the name it was staged under.
+fn preset_about(name: &str) -> Option<String> {
+    Preset::ALL
+        .into_iter()
+        .find(|preset| preset.label() == name)
+        .map(|preset| preset.hover().to_string())
+        .or_else(|| {
+            super::status_recipes::Defense::ALL
+                .into_iter()
+                .find(|defense| defense.label() == name)
+                .map(|defense| defense.hover())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2524,18 +2539,4 @@ mod tests {
             "private values should be collapsed: {displayed}"
         );
     }
-}
-
-/// What a ready-made gimmick does, looked up by the name it was staged under.
-fn preset_about(name: &str) -> Option<String> {
-    Preset::ALL
-        .into_iter()
-        .find(|preset| preset.label() == name)
-        .map(|preset| preset.hover().to_string())
-        .or_else(|| {
-            super::status_recipes::Defense::ALL
-                .into_iter()
-                .find(|defense| defense.label() == name)
-                .map(|defense| defense.hover())
-        })
 }

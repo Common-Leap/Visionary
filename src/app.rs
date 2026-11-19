@@ -20024,10 +20024,10 @@ impl VisionaryApp {
                 crate::project_hub::import_model_folder(workspace, fighter, slot, &path)
                     .map(|files| format!("{} model files", files.len()))
             } else if crate::project_hub::MODEL_ASSET_EXTENSIONS.contains(&extension.as_str()) {
-                crate::project_hub::import_model_files(workspace, fighter, slot, &[path.clone()])
+                crate::project_hub::import_model_files(workspace, fighter, slot, std::slice::from_ref(&path))
                     .map(|_| format!("{name} to the model"))
             } else if extension == "nuanmb" || name == "motion_list.bin" {
-                crate::project_hub::import_animation_files(workspace, fighter, slot, &[path.clone()])
+                crate::project_hub::import_animation_files(workspace, fighter, slot, std::slice::from_ref(&path))
                     .map(|_| format!("{name} to the animations"))
             } else if extension == "prc" {
                 crate::project_hub::import_swing_prc(workspace, fighter, slot, &path)
