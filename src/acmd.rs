@@ -21951,36 +21951,152 @@ mod article_call_tests {
         );
     }
 
+    /// The call a written line gives, with where it came from left out.
+    fn written(call: &ArticleCall) -> (ArticleOp, String, Vec<String>, ArticleTarget, String) {
+        (
+            call.op.clone(),
+            call.article.clone(),
+            call.args.clone(),
+            call.target,
+            call.source.clone(),
+        )
+    }
+
+    /// The article calls a script of these statements gives, through the walk.
+    fn walked(stmts: Vec<ExcuteStmt>) -> Vec<(ArticleOp, String, Vec<String>, ArticleTarget, String)> {
+        AcmdScript {
+            stmts: vec![AcmdStmt::Excute(stmts)],
+        }
+        .to_article_calls()
+        .iter()
+        .map(|(_, call)| written(call))
+        .collect()
+    }
+
+    /// One written line, read through each statement form that accepts it: the parser's own
+    /// choice (a closed timeline form, a typed native call), a typed native call, and a typed
+    /// `Article`. All give the same call, with the original line as `source`.
     #[test]
     fn native_and_typed_agree() {
-        let parsed = parse_acmd_script(&game(&[
-            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
-            "        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, Hash40::new(\"catch\"), false, -1.0);",
-        ]));
-        let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
-            panic!("{:#?}", parsed.stmts);
+        use crate::move_nodes::native_calls;
+        // (written line, the form the parser keeps it as)
+        let cases = [
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GBEAM, false, -1);",
+                "lifecycle",
+            ),
+            (
+                "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+                "native",
+            ),
+            (
+                "let id = ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+                "article",
+            ),
+            (
+                "ArticleModule::change_motion(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, Hash40::new(\"catch\"), false, -1.0);",
+                "native",
+            ),
+            (
+                "ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, (25.0 - 1.0)/13.0);",
+                "article",
+            ),
+        ];
+        for (line, form) in cases {
+            let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+            let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
+                panic!("{:#?}", parsed.stmts);
+            };
+            let kept = match inner.as_slice() {
+                [ExcuteStmt::ArticleLifecycle(_)] => "lifecycle",
+                [ExcuteStmt::NativeCall(_)] => "native",
+                [ExcuteStmt::Article(_)] => "article",
+                other => panic!("{line}: {other:#?}"),
+            };
+            assert_eq!(kept, form, "{line}");
+
+            let expected = vec![written(&ArticleCall::parse(line).unwrap())];
+            assert_eq!(expected[0].4, line, "source is the line as written");
+            assert_eq!(walked(inner.clone()), expected, "parser's form: {line}");
+            assert_eq!(
+                walked(vec![ExcuteStmt::Article(ArticleCall::parse(line).unwrap())]),
+                expected,
+                "typed: {line}"
+            );
+            if let Some(call) = native_calls::parse(line) {
+                assert_eq!(
+                    walked(vec![ExcuteStmt::NativeCall(call)]),
+                    expected,
+                    "native: {line}"
+                );
+            } else {
+                assert_ne!(form, "native", "{line}");
+            }
+            assert_eq!(parsed.to_article_spawns(), {
+                let typed = AcmdScript {
+                    stmts: vec![AcmdStmt::Excute(vec![ExcuteStmt::Article(
+                        ArticleCall::parse(line).unwrap(),
+                    )])],
+                };
+                typed.to_article_spawns()
+            });
+        }
+    }
+
+    /// A native call edited after it was read no longer spells its original line, so the walk
+    /// reads the call's own spelling instead of the stale text.
+    #[test]
+    fn article_native_edit_is_read_from_the_call_not_the_stale_line() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);";
+        let mut call = crate::move_nodes::native_calls::parse(line).unwrap();
+        assert_eq!(ArticleCall::from_native(&call).unwrap().source, line);
+        call.arguments[2] = "0".into();
+        let read = ArticleCall::from_native(&call).unwrap();
+        assert_eq!(read.args, ["true", "0"]);
+        assert_eq!(read.source, call.source());
+    }
+
+    /// A closed timeline form keeps no text, so it is read from the line the timeline writes for
+    /// it and says so. A bare shoot target comes back wrapped.
+    #[test]
+    fn article_timeline_form_is_marked_and_read_from_its_written_form() {
+        let line = "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_LAST, false);";
+        let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+        let calls = parsed.to_article_calls();
+        let [(_, call)] = calls.as_slice() else {
+            panic!("{calls:#?}");
         };
-        assert!(
-            inner.iter().any(|stmt| matches!(stmt, ExcuteStmt::NativeCall(_))),
-            "{inner:#?}"
+        assert_eq!(call.origin, crate::data::ArticleOrigin::Timeline);
+        assert_eq!(call.target, ArticleTarget::Last);
+        assert_eq!(
+            call.source,
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);"
         );
-        let typed = AcmdScript {
-            stmts: vec![AcmdStmt::Excute(
-                inner
-                    .iter()
-                    .map(|stmt| match stmt {
-                        ExcuteStmt::NativeCall(call) => {
-                            ExcuteStmt::Article(ArticleCall::parse(&call.source()).unwrap())
-                        }
-                        other => other.clone(),
-                    })
-                    .collect(),
-            )],
-            ..parsed.clone()
-        };
-        assert!(!parsed.to_article_spawns().is_empty());
-        assert_eq!(parsed.to_article_spawns(), typed.to_article_spawns());
-        assert_eq!(parsed.to_article_motions(), typed.to_article_motions());
-        assert_eq!(parsed.to_article_calls(), typed.to_article_calls());
+    }
+
+    #[test]
+    fn article_edit_keeps_binding_receiver_and_path() {
+        let line = "let id = smash::app::lua_bind::ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);";
+        let mut call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::Generate);
+        assert_eq!(call.emit(), line);
+        call.args[0] = "false".into();
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "let id = smash::app::lua_bind::ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, false, -1);"
+        );
+        // Through the native path the call keeps the receiver it was written with.
+        let native = crate::move_nodes::native_calls::parse(
+            "ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+        )
+        .unwrap();
+        let mut call = ArticleCall::from_native(&native).unwrap();
+        call.args[0] = "false".into();
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "ArticleModule::generate_article(boma, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, false, -1);"
+        );
     }
 }

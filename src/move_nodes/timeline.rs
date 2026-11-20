@@ -402,6 +402,7 @@ fn import_stmts(
                                 receiver: None,
                                 binding: None,
                                 source_line: None,
+                                written: Default::default(),
                             });
                             promoted_event = true;
                         }

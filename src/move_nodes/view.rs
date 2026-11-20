@@ -3130,6 +3130,7 @@ pub(super) fn context_command(kind: usize, fighter: &str) -> ExcuteStmt {
             receiver: None,
             binding: None,
             source_line: None,
+            written: Default::default(),
         });
     }
     if kind == 99 {

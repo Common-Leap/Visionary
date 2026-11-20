@@ -2200,11 +2200,28 @@ impl ArticleOp {
     }
 }
 
+/// Which statement form an [`ArticleCall`] was read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleOrigin {
+    /// An [`ExcuteStmt::Article`] statement: `source` is the line as written.
+    #[default]
+    Script,
+    /// A typed native call (`move_nodes::native_calls`): `source` is the line as written while
+    /// the call still matches it, and the call's own spelling once it has been edited.
+    Native,
+    /// One of the timeline's closed [`ExcuteStmt::ArticleLifecycle`] forms. The statement keeps
+    /// no text of its own, so `source` is the line the timeline writes for it. That line differs
+    /// from the original only in spacing and in a shoot target written bare
+    /// (`*ARTICLE_OPE_TARGET_X`), which the timeline writes as `ArticleOperationTarget(..)`.
+    /// Write these back through their timeline statement, not as text.
+    Timeline,
+}
+
 /// One `ArticleModule::*` statement in a script, read from its source line.
 ///
 /// `source` is the statement as written and is what gets saved back until `edited` is set, so
-/// an unedited script saves byte for byte. Once edited, the call is rebuilt from the fields in
-/// the spelling and with the receiver `source` used.
+/// an unedited script saves byte for byte. Once edited, the call is rebuilt from the fields with
+/// the binding (`let x = `), module path and receiver `source` was written with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArticleCall {
     pub op: ArticleOp,
@@ -2216,27 +2233,49 @@ pub struct ArticleCall {
     /// The original statement.
     pub source: String,
     pub edited: bool,
+    #[serde(default)]
+    pub origin: ArticleOrigin,
 }
 
 /// The two path spellings of the module a call may be written with.
 const ARTICLE_MODULE_PATHS: [&str; 2] = ["smash::app::lua_bind::ArticleModule::", "ArticleModule::"];
 
-/// Split one complete `[path]ArticleModule::f(args);` statement into (path, fn, args).
-/// Anything else, such as a call inside an expression, a binding or a trailing comment, is
-/// not a statement this model owns and gives `None`.
-fn split_article_statement(line: &str) -> Option<(&'static str, &str, Vec<String>)> {
+/// One complete `[let x = ][path]ArticleModule::f(args);` statement, split into its parts.
+struct ArticleStatement<'a> {
+    /// `let x = ` exactly as written, or empty.
+    binding: &'a str,
+    path: &'static str,
+    name: &'a str,
+    /// Every argument, the receiver first, each trimmed.
+    args: Vec<String>,
+}
+
+/// Split one complete article statement. Anything else, such as a call inside an expression,
+/// a trailing statement or a trailing comment, is not a statement this model owns.
+fn split_article_statement(line: &str) -> Option<ArticleStatement<'_>> {
     let line = line.trim();
+    let call_start = match line.strip_prefix("let ") {
+        Some(rest) => {
+            let (pattern, _) = rest.split_once(" = ")?;
+            if pattern.is_empty() || pattern.contains(['(', '"', ';']) {
+                return None;
+            }
+            "let ".len() + pattern.len() + " = ".len()
+        }
+        None => 0,
+    };
+    let (binding, call) = line.split_at(call_start);
     let path = ARTICLE_MODULE_PATHS
         .into_iter()
-        .find(|path| line.starts_with(path))?;
+        .find(|path| call.starts_with(path))?;
     if line.contains("//") || line.contains("/*") {
-        return Option::None;
+        return None;
     }
-    let rest = &line[path.len()..];
+    let rest = &call[path.len()..];
     let open = rest.find('(')?;
     let name = &rest[..open];
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Option::None;
+        return None;
     }
     let body = rest[open..].strip_suffix(';')?.trim_end();
     // The opening parenthesis must close exactly at the end of the statement.
@@ -2259,61 +2298,69 @@ fn split_article_statement(line: &str) -> Option<(&'static str, &str, Vec<String
             ')' => {
                 depth -= 1;
                 if depth == 0 && index + 1 != body.len() {
-                    return Option::None;
+                    return None;
                 }
             }
             _ => {}
         }
     }
     if depth != 0 || in_string || !body.ends_with(')') {
-        return Option::None;
+        return None;
     }
     let args = crate::acmd::tokenize_args_balanced(&body[1..body.len() - 1]);
-    Some((path, name, args))
+    Some(ArticleStatement {
+        binding,
+        path,
+        name,
+        args,
+    })
 }
 
 impl ArticleCall {
-    /// Read one `ArticleModule::f(accessor, article, ...);` statement, either module path.
+    /// Read one `ArticleModule::f(accessor, article, ...);` statement, either module path,
+    /// with or without a `let` binding.
     pub fn parse(line: &str) -> Option<Self> {
-        let (_, name, mut args) = split_article_statement(line)?;
+        let ArticleStatement { name, mut args, .. } = split_article_statement(line)?;
         if args.len() < 2 {
-            return Option::None;
+            return None;
         }
         let op = ArticleOp::from_name(name);
         args.remove(0);
         let article = args.remove(0);
-        Some(Self::from_parts(op, article, args, line.trim().to_owned()))
-    }
-
-    fn from_parts(op: ArticleOp, article: String, args: Vec<String>, source: String) -> Self {
         let target = op
             .target_index()
             .and_then(|index| args.get(index))
             .map_or(ArticleTarget::Unspecified, |text| ArticleTarget::read(text));
-        Self {
+        Some(Self {
             op,
             article,
             args,
             target,
-            source,
+            source: line.trim().to_owned(),
             edited: false,
-        }
+            origin: ArticleOrigin::Script,
+        })
     }
 
-    /// The same call when it is kept as a typed native call (`move_nodes::native_calls`).
+    /// The same call when it is kept as a typed native call (`move_nodes::native_calls`): read
+    /// from the line the script wrote while the call still spells it, else from the call.
     pub fn from_native(call: &crate::move_nodes::native_calls::NativeCall) -> Option<Self> {
-        let name = call.callee.strip_prefix("ArticleModule::")?;
-        let mut args = call.arguments.clone();
-        if args.is_empty() {
-            return Option::None;
-        }
-        let article = args.remove(0);
-        Some(Self::from_parts(
-            ArticleOp::from_name(name),
-            article,
-            args,
-            call.source(),
-        ))
+        call.callee.strip_prefix("ArticleModule::")?;
+        let line = call
+            .written_source()
+            .map_or_else(|| call.source(), str::to_owned);
+        Some(Self {
+            origin: ArticleOrigin::Native,
+            ..Self::parse(&line)?
+        })
+    }
+
+    /// One of the timeline's closed forms, read from the line the timeline writes for it.
+    pub(crate) fn from_timeline(line: &str) -> Option<Self> {
+        Some(Self {
+            origin: ArticleOrigin::Timeline,
+            ..Self::parse(line)?
+        })
     }
 
     /// The article symbol without its `*`, as the preview looks objects up.
@@ -2321,15 +2368,20 @@ impl ArticleCall {
         self.article.trim_start_matches('*')
     }
 
-    /// The statement to save: `source` unless edited, else rebuilt with the written module
-    /// path, receiver and target spelling.
+    /// The statement to save: `source` unless edited, else rebuilt with the binding, module
+    /// path, receiver and target spelling `source` was written with.
     pub fn emit(&self) -> String {
         if !self.edited {
             return self.source.clone();
         }
-        let (path, receiver) = split_article_statement(&self.source)
-            .map(|(path, _, args)| (path, args.into_iter().next()))
-            .unwrap_or(("ArticleModule::", Option::None));
+        let (binding, path, receiver) = match split_article_statement(&self.source) {
+            Some(written) => (
+                written.binding,
+                written.path,
+                written.args.into_iter().next(),
+            ),
+            None => ("", "ArticleModule::", None),
+        };
         let receiver = receiver.unwrap_or_else(|| "agent.module_accessor".to_owned());
         let mut args = self.args.clone();
         if let Some(slot) = self.op.target_index().and_then(|index| args.get_mut(index)) {
@@ -2337,7 +2389,7 @@ impl ArticleCall {
         }
         let mut all = vec![receiver, self.article.clone()];
         all.extend(args);
-        format!("{path}{}({});", self.op.name(), all.join(", "))
+        format!("{binding}{path}{}({});", self.op.name(), all.join(", "))
     }
 }
 
@@ -7515,11 +7567,11 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         | ExcuteStmt::AttackModuleAddReactionFrame { .. }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
         | ExcuteStmt::GrabRebound { .. } => {}
-        // The closed timeline forms are read through their own emitted line, so they reach
-        // the preview as the same `ArticleCall` a raw or native spelling of the call gives.
+        // The closed timeline forms keep no text of their own, so they are read through the
+        // line the timeline writes for them (`ArticleOrigin::Timeline`).
         ExcuteStmt::ArticleLifecycle(_) => {
             for line in crate::acmd::emit_excute_stmts(std::slice::from_ref(s), "") {
-                if let Some(call) = ArticleCall::parse(&line) {
+                if let Some(call) = ArticleCall::from_timeline(&line) {
                     hurt.article_calls.push((script_frame(frame), call));
                 }
             }
