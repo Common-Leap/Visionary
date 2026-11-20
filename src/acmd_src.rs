@@ -8002,6 +8002,601 @@ pub fn sync_motion_rates(
     })
 }
 
+// ── Article call write-back ─────────────────────────────────────────────────
+
+/// The module paths an article call is written with, as [`crate::data::ArticleCall::parse`]
+/// reads them.
+const ARTICLE_MODULE: &str = "ArticleModule::";
+const ARTICLE_LUA_BIND: &str = "smash::app::lua_bind::";
+
+/// Every `ArticleModule::f(..)` call in `text` written as a whole statement, in document order:
+/// `[let x = ][smash::app::lua_bind::]ArticleModule::f(args);`.
+///
+/// Located in the file's own text, never rebuilt from the editor's model of a call (a timeline
+/// call carries the timeline's spelling, not the file's). A call inside an expression
+/// (`if ArticleModule::is_exist(..)`, an argument of another call) is not a statement and is not
+/// counted: the parser keeps those as raw lines, so the walk never reports them either.
+pub(crate) fn article_call_sites(text: &str) -> Vec<MacroSite> {
+    let bytes = text.as_bytes();
+    let mut sites = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        if !text.is_char_boundary(i) || !text[i..].starts_with(ARTICLE_MODULE) {
+            i += 1;
+            continue;
+        }
+        let start = if text[..i].ends_with(ARTICLE_LUA_BIND) {
+            i - ARTICLE_LUA_BIND.len()
+        } else {
+            i
+        };
+        let name_start = i + ARTICLE_MODULE.len();
+        // Not a longer or differently qualified name that merely ends in `ArticleModule::`.
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.')
+        {
+            i = name_start;
+            continue;
+        }
+        let mut name_end = name_start;
+        while name_end < text.len()
+            && (bytes[name_end].is_ascii_alphanumeric() || bytes[name_end] == b'_')
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes.get(name_end) != Some(&b'(') {
+            i = name_end;
+            continue;
+        }
+        let Some((args, close)) = split_call_args(text, name_end + 1, text.len()) else {
+            i = name_end + 1;
+            continue;
+        };
+        i = close + 1;
+        if article_statement_semicolon(text, start, close).is_some() {
+            sites.push(MacroSite {
+                name: text[name_start..name_end].to_string(),
+                span: start..close + 1,
+                args,
+            });
+        }
+    }
+    sites
+}
+
+/// The `;` ending the statement a call from `start` to its `)` at `close` makes, if the call is
+/// a whole statement: preceded by the start of a block or statement (`{`, `;`, `}`), optionally
+/// through a `let` binding on the same line, and followed by `;`.
+fn article_statement_semicolon(text: &str, start: usize, close: usize) -> Option<usize> {
+    let after = &text[close + 1..];
+    let semicolon = close + 1 + (after.len() - after.trim_start().len());
+    if text.as_bytes().get(semicolon) != Some(&b';') {
+        return None;
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+    let prefix = text[line_start..start].trim();
+    let before = if prefix.is_empty() {
+        &text[..line_start]
+    } else if let Some(binding) = prefix.strip_prefix("let ") {
+        // `let id = ` and nothing else: no operator before the `=`.
+        let pattern = binding.strip_suffix('=')?.trim_end();
+        if pattern.is_empty()
+            || pattern.ends_with(['=', '!', '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'])
+            || pattern.contains(['(', ';', '"', '{', '}'])
+        {
+            return None;
+        }
+        let at = text[line_start..start].find("let ")? + line_start;
+        &text[..at]
+    } else {
+        &text[..start]
+    };
+    matches!(last_code_char(before), None | Some('{' | ';' | '}')).then_some(semicolon)
+}
+
+/// The last character of `text` that is code: not whitespace and not inside a comment.
+fn last_code_char(text: &str) -> Option<char> {
+    let mut last = None;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            if !(text[i..].starts_with("//") || text[i..].starts_with("/*")) {
+                last = text[..next.min(text.len())].chars().next_back();
+            }
+            i = next;
+            continue;
+        }
+        let Some(c) = text[i..].chars().next() else {
+            break;
+        };
+        if !c.is_whitespace() {
+            last = Some(c);
+        }
+        i += c.len_utf8();
+    }
+    last
+}
+
+/// The frame block `site` sits in, as [`source_frame_block`] finds it, when its `frame(..)` line
+/// comes before the `is_excute` block holding the site and on a line of its own. (A `frame` inside
+/// the block, or on the block's own line, is not a frame block this can retime.)
+fn article_frame_block(text: &str, site: &MacroSite) -> Option<EffectSourceBlock> {
+    let (open, _) = enclosing_effect_execute(text, site.span.start)?;
+    let frame = scan_named_sites(text, "frame", 0..text.len())
+        .into_iter()
+        .rev()
+        .find(|frame| frame.span.end <= site.span.start)?;
+    let frame_line = line_range_at(text, frame.span.start)?;
+    let execute_line = line_range_at(text, open)?;
+    if execute_line.start < frame_line.end {
+        return None;
+    }
+    source_frame_block(text, site)
+}
+
+/// Why the call at `site` is not the one the editor numbered `frame`/`call` at this position, if
+/// it is not. Positional pairing is only safe while every pair agrees on the function, the
+/// article and, where the source states it, the frame.
+fn article_pairing_mismatch(
+    text: &str,
+    site: &MacroSite,
+    frame: u32,
+    call: &crate::data::ArticleCall,
+    edited_frame: u32,
+) -> Option<String> {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    if site.name != call.op.name() {
+        return Some(format!("the source calls `{}` where the editor has `{}`", site.name, call.op.name()));
+    }
+    if site.args.len() != call.args.len() + 2 {
+        return Some(format!(
+            "the source's `{}` has {} argument(s) where the editor has {}",
+            site.name,
+            site.args.len(),
+            call.args.len() + 2
+        ));
+    }
+    if squash(&text[site.args[1].clone()]) != squash(&call.article) {
+        return Some(format!(
+            "the source's `{}` acts on `{}` where the editor has `{}`",
+            site.name,
+            text[site.args[1].clone()].trim(),
+            call.article
+        ));
+    }
+    if let Some(block) = article_frame_block(text, site) {
+        if block.frame != frame && block.frame != edited_frame {
+            return Some(format!(
+                "the source's `{}` is under frame {} where the editor has it at frame {frame}",
+                site.name, block.frame
+            ));
+        }
+    }
+    None
+}
+
+/// Rewrite edited article calls into the user's own source.
+///
+/// `pristine` and `edited` are the script's [`AcmdScript::to_article_calls`]
+/// (crate::data::AcmdScript::to_article_calls) before and after editing, as (script frame, call).
+/// They are paired with the file's own call statements **by position**, the way
+/// [`rewrite_motion_rates`] pairs rates, and every pair must agree on function, article and frame;
+/// when the counts differ or a pair disagrees nothing is written and the reason is reported.
+///
+/// - An argument edit replaces only that argument's bytes, so the receiver, any `let` binding,
+///   the module path and the spacing stay as written. A changed target keeps the file's own
+///   spelling of it (`ArticleOperationTarget(..)` or bare, symbolic or numeric).
+/// - A frame change moves the statement to the new frame's block, creating the block when the
+///   function has none, as effect blocks move. See [`move_call_to_frame`].
+/// - Changing which `ArticleModule` function is called, or adding or removing arguments or calls,
+///   is structural and reported.
+pub fn rewrite_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let mut report = SyncReport::default();
+    // What a call does; `source`, `edited` and `origin` only say how it was read.
+    let same = |(a, x): &(u32, crate::data::ArticleCall), (b, y): &(u32, crate::data::ArticleCall)| {
+        a == b && x.op == y.op && x.article == y.article && x.args == y.args && x.target == y.target
+    };
+    if pristine.len() == edited.len() && pristine.iter().zip(edited).all(|(a, b)| same(a, b)) {
+        return Ok((text.to_string(), report));
+    }
+    if pristine.len() != edited.len() {
+        report.skipped.push(format!(
+            "{label}: article calls were added or removed — source syncing only retunes existing \
+             calls, so use an export to land that"
+        ));
+        return Ok((text.to_string(), report));
+    }
+    let sites = article_call_sites(text);
+    if sites.len() != pristine.len() {
+        report.skipped.push(format!(
+            "{label}: the source has {} `ArticleModule` call(s) and the editor models {} — one of \
+             them is inside a branch, a loop or an expression, which this cannot address by \
+             position",
+            sites.len(),
+            pristine.len()
+        ));
+        return Ok((text.to_string(), report));
+    }
+    for (index, (site, ((frame, before), (edited_frame, _)))) in
+        sites.iter().zip(pristine.iter().zip(edited)).enumerate()
+    {
+        if let Some(reason) = article_pairing_mismatch(text, site, *frame, before, *edited_frame) {
+            report.skipped.push(format!(
+                "{label}: article call #{} cannot be paired with the source by position: {reason}",
+                index + 1
+            ));
+            return Ok((text.to_string(), report));
+        }
+    }
+
+    let mut edits = Vec::new();
+    let mut moves = Vec::new();
+    for (index, (site, (was, now))) in sites.iter().zip(pristine.iter().zip(edited)).enumerate() {
+        if same(was, now) {
+            continue;
+        }
+        let ((from, before), (to, after)) = (was, now);
+        let number = index + 1;
+        if before.op != after.op {
+            report.skipped.push(format!(
+                "{label}: article call #{number} changes which function it calls (`{}` to `{}`) — \
+                 source syncing only retunes existing calls, so use an export to land that",
+                before.op.name(),
+                after.op.name()
+            ));
+            continue;
+        }
+        if before.args.len() != after.args.len() {
+            report.skipped.push(format!(
+                "{label}: article call #{number} (`{}`) had arguments added or removed — source \
+                 syncing only retunes existing arguments",
+                site.name
+            ));
+            continue;
+        }
+        let mut replace = |span: &Range<usize>, value: String| {
+            if text[span.clone()].trim() != value.trim() {
+                edits.push(Replacement { span: span.clone(), value });
+            }
+        };
+        if before.article != after.article {
+            replace(&site.args[1], after.article.clone());
+        }
+        let target_slot = before.op.target_index();
+        for (slot, (was, now)) in before.args.iter().zip(&after.args).enumerate() {
+            let span = &site.args[slot + 2];
+            if Some(slot) == target_slot && before.target != after.target {
+                // The file's own spelling of the target, not the editor's.
+                replace(span, after.target.respell(&text[span.clone()]));
+            } else if was != now {
+                replace(span, now.clone());
+            }
+        }
+        if from != to {
+            moves.push((index, *from, *to));
+        }
+    }
+
+    report.changed = edits.len();
+    let mut out = apply(text, edits);
+    // Which editor call each statement in `out` is, in document order: a move can carry a call
+    // past others, and every later move must still find its own call.
+    let mut order: Vec<usize> = (0..sites.len()).collect();
+    for (index, from, to) in moves {
+        let number = index + 1;
+        let current = article_call_sites(&out);
+        let Some(site) = order
+            .iter()
+            .position(|&call| call == index)
+            .and_then(|position| current.get(position))
+        else {
+            report.skipped.push(format!(
+                "{label}: article call #{number} could not be found again after an earlier move"
+            ));
+            break;
+        };
+        if article_frame_block(&out, site).is_some_and(|block| block.frame == to) {
+            continue; // Already there: a sync ran before with this edit.
+        }
+        match move_call_to_frame(&out, site, from, to) {
+            Ok((moved, at)) => {
+                let after = article_call_sites(&moved);
+                let Some(position) = after.iter().position(|site| site.span.start == at) else {
+                    report.skipped.push(format!(
+                        "{label}: article call #{number} moved, but could not be found again, so no \
+                         later article call was moved"
+                    ));
+                    out = moved;
+                    report.changed += 1;
+                    break;
+                };
+                order.retain(|&call| call != index);
+                order.insert(position, index);
+                out = moved;
+                report.changed += 1;
+            }
+            Err(reason) => report.skipped.push(format!(
+                "{label}: `{}` (article call #{number}) could not move from frame {from} to frame \
+                 {to}: {reason}",
+                site.name
+            )),
+        }
+    }
+    Ok((out, report))
+}
+
+/// Sync edited article calls for one move back into the project source on disk.
+pub fn sync_article_calls(
+    index: &SourceIndex,
+    fighter: &str,
+    move_name: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<SyncReport> {
+    let script_name = crate::acmd::acmd_script_name("game", move_name);
+    sync_script(index, fighter, &script_name, |body| {
+        rewrite_article_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
+    })
+}
+
+/// Why frame blocks in `text` do not say when a line runs, if they do not: a `wait` makes the
+/// time a block runs at depend on what came before it, and a loop runs its blocks more than once.
+fn frame_order_unreliable(text: &str) -> Option<&'static str> {
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < text.len() {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if word_start {
+            // `wait(..)`, `macros::wait(..)` and the `wait_loop_*` family all hold the script.
+            let rest = &text[i..];
+            let wait_call = rest.strip_prefix("wait").is_some_and(|after| {
+                after.trim_start().starts_with('(') || after.starts_with("_loop")
+            });
+            if wait_call {
+                return Some("the script uses `wait`, so a frame block's place does not say when it runs");
+            }
+            for keyword in ["for", "while", "loop"] {
+                let end = i + keyword.len();
+                if text[i..].starts_with(keyword)
+                    && bytes.get(end).is_some_and(|b| b.is_ascii_whitespace() || *b == b'{')
+                {
+                    return Some("the script has a loop, so its frame blocks can run more than once");
+                }
+            }
+        }
+        i += 1;
+        while i < text.len() && !text.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The brace depth of `at` inside `body` (0 directly in it), ignoring literals and comments.
+fn brace_depth(text: &str, body: Range<usize>, at: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = body.start;
+    while i < at {
+        if let Some(next) = skip_rust_literal_or_comment(text, i) {
+            i = next;
+            continue;
+        }
+        match text.as_bytes()[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// The frame argument `old` respelled as `frame`: `10.0` gives `14.0`, `10` gives `14`.
+fn frame_arg_like(old: &str, frame: u32) -> String {
+    crate::project_consts::format_literal_like(old, f64::from(frame))
+        .unwrap_or_else(|| format_float(frame as f32))
+}
+
+/// Move the statement calling `site` from its frame block (at frame `from`) to frame `to`.
+///
+/// This works for any call `site` locates, not only effects. The statement must be a whole line
+/// (or lines) directly inside a `frame(..); if is_excute(..) { .. }` block, the shape effect
+/// timing moves accept. Then:
+///
+/// - If it is the block's only statement (comments aside) and no block exists at `to`, the whole
+///   block, comments included, is retimed and placed in frame order, exactly as an effect block
+///   moves.
+/// - If a block already exists at `to`, the statement joins the end of it, and a block the
+///   statement leaves with nothing in it at all is removed; one left holding comments stays.
+/// - Otherwise a new block is made at `to` from the frame line, `is_excute` header and closing
+///   line of the block it left, so it is written the way the user writes blocks.
+///
+/// Every byte moved keeps its own line endings and indentation. Returns the new text and where
+/// the moved call now starts, or why it cannot be moved.
+fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Result<(String, usize), String> {
+    if let Some(reason) = frame_order_unreliable(text) {
+        return Err(reason.into());
+    }
+    let block = article_frame_block(text, site).ok_or(
+        "it is not directly inside a `frame(..)` statement's `is_excute` block",
+    )?;
+    if block.frame != from {
+        return Err(format!("its block is at frame {}, not {from}", block.frame));
+    }
+    if brace_depth(text, block.execute_body.clone(), site.span.start) != 0 {
+        return Err("it is inside a condition or block within its frame block".into());
+    }
+    let line_of = |at: usize| line_range_at(text, at).ok_or("its line could not be found");
+    let start_line = line_of(site.span.start)?;
+    let prefix = text[start_line.start..site.span.start].trim();
+    if !(prefix.is_empty() || prefix.starts_with("let ")) {
+        return Err("another statement shares its line".into());
+    }
+    let semicolon = article_statement_semicolon(text, site.span.start, site.span.end - 1)
+        .or_else(|| {
+            let after = &text[site.span.end..];
+            let at = site.span.end + (after.len() - after.trim_start().len());
+            (text.as_bytes().get(at) == Some(&b';')).then_some(at)
+        })
+        .ok_or("it is not a whole statement")?;
+    let end_line = line_of(semicolon)?;
+    let tail = text[semicolon + 1..end_line.end].trim();
+    if !(tail.is_empty() || tail.starts_with("//")) {
+        return Err("another statement shares its line".into());
+    }
+    let statement = start_line.start..end_line.end;
+    if statement.start < block.execute_body.start || statement.end > block.execute_body.end {
+        return Err("its block opens or closes on the same line as it".into());
+    }
+    let statement_text = &text[statement.clone()];
+    let call_offset = site.span.start - statement.start;
+    // What else the block holds: nothing at all, or only comments (which move with a block that
+    // moves whole, as an effect block's do, and stay put otherwise).
+    let rest = format!(
+        "{}{}",
+        &text[block.execute_body.start..statement.start],
+        &text[statement.end..block.execute_body.end]
+    );
+    let empty = rest.trim().is_empty();
+    let alone = rest.lines().all(|line| {
+        let line = line.trim();
+        line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.ends_with("*/")
+    });
+
+    // Where a block closes: the start of the line holding its `}`, which must hold nothing else.
+    let closing_line = |close: usize| -> Result<Range<usize>, String> {
+        let line = line_of(close)?;
+        if !text[line.start..close].trim().is_empty() {
+            return Err(format!(
+                "a block at frame {to} closes on the same line as its last statement"
+            ));
+        }
+        Ok(line)
+    };
+    let target = source_frame_blocks(text)
+        .into_iter()
+        .find(|candidate| candidate.frame == to && candidate.range != block.range);
+
+    // (removed range, insertion point, inserted text, call's offset in the inserted text)
+    let (removed, anchor, inserted, offset) = match &target {
+        Some(target) => {
+            let anchor = closing_line(target.execute_body.end)?.start;
+            let removed = if empty { block.range.clone() } else { statement.clone() };
+            (removed, anchor, statement_text.to_string(), call_offset)
+        }
+        None => {
+            let frame_arg = block.frame_arg.clone();
+            let new_arg = frame_arg_like(&text[frame_arg.clone()], to);
+            let (removed, chunk, offset) = if alone {
+                let relative = frame_arg.start - block.range.start..frame_arg.end - block.range.start;
+                let mut chunk = text[block.range.clone()].to_string();
+                let growth = new_arg.len() as isize - relative.len() as isize;
+                chunk.replace_range(relative, &new_arg);
+                let offset = (site.span.start - block.range.start) as isize + growth;
+                (block.range.clone(), chunk, offset as usize)
+            } else {
+                // `{` ends its header line and `}` starts its closing line, or the block cannot
+                // be copied without the statements it holds.
+                let header_end = line_of(block.execute_body.start - 1)?.end;
+                if !text[block.execute_body.start..header_end].trim().is_empty() {
+                    return Err("its block's `is_excute` line also holds a statement".into());
+                }
+                let closer = closing_line(block.execute_body.end)
+                    .map_err(|_| "its block closes on the same line as a statement".to_string())?;
+                let mut header = text[block.range.start..header_end].to_string();
+                header.replace_range(
+                    frame_arg.start - block.range.start..frame_arg.end - block.range.start,
+                    &new_arg,
+                );
+                let offset = header.len() + call_offset;
+                let chunk = format!("{header}{statement_text}{}", &text[closer.start..block.range.end]);
+                (statement.clone(), chunk, offset)
+            };
+            // A block the call leaves behind keeps its frame line, which still orders the rest.
+            let moving = if alone { block.range.clone() } else { statement.clone() };
+            (removed, frame_insertion_point(text, to, &moving)?, chunk, offset)
+        }
+    };
+    if removed.start < anchor && anchor < removed.end {
+        return Err("its new place is inside the lines it leaves".into());
+    }
+    let mut out = String::with_capacity(text.len() + inserted.len());
+    let at = if anchor <= removed.start {
+        out.push_str(&text[..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..removed.start]);
+        out.push_str(&text[removed.end..]);
+        at
+    } else {
+        out.push_str(&text[..removed.start]);
+        out.push_str(&text[removed.end..anchor]);
+        let at = out.len() + offset;
+        out.push_str(&inserted);
+        out.push_str(&text[anchor..]);
+        at
+    };
+    Ok((out, at))
+}
+
+/// Where a new block for `frame` goes: before the first `frame(..)` statement for a later frame
+/// (outside `moving`, the block being moved), else at the end of the function. Every frame line
+/// counts, not only those with an `is_excute` block: placing a block after a later frame would
+/// make it run at that later frame.
+fn frame_insertion_point(text: &str, frame: u32, moving: &Range<usize>) -> Result<usize, String> {
+    let mut later: Option<usize> = None;
+    for site in scan_named_sites(text, "frame", 0..text.len()) {
+        if moving.start <= site.span.start && site.span.start < moving.end {
+            continue;
+        }
+        let Some(line) = line_range_at(text, site.span.start) else {
+            continue;
+        };
+        if !text[line.clone()].trim_start().starts_with("frame(") {
+            continue;
+        }
+        let value = site.arg(text, 1).and_then(|value| value.trim().parse::<f32>().ok());
+        let Some(value) = value else {
+            return Err(format!(
+                "a `frame` statement is not a plain number (`{}`), so where frame {frame} goes is \
+                 unclear",
+                text[site.span.clone()].trim()
+            ));
+        };
+        if crate::data::script_frame(value) > frame && later.is_none_or(|at| line.start < at) {
+            later = Some(line.start);
+        }
+    }
+    if let Some(at) = later {
+        return Ok(at);
+    }
+    let close = text.rfind('}').ok_or("the function has no closing brace")?;
+    let line = line_range_at(text, close).ok_or("the function has no closing brace")?;
+    if !text[line.start..close].trim().is_empty() {
+        return Err("the function's closing brace shares its line with a statement".into());
+    }
+    Ok(line.start)
+}
+
 // ── Kinetic speed write-back ────────────────────────────────────────────────
 
 /// The buildable `SET_SPEED_EX` calls in source order.
@@ -18122,5 +18717,230 @@ pub fn install() {
         assert_eq!(script.to_hitboxes()[0].active_start, 4);
         let effect = source.replace("game_x", "effect_x");
         let _ = crate::acmd::parse_effect_script(&effect);
+    }
+}
+
+#[cfg(test)]
+mod rewrite_article_tests {
+    use super::*;
+    use crate::data::{ArticleCall, ArticleTarget};
+
+    /// A charge-shot spawn and its shoot, each in its own frame block, in the shape the vanilla
+    /// dump and the corpus write them (`samus/game_specialn`).
+    const SPECIAL_N: &str = "unsafe extern \"C\" fn game_specialn(agent: &mut L2CAgentBase) {\n\
+        \x20   frame(agent.lua_state_agent, 10.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n\
+        \x20   }\n\
+        \x20   frame(agent.lua_state_agent, 20.0);\n\
+        \x20   if macros::is_excute(agent) {\n\
+        \x20       ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);\n\
+        \x20   }\n\
+        }\n";
+
+    fn calls(text: &str) -> Vec<(u32, ArticleCall)> {
+        crate::acmd::parse_acmd_script(text).to_article_calls()
+    }
+
+    fn rewrite(text: &str, edit: impl FnOnce(&mut Vec<(u32, ArticleCall)>)) -> (String, SyncReport) {
+        let pristine = calls(text);
+        let mut edited = pristine.clone();
+        edit(&mut edited);
+        rewrite_article_calls(text, "samus/specialn", &pristine, &edited).unwrap()
+    }
+
+    #[test]
+    fn edits_target_only() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            assert_eq!(calls.len(), 2, "{calls:#?}");
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        assert_eq!(report.changed, 1);
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(calls(&out)[1].1.target, ArticleTarget::All);
+    }
+
+    /// A bare `*ARTICLE_OPE_TARGET_X` is the timeline's canonical form wrapped; the file keeps
+    /// its own bare spelling, and compact commas stay compact, because only the target's bytes
+    /// are replaced.
+    #[test]
+    fn edits_keep_the_file_spelling() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::shoot(agent.module_accessor,*FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT,*ARTICLE_OPE_TARGET_LAST,false);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, text.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        // The receiver path, the binding and an argument edit.
+        let text = SPECIAL_N.replace(
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+            "let id = smash::app::lua_bind::ArticleModule::generate_article(boma,  *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);",
+        );
+        let (out, report) = rewrite(&text, |calls| {
+            calls[0].1.args[0] = "true".into();
+            calls[0].1.edited = true;
+        });
+        assert_eq!(out, text.replace("CSHOT, false, -1", "CSHOT, true, -1"), "{report:?}");
+    }
+
+    /// The only call in its frame block: the block is retimed and placed in frame order, the way
+    /// effect blocks move.
+    #[test]
+    fn moves_spawn_to_new_frame() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 14);
+        assert_eq!(out, SPECIAL_N.replace("10.0", "14.0"), "{report:?}");
+        assert!(out.contains("frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article("));
+        assert_eq!(calls(&out)[0].0, 14);
+        assert_eq!(report.changed, 1);
+
+        // Past the shoot: the block lands after frame 20, so the calls swap order.
+        let (out, report) = rewrite(SPECIAL_N, |calls| calls[0].0 = 25);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert_eq!(out.len(), SPECIAL_N.len());
+    }
+
+    /// A call sharing its block moves alone: into the target frame's block when there is one,
+    /// else into a new block built like the one it left.
+    #[test]
+    fn moves_one_line_between_blocks() {
+        let shared = SPECIAL_N.replace(
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n",
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n        macros::ATTACK(agent, 0, 0, Hash40::new(\"top\"), 1.0, 361, 100, 0, 0, 3.0, 0.0, 8.0, 8.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_NONE);\n",
+        );
+        // Into frame 20's existing block, after its own call.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 20);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 20), "{out}\n{report:?}");
+        assert_eq!(moved[1].1.op, crate::data::ArticleOp::Generate);
+        assert!(out.contains("frame(agent.lua_state_agent, 10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        // Into a new frame 14 block.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 14);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (14, 20), "{out}\n{report:?}");
+        assert!(out.contains("    }\n    frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n    }\n    frame(agent.lua_state_agent, 20.0);"), "{out}");
+        assert!(out.contains("10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        assert_eq!(crate::acmd::parse_acmd_script(&out).to_hitboxes().len(), 1);
+        // Earlier than the block it leaves: the new block goes before that block's frame line.
+        let (out, report) = rewrite(&shared, |calls| calls[0].0 = 5);
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (5, 20), "{out}\n{report:?}");
+        let (five, ten) = (out.find("5.0);").unwrap(), out.find("10.0);").unwrap());
+        assert!(five < ten, "{out}");
+    }
+
+    /// Comments, a `let` binding and an `if` condition around the calls: the statements are
+    /// counted as the parser types them.
+    #[test]
+    fn statement_sites_skip_comments_and_conditions() {
+        let text = SPECIAL_N
+            .replace(
+                "        ArticleModule::generate_article(",
+                "        // spawn the shot\n        /* charged */ \n        ArticleModule::generate_article(",
+            )
+            .replace(
+                "    frame(agent.lua_state_agent, 20.0);\n",
+                "    frame(agent.lua_state_agent, 20.0); // fire\n",
+            );
+        let sites = article_call_sites(&text);
+        assert_eq!(sites.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["generate_article", "shoot"]);
+        let condition = "    if ArticleModule::is_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT) {\n    }\n";
+        let with_condition = format!("{}{condition}}}\n", &SPECIAL_N[..SPECIAL_N.len() - 2]);
+        assert_eq!(article_call_sites(&with_condition).len(), 2, "{with_condition}");
+        assert_eq!(calls(&with_condition).len(), 2);
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text.replace("10.0", "14.0"), "{report:?}");
+    }
+
+    #[test]
+    fn count_mismatch_skips_with_reason() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[1].1.target = ArticleTarget::All;
+        // A third call the editor does not model by position (inside a condition).
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_SAMUS_STATUS_SPECIAL_N_FLAG_CHARGE) {\n        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));\n    }\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert!(report.skipped[0].contains("3 `ArticleModule` call(s)"), "{report:?}");
+        assert!(report.skipped[0].contains("models 2"), "{report:?}");
+
+        // Added or removed calls are structural too.
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited[..1]).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("added or removed"), "{report:?}");
+
+        // Nothing edited: nothing reported, even where the counts disagree.
+        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &pristine).unwrap();
+        assert_eq!((out.as_str(), report), (text.as_str(), SyncReport::default()));
+    }
+
+    /// Paired by position, but the call at that position is a different one: refused.
+    #[test]
+    fn mispaired_calls_are_refused() {
+        let pristine = calls(SPECIAL_N);
+        let swapped = vec![pristine[1].clone(), pristine[0].clone()];
+        let mut edited = swapped.clone();
+        edited[0].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("cannot be paired"), "{report:?}");
+    }
+
+    #[test]
+    fn changing_the_function_is_reported() {
+        let (out, report) = rewrite(SPECIAL_N, |calls| {
+            calls[1].1.op = crate::data::ArticleOp::ShootExist;
+            calls[1].1.edited = true;
+        });
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("`shoot` to `shoot_exist`"), "{report:?}");
+    }
+
+    #[test]
+    fn crlf_preserved() {
+        let text = SPECIAL_N.replace('\n', "\r\n");
+        let (out, report) = rewrite(&text, |calls| {
+            calls[1].1.target = ArticleTarget::All;
+            calls[1].1.edited = true;
+            calls[0].0 = 25;
+        });
+        assert_eq!(report.changed, 2, "{report:?}");
+        assert!(out.contains("TARGET_ALL"));
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(out.len(), text.len() - "LAST".len() + "ALL".len());
+        let moved = calls(&out);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out:?}");
+
+        let shared = text.replace(
+            "-1);\r\n",
+            "-1);\r\n        macros::FT_MOTION_RATE(agent, 0.5);\r\n",
+        );
+        let (out, _) = rewrite(&shared, |calls| calls[0].0 = 14);
+        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(calls(&out)[0].0, 14, "{out:?}");
+    }
+
+    /// A move is refused, with the reason, where frame blocks do not say when a line runs.
+    #[test]
+    fn move_refused_after_a_wait() {
+        let text = SPECIAL_N.replace(
+            "    frame(agent.lua_state_agent, 20.0);\n",
+            "    wait(agent.lua_state_agent, 2.0);\n    frame(agent.lua_state_agent, 20.0);\n",
+        );
+        let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
+        assert_eq!(out, text);
+        assert_eq!(report.changed, 0);
+        assert!(report.skipped[0].contains("wait"), "{report:?}");
     }
 }

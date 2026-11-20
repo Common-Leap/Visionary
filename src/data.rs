@@ -8293,6 +8293,7 @@ macro_rules! with_point_families {
             work_transition_term_pristine: WorkTransitionTermEvent => to_work_transition_term_events,
             work_module_inc_int_pristine: WorkModuleIncIntEvent => to_work_module_inc_int_events,
             work_module_set_pristine: WorkModuleSetEvent => to_work_module_set_events,
+            article_calls_pristine: (u32, ArticleCall) => to_article_calls,
         }
     };
 }

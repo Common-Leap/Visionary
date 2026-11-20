@@ -304,6 +304,16 @@ pub fn apply_edits(consts: &ProjectConsts, edits: &[ConstEdit]) -> (Vec<PathBuf>
                 ));
                 continue;
             }
+            // An edit may carry a plain number (`plan_setting_write` has no definition to spell
+            // it like): it is written the way the definition is, and an integer const refuses a
+            // fraction rather than rounding it.
+            let Some(value) = respell_like_definition(def, value) else {
+                notes.push(format!(
+                    "{name} is a whole-number constant, so it can't hold {value}; it was not changed"
+                ));
+                continue;
+            };
+            let value = value.as_str();
             text.replace_range(def.value_span.clone(), value);
             wrote = true;
             changed += 1;
@@ -479,6 +489,40 @@ fn format_like(existing: &str, float: bool, new: f64) -> String {
         format!("{}", new.round() as i64)
     };
     format!("{body}{suffix}")
+}
+
+/// `value` spelled like `def`'s value. A value that is not a plain number is kept as given; a
+/// fraction for an integer const is `None`.
+fn respell_like_definition(def: &ConstDef, value: &str) -> Option<String> {
+    let Some(number) = numeric_value(value) else {
+        return Some(value.to_string());
+    };
+    if def.is_float() {
+        return Some(format_like(&def.value, true, number));
+    }
+    format_literal_like(&def.value, number)
+}
+
+/// `new` written in the style of the numeric literal `existing`: `30` gives `45`, `30.0` gives
+/// `45.0`, `1.6f32` gives `2.0f32`. A literal written as a whole number (no decimal point and no
+/// float suffix) is `None` for a value with a fraction, which it cannot hold.
+pub(crate) fn format_literal_like(existing: &str, new: f64) -> Option<String> {
+    let existing = existing.trim();
+    if !new.is_finite() {
+        return None;
+    }
+    let plain = strip_suffix(existing);
+    let has_point = plain.contains('.') || plain.contains(['e', 'E']);
+    let float_suffix = existing.ends_with("f32") || existing.ends_with("f64");
+    if has_point {
+        return Some(format_like(existing, true, new));
+    }
+    if new.fract() != 0.0 {
+        // `30f32` holds a fraction; a bare `30` or `30u8` does not.
+        return float_suffix.then(|| format_like(existing, true, new));
+    }
+    let suffix = &existing[plain.len()..];
+    Some(format!("{}{suffix}", new as i64))
 }
 
 fn skip_literal_or_comment(text: &str, i: usize) -> Option<usize> {

@@ -6850,6 +6850,11 @@ impl VisionaryApp {
                 work_module_set_pristine,
                 script.to_work_module_set_events
             );
+            step!(
+                rewrite_article_calls,
+                article_calls_pristine,
+                script.to_article_calls
+            );
         }
         let Some(buffer) = self.acmd_src_buffer.as_mut() else {
             return;
@@ -7202,6 +7207,13 @@ impl VisionaryApp {
                     .state
                     .script
                     .to_kinetic_set_consider_ground_friction_events()
+            ));
+            refresh_acmd_index(&mut index, &mut notes);
+            // Article calls are matched by their own `ArticleModule` statements, and a frame
+            // change moves a line between frame blocks, so they get their own pass too.
+            sync!(sync_article_calls(
+                &self.state.point_originals.article_calls_pristine,
+                &self.state.script.to_article_calls()
             ));
             // The last game pass above has no later game family to protect, but sound
             // and expression live in their own functions that can share the file. Without

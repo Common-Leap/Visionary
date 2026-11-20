@@ -447,8 +447,10 @@ pub fn write_param_field(
             .find(|(name, _, _)| hash_of(name) == field_h)
             .ok_or_else(|| anyhow!("{field} is not in {block} variant {variant}"))?;
         let text = match element.as_str() {
-            "float" => (value as f32).to_string(),
-            "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => (value.round() as i64).to_string(),
+            "float" => float_text(field, value)?,
+            "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => {
+                whole_number(field, element.as_str(), value)?.to_string()
+            }
             other => bail!("{field} is a {other}, not a number"),
         };
         let out = format!("{}{text}{}", &src[..range.start], &src[range.end..]);
@@ -475,18 +477,68 @@ pub fn write_param_field(
         .iter_mut()
         .find_map(|(key, v)| (key.0 == field_h).then_some(v))
         .ok_or_else(|| anyhow!("{field} is not in {block} variant {variant}"))?;
-    let int = value.round();
     match slot {
-        prc::ParamKind::Float(v) => *v = value as f32,
-        prc::ParamKind::I8(v) => *v = int as i8,
-        prc::ParamKind::U8(v) => *v = int as u8,
-        prc::ParamKind::I16(v) => *v = int as i16,
-        prc::ParamKind::U16(v) => *v = int as u16,
-        prc::ParamKind::I32(v) => *v = int as i32,
-        prc::ParamKind::U32(v) => *v = int as u32,
+        prc::ParamKind::Float(v) => {
+            float_text(field, value)?;
+            *v = value as f32
+        }
+        prc::ParamKind::I8(v) => *v = whole_number(field, "sbyte", value)? as i8,
+        prc::ParamKind::U8(v) => *v = whole_number(field, "byte", value)? as u8,
+        prc::ParamKind::I16(v) => *v = whole_number(field, "short", value)? as i16,
+        prc::ParamKind::U16(v) => *v = whole_number(field, "ushort", value)? as u16,
+        prc::ParamKind::I32(v) => *v = whole_number(field, "int", value)? as i32,
+        prc::ParamKind::U32(v) => *v = whole_number(field, "uint", value)? as u32,
         _ => bail!("{field} is not a number"),
     }
     prc::save(file, &root).map_err(|e| anyhow!("writing {}: {e}", file.display()))
+}
+
+/// Whether `file` holds `block.field` in `variant` (`block` a full `param_…` name; `field` a label
+/// or `0x…` hash). A missing file holds nothing; one that cannot be read is an error, so a caller
+/// never mistakes it for a layer without the field.
+pub fn layer_has_field(file: &Path, block: &str, field: &str, variant: usize) -> Result<bool> {
+    if !file.exists() {
+        return Ok(false);
+    }
+    let read = if is_xml(file) {
+        read_xml_block(file, hash_of(block))
+    } else {
+        read_prc_block(file, hash_of(block), &HashMap::new())
+    };
+    let found = read.map_err(|error| anyhow!("Visionary could not read {}: {error}", file.display()))?;
+    let field = hash_of(field);
+    Ok(found
+        .and_then(|found| found.variants.into_iter().nth(variant))
+        .is_some_and(|fields| fields.iter().any(|(name, _)| hash_of(name) == field)))
+}
+
+/// A float param's text, refusing a value an `f32` cannot hold.
+fn float_text(field: &str, value: f64) -> Result<String> {
+    let single = value as f32;
+    if !single.is_finite() {
+        bail!("{field} holds a decimal number, and {value} is too large or not a number");
+    }
+    Ok(single.to_string())
+}
+
+/// `value` rounded to a whole number, refused when the param's type (`sbyte`, `byte`, `short`,
+/// `ushort`, `int`, `uint`, as a prcxml names them) cannot hold it rather than clamped to the
+/// nearest value it can.
+fn whole_number(field: &str, kind: &str, value: f64) -> Result<i64> {
+    let (min, max, words) = match kind {
+        "sbyte" => (i8::MIN as i64, i8::MAX as i64, "a small whole number"),
+        "byte" => (0, u8::MAX as i64, "a small whole number that can't be negative"),
+        "short" => (i16::MIN as i64, i16::MAX as i64, "a whole number"),
+        "ushort" => (0, u16::MAX as i64, "a whole number that can't be negative"),
+        "int" => (i32::MIN as i64, i32::MAX as i64, "a whole number"),
+        "uint" => (0, u32::MAX as i64, "a whole number that can't be negative"),
+        other => bail!("{field} is a {other}, not a number"),
+    };
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded < min as f64 || rounded > max as f64 {
+        bail!("{field} holds {words} from {min} to {max}, so it can't be set to {value}");
+    }
+    Ok(rounded as i64)
 }
 
 #[cfg(test)]
@@ -732,6 +784,46 @@ mod tests {
         assert_eq!(param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(1.6));
         write_param_field(&file, "param_x", "speed", 0, 2.5, &labels()).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before.replace("1.6", "2.5"));
+    }
+
+    /// R8: an integer param refuses a value its type cannot hold instead of clamping it
+    /// (`300 as u8` would silently write 255, `-1` would write 0).
+    #[test]
+    fn integer_write_refuses_out_of_range_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vl.prc");
+        prc::save(&file, &mixed_root(1.0)).unwrap();
+        for value in [300.0, -1.0, f64::NAN] {
+            let error = write_param_field(&file, "param_x", "tiny", 0, value, &labels()).unwrap_err();
+            assert!(error.to_string().contains("can't be set to"), "{error}");
+        }
+        assert_eq!(prc::open(&file).unwrap(), mixed_root(1.0), "a refused write changes nothing");
+        write_param_field(&file, "param_x", "tiny", 0, 255.0, &labels()).unwrap();
+        let error = write_param_field(&file, "param_x", "life", 0, 3e9, &labels()).unwrap_err();
+        assert!(error.to_string().contains("from -2147483648 to 2147483647"), "{error}");
+
+        let xml = dir.path().join("vl.prcxml");
+        let before = "<struct><struct hash=\"param_x\"><byte hash=\"tiny\">7</byte></struct></struct>";
+        std::fs::write(&xml, before).unwrap();
+        let error = write_param_field(&xml, "param_x", "tiny", 0, 300.0, &labels()).unwrap_err();
+        assert!(error.to_string().contains("can't be set to 300"), "{error}");
+        assert_eq!(std::fs::read_to_string(&xml).unwrap(), before);
+        write_param_field(&xml, "param_x", "tiny", 0, 200.0, &labels()).unwrap();
+        assert_eq!(std::fs::read_to_string(&xml).unwrap(), before.replace(">7<", ">200<"));
+    }
+
+    /// Whether prc-rs's open+save reproduces a real, game/mod-written `vl.prc` byte for byte.
+    #[test]
+    #[ignore = "reads a real moveset checkout"]
+    fn real_latios_open_save_is_byte_identical() {
+        let real = PathBuf::from("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset/romfs/fighter/samus/param/vl.prc");
+        let dir = tempfile::tempdir().unwrap();
+        let (copy, saved) = (dir.path().join("vl.prc"), dir.path().join("saved.prc"));
+        std::fs::copy(&real, &copy).unwrap();
+        prc::save(&saved, &prc::open(&copy).unwrap()).unwrap();
+        let (before, after) = (std::fs::read(&copy).unwrap(), std::fs::read(&saved).unwrap());
+        assert_eq!(before.len(), after.len(), "saved file length differs");
+        assert!(before == after, "saved bytes differ from the original");
     }
 
     #[test]

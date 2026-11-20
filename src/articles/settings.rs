@@ -665,6 +665,8 @@ impl<'ast> syn::visit::Visit<'ast> for Scanner<'_, '_> {
     }
 }
 
+pub use write::{plan_setting_write, SettingWrite};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1194,315 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         );
         assert_eq!(s[0].span, 0..text.len());
         assert!(s.iter().all(|s| s.field != SettingField::Scale));
+    }
+}
+
+/// Where an edited setting is saved: at the literal in the status code, at a const's definition,
+/// or in the param file the value is read from.
+pub mod write {
+    use std::path::PathBuf;
+
+    use anyhow::{bail, Context, Result};
+
+    use super::{Setting, SettingField, SettingValue};
+    use crate::project_consts::ConstEdit;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum SettingWrite {
+        /// `file`'s whole new text: only the literal's bytes differ.
+        Source { file: PathBuf, text: String },
+        /// Change the const's definition (through [`crate::project_consts::apply_edits`], which
+        /// spells the number the way the definition is written).
+        Const(ConstEdit),
+        /// Write variant 0 of `block.field` in `file` (through
+        /// [`crate::articles::params::write_param_field`]).
+        Param { file: PathBuf, block: String, field: String },
+    }
+
+    /// Plan saving `new` for `setting`. `layers` are the param files the article reads, lowest
+    /// first, the moveset's own romfs file last.
+    ///
+    /// - A `Literal` has its bytes in the status code replaced, written the way the literal was
+    ///   (`30` → `45`, `30.0` → `45.0`, `1.6f32` → `2.0f32`); every other byte of the file is kept.
+    /// - A `Const` becomes a [`ConstEdit`] on its definition.
+    /// - A `Param` goes to the top-most layer that already has the field, else to the moveset's
+    ///   own file (the last layer).
+    /// - A `Computed` value, and anything this cannot write, is an error saying why.
+    ///
+    /// Nothing is written here: the caller applies the plan.
+    pub fn plan_setting_write(setting: &Setting, new: f64, layers: &[PathBuf]) -> Result<SettingWrite> {
+        if !new.is_finite() {
+            bail!("{new} is not a number Visionary can write");
+        }
+        if setting.field == SettingField::Gravity && new < 0.0 {
+            bail!(
+                "Gravity is written as a pull downwards (a negated acceleration), so it can't be \
+                 negative here; set Acceleration Y in the source instead"
+            );
+        }
+        match &setting.value {
+            SettingValue::Computed(text) => bail!(
+                "This value is worked out from other values ({text}), so Visionary can't change it \
+                 without losing how it is worked out; change it in the source"
+            ),
+            SettingValue::Literal(old) => {
+                let file = &setting.file;
+                let mut text =
+                    std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+                let Some(written) = text.get(setting.span.clone()).map(str::to_string) else {
+                    bail!("{} changed since it was read — rescan and try again", file.display());
+                };
+                if literal_value(&written).is_none_or(|value| (value - old).abs() > 1e-9) {
+                    bail!(
+                        "{} changed since it was read (the value there is now `{written}`) — rescan and \
+                         try again",
+                        file.display()
+                    );
+                }
+                let Some(value) = crate::project_consts::format_literal_like(&written, new) else {
+                    bail!(
+                        "{} is written as a whole number (`{written}`), so it can't hold {new}",
+                        setting.field.label()
+                    );
+                };
+                text.replace_range(setting.span.clone(), &value);
+                Ok(SettingWrite::Source { file: file.clone(), text })
+            }
+            SettingValue::Const { name, value } => {
+                if value.is_none() {
+                    bail!(
+                        "{name} is not a number this project defines, so Visionary can't find where to \
+                         change it; change it where it is defined"
+                    );
+                }
+                // Plain digits: `apply_edits` spells them the way the definition is written.
+                Ok(SettingWrite::Const(ConstEdit { name: name.clone(), value: new.to_string() }))
+            }
+            SettingValue::Param { block, field } => {
+                let Some(own) = layers.last() else {
+                    bail!("{block}.{field} is read from params, but there is no param file to write it to");
+                };
+                for layer in layers.iter().rev() {
+                    // A layer that cannot be read may be the one the game reads, so choosing one
+                    // below it could write a value the game never sees.
+                    let has = crate::articles::params::layer_has_field(layer, block, field, 0)
+                        .map_err(|error| {
+                            anyhow::anyhow!("{error}, so Visionary can't tell which file holds {block}.{field}")
+                        })?;
+                    if has {
+                        return Ok(SettingWrite::Param {
+                            file: layer.clone(),
+                            block: block.clone(),
+                            field: field.clone(),
+                        });
+                    }
+                }
+                Ok(SettingWrite::Param { file: own.clone(), block: block.clone(), field: field.clone() })
+            }
+        }
+    }
+
+    /// The number a literal's text spells (`30`, `-1.5`, `1.6f32`, `1_000`).
+    fn literal_value(text: &str) -> Option<f64> {
+        let expr: syn::Expr = syn::parse_str(text.trim()).ok()?;
+        super::number(&expr)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        const STATUS: &str = "unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\r\n    weapon.set_life(30);\r\n    ModelModule::set_scale(weapon.module_accessor, 1.6f32);\r\n    AttackModule::set_power_mul(weapon.module_accessor, 30.0);\r\n    sv_kinetic_energy!(set_accel, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 0.0, -0.08);\r\n    0.into()\r\n}\r\n";
+
+        fn setting(file: &Path, text: &str, field: SettingField, value: SettingValue, written: &str) -> Setting {
+            let start = text.find(written).expect("fixture holds the value");
+            Setting {
+                field,
+                value,
+                status: "*WEAPON_X_STATUS_KIND_SHOOT".into(),
+                phase: "Main".into(),
+                file: file.to_path_buf(),
+                span: start..start + written.len(),
+                facing_factor: false,
+                referenced_params: Vec::new(),
+            }
+        }
+
+        fn source_text(write: SettingWrite) -> String {
+            match write {
+                SettingWrite::Source { text, .. } => text,
+                other => panic!("expected a source write, got {other:?}"),
+            }
+        }
+
+        /// The settings reader's own spans: what it records is what the writer splices.
+        #[test]
+        fn literal_setting_keeps_style() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.rs");
+            std::fs::write(&file, STATUS).unwrap();
+            let life = setting(&file, STATUS, SettingField::Life, SettingValue::Literal(30.0), "30)");
+            let life = Setting { span: life.span.start..life.span.end - 1, ..life };
+            let scale = setting(&file, STATUS, SettingField::Scale, SettingValue::Literal(1.6), "1.6f32");
+            let power = setting(&file, STATUS, SettingField::PowerMul, SettingValue::Literal(30.0), "30.0");
+            let gravity = setting(&file, STATUS, SettingField::Gravity, SettingValue::Literal(0.08), "0.08");
+
+            let text = source_text(plan_setting_write(&life, 45.0, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("set_life(30)", "set_life(45)"));
+            let text = source_text(plan_setting_write(&scale, 2.0, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("1.6f32", "2.0f32"));
+            let text = source_text(plan_setting_write(&power, 45.0, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("30.0", "45.0"));
+            // Gravity is the magnitude of a negated acceleration: the `-` stays where it is.
+            let text = source_text(plan_setting_write(&gravity, 0.1, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("-0.08", "-0.1"));
+            assert_eq!(text.matches("\r\n").count(), STATUS.matches("\r\n").count());
+
+            let error = plan_setting_write(&life, 45.5, &[]).unwrap_err().to_string();
+            assert!(error.contains("whole number"), "{error}");
+            let error = plan_setting_write(&gravity, -0.1, &[]).unwrap_err().to_string();
+            assert!(error.contains("negative"), "{error}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS, "planning writes nothing");
+        }
+
+        /// The spans the reader gives for a real status agree with the writer.
+        #[test]
+        fn literal_setting_from_the_reader() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.rs");
+            std::fs::write(&file, STATUS).unwrap();
+            let consts = crate::project_consts::ProjectConsts::default();
+            let site = crate::acmd_src::StatusSite {
+                kind_expr: "*WEAPON_X_STATUS_KIND_SHOOT".into(),
+                phase: "Main".into(),
+                function: "shot_main".into(),
+                file: file.clone(),
+                span: 0..STATUS.len(),
+            };
+            let settings = super::super::read_settings(&[(&site, STATUS.to_string())], &consts, &|_, _| None);
+            let gravity = settings.iter().find(|s| s.field == SettingField::Gravity).unwrap();
+            let text = source_text(plan_setting_write(gravity, 0.5, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("-0.08", "-0.5"));
+            let life = settings.iter().find(|s| s.field == SettingField::Life).unwrap();
+            let text = source_text(plan_setting_write(life, 90.0, &[]).unwrap());
+            assert_eq!(text, STATUS.replace("set_life(30)", "set_life(90)"));
+        }
+
+        #[test]
+        fn literal_changed_on_disk_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.rs");
+            std::fs::write(&file, STATUS.replace("1.6f32", "1.9f32")).unwrap();
+            let scale = setting(&file, STATUS, SettingField::Scale, SettingValue::Literal(1.6), "1.6f32");
+            let error = plan_setting_write(&scale, 2.0, &[]).unwrap_err().to_string();
+            assert!(error.contains("changed"), "{error}");
+        }
+
+        #[test]
+        fn computed_setting_refuses() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.rs");
+            std::fs::write(&file, STATUS).unwrap();
+            let computed = setting(
+                &file,
+                STATUS,
+                SettingField::PowerMul,
+                SettingValue::Computed("charge_boost + 1.0".into()),
+                "30.0",
+            );
+            let error = plan_setting_write(&computed, 2.0, &[]).unwrap_err().to_string();
+            assert!(error.contains("worked out"), "{error}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS);
+        }
+
+        #[test]
+        fn const_setting_becomes_a_const_edit() {
+            let file = PathBuf::from("shot.rs");
+            let value = SettingValue::Const { name: "FIREBALL_SCALE".into(), value: Some(1.4) };
+            let scale = setting(&file, "FIREBALL_SCALE", SettingField::Scale, value, "FIREBALL_SCALE");
+            assert_eq!(
+                plan_setting_write(&scale, 2.5, &[]).unwrap(),
+                SettingWrite::Const(ConstEdit { name: "FIREBALL_SCALE".into(), value: "2.5".into() })
+            );
+            let unknown = Setting {
+                value: SettingValue::Const { name: "FROM_ELSEWHERE".into(), value: None },
+                ..scale
+            };
+            let error = plan_setting_write(&unknown, 2.5, &[]).unwrap_err().to_string();
+            assert!(error.contains("FROM_ELSEWHERE"), "{error}");
+
+            // The definition keeps its own spelling when the edit is applied.
+            let dir = tempfile::tempdir().unwrap();
+            let defs = dir.path().join("consts.rs");
+            let text = "const FIREBALL_SCALE: f32 = 1.4f32;\nconst FIREBALL_LIFE: i32 = 180;\n";
+            std::fs::write(&defs, text).unwrap();
+            let consts = crate::project_consts::ProjectConsts::scan(&[(defs.clone(), text.to_string())]);
+            let edits = [
+                ConstEdit { name: "FIREBALL_SCALE".into(), value: "2".into() },
+                ConstEdit { name: "FIREBALL_LIFE".into(), value: "200.5".into() },
+            ];
+            let (_, notes, changed) = crate::project_consts::apply_edits(&consts, &edits);
+            assert_eq!(changed, 1, "{notes:?}");
+            assert!(notes.iter().any(|n| n.contains("FIREBALL_LIFE") && n.contains("whole-number")), "{notes:?}");
+            assert_eq!(std::fs::read_to_string(&defs).unwrap(), text.replace("1.4f32", "2.0f32"));
+        }
+
+        fn prc_with(path: &Path, fields: &[(&str, prc::ParamKind)]) {
+            let inner = prc::ParamStruct(fields.iter().map(|(n, v)| (hash40::hash40(n), v.clone())).collect());
+            let root = prc::ParamStruct(vec![(hash40::hash40("param_cshot"), prc::ParamKind::Struct(inner))]);
+            prc::save(path, &root).unwrap();
+        }
+
+        #[test]
+        fn param_setting_targets_existing_layer() {
+            let dir = tempfile::tempdir().unwrap();
+            let (dump, romfs) = (dir.path().join("dump.prc"), dir.path().join("romfs.prcxml"));
+            prc_with(&dump, &[("speed", prc::ParamKind::Float(1.0)), ("life", prc::ParamKind::I32(60))]);
+            std::fs::write(
+                &romfs,
+                "<struct>\r\n  <struct hash=\"param_cshot\">\r\n    <float hash=\"speed\">2</float>\r\n  </struct>\r\n</struct>\r\n",
+            )
+            .unwrap();
+            let file = PathBuf::from("shot.rs");
+            let param = |field: &str| {
+                setting(
+                    &file,
+                    "x",
+                    SettingField::SpeedX,
+                    SettingValue::Param { block: "param_cshot".into(), field: field.into() },
+                    "x",
+                )
+            };
+            let planned = |file: &PathBuf, field: &str| SettingWrite::Param {
+                file: file.clone(),
+                block: "param_cshot".into(),
+                field: field.into(),
+            };
+            let layers = [dump.clone(), romfs.clone()];
+            // The moveset's own file has `speed`: it is written there, over the dump's.
+            assert_eq!(plan_setting_write(&param("speed"), 3.0, &layers).unwrap(), planned(&romfs, "speed"));
+            // Only the dump has `life`: the top-most layer that has it.
+            assert_eq!(plan_setting_write(&param("life"), 70.0, &layers).unwrap(), planned(&dump, "life"));
+            // No layer has it: the moveset's own romfs file.
+            assert_eq!(plan_setting_write(&param("gravity"), 1.0, &layers).unwrap(), planned(&romfs, "gravity"));
+            // A layer above the one that has the field could not be read: which file the game
+            // reads is unknown, so nothing is chosen.
+            let broken = dir.path().join("broken.prc");
+            std::fs::write(&broken, b"not a param file").unwrap();
+            let error = plan_setting_write(&param("life"), 70.0, &[dump.clone(), broken]).unwrap_err().to_string();
+            assert!(error.contains("could not read"), "{error}");
+            let error = plan_setting_write(&param("life"), 70.0, &[]).unwrap_err().to_string();
+            assert!(error.contains("no param file"), "{error}");
+
+            // The planned write lands through the param writer, changing only that value.
+            let SettingWrite::Param { file, block, field } = plan_setting_write(&param("speed"), 3.0, &layers).unwrap()
+            else {
+                unreachable!()
+            };
+            crate::articles::params::write_param_field(&file, &block, &field, 0, 3.0, &HashMap::new()).unwrap();
+            assert!(std::fs::read_to_string(&romfs).unwrap().contains("    <float hash=\"speed\">3</float>\r\n"));
+        }
     }
 }
