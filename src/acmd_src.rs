@@ -539,6 +539,21 @@ pub struct StatusSite {
     pub span: Range<usize>,
 }
 
+/// A status registration the index saw but could not turn into a [`StatusSite`], kept so it is
+/// shown to the user rather than silently missing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedStatus {
+    /// The agent, when it is known (a no-op status on a known agent, say).
+    pub agent_hint: Option<String>,
+    pub kind_expr: String,
+    pub phase: String,
+    pub file: PathBuf,
+    /// 1-based line of the registration.
+    pub line: usize,
+    /// One sentence on why no site was recorded.
+    pub reason: String,
+}
+
 /// The shared implementation a forwarding script calls, as this caller sees it.
 ///
 /// The wrapper itself has no body worth showing, so reads use the callee's body with this
@@ -705,9 +720,11 @@ pub struct SourceIndex {
     /// game's. See [`scan_agent_gating`].
     pub costume_gated: HashSet<String>,
     /// Agent (`dedede_fireball`, `pacman`) -> the status scripts the project registers on it.
-    /// Registrations made on a parameter agent (`fn install(agent: &mut Agent)`) are not here:
-    /// only the caller knows which agent that is.
+    /// A registration on a parameter agent (`fn install(agent: &mut Agent)`) is attributed through
+    /// the module that installs it, as ACMD scripts are.
     pub statuses: HashMap<String, Vec<StatusSite>>,
+    /// Status registrations that could not be attributed to an agent or a function.
+    pub unresolved_statuses: Vec<UnresolvedStatus>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -925,7 +942,7 @@ impl SourceIndex {
             );
         }
         index.resolve_delegates(&sources);
-        index.index_statuses(&sources);
+        index.index_statuses(&sources, &fighter_scopes, &scope_root);
         index.hash_macros =
             crate::hash_macros::HashMacros::scan(sources.iter().map(|(_, text)| text.as_str()));
         crate::hash_macros::set_current(index.hash_macros.clone());
@@ -1516,21 +1533,59 @@ impl SourceIndex {
         }
     }
 
-    /// Record every `.status(..)` / `.on_start(..)` registration made on a known agent. The
-    /// registered function is looked up in its own file first, then project-wide when its name
-    /// is defined exactly once.
-    fn index_statuses(&mut self, sources: &[(PathBuf, String)]) {
+    /// Record every `.status(..)` / `.on_start(..)` registration. The agent is the call's own
+    /// receiver, else the module's fighter the way ACMD scripts find theirs (`status::install(agent)`
+    /// in a module that holds an `Agent::new`). The registered function is looked up in its own
+    /// file first, then project-wide when its name is defined exactly once. Whatever cannot be
+    /// resolved goes to `unresolved_statuses` with the reason.
+    fn index_statuses(
+        &mut self,
+        sources: &[(PathBuf, String)],
+        fighter_scopes: &HashMap<PathBuf, Vec<String>>,
+        scope_root: &Path,
+    ) {
         let mut defined: HashMap<String, Vec<(usize, Range<usize>)>> = HashMap::new();
         for (n, (_, text)) in sources.iter().enumerate() {
             for function in scan_plain_functions(text) {
                 defined.entry(function.name).or_default().push((n, function.span));
             }
         }
-        for (n, (_, text)) in sources.iter().enumerate() {
+        for (n, (file, text)) in sources.iter().enumerate() {
             for registration in scan_status_registrations(text) {
-                let Some(agent) = registration.agent else {
+                let line = text[..registration.at].matches('\n').count() + 1;
+                let agent = registration
+                    .agent
+                    .clone()
+                    .or_else(|| fighter_for_file(file, scope_root, fighter_scopes));
+                let unresolved = UnresolvedStatus {
+                    agent_hint: agent.clone(),
+                    kind_expr: registration.kind_expr.clone(),
+                    phase: registration.phase.clone(),
+                    file: file.clone(),
+                    line,
+                    reason: String::new(),
+                };
+                if registration.noop {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered as a no-op with noop_status!".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
+                let Some(agent) = agent else {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "the agent is a parameter and no single module installs it from an Agent::new, or several agents claim the module".to_string(),
+                        ..unresolved
+                    });
                     continue;
                 };
+                if !is_identifier(&registration.function) {
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: "registered with a closure or expression, not a named function".to_string(),
+                        ..unresolved
+                    });
+                    continue;
+                }
                 let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
                 let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
                 let found = match (own.as_slice(), candidates) {
@@ -1539,6 +1594,15 @@ impl SourceIndex {
                     _ => None,
                 };
                 let Some((at, span)) = found else {
+                    let reason = if candidates.is_empty() {
+                        "the registered function is not defined in the project source"
+                    } else {
+                        "the registered function name is defined more than once"
+                    };
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason: reason.to_string(),
+                        ..unresolved
+                    });
                     continue;
                 };
                 let site = StatusSite {
@@ -2383,22 +2447,37 @@ fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
         .collect()
 }
 
-/// One `.status(Phase, KIND, f)` or `.on_start(f)` call.
+/// One `.status(Phase, KIND, f)` or `.on_start(f)` call, or one phase of a `noop_status!`.
 struct StatusRegistration {
+    /// Offset of the call, for its line number.
+    at: usize,
     agent: Option<String>,
     phase: String,
     kind_expr: String,
-    /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment.
+    /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment. Anything
+    /// that is not a name (a closure) is kept as written.
     function: String,
+    /// A phase registered with `noop_status!`: there is no function to follow.
+    noop: bool,
 }
 
-/// Every `.status(..)` / `.on_start(..)` registration in `text`, in document order, with the
-/// agent each is made on (as [`scan_registrations`] decides it).
+/// A path's last segment, unless the text is not a plain path (a closure), which stays as written.
+fn function_name(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        text.rsplit("::").next().unwrap_or(text).to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Every `.status(..)` / `.on_start(..)` / `noop_status!(..)` registration in `text`, in document
+/// order, with the agent each is made on when the call itself says (as [`scan_registrations`]).
 fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
-    let mut out: Vec<(usize, StatusRegistration)> = Vec::new();
+    let mut out: Vec<StatusRegistration> = Vec::new();
     let boundaries = statement_boundaries(text);
     let bindings = agent_bindings(text, &boundaries);
-    for marker in [".status(", ".on_start("] {
+    for marker in [".status(", ".on_start(", "noop_status!("] {
         let mut search = 0;
         while search < text.len() {
             if !text.is_char_boundary(search) {
@@ -2413,40 +2492,51 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                 search += 1;
                 continue;
             }
-            let dot = search;
+            let at = search;
             let open = search + marker.len() - 1;
             search = open + 1;
             let Some((args, _)) = split_call_args(text, open + 1, text.len()) else {
                 continue;
             };
-            let (phase, kind_expr, function) = match (marker, args.len()) {
-                (".status(", 3..) => (
-                    text[args[0].clone()].trim(),
-                    text[args[1].clone()].trim(),
-                    text[args[2].clone()].trim(),
-                ),
-                (".on_start(", 1) => ("Start", "", text[args[0].clone()].trim()),
-                _ => continue,
-            };
-            let phase = phase.rsplit("::").next().unwrap_or(phase).trim();
-            let function = function.rsplit("::").next().unwrap_or(function).trim();
-            if !is_identifier(phase) || !is_identifier(function) {
-                continue;
-            }
-            let receiver = &text[statement_start(&boundaries, dot)..dot];
-            out.push((
-                open,
-                StatusRegistration {
+            let receiver = &text[statement_start(&boundaries, at)..at];
+            match (marker, args.len()) {
+                (".status(", 3..) => out.push(StatusRegistration {
+                    at,
                     agent: receiver_agent(receiver, &bindings),
-                    phase: phase.to_string(),
-                    kind_expr: kind_expr.to_string(),
-                    function: function.to_string(),
-                },
-            ));
+                    phase: function_name(&text[args[0].clone()]),
+                    kind_expr: text[args[1].clone()].trim().to_string(),
+                    function: function_name(&text[args[2].clone()]),
+                    noop: false,
+                }),
+                (".on_start(", 1) => out.push(StatusRegistration {
+                    at,
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: "Start".to_string(),
+                    kind_expr: String::new(),
+                    function: function_name(&text[args[0].clone()]),
+                    noop: false,
+                }),
+                ("noop_status!(", 3..) => {
+                    let agent = receiver_agent(&text[args[0].clone()], &bindings);
+                    let kind_expr = text[args[1].clone()].trim().to_string();
+                    let phases = text[args[2].clone()].trim().trim_start_matches('[').trim_end_matches(']');
+                    for phase in phases.split(',').map(str::trim).filter(|phase| !phase.is_empty()) {
+                        out.push(StatusRegistration {
+                            at,
+                            agent: agent.clone(),
+                            phase: function_name(phase),
+                            kind_expr: kind_expr.clone(),
+                            function: String::new(),
+                            noop: true,
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    out.sort_by_key(|(at, _)| *at);
-    out.into_iter().map(|(_, registration)| registration).collect()
+    out.sort_by_key(|registration| registration.at);
+    out
 }
 
 /// Offsets of every `;`, `{` and `}` outside strings and comments, ascending.
@@ -17387,9 +17477,10 @@ pub fn install(agent: &mut smashline::Agent) {
         std::fs::write(path, text).unwrap();
     }
 
-    /// King Boo's fireball registers its status scripts on a chained `Agent::new` and keeps the
-    /// speed in the status body: that body is where an article's motion is read from.
-    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:35,103 (tier 1)
+    /// A status registered on a chained `Agent::new`, whose body holds the article's motion. The
+    /// chain form is synthetic; the status body shape (`sv_kinetic_energy!` in a `Main` status) is
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:49 (tier 1). The parameter-agent
+    /// layout King Boo really uses is `indexes_parameter_agent_status_through_install_module`.
     #[test]
     fn indexes_weapon_status_on_chain() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17450,6 +17541,90 @@ pub fn install() {
         assert!(sites.iter().any(|s| s.phase == "Main" && s.function == "jackbox_main"));
         assert!(sites.iter().any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
         assert_eq!(index.status_bodies("pacman_trampoline").len(), 3);
+    }
+
+    /// King Boo's real layout: `mod.rs` builds the agent and hands it to `status::install(agent)`;
+    /// `status.rs` registers on the parameter. `start.rs` does the same with `on_start`.
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/mod.rs:5-11, status.rs:103-111;
+    /// weapon/portrait/start.rs:26 (tier 1)
+    #[test]
+    fn indexes_parameter_agent_status_through_install_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "weapon/fireball/mod.rs",
+            r#"mod status;
+mod start;
+pub fn install() {
+    let agent = &mut smashline::Agent::new("dedede_fireball");
+    status::install(agent);
+    start::install(agent);
+    agent.install();
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.status(Main, FIREBALL_STATUS_KIND_SHOOT, shoot_main);
+}
+"#,
+        );
+        put(
+            root,
+            "weapon/fireball/start.rs",
+            r#"unsafe extern "C" fn fireball_start(weapon: &mut L2CWeaponCommon) {}
+pub fn install(agent: &mut smashline::Agent) {
+    agent.on_start(fireball_start);
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 2, "{:?} / {:?}", index.statuses, index.unresolved_statuses);
+        assert!(bodies.iter().any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
+        assert!(bodies.iter().any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+    }
+
+    /// Closures, `noop_status!` (Shy Guy has eight) and a parameter nobody installs are not
+    /// sites, but they are listed with a reason rather than dropped.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:13-14 (tier 1)
+    #[test]
+    fn indexes_unresolved_statuses_are_listed_with_reasons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "tramp/install.rs",
+            r#"pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    noop_status!(agent, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_START, [Pre, Main, End]);
+    agent.status(Main, 0, |weapon| 0.into());
+    agent.status(End, 0, missing_function);
+}
+"#,
+        );
+        put(
+            root,
+            "orphan.rs",
+            "pub fn install(agent: &mut Agent) {\n    agent.status(Main, 1, orphan_main);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        let noops = unresolved.iter().filter(|u| u.reason.contains("noop_status!")).collect::<Vec<_>>();
+        assert_eq!(noops.len(), 3, "{unresolved:?}");
+        assert!(noops.iter().all(|u| u.agent_hint.as_deref() == Some("pacman_trampoline")));
+        assert!(unresolved.iter().any(|u| u.reason.contains("closure") && u.phase == "Main" && u.line == 4));
+        assert!(unresolved.iter().any(|u| u.reason.contains("not defined") && u.phase == "End"));
+        assert!(unresolved.iter().any(|u| u.kind_expr == "1" && u.reason.contains("parameter")), "{unresolved:?}");
+        assert!(index.statuses.is_empty(), "{:?}", index.statuses);
     }
 
     /// The fighter's own status registrations never leak onto its article, or the reverse.
