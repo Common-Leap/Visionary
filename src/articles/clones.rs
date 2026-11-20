@@ -35,6 +35,10 @@ pub struct CloneDecl {
     pub id_bindings: Vec<String>,
     /// Names the clone's own weapon kind is stored in (new signature only).
     pub kind_bindings: Vec<String>,
+    /// Why `id_bindings` is empty when the new signature was used: the generate id is stored
+    /// somewhere the reader does not follow. `None` when bound, or for the old signature (whose
+    /// id is legitimately discarded by a bare statement).
+    pub id_note: Option<String>,
     pub file: PathBuf,
     pub line: usize,
 }
@@ -184,6 +188,44 @@ struct Reader<'a> {
     unresolved: Vec<UnresolvedClone>,
 }
 
+const UNBOUND_ID: &str = "the generate id is stored somewhere this reader does not follow (a destructured `let`, a pointer or an unnamed target), so no name is known for it";
+
+/// A name an id or kind is stored into: `A`, `path::A`, or the field in `self.A`. A pointer
+/// (`*slot`) names nothing.
+fn target_name(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Paren(p) => target_name(&p.expr),
+        syn::Expr::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+        syn::Expr::Field(f) => match &f.member {
+            syn::Member::Named(m) => Some(m.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `clone_weapon(..).generate_id` / `.weapon_id` written inline: the call and which field.
+fn inline_field(expr: &syn::Expr) -> Option<(&syn::ExprCall, &'static str)> {
+    match expr {
+        syn::Expr::Field(f) => {
+            let kind = match &f.member {
+                syn::Member::Named(m) if m == "generate_id" => "id",
+                syn::Member::Named(m) if m == "weapon_id" => "kind",
+                _ => return None,
+            };
+            find_clone_call(&f.base).map(|c| (c, kind))
+        }
+        syn::Expr::Paren(p) => inline_field(&p.expr),
+        syn::Expr::Group(g) => inline_field(&g.expr),
+        syn::Expr::Closure(c) => inline_field(&c.body),
+        syn::Expr::Block(b) => match b.block.stmts.as_slice() {
+            [syn::Stmt::Expr(e, None)] => inline_field(e),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 type Args<'a> = Vec<&'a syn::Expr>;
 
 impl Reader<'_> {
@@ -303,6 +345,7 @@ impl Reader<'_> {
             use_original_code: Self::bool_arg(a[4])?,
             id_bindings: Vec::new(),
             kind_bindings: Vec::new(),
+            id_note: None,
             file: PathBuf::new(),
             line: 0,
         })
@@ -318,6 +361,7 @@ impl Reader<'_> {
             use_original_code: Self::bool_arg(a[3])?,
             id_bindings: Vec::new(),
             kind_bindings: Vec::new(),
+            id_note: Some(UNBOUND_ID.into()),
             file: PathBuf::new(),
             line: 0,
         })
@@ -341,11 +385,29 @@ impl Reader<'_> {
 
     /// Declarations made by one statement `X = N + clone_weapon(..)` / `X += clone_weapon(..)`.
     fn assignment(&mut self, target: &syn::Expr, value: &syn::Expr) -> bool {
+        if self.inline_store(target, value) {
+            return true;
+        }
         let Some(call) = find_clone_call(value) else { return false };
-        // Visit the arguments (nested calls are unusual but cheap to honour).
         let id = self.resolve(call);
-        if let (Some(index), Some(name)) = (id, path_name(target)) {
+        if let (Some(index), Some(name)) = (id, target_name(target)) {
             self.decls[index].id_bindings.push(name);
+        }
+        true
+    }
+
+    /// `A.get_or_init(|| clone_weapon(..).generate_id)` / `A = clone_weapon(..).weapon_id`.
+    fn inline_store(&mut self, target: &syn::Expr, value: &syn::Expr) -> bool {
+        let Some((call, field)) = inline_field(value) else { return false };
+        if let Some(index) = self.resolve(call) {
+            if let Some(name) = target_name(target) {
+                if field == "id" {
+                    self.decls[index].id_bindings.push(name);
+                    self.decls[index].id_note = None;
+                } else {
+                    self.decls[index].kind_bindings.push(name);
+                }
+            }
         }
         true
     }
@@ -361,9 +423,12 @@ impl Reader<'_> {
         };
         let Some(index) = self.resolve(call) else { return true };
         if let Some(var) = var {
-            let mut finder = BindingFinder { var, ids: Vec::new(), kinds: Vec::new() };
+            let mut finder = BindingFinder { var, aliases: Vec::new(), ids: Vec::new(), kinds: Vec::new() };
             for stmt in rest {
                 syn::visit::Visit::visit_stmt(&mut finder, stmt);
+            }
+            if !finder.ids.is_empty() {
+                self.decls[index].id_note = None;
             }
             self.decls[index].id_bindings = finder.ids;
             self.decls[index].kind_bindings = finder.kinds;
@@ -382,6 +447,17 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
             }
             self.visit_stmt(stmt);
         }
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "get_or_init" || call.method == "set" {
+            if let Some(arg) = call.args.first() {
+                if self.inline_store(&call.receiver, arg) {
+                    return;
+                }
+            }
+        }
+        syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
@@ -452,6 +528,8 @@ fn collect_pat_names(pat: &syn::Pat, out: &mut Vec<String>) {
 /// `A.set(v.generate_id)` or `A = v.generate_id`.
 struct BindingFinder {
     var: String,
+    /// Names bound to a field read (`let id = v.generate_id;`), with which field.
+    aliases: Vec<(String, &'static str)>,
     ids: Vec<String>,
     kinds: Vec<String>,
 }
@@ -461,9 +539,19 @@ impl BindingFinder {
     fn field_of(&self, expr: &syn::Expr) -> Option<&'static str> {
         struct Probe<'v> {
             var: &'v str,
+            aliases: &'v [(String, &'static str)],
             found: Option<&'static str>,
         }
         impl<'ast> syn::visit::Visit<'ast> for Probe<'_> {
+            fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+                if p.path.segments.len() == 1 {
+                    let name = p.path.segments[0].ident.to_string();
+                    if let Some((_, field)) = self.aliases.iter().find(|(n, _)| *n == name) {
+                        self.found = Some(field);
+                    }
+                }
+            }
+
             fn visit_expr_field(&mut self, f: &'ast syn::ExprField) {
                 if path_name(&f.base).as_deref() == Some(self.var) {
                     if let syn::Member::Named(m) = &f.member {
@@ -477,13 +565,13 @@ impl BindingFinder {
                 syn::visit::visit_expr_field(self, f);
             }
         }
-        let mut probe = Probe { var: &self.var, found: None };
+        let mut probe = Probe { var: &self.var, aliases: &self.aliases, found: None };
         syn::visit::Visit::visit_expr(&mut probe, expr);
         probe.found
     }
 
     fn store(&mut self, target: &syn::Expr, value: &syn::Expr) {
-        let (Some(name), Some(field)) = (path_name(target), self.field_of(value)) else { return };
+        let (Some(name), Some(field)) = (target_name(target), self.field_of(value)) else { return };
         let list = if field == "id" { &mut self.ids } else { &mut self.kinds };
         if !list.contains(&name) {
             list.push(name);
@@ -492,6 +580,15 @@ impl BindingFinder {
 }
 
 impl<'ast> syn::visit::Visit<'ast> for BindingFinder {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let (syn::Pat::Ident(p), Some(init)) = (&local.pat, &local.init) {
+            if let Some(field) = self.field_of(&init.expr) {
+                self.aliases.push((p.ident.to_string(), field));
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if call.method == "get_or_init" || call.method == "set" {
             if let Some(arg) = call.args.first() {
@@ -516,15 +613,16 @@ mod tests {
     }
 
     fn run_many(files: &[(&str, &str)]) -> (Vec<CloneDecl>, Vec<UnresolvedClone>) {
+        run_dirs(files, &["mario", "miiswordsman", "link", "kingteresa", "mii", "buddy"])
+    }
+
+    fn run_dirs(files: &[(&str, &str)], dirs: &[&str]) -> (Vec<CloneDecl>, Vec<UnresolvedClone>) {
         let sources: Vec<(PathBuf, String)> = files
             .iter()
             .map(|(p, t)| (PathBuf::from(p), t.to_string()))
             .collect();
         let consts = ProjectConsts::scan(&sources);
-        let dirs: Vec<String> = ["mario", "miiswordsman", "link", "kingteresa", "mii", "buddy"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let dirs: Vec<String> = dirs.iter().map(|s| s.to_string()).collect();
         read_clones(&sources, &consts, &dirs)
     }
 
@@ -596,13 +694,68 @@ pub fn smashline_install() {
         assert_eq!(d[1].src_owner, None);
     }
 
-    /// Longest matching fighter wins (`mii` vs `miiswordsman`).
+    /// Longest matching fighter wins: both `PTRAINER_` and `PTRAINER_LOW_` prefix the kind
+    /// (synthetic dir names; a first-match or shortest-match would pick `ptrainer`).
     #[test]
     fn new_api_source_owner_prefers_longest() {
-        let (d, _) = run(
-            r#"fn f() { let a = clone_weapon("x", "y", *WEAPON_KIND_MIISWORDSMAN_WAVE, false); }"#,
+        let (d, _) = run_dirs(
+            &[("lib.rs", r#"fn f() { let a = clone_weapon("x", "y", *WEAPON_KIND_PTRAINER_LOW_BALL, false); }"#)],
+            &["ptrainer", "ptrainer_low", "mario"],
         );
-        assert_eq!(d[0].src_owner.as_deref(), Some("miiswordsman"));
+        assert_eq!(d[0].src_owner.as_deref(), Some("ptrainer_low"));
+    }
+
+    /// Two-hop: `let id = v.generate_id; A.set(id)`.
+    #[test]
+    fn new_api_two_hop_binding() {
+        let (d, u) = run(r#"
+fn f() {
+    let v = smashline::clone_weapon("dedede", "a", *WEAPON_KIND_LINK_SWORD_BEAM, false);
+    let id = v.generate_id;
+    let kind = v.weapon_id;
+    ID.set(id).ok();
+    self.KIND = kind;
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d[0].id_bindings, ["ID"]);
+        assert_eq!(d[0].kind_bindings, ["KIND"]);
+        assert_eq!(d[0].id_note, None);
+    }
+
+    /// Inline: `X.get_or_init(|| clone_weapon(..).generate_id)`.
+    #[test]
+    fn new_api_inline_get_or_init() {
+        let (d, u) = run(r#"
+fn f() {
+    X.get_or_init(|| smashline::clone_weapon("dedede", "a", *WEAPON_KIND_LINK_SWORD_BEAM, false).generate_id);
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].id_bindings, ["X"]);
+        assert_eq!(d[0].id_note, None);
+    }
+
+    /// Stored through a pointer, as Sceptile's helper does (`*generate_id = clone.generate_id`),
+    /// or destructured: the decl is kept and says why it has no id name.
+    #[test]
+    fn new_api_stored_elsewhere_gives_reason() {
+        let (d, u) = run(r#"
+unsafe fn f(slot: *mut i32) {
+    let clone = smashline::clone_weapon("mario", "a", *WEAPON_KIND_LINK_SWORD_BEAM, false);
+    *slot = clone.generate_id;
+    let b = smashline::clone_weapon("mario", "b", *WEAPON_KIND_LINK_SWORD_BEAM, false);
+    let smashline::CloneWeapon { generate_id, .. } = b;
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 2);
+        for decl in &d {
+            assert!(decl.id_bindings.is_empty());
+            let note = decl.id_note.as_deref().expect("a reason");
+            assert!(note.contains("does not follow"), "{note}");
+        }
     }
 
     /// Empoleon-Moveset · src/lib.rs:408 (bare statement, full path kind, `true`).
