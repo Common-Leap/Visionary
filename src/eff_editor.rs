@@ -44,6 +44,8 @@ pub struct MoveUse {
     pub label: String,
     /// The move's motion name, to open it; `None` when it is not in the fighter's move list.
     pub motion: Option<String>,
+    /// The bones the move spawns the effect on, as its scripts name them.
+    pub bones: Vec<String>,
 }
 
 /// How the Effects page's view plays the selected effect.
@@ -1847,6 +1849,17 @@ impl EffEditor {
             .and_then(|entry| self.effect_uses.get(&entry.hash))
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// The bones the moves that play the selected effect spawn it on, once every move has been
+    /// read.
+    pub fn selected_spawn_bones(&self) -> Option<Vec<&str>> {
+        self.effect_uses_ready.then(|| {
+            self.selected_uses()
+                .iter()
+                .flat_map(|found| found.bones.iter().map(String::as_str))
+                .collect()
+        })
     }
 
     /// Whether the open move plays the selected effect, by its script or an object it makes.

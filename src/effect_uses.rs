@@ -12,6 +12,8 @@ pub struct EffectUse {
     pub script: Option<String>,
     /// The object that plays the effect for the move, like "fireball".
     pub object: Option<String>,
+    /// The bone the script spawns it on ("top", "haver").
+    pub bone: Option<String>,
 }
 
 /// Effect name hash to the moves that play it.
@@ -82,7 +84,15 @@ fn object_agents(fighter: &str) -> Vec<String> {
 /// The effects a script spawns, by name: the first name of every effect macro that makes one,
 /// in every branch (a left-facing fighter's `mario_fb_bullet_l` as well as the right's).
 fn spawned_effects(body: &str) -> Vec<String> {
-    let mut names: Vec<String> = body
+    let mut names: Vec<String> = spawns(body).into_iter().map(|(name, _)| name).collect();
+    names.dedup();
+    names
+}
+
+/// Each effect a script spawns with the bone it spawns it on (the second name in the call),
+/// sorted, once each.
+fn spawns(body: &str) -> Vec<(String, Option<String>)> {
+    let mut found: Vec<(String, Option<String>)> = body
         .lines()
         .filter_map(|line| {
             let (_, call) = line.split_once("macros::")?;
@@ -95,13 +105,17 @@ fn spawned_effects(body: &str) -> Vec<String> {
                 return None;
             }
             let (_, rest) = args.split_once("Hash40::new(\"")?;
-            let (name, _) = rest.split_once('"')?;
-            Some(name.to_owned())
+            let (name, rest) = rest.split_once('"')?;
+            let bone = rest
+                .split_once("Hash40::new(\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(bone, _)| bone.to_owned());
+            Some((name.to_owned(), bone))
         })
         .collect();
-    names.sort();
-    names.dedup();
-    names
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// The objects a script creates ("FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL" is "fireball").
@@ -148,13 +162,14 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
         };
         let mut creators: HashMap<String, Vec<String>> = HashMap::new();
         for (script, body) in &bodies {
-            for effect in spawned_effects(body) {
+            for (effect, bone) in spawns(body) {
                 add(
                     &mut uses,
                     &effect,
                     EffectUse {
                         script: Some(script.clone()),
                         object: None,
+                        bone,
                     },
                 );
             }
@@ -176,7 +191,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
             });
             let movers = creators.get(&object).cloned().unwrap_or_default();
             for (_, body) in &bodies {
-                for effect in spawned_effects(body) {
+                for (effect, bone) in spawns(body) {
                     if movers.is_empty() {
                         add(
                             &mut uses,
@@ -184,6 +199,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
                             EffectUse {
                                 script: None,
                                 object: Some(object.clone()),
+                                bone: bone.clone(),
                             },
                         );
                     }
@@ -194,6 +210,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
                             EffectUse {
                                 script: Some(mover.clone()),
                                 object: Some(object.clone()),
+                                bone: bone.clone(),
                             },
                         );
                     }
@@ -294,6 +311,13 @@ mod tests {
         assert_eq!(
             spawned_effects(body),
             vec!["mario_fb_bullet_l".to_owned(), "mario_fb_shoot".to_owned()]
+        );
+        assert_eq!(
+            spawns(body),
+            vec![
+                ("mario_fb_bullet_l".to_owned(), Some("rot".to_owned())),
+                ("mario_fb_shoot".to_owned(), Some("havel".to_owned())),
+            ]
         );
     }
 }

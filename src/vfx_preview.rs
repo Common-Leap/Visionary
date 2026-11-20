@@ -44,6 +44,22 @@ pub struct EffectDraw {
     pub looping: Option<usize>,
 }
 
+/// Where the Effects page puts an effect it plays on its own, from the bones its moves spawn
+/// it on. On the fighter's root bones ("top", "rot", "trans") an effect turns with the fighter,
+/// which in the preview, facing right, is no turn at all. Any other bone (a hand, a weapon) has
+/// a pose the view cannot know without the move, so the effect keeps the game's world axes,
+/// the ones effects are made in. Sephiroth's blue charge (edge_fire2_hold, on "haver") throws
+/// its rays, sparks and lightning across the screen in game; turned as if on the top bone, that
+/// plane was seen edge on and they all stood upright.
+pub fn alone_placement(bones: &[&str]) -> Mat4 {
+    let root = |bone: &&str| ["top", "rot", "trans"].contains(&bone.to_ascii_lowercase().as_str());
+    if bones.is_empty() || bones.iter().any(root) {
+        Mat4::IDENTITY
+    } else {
+        Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2)
+    }
+}
+
 /// The draw path the game gives its soft glows (3,389 fighter emitters, nearly all named flare,
 /// light or smoke).
 const GLOW_PATH: u8 = 21;
@@ -1034,5 +1050,54 @@ mod tests {
             s.step();
         }
         assert!(s.children().iter().all(|c| c.count() > 0));
+    }
+
+    /// The same charge on its own, as the preview camera sees it: from the side, the preview's
+    /// +Z to the right and +Y up. Its move spawns it on Sephiroth's hand ("haver"), and in game
+    /// its rays (light2) go every way across the screen; placed as on the top bone they all
+    /// stood upright, their plane edge on. A top bone effect still sits unturned.
+    #[test]
+    fn a_hand_effect_on_its_own_throws_its_rays_across_the_screen() {
+        assert_eq!(alone_placement(&["top"]), Mat4::IDENTITY);
+        assert_eq!(alone_placement(&[]), Mat4::IDENTITY);
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeFire2Hold")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[set];
+        let rays = emitters
+            .iter()
+            .find(|e| e.data.name.as_deref() == Some("light2"))
+            .unwrap();
+        // The bone edge/SpecialNStart spawns it on.
+        let placement = alone_placement(&["haver"]);
+        let mut s = sim::EmitterSim::new(&rays.data, &rays.fixed);
+        let (mut across, mut total) = (0, 0);
+        for _ in 0..80 {
+            s.step_at(&placement);
+            let srt = s.emitter_srt(&placement);
+            for v in s.streams().get("sysLocalVecAttr").into_iter().flatten() {
+                let d = srt
+                    .transform_vector3(glam::Vec3::new(v[0], v[1], v[2]))
+                    .normalize_or_zero();
+                total += 1;
+                // More than 30 degrees off upright on screen.
+                if d.z.abs() > 0.5 {
+                    across += 1;
+                }
+            }
+        }
+        assert!(total > 20);
+        assert!(across * 3 > total, "{across} of {total} rays go across");
     }
 }

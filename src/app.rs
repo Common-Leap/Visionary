@@ -9945,11 +9945,14 @@ impl VisionaryApp {
                 let clock =
                     (self.effect_loop_started.elapsed().as_secs_f32() * self.playback_fps) as usize;
                 let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
+                let placement = crate::vfx_preview::alone_placement(
+                    &self.eff_editor.selected_spawn_bones().unwrap_or_default(),
+                );
                 out.push(crate::vfx_preview::EffectDraw {
                     file,
                     solo: solo_for(&name),
                     name,
-                    placements: vec![glam::Mat4::IDENTITY],
+                    placements: vec![placement],
                     kill_at: None,
                     colour,
                     particle_colour: [1.0; 4],
@@ -30620,11 +30623,19 @@ impl VisionaryApp {
                     .push(crate::eff_editor::MoveUse {
                         label: crate::move_kinds::plain_name(&motion),
                         motion: known.then_some(motion),
+                        bones: Vec::new(),
                     });
             }
             for moves in resolved.values_mut() {
                 moves.sort_by(|a, b| a.label.cmp(&b.label));
-                moves.dedup();
+                // One entry a move, with every bone it spawns the effect on.
+                moves.dedup_by(|later, kept| {
+                    let same = later.label == kept.label && later.motion == kept.motion;
+                    if same {
+                        kept.bones.append(&mut later.bones);
+                    }
+                    same
+                });
             }
             self.eff_editor.set_effect_uses(resolved, finished);
         }
@@ -36680,7 +36691,11 @@ fn move_use(
         (None, Some(object)) => object,
         (None, None) => String::new(),
     };
-    crate::eff_editor::MoveUse { label, motion }
+    crate::eff_editor::MoveUse {
+        label,
+        motion,
+        bones: found.bone.iter().cloned().collect(),
+    }
 }
 
 struct UseScan {
