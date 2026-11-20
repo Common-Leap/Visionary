@@ -48,41 +48,50 @@ fn costume_scope_ui(
     roots: &[PathBuf],
     behaviors: &mut BTreeMap<String, BehaviorGraph>,
 ) {
-    // A made character's gimmick runs on its own costumes: a new one starts limited to them.
-    if !context.costume_slots.is_empty() {
+    // A gimmick not made yet starts on the open character's own costumes. A made character's
+    // gimmick runs on its costumes alone, always: it is the made character's own.
+    let made = context.character.is_some();
+    if made
+        || behaviors
+            .get(&context.fighter)
+            .is_some_and(BehaviorGraph::is_empty)
+    {
         let graph = behaviors.entry(context.fighter.clone()).or_default();
-        if graph.costumes.is_empty() && graph.is_empty() {
+        if graph.costumes != context.costume_slots {
             graph.costumes = context.costume_slots.clone();
         }
+    }
+    if made {
+        let range = crate::character::slot_range(&context.costume_slots).unwrap_or_default();
+        ui.label(format!("Runs on {range}"))
+            .on_hover_text(format!("Only {}'s costumes", context.name));
+        return;
     }
     let current = behaviors
         .get(&context.fighter)
         .map(|graph| graph.costumes.clone())
         .unwrap_or_default();
-    let mut all = crate::data::costume_slots_or_default(roots, &context.fighter);
-    all.extend(context.costume_slots.iter().copied());
-    all.sort_unstable();
-    all.dedup();
-    let label = match current.as_slice() {
-        [] => "Runs on every costume".to_owned(),
-        slots => format!(
-            "Runs on {}",
-            slots
-                .iter()
-                .map(|slot| format!("c{slot:02}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    // A fighter with characters made on it keeps to its own costumes (`costume_slots`): theirs
+    // are theirs. One without any can run on every costume, which is no limit at all.
+    let unlimited = context.costume_slots.clone();
+    let all = if unlimited.is_empty() {
+        crate::data::costume_slots_or_default(roots, &context.fighter)
+    } else {
+        unlimited.clone()
+    };
+    let label = match crate::character::slot_range(&current) {
+        None => "Runs on every costume".to_owned(),
+        Some(range) => format!("Runs on {range}"),
     };
     let mut chosen = None;
     ui.menu_button(label, |ui| {
-        if ui.button("Every costume").clicked() {
-            chosen = Some(Vec::new());
-        }
-        if !context.costume_slots.is_empty()
-            && ui.button(format!("Only {}'s costumes", context.name)).clicked()
-        {
-            chosen = Some(context.costume_slots.clone());
+        let every = if unlimited.is_empty() {
+            "Every costume".to_owned()
+        } else {
+            format!("Every {} costume", context.name)
+        };
+        if ui.button(every).clicked() {
+            chosen = Some(unlimited.clone());
         }
         ui.separator();
         for &slot in &all {
@@ -98,7 +107,7 @@ fn costume_scope_ui(
                 next.dedup();
                 // Every slot ticked is the same as no limit.
                 if next == all {
-                    next.clear();
+                    next = unlimited.clone();
                 }
                 chosen = Some(next);
             }

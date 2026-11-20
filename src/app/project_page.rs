@@ -173,6 +173,8 @@ struct CardFacts {
     base_name: String,
     /// Characters made on this fighter, which share its values.
     sharing: Vec<String>,
+    /// Who has the fighter's one gimmick, when another character on it does.
+    gimmick_holder: Option<String>,
     /// The folder of the move code the project uses, by name.
     move_code: Option<String>,
     /// The project has the character's own effect file.
@@ -252,11 +254,12 @@ fn fighters_with_edits(families: &EditFamilies) -> BTreeSet<String> {
     .collect()
 }
 
-/// The fighter a "fighter/move" key belongs to. Live rule keys may carry a `#` part.
-fn fighter_of_move_key(key: &str) -> Option<String> {
-    let (fighter, _) = key.split_once('/')?;
-    let fighter = fighter.split('#').next().unwrap_or(fighter);
-    (!fighter.is_empty()).then(|| fighter.to_owned())
+/// The character a per-move store key belongs to, as the store spells it: `"mario"` for a
+/// fighter, `"mario#c08"` for a character made in the project. Live rule keys carry a `#` part
+/// after the move, which is not the character's.
+fn owner_of_move_key(key: &str) -> Option<String> {
+    let (owner, _) = crate::character::split_move_key(key)?;
+    (!owner.is_empty()).then(|| owner.to_owned())
 }
 
 /// Costumes as ranges: "c00–c07", "c08–c15, c20".
@@ -317,6 +320,10 @@ fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
                 counts.gimmick_values,
                 counted(counts.gimmick_values, "value"),
             );
+            // The game runs one gimmick per fighter: say whose it is when it is another's.
+            if let Some(holder) = &facts.gimmick_holder {
+                chips.push(format!("{holder} has the gimmick"));
+            }
             counts.gimmicks + counts.meters + counts.gimmick_values > 0
         }
         Part::Effects => {
@@ -867,24 +874,25 @@ impl VisionaryApp {
         out
     }
 
-    /// The fighters each kind of edit touches. Edits made for a made character's costumes
-    /// alone are that character's, not its base fighter's.
+    /// The characters each kind of edit touches, as each store spells them: `"mario"` for a
+    /// fighter, `"mario#c08"` for a character made in the project. Every store keeps a made
+    /// character's edits under its own key, so none of them counts on its base fighter.
     fn edit_families(&self, parts: &ProjectParts) -> EditFamilies {
         let made = self.made_slots();
-        let made_only = |fighter: &str, scopes: &[u8]| {
-            !scopes.is_empty()
-                && made
-                    .get(fighter)
-                    .is_some_and(|slots| scopes.iter().all(|slot| slots.contains(slot)))
-        };
         let of_keys = |keys: &mut dyn Iterator<Item = &String>| -> Vec<String> {
-            keys.filter_map(|key| fighter_of_move_key(key)).collect()
+            keys.filter_map(|key| owner_of_move_key(key)).collect()
         };
         let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
             graph
                 .transitions
                 .iter()
                 .any(|step| !step.actions.is_empty())
+        };
+        // The game keeps one gimmick per fighter: it is the made character's when limited to
+        // its costumes, else the fighter's.
+        let gimmick_of = |fighter: &String| {
+            self.gimmick_owner(fighter)
+                .map(|owner| owner.as_str().to_owned())
         };
         let roster = &self.roster;
         EditFamilies {
@@ -893,17 +901,14 @@ impl VisionaryApp {
                 .edit_log
                 .entries
                 .iter()
-                .filter(|(fighter, log)| {
-                    log.values()
-                        .any(|record| !made_only(fighter, &record.effective_scopes()))
-                })
-                .map(|(fighter, _)| fighter.clone())
+                .filter(|(_, log)| !log.is_empty())
+                .map(|(owner, _)| owner.clone())
                 .collect(),
             graphs: self
                 .move_graphs
                 .iter()
                 .filter(|(_, graphs)| !graphs.is_empty())
-                .map(|(fighter, _)| fighter.clone())
+                .map(|(owner, _)| owner.clone())
                 .collect(),
             expressions: of_keys(&mut self.state.expression_script_edits.keys()),
             effect_calls: of_keys(
@@ -920,7 +925,7 @@ impl VisionaryApp {
                 .eff_mods
                 .iter()
                 .filter(|(_, eff)| !eff.is_empty())
-                .map(|(fighter, _)| fighter.clone())
+                .map(|(owner, _)| owner.clone())
                 .collect(),
             values: roster
                 .params
@@ -931,20 +936,20 @@ impl VisionaryApp {
             gimmicks: roster
                 .behaviors
                 .iter()
-                .filter(|(fighter, graph)| acts(graph) && !made_only(fighter, &graph.costumes))
-                .map(|(fighter, _)| fighter.clone())
+                .filter(|(_, graph)| acts(graph))
+                .filter_map(|(fighter, _)| gimmick_of(fighter))
                 .collect(),
             controllers: roster
                 .controller_charts
                 .iter()
                 .filter(|(_, charts)| charts.values().any(|chart| acts(&chart.graph)))
-                .map(|(fighter, _)| fighter.clone())
+                .filter_map(|(fighter, _)| gimmick_of(fighter))
                 .collect(),
             meters: roster
                 .meters
                 .iter()
                 .filter(|(_, meters)| !meters.is_empty())
-                .map(|(fighter, _)| fighter.clone())
+                .filter_map(|(fighter, _)| gimmick_of(fighter))
                 .collect(),
             live_rules: of_keys(
                 &mut self
@@ -965,12 +970,17 @@ impl VisionaryApp {
                             .map(|(key, _)| key),
                     ),
             ),
+            // Folders are picked per fighter and costume: one picked for a made character's
+            // costume is that character's.
             folders: parts
                 .links
                 .iter()
                 .filter(|link| link.part != Part::Moves)
                 .filter(|link| {
-                    !made_only(&link.fighter, &link.slot.into_iter().collect::<Vec<_>>())
+                    !link.slot.is_some_and(|slot| {
+                        made.get(&link.fighter.to_ascii_lowercase())
+                            .is_some_and(|slots| slots.contains(&slot))
+                    })
                 })
                 .map(|link| link.fighter.clone())
                 .collect(),
@@ -988,7 +998,8 @@ impl VisionaryApp {
             .filter(|key| !key.contains('#'))
             .cloned()
             .collect();
-        names.extend(edited.iter().cloned());
+        // A made character's edits are on its own card, which every made character has.
+        names.extend(edited.iter().filter(|owner| !owner.contains('#')).cloned());
         let mut cards: Vec<Card> = Vec::new();
         for name in names {
             // One card for all the fighters of a character, showing the one picked on it.
@@ -1104,125 +1115,98 @@ impl VisionaryApp {
         cards
     }
 
-    /// How much of each kind of edit the project makes to `card`'s character.
-    ///
-    /// Edits are stored per fighter, so a made character's are told apart by the costumes
-    /// they are limited to: move edits and gimmicks limited to its costumes are its own, and
-    /// its base fighter's card leaves them out. Its other edits cannot be told apart yet and
-    /// count on the base fighter's card.
-    fn card_counts(&self, card: &Card) -> CardCounts {
-        let fighter = card.fighter.to_ascii_lowercase();
-        let made = self.made_slots();
-        let made_slots = made.get(&fighter).cloned().unwrap_or_default();
-        // An edit is this card's when its costumes are all this made character's, or, on the
-        // base fighter's card, when they are not all some made character's.
-        let mine = |scopes: &[u8]| {
-            if card.made {
-                !scopes.is_empty() && scopes.iter().all(|slot| card.slots.contains(slot))
-            } else {
-                scopes.is_empty() || !scopes.iter().all(|slot| made_slots.contains(slot))
-            }
-        };
-        let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
-            graph
-                .transitions
-                .iter()
-                .any(|step| !step.actions.is_empty())
-        };
-        let roster = &self.roster;
-        let gimmicks = roster
-            .behaviors
-            .get(&fighter)
-            .is_some_and(|graph| acts(graph) && mine(&graph.costumes))
-            as usize;
-        let mut moves: BTreeSet<&str> = self
+    /// The character a card stands for: its made character, or the fighter it shows.
+    fn card_character(card: &Card) -> crate::character::CharacterKey {
+        if card.made {
+            crate::character::CharacterKey::made(card.key.clone())
+        } else {
+            crate::character::CharacterKey::base(&card.fighter)
+        }
+    }
+
+    /// The moves `owner` has edited in any way the Moves part shows: hitboxes and other game
+    /// script calls, node graphs, expressions, and moves the game is changed in live.
+    fn character_edited_moves(&self, owner: &crate::character::CharacterKey) -> BTreeSet<String> {
+        let mine = |key: &&String| owner_of_move_key(key).as_deref() == Some(owner.as_str());
+        let mut moves: BTreeSet<String> = self
             .state
             .edit_log
             .entries
-            .get(&fighter)
+            .get(owner.as_str())
             .into_iter()
-            .flatten()
-            .filter(|(_, record)| mine(&record.effective_scopes()))
-            .map(|(name, _)| name.as_str())
+            .flat_map(|log| log.keys().cloned())
             .collect();
-        if card.made {
-            return CardCounts {
-                moves: moves.len(),
-                gimmicks,
-                ..CardCounts::default()
-            };
-        }
-        let moves_of = |keys: &mut dyn Iterator<Item = &String>| -> BTreeSet<String> {
-            keys.filter_map(|key| key.split_once('/'))
-                .filter(|(owner, _)| owner.eq_ignore_ascii_case(&fighter))
-                .map(|(_, name)| name.to_owned())
-                .collect()
-        };
-        let graphs = self.move_graphs.get(&fighter);
         moves.extend(
-            graphs
+            self.move_graphs
+                .get(owner.as_str())
                 .into_iter()
-                .flat_map(|graphs| graphs.keys().map(String::as_str)),
+                .flat_map(|graphs| graphs.keys().cloned()),
         );
-        let expressions = moves_of(&mut self.state.expression_script_edits.keys());
-        let mut moves: BTreeSet<String> = moves.into_iter().map(str::to_owned).collect();
-        moves.extend(expressions);
-        // Moves the game is changed in live: a rule exists only for a changed move.
-        for (key, empty) in self
+        let named = |key: &String| {
+            crate::character::split_move_key(key)
+                .map(|(_, name)| name.split('#').next().unwrap_or(name).to_owned())
+        };
+        moves.extend(
+            self.state
+                .expression_script_edits
+                .keys()
+                .filter(mine)
+                .filter_map(named),
+        );
+        // A live rule exists only for a changed move.
+        let live = self
             .hitbox_rules_store
             .iter()
-            .map(|(key, rules)| (key, rules.is_empty()))
+            .filter(|(_, rules)| !rules.is_empty())
+            .map(|(key, _)| key)
             .chain(
                 self.effect_rules_store
                     .iter()
-                    .map(|(key, rules)| (key, rules.is_empty())),
+                    .filter(|(_, rules)| !rules.is_empty())
+                    .map(|(key, _)| key),
             )
             .chain(
                 self.effect_control_rules_store
                     .iter()
-                    .map(|(key, rules)| (key, rules.is_empty())),
+                    .filter(|(_, rules)| !rules.is_empty())
+                    .map(|(key, _)| key),
+            );
+        moves.extend(live.filter(mine).filter_map(named));
+        moves
+    }
+
+    /// How much of each kind of edit the project makes to `card`'s character: its own edits
+    /// only, as [`VisionaryApp::character_edit_counts`] counts them. Fighter values are kept per
+    /// fighter, so a made character's card counts none of its own.
+    fn card_counts(&self, card: &Card) -> CardCounts {
+        let owner = Self::card_character(card);
+        let counts = self.character_edit_counts(&owner);
+        let fighter = card.fighter.to_ascii_lowercase();
+        let roster = &self.roster;
+        let (values, gimmick_values) = if card.made {
+            (0, 0)
+        } else {
+            let values = roster.fighter_value_count(&fighter);
+            (
+                values,
+                roster
+                    .params
+                    .get(&fighter)
+                    .map_or(0, |params| params.field_count().saturating_sub(values)),
             )
-        {
-            if empty || fighter_of_move_key(key).as_deref() != Some(fighter.as_str()) {
-                continue;
-            }
-            if let Some((_, name)) = key.split_once('/') {
-                moves.insert(name.to_owned());
-            }
-        }
-        let mut effect_moves = moves_of(
-            &mut self
-                .state
-                .effect_call_edits
-                .iter()
-                .filter(|(_, edits)| !edits.is_empty())
-                .map(|(key, _)| key),
-        );
-        effect_moves.extend(moves_of(&mut self.node_effect_scripts.keys()));
-        let eff = self.eff_mods.get(&fighter);
+        };
         CardCounts {
-            moves: moves.len(),
-            nodes: graphs.map_or(0, BTreeMap::len),
-            gimmicks: gimmicks
-                + roster.controller_charts.get(&fighter).map_or(0, |charts| {
-                    charts.values().filter(|chart| acts(&chart.graph)).count()
-                }),
-            meters: roster.meters.get(&fighter).map_or(0, Vec::len),
-            effects_changed: eff.map_or(0, |eff| {
-                eff.authored.len() + eff.rosters.len() + eff.entry_edits.len()
-            }),
-            effects_borrowed: eff.map_or(0, |eff| eff.transplants.len()),
-            textures: eff.map_or(0, |eff| {
-                eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len()
-            }),
-            effect_moves: effect_moves.len(),
-            sound_moves: moves_of(&mut self.state.sound_script_edits.keys()).len(),
-            values: roster.fighter_value_count(&fighter),
-            gimmick_values: roster.params.get(&fighter).map_or(0, |params| {
-                params
-                    .field_count()
-                    .saturating_sub(roster.fighter_value_count(&fighter))
-            }),
+            moves: self.character_edited_moves(&owner).len(),
+            nodes: counts.node_graphs,
+            gimmicks: counts.gimmicks,
+            meters: counts.meters,
+            effects_changed: counts.authored_effects,
+            effects_borrowed: counts.borrowed_effects,
+            textures: counts.textures,
+            effect_moves: counts.effect_call_moves,
+            sound_moves: counts.sound_moves,
+            values,
+            gimmick_values,
         }
     }
 
@@ -1312,7 +1296,13 @@ impl VisionaryApp {
             .iter()
             .find(|entry| entry.key == cell)
             .map(|entry| entry.display_name.clone());
+        let character = Self::card_character(card);
+        let gimmick_holder = self
+            .gimmick_owner(&card.fighter)
+            .filter(|owner| *owner != character)
+            .map(|owner| self.character_name(&owner));
         CardFacts {
+            gimmick_holder,
             counts: self.card_counts(card),
             made: card.made,
             base_name: card.base_name.clone(),
@@ -1353,25 +1343,9 @@ impl VisionaryApp {
         }
     }
 
-    /// The character the editors have open: a made character when move edits go to it, else
-    /// the picked fighter.
+    /// Whether `card`'s character is the one the editors have open.
     fn card_is_active(&self, card: &Card) -> bool {
-        let fighter = self
-            .state
-            .selected_fighter
-            .and_then(|index| self.state.fighters.get(index))
-            .is_some_and(|entry| entry.name.eq_ignore_ascii_case(&card.fighter));
-        let target = self.roster.edit_target();
-        fighter
-            && if card.made {
-                target == Some(&card.key)
-            } else {
-                target.is_none_or(|key| {
-                    !self.roster.project.authored.iter().any(|made| {
-                        &made.key == key && made.donor.eq_ignore_ascii_case(&card.fighter)
-                    })
-                })
-            }
+        self.active_key().as_ref() == Some(&Self::card_character(card))
     }
 
     /// Project > Characters.
@@ -1533,13 +1507,8 @@ impl VisionaryApp {
                     self.state.status = "Open a card's Model or Animations first.".into();
                 }
                 (Some(workspace), Some(card)) => {
+                    // The status names the costume's owner: the made character, for its own.
                     self.import_dropped_files(workspace, &card.fighter, card.slot, dropped);
-                    // Said with the character's name, not its base fighter's.
-                    let said = format!("{} c{:02}", card.fighter, card.slot);
-                    self.state.status = self
-                        .state
-                        .status
-                        .replace(&said, &format!("{} c{:02}", card.name, card.slot));
                     forget_cached(ui.ctx());
                 }
             }
@@ -1858,13 +1827,10 @@ impl VisionaryApp {
                         }
                     }
                     Part::Effects => {
-                        let ready = self.page_ready(card, CardPage::Effects);
-                        let edit = ui
-                            .add_enabled_ui(ready.is_ok(), |ui| act(ui, look, "Edit effects", main))
-                            .inner
+                        if act(ui, look, "Edit effects", main)
                             .on_hover_text(format!("{name}'s effect file on the Effects page"))
-                            .on_disabled_hover_text(ready.err().unwrap_or_default());
-                        if edit.clicked() {
+                            .clicked()
+                        {
                             actions.push(go(CardPage::Effects));
                         }
                         if act(ui, look, "Edit in moves", None)
@@ -2017,7 +1983,10 @@ impl VisionaryApp {
         let mut edited: Vec<(&'static str, String)> = self
             .eff_mods
             .iter()
-            .filter(|(key, eff)| !fighters.contains(key.as_str()) && !eff.is_empty())
+            // A made character's effect file is on its own card.
+            .filter(|(key, eff)| {
+                !fighters.contains(key.as_str()) && !key.contains('#') && !eff.is_empty()
+            })
             .map(|(_, eff)| (effect_group(&eff.source_rel), eff.source_rel.clone()))
             .collect();
         edited.sort();
@@ -2226,97 +2195,43 @@ impl VisionaryApp {
             .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
     }
 
-    /// Pick the fighter in the editor, showing `slot` of it.
-    fn focus_card(&mut self, fighter: &str, slot: u8) {
-        let Some(index) = self.fighter_index(fighter) else {
-            return;
-        };
-        if self.state.selected_fighter != Some(index) {
-            self.select_fighter(index);
-        }
-        self.workspace_asset_slot = slot;
-        let fighter = self.state.fighters[index].name.clone();
-        self.show_skin(&fighter, slot);
-    }
-
-    /// Whether `card` can open `page` yet, and why not.
-    fn page_ready(&self, card: &Card, page: CardPage) -> Result<(), String> {
-        // A made character's own effect file is not opened on the Effects page yet: the page
-        // keeps its edits per fighter, so editing it would mix them with the base fighter's.
-        if card.made && page == CardPage::Effects {
-            return Err(format!(
-                "{}'s own effect file opens here once its effects are kept apart from {}'s",
-                card.name, card.base_name
-            ));
-        }
-        Ok(())
-    }
-
     /// Open `page` with `key`'s character active and its costume `costume` shown. Every page a
     /// card opens goes through here.
     fn go(&mut self, key: &RosterKey, costume: u8, page: CardPage) {
-        let made = self
-            .roster
-            .project
-            .authored
-            .iter()
-            .find(|entry| &entry.key == key)
-            .cloned();
-        let fighter = made
-            .as_ref()
-            .map_or_else(|| key.as_str().to_owned(), |entry| entry.donor.clone());
-        match page {
+        use crate::character::{CharacterKey, CharacterPage};
+        let character = CharacterKey::parse(key.as_str());
+        let fighter = character.engine_fighter().to_owned();
+        let page = match page {
             CardPage::Values => {
                 self.roster.focus_traits_for(&fighter);
                 return;
             }
             CardPage::SelectScreen => {
-                let cell = match &made {
-                    Some(_) => key.clone(),
-                    None => {
-                        let members: Vec<&str> = group_of(&fighter).map_or_else(
-                            || vec![fighter.as_str()],
-                            |(_, members)| members.iter().map(|(member, _)| *member).collect(),
-                        );
-                        self.roster
-                            .select_screen_cell(&members)
-                            .unwrap_or_else(|| key.clone())
-                    }
+                let cell = if character.is_made() {
+                    key.clone()
+                } else {
+                    let members: Vec<&str> = group_of(&fighter).map_or_else(
+                        || vec![fighter.as_str()],
+                        |(_, members)| members.iter().map(|(member, _)| *member).collect(),
+                    );
+                    self.roster
+                        .select_screen_cell(&members)
+                        .unwrap_or_else(|| key.clone())
                 };
                 self.roster.select_css(cell);
                 return;
             }
-            _ => {}
-        }
-        // Seam: making the opened character the one edited (a made character's own edits, kept
-        // apart from its base fighter's) is `open_character`'s job. The old edit target is not
-        // set here: saving re-scopes whatever move is open to it, which moved the base
-        // fighter's existing edits onto the made character.
-        self.focus_card(&fighter, costume);
-        self.roster.open = false;
-        self.eff_editor.open = false;
-        self.node_workspace = page == CardPage::MoveNodes;
-        match page {
-            CardPage::ClassicCollisions => self.primary_tab = PrimaryEditorTab::Collisions,
-            CardPage::ClassicEffects => self.primary_tab = PrimaryEditorTab::Effects,
-            CardPage::ClassicAudio => self.primary_tab = PrimaryEditorTab::AudioFeedback,
-            CardPage::Gimmicks => self.primary_tab = PrimaryEditorTab::Gimmicks,
-            CardPage::MoveNodes => {
-                self.primary_tab = PrimaryEditorTab::Nodes;
-                self.node_editor.refresh_character();
-            }
-            CardPage::Effects => {
-                let rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
-                if self.eff_editor.loaded_rel().as_deref() != Some(rel.as_str()) {
-                    self.reopen_fighter_effects(&fighter);
-                }
-                self.open_effects_page();
-            }
-            CardPage::Values | CardPage::SelectScreen => {}
-        }
+            CardPage::ClassicCollisions => CharacterPage::ClassicCollisions,
+            CardPage::ClassicEffects => CharacterPage::ClassicEffects,
+            CardPage::ClassicAudio => CharacterPage::ClassicAudio,
+            CardPage::MoveNodes => CharacterPage::MoveNodes,
+            CardPage::Gimmicks => CharacterPage::Gimmicks,
+            CardPage::Effects => CharacterPage::Effects,
+        };
+        self.open_character(character, Some(costume), page);
     }
 
-    /// Take a made character out of the project, with the edits made for it alone.
+    /// Take a made character out of the project, with every edit it owns.
     fn remove_character(&mut self, key: &RosterKey) {
         let Some(made) = self
             .roster
@@ -2329,19 +2244,7 @@ impl VisionaryApp {
             return;
         };
         let slots = made.all_slots();
-        let only_its =
-            |scopes: &[u8]| !scopes.is_empty() && scopes.iter().all(|slot| slots.contains(slot));
-        if let Some(log) = self.state.edit_log.entries.get_mut(&made.donor) {
-            log.retain(|_, record| !only_its(&record.effective_scopes()));
-        }
-        if self
-            .roster
-            .behaviors
-            .get(&made.donor)
-            .is_some_and(|graph| only_its(&graph.costumes))
-        {
-            self.roster.behaviors.remove(&made.donor);
-        }
+        self.remove_character_edits(&crate::character::CharacterKey::made(key.clone()));
         let status = self.roster.handle_new_character(
             crate::roster::new_character::NewCharacterAction::Remove(key.clone()),
         );
@@ -2556,7 +2459,13 @@ impl VisionaryApp {
         };
         let parts = self.project_parts();
         let (fighter, slot) = (card.fighter.as_str(), card.slot);
-        let shown = format!("{} c{slot:02}", card.name);
+        // A group card names the fighter it shows: the files are that fighter's.
+        let name = card
+            .members
+            .iter()
+            .find(|(member, _)| member.eq_ignore_ascii_case(fighter))
+            .map_or(card.name.as_str(), |(_, label)| *label);
+        let shown = format!("{name} c{slot:02}");
         let result: anyhow::Result<Vec<PathBuf>> = match what {
             FileAction::CopyBase(part) => {
                 self.state.status = match self.copy_base_costume(&workspace, &parts, card, part) {
@@ -2695,15 +2604,12 @@ impl VisionaryApp {
             return;
         }
         self.eff_editor.load_as(&path, rel.clone());
-        let fighter = crate::mod_project::fighter_from_source_rel(&rel);
-        let staged = if self
-            .eff_mods
-            .get(&fighter)
-            .is_some_and(|eff| !eff.is_empty())
-        {
-            self.deploy_live_eff(&fighter)
+        // Whose file it is: a made character's costume file is its own.
+        let owner = self.eff_owner(&rel);
+        let staged = if self.eff_mods.get(&owner).is_some_and(|eff| !eff.is_empty()) {
+            self.deploy_live_eff(&owner)
         } else {
-            std::fs::read(&path).is_ok_and(|bytes| self.serve_live_eff(&fighter, &rel, &bytes))
+            std::fs::read(&path).is_ok_and(|bytes| self.serve_live_eff(&owner, &rel, &bytes))
         };
         self.state.status = if staged {
             format!(
@@ -2829,16 +2735,21 @@ mod tests {
     }
 
     #[test]
-    fn move_keys_name_their_fighter() {
+    fn move_keys_name_their_character() {
         assert_eq!(
-            fighter_of_move_key("mario/attack11").as_deref(),
+            owner_of_move_key("mario/attack11").as_deref(),
             Some("mario")
         );
         assert_eq!(
-            fighter_of_move_key("mario#c08/attack11").as_deref(),
+            owner_of_move_key("mario/attack11#hurt").as_deref(),
             Some("mario")
         );
-        assert_eq!(fighter_of_move_key("attack11"), None);
+        // A made character's edits are its own, never its base fighter's.
+        assert_eq!(
+            owner_of_move_key("mario#c08/attack11").as_deref(),
+            Some("mario#c08")
+        );
+        assert_eq!(owner_of_move_key("attack11"), None);
     }
 
     fn facts() -> CardFacts {
@@ -2880,6 +2791,19 @@ mod tests {
         assert_eq!(model.chips, vec!["12 files".to_owned()]);
         let animations = part_summary(Part::Animations, &base);
         assert_eq!(animations.chips, vec!["Game".to_owned()]);
+    }
+
+    #[test]
+    fn gimmicks_say_who_has_the_fighters_one_gimmick() {
+        let mut vision = facts();
+        vision.made = true;
+        let free = part_summary(Part::Gimmicks, &vision);
+        assert!(free.chips.is_empty() && !free.changed);
+        vision.gimmick_holder = Some("Mario".into());
+        let held = part_summary(Part::Gimmicks, &vision);
+        assert_eq!(held.chips, ["Mario has the gimmick"]);
+        // Another character's gimmick is not a change to this one.
+        assert!(!held.changed);
     }
 
     #[test]

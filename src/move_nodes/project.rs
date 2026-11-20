@@ -339,18 +339,17 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
         }
     }
     for (key, data) in &project.characters {
-        // A made character's store carries its moves only. Fighter-wide values, gimmicks and
-        // the effect file stay with the engine fighter; anything here would be saved and never
-        // exported, so it is refused rather than dropped.
+        // A made character's store carries its moves and its own effect file. Fighter-wide
+        // values and gimmicks stay with the engine fighter; anything here would be saved and
+        // never exported, so it is refused rather than dropped.
         if !data.params.is_empty()
             || !data.behavior.is_unset()
             || !data.meters.is_empty()
             || !data.controller_charts.is_empty()
-            || data.eff.is_some()
         {
             errors.push(NodeError {
                 subject: format!("character {key}"),
-                reason: "fighter values, gimmicks and effect files belong to the base fighter, not to a made character's moves".into(),
+                reason: "fighter values and gimmicks belong to the base fighter, not to a made character's moves".into(),
             });
         }
         for (move_name, graph) in &data.move_graphs {

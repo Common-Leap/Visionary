@@ -148,13 +148,6 @@ pub struct RosterWindow {
     traits: TraitsView,
     /// The new-character tab.
     new_character: NewCharacterView,
-    /// Moves the project has replaced for each character you added, supplied by `app.rs` from
-    /// the edit log. Without it the readiness panel would report every character as having
-    /// replaced nothing.
-    pub authored_moves: std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>>,
-    /// The character you added whose moveset is currently being edited, if any. Moves saved
-    /// while this is set are scoped to that character's costume.
-    edit_target: Option<RosterKey>,
     /// Sparse fighter-value edits, fighter name → edits. Read by `app.rs` when it builds the
     /// project file and replaced wholesale when a project is loaded, exactly like `project`.
     pub params: std::collections::BTreeMap<String, ParamMod>,
@@ -220,8 +213,6 @@ impl Default for RosterWindow {
             css: CssView::default(),
             traits: TraitsView::default(),
             new_character: NewCharacterView::default(),
-            authored_moves: Default::default(),
-            edit_target: None,
             params: Default::default(),
             behaviors: Default::default(),
             behavior_layouts: Default::default(),
@@ -393,62 +384,6 @@ impl RosterWindow {
     /// The arc root the base roster database is read from, if one was found.
     fn ui_root(&self) -> Option<PathBuf> {
         super::css::locate_ui_root(&self.roots)
-    }
-
-    /// The costume slots new edits to `fighter` should belong to, if the user set one of their
-    /// own characters as the edit target.
-    ///
-    /// Empty — the normal case — means an edit applies to every costume, which is what an
-    /// ACMD replacement does. This is read on every edit save rather than latched, so turning
-    /// the target off immediately stops scoping without a stale flag surviving anywhere.
-    /// A multi-skin character returns all its slots, so one moveset covers c08–c15.
-    pub fn slot_scopes_for(&self, fighter: &str) -> Vec<u8> {
-        let Some(target) = self.edit_target.as_ref() else {
-            return Vec::new();
-        };
-        let Some(entry) = self
-            .project
-            .authored
-            .iter()
-            .find(|authored| &authored.key == target)
-        else {
-            return Vec::new();
-        };
-        if !entry.donor.eq_ignore_ascii_case(fighter) {
-            return Vec::new();
-        }
-        entry.all_slots()
-    }
-
-    /// The moves each added character has replaced, read out of the edit log.
-    ///
-    /// An edit belongs to a character when it is scoped to one of that character's
-    /// costumes — the same fields the export gates on — so this cannot drift from
-    /// what actually ships.
-    pub fn replaced_moves(
-        &self,
-        log: &crate::data::EditLog,
-    ) -> std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>> {
-        let mut out: std::collections::BTreeMap<RosterKey, std::collections::BTreeSet<String>> =
-            Default::default();
-        for authored in &self.project.authored {
-            let Some(moves) = log.entries.get(&authored.donor) else {
-                continue;
-            };
-            let owned = authored.all_slots();
-            let replaced: std::collections::BTreeSet<String> = moves
-                .iter()
-                .filter(|(_, record)| {
-                    let scopes = record.effective_scopes();
-                    !scopes.is_empty() && scopes.iter().any(|slot| owned.contains(slot))
-                })
-                .map(|(move_name, _)| move_name.clone())
-                .collect();
-            if !replaced.is_empty() {
-                out.insert(authored.key.clone(), replaced);
-            }
-        }
-        out
     }
 
     fn show_tab(&mut self, tab: RosterTab) {
@@ -740,12 +675,6 @@ impl RosterWindow {
         self.refresh(fighters, data_root);
     }
 
-    /// Whether the project has a folder on disk; new characters need one.
-    /// The character move edits go to alone, when one is picked.
-    pub fn edit_target(&self) -> Option<&RosterKey> {
-        self.edit_target.as_ref()
-    }
-
     /// Called every frame with the open project's folder. Keeps the made characters' folders
     /// stored relative to it, and registers those folders as this project's roots: added when
     /// the project opens or makes a character, dropped when it closes or removes one. Only a
@@ -998,9 +927,6 @@ impl RosterWindow {
                 None
             }
             NewCharacterAction::Remove(key) => {
-                if self.edit_target.as_ref() == Some(&key) {
-                    self.edit_target = None;
-                }
                 let name = self.shown_name(&key).unwrap_or_else(|| key.to_string());
                 // Older versions installed its folder as a mod; that goes too, or the
                 // character's files would still load and ship. Its place among this project's

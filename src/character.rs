@@ -100,6 +100,17 @@ impl CharacterKey {
             .map_or_else(|| self.engine_fighter().to_owned(), str::to_owned)
     }
 
+    /// The effect file this character's effects are edited in, by the game path it stands for:
+    /// a fighter's own file, or a made character's costume file (its first costume's), which
+    /// export writes for every one of its costumes.
+    pub fn effect_rel(&self, roster: &crate::mod_project::RosterMod) -> String {
+        let fighter = self.engine_fighter();
+        match self.made_slots(roster).first() {
+            Some(slot) => crate::roster::scaffold::effect_file(fighter, *slot),
+            None => format!("effect/fighter/{fighter}/ef_{fighter}.eff"),
+        }
+    }
+
     /// "c08–c15" for a made character, or the given base range for a base fighter.
     pub fn costume_range(&self, roster: &crate::mod_project::RosterMod) -> Option<String> {
         let slots = self.made_slots(roster);
@@ -164,6 +175,21 @@ pub fn made_on<'a>(
         .filter(move |entry| entry.donor.eq_ignore_ascii_case(fighter))
 }
 
+/// The key an effect file's edits are kept under: the made character whose own costume file it
+/// is (`ef_mario_c08.eff` while Vision owns c08), else the fighter (or file) it is for.
+pub fn effect_owner(rel: &str, roster: &crate::mod_project::RosterMod) -> String {
+    let fighter = crate::mod_project::fighter_from_source_rel(rel);
+    let costume = std::path::Path::new(rel)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix(&format!("ef_{fighter}_c")))
+        .and_then(|number| number.parse::<u8>().ok());
+    let owner = costume
+        .and_then(|slot| made_on(&fighter, roster).find(|entry| entry.all_slots().contains(&slot)))
+        .map(|entry| entry.key.as_str().to_owned());
+    owner.unwrap_or(fighter)
+}
+
 /// A page a character can be opened on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharacterPage {
@@ -214,6 +240,8 @@ pub struct CharacterEditCounts {
     pub authored_effects: usize,
     /// Effects borrowed from another effect file.
     pub borrowed_effects: usize,
+    /// Effect textures replaced, added or removed.
+    pub textures: usize,
     pub gimmicks: usize,
     pub meters: usize,
 }
@@ -310,6 +338,43 @@ mod tests {
         assert_eq!(
             base_costumes("mario", &(0..16).collect::<Vec<_>>(), &roster),
             (0..8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_made_characters_costume_effect_file_is_its_own() {
+        let roster = roster_with_vision();
+        let vision = CharacterKey::parse("mario#c08");
+        assert_eq!(
+            vision.effect_rel(&roster),
+            "effect/fighter/mario/ef_mario_c08.eff"
+        );
+        assert_eq!(
+            effect_owner(&vision.effect_rel(&roster), &roster),
+            "mario#c08"
+        );
+        // Any of its costumes' files, wherever the file sits on disk.
+        assert_eq!(
+            effect_owner(
+                "/home/x/characters/vision/effect/fighter/mario/ef_mario_c15.eff",
+                &roster
+            ),
+            "mario#c08"
+        );
+        // The fighter's own file, and a costume file no made character owns, stay the fighter's.
+        let mario = CharacterKey::base("mario");
+        assert_eq!(
+            mario.effect_rel(&roster),
+            "effect/fighter/mario/ef_mario.eff"
+        );
+        assert_eq!(effect_owner(&mario.effect_rel(&roster), &roster), "mario");
+        assert_eq!(
+            effect_owner("effect/fighter/mario/ef_mario_c03.eff", &roster),
+            "mario"
+        );
+        assert_eq!(
+            effect_owner("effect/fighter/luigi/ef_luigi_c08.eff", &roster),
+            "luigi"
         );
     }
 

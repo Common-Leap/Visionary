@@ -371,7 +371,10 @@ struct EffEntry {
 /// present; `alt_base` covers the data-root path when it differs from the export root.
 #[derive(Clone, PartialEq)]
 pub struct EditSource {
+    /// The key the project keeps these edits under: a fighter, or a made character's key.
     pub fighter: String,
+    /// The name it is shown by.
+    pub label: String,
     pub base: PathBuf,
     pub alt_base: Option<PathBuf>,
     pub merged: Option<PathBuf>,
@@ -411,6 +414,10 @@ pub struct EffEditor {
     pending_select: Option<String>,
     /// Authored edits applied once the queued eff loads.
     pending_edits: Option<Vec<AuthoredEdit>>,
+    /// The open file's working copy is from before the project in the app now: a project was
+    /// opened or closed since it loaded. Its diff is not the project's until a load gives it
+    /// the project's edits, so nothing may be read back from it until then.
+    working_stale: bool,
     /// Emitter lists and spawn structures to apply once the queued eff loads. Applied BEFORE
     /// [`Self::pending_edits`], for the same reason the exporter applies them first: they decide
     /// which emitters an authored edit has to land on.
@@ -594,6 +601,7 @@ impl Default for EffEditor {
             pending_load: None,
             pending_select: None,
             pending_edits: None,
+            working_stale: false,
             pending_structure: None,
             pending_edits_push_live: false,
             export_root: std::env::current_dir().unwrap_or_default(),
@@ -1177,6 +1185,8 @@ impl EffEditor {
         self.texture_pool = loaded.texture_pool;
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
+        // The queued edits for it, if any, are applied right after this.
+        self.working_stale = false;
         // Back on a file: the effect and part that were open in it are again.
         if let Some(name) = self.entry_picked.get(path).cloned() {
             if let Some(i) = self.entries.iter().position(|e| e.name == name) {
@@ -1226,7 +1236,33 @@ impl EffEditor {
     /// Opens it again even when it is already open, as a changed file needs.
     pub fn load_as(&mut self, path: &Path, rel: String) {
         self.game_paths.insert(path.to_path_buf(), rel);
+        self.replace_pending_load(path);
+    }
+
+    /// Queue `path` to load next. Edits queued for another file that has not loaded yet were
+    /// that file's: they are dropped rather than applied to this one, and the app queues this
+    /// file's own (see [`Self::load_needing_edits`]).
+    fn replace_pending_load(&mut self, path: &Path) {
+        if self
+            .pending_load
+            .as_deref()
+            .is_some_and(|pending| pending != path)
+        {
+            self.pending_edits = None;
+            self.pending_structure = None;
+            self.pending_edits_push_live = false;
+        }
         self.pending_load = Some(path.to_path_buf());
+    }
+
+    /// Whether the open file's working copy holds the project's edits, so its diff may be read
+    /// back into the project. Not while a project's edits for it wait to be applied, nor after
+    /// another project opened until a file loads for it.
+    pub fn working_is_current(&self) -> bool {
+        !self.working_stale
+            && !(self.pending_load.is_some()
+                && self.pending_load == self.loaded_path
+                && (self.pending_edits.is_some() || self.pending_structure.is_some()))
     }
 
     pub fn export_root(&self) -> &Path {
@@ -1323,6 +1359,12 @@ impl EffEditor {
     /// Drop project-owned overlays and queued operations before another project replaces it.
     /// Reloading the base file immediately afterwards resets the current authored diff too.
     pub fn reset_project_state(&mut self) {
+        // What is open was loaded for the project before: its diff is not this one's. It
+        // loads again, and the app hands it the new project's edits for it.
+        self.working_stale = true;
+        if self.pending_load.is_none() {
+            self.pending_load = self.loaded_path.clone();
+        }
         self.pending_edits = None;
         self.pending_structure = None;
         self.pending_edits_push_live = false;
@@ -2059,10 +2101,14 @@ impl EffEditor {
     pub fn queue_load(&mut self, path: &Path) {
         // Already showing this file and no reload pending → nothing to do. (A pending
         // reload — e.g. a merged overlay just changed under the loaded file — survives.)
-        if self.loaded_path.as_deref() == Some(path) && self.pending_load.is_none() {
+        // A working copy from before another project opened loads again, with this one's edits.
+        if self.loaded_path.as_deref() == Some(path)
+            && self.pending_load.is_none()
+            && !self.working_stale
+        {
             return;
         }
-        self.pending_load = Some(path.to_path_buf());
+        self.replace_pending_load(path);
     }
 
     /// Replace the edit-source list (the app's per-fighter eff mods). This is the single
@@ -2726,9 +2772,9 @@ impl EffEditor {
                     ));
                 }
                 let label = if badges.is_empty() {
-                    src.fighter.clone()
+                    src.label.clone()
                 } else {
-                    format!("{} ({})", src.fighter, badges.join(", "))
+                    format!("{} ({})", src.label, badges.join(", "))
                 };
                 // A slotted fighter whose merged build is missing signals a failed merge —
                 // surface it instead of silently showing the base file.
@@ -2743,7 +2789,7 @@ impl EffEditor {
                     "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
-                    format!("open {}'s eff with its edits applied", src.fighter)
+                    format!("open {}'s eff with its edits applied", src.label)
                 });
                 if resp.clicked() {
                     self.pending_load = Some(src.base.clone());
@@ -4834,6 +4880,48 @@ mod tests {
             loaded_path: Some(PathBuf::from(path)),
             ..Default::default()
         }
+    }
+
+    /// A file loaded before a project opened holds none of that project's edits: reading its
+    /// diff back then wrote "no edits" over the project's (Mario's saved effect edit vanished
+    /// on every relaunch). Paired: an untouched editor's working copy is read back.
+    #[test]
+    fn a_working_copy_from_before_a_project_opened_is_not_read_back() {
+        let mut editor = editor_with_one_emitter("/fx/ef_mario.eff");
+        assert!(editor.working_is_current());
+        editor.reset_project_state();
+        assert!(!editor.working_is_current());
+        // It loads again, for the new project.
+        assert_eq!(
+            editor.pending_load.as_deref(),
+            Some(Path::new("/fx/ef_mario.eff"))
+        );
+        // Queued once more while stale, it still reloads instead of being skipped.
+        editor.pending_load = None;
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        assert!(editor.pending_load.is_some());
+    }
+
+    /// Edits queued for a file that has not loaded yet are that file's: another file queued
+    /// over it must not receive them. Paired: queuing the same file keeps them.
+    #[test]
+    fn edits_queued_for_one_file_never_reach_another() {
+        let mut editor = editor_with_one_emitter("/fx/ef_bayonetta.eff");
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        editor.queue_edits(Vec::new());
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        assert!(
+            editor.pending_edits.is_some(),
+            "the same file keeps its edits"
+        );
+        editor.load_as(
+            Path::new("/fx/ef_bayonetta.eff"),
+            "effect/fighter/bayonetta/ef_bayonetta.eff".into(),
+        );
+        assert!(
+            editor.pending_edits.is_none(),
+            "Mario's edits went to Bayonetta's file"
+        );
     }
 
     /// The attribute these tests move to make the fixture "edited".

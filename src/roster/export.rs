@@ -526,6 +526,9 @@ pub fn export_authored_files(
         kept: Vec::new(),
         mod_root,
     };
+    // A made character's costume effect files, each with the file the export rebuilds them all
+    // from: its first costume's, in its own folder.
+    let mut effect_sources: std::collections::HashMap<String, PathBuf> = Default::default();
     for entry in authored {
         // Every skin ships, not just the primary slot: a multi-skin character
         // whose extra costumes are missing plays the donor's files (or
@@ -539,9 +542,21 @@ pub fn export_authored_files(
             None => root.to_path_buf(),
         });
         if let Some(own) = own.as_deref().filter(|own| own.is_dir()) {
+            if let Some(first) = all.first() {
+                let source = own.join(super::scaffold::effect_file(&entry.donor, *first));
+                for effect in super::scaffold::effect_files(&entry.donor, &all) {
+                    effect_sources.insert(effect, source.clone());
+                }
+            }
             copied += copy.tree(own, mod_root)?;
         }
-        for relative in super::scaffold::directories_for_slots(&entry.donor, &all) {
+        // From the other roots, only the character's own costumes: the donor's effect folder
+        // holds the donor's own file (and the editor's scratch files), which are not this
+        // character's. Its own effect files are taken one by one below.
+        for relative in super::scaffold::directories_for_slots(&entry.donor, &all)
+            .into_iter()
+            .filter(|relative| !relative.starts_with("effect/"))
+        {
             for root in roots {
                 copied += copy.tree(&root.join(&relative), &mod_root.join(&relative))?;
             }
@@ -568,7 +583,17 @@ pub fn export_authored_files(
                 .push(format!("{} ({copied} file(s))", entry.display_name));
         }
     }
-    for kept in copy.kept {
+    for (kept, source) in copy.kept {
+        // The export rebuilds every costume's effect file from the character's own one. A
+        // costume file that is a copy of that one loses nothing; only one the author changed
+        // is worth saying.
+        let same = |a: &Path, b: &Path| a == b || std::fs::read(a).ok() == std::fs::read(b).ok();
+        if effect_sources
+            .get(&kept)
+            .is_some_and(|own| same(own, &source))
+        {
+            continue;
+        }
         report.warnings.push(format!(
             "{kept}: the export built its own version, so the copy in the character's folder was not shipped."
         ));
@@ -643,8 +668,9 @@ fn slot_span(slots: &[u8]) -> String {
 struct Copier<'a> {
     /// Files this copy wrote: a later root offering the same file is skipped quietly.
     written: std::collections::HashSet<PathBuf>,
-    /// Files the export had already written, kept, by path in the mod.
-    kept: Vec<String>,
+    /// Files the export had already written, kept, by path in the mod, with the file that was
+    /// not copied over them.
+    kept: Vec<(String, PathBuf)>,
     mod_root: &'a Path,
 }
 
@@ -660,8 +686,8 @@ impl Copier<'_> {
                 .unwrap_or(destination)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if !self.kept.contains(&shown) {
-                self.kept.push(shown);
+            if !self.kept.iter().any(|(kept, _)| *kept == shown) {
+                self.kept.push((shown, source.to_path_buf()));
             }
             return Ok(0);
         }
@@ -1099,15 +1125,21 @@ mod authored_file_tests {
             b"model",
         )
         .unwrap();
-        let mut entry = authored_entry_multi("mario", &[8], "Vision", "vision");
+        // c09 is a copy of c08, as made with the character; c10 the author changed.
+        scaffold::create_many(&own, "mario", &[9, 10]).unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 9)), b"created").unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 10)), b"author's").unwrap();
+        let mut entry = authored_entry_multi("mario", &[8, 9, 10], "Vision", "vision");
         // Stored relative to the project, as new projects store it.
         entry.files_root = Some(PathBuf::from("characters/vision"));
         let export = |built: bool| {
             let mod_root = dir.path().join(if built { "built" } else { "plain" });
             if built {
-                let eff = mod_root.join(scaffold::effect_file("mario", 8));
-                std::fs::create_dir_all(eff.parent().unwrap()).unwrap();
-                std::fs::write(&eff, b"built").unwrap();
+                for slot in [8, 9, 10] {
+                    let eff = mod_root.join(scaffold::effect_file("mario", slot));
+                    std::fs::create_dir_all(eff.parent().unwrap()).unwrap();
+                    std::fs::write(&eff, b"built").unwrap();
+                }
             }
             let mut report = RosterExport::default();
             // The folder is also one of the roots, as it is while the project is open.
@@ -1129,8 +1161,10 @@ mod authored_file_tests {
         assert!(mod_root
             .join("fighter/mario/model/body/c08/model.numdlb")
             .is_file());
+        // Only the costume file the author changed is a loss worth saying; the copies of the
+        // file the export rebuilt from are not.
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
-        assert!(report.warnings[0].contains("ef_mario_c08.eff"));
+        assert!(report.warnings[0].contains("ef_mario_c10.eff"));
         // Paired: with nothing built, the character's own copy ships, and the same file
         // offered by its folder and by the roots is not a clash.
         let (mod_root, report) = export(false);
@@ -1139,6 +1173,38 @@ mod authored_file_tests {
             b"created"
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    /// A root's effect folder for the donor holds the donor's own file and the editor's scratch
+    /// files: none of them is the character's. Paired with the character's own costume effect
+    /// file from the same root, which ships.
+    #[test]
+    fn only_a_characters_own_effect_files_ship_from_the_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("game");
+        let effects = root.join("effect/fighter/mario");
+        std::fs::create_dir_all(&effects).unwrap();
+        for name in [
+            "ef_mario.eff",
+            "_transplant_preview.eff",
+            "ef_mario_c08.eff",
+        ] {
+            std::fs::write(effects.join(name), name).unwrap();
+        }
+        let mod_root = dir.path().join("mod");
+        let mut report = RosterExport::default();
+        export_authored_files(
+            &mod_root,
+            &[root],
+            None,
+            &[authored_entry_multi("mario", &[8], "Vision", "vision")],
+            &mut report,
+        )
+        .unwrap();
+        let shipped = mod_root.join("effect/fighter/mario");
+        assert!(shipped.join("ef_mario_c08.eff").is_file());
+        assert!(!shipped.join("ef_mario.eff").exists());
+        assert!(!shipped.join("_transplant_preview.eff").exists());
     }
 
     /// A mod with the moveset and no model is a character that appears as the donor running
