@@ -183,10 +183,53 @@ reaches, marked approximate.
 - Status/opff spawn sites are previewed and listed but not editable in phase A.
 - Clone registrations are shown, not edited, in phase A.
 
+## Clone params and the clone compatibility sheet
+
+**Where a clone's params live (settled 2026-11-20).** A clone reads `param_<new_name>` from
+the **new owner's** param file. The source article's original code, when it runs, reads that
+block too. Evidence: every cloning moveset that ships a `vl.prc` carries a block named after the
+clone, and none carry the source's name:
+- Latios: `param_lativolt`, `param_latisnow`, `param_latihado` are in `fighter/samus/param/vl.prc`. `param_fireball` and `param_swordbeam` are absent.
+- Sceptile: `param_stick`, `param_healingorb`, `param_leafstorm`, `param_leechseed`, `param_bulletseed` are in `fighter/mario/param/vl.prc`.
+- Amy: `param_present` is in `fighter/kamui/param/vl.prc`. `param_ironball` is absent.
+- Iron-Man and Latios's `latiball` ship no block for the clone. Their settings come from their own status code, or are missing.
+
+joobert's sheet gives the in-game side, as the "Depends on vl.prc" rows. Mario's fireball clone:
+horizontal speed "will always be controlled via vl parameters". Yoshi's egg: whether it
+self-destructs depends on vl.prc.
+
+So in Phase A, the settings reader resolves a clone's `Param` settings against the new
+owner's file, merged as the game loads it (dump, then reference mods, then the moveset's
+`romfs`, then `param_config` overrides). Two cases need care:
+- When the clone uses its source's original code but the new owner's file has no
+  `param_<new_name>` block, the Settings card says the article reads params that aren't there,
+  and that the source's defaults are not inherited. The values are shown as missing, never
+  borrowed from the source.
+- When the block exists, its fields are editable and saved to the moveset's own param file,
+  or its prcxml when that is what the moveset ships.
+
+**Clone compatibility sheet** (<https://docs.google.com/spreadsheets/d/16SEU3MibrzTJHTjxJb7c5e7JzGgrfWY_c_hqNJtGvNY>):
+67 community-verified weapon kinds. Each records whether it can be cloned, whether it
+self-destructs on hitting an opponent and on hitting a shield, who verified it, and notes. It
+ships as a data file with a link to the source and the verifiers' credit. Visionary uses it in
+three places:
+- The Objects list warns when a moveset clones a kind marked "Can Clone: No": `BRAVE_CRASH`,
+  `EFLAME_ESWORD`, `LUCARIO_AURABALL`, `MURABITO_BULLET`, `PACMAN_FIREHYDRANT`, `PICKEL_MELT`,
+  `SZEROSUIT_LASER`.
+- The clone's card shows the sheet's self-destruct behaviour and notes for its source kind.
+  Examples: `SAMUS_BOMB` "ArticleModule::get_active_num doesn't work"; `LINK_BOWARROW` crashes
+  when picked up while using its original code; `PALUTENA_AUTOAIMBULLET` always spawns with its
+  effect.
+- The sheet's top-of-sheet rule of thumb is shown as advice for kinds the sheet doesn't list.
+  Articles that talk to their owner in a special way, use stage geometry, or come from a DLC or
+  echo fighter will probably not clone well.
+
+The preview does not model self-destruction from the sheet. It only shows it as text.
+
 ## Left to the builder
 
-- Exactly where a clone's params live at runtime (the clone owner's `param_<new_name>`, the
-  source owner's block, or none) — verify in game with the plugin before Phase C trusts it.
+- Check the param rule above in game with the plugin for one moveset that ships the block
+  (Latios `lativolt`) and one that doesn't (Iron-Man), before Phase C relies on it.
 - The precise smashline revision → signature table (two shapes known; check the moveset's
   `Cargo.lock` pin first, argument types second).
 - How far the syn-based settings reader follows helpers (one call deep is the suggested start).
