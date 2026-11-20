@@ -598,11 +598,8 @@ impl VfxPreview {
                     self.waiting = true;
                     continue;
                 }
-                let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+                let mut s = emitter_sim(emitter);
                 s.set_particle_colour(draw.particle_colour);
-                for child in &emitter.children {
-                    s.add_child(&child.data, &child.fixed);
-                }
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
                 let first = placements.len().saturating_sub(601);
@@ -907,6 +904,18 @@ fn load_file(
     })
 }
 
+/// An emitter as the preview runs it: with its child emitters, and with the field sections
+/// that move its particles (a convergence field pulls Sephiroth's charge sparks in).
+fn emitter_sim(emitter: &Emitter) -> sim::EmitterSim<'_> {
+    let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+    s.set_fields(sim::Fields::of(&emitter.raw.attributes));
+    for child in &emitter.children {
+        s.add_child(&child.data, &child.fixed)
+            .set_fields(sim::Fields::of(&child.raw.attributes));
+    }
+    s
+}
+
 /// Every set's emitters: parsed, raw and with the runtime's load-time fixes.
 fn set_emitters(ptcl_file: &effect_library::ptcl_file::PtclFile) -> Vec<Vec<Emitter>> {
     let raw_sets = ptcl::emitter_sets(&ptcl_file.base_bytes);
@@ -1072,14 +1081,34 @@ mod tests {
             .map(|c| c.data.name.clone().unwrap_or_default())
             .collect();
         assert_eq!(names, ["Emitter1", "Emitter2"]);
-        let mut s = sim::EmitterSim::new(&sparks.data, &sparks.fixed);
-        for child in &sparks.children {
-            s.add_child(&child.data, &child.fixed);
-        }
+        let mut s = emitter_sim(sparks);
         for _ in 0..30 {
             s.step();
         }
         assert!(s.children().iter().all(|c| c.count() > 0));
+        // The sparks' convergence field runs too: 0.11 of the way to the centre a frame on top
+        // of their own speed, so the first ones (out at 6 to 30 on frame 18) are nearly in.
+        // Without it the preview's sparks crept in at their own speed and drew short dashes.
+        let mut bare = sim::EmitterSim::new(&sparks.data, &sparks.fixed);
+        let mut pulled = emitter_sim(sparks);
+        for _ in 0..25 {
+            bare.step();
+            pulled.step();
+        }
+        let radius = |s: &sim::EmitterSim| {
+            let positions = &s.streams()["sysLocalPosAttr"];
+            positions
+                .iter()
+                .map(|p| glam::Vec3::new(p[0], p[1], p[2]).length())
+                .sum::<f32>()
+                / positions.len() as f32
+        };
+        assert!(
+            radius(&pulled) < radius(&bare) * 0.7,
+            "{} with the field, {} without",
+            radius(&pulled),
+            radius(&bare)
+        );
     }
 
     /// The same charge on its own, as the preview camera sees it: from the side, the preview's
