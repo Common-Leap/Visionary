@@ -33,6 +33,8 @@ use parking_lot::Mutex;
 use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
+pub mod costume_scope;
+pub use costume_scope::{costume_is, prefer_specific_costumes, CostumeScoped};
 mod drop_hooks;
 mod node_steps;
 pub use node_steps::{passes as guard_passes, LiveGuard};
@@ -1485,6 +1487,12 @@ pub struct HitboxRule {
     /// The fighter this rule was made for; `None` fires for anyone playing the motion.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The only costumes this rule runs on; empty = every costume. See [`acting_is`].
+    #[serde(default)]
+    pub costumes: Vec<u8>,
+    /// Costumes this rule never runs on. See [`acting_is`].
+    #[serde(default)]
+    pub except_costumes: Vec<u8>,
     /// Collision family this rule targets (0 attack / 1 grab / 2 wind). Old editors omit
     /// it → defaults to attack, preserving prior behavior.
     #[serde(default)]
@@ -1522,17 +1530,27 @@ pub struct HitboxRule {
 
 /// The fighter whose hook is reading rules right now; -1 for anything that isn't a fighter.
 static ACTING_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// That fighter's costume (colour slot); -1 for anything that isn't a fighter.
+static ACTING_COLOR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-/// Every rule lookup follows a hook reading this boma's motion, so that read names the fighter.
+/// Every rule lookup follows a hook reading this boma's motion, so that read names the fighter
+/// and the costume it wears.
 pub unsafe fn note_acting(boma: *mut smash::app::BattleObjectModuleAccessor) {
-    let kind = if smash::app::utility::get_category(&mut *boma)
+    let (kind, color) = if smash::app::utility::get_category(&mut *boma)
         == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
     {
-        smash::app::utility::get_kind(&mut *boma)
+        (
+            smash::app::utility::get_kind(&mut *boma),
+            smash::app::lua_bind::WorkModule::get_int(
+                boma,
+                *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+            ),
+        )
     } else {
-        -1
+        (-1, -1)
     };
     ACTING_KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
+    ACTING_COLOR.store(color, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
@@ -1542,21 +1560,44 @@ pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -
 
 /// Moves share names across fighters, so a rule only fires for the fighter it was made for.
 /// Projectiles run under their owner's rules, and Nana uses Popo's moves.
-pub fn acting_is(fighter_kind: Option<i32>) -> bool {
+///
+/// A character made in the editor shares its donor's fighter kind and owns some of its
+/// costumes, so a rule also names costumes: `costumes` lists the only ones it runs on (empty =
+/// all), `except_costumes` the ones it never runs on. Anything whose costume is unknown (-1, not
+/// a fighter) passes the costume test, as it passes the fighter test.
+pub fn acting_is(fighter_kind: Option<i32>, costumes: &[u8], except_costumes: &[u8]) -> bool {
     let acting = ACTING_KIND.load(std::sync::atomic::Ordering::Relaxed);
-    fighter_kind.is_none_or(|wanted| {
+    let fighter = fighter_kind.is_none_or(|wanted| {
         acting == -1
             || acting == wanted
             || (wanted == *smash::lib::lua_const::FIGHTER_KIND_POPO
                 && acting == *smash::lib::lua_const::FIGHTER_KIND_NANA)
-    })
+    });
+    fighter
+        && costume_is(
+            ACTING_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+            costumes,
+            except_costumes,
+        )
+}
+
+impl CostumeScoped for HitboxRule {
+    fn scope(&self) -> (Option<i32>, Option<u64>) {
+        (self.fighter_kind, Some(self.motion))
+    }
+    fn costumes(&self) -> &[u8] {
+        &self.costumes
+    }
+    fn except_costumes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.except_costumes
+    }
 }
 
 impl HitboxRule {
     fn matches(&self, category: u8, motion: u64, id: u64, frame: f32) -> bool {
         self.category == category
             && self.motion == motion
-            && acting_is(self.fighter_kind)
+            && acting_is(self.fighter_kind, &self.costumes, &self.except_costumes)
             && self.hitbox_id.map(|h| h == id).unwrap_or(true)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
@@ -1603,7 +1644,8 @@ pub(crate) unsafe fn dropped(
 }
 
 /// Full-list replace (same semantics as effect spawn rules).
-pub fn set_rules(rules: Vec<HitboxRule>) {
+pub fn set_rules(mut rules: Vec<HitboxRule>) {
+    prefer_specific_costumes(&mut rules);
     let n = rules.len();
     {
         let mut guard = RULES.lock();
@@ -1678,9 +1720,23 @@ pub fn set_rules(rules: Vec<HitboxRule>) {
     // Without this the budget is spent long before the rule under test ever arrives.
     sound_hooks::reset_reports();
     rate_hooks::reset_reports();
+    // Which costumes each version of a move runs on, so a made character's edit that changes
+    // its donor (or nothing) can be told apart from one the plugin never received.
+    let scoped: Vec<String> = RULES
+        .lock()
+        .iter()
+        .filter(|rule| !rule.costumes.is_empty() || !rule.except_costumes.is_empty())
+        .map(|rule| {
+            format!(
+                "{:#x} only{:?} except{:?}",
+                rule.motion, rule.costumes, rule.except_costumes
+            )
+        })
+        .collect();
     crate::slight::diag::note(format!(
-        "hitbox_rules set: {n} rule(s) [{}]",
-        by_cat.join(" ")
+        "hitbox_rules set: {n} rule(s) [{}] costume-scoped [{}]",
+        by_cat.join(" "),
+        scoped.join("; ")
     ));
 }
 
@@ -2890,7 +2946,11 @@ fn injections_for(motion: u64) -> Vec<(u64, u8, InjectRule)> {
     let rules = RULES.lock();
     rules
         .iter()
-        .filter(|r| r.motion == motion && r.inject.is_some() && acting_is(r.fighter_kind))
+        .filter(|r| {
+            r.motion == motion
+                && r.inject.is_some()
+                && acting_is(r.fighter_kind, &r.costumes, &r.except_costumes)
+        })
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
             (

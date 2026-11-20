@@ -22,6 +22,12 @@ pub struct ControlRule {
     /// The fighter this rule was made for; `None` fires for anyone.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The only costumes this rule runs on; empty = every costume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costumes: Vec<u8>,
+    /// Costumes this rule never runs on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_costumes: Vec<u8>,
     pub func: String,
     #[serde(default)]
     pub args: Vec<LuaArg>,
@@ -47,7 +53,11 @@ impl ControlRule {
     fn matches(&self, func: &str, args: &[LuaArg], motion: u64, frame: f32) -> bool {
         self.func == func
             && self.motion.map(|m| m == motion).unwrap_or(true)
-            && crate::slight::hitbox_viewer::acting_is(self.fighter_kind)
+            && crate::slight::hitbox_viewer::acting_is(
+                self.fighter_kind,
+                &self.costumes,
+                &self.except_costumes,
+            )
             && self.args == args
             && self.frame_start.map(|start| frame >= start).unwrap_or(true)
             && self.frame_end.map(|end| frame <= end).unwrap_or(true)
@@ -70,7 +80,20 @@ fn fingerprint_bytes(bytes: &[u8]) -> u64 {
     })
 }
 
+impl crate::slight::hitbox_viewer::CostumeScoped for ControlRule {
+    fn scope(&self) -> (Option<i32>, Option<u64>) {
+        (self.fighter_kind, self.motion)
+    }
+    fn costumes(&self) -> &[u8] {
+        &self.costumes
+    }
+    fn except_costumes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.except_costumes
+    }
+}
+
 fn prepare_rules(mut rules: Vec<ControlRule>) -> Vec<ControlRule> {
+    crate::slight::hitbox_viewer::prefer_specific_costumes(&mut rules);
     for rule in &mut rules {
         rule.identity = serde_json::to_vec(rule)
             .map(|bytes| fingerprint_bytes(&bytes))
@@ -207,7 +230,11 @@ pub fn injections_for(motion: u64) -> Vec<(usize, ControlInject, Option<i32>, u6
         .filter(|(_, rule)| {
             rule.inject.is_some()
                 && rule.motion.map(|wanted| wanted == motion).unwrap_or(true)
-                && crate::slight::hitbox_viewer::acting_is(rule.fighter_kind)
+                && crate::slight::hitbox_viewer::acting_is(
+                    rule.fighter_kind,
+                    &rule.costumes,
+                    &rule.except_costumes,
+                )
         })
         .map(|(index, rule)| {
             (

@@ -30,6 +30,12 @@ pub struct SpawnRule {
     /// The fighter this rule was made for; `None` fires for anyone.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The only costumes this rule runs on; empty = every costume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costumes: Vec<u8>,
+    /// Costumes this rule never runs on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_costumes: Vec<u8>,
     #[serde(default)]
     pub suppress: bool,
     /// Optional lifetime command this rule suppresses. Stop rules are checked only by the
@@ -112,7 +118,11 @@ impl SpawnRule {
     fn matches(&self, eff_hash: u64, motion: u64, frame: f32) -> bool {
         self.eff_hash == eff_hash
             && self.motion.map(|m| m == motion).unwrap_or(true)
-            && crate::slight::hitbox_viewer::acting_is(self.fighter_kind)
+            && crate::slight::hitbox_viewer::acting_is(
+                self.fighter_kind,
+                &self.costumes,
+                &self.except_costumes,
+            )
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
     }
@@ -141,7 +151,20 @@ fn slot_identity(identity: u64, slot: usize) -> u64 {
     fingerprint_bytes(&bytes)
 }
 
+impl crate::slight::hitbox_viewer::CostumeScoped for SpawnRule {
+    fn scope(&self) -> (Option<i32>, Option<u64>) {
+        (self.fighter_kind, self.motion)
+    }
+    fn costumes(&self) -> &[u8] {
+        &self.costumes
+    }
+    fn except_costumes_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.except_costumes
+    }
+}
+
 fn prepare_rules(mut rules: Vec<SpawnRule>) -> Vec<SpawnRule> {
+    crate::slight::hitbox_viewer::prefer_specific_costumes(&mut rules);
     for rule in &mut rules {
         rule.identity = serde_json::to_vec(rule)
             .map(|bytes| fingerprint_bytes(&bytes))
@@ -280,7 +303,11 @@ pub fn injections_for(motion: u64) -> Vec<(usize, SpawnInject, u64)> {
         .filter(|(_, r)| {
             (r.inject.is_some() || r.color_inject.is_some())
                 && r.motion.map(|m| m == motion).unwrap_or(true)
-                && crate::slight::hitbox_viewer::acting_is(r.fighter_kind)
+                && crate::slight::hitbox_viewer::acting_is(
+                    r.fighter_kind,
+                    &r.costumes,
+                    &r.except_costumes,
+                )
         })
         .flat_map(|(i, r)| {
             [r.inject.clone(), r.color_inject.clone()]

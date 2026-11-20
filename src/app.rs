@@ -3,7 +3,7 @@ use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
@@ -18918,10 +18918,9 @@ impl VisionaryApp {
     fn live_hitbox_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::HitboxRuleWire>> {
-        let shown = self.live_owner_keys(self.hitbox_rules_store.keys());
+        let roster = &self.roster.project;
         self.hitbox_rules_store
             .iter()
-            .filter(|(key, _)| shown.contains(key.as_str()))
             .filter(|(key, _)| self.allows_flat(key, false))
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
@@ -18933,7 +18932,7 @@ impl VisionaryApp {
                         ))
                     })
                     .unwrap_or_default();
-                rules.iter().cloned().map(move |mut rule| {
+                rules.iter().cloned().filter_map(move |mut rule| {
                     if let Some(inject) =
                         rule.inject.as_mut().filter(|inject| inject.guard.is_none())
                     {
@@ -18942,7 +18941,7 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    crate::game_link::ForFighter::from_key(key, rule)
+                    crate::game_link::ForFighter::scoped(key, rule, roster)
                 })
             })
             .collect()
@@ -18980,54 +18979,12 @@ impl VisionaryApp {
         check(&view, &format!("{engine}/{rest}"))
     }
 
-    /// The rule-store keys whose rules go to the game. The game cannot tell costumes apart
-    /// yet, so each move of a fighter sends one character's version: the open character's when
-    /// it has one, else the fighter's own, else the first made character's.
-    fn live_owner_keys<'a>(&self, keys: impl Iterator<Item = &'a String>) -> HashSet<String> {
-        let active = self.active_key();
-        let mut by_move: BTreeMap<(String, String), Vec<&'a String>> = BTreeMap::new();
-        for key in keys {
-            let move_key = rule_move_key(key);
-            let Some((owner, move_name)) = crate::character::parse_move_key(&move_key) else {
-                continue;
-            };
-            by_move
-                .entry((owner.engine_fighter().to_owned(), move_name.to_owned()))
-                .or_default()
-                .push(key);
-        }
-        let mut shown = HashSet::new();
-        for keys in by_move.values() {
-            let owner_of = |key: &String| {
-                crate::character::split_move_key(key)
-                    .map(|(owner, _)| owner.to_owned())
-                    .unwrap_or_default()
-            };
-            let mut owners: Vec<String> = keys.iter().map(|key| owner_of(key)).collect();
-            owners.sort();
-            owners.dedup();
-            let chosen = active
-                .as_ref()
-                .map(|key| key.as_str().to_owned())
-                .filter(|key| owners.contains(key))
-                .or_else(|| owners.iter().find(|owner| !owner.contains('#')).cloned())
-                .or_else(|| owners.first().cloned());
-            shown.extend(
-                keys.iter()
-                    .filter(|key| Some(owner_of(key)) == chosen)
-                    .map(|key| (*key).clone()),
-            );
-        }
-        shown
-    }
-
     fn live_effect_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::SpawnRuleWire>> {
-        let shown = self.live_owner_keys(self.effect_rules_store.keys());
+        let roster = &self.roster.project;
         self.effect_rules_store
             .iter()
-            .filter(|(key, _)| shown.contains(key.as_str()))
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
@@ -19039,7 +18996,7 @@ impl VisionaryApp {
                         ))
                     })
                     .unwrap_or_default();
-                rules.iter().cloned().map(move |mut rule| {
+                rules.iter().cloned().filter_map(move |mut rule| {
                     if let Some(inject) =
                         rule.inject.as_mut().filter(|inject| inject.guard.is_none())
                     {
@@ -19048,7 +19005,7 @@ impl VisionaryApp {
                             .find(|(frame, _)| *frame == inject.frame)
                             .map(|(_, guard)| guard.clone());
                     }
-                    crate::game_link::ForFighter::from_key(key, rule)
+                    crate::game_link::ForFighter::scoped(key, rule, roster)
                 })
             })
             .collect()
@@ -19057,16 +19014,15 @@ impl VisionaryApp {
     fn live_effect_control_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
-        let shown = self.live_owner_keys(self.effect_control_rules_store.keys());
+        let roster = &self.roster.project;
         self.effect_control_rules_store
             .iter()
-            .filter(|(key, _)| shown.contains(key.as_str()))
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
                 rules
                     .iter()
                     .cloned()
-                    .map(|rule| crate::game_link::ForFighter::from_key(key, rule))
+                    .filter_map(|rule| crate::game_link::ForFighter::scoped(key, rule, roster))
             })
             .collect()
     }
@@ -21184,22 +21140,6 @@ impl VisionaryApp {
                         std::env::current_exe().ok(),
                     )
                     .is_none());
-            // The rule pack replays live rules, which cannot tell costumes apart yet: a made
-            // character's moves would change every costume of its fighter.
-            if rule_pack && !project.characters.is_empty() {
-                let names: Vec<String> = project
-                    .characters
-                    .keys()
-                    .map(|key| {
-                        self.character_name(&crate::character::CharacterKey::made(key.clone()))
-                    })
-                    .collect();
-                self.state.status = format!(
-                    "Export needs Rust and the plugin source to ship {}'s moves on their own costumes.",
-                    names.join(", ")
-                );
-                return;
-            }
             let plan = if rule_pack {
                 crate::mod_export::NormalExportPlan {
                     generated_source: None,

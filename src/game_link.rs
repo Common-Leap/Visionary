@@ -268,24 +268,64 @@ impl Default for RpmEffectData {
 /// Wire form of a plugin spawn rule (matches slight_replica spawn_rules::SpawnRule).
 /// `motion` + frame window scope the rule to ONE spawn so editing one spawn of an effect
 /// doesn't move every spawn; `pos`/`rot`/`scale` are the per-spawn transform override.
-/// A live rule tagged with its fighter. Moves share names across fighters, so without the tag an
-/// edit to one fighter's `special_n` would change every fighter's.
-#[derive(Clone, Debug, Serialize)]
+/// A live rule tagged with its fighter and costumes. Moves share names across fighters, so
+/// without the tag an edit to one fighter's `special_n` would change every fighter's; and a
+/// character made in Visionary shares its donor's fighter, so without the costumes an edit to
+/// Vision's jab would change Mario's.
+///
+/// Both costume lists are left out when empty, so a plugin older than them reads the rule as it
+/// always did, and a rule from an older editor applies to every costume.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ForFighter<T> {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fighter_kind: Option<i32>,
+    /// The only costumes (colour slots) the rule runs on; empty means every costume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub costumes: Vec<u8>,
+    /// Costumes the rule never runs on: a base fighter's rule skips the costumes its made
+    /// characters own, whether or not they have a version of the move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_costumes: Vec<u8>,
     #[serde(flatten)]
     pub rule: T,
 }
 
 impl<T> ForFighter<T> {
-    /// `key` is a rule store key, which starts with the fighter's name.
+    /// `key` is a rule store key, which starts with the fighter's name. The rule runs on every
+    /// costume; [`Self::scoped`] is the form that knows about made characters.
     pub fn from_key(key: &str, rule: T) -> Self {
         let fighter = key.split(['/', '#']).next().unwrap_or_default();
         Self {
             fighter_kind: crate::gimmicks::registry::fighter_kind_value(fighter),
+            costumes: Vec::new(),
+            except_costumes: Vec::new(),
             rule,
         }
+    }
+
+    /// A rule for the character whose store key this is, on that character's costumes only: a
+    /// made character's own, or a base fighter's every costume but those its made characters
+    /// own. `None` for a made character with no costumes, whose rule would otherwise run on
+    /// every costume of its donor.
+    pub fn scoped(key: &str, rule: T, roster: &crate::mod_project::RosterMod) -> Option<Self> {
+        let owner = crate::character::split_move_key(key).map_or(key, |(owner, _)| owner);
+        let owner = crate::character::CharacterKey::parse(owner);
+        let mut tagged = Self::from_key(key, rule);
+        if owner.is_made() {
+            tagged.costumes = owner.made_slots(roster);
+            tagged.costumes.sort_unstable();
+            tagged.costumes.dedup();
+            if tagged.costumes.is_empty() {
+                return None;
+            }
+        } else {
+            tagged.except_costumes = crate::character::made_on(owner.engine_fighter(), roster)
+                .flat_map(crate::mod_project::AuthoredEntry::all_slots)
+                .collect();
+            tagged.except_costumes.sort_unstable();
+            tagged.except_costumes.dedup();
+        }
+        Some(tagged)
     }
 }
 
@@ -3698,6 +3738,328 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.client_id = client_id;
         }
         _ => {}
+    }
+}
+
+/// The plugin's costume matching, run here: tests in the plugin crate never run.
+#[cfg(test)]
+#[path = "../plugins/slight_replica/src/slight/hitbox_viewer/costume_scope.rs"]
+mod plugin_costume_scope;
+
+#[cfg(test)]
+mod costume_scope_tests {
+    use super::plugin_costume_scope::{costume_is, prefer_specific_costumes, CostumeScoped};
+    use super::ForFighter;
+    use crate::roster::RosterKey;
+
+    fn roster_with_vision() -> crate::mod_project::RosterMod {
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: (9..=15).collect(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        roster
+    }
+
+    /// A rule as the plugin reads it off the wire, with the plugin's field names.
+    #[derive(Debug, serde::Deserialize)]
+    struct PluginRule {
+        #[serde(default)]
+        fighter_kind: Option<i32>,
+        motion: u64,
+        damage: f32,
+        #[serde(default)]
+        costumes: Vec<u8>,
+        #[serde(default)]
+        except_costumes: Vec<u8>,
+    }
+
+    impl CostumeScoped for PluginRule {
+        fn scope(&self) -> (Option<i32>, Option<u64>) {
+            (self.fighter_kind, Some(self.motion))
+        }
+        fn costumes(&self) -> &[u8] {
+            &self.costumes
+        }
+        fn except_costumes_mut(&mut self) -> &mut Vec<u8> {
+            &mut self.except_costumes
+        }
+    }
+
+    fn jab(damage: f32) -> serde_json::Value {
+        serde_json::json!({ "motion": 7, "damage": damage })
+    }
+
+    /// What the plugin installs from these wire rules: each one through the same JSON and the
+    /// same set-time pass the plugin runs.
+    fn installed<T: serde::Serialize>(wire: &[ForFighter<T>]) -> Vec<PluginRule> {
+        let json = serde_json::to_string(wire).unwrap();
+        let mut rules: Vec<PluginRule> = serde_json::from_str(&json).unwrap();
+        prefer_specific_costumes(&mut rules);
+        rules
+    }
+
+    /// The damage costume `color` gets: every matching rule's, which must be exactly one.
+    fn damage_on(rules: &[PluginRule], color: i32) -> Vec<f32> {
+        rules
+            .iter()
+            .filter(|rule| costume_is(color, &rule.costumes, &rule.except_costumes))
+            .map(|rule| rule.damage)
+            .collect()
+    }
+
+    #[test]
+    fn each_character_s_version_of_a_move_runs_on_its_own_costumes() {
+        let roster = roster_with_vision();
+        let wire = [
+            ForFighter::scoped("mario/attack_11", jab(5.0), &roster).unwrap(),
+            ForFighter::scoped("mario#c08/attack_11", jab(20.0), &roster).unwrap(),
+        ];
+        let rules = installed(&wire);
+        for color in 0..8 {
+            assert_eq!(
+                damage_on(&rules, color),
+                [5.0],
+                "Mario's costume c{color:02}"
+            );
+        }
+        for color in 8..16 {
+            assert_eq!(
+                damage_on(&rules, color),
+                [20.0],
+                "Vision's costume c{color:02}"
+            );
+        }
+        // Both carry Mario's fighter kind: the costumes alone keep them apart.
+        assert_eq!(rules[0].fighter_kind, rules[1].fighter_kind);
+        assert!(rules[0].fighter_kind.is_some());
+    }
+
+    #[test]
+    fn a_donor_edit_never_reaches_a_made_character_without_a_version_of_its_own() {
+        let wire =
+            [ForFighter::scoped("mario/attack_11", jab(5.0), &roster_with_vision()).unwrap()];
+        let rules = installed(&wire);
+        assert_eq!(damage_on(&rules, 0), [5.0]);
+        assert!(
+            damage_on(&rules, 8).is_empty(),
+            "Vision runs the game's jab"
+        );
+        // Paired: with no made character, the same edit reaches every costume and the wire is
+        // exactly what plugins older than costumes read.
+        let plain = crate::mod_project::RosterMod::default();
+        let wire = [ForFighter::scoped("mario/attack_11", jab(5.0), &plain).unwrap()];
+        assert_eq!(damage_on(&installed(&wire), 8), [5.0]);
+        let json = serde_json::to_value(&wire[0]).unwrap();
+        assert!(json.get("costumes").is_none() && json.get("except_costumes").is_none());
+    }
+
+    #[test]
+    fn a_rule_naming_no_costumes_yields_to_one_that_does() {
+        // An editor older than `except_costumes` sends Mario's rule for every costume.
+        let roster = roster_with_vision();
+        let wire = [
+            ForFighter::from_key("mario/attack_11", jab(5.0)),
+            ForFighter::scoped("mario#c08/attack_11", jab(20.0), &roster).unwrap(),
+        ];
+        assert_eq!(damage_on(&installed(&wire), 8), [20.0]);
+        assert_eq!(damage_on(&installed(&wire), 0), [5.0]);
+        // Paired: without the plugin's set-time pass both would run on Vision's costumes.
+        let json = serde_json::to_string(&wire).unwrap();
+        let raw: Vec<PluginRule> = serde_json::from_str(&json).unwrap();
+        assert_eq!(damage_on(&raw, 8), [5.0, 20.0]);
+        // Another move of the same fighter is not claimed by Vision's jab.
+        let mut other = jab(9.0);
+        other["motion"] = 8.into();
+        let wire = [
+            ForFighter::from_key("mario/attack_12", other),
+            ForFighter::scoped("mario#c08/attack_11", jab(20.0), &roster).unwrap(),
+        ];
+        assert_eq!(damage_on(&installed(&wire), 8), [9.0, 20.0]);
+    }
+
+    #[test]
+    fn a_character_missing_from_the_project_sends_no_rule() {
+        // Not in the project at all: an empty list would mean every costume of Mario.
+        let empty = crate::mod_project::RosterMod::default();
+        assert!(ForFighter::scoped("mario#c08/attack_11", jab(1.0), &empty).is_none());
+        // Paired: a one-costume character in the project gets a rule on that costume alone.
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let rule = ForFighter::scoped("mario#c08/attack_11", jab(1.0), &roster).unwrap();
+        assert_eq!(rule.costumes, [8]);
+        assert!(rule.except_costumes.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_costume_passes_like_an_unknown_fighter() {
+        assert!(costume_is(-1, &[8], &[]));
+        assert!(costume_is(-1, &[], &[8]));
+        assert!(!costume_is(3, &[8], &[]));
+        assert!(!costume_is(8, &[], &[8]));
+    }
+
+    #[test]
+    fn the_costume_fields_round_trip_and_old_rules_read_as_every_costume() {
+        let tagged = ForFighter {
+            fighter_kind: Some(3),
+            costumes: vec![8, 9],
+            except_costumes: vec![1],
+            rule: jab(4.0),
+        };
+        let json = serde_json::to_string(&tagged).unwrap();
+        let back: ForFighter<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fighter_kind, Some(3));
+        assert_eq!(back.costumes, [8, 9]);
+        assert_eq!(back.except_costumes, [1]);
+        assert_eq!(back.rule["damage"], 4.0);
+        let old: ForFighter<serde_json::Value> =
+            serde_json::from_str(r#"{"fighter_kind":3,"motion":7,"damage":4.0}"#).unwrap();
+        assert!(old.costumes.is_empty() && old.except_costumes.is_empty());
+    }
+
+    const HITBOX: &str = include_str!("../plugins/slight_replica/src/slight/hitbox_viewer/mod.rs");
+    const SPAWN: &str =
+        include_str!("../plugins/slight_replica/src/slight/effect_viewer/spawn_rules.rs");
+    const CONTROL: &str =
+        include_str!("../plugins/slight_replica/src/slight/effect_viewer/control_rules.rs");
+
+    /// The text of the item that starts with `start`, up to its closing brace, without spaces.
+    fn item(source: &str, start: &str) -> Option<String> {
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        let at = flat.find(start)?;
+        let open = at + flat[at..].find('{')?;
+        let mut depth = 0;
+        for (offset, c) in flat[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(flat[at..=open + offset].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Where the plugin must read and check the costume: (file, item, text it must contain).
+    const CHECKS: &[(usize, &str, &str)] = &[
+        (0, "staticACTING_COLOR:", "staticACTING_COLOR:"),
+        (
+            0,
+            "pubunsafefnnote_acting(",
+            "FIGHTER_INSTANCE_WORK_ID_INT_COLOR",
+        ),
+        (0, "pubunsafefnnote_acting(", "ACTING_COLOR.store(color"),
+        (0, "pubfnacting_is(", "&&costume_is(ACTING_COLOR.load("),
+        (0, "pubstructHitboxRule{", "pubcostumes:Vec<u8>"),
+        (0, "pubstructHitboxRule{", "pubexcept_costumes:Vec<u8>"),
+        (
+            0,
+            "implHitboxRule{fnmatches(",
+            "&self.costumes,&self.except_costumes",
+        ),
+        (0, "pubfnset_rules(", "prefer_specific_costumes(&mutrules)"),
+        (1, "pubstructSpawnRule{", "pubcostumes:Vec<u8>"),
+        (1, "pubstructSpawnRule{", "pubexcept_costumes:Vec<u8>"),
+        (
+            1,
+            "implSpawnRule{fnmatches(",
+            "&self.costumes,&self.except_costumes",
+        ),
+        (1, "pubfninjections_for(", "&r.costumes,&r.except_costumes"),
+        (1, "fnprepare_rules(", "prefer_specific_costumes(&mutrules)"),
+        (2, "pubstructControlRule{", "pubcostumes:Vec<u8>"),
+        (2, "pubstructControlRule{", "pubexcept_costumes:Vec<u8>"),
+        (
+            2,
+            "implControlRule{fnmatches(",
+            "&self.costumes,&self.except_costumes",
+        ),
+        (
+            2,
+            "pubfninjections_for(",
+            "&rule.costumes,&rule.except_costumes",
+        ),
+        (2, "fnprepare_rules(", "prefer_specific_costumes(&mutrules)"),
+    ];
+
+    fn plugin_checks_costumes(files: [&str; 3]) -> Result<(), String> {
+        for (file, start, needle) in CHECKS {
+            let body = item(files[*file], start).ok_or(format!("{start} not found"))?;
+            if !body.contains(needle) {
+                return Err(format!("{start} lacks {needle}"));
+            }
+        }
+        // Every rule lookup passes costumes: no call of the old one-argument form is left.
+        for (name, source) in [
+            ("hitbox", files[0]),
+            ("spawn", files[1]),
+            ("control", files[2]),
+        ] {
+            let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+            for call in flat.split("acting_is(").skip(1) {
+                let args = call.split(')').next().unwrap_or_default();
+                if !args.contains("costumes") {
+                    return Err(format!("{name}: acting_is({args}) ignores costumes"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_plugin_checks_the_acting_fighter_s_costume() {
+        plugin_checks_costumes([HITBOX, SPAWN, CONTROL]).unwrap();
+    }
+
+    #[test]
+    fn the_costume_scan_fails_on_a_plugin_without_each_check() {
+        let files = [HITBOX, SPAWN, CONTROL];
+        for (file, start, needle) in CHECKS {
+            // The check's text, as it is written in the file (spaces allowed between tokens).
+            let flat_at = item(files[*file], start).and_then(|body| body.find(needle));
+            assert!(flat_at.is_some(), "{start} {needle}");
+            let mut mutated = files.map(str::to_owned);
+            let spaced: String = mutated[*file]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            mutated[*file] = spaced.replacen(needle, "MUTATED", 1);
+            let views = [&*mutated[0], &*mutated[1], &*mutated[2]];
+            assert!(
+                plugin_checks_costumes(views).is_err(),
+                "the scan still passes without {needle} in {start}"
+            );
+        }
+        let old_call = HITBOX.replacen(
+            "acting_is(self.fighter_kind, &self.costumes, &self.except_costumes)",
+            "acting_is(self.fighter_kind)",
+            1,
+        );
+        assert_ne!(
+            old_call, HITBOX,
+            "the hitbox matcher's call is written as expected"
+        );
+        assert!(plugin_checks_costumes([&old_call, SPAWN, CONTROL]).is_err());
     }
 }
 
