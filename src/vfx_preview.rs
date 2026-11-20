@@ -42,6 +42,27 @@ pub struct EffectDraw {
     /// Play the effect over and over on its own length, this many frames since the loop
     /// started, at the last placement (the Effects page shows an effect no move spawns so).
     pub looping: Option<usize>,
+    /// Effect frames a game frame (`LAST_EFFECT_SET_RATE`); 1 unless the script sets one.
+    pub rate: f32,
+}
+
+/// The placements an effect's emitters step through when it plays at `rate` effect frames a
+/// game frame, and the step that kills it: `LAST_EFFECT_SET_RATE` makes the game update an
+/// effect's emitters that much faster or slower. Each step takes the placement of the game
+/// frame it falls in. Whole steps only: a rate below 1 holds a frame for a while.
+fn rated_steps(
+    placements: &[Mat4],
+    kill_at: Option<usize>,
+    rate: f32,
+) -> (Vec<Mat4>, Option<usize>) {
+    if !rate.is_finite() || rate <= 0.0 || (rate - 1.0).abs() < 1e-6 || placements.is_empty() {
+        return (placements.to_vec(), kill_at);
+    }
+    let steps = ((placements.len() as f32 * rate).floor() as usize).max(1);
+    let at = |step: usize| ((step as f32 / rate) as usize).min(placements.len() - 1);
+    let stepped = (0..steps).map(|step| placements[at(step)]).collect();
+    let kill = kill_at.map(|kill| (0..steps).find(|&step| at(step) >= kill).unwrap_or(steps));
+    (stepped, kill)
 }
 
 /// Where the Effects page puts an effect it plays on its own, from the bones its moves spawn
@@ -530,6 +551,15 @@ impl VfxPreview {
                 }
                 _ => &draw.placements,
             };
+            let rated;
+            let placements: &[Mat4] = if (draw.rate - 1.0).abs() < 1e-6 {
+                placements
+            } else {
+                let (steps, kill) = rated_steps(placements, kill_at, draw.rate);
+                rated = steps;
+                kill_at = kill;
+                &rated
+            };
             file.renderer.set_view(queue, &camera);
             // Refraction shaders read the frame behind them; the preview has only its backdrop.
             file.renderer.set_background(queue, self.backdrop);
@@ -971,7 +1001,7 @@ mod tests {
             eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
             return;
         };
-        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
         let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
         let ptcl_file = file.ptcl_file.as_ref().unwrap();
         let set = ptcl_file
@@ -1022,7 +1052,7 @@ mod tests {
             eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
             return;
         };
-        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
         let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
         let ptcl_file = file.ptcl_file.as_ref().unwrap();
         let set = ptcl_file
@@ -1065,7 +1095,7 @@ mod tests {
             eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
             return;
         };
-        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
         let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
         let ptcl_file = file.ptcl_file.as_ref().unwrap();
         let set = ptcl_file
@@ -1099,5 +1129,25 @@ mod tests {
         }
         assert!(total > 20);
         assert!(across * 3 > total, "{across} of {total} rays go across");
+    }
+
+    /// An effect the script plays at another rate (`LAST_EFFECT_SET_RATE`, 282 vanilla calls)
+    /// updates that many frames a game frame. The preview ignored the rate, so a rate 2 spawn
+    /// played at half speed and a 0.5 one at double.
+    #[test]
+    fn an_effect_rate_scales_the_steps_and_the_kill() {
+        let placements: Vec<Mat4> = (0..10)
+            .map(|i| Mat4::from_translation(glam::Vec3::new(i as f32, 0.0, 0.0)))
+            .collect();
+        let (steps, kill) = rated_steps(&placements, Some(6), 2.0);
+        assert_eq!(steps.len(), 20);
+        assert_eq!(kill, Some(12));
+        assert_eq!(steps[13].w_axis.x, 6.0);
+        let (steps, kill) = rated_steps(&placements, Some(6), 0.5);
+        assert_eq!(steps.len(), 5);
+        assert_eq!(kill, Some(3));
+        assert_eq!(steps.last().unwrap().w_axis.x, 8.0);
+        let (steps, kill) = rated_steps(&placements, Some(6), 1.0);
+        assert_eq!((steps.len(), kill), (10, Some(6)));
     }
 }

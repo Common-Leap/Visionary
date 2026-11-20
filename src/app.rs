@@ -9812,6 +9812,7 @@ impl VisionaryApp {
             let colour = crate::effect_colour::draw_colour(call, name, fighter_colour);
             let particle_colour = crate::effect_colour::particle_colour(call);
             let ink = crate::effect_colour::ink(call, fighter_colour);
+            let rate = call.and_then(|call| call.rate).unwrap_or(1.0);
             for file in &files {
                 out.push(crate::vfx_preview::EffectDraw {
                     file: file.clone(),
@@ -9823,6 +9824,7 @@ impl VisionaryApp {
                     ink,
                     solo: solo_for(name),
                     looping: None,
+                    rate,
                 });
             }
         };
@@ -9958,6 +9960,7 @@ impl VisionaryApp {
                     particle_colour: [1.0; 4],
                     ink: None,
                     looping: Some(clock),
+                    rate: 1.0,
                 });
             }
         }
@@ -33577,10 +33580,7 @@ impl eframe::App for VisionaryApp {
                 .show(ui, |ui| {
                     ui.add_space(4.0);
                     if effect_alone {
-                        ui.weak(
-                            "The effect plays by itself on a loop. Pick a move at the top of the \
-                             view to see it in that move.",
-                        );
+                        self.playback_speed_slider(ui);
                     } else {
                         self.draw_scrubber(ui);
                     }
