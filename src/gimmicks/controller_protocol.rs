@@ -193,7 +193,9 @@ pub fn validate_request(request: &ControllerBundleRequest) -> Result<(), String>
     let mut chart_keys = BTreeSet::new();
     let mut program_ids = BTreeSet::new();
     let mut disabled = BTreeSet::new();
-    let mut budgets = BTreeMap::<&str, FighterBudget>::new();
+    // A fighter may carry one gimmick per character, each on its own costumes: the fighter's
+    // own and one per character made on it. Each is a separate owner with its own budget.
+    let mut budgets = BTreeMap::<(&str, CostumeKey<'_>), FighterBudget>::new();
 
     for (index, record) in request.charts.iter().enumerate() {
         let program = &record.program;
@@ -209,7 +211,8 @@ pub fn validate_request(request: &ControllerBundleRequest) -> Result<(), String>
                 "{context}: chart ID must be nonblank, at most {MAX_CHART_ID_BYTES} UTF-8 bytes, and contain no NUL"
             ));
         }
-        if !chart_keys.insert((program.fighter.as_str(), record.chart_id.as_str())) {
+        let scope = costume_key(program);
+        if !chart_keys.insert((program.fighter.as_str(), scope, record.chart_id.as_str())) {
             return Err(format!("{context}: duplicate fighter/chart ID pair"));
         }
         if !program_ids.insert(program.id.as_str()) {
@@ -229,7 +232,9 @@ pub fn validate_request(request: &ControllerBundleRequest) -> Result<(), String>
                 "bundle has more than {MAX_FIGHTER_OWNERS} fighter owners"
             ));
         }
-        let budget = budgets.entry(program.fighter.as_str()).or_default();
+        let budget = budgets
+            .entry((program.fighter.as_str(), scope))
+            .or_default();
         budget.charts = budget
             .charts
             .checked_add(1)
@@ -311,6 +316,8 @@ pub fn validate_request(request: &ControllerBundleRequest) -> Result<(), String>
         )?;
     }
 
+    claim_costumes(budgets.keys().copied())?;
+
     for (index, fighter) in request.disabled_fighters.iter().enumerate() {
         if !disabled.insert(fighter.as_str()) {
             return Err(format!(
@@ -331,6 +338,36 @@ pub fn validate_request(request: &ControllerBundleRequest) -> Result<(), String>
         if owners.len() > MAX_FIGHTER_OWNERS {
             return Err(format!(
                 "bundle has more than {MAX_FIGHTER_OWNERS} fighter owners"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Which costumes one gimmick of a fighter runs on: (costumes, except costumes).
+type CostumeKey<'a> = (&'a [u8], &'a [u8]);
+
+fn costume_key(program: &model::LiveProgram) -> CostumeKey<'_> {
+    (&program.costumes, &program.except_costumes)
+}
+
+/// A fighter's gimmicks must never both claim one costume, or which runs would depend on order:
+/// costume-limited gimmicks name disjoint costumes, and at most one names none.
+fn claim_costumes<'a>(
+    owners: impl Iterator<Item = (&'a str, CostumeKey<'a>)>,
+) -> Result<(), String> {
+    let mut claimed = BTreeMap::<&str, (BTreeSet<u8>, bool)>::new();
+    for (fighter, (costumes, _)) in owners {
+        let (taken, unlimited) = claimed.entry(fighter).or_default();
+        if costumes.is_empty() {
+            if std::mem::replace(unlimited, true) {
+                return Err(format!(
+                    "fighter {fighter:?} has two gimmicks that both run on every costume"
+                ));
+            }
+        } else if let Some(slot) = costumes.iter().find(|slot| !taken.insert(**slot)) {
+            return Err(format!(
+                "fighter {fighter:?} has two gimmicks that both run on costume c{slot:02}"
             ));
         }
     }
@@ -424,23 +461,35 @@ fn ensure_budget(context: &str, label: &str, count: usize, limit: usize) -> Resu
 }
 
 impl ControllerBundleRequest {
-    /// Construct all per-fighter coordinators only after validating the entire
-    /// bundle. The caller still owns atomic live installation and state swap.
-    pub fn coordinators(&self) -> Result<BTreeMap<String, ControllerCoordinator>, String> {
+    /// Construct all coordinators only after validating the entire bundle: per fighter, one per
+    /// costume choice (the fighter's own gimmick and each made character's), in a stable order.
+    /// The caller still owns atomic live installation and state swap, and picks a fighter's
+    /// coordinator with [`super::controller_runtime::coordinator_for_costume`].
+    pub fn coordinators(&self) -> Result<BTreeMap<String, Vec<ControllerCoordinator>>, String> {
         validate_request(self)?;
-        let mut programs = BTreeMap::<String, BTreeMap<String, model::LiveProgram>>::new();
+        type Charts = BTreeMap<String, model::LiveProgram>;
+        let mut programs = BTreeMap::<String, BTreeMap<(Vec<u8>, Vec<u8>), Charts>>::new();
         for record in &self.charts {
+            let program = &record.program;
             programs
-                .entry(record.program.fighter.clone())
+                .entry(program.fighter.clone())
                 .or_default()
-                .insert(record.chart_id.clone(), record.program.clone());
+                .entry((program.costumes.clone(), program.except_costumes.clone()))
+                .or_default()
+                .insert(record.chart_id.clone(), program.clone());
         }
         programs
             .into_iter()
-            .map(|(fighter, charts)| {
-                ControllerCoordinator::new(charts)
-                    .map(|coordinator| (fighter, coordinator))
-                    .map_err(|error| format!("fighter coordinator validation failed: {error}"))
+            .map(|(fighter, owners)| {
+                owners
+                    .into_values()
+                    .map(|charts| {
+                        ControllerCoordinator::new(charts).map_err(|error| {
+                            format!("fighter coordinator validation failed: {error}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|coordinators| (fighter, coordinators))
             })
             .collect()
     }
@@ -456,6 +505,7 @@ mod tests {
     fn valid_program(id: &str, fighter: &str) -> model::LiveProgram {
         model::LiveProgram {
             costumes: Vec::new(),
+            except_costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: model::MODEL_VERSION,
@@ -540,7 +590,7 @@ mod tests {
         assert_eq!(decoded, original);
         assert_eq!(decoded.coordinators().unwrap().len(), 1);
         assert_eq!(
-            decoded.coordinators().unwrap()["cloud"]
+            decoded.coordinators().unwrap()["cloud"][0]
                 .chart_ids()
                 .collect::<Vec<_>>(),
             ["main", "meter"]

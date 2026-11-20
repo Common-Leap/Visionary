@@ -198,8 +198,6 @@ struct CardFacts {
     base_name: String,
     /// Characters made on this fighter, which share its values.
     sharing: Vec<String>,
-    /// Who has the fighter's one gimmick, when another character on it does.
-    gimmick_holder: Option<String>,
     /// The folder of the move code the project uses, by name.
     move_code: Option<String>,
     /// The project has the character's own effect file.
@@ -354,10 +352,6 @@ fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
                 counts.gimmick_values,
                 counted(counts.gimmick_values, "value"),
             );
-            // The game runs one gimmick per fighter: say whose it is when it is another's.
-            if let Some(holder) = &facts.gimmick_holder {
-                chips.push(format!("{holder} has the gimmick"));
-            }
             counts.gimmicks + counts.meters + counts.gimmick_values > 0
         }
         Part::Effects => {
@@ -922,12 +916,8 @@ impl VisionaryApp {
                 .iter()
                 .any(|step| !step.actions.is_empty())
         };
-        // The game keeps one gimmick per fighter: it is the made character's when limited to
-        // its costumes, else the fighter's.
-        let gimmick_of = |fighter: &String| {
-            self.gimmick_owner(fighter)
-                .map(|owner| owner.as_str().to_owned())
-        };
+        // Gimmicks are kept per character; meters, like values, per fighter.
+        let gimmick_of = |key: &String| Some(key.clone());
         let roster = &self.roster;
         EditFamilies {
             moves: self
@@ -1320,13 +1310,7 @@ impl VisionaryApp {
             .iter()
             .find(|entry| entry.key == cell)
             .map(|entry| entry.display_name.clone());
-        let character = Self::card_character(card);
-        let gimmick_holder = self
-            .gimmick_owner(&card.fighter)
-            .filter(|owner| *owner != character)
-            .map(|owner| self.character_name(&owner));
         CardFacts {
-            gimmick_holder,
             counts: self.card_counts(card),
             made: card.made,
             base_name: card.base_name.clone(),
@@ -2900,19 +2884,6 @@ mod tests {
         assert_eq!(model.chips, vec!["12 files".to_owned()]);
         let animations = part_summary(Part::Animations, &base);
         assert_eq!(animations.chips, vec!["Game".to_owned()]);
-    }
-
-    #[test]
-    fn gimmicks_say_who_has_the_fighters_one_gimmick() {
-        let mut vision = facts();
-        vision.made = true;
-        let free = part_summary(Part::Gimmicks, &vision);
-        assert!(free.chips.is_empty() && !free.changed);
-        vision.gimmick_holder = Some("Mario".into());
-        let held = part_summary(Part::Gimmicks, &vision);
-        assert_eq!(held.chips, ["Mario has the gimmick"]);
-        // Another character's gimmick is not a change to this one.
-        assert!(!held.changed);
     }
 
     #[test]

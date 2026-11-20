@@ -164,6 +164,70 @@ pub fn base_costumes(
         .collect()
 }
 
+/// The gimmick kept under `key` as the game is sent it: its fighter and the costumes it runs on.
+/// A made character's gimmick runs on exactly its own costumes, whatever it saved. A fighter's
+/// own gimmick runs on the costumes it saved (every costume when it saved none), never on a
+/// costume one of its made characters owns: a gimmick saved before made characters existed is
+/// limited here, at send and export time, and its saved costumes are left as they are. None when
+/// it would run on no costume (a made character that is no longer in the project, or a fighter's
+/// gimmick limited to costumes that all belong to made characters).
+pub fn gimmick_owner(
+    key: &str,
+    saved_costumes: &[u8],
+    roster: &crate::mod_project::RosterMod,
+) -> Option<crate::gimmicks::controller_project::GimmickOwner> {
+    use crate::gimmicks::controller_project::{CostumeScope, GimmickOwner};
+    let character = CharacterKey::parse(key);
+    let fighter = character.engine_fighter().to_owned();
+    let sorted = |mut slots: Vec<u8>| {
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    };
+    let scope = if character.is_made() {
+        let costumes = sorted(character.made_slots(roster));
+        if costumes.is_empty() {
+            return None;
+        }
+        CostumeScope {
+            costumes,
+            except_costumes: Vec::new(),
+        }
+    } else {
+        let taken = sorted(
+            made_on(&fighter, roster)
+                .flat_map(crate::mod_project::AuthoredEntry::all_slots)
+                .collect(),
+        );
+        if saved_costumes.is_empty() {
+            CostumeScope {
+                costumes: Vec::new(),
+                except_costumes: taken,
+            }
+        } else {
+            let costumes = sorted(
+                saved_costumes
+                    .iter()
+                    .copied()
+                    .filter(|slot| !taken.contains(slot))
+                    .collect(),
+            );
+            if costumes.is_empty() {
+                return None;
+            }
+            CostumeScope {
+                costumes,
+                except_costumes: Vec::new(),
+            }
+        }
+    };
+    Some(GimmickOwner {
+        key: character.as_str().to_owned(),
+        fighter,
+        scope,
+    })
+}
+
 /// The characters made on `fighter`, in roster order.
 pub fn made_on<'a>(
     fighter: &'a str,
@@ -339,6 +403,35 @@ mod tests {
             base_costumes("mario", &(0..16).collect::<Vec<_>>(), &roster),
             (0..8).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn each_characters_gimmick_runs_on_its_own_costumes() {
+        let roster = roster_with_vision();
+        let vision: Vec<u8> = (8..=15).collect();
+        // A made character's runs on exactly its costumes, whatever it saved.
+        for saved in [Vec::new(), vec![0u8, 1], vision.clone()] {
+            let owner = gimmick_owner("mario#c08", &saved, &roster).unwrap();
+            assert_eq!(owner.fighter, "mario");
+            assert_eq!(owner.key, "mario#c08");
+            assert_eq!(owner.scope.costumes, vision);
+            assert!(owner.scope.except_costumes.is_empty());
+        }
+        // A fighter's own gimmick saved with no limit (before made characters existed) never
+        // runs on a made character's costume.
+        let mario = gimmick_owner("mario", &[], &roster).unwrap();
+        assert!(mario.scope.costumes.is_empty());
+        assert_eq!(mario.scope.except_costumes, vision);
+        // One limited to some costumes keeps those, less the made character's.
+        let limited = gimmick_owner("mario", &[0, 8, 3], &roster).unwrap();
+        assert_eq!(limited.scope.costumes, vec![0, 3]);
+        assert!(limited.scope.except_costumes.is_empty());
+        // Nothing left to run on, or no such character: not sent at all.
+        assert!(gimmick_owner("mario", &[8, 9], &roster).is_none());
+        assert!(gimmick_owner("mario#c20", &[], &roster).is_none());
+        // A fighter with no made characters is unchanged.
+        let luigi = gimmick_owner("luigi", &[], &roster).unwrap();
+        assert_eq!(luigi.scope, Default::default());
     }
 
     #[test]

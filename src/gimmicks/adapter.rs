@@ -89,37 +89,42 @@ pub fn render_with_meters(
     graphs: &BTreeMap<String, BehaviorGraph>,
     meters: &BTreeMap<String, Vec<meter::MeterBinding>>,
 ) -> Result<RenderedAdapter, Vec<AdapterError>> {
-    render_with_controllers_internal(graphs, &BTreeMap::new(), meters)
+    render_with_controllers_internal(
+        graphs,
+        &BTreeMap::new(),
+        meters,
+        &crate::mod_project::RosterMod::default(),
+    )
 }
 
 /// Render static behavior, meters, and complete independent controller charts.
 /// Owners with additional charts are installed as one bounded V5 bundle and
-/// deliberately omit their legacy V4 program registration.
+/// deliberately omit their legacy V4 program registration. `graphs` and `controllers` are keyed
+/// by character (a fighter's name or a made character's key); `roster` says which costumes each
+/// runs on. Meters stay keyed by fighter.
 pub(crate) fn render_with_controllers(
     graphs: &BTreeMap<String, BehaviorGraph>,
     controllers: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
     meters: &BTreeMap<String, Vec<meter::MeterBinding>>,
+    roster: &crate::mod_project::RosterMod,
 ) -> Result<RenderedAdapter, Vec<AdapterError>> {
-    render_with_controllers_internal(graphs, controllers, meters)
+    render_with_controllers_internal(graphs, controllers, meters, roster)
 }
 
 fn render_with_controllers_internal(
     graphs: &BTreeMap<String, BehaviorGraph>,
     controllers: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
     meters: &BTreeMap<String, Vec<meter::MeterBinding>>,
+    roster: &crate::mod_project::RosterMod,
 ) -> Result<RenderedAdapter, Vec<AdapterError>> {
     // Compile and validate the entire charted-owner candidate before the
     // existing renderer starts constructing any legacy artifacts.
-    let compiled_bundle = controller_adapter::compile_bundle(graphs, controllers)?;
+    let compiled_bundle = controller_adapter::compile_bundle(graphs, controllers, roster)?;
     let mut errors = Vec::new();
     let mut programs = Vec::new();
     let mut names = Names::default();
     for (fighter, graph) in graphs {
-        if super::behavior::requires_controller_runtime(graph)
-            || controllers
-                .get(fighter)
-                .is_some_and(|charts| !charts.is_empty())
-        {
+        if controller_adapter::needs_bundle(fighter, graph, controllers, roster) {
             continue;
         }
         if graph.is_empty() {

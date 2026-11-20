@@ -4112,7 +4112,7 @@ mod tests {
         let mut sync = crate::gimmicks::live_sync::LiveSync::default();
         let mut params = BTreeMap::new();
         let graphs = BTreeMap::new();
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         let expected = link.shared.lock().unwrap().gimmick_live_expected.clone();
         params.insert(
             "cloud".into(),
@@ -4130,11 +4130,11 @@ mod tests {
                 )]),
             },
         );
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         assert!(sync.error_for("parameters").is_some());
         assert_eq!(link.shared.lock().unwrap().gimmick_live_expected, expected);
         params.clear();
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         assert!(sync.error_for("parameters").is_none());
         assert!(sync.error.is_empty());
     }
@@ -4465,13 +4465,13 @@ mod tests {
             "mario".into(),
             crate::gimmicks::templates::Preset::Timer.graph(),
         )]);
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         let expected = link.shared.lock().unwrap().gimmick_live_expected.clone();
         assert!(expected.values().all(|revision| *revision > 100));
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         assert_eq!(link.shared.lock().unwrap().gimmick_live_expected, expected);
         graphs.clear();
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         {
             let shared = link.shared.lock().unwrap();
             let message = shared
@@ -4482,7 +4482,7 @@ mod tests {
             assert!(message.contains("disabled_fighters\":[\"mario\"]"));
         }
         sync.enabled = false;
-        sync.update(&params, &graphs, &link);
+        sync.update(&params, &graphs, &Default::default(), &link);
         let shared = link.shared.lock().unwrap();
         let message = shared
             .outbox

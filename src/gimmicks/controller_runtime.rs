@@ -72,13 +72,60 @@ pub struct ControllerStepResult {
     pub engine_actions: Vec<ChartEngineAction>,
 }
 
+/// The one gimmick of a fighter that runs for a fighter in costume `color`, out of every
+/// gimmick installed for that fighter (one per character: the fighter's own and each made
+/// character's). The gimmick naming the costume wins; otherwise the one naming no costumes runs,
+/// unless it excludes this costume. A costume the game did not report (-1) runs none.
+pub fn coordinator_for_costume<C: AsRef<ControllerCoordinator>>(
+    owners: &[C],
+    color: i32,
+) -> Option<&C> {
+    let color = u8::try_from(color).ok()?;
+    let runs = |owner: &C, named: bool| {
+        let coordinator = owner.as_ref();
+        coordinator.costumes().contains(&color) == named
+            && (named || coordinator.costumes().is_empty())
+            && !coordinator.except_costumes().contains(&color)
+    };
+    owners
+        .iter()
+        .find(|owner| runs(owner, true))
+        .or_else(|| owners.iter().find(|owner| runs(owner, false)))
+}
+
+impl AsRef<ControllerCoordinator> for ControllerCoordinator {
+    fn as_ref(&self) -> &ControllerCoordinator {
+        self
+    }
+}
+
 impl ControllerCoordinator {
-    /// False when this costume slot is outside a chart that names its costumes.
-    #[allow(dead_code)] // Called by the plugin only.
-    pub fn runs_for_costume(&self, costume: u8) -> bool {
+    /// The costumes every chart of this coordinator runs on; empty is every costume. One
+    /// coordinator is one character's gimmick, so its charts share one costume choice.
+    pub fn costumes(&self) -> &[u8] {
         self.programs
             .values()
-            .all(|program| program.costumes.is_empty() || program.costumes.contains(&costume))
+            .next()
+            .map_or(&[], |program| program.costumes.as_slice())
+    }
+
+    /// The costumes no chart of this coordinator runs on.
+    pub fn except_costumes(&self) -> &[u8] {
+        self.programs
+            .values()
+            .next()
+            .map_or(&[], |program| program.except_costumes.as_slice())
+    }
+
+    /// True when `state` was made by this coordinator (or carried into it by a reconcile).
+    pub fn holds(&self, state: &ControllerState) -> bool {
+        Arc::ptr_eq(&self.state_token, &state.token)
+    }
+
+    /// True when both run on exactly the same costumes, which is what makes one the other's
+    /// successor when a new snapshot replaces the installed one.
+    pub fn same_costumes(&self, other: &Self) -> bool {
+        self.costumes() == other.costumes() && self.except_costumes() == other.except_costumes()
     }
 
     /// Validate all programs and aggregate budgets before taking ownership of
@@ -795,6 +842,16 @@ fn validate_program_set(programs: &BTreeMap<String, LiveProgram>) -> Result<(), 
         } else {
             fighter = Some(&program.fighter);
         }
+        // One coordinator is one character's gimmick: every chart runs on its costumes.
+        if let Some(first) = programs.values().next() {
+            if (&program.costumes, &program.except_costumes)
+                != (&first.costumes, &first.except_costumes)
+            {
+                return Err(format!(
+                    "chart {chart_id:?} runs on other costumes than the rest of its gimmick"
+                ));
+            }
+        }
         if !ids.insert(program.id.as_str()) {
             return Err(format!(
                 "chart {chart_id:?} duplicates program ID {:?}",
@@ -1044,6 +1101,7 @@ mod tests {
     fn program(id: &str, timer: i32) -> LiveProgram {
         LiveProgram {
             costumes: Vec::new(),
+            except_costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: super::super::live_model::MODEL_VERSION,

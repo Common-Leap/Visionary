@@ -608,6 +608,11 @@ pub struct LiveProgram {
     /// Costume slots this runs on; empty runs on every costume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub costumes: Vec<u8>,
+    /// Costume slots this never runs on: the costumes characters made on this fighter own, when
+    /// this is the fighter's own gimmick. Left out of the wire when empty, so a plugin that
+    /// predates it reads every older snapshot unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub except_costumes: Vec<u8>,
     pub version: u8,
     pub id: String,
     pub fighter: String,
@@ -4560,6 +4565,25 @@ pub fn phase_scalar_valid(action: &Action, value: f32) -> bool {
 mod tests {
     use super::*;
 
+    /// A program from before costume exclusions reads unchanged, one without exclusions writes
+    /// exactly as before (an older plugin refuses unknown fields), and exclusions round-trip.
+    #[test]
+    fn costume_exclusions_are_wire_compatible_both_ways() {
+        let program = timer_program(false);
+        let text = serde_json::to_string(&program).unwrap();
+        assert!(!text.contains("costumes"), "{text}");
+        let old: LiveProgram = serde_json::from_str(&text).unwrap();
+        assert_eq!(old, program);
+        assert!(old.except_costumes.is_empty());
+
+        let mut scoped = program;
+        scoped.except_costumes = vec![8, 9];
+        let text = serde_json::to_string(&scoped).unwrap();
+        assert!(text.contains("\"except_costumes\":[8,9]"), "{text}");
+        assert_eq!(serde_json::from_str::<LiveProgram>(&text).unwrap(), scoped);
+        assert!(scoped.validate().is_ok());
+    }
+
     fn typed_event_program() -> LiveProgram {
         let mut program = timer_program(false);
         let gate = || Predicate::Compare {
@@ -5028,6 +5052,7 @@ mod tests {
         }
         LiveProgram {
             costumes: Vec::new(),
+            except_costumes: Vec::new(),
             custom_statuses: Default::default(),
             status_bindings: Vec::new(),
             version: MODEL_VERSION,

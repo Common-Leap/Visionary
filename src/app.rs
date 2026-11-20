@@ -2779,8 +2779,54 @@ fn project_owner_mod<'a>(
     }
 }
 
+/// A gimmick saved while the game ran one per fighter, limited to exactly a made character's
+/// costumes, was that character's. Move it to the character, unchanged, unless the character
+/// already has one of its own.
+fn claim_saved_gimmicks(roster: &mut crate::roster::window::RosterWindow) {
+    let fighters: Vec<String> = roster
+        .behaviors
+        .keys()
+        .filter(|key| !crate::character::CharacterKey::parse(key).is_made())
+        .cloned()
+        .collect();
+    for fighter in fighters {
+        let costumes = roster.behaviors[&fighter].costumes.clone();
+        let owner = gimmick_owner_of(&fighter, &costumes, &roster.project);
+        if !owner.is_made()
+            || roster.behaviors.contains_key(owner.as_str())
+            || roster.controller_charts.contains_key(owner.as_str())
+        {
+            continue;
+        }
+        lend_gimmick(roster, owner.as_str(), &fighter);
+    }
+}
+
+/// Swap the gimmick kept under character `key` with the one kept under its engine `fighter`, in
+/// every store a character's gimmick is kept in. Calling it twice puts both back. Nothing moves
+/// for a base fighter, whose key is the fighter. Meters and values are the fighter's and stay.
+fn lend_gimmick(roster: &mut crate::roster::window::RosterWindow, key: &str, fighter: &str) {
+    fn swap<T>(store: &mut BTreeMap<String, T>, a: &str, b: &str) {
+        let first = store.remove(a);
+        let second = store.remove(b);
+        if let Some(value) = first {
+            store.insert(b.to_owned(), value);
+        }
+        if let Some(value) = second {
+            store.insert(a.to_owned(), value);
+        }
+    }
+    if key == fighter {
+        return;
+    }
+    swap(&mut roster.behaviors, key, fighter);
+    swap(&mut roster.behavior_layouts, key, fighter);
+    swap(&mut roster.controller_charts, key, fighter);
+}
+
 /// The character a gimmick limited to `costumes` of `fighter` belongs to: the made character
-/// whose costumes they are exactly, else the fighter.
+/// whose costumes they are exactly, else the fighter. Gimmicks saved while the game ran one per
+/// fighter were kept under the fighter; this says which character's each one was.
 fn gimmick_owner_of(
     fighter: &str,
     costumes: &[u8],
@@ -11055,16 +11101,20 @@ impl VisionaryApp {
             ui.weak("Connect a compatible game plugin to see accepted trigger values.");
             return;
         };
+        // The open character's gimmick, and only the players whose costume runs it.
+        let Some(owner) = self.active_key() else {
+            return;
+        };
         let definitions = move_node_live_definitions(
             &self
                 .roster
                 .behaviors
-                .get(&fighter.name)
+                .get(owner.as_str())
                 .cloned()
                 .unwrap_or_default(),
             &self
                 .move_graphs
-                .get(&fighter.name)
+                .get(owner.as_str())
                 .cloned()
                 .unwrap_or_default(),
         );
@@ -11075,6 +11125,12 @@ impl VisionaryApp {
                     .get("chart_id")
                     .and_then(serde_json::Value::as_str)
                     .is_none_or(|id| id == "main")
+                && row
+                    .get("program_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|id| {
+                        crate::gimmicks::controller_project::program_belongs_to(id, owner.as_str())
+                    })
         }) {
             found = true;
             let player = row
@@ -11120,7 +11176,7 @@ impl VisionaryApp {
             ui.weak("Loading move scripts…");
             return;
         }
-        // Graphs belong to the character being edited; behavior and controllers to its fighter.
+        // Graphs, gimmick and controllers all belong to the character being edited.
         let Some(owner) = self.active_key() else {
             return;
         };
@@ -11128,7 +11184,7 @@ impl VisionaryApp {
         let base = self
             .roster
             .behaviors
-            .get(&fighter.name)
+            .get(&owner)
             .cloned()
             .unwrap_or_default();
         // Hitboxes changed in the classic editor show here too, the way export writes them.
@@ -11180,7 +11236,7 @@ impl VisionaryApp {
         let controller_charts = self
             .roster
             .controller_charts
-            .get(&fighter.name)
+            .get(&owner)
             .cloned()
             .unwrap_or_default();
         self.node_editor
@@ -11210,7 +11266,7 @@ impl VisionaryApp {
             &self
                 .roster
                 .behavior_layouts
-                .get(&fighter.name)
+                .get(&owner)
                 .cloned()
                 .unwrap_or_default(),
         );
@@ -11295,13 +11351,9 @@ impl VisionaryApp {
             }
         }
         if let Some((main, charts, layout)) = character {
-            self.roster.behaviors.insert(fighter.name.clone(), main);
-            self.roster
-                .controller_charts
-                .insert(fighter.name.clone(), charts);
-            self.roster
-                .behavior_layouts
-                .insert(fighter.name.clone(), layout);
+            self.roster.behaviors.insert(owner.clone(), main);
+            self.roster.controller_charts.insert(owner.clone(), charts);
+            self.roster.behavior_layouts.insert(owner.clone(), layout);
         }
         let recipes = self.move_graphs.entry(owner).or_default();
         recipes.insert(move_entry.name, graph);
@@ -11323,6 +11375,7 @@ impl VisionaryApp {
             self.gimmicks_editor.sync_live(
                 &self.roster.params,
                 &self.roster.behaviors,
+                &self.roster.project,
                 &self.game_link,
             );
             return;
@@ -11342,12 +11395,9 @@ impl VisionaryApp {
             let mut effective = self.roster.behaviors.clone();
             let mut errors = Vec::new();
             let mut recipe_errors = BTreeMap::new();
+            // Each character's graphs run against its own gimmick: a made character's costumes
+            // run its gimmick in the game, never its fighter's.
             for (fighter, graphs) in &self.move_graphs {
-                // A made character's graphs run against its fighter's behavior; they add no
-                // behavior of their own, and the export checks them against that behavior.
-                if crate::character::CharacterKey::parse(fighter).is_made() {
-                    continue;
-                }
                 let base = self
                     .roster
                     .behaviors
@@ -11360,8 +11410,12 @@ impl VisionaryApp {
                     .get(fighter)
                     .cloned()
                     .unwrap_or_default();
+                let engine = crate::character::CharacterKey::parse(fighter);
                 match crate::move_nodes::project::compile_recipes_with_controllers(
-                    fighter, &base, &charts, graphs,
+                    engine.engine_fighter(),
+                    &base,
+                    &charts,
+                    graphs,
                 ) {
                     Ok(compiled) => {
                         effective.insert(fighter.clone(), compiled.behavior);
@@ -11390,6 +11444,7 @@ impl VisionaryApp {
                 &self.roster.params,
                 effective,
                 &self.roster.controller_charts,
+                &self.roster.project,
                 &self.game_link,
             );
         }
@@ -11460,32 +11515,16 @@ impl VisionaryApp {
             } else {
                 Vec::new()
             };
-            // The game runs one gimmick per fighter: a fighter and the characters made on it
-            // cannot each have their own.
-            if let Some(owner) = self
-                .gimmick_owner(&context.fighter)
-                .filter(|owner| *owner != picked)
-            {
-                let owner_name = self.character_name(&owner);
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{owner_name} has a gimmick, and the game runs one gimmick per fighter. {} can't have its own while {owner_name}'s exists.",
-                        self.character_name(&picked)
-                    ))
-                    .color(ui.visuals().warn_fg_color),
-                );
-                if ui.button(format!("Open {owner_name}")).clicked() {
-                    self.select_character(owner);
-                }
-                return;
-            }
             // A fighter with characters made on it keeps its gimmick to its own costumes.
             let mut context = context;
             if context.character.is_none() {
                 context.costume_slots = base_slots;
             }
             let roots = self.roster.gimmick_roots(self.state.data_root.as_ref());
+            // Each character has its own gimmick. The editor works on the fighter's place in the
+            // gimmick stores, so a made character's is lent to that place while the page is
+            // drawn and put back after; the fighter's own stays untouched meanwhile.
+            lend_gimmick(&mut self.roster, picked.as_str(), &context.fighter);
             self.gimmicks_editor.ui(
                 ui,
                 &context,
@@ -11498,9 +11537,10 @@ impl VisionaryApp {
                     controller_charts: &mut self.roster.controller_charts,
                     meters: &mut self.roster.meters,
                     link: &self.game_link,
-                    recipes: self.move_graphs.get(&context.fighter),
+                    recipes: self.move_graphs.get(picked.as_str()),
                 },
             );
+            lend_gimmick(&mut self.roster, picked.as_str(), &context.fighter);
             if std::mem::take(&mut self.gimmicks_editor.open_workspace) {
                 self.primary_tab = PrimaryEditorTab::Nodes;
                 self.node_workspace = true;
@@ -17777,19 +17817,19 @@ impl VisionaryApp {
             counts.textures =
                 eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len();
         }
-        let fighter = key.engine_fighter();
-        if self.gimmick_owner(fighter).as_ref() == Some(key) {
-            counts.gimmicks = usize::from(
-                self.roster
-                    .behaviors
-                    .get(fighter)
-                    .is_some_and(|graph| !graph.is_empty()),
-            ) + self
-                .roster
-                .controller_charts
-                .get(fighter)
-                .map_or(0, BTreeMap::len);
-            counts.meters = self.roster.meters.get(fighter).map_or(0, |meters| {
+        // Each character's gimmick is its own; meters, like values, are the fighter's.
+        counts.gimmicks = usize::from(
+            self.roster
+                .behaviors
+                .get(key.as_str())
+                .is_some_and(|graph| !graph.is_empty()),
+        ) + self
+            .roster
+            .controller_charts
+            .get(key.as_str())
+            .map_or(0, BTreeMap::len);
+        if !key.is_made() {
+            counts.meters = self.roster.meters.get(key.as_str()).map_or(0, |meters| {
                 meters.iter().filter(|meter| meter.enabled).count()
             });
         }
@@ -17938,47 +17978,11 @@ impl VisionaryApp {
             .is_some_and(|game| crate::mod_export::record_matches_game(&game, move_name, record))
     }
 
-    /// Who the gimmick kept for `fighter` belongs to: the made character whose costumes it is
-    /// limited to exactly, else the fighter itself. `None` when the fighter has none. The game
-    /// runs one gimmick per fighter, so a fighter and its made characters cannot each have one.
-    pub(crate) fn gimmick_owner(&self, fighter: &str) -> Option<crate::character::CharacterKey> {
-        let fighter = fighter.to_ascii_lowercase();
-        let graph = self
-            .roster
-            .behaviors
-            .get(&fighter)
-            .filter(|graph| !graph.is_empty());
-        let exists = graph.is_some()
-            || self
-                .roster
-                .controller_charts
-                .get(&fighter)
-                .is_some_and(|charts| !charts.is_empty())
-            || self
-                .roster
-                .meters
-                .get(&fighter)
-                .is_some_and(|meters| !meters.is_empty());
-        if !exists {
-            return None;
-        }
-        let costumes = graph
-            .map(|graph| graph.costumes.clone())
-            .unwrap_or_default();
-        Some(gimmick_owner_of(&fighter, &costumes, &self.roster.project))
-    }
-
     /// Drop every edit `key` owns: moves, node graphs, sounds, expressions, effect calls, its
-    /// source snapshots, live rules and undo history, and a gimmick limited to its costumes.
+    /// source snapshots, live rules and undo history, and its gimmick.
     /// A base fighter's key drops only that fighter's own edits.
+    /// The character may already be gone from the project.
     pub(crate) fn remove_character_edits(&mut self, key: &crate::character::CharacterKey) {
-        let slots = key.made_slots(&self.roster.project);
-        self.remove_character_edits_on(key, &slots);
-    }
-
-    /// [`Self::remove_character_edits`] for a character whose costumes are `slots` (it may
-    /// already be gone from the project).
-    fn remove_character_edits_on(&mut self, key: &crate::character::CharacterKey, slots: &[u8]) {
         let mine = |store_key: &str| {
             crate::character::split_move_key(store_key)
                 .is_some_and(|(owner, _)| owner == key.as_str())
@@ -18010,18 +18014,9 @@ impl VisionaryApp {
         self.effect_rules_store.retain(|k, _| !mine(k));
         self.effect_control_rules_store.retain(|k, _| !mine(k));
         if key.is_made() {
-            let fighter = key.engine_fighter().to_owned();
-            let owned_gimmick = self
-                .roster
-                .behaviors
-                .get(&fighter)
-                .is_some_and(|graph| !slots.is_empty() && graph.costumes == slots);
-            if owned_gimmick {
-                self.roster.behaviors.remove(&fighter);
-                self.roster.behavior_layouts.remove(&fighter);
-                self.roster.controller_charts.remove(&fighter);
-                self.roster.meters.remove(&fighter);
-            }
+            self.roster.behaviors.remove(key.as_str());
+            self.roster.behavior_layouts.remove(key.as_str());
+            self.roster.controller_charts.remove(key.as_str());
         }
         self.node_editor.invalidate();
         self.node_live_cache = None;
@@ -18078,6 +18073,25 @@ impl VisionaryApp {
                 target.entry(move_name).or_insert(graph);
             }
         }
+        // The donor's gimmick, run on the character's own costumes from now on.
+        if !self.roster.behaviors.contains_key(key.as_str())
+            && !self.roster.controller_charts.contains_key(key.as_str())
+        {
+            if let Some(mut graph) = self.roster.behaviors.get(&donor).cloned() {
+                graph.costumes = key.made_slots(&self.roster.project);
+                self.roster.behaviors.insert(key.as_str().to_owned(), graph);
+            }
+            if let Some(layout) = self.roster.behavior_layouts.get(&donor).cloned() {
+                self.roster
+                    .behavior_layouts
+                    .insert(key.as_str().to_owned(), layout);
+            }
+            if let Some(charts) = self.roster.controller_charts.get(&donor).cloned() {
+                self.roster
+                    .controller_charts
+                    .insert(key.as_str().to_owned(), charts);
+            }
+        }
         // The donor's effect edits, onto the character's own effect file. Effects borrowed for
         // some of the donor's costumes are not part of the donor as a whole.
         if let Some(mut eff) = self.eff_mods.get(&donor).cloned() {
@@ -18126,9 +18140,9 @@ impl VisionaryApp {
             let key = crate::character::CharacterKey::made(added.clone());
             self.fork_donor_edits(&key);
         }
-        for (removed, slots) in before.iter().filter(|(key, _)| !now.contains_key(*key)) {
+        for removed in before.keys().filter(|key| !now.contains_key(*key)) {
             let key = crate::character::CharacterKey::made(removed.clone());
-            self.remove_character_edits_on(&key, slots);
+            self.remove_character_edits(&key);
         }
     }
 
@@ -19695,31 +19709,26 @@ impl VisionaryApp {
                 project.fighters.entry(fighter.clone()).or_default().params = params.clone();
             }
         }
-        for (fighter, behavior) in &self.roster.behaviors {
+        // Gimmicks are kept per character: a made character's in its own store.
+        for (owner, behavior) in &self.roster.behaviors {
             if !behavior.is_unset() {
-                project
-                    .fighters
-                    .entry(fighter.clone())
-                    .or_default()
-                    .behavior = behavior.clone();
+                if let Some(fm) = project_owner_mod(&mut project, &roster, owner) {
+                    fm.behavior = behavior.clone();
+                }
             }
         }
-        for (fighter, layout) in &self.roster.behavior_layouts {
+        for (owner, layout) in &self.roster.behavior_layouts {
             if !layout.is_empty() {
-                project
-                    .fighters
-                    .entry(fighter.clone())
-                    .or_default()
-                    .behavior_layout = layout.clone();
+                if let Some(fm) = project_owner_mod(&mut project, &roster, owner) {
+                    fm.behavior_layout = layout.clone();
+                }
             }
         }
-        for (fighter, charts) in &self.roster.controller_charts {
+        for (owner, charts) in &self.roster.controller_charts {
             if !charts.is_empty() {
-                project
-                    .fighters
-                    .entry(fighter.clone())
-                    .or_default()
-                    .controller_charts = charts.clone();
+                if let Some(fm) = project_owner_mod(&mut project, &roster, owner) {
+                    fm.controller_charts = charts.clone();
+                }
             }
         }
         for (fighter, meters) in &self.roster.meters {
@@ -21063,6 +21072,7 @@ impl VisionaryApp {
                     &self.roster.params,
                     &self.roster.behaviors,
                     &self.roster.controller_charts,
+                    &self.roster.project,
                 )
                 .map_err(anyhow::Error::msg)?,
         );
@@ -21096,7 +21106,7 @@ impl VisionaryApp {
         // Export source code writes the same plugin source Export mod builds.
         let mut source_runtime = None;
         {
-            let has_gimmicks = project.fighters.values().any(|fighter| {
+            let has_gimmicks = project.all_move_edits().any(|fighter| {
                 !fighter.behavior.is_empty()
                     || !fighter.controller_charts.is_empty()
                     || fighter.meters.iter().any(|binding| binding.enabled)
@@ -21580,11 +21590,9 @@ impl VisionaryApp {
                     .map(|(key, fm)| (key.as_str().to_owned(), fm.move_graphs.clone())),
             )
             .collect();
-        let stored_behaviors = project
-            .fighters
-            .iter()
+        let stored_behaviors: BTreeMap<String, _> = crate::mod_export::gimmick_owners(&project)
             .filter(|(_, fm)| !fm.behavior.is_unset())
-            .map(|(fighter, fm)| (fighter.clone(), fm.behavior.clone()))
+            .map(|(owner, fm)| (owner, fm.behavior.clone()))
             .collect();
         project = match crate::move_nodes::project::expand(&project) {
             Ok(project) => project,
@@ -21648,18 +21656,15 @@ impl VisionaryApp {
             .map(|(fighter, fm)| (fighter.clone(), fm.params.clone()))
             .collect();
         self.roster.behaviors = stored_behaviors;
-        self.roster.behavior_layouts = project
-            .fighters
-            .iter()
-            .filter(|(_, fighter)| !fighter.behavior_layout.is_empty())
-            .map(|(fighter, data)| (fighter.clone(), data.behavior_layout.clone()))
+        self.roster.behavior_layouts = crate::mod_export::gimmick_owners(&project)
+            .filter(|(_, data)| !data.behavior_layout.is_empty())
+            .map(|(owner, data)| (owner, data.behavior_layout.clone()))
             .collect();
-        self.roster.controller_charts = project
-            .fighters
-            .iter()
-            .filter(|(_, fighter)| !fighter.controller_charts.is_empty())
-            .map(|(fighter, data)| (fighter.clone(), data.controller_charts.clone()))
+        self.roster.controller_charts = crate::mod_export::gimmick_owners(&project)
+            .filter(|(_, data)| !data.controller_charts.is_empty())
+            .map(|(owner, data)| (owner, data.controller_charts.clone()))
             .collect();
+        claim_saved_gimmicks(&mut self.roster);
         self.roster.meters = project
             .fighters
             .iter()
@@ -47879,7 +47884,9 @@ mod move_key_guard_tests {
 
 #[cfg(test)]
 mod character_store_tests {
-    use super::{gimmick_owner_of, project_owner_mod, rule_move_key};
+    use super::{
+        claim_saved_gimmicks, gimmick_owner_of, lend_gimmick, project_owner_mod, rule_move_key,
+    };
 
     fn roster_with_vision() -> crate::mod_project::RosterMod {
         let mut roster = crate::mod_project::RosterMod::default();
@@ -47896,8 +47903,8 @@ mod character_store_tests {
         roster
     }
 
-    /// The game runs one gimmick per fighter. It is a made character's only when limited to
-    /// exactly that character's costumes; any other belongs to the fighter.
+    /// A gimmick saved while the game ran one per fighter was a made character's only when
+    /// limited to exactly that character's costumes; any other belongs to the fighter.
     #[test]
     fn a_gimmick_belongs_to_the_character_whose_costumes_it_runs_on() {
         let roster = roster_with_vision();
@@ -47917,6 +47924,106 @@ mod character_store_tests {
         assert_eq!(
             gimmick_owner_of("luigi", &vision, &roster).as_str(),
             "luigi"
+        );
+    }
+
+    fn roster_window() -> crate::roster::window::RosterWindow {
+        let mut window = crate::roster::window::RosterWindow::default();
+        window.project = roster_with_vision();
+        window
+    }
+
+    fn graph_on(costumes: Vec<u8>) -> crate::gimmicks::behavior::BehaviorGraph {
+        crate::gimmicks::behavior::BehaviorGraph {
+            costumes,
+            ..crate::gimmicks::templates::Preset::Timer.graph()
+        }
+    }
+
+    /// The Gimmicks page edits Vision's gimmick in Mario's place and puts both back after.
+    #[test]
+    fn lending_a_made_characters_gimmick_swaps_and_restores_both() {
+        let mut window = roster_window();
+        let mario = graph_on(Vec::new());
+        let vision = crate::gimmicks::behavior::BehaviorGraph {
+            costumes: (8..=15).collect(),
+            ..crate::gimmicks::templates::Preset::Charge.graph()
+        };
+        window.behaviors.insert("mario".into(), mario.clone());
+        window.behaviors.insert("mario#c08".into(), vision.clone());
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert_eq!(window.behaviors["mario"], vision);
+        assert_eq!(window.behaviors["mario#c08"], mario);
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert_eq!(window.behaviors["mario"], mario);
+        assert_eq!(window.behaviors["mario#c08"], vision);
+        // A character with no gimmick yet leaves the fighter's place empty while lent.
+        window.behaviors.remove("mario#c08");
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert!(!window.behaviors.contains_key("mario"));
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert_eq!(window.behaviors["mario"], mario);
+        assert!(!window.behaviors.contains_key("mario#c08"));
+        // A base fighter's is already in place.
+        lend_gimmick(&mut window, "mario", "mario");
+        assert_eq!(window.behaviors["mario"], mario);
+    }
+
+    /// A gimmick saved under Mario but limited to exactly Vision's costumes was Vision's; it
+    /// moves to Vision unchanged. Mario's own, with no limit, stays Mario's, its saved costumes
+    /// untouched (made costumes are left out when it is sent, not in the file).
+    #[test]
+    fn an_old_save_gives_a_made_characters_gimmick_back_to_it() {
+        let mut window = roster_window();
+        let visions = graph_on((8..=15).collect());
+        window.behaviors.insert("mario".into(), visions.clone());
+        claim_saved_gimmicks(&mut window);
+        assert_eq!(window.behaviors.get("mario#c08"), Some(&visions));
+        assert!(!window.behaviors.contains_key("mario"));
+
+        let mut window = roster_window();
+        window
+            .behaviors
+            .insert("mario".into(), graph_on(Vec::new()));
+        claim_saved_gimmicks(&mut window);
+        assert_eq!(window.behaviors["mario"], graph_on(Vec::new()));
+        assert!(!window.behaviors.contains_key("mario#c08"));
+
+        // Vision's own gimmick is never overwritten by an old one.
+        let mut window = roster_window();
+        let own = crate::gimmicks::behavior::BehaviorGraph {
+            costumes: (8..=15).collect(),
+            ..crate::gimmicks::templates::Preset::Charge.graph()
+        };
+        window.behaviors.insert("mario".into(), visions.clone());
+        window.behaviors.insert("mario#c08".into(), own.clone());
+        claim_saved_gimmicks(&mut window);
+        assert_eq!(window.behaviors["mario#c08"], own);
+        assert_eq!(window.behaviors["mario"], visions);
+    }
+
+    /// Saved per character: Vision's gimmick goes in its own store, Mario's under Mario.
+    #[test]
+    fn each_characters_gimmick_is_saved_in_its_own_store() {
+        let roster = roster_with_vision();
+        let mut project = crate::mod_project::ModProjectFile::default();
+        project_owner_mod(&mut project, &roster, "mario#c08")
+            .unwrap()
+            .behavior = graph_on((8..=15).collect());
+        project_owner_mod(&mut project, &roster, "mario")
+            .unwrap()
+            .behavior = graph_on(Vec::new());
+        let text = serde_json::to_string(&project).unwrap();
+        let back: crate::mod_project::ModProjectFile = serde_json::from_str(&text).unwrap();
+        let owners: Vec<(String, Vec<u8>)> = crate::mod_export::gimmick_owners(&back)
+            .map(|(key, edits)| (key, edits.behavior.costumes.clone()))
+            .collect();
+        assert_eq!(
+            owners,
+            [
+                ("mario".to_string(), Vec::new()),
+                ("mario#c08".to_string(), (8..=15).collect())
+            ]
         );
     }
 

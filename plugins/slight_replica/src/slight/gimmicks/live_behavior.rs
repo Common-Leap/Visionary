@@ -102,9 +102,11 @@ struct Runtime {
     custom_statuses: BTreeMap<(String, String), u8>,
     pending_status_update: Option<(u64, String, BTreeSet<String>)>,
     disabled_fighters: BTreeSet<String>,
-    controllers: BTreeMap<String, Arc<super::controller_runtime::ControllerCoordinator>>,
+    /// Per fighter, one coordinator per character: the fighter's own gimmick and one for each
+    /// character made on it, each on its own costumes. An actor's costume picks one.
+    controllers: BTreeMap<String, controllers::Owners>,
     controller_objects: BTreeMap<u32, controllers::ObjectState>,
-    compiled_controllers: BTreeMap<String, Arc<super::controller_runtime::ControllerCoordinator>>,
+    compiled_controllers: BTreeMap<String, controllers::Owners>,
     compiled_controller_objects: BTreeMap<u32, controllers::ObjectState>,
 }
 
@@ -167,15 +169,15 @@ fn refresh_cloud_resource_demand(runtime: &Runtime) {
             .chart_ids()
             .any(|id| coordinator.program(id).is_some_and(uses))
     };
-    let needed = if let Some(coordinator) = runtime.controllers.get("cloud") {
-        coordinator_uses(coordinator)
+    let needed = if let Some(owners) = runtime.controllers.get("cloud") {
+        owners.iter().any(|coordinator| coordinator_uses(coordinator))
     } else if runtime.disabled_fighters.contains("cloud") {
         false
     } else {
         runtime
             .compiled_controllers
             .get("cloud")
-            .is_some_and(|coordinator| coordinator_uses(coordinator))
+            .is_some_and(|owners| owners.iter().any(|coordinator| coordinator_uses(coordinator)))
     };
     CLOUD_ACTIVE_ACTIONS.store(needed, std::sync::atomic::Ordering::Release);
 }
@@ -581,18 +583,22 @@ pub(super) fn register_damage_routes() {
     let needed = runtime
         .controllers
         .values()
+        .flatten()
         .any(|coordinator| coordinator_uses_damage(coordinator))
         || runtime
             .compiled_controllers
             .iter()
-            .any(|(fighter, coordinator)| {
+            .any(|(fighter, owners)| {
                 !runtime.controllers.contains_key(fighter)
                     && !runtime.disabled_fighters.contains(fighter)
-                    && coordinator_uses_damage(coordinator)
+                    && owners
+                        .iter()
+                        .any(|coordinator| coordinator_uses_damage(coordinator))
             });
     let incoming = runtime
         .controllers
         .values()
+        .flatten()
         .chain(
             runtime
                 .compiled_controllers
@@ -601,7 +607,7 @@ pub(super) fn register_damage_routes() {
                     !runtime.controllers.contains_key(*fighter)
                         && !runtime.disabled_fighters.contains(*fighter)
                 })
-                .map(|(_, coordinator)| coordinator),
+                .flat_map(|(_, owners)| owners),
         )
         .chain(
             runtime

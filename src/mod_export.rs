@@ -229,17 +229,14 @@ pub fn plan_normal_export(
         .unwrap_or_default();
     let has_acmd_source = ordinary_source.is_some();
 
-    let graphs = project
-        .fighters
-        .iter()
-        .map(|(fighter, edits)| (fighter.clone(), edits.behavior.clone()))
+    // Gimmicks are kept per character: a made character's runs on its own costumes beside its
+    // fighter's, which never runs on the made character's costumes.
+    let graphs = gimmick_owners(project)
+        .map(|(key, edits)| (key, edits.behavior.clone()))
         .collect();
-    let controllers = project
-        .fighters
-        .iter()
-        .filter_map(|(fighter, edits)| {
-            (!edits.controller_charts.is_empty())
-                .then_some((fighter.clone(), edits.controller_charts.clone()))
+    let controllers = gimmick_owners(project)
+        .filter_map(|(key, edits)| {
+            (!edits.controller_charts.is_empty()).then_some((key, edits.controller_charts.clone()))
         })
         .collect();
     let meters = project
@@ -249,19 +246,22 @@ pub fn plan_normal_export(
             (!edits.meters.is_empty()).then_some((fighter.clone(), edits.meters.clone()))
         })
         .collect();
-    let artifact =
-        crate::gimmicks::adapter::render_with_controllers(&graphs, &controllers, &meters).map_err(
-            |errors| {
-                anyhow::anyhow!(
-                    "gimmick runtime was not rendered:\n{}",
-                    errors
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-            },
-        )?;
+    let artifact = crate::gimmicks::adapter::render_with_controllers(
+        &graphs,
+        &controllers,
+        &meters,
+        &project.roster,
+    )
+    .map_err(|errors| {
+        anyhow::anyhow!(
+            "gimmick runtime was not rendered:\n{}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
     let acmd = crate::gimmicks::acmd_adapter::render(
         ordinary_source.as_ref().map(|source| &source.project),
     )
@@ -469,9 +469,23 @@ fn source_project_for_selected_runtime(
 /// represented in the selected runtime. Silently exporting only the legacy
 /// main graph would otherwise discard authored chart behavior from the mod.
 /// Project-file save and validation deliberately do not use this guard.
-pub fn refuse_uninstalled_controller_charts(project: &ModProjectFile) -> Result<()> {
-    let mut charts = project
+/// Every character's gimmick store, by character key: each fighter's, then each made character's.
+pub fn gimmick_owners(project: &ModProjectFile) -> impl Iterator<Item = (String, &FighterMod)> {
+    project
         .fighters
+        .iter()
+        .map(|(fighter, edits)| (fighter.clone(), edits))
+        .chain(
+            project
+                .characters
+                .iter()
+                .map(|(key, edits)| (key.as_str().to_owned(), edits)),
+        )
+}
+
+pub fn refuse_uninstalled_controller_charts(project: &ModProjectFile) -> Result<()> {
+    let owners = gimmick_owners(project).collect::<Vec<_>>();
+    let mut charts = owners
         .iter()
         .flat_map(|(fighter, edits)| {
             edits
@@ -508,9 +522,7 @@ fn node_errors(errors: Vec<crate::move_nodes::model::NodeError>) -> anyhow::Erro
 /// List all behavior/meter declarations that would require the static gimmick
 /// runtime, in deterministic order for diagnostics and tests.
 fn active_gimmicks(project: &ModProjectFile) -> Vec<String> {
-    let mut active = project
-        .fighters
-        .iter()
+    let mut active = gimmick_owners(project)
         .filter_map(|(fighter, edits)| {
             let behavior = !edits.behavior.is_empty();
             let meters = edits.meters.iter().any(|binding| binding.enabled);

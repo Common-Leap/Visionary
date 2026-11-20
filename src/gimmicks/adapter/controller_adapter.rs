@@ -21,26 +21,47 @@ pub(super) struct ControllerOwner {
     pub has_main: bool,
 }
 
+/// True when the gimmick kept under `key` is installed through the controller bundle rather than
+/// as a legacy static program: it needs the controller runtime, has more charts, or runs on only
+/// some costumes (a legacy program runs on every costume of its fighter, so a made character's
+/// gimmick, and a fighter's own when it has made characters, can only run as a bundle owner).
+pub(super) fn needs_bundle(
+    key: &str,
+    graph: &BehaviorGraph,
+    controllers: &BTreeMap<String, BTreeMap<String, ControllerChart>>,
+    roster: &crate::mod_project::RosterMod,
+) -> bool {
+    super::super::behavior::requires_controller_runtime(graph)
+        || controllers
+            .get(key)
+            .is_some_and(|charts| !charts.is_empty())
+        || crate::character::gimmick_owner(key, &graph.costumes, roster)
+            .is_none_or(|owner| owner.key != owner.fighter || owner.scope != Default::default())
+}
+
 /// Compile every chart owner only after preflighting the entire candidate.
 /// The shared protocol codec supplies ordering, semantic checks and byte caps.
 pub(super) fn compile_bundle(
     graphs: &BTreeMap<String, BehaviorGraph>,
     controllers: &BTreeMap<String, BTreeMap<String, ControllerChart>>,
+    roster: &crate::mod_project::RosterMod,
 ) -> Result<Option<CompiledBundle>, Vec<AdapterError>> {
     let empty_charts = BTreeMap::new();
     let mut all_controllers: BTreeMap<_, _> = controllers.iter().collect();
     for (fighter, graph) in graphs {
-        if super::super::behavior::requires_controller_runtime(graph) {
+        if !graph.is_empty() && needs_bundle(fighter, graph, controllers, roster) {
             all_controllers.entry(fighter).or_insert(&empty_charts);
         }
     }
+    let empty = BehaviorGraph::default();
     let chart_owners = all_controllers
         .into_iter()
         .filter(|(fighter, charts)| {
-            !charts.is_empty()
-                || graphs
-                    .get(*fighter)
-                    .is_some_and(super::super::behavior::requires_controller_runtime)
+            let main = graphs.get(*fighter).unwrap_or(&empty);
+            // A gimmick that runs on no costume is left out, like the live preview leaves it.
+            (!charts.is_empty()
+                || (!main.is_empty() && needs_bundle(fighter, main, controllers, roster)))
+                && crate::character::gimmick_owner(fighter, &main.costumes, roster).is_some()
         })
         .take(controller_protocol::MAX_FIGHTER_OWNERS + 1)
         .collect::<Vec<_>>();
@@ -75,7 +96,6 @@ pub(super) fn compile_bundle(
         )]);
     }
 
-    let empty = BehaviorGraph::default();
     for (fighter, charts) in &chart_owners {
         if fighter.len() > super::super::live_model::MAX_FIGHTER_BYTES
             || fighter.trim().is_empty()
@@ -97,11 +117,15 @@ pub(super) fn compile_bundle(
     }
 
     let mut records = Vec::new();
-    let mut owners = Vec::with_capacity(chart_owners.len());
-    for (fighter, charts) in chart_owners {
-        let main = graphs.get(fighter).unwrap_or(&empty);
-        let compiled = controller_project::compile(fighter, main, charts)
-            .map_err(|reason| vec![error(&format!("fighter {fighter}"), reason)])?;
+    // One dispatch arm per engine fighter: the runtime picks the character's gimmick by costume.
+    let mut owners: Vec<ControllerOwner> = Vec::with_capacity(chart_owners.len());
+    for (key, charts) in chart_owners {
+        let main = graphs.get(key).unwrap_or(&empty);
+        let owner = crate::character::gimmick_owner(key, &main.costumes, roster)
+            .expect("owners that run on no costume were left out above");
+        let fighter = &owner.fighter;
+        let compiled = controller_project::compile_owner(&owner, main, charts)
+            .map_err(|reason| vec![error(&format!("fighter {key}"), reason)])?;
         records.extend(compiled);
         let Some(kind) = registry::FIGHTER_KINDS
             .iter()
@@ -112,11 +136,14 @@ pub(super) fn compile_bundle(
                 "no exact pinned fighter-kind mapping exists".to_string(),
             )]);
         };
-        owners.push(ControllerOwner {
-            fighter: fighter.clone(),
-            kind_symbol: kind.symbol.to_string(),
-            has_main: !main.is_empty(),
-        });
+        match owners.iter_mut().find(|known| known.fighter == *fighter) {
+            Some(known) => known.has_main |= !main.is_empty(),
+            None => owners.push(ControllerOwner {
+                fighter: fighter.clone(),
+                kind_symbol: kind.symbol.to_string(),
+                has_main: !main.is_empty(),
+            }),
+        }
     }
     let request = controller_protocol::ControllerBundleRequest {
         version: controller_protocol::REQUEST_VERSION,
@@ -187,6 +214,79 @@ mod tests {
         }
     }
 
+    /// An exported mod carries Mario's gimmick and Vision's (Mario costumes c08-c15) as two
+    /// bundle owners on disjoint costumes, with one dispatch arm for the fighter. A gimmick limited
+    /// to some costumes can never be a legacy program, which runs on every costume.
+    #[test]
+    fn export_carries_each_characters_gimmick_on_disjoint_costumes() {
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: (9..=15).collect(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let graphs = BTreeMap::from([
+            ("mario".to_string(), Preset::KoTally.graph()),
+            ("mario#c08".to_string(), Preset::Charge.graph()),
+        ]);
+        let rendered = super::super::render_with_controllers(
+            &graphs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &roster,
+        )
+        .unwrap();
+        let bundle = compile_bundle(&graphs, &BTreeMap::new(), &roster)
+            .unwrap()
+            .expect("both gimmicks go in the bundle");
+        let request = controller_protocol::decode_request(&bundle.encoded).unwrap();
+        let mut scopes: Vec<(&str, &[u8], &[u8])> = request
+            .charts
+            .iter()
+            .map(|chart| {
+                (
+                    chart.program.id.as_str(),
+                    chart.program.costumes.as_slice(),
+                    chart.program.except_costumes.as_slice(),
+                )
+            })
+            .collect();
+        scopes.sort();
+        let vision: Vec<u8> = (8..=15).collect();
+        assert_eq!(
+            scopes,
+            [
+                ("live:mario", &[][..], vision.as_slice()),
+                ("live:mario#c08", vision.as_slice(), &[][..]),
+            ]
+        );
+        assert_eq!(bundle.owners.len(), 1);
+        assert_eq!(bundle.owners[0].fighter, "mario");
+        assert_eq!(rendered.fighters, ["mario"]);
+        // No legacy program for either: both run through the bundle.
+        assert_eq!(
+            rendered
+                .source
+                .matches("dispatch_named(boid, \"mario\"")
+                .count(),
+            1
+        );
+
+        // The paired control: without Vision in the project, Mario's KO tally stays a legacy
+        // program, as before.
+        let only_mario = BTreeMap::from([("mario".to_string(), Preset::KoTally.graph())]);
+        assert!(
+            compile_bundle(&only_mario, &BTreeMap::new(), &Default::default())
+                .unwrap()
+                .is_none()
+        );
+    }
+
     fn chart_sets(pairs: &[(&str, &str)]) -> BTreeMap<String, BTreeMap<String, ControllerChart>> {
         pairs
             .iter()
@@ -202,9 +302,13 @@ mod tests {
     fn no_extra_chart_entry_matches_existing_meter_renderer() {
         let graphs = BTreeMap::from([("mario".to_string(), Preset::Timer.graph())]);
         let legacy = super::super::render_with_meters(&graphs, &BTreeMap::new()).unwrap();
-        let extended =
-            super::super::render_with_controllers(&graphs, &BTreeMap::new(), &BTreeMap::new())
-                .unwrap();
+        let extended = super::super::render_with_controllers(
+            &graphs,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(extended, legacy);
         assert!(!extended.source.contains("STATIC_CONTROLLER_BUNDLE"));
     }
@@ -213,8 +317,13 @@ mod tests {
     fn charted_owner_has_one_bundle_and_no_legacy_program_or_registration() {
         let graphs = BTreeMap::from([("mario".to_string(), Preset::Timer.graph())]);
         let controllers = chart_sets(&[("mario", "charge")]);
-        let artifact =
-            super::super::render_with_controllers(&graphs, &controllers, &BTreeMap::new()).unwrap();
+        let artifact = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &BTreeMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(artifact
             .source
             .contains("visionary.gimmicks.static-controller-bundle.v1"));
@@ -228,7 +337,9 @@ mod tests {
             .contains("dispatch_named(boid, \"mario\", name)"));
         let parsed = syn::parse_file(&artifact.source).unwrap();
         assert!(!parsed.items.is_empty());
-        let bundle = compile_bundle(&graphs, &controllers).unwrap().unwrap();
+        let bundle = compile_bundle(&graphs, &controllers, &Default::default())
+            .unwrap()
+            .unwrap();
         let decoded = controller_protocol::decode_request(&bundle.encoded).unwrap();
         assert_eq!(decoded.revision, 0);
         assert_eq!(
@@ -245,9 +356,16 @@ mod tests {
     fn chart_only_owner_routes_main_exactly_and_never_falls_through() {
         let graphs = BTreeMap::new();
         let controllers = chart_sets(&[("mario", "charge")]);
-        let artifact =
-            super::super::render_with_controllers(&graphs, &controllers, &BTreeMap::new()).unwrap();
-        let bundle = compile_bundle(&graphs, &controllers).unwrap().unwrap();
+        let artifact = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &BTreeMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
+        let bundle = compile_bundle(&graphs, &controllers, &Default::default())
+            .unwrap()
+            .unwrap();
         let decoded = controller_protocol::decode_request(&bundle.encoded).unwrap();
         assert_eq!(decoded.charts.len(), 1);
         assert_eq!(decoded.charts[0].chart_id, "charge");
@@ -278,8 +396,13 @@ mod tests {
                 },
             }],
         )]);
-        let artifact =
-            super::super::render_with_controllers(&graphs, &controllers, &meters).unwrap();
+        let artifact = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &meters,
+            &Default::default(),
+        )
+        .unwrap();
         assert!(artifact.source.contains("GIMMICK_CLOUD_PROGRAM"));
         assert!(artifact.source.contains("GIMMICK_CLOUD_REGISTRATIONS"));
         assert!(!artifact.source.contains("GIMMICK_MARIO_PROGRAM"));
@@ -295,12 +418,24 @@ mod tests {
             ("mario".to_string(), Preset::Timer.graph()),
         ]);
         let controllers = chart_sets(&[("mario", "zeta"), ("mario", "alpha"), ("cloud", "extra")]);
-        let first =
-            super::super::render_with_controllers(&graphs, &controllers, &BTreeMap::new()).unwrap();
-        let second =
-            super::super::render_with_controllers(&graphs, &controllers, &BTreeMap::new()).unwrap();
+        let first = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &BTreeMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
+        let second = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &BTreeMap::new(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(first, second);
-        let bundle = compile_bundle(&graphs, &controllers).unwrap().unwrap();
+        let bundle = compile_bundle(&graphs, &controllers, &Default::default())
+            .unwrap()
+            .unwrap();
         let decoded = controller_protocol::decode_request(&bundle.encoded).unwrap();
         let order = decoded
             .charts
@@ -322,15 +457,17 @@ mod tests {
     #[test]
     fn invalid_owner_and_invalid_graph_fail_closed_before_rendering() {
         let unknown = chart_sets(&[("Unknown Fighter", "extra")]);
-        assert!(compile_bundle(&BTreeMap::new(), &unknown).unwrap_err()[0]
-            .reason
-            .contains("pinned fighter-kind"));
+        assert!(
+            compile_bundle(&BTreeMap::new(), &unknown, &Default::default()).unwrap_err()[0]
+                .reason
+                .contains("pinned fighter-kind")
+        );
 
         let invalid = BTreeMap::from([(
             "mario".into(),
             BTreeMap::from([("extra".into(), ControllerChart::default())]),
         )]);
-        assert!(compile_bundle(&BTreeMap::new(), &invalid).is_err());
+        assert!(compile_bundle(&BTreeMap::new(), &invalid, &Default::default()).is_err());
     }
 
     #[test]
@@ -340,7 +477,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let over_owner_cap = BTreeMap::from([("mario".to_string(), nine)]);
         assert!(
-            compile_bundle(&BTreeMap::new(), &over_owner_cap).unwrap_err()[0]
+            compile_bundle(&BTreeMap::new(), &over_owner_cap, &Default::default()).unwrap_err()[0]
                 .reason
                 .contains("exceeds 8 charts")
         );
@@ -361,7 +498,7 @@ mod tests {
             );
         }
         assert!(
-            compile_bundle(&BTreeMap::new(), &too_many_owners).unwrap_err()[0]
+            compile_bundle(&BTreeMap::new(), &too_many_owners, &Default::default()).unwrap_err()[0]
                 .reason
                 .contains("owners")
         );
@@ -381,7 +518,7 @@ mod tests {
         // This exceeds the project-wide 256-chart limit while each owner is
         // within the per-fighter limit, so failure must come from shared bounds.
         assert!(
-            compile_bundle(&BTreeMap::new(), &controllers).unwrap_err()[0]
+            compile_bundle(&BTreeMap::new(), &controllers, &Default::default()).unwrap_err()[0]
                 .reason
                 .contains("charts")
         );
@@ -405,7 +542,7 @@ mod tests {
                 },
             )]),
         )]);
-        let error = compile_bundle(&BTreeMap::new(), &huge).unwrap_err();
+        let error = compile_bundle(&BTreeMap::new(), &huge, &Default::default()).unwrap_err();
         assert_eq!(
             error[0].reason,
             "controller \"extra\": behavior graph exceeds a bounded table limit"
@@ -426,7 +563,8 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let error = compile_bundle(&BTreeMap::new(), &controllers).unwrap_err();
+        let error =
+            compile_bundle(&BTreeMap::new(), &controllers, &Default::default()).unwrap_err();
         assert!(error[0].reason.contains("bytes"), "{}", error[0]);
     }
 
@@ -448,7 +586,7 @@ mod tests {
             ("samus".into(), oversized_later_main),
         ]);
         let controllers = chart_sets(&[("mario", "extra"), ("samus", "extra")]);
-        let errors = compile_bundle(&graphs, &controllers).unwrap_err();
+        let errors = compile_bundle(&graphs, &controllers, &Default::default()).unwrap_err();
         assert!(errors[0].subject.contains("samus main"), "{}", errors[0]);
         assert_eq!(
             errors[0].reason,
@@ -463,7 +601,8 @@ mod tests {
             long_owner.clone(),
             BTreeMap::from([("extra".into(), timer_chart())]),
         )]);
-        let errors = compile_bundle(&BTreeMap::new(), &controllers).unwrap_err();
+        let errors =
+            compile_bundle(&BTreeMap::new(), &controllers, &Default::default()).unwrap_err();
         assert_eq!(errors[0].subject, "fighter owner");
         assert!(!errors[0].to_string().contains(&long_owner));
         assert!(errors[0].reason.contains("48 bytes"));
@@ -515,8 +654,13 @@ mod tests {
                 },
             }],
         )]);
-        let mut artifact =
-            super::super::render_with_controllers(&graphs, &controllers, &meters).unwrap();
+        let mut artifact = super::super::render_with_controllers(
+            &graphs,
+            &controllers,
+            &meters,
+            &Default::default(),
+        )
+        .unwrap();
         let chart_values_script = crate::data::AcmdScript {
             stmts: vec![crate::data::AcmdStmt::Excute(vec![
                 crate::data::ExcuteStmt::GimmickChartEventValues {
@@ -604,6 +748,7 @@ mod tests {
         let bundle = compile_bundle(
             &BTreeMap::new(),
             &BTreeMap::from([("mario".to_string(), charts)]),
+            &Default::default(),
         )
         .unwrap()
         .unwrap();
@@ -612,7 +757,8 @@ mod tests {
             .coordinators()
             .unwrap()
             .remove("mario")
-            .unwrap();
+            .unwrap()
+            .remove(0);
         let inputs = coordinator.native_inputs();
         let mut state = coordinator.initial_state();
         let mut step = |live: bool, guard: bool| {

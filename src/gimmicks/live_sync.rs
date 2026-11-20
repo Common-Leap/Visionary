@@ -1,7 +1,7 @@
 //! Authoritative, reconnect-aware live preview of saved project gimmicks.
 use super::behavior::BehaviorGraph;
 use crate::game_link::GameLink;
-use crate::mod_project::{ParamMod, ParamValue};
+use crate::mod_project::{ParamMod, ParamValue, RosterMod};
 use std::collections::{BTreeMap, BTreeSet};
 
 type ControllerCharts = BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>;
@@ -49,16 +49,20 @@ impl LiveSync {
         &mut self,
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
+        roster: &RosterMod,
         link: &GameLink,
     ) {
-        self.update_with_controllers(params, graphs, &BTreeMap::new(), link);
+        self.update_with_controllers(params, graphs, &BTreeMap::new(), roster, link);
     }
 
+    /// `graphs` and `charts` are keyed by character: a fighter's name, or a made character's
+    /// key. `roster` says which costumes each one runs on.
     pub fn update_with_controllers(
         &mut self,
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &ControllerCharts,
+        roster: &RosterMod,
         link: &GameLink,
     ) {
         let Some(snapshot) = link.gimmick_controller_snapshot() else {
@@ -73,7 +77,7 @@ impl LiveSync {
             self.epoch = epoch;
             self.sent.clear();
         }
-        let behavior = self.prepare_controller_snapshot(graphs, charts);
+        let behavior = self.prepare_controller_snapshot(graphs, charts, roster);
         let mut edits = Vec::new();
         if self.enabled {
             for (fighter, personal) in params {
@@ -109,8 +113,9 @@ impl LiveSync {
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &ControllerCharts,
+        roster: &RosterMod,
     ) -> Result<Vec<String>, String> {
-        let mut behavior = self.prepare_controller_snapshot(graphs, charts)?;
+        let mut behavior = self.prepare_controller_snapshot(graphs, charts, roster)?;
         behavior["revision"] = 1.into();
         let mut edits = Vec::new();
         for (fighter, personal) in params {
@@ -128,11 +133,14 @@ impl LiveSync {
 
     /// Compile each complete owner or disable it, never send main while silently
     /// omitting that owner's additional charts. Global overflow refuses the
-    /// entire outgoing snapshot instead of truncating it.
+    /// entire outgoing snapshot instead of truncating it. Each character's gimmick is its own
+    /// owner on its own costumes; a fighter is disabled only when none of its characters'
+    /// gimmicks compiled.
     fn prepare_controller_snapshot(
         &mut self,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &ControllerCharts,
+        roster: &RosterMod,
     ) -> Result<serde_json::Value, String> {
         if !self.enabled {
             return serde_json::to_value(super::controller_protocol::ControllerBundleRequest {
@@ -174,25 +182,30 @@ impl LiveSync {
         let empty_charts = BTreeMap::new();
         let mut records = Vec::new();
         let mut active = BTreeSet::new();
-        for fighter in owners {
+        for key in owners {
+            let graph = graphs.get(key).unwrap_or(&empty_graph);
+            let fighter = super::controller_project::owner_fighter(key);
             if super::registry::fighter_kind_symbol(fighter).is_none() {
                 self.warnings
-                    .entry(fighter.into())
+                    .entry(key.into())
                     .or_default()
                     .push("Controller preview refused: no exact engine fighter".into());
                 continue;
             }
             self.managed.insert(fighter.into());
-            if let Some(error) = self.recipe_errors.get(fighter) {
+            // A gimmick that runs on no costume is not sent at all.
+            let Some(owner) = crate::character::gimmick_owner(key, &graph.costumes, roster) else {
+                continue;
+            };
+            if let Some(error) = self.recipe_errors.get(key) {
                 self.warnings
-                    .entry(fighter.into())
+                    .entry(key.into())
                     .or_default()
                     .push(format!("Controller preview refused: {error}"));
                 continue;
             }
-            let graph = graphs.get(fighter).unwrap_or(&empty_graph);
-            let extra = charts.get(fighter).unwrap_or(&empty_charts);
-            match super::controller_project::compile(fighter, graph, extra) {
+            let extra = charts.get(key).unwrap_or(&empty_charts);
+            match super::controller_project::compile_owner(&owner, graph, extra) {
                 Ok(compiled) => {
                     if !compiled.is_empty() {
                         active.insert(fighter.to_owned());
@@ -201,7 +214,7 @@ impl LiveSync {
                 }
                 Err(error) => self
                     .warnings
-                    .entry(fighter.into())
+                    .entry(key.into())
                     .or_default()
                     .push(format!("Complete controller owner refused: {error}")),
             }
@@ -372,8 +385,10 @@ mod tests {
         ]);
         let charts = extra_charts();
         let before = serde_json::to_value((&graphs, &charts)).unwrap();
-        let request =
-            controller_request(sync.prepare_controller_snapshot(&graphs, &charts).unwrap());
+        let request = controller_request(
+            sync.prepare_controller_snapshot(&graphs, &charts, &RosterMod::default())
+                .unwrap(),
+        );
         assert_eq!(request.charts.len(), 4);
         assert!(request.disabled_fighters.is_empty());
         assert_eq!(
@@ -421,14 +436,18 @@ mod tests {
             .graph
             .vars
             .clear();
-        let refused =
-            controller_request(sync.prepare_controller_snapshot(&graphs, &charts).unwrap());
+        let refused = controller_request(
+            sync.prepare_controller_snapshot(&graphs, &charts, &RosterMod::default())
+                .unwrap(),
+        );
         assert_eq!(refused.charts.len(), 1);
         assert_eq!(refused.charts[0].program.fighter, "cloud");
         assert_eq!(refused.disabled_fighters, ["mario"]);
         assert!(sync.warnings.contains_key("mario"));
-        let recovered =
-            controller_request(sync.prepare_controller_snapshot(&graphs, &valid).unwrap());
+        let recovered = controller_request(
+            sync.prepare_controller_snapshot(&graphs, &valid, &RosterMod::default())
+                .unwrap(),
+        );
         assert_eq!(recovered.charts.len(), 4);
         assert!(recovered.disabled_fighters.is_empty());
         assert!(sync.warnings.is_empty());
@@ -446,7 +465,7 @@ mod tests {
             ("cloud".into(), recipe_graph()),
         ]);
         let request = controller_request(
-            sync.prepare_controller_snapshot(&graphs, &extra_charts())
+            sync.prepare_controller_snapshot(&graphs, &extra_charts(), &RosterMod::default())
                 .unwrap(),
         );
         assert_eq!(request.charts.len(), 1);
@@ -458,7 +477,7 @@ mod tests {
     #[test]
     fn disabling_preview_clears_all_overrides_without_compiling_invalid_charts() {
         let mut sync = LiveSync::default();
-        sync.prepare_controller_snapshot(&BTreeMap::new(), &extra_charts())
+        sync.prepare_controller_snapshot(&BTreeMap::new(), &extra_charts(), &RosterMod::default())
             .unwrap();
         sync.enabled = false;
         let mut invalid = extra_charts();
@@ -467,7 +486,7 @@ mod tests {
             .unwrap()
             .insert(" ".into(), Default::default());
         let cleared = sync
-            .prepare_controller_snapshot(&BTreeMap::new(), &invalid)
+            .prepare_controller_snapshot(&BTreeMap::new(), &invalid, &RosterMod::default())
             .unwrap();
         assert_eq!(request_parts(&cleared), (Vec::new(), Vec::new()));
     }
@@ -489,7 +508,7 @@ mod tests {
             );
         }
         assert!(LiveSync::default()
-            .prepare_controller_snapshot(&BTreeMap::new(), &charts)
+            .prepare_controller_snapshot(&BTreeMap::new(), &charts, &RosterMod::default())
             .unwrap_err()
             .contains("256 charts"));
     }
@@ -568,5 +587,155 @@ mod tests {
         assert_eq!(super::super::registry::fighter_kind_symbol("Cloud"), None);
         assert_eq!(super::super::registry::fighter_kind_symbol("pokemon"), None);
         assert_eq!(super::super::registry::fighter_kind_symbol("shield"), None);
+    }
+
+    fn roster_with_vision() -> RosterMod {
+        let mut roster = RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: (9..=15).collect(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        roster
+    }
+
+    /// Mario's gimmick and Vision's (Mario costumes c08-c15) are sent side by side, each on
+    /// costumes the other never claims. Mario's was saved with no costume limit, before made
+    /// characters existed: it is limited when sent, and the saved graph is left as it was.
+    #[test]
+    fn a_made_characters_gimmick_is_sent_beside_its_fighters_on_disjoint_costumes() {
+        let mut sync = LiveSync::default();
+        let vision = crate::gimmicks::templates::Preset::Charge.graph();
+        let graphs = BTreeMap::from([
+            ("mario".to_string(), recipe_graph()),
+            ("mario#c08".to_string(), vision.clone()),
+        ]);
+        let before = graphs.clone();
+        let request = controller_request(
+            sync.prepare_controller_snapshot(&graphs, &BTreeMap::new(), &roster_with_vision())
+                .unwrap(),
+        );
+        assert_eq!(graphs, before);
+        let program = |id: &str| {
+            &request
+                .charts
+                .iter()
+                .find(|chart| chart.program.id == id)
+                .unwrap_or_else(|| panic!("{id} was not sent"))
+                .program
+        };
+        let (mario, vision) = (program("live:mario"), program("live:mario#c08"));
+        let theirs: Vec<u8> = (8..=15).collect();
+        assert_eq!(
+            (mario.fighter.as_str(), vision.fighter.as_str()),
+            ("mario", "mario")
+        );
+        assert!(mario.costumes.is_empty());
+        assert_eq!(mario.except_costumes, theirs);
+        assert_eq!(vision.costumes, theirs);
+        assert!(vision.except_costumes.is_empty());
+        // Each carries its own character's graph.
+        let charge = &graphs["mario#c08"].vars;
+        assert_eq!(vision.vars, *charge);
+        assert_ne!(mario.vars, *charge);
+        // Two gimmicks of one fighter, installed as two coordinators.
+        assert_eq!(request.coordinators().unwrap()["mario"].len(), 2);
+        // The exported mod replays exactly the same snapshot.
+        let packed = sync
+            .pack_messages(
+                &BTreeMap::new(),
+                &graphs,
+                &BTreeMap::new(),
+                &roster_with_vision(),
+            )
+            .unwrap();
+        let replayed = super::super::controller_protocol::decode_request(&packed[0]).unwrap();
+        assert_eq!(replayed.charts, request.charts);
+    }
+
+    /// The paired control: with no made character, Mario's gimmick goes out exactly as before,
+    /// with no costume fields at all, so an older plugin reads it unchanged.
+    #[test]
+    fn a_fighter_without_made_characters_sends_its_gimmick_as_before() {
+        let mut sync = LiveSync::default();
+        let graphs = BTreeMap::from([("mario".to_string(), recipe_graph())]);
+        let body = sync
+            .prepare_controller_snapshot(&graphs, &BTreeMap::new(), &RosterMod::default())
+            .unwrap();
+        let text = body.to_string();
+        assert!(!text.contains("costumes"), "{text}");
+        assert!(text.contains("\"live:mario\""));
+        // And with Vision in the project the exclusion appears.
+        let text = sync
+            .prepare_controller_snapshot(&graphs, &BTreeMap::new(), &roster_with_vision())
+            .unwrap()
+            .to_string();
+        assert!(
+            text.contains("\"except_costumes\":[8,9,10,11,12,13,14,15]"),
+            "{text}"
+        );
+    }
+
+    /// The plugin is a crate `cargo test` never builds, so its use of the costume is pinned
+    /// here by reading its source.
+    const PLUGIN_CONTROLLERS: &str = include_str!(
+        "../../plugins/slight_replica/src/slight/gimmicks/live_behavior/controllers.rs"
+    );
+
+    /// The body of `fn name(` in `source`, up to the next top-level item.
+    fn plugin_fn<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("\nfn {name}("))
+            .or_else(|| source.find(&format!("\npub(super) fn {name}(")))
+            .unwrap_or_else(|| panic!("plugin has no fn {name}"));
+        let rest = &source[start + 1..];
+        let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);
+        &rest[..end]
+    }
+
+    /// True when the plugin's dispatch picks the acting fighter's gimmick by its costume, for
+    /// live and for compiled gimmicks alike, rather than one gimmick per fighter.
+    fn picks_by_costume(source: &str) -> bool {
+        let active = plugin_fn(source, "active");
+        let object = plugin_fn(source, "active_for_object");
+        active
+            .matches("coordinator_for_costume(owners, color)")
+            .count()
+            == 2
+            && object.contains("active(fighter, costume_of(boid))")
+            && plugin_fn(source, "costume_of").contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR")
+    }
+
+    #[test]
+    fn the_plugin_picks_each_fighters_gimmick_by_its_costume() {
+        assert!(picks_by_costume(PLUGIN_CONTROLLERS));
+        // Per frame this is a few reads: no allocation and no file access on that path.
+        let picked = plugin_fn(PLUGIN_CONTROLLERS, "costume_of");
+        for banned in ["format!", "to_owned", "Vec::", "std::fs", "File"] {
+            assert!(!picked.contains(banned), "costume_of uses {banned}");
+        }
+    }
+
+    /// The paired positive: the scan rejects the plugin as it was, one gimmick per fighter
+    /// filtered by a costume list.
+    #[test]
+    fn the_costume_scan_rejects_one_gimmick_per_fighter() {
+        let old = "\nfn active(fighter: &str) -> Result<(), String> {\n    let runtime = RUNTIME.lock();\n    if let Some(coordinator) = runtime.controllers.get(fighter) {\n        return Ok(());\n    }\n    runtime.compiled_controllers.get(fighter)\n}\n\nfn active_for_object(boid: u32, fighter: &str) {\n    let (coordinator, source) = active(fighter)?;\n    coordinator.runs_for_costume(costume)\n}\n\npub(super) fn costume_of(boid: u32) -> i32 {\n    FIGHTER_INSTANCE_WORK_ID_INT_COLOR\n}\n";
+        assert!(!picks_by_costume(old));
+        // And a one-line revert of either half is caught on the real source.
+        let live_only = PLUGIN_CONTROLLERS.replacen(
+            "coordinator_for_costume(owners, color)",
+            "owners.first()",
+            1,
+        );
+        assert!(!picks_by_costume(&live_only));
+        let colourless =
+            PLUGIN_CONTROLLERS.replace("active(fighter, costume_of(boid))", "active(fighter, 0)");
+        assert!(!picks_by_costume(&colourless));
     }
 }

@@ -85,14 +85,33 @@ pub mod app {
     pub mod lua_bind {
         pub struct WorkModule;
         impl WorkModule {
-            /// Every test fighter wears costume 0.
-            pub unsafe fn get_int(
-                _module: *mut super::BattleObjectModuleAccessor,
-                _id: i32,
-            ) -> i32 {
-                0
+            /// Every test fighter wears costume 0 unless a test dresses it with [`dress`].
+            pub unsafe fn get_int(module: *mut super::BattleObjectModuleAccessor, id: i32) -> i32 {
+                if id != *crate::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR {
+                    return 0;
+                }
+                COSTUMES
+                    .lock()
+                    .unwrap()
+                    .get(&(module as u64))
+                    .copied()
+                    .unwrap_or(0)
             }
         }
+
+        static COSTUMES: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::BTreeMap<u64, i32>>,
+        > = std::sync::LazyLock::new(Default::default);
+
+        /// Put the fighter whose module accessor is `accessor` in costume `color`.
+        pub fn dress(accessor: u64, color: i32) {
+            COSTUMES.lock().unwrap().insert(accessor, color);
+        }
+
+        pub fn undress_all() {
+            COSTUMES.lock().unwrap().clear();
+        }
+
         pub struct StatusModule;
         impl StatusModule {
             pub unsafe fn status_kind(module: *mut super::BattleObjectModuleAccessor) -> i32 {
@@ -1420,6 +1439,7 @@ fn reset() {
     slight::gimmicks::dispatcher::clear();
     slight::agents::clear();
     smash::app::sv_battle_object::clear();
+    smash::app::lua_bind::undress_all();
     slight::gimmicks::operations::take_actions();
     slight::gimmicks::operations::reset_controls();
     slight::gimmicks::phase_control::set_sample(None);
@@ -1630,6 +1650,7 @@ fn program(
     }
     model::LiveProgram {
         costumes: Vec::new(),
+        except_costumes: Vec::new(),
         custom_statuses: Default::default(),
         status_bindings: Vec::new(),
         event_bindings: Vec::new(),

@@ -231,6 +231,8 @@ pub struct GimmicksEditor {
     pending: Option<(String, BehaviorGraph)>,
     pending_setup: Option<(String, super::blueprint::PreparedGimmicks)>,
     character: Option<crate::roster::RosterKey>,
+    /// The character whose gimmick the page last showed; drafts belong to it.
+    shown_character: Option<crate::roster::RosterKey>,
     advanced_params: super::view::PersonalView,
     chart: String,
     chart_sessions: BTreeMap<String, controllers::ControllerSession>,
@@ -245,13 +247,16 @@ impl GimmicksEditor {
         self.live.set_recipe_errors(errors);
     }
 
+    /// `graphs` (and `charts` below) are keyed by character; `roster` says which costumes each
+    /// character's gimmick runs on.
     pub fn sync_live(
         &mut self,
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
+        roster: &crate::mod_project::RosterMod,
         link: &GameLink,
     ) {
-        self.live.update(params, graphs, link);
+        self.live.update(params, graphs, roster, link);
     }
 
     pub fn pack_messages(
@@ -259,8 +264,9 @@ impl GimmicksEditor {
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
+        roster: &crate::mod_project::RosterMod,
     ) -> Result<Vec<String>, String> {
-        self.live.pack_messages(params, graphs, charts)
+        self.live.pack_messages(params, graphs, charts, roster)
     }
 
     pub fn sync_live_controllers(
@@ -268,10 +274,11 @@ impl GimmicksEditor {
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
+        roster: &crate::mod_project::RosterMod,
         link: &GameLink,
     ) {
         self.live
-            .update_with_controllers(params, graphs, charts, link);
+            .update_with_controllers(params, graphs, charts, roster, link);
     }
 
     fn live_status(&mut self, ui: &mut Ui, fighter: &str, link: &GameLink) {
@@ -354,8 +361,12 @@ impl GimmicksEditor {
 
     pub fn ui(&mut self, ui: &mut Ui, context: &CharacterContext, mut data: EditorData<'_>) {
         let saved = SavedGimmicks::capture(&context.fighter, &data);
-        if self.fighter != context.fighter || self.roots != data.roots {
+        if self.fighter != context.fighter
+            || self.shown_character != context.character
+            || self.roots != data.roots
+        {
             self.fighter = context.fighter.clone();
+            self.shown_character = context.character.clone();
             self.roots = data.roots.to_vec();
             self.base = None;
             self.profile = super::catalog::profile(&context.fighter);
@@ -503,7 +514,11 @@ impl GimmicksEditor {
         let has_articles = profile
             .as_ref()
             .is_some_and(|profile| profile.articles + profile.weapon_statuses > 0);
-        self.live_status(ui, &context.fighter, data.link);
+        let key = context
+            .character
+            .as_ref()
+            .map_or(context.fighter.as_str(), crate::roster::RosterKey::as_str);
+        self.live_status(ui, key, data.link);
         egui::ScrollArea::vertical()
             .id_salt(("main_gimmicks", &context.fighter))
             .show(ui, |ui| {
@@ -1054,8 +1069,11 @@ impl GimmicksEditor {
         egui::CollapsingHeader::new("What the gimmick is doing now").id_salt(("behavior_state", fighter)).default_open(link.gimmick_controller_snapshot().is_some()).show(ui, |ui| {
             if let Some(snapshot) = link.gimmick_controller_snapshot().filter(|snapshot| self.live.error_for("behavior").is_none() && link.gimmick_live_ack("behavior")
                 .is_some_and(|ack| ack.accepted && ack.revision == snapshot.behavior_revision)) {
+                // Players of this fighter in another character's costumes run that one's gimmick.
+                let key = self.shown_character.as_ref().map_or(fighter, crate::roster::RosterKey::as_str).to_owned();
                 for row in snapshot.behavior.iter().filter(|row| row.get("fighter").and_then(|v| v.as_str()) == Some(fighter)
-                    && row.get("chart_id").and_then(|value| value.as_str()).unwrap_or(super::controller_project::MAIN_CHART) == chart_id) {
+                    && row.get("chart_id").and_then(|value| value.as_str()).unwrap_or(super::controller_project::MAIN_CHART) == chart_id
+                    && row.get("program_id").and_then(|value| value.as_str()).is_none_or(|id| super::controller_project::program_belongs_to(id, &key))) {
                     ui.push_id(("live_actor", row.get("boid").and_then(|value| value.as_u64()), row.get("entry_id").and_then(|value| value.as_i64())), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Player {} · {}", row.get("entry_id").and_then(|v| v.as_i64()).map_or(0, |id| id + 1), row.get("state").and_then(|v| v.as_str()).unwrap_or("unknown")));
