@@ -6851,7 +6851,7 @@ impl VisionaryApp {
                 script.to_work_module_set_events
             );
             step!(
-                rewrite_article_calls,
+                rewrite_editor_article_calls,
                 article_calls_pristine,
                 script.to_article_calls
             );

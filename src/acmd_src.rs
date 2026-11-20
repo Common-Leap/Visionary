@@ -8140,42 +8140,56 @@ fn article_frame_block(text: &str, site: &MacroSite) -> Option<EffectSourceBlock
     source_frame_block(text, site)
 }
 
-/// Why the call at `site` is not the one the editor numbered `frame`/`call` at this position, if
-/// it is not. Positional pairing is only safe while every pair agrees on the function, the
-/// article and, where the source states it, the frame.
+/// Why the call at `site` is not `call` at `frame`, if it is not. The writer pairs by position
+/// with a list read from this same text, so every field must agree: function, argument count,
+/// article, every argument (the target by what it names, since a timeline call carries the
+/// timeline's spelling of it) and, where the source states one, the frame.
 fn article_pairing_mismatch(
     text: &str,
     site: &MacroSite,
     frame: u32,
     call: &crate::data::ArticleCall,
-    edited_frame: u32,
-    edited_article: &str,
 ) -> Option<String> {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     if site.name != call.op.name() {
-        return Some(format!("the source calls `{}` where the editor has `{}`", site.name, call.op.name()));
+        return Some(format!("the source calls `{}` where the list has `{}`", site.name, call.op.name()));
     }
     if site.args.len() != call.args.len() + 2 {
         return Some(format!(
-            "the source's `{}` has {} argument(s) where the editor has {}",
+            "the source's `{}` has {} argument(s) where the list has {}",
             site.name,
             site.args.len(),
             call.args.len() + 2
         ));
     }
-    let written = squash(&text[site.args[1].clone()]);
-    if written != squash(&call.article) && written != squash(edited_article) {
+    if squash(&text[site.args[1].clone()]) != squash(&call.article) {
         return Some(format!(
-            "the source's `{}` acts on `{}` where the editor has `{}`",
+            "the source's `{}` acts on `{}` where the list has `{}`",
             site.name,
             text[site.args[1].clone()].trim(),
             call.article
         ));
     }
-    if let Some(block) = article_frame_block(text, site) {
-        if block.frame != frame && block.frame != edited_frame {
+    let target_slot = call.op.target_index();
+    for (slot, expected) in call.args.iter().enumerate() {
+        let written = &text[site.args[slot + 2].clone()];
+        let agrees = if Some(slot) == target_slot {
+            crate::data::ArticleTarget::read(written) == call.target
+        } else {
+            squash(written) == squash(expected)
+        };
+        if !agrees {
             return Some(format!(
-                "the source's `{}` is under frame {} where the editor has it at frame {frame}",
+                "the source's `{}` passes `{}` where the list has `{expected}`",
+                site.name,
+                written.trim()
+            ));
+        }
+    }
+    if let Some(block) = article_frame_block(text, site) {
+        if block.frame != frame {
+            return Some(format!(
+                "the source's `{}` is under frame {} where the list has it at frame {frame}",
                 site.name, block.frame
             ));
         }
@@ -8183,68 +8197,15 @@ fn article_pairing_mismatch(
     None
 }
 
-/// For each source statement in `sites`, the index of the editor call (`pristine[i]` edited into
-/// `edited[i]`) it is.
-///
-/// By position while every pair agrees ([`article_pairing_mismatch`]); else each statement takes
-/// the one unpaired editor call it agrees with, as it was or as edited (so an edit that was
-/// already written still pairs). Several agreeing calls are accepted only when they are the same
-/// call, so a repeated call is never retuned in place of its neighbour.
-fn pair_article_calls(
-    text: &str,
-    sites: &[MacroSite],
-    pristine: &[(u32, crate::data::ArticleCall)],
-    edited: &[(u32, crate::data::ArticleCall)],
-) -> std::result::Result<Vec<usize>, String> {
-    let agrees = |site: &MacroSite, index: usize| {
-        let ((frame, before), (edited_frame, after)) = (&pristine[index], &edited[index]);
-        article_pairing_mismatch(text, site, *frame, before, *edited_frame, &after.article)
-    };
-    let mut first_mismatch = None;
-    for (index, site) in sites.iter().enumerate() {
-        if let Some(reason) = agrees(site, index) {
-            first_mismatch = Some((index, reason));
-            break;
-        }
-    }
-    let Some((at, reason)) = first_mismatch else {
-        return Ok((0..sites.len()).collect());
-    };
-    let interchangeable = |a: usize, b: usize| pristine[a] == pristine[b] && edited[a] == edited[b];
-    let mut used = vec![false; pristine.len()];
-    let mut assigned = Vec::with_capacity(sites.len());
-    for site in sites {
-        let candidates: Vec<usize> = (0..pristine.len())
-            .filter(|&index| !used[index] && agrees(site, index).is_none())
-            .collect();
-        let Some(&index) = candidates.first() else {
-            return Err(format!(
-                "article call #{} cannot be paired with the source by position: {reason}",
-                at + 1
-            ));
-        };
-        if candidates.iter().any(|&other| !interchangeable(index, other)) {
-            return Err(format!(
-                "the source's `{}` call could be more than one of the editor's article calls, so                  none was changed",
-                site.name
-            ));
-        }
-        used[index] = true;
-        assigned.push(index);
-    }
-    Ok(assigned)
-}
-
 /// Rewrite edited article calls into the user's own source.
 ///
-/// `pristine` and `edited` are the script's [`AcmdScript::to_article_calls`]
-/// (crate::data::AcmdScript::to_article_calls) before and after editing, as (script frame, call).
-/// They are paired with the file's own call statements **by position**, the way
-/// [`rewrite_motion_rates`] pairs rates, and every pair must agree on function, article and frame.
-/// Once an earlier sync has written a move or a rename, the file lists its calls differently;
-/// each statement then pairs with the one editor call it matches before or after editing (see
-/// [`pair_article_calls`]). When the counts differ or a statement does not pair exactly, nothing
-/// is written and the reason is reported.
+/// `pristine` is the calls `text` holds, as [`AcmdScript::to_article_calls`]
+/// (crate::data::AcmdScript::to_article_calls) reads them from it, and `edited` is the same list
+/// with the user's edits, as (script frame, call). They are paired with the file's own call
+/// statements **by position**, the way [`rewrite_motion_rates`] pairs rates, and every pair must
+/// agree exactly ([`article_pairing_mismatch`]); otherwise nothing is written and the reason is
+/// reported. The editor's own lists go through [`rewrite_editor_article_calls`], which puts them
+/// in this form.
 ///
 /// - An argument edit replaces only that argument's bytes, so the receiver, any `let` binding,
 ///   the module path and the spacing stay as written. A changed target keeps the file's own
@@ -8260,10 +8221,7 @@ pub fn rewrite_article_calls(
     edited: &[(u32, crate::data::ArticleCall)],
 ) -> Result<(String, SyncReport)> {
     let mut report = SyncReport::default();
-    // What a call does; `source`, `edited` and `origin` only say how it was read.
-    let same = |(a, x): &(u32, crate::data::ArticleCall), (b, y): &(u32, crate::data::ArticleCall)| {
-        a == b && x.op == y.op && x.article == y.article && x.args == y.args && x.target == y.target
-    };
+    let same = article_call_unchanged;
     if pristine.len() == edited.len() && pristine.iter().zip(edited).all(|(a, b)| same(a, b)) {
         return Ok((text.to_string(), report));
     }
@@ -8285,18 +8243,17 @@ pub fn rewrite_article_calls(
         ));
         return Ok((text.to_string(), report));
     }
-    // Which editor call each source statement is. A written frame move can carry a call past
-    // others and a written article change renames one, so a later sync of the same move reads a
-    // file that no longer lists the calls as the editor's pristine list does.
-    let Some(assigned) = (match pair_article_calls(text, &sites, pristine, edited) {
-        Ok(assigned) => Some(assigned),
-        Err(reason) => {
-            report.skipped.push(format!("{label}: {reason}"));
-            None
+    for (index, (site, (frame, call))) in sites.iter().zip(pristine).enumerate() {
+        if let Some(reason) = article_pairing_mismatch(text, site, *frame, call) {
+            report.skipped.push(format!(
+                "{label}: article call #{} is not what the source holds there ({reason}), so no \
+                 article call was changed; reload the move",
+                index + 1
+            ));
+            return Ok((text.to_string(), report));
         }
-    }) else {
-        return Ok((text.to_string(), report));
-    };
+    }
+    let assigned: Vec<usize> = (0..sites.len()).collect();
 
     let mut edits = Vec::new();
     let mut moves = Vec::new();
@@ -8395,7 +8352,147 @@ pub fn rewrite_article_calls(
     Ok((out, report))
 }
 
-/// Sync edited article calls for one move back into the project source on disk.
+/// The editor's edited article calls in the order, and against the values, of `source`: the
+/// calls `text` holds now, read with the same parser (`to_article_calls`). This is the per-write
+/// baseline hitboxes and effects use. An earlier sync may have moved a call past another,
+/// renamed its article, or retimed it, so the file's list and the editor's original list
+/// (`pristine`, edited into `edited`) no longer line up by position.
+///
+/// Each source call is matched with an editor call of the same function and argument count,
+/// preferring the one that agrees on the most fields (article, frame, each argument), where a field
+/// agrees when the source holds it as it was or as edited. A source call with one best match takes
+/// it; that settles the rest in turn. Several best matches are accepted only when they are the
+/// same call, edited the same way. Anything else is refused with the reason, and nothing is
+/// guessed by position.
+pub fn article_calls_in_source_order(
+    source: &[(u32, crate::data::ArticleCall)],
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> std::result::Result<Vec<(u32, crate::data::ArticleCall)>, String> {
+    if pristine.len() != edited.len() {
+        return Err(
+            "article calls were added or removed — source syncing only retunes existing calls, so \
+             use an export to land that"
+                .into(),
+        );
+    }
+    if source.len() != pristine.len() {
+        return Err(format!(
+            "the source has {} article call(s) where the editor has {}, so they cannot be matched \
+             up; reload the move",
+            source.len(),
+            pristine.len()
+        ));
+    }
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let either = |now: &str, was: &str, then: &str| {
+        let now = squash(now);
+        now == squash(was) || now == squash(then)
+    };
+    // `None`: not the same call at all. Otherwise how many fields agree.
+    let score = |(frame, call): &(u32, crate::data::ArticleCall), index: usize| -> Option<usize> {
+        let ((was_frame, was), (then_frame, then)) = (&pristine[index], &edited[index]);
+        if (call.op != was.op && call.op != then.op) || call.args.len() != was.args.len() {
+            return None;
+        }
+        let mut agree = usize::from(either(&call.article, &was.article, &then.article))
+            + usize::from(frame == was_frame || frame == then_frame);
+        let target_slot = call.op.target_index();
+        for (slot, arg) in call.args.iter().enumerate() {
+            agree += usize::from(if Some(slot) == target_slot {
+                call.target == was.target || call.target == then.target
+            } else {
+                either(arg, &was.args[slot], then.args.get(slot).map_or("", String::as_str))
+            });
+        }
+        Some(agree)
+    };
+    let interchangeable = |a: usize, b: usize| pristine[a] == pristine[b] && edited[a] == edited[b];
+
+    let mut assigned: Vec<Option<usize>> = vec![None; source.len()];
+    let mut used = vec![false; pristine.len()];
+    while assigned.iter().any(Option::is_none) {
+        let mut progress = false;
+        for (position, call) in source.iter().enumerate() {
+            if assigned[position].is_some() {
+                continue;
+            }
+            let scored: Vec<(usize, usize)> = (0..pristine.len())
+                .filter(|&index| !used[index])
+                .filter_map(|index| score(call, index).map(|agree| (index, agree)))
+                .collect();
+            let Some(best) = scored.iter().map(|(_, agree)| *agree).max() else {
+                return Err(format!(
+                    "the source's `{}` call (article call #{}) matches none of the editor's article \
+                     calls; reload the move",
+                    call.1.op.name(),
+                    position + 1
+                ));
+            };
+            let top: Vec<usize> = scored
+                .iter()
+                .filter(|(_, agree)| *agree == best)
+                .map(|(index, _)| *index)
+                .collect();
+            if top.iter().all(|&index| interchangeable(top[0], index)) {
+                assigned[position] = Some(top[0]);
+                used[top[0]] = true;
+                progress = true;
+            }
+        }
+        if !progress {
+            let position = assigned.iter().position(Option::is_none).unwrap_or(0);
+            let (frame, call) = &source[position];
+            return Err(format!(
+                "the source's `{}` call on {} at frame {frame} could be more than one of the \
+                 editor's article calls, so none was changed; reload the move, or edit one call at \
+                 a time and sync in between",
+                call.op.name(),
+                call.article
+            ));
+        }
+    }
+    Ok(assigned
+        .into_iter()
+        .map(|index| edited[index.expect("every source call was assigned")].clone())
+        .collect())
+}
+
+/// [`rewrite_article_calls`] for the editor's lists: the baseline is what `text` holds now (see
+/// [`article_calls_in_source_order`]), so a sync after an earlier sync of the same move still
+/// pairs each call with its own statement. Nothing is reported when the editor has no article
+/// edits and the lists cannot be matched.
+pub fn rewrite_editor_article_calls(
+    text: &str,
+    label: &str,
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> Result<(String, SyncReport)> {
+    let source = crate::acmd::parse_acmd_script(text).to_article_calls();
+    match article_calls_in_source_order(&source, pristine, edited) {
+        Ok(ordered) => rewrite_article_calls(text, label, &source, &ordered),
+        Err(reason) => {
+            let mut report = SyncReport::default();
+            let untouched = pristine.len() == edited.len()
+                && pristine.iter().zip(edited).all(|(a, b)| article_call_unchanged(a, b));
+            if !untouched {
+                report.skipped.push(format!("{label}: {reason}"));
+            }
+            Ok((text.to_string(), report))
+        }
+    }
+}
+
+/// Whether two calls do the same thing: `source`, `edited` and `origin` only say how one was read.
+fn article_call_unchanged(
+    (a, x): &(u32, crate::data::ArticleCall),
+    (b, y): &(u32, crate::data::ArticleCall),
+) -> bool {
+    a == b && x.op == y.op && x.article == y.article && x.args == y.args && x.target == y.target
+}
+
+/// Sync edited article calls for one move back into the project source on disk. `pristine` and
+/// `edited` are the editor's lists; the baseline is re-read from the file on every sync.
 pub fn sync_article_calls(
     index: &SourceIndex,
     fighter: &str,
@@ -8405,7 +8502,7 @@ pub fn sync_article_calls(
 ) -> Result<SyncReport> {
     let script_name = crate::acmd::acmd_script_name("game", move_name);
     sync_script(index, fighter, &script_name, |body| {
-        rewrite_article_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
+        rewrite_editor_article_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
     })
 }
 
@@ -18948,49 +19045,143 @@ mod rewrite_article_tests {
     #[test]
     fn mispaired_calls_are_refused() {
         let pristine = calls(SPECIAL_N);
-        // An editor call the source does not hold, as it was or as edited.
         let mut other = pristine.clone();
         other[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
         let mut edited = other.clone();
         edited[1].1.target = ArticleTarget::All;
         let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
         assert_eq!(out, SPECIAL_N);
-        assert!(report.skipped[0].contains("cannot be paired"), "{report:?}");
+        assert!(report.skipped[0].contains("is not what the source holds there"), "{report:?}");
         assert!(report.skipped[0].contains("SUPERMISSILE"), "{report:?}");
-    }
-
-    /// The editor's list in another order than the file's pairs each statement with its own call.
-    #[test]
-    fn reordered_calls_pair_by_what_they_are() {
-        let pristine = calls(SPECIAL_N);
+        // An argument that differs is a different call too, not only the function or article.
+        let mut other = pristine.clone();
+        other[0].1.args[0] = "true".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &other).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped.is_empty(), "nothing edited: {report:?}");
+        let mut edited = other.clone();
+        edited[0].1.args[1] = "0".into();
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("passes `false` where the list has `true`"), "{report:?}");
+        // The editor's list in another order than the file's pairs each call with its own.
         let swapped = vec![pristine[1].clone(), pristine[0].clone()];
         let mut edited = swapped.clone();
         edited[0].1.target = ArticleTarget::All;
-        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
+        let (out, report) = rewrite_editor_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
         assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
     }
 
-    /// I1: a written move carries a call past another; the next sync (same stale pristine list,
-    /// plus a new edit) still pairs and writes.
+    /// One editor session, synced after every edit: `pristine` stays the list loaded at the start,
+    /// as the editor keeps it; the baseline is the file each time.
+    fn sync_each(text: &str, pristine: &[(u32, ArticleCall)], edited: &[(u32, ArticleCall)]) -> String {
+        let (out, report) = rewrite_editor_article_calls(text, "samus/specialn", pristine, edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}\n{out}");
+        out
+    }
+
+    /// I1: a written move carries a call past another; the next sync still pairs and writes.
     #[test]
     fn second_sync_after_a_carry_past_move() {
         let pristine = calls(SPECIAL_N);
         let mut edited = pristine.clone();
         edited[0].0 = 25;
-        let (first, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited).unwrap();
-        assert!(report.skipped.is_empty(), "{report:?}");
-        let (again, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
-        assert_eq!((again.as_str(), report.changed), (first.as_str(), 0), "{report:?}");
-        assert!(report.skipped.is_empty(), "{report:?}");
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(sync_each(&first, &pristine, &edited), first, "re-running writes nothing");
         edited[1].1.target = ArticleTarget::All;
         edited[0].1.args[0] = "true".into();
-        let (second, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
-        assert!(report.skipped.is_empty(), "{report:?}");
-        assert_eq!(report.changed, 2, "{report:?}");
+        let second = sync_each(&first, &pristine, &edited);
         assert_eq!(
             second,
             first.replace("TARGET_LAST", "TARGET_ALL").replace("CSHOT, false, -1", "CSHOT, true, -1")
         );
+    }
+
+    /// Important B: the same call retimed twice, 10→25 then 25→30, without a reload.
+    #[test]
+    fn a_call_retimed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        edited[0].0 = 30;
+        let second = sync_each(&first, &pristine, &edited);
+        let now = calls(&second);
+        assert_eq!((now[0].0, now[1].0), (20, 30), "{second}");
+        assert_eq!(second.len(), SPECIAL_N.len(), "only the block moved and its frame changed: {second}");
+        assert!(second.ends_with("    frame(agent.lua_state_agent, 30.0);
+    if macros::is_excute(agent) {
+        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);
+    }
+}
+"), "{second}");
+    }
+
+    /// Important B: the same call's article changed twice, A→B then B→C, without a reload.
+    #[test]
+    fn an_article_changed_twice() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
+        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1));
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_MISSILE".into();
+        edited[0].1.args[1] = "0".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, SPECIAL_N.replacen("ARTICLE_CSHOT, false, -1", "ARTICLE_MISSILE, false, 0", 1));
+    }
+
+    /// Important A: two `generate_article` calls of the same article with different arguments.
+    /// The first moves onto the second's frame and lands after it, so the file lists them the other
+    /// way round; a later edit to the first changes only the first's bytes.
+    #[test]
+    fn same_article_calls_keep_their_own_edits() {
+        let text = SPECIAL_N.replace(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST), false);",
+            "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, true, 7);",
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[0].0 = 20;
+        let first = sync_each(&text, &pristine, &edited);
+        let lines: Vec<&str> = first.lines().filter(|line| line.contains("generate_article")).collect();
+        assert!(lines[0].contains("true, 7") && lines[1].contains("false, -1"), "{first}");
+        edited[0].1.args[1] = "3".into();
+        let second = sync_each(&first, &pristine, &edited);
+        assert_eq!(second, first.replace("CSHOT, false, -1", "CSHOT, false, 3"), "{second}");
+        assert!(second.contains("CSHOT, true, 7"), "the other call is untouched: {second}");
+    }
+
+    /// Calls the mapping cannot tell apart are refused with the reason, and nothing is written.
+    #[test]
+    fn ambiguous_mapping_is_refused() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);";
+        let call = ArticleCall::parse(line).unwrap();
+        // The editor retimed both identical calls; the file holds them at frames neither had.
+        let pristine = vec![(10, call.clone()), (20, call.clone())];
+        let edited = vec![(30, call.clone()), (40, call.clone())];
+        let source = vec![(25, call.clone()), (35, call.clone())];
+        let error = article_calls_in_source_order(&source, &pristine, &edited).unwrap_err();
+        assert!(error.contains("could be more than one of the editor's article calls"), "{error}");
+        assert!(!error.contains("  "), "one sentence, no stray spacing: {error}");
+        // Told apart by frame, the same lists pair.
+        let source = vec![(20, call.clone()), (30, call.clone())];
+        let ordered = article_calls_in_source_order(&source, &pristine, &edited).unwrap();
+        assert_eq!((ordered[0].0, ordered[1].0), (40, 30));
+        // Identical calls edited identically are interchangeable.
+        let same = vec![(10, call.clone()), (10, call.clone())];
+        assert!(article_calls_in_source_order(&same, &same, &same).is_ok());
+        // Through the writer: the reason is reported and the text is unchanged.
+        let text = format!(
+            "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 25.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n    frame(agent.lua_state_agent, 35.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+        );
+        let (out, report) = rewrite_editor_article_calls(&text, "samus/x", &pristine, &edited).unwrap();
+        assert_eq!(out, text);
+        assert!(report.skipped[0].contains("could be more than one"), "{report:?}");
+        // A different number of calls is refused too.
+        let error = article_calls_in_source_order(&source[..1], &pristine, &edited).unwrap_err();
+        assert!(error.contains("1 article call(s) where the editor has 2"), "{error}");
     }
 
     /// I1: a written article change renames the call; a later edit to it still lands.
@@ -18999,11 +19190,9 @@ mod rewrite_article_tests {
         let pristine = calls(SPECIAL_N);
         let mut edited = pristine.clone();
         edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
-        let (first, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited).unwrap();
-        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1), "{report:?}");
+        let first = sync_each(SPECIAL_N, &pristine, &edited);
         edited[0].1.args[1] = "0".into();
-        let (second, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
-        assert!(report.skipped.is_empty(), "{report:?}");
+        let second = sync_each(&first, &pristine, &edited);
         assert_eq!(second, first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0"));
     }
 
