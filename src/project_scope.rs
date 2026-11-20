@@ -126,10 +126,11 @@ pub fn romfs_fighter_slots(romfs: &Path) -> BTreeMap<String, BTreeSet<u8>> {
 /// project wins over the dump. A part the romfs lacks keeps its dump path. `fighter_dir`,
 /// `slots`, `source` and the name fields are never touched.
 ///
-/// `effect_dir` is left alone too. The effect editor saves the path of the eff it loaded into
-/// the project relative to the dump, falling back to an absolute path; an eff loaded from
-/// `romfs/` would then be exported straight back over that romfs file. Effects keep resolving
-/// from the dump and reference mods (`fighter_effect_names` already scans every root).
+/// `effect_dir` is left alone too: it stays the dump's or a reference mod's folder
+/// (`fighter_effect_names` already scans every root). Opening a fighter asks the romfs for
+/// its eff first all the same (`fighter_eff_path` in `app.rs`), since a slot character's
+/// effects are only in its slot's file there. The editor records that file by its game path
+/// (`mod_project::eff_game_rel`), and export writes it under the folder the user picks.
 pub fn apply_romfs_overlay(entry: &mut FighterEntry, romfs: &Path) {
     let fighter = romfs.join("fighter").join(&entry.name);
     let slot = format!("c{:02}", entry.base_slot());

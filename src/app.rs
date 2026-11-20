@@ -2795,6 +2795,18 @@ fn fighter_key_matches(key: &str, fighter: &str) -> bool {
         .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(fighter))
 }
 
+/// The eff a fighter row plays from `dirs` (in order of preference): its base slot's one-slot
+/// file where one exists, as ARCropolis loads `ef_pacman_c40.eff` for Pac-Man's c40, else the
+/// fighter's own `ef_<fighter>.eff`. A slot character's effects are only in its slot's file.
+fn fighter_eff_path(name: &str, base_slot: u8, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let slot_file = format!("ef_{name}_c{base_slot:02}.eff");
+    let own_file = format!("ef_{name}.eff");
+    [slot_file, own_file]
+        .iter()
+        .flat_map(|file| dirs.iter().map(move |dir| dir.join(file)))
+        .find(|path| path.is_file())
+}
+
 /// True for an Arcropolis-style fighter effect path, accepting either an absolute dump path or
 /// the project-relative spelling used in `EffMod::source_rel` and live-eff manifests.
 fn path_is_fighter_eff(path: &Path, fighter: &str) -> bool {
@@ -5425,19 +5437,18 @@ impl VisionaryApp {
 
         // The desktop no longer simulates or renders particles. Keep the selected fighter's
         // effect file queued for the editor; live preview is provided by slight_replica in game.
-        let eff_path = fighter
-            .effect_dir
-            .as_ref()
-            .map(|d| d.join(format!("ef_{}.eff", fighter.name)))
-            .or_else(|| {
-                self.state.data_root.as_ref().map(|root| {
-                    root.join("effect")
-                        .join("fighter")
-                        .join(&fighter.name)
-                        .join(format!("ef_{}.eff", fighter.name))
-                })
-            })
-            .filter(|path| path.exists());
+        // The project's romfs is asked first, as the game would load its file: Shy Guy's
+        // effects live only in `romfs/effect/fighter/pacman/ef_pacman_c40.eff`.
+        let eff_dirs: Vec<PathBuf> = self
+            .project_romfs()
+            .into_iter()
+            .map(|romfs| romfs.join("effect").join("fighter").join(&fighter.name))
+            .chain(fighter.effect_dir.clone())
+            .chain(self.state.data_root.as_ref().map(|root| {
+                root.join("effect").join("fighter").join(&fighter.name)
+            }))
+            .collect();
+        let eff_path = fighter_eff_path(&fighter.name, fighter.base_slot(), &eff_dirs);
         self.current_eff_path = eff_path.clone();
         if let Some(path) = eff_path {
             self.eff_editor.queue_load(&path);
@@ -10767,8 +10778,12 @@ impl VisionaryApp {
 
     /// Effect sets out at the playhead, placed on their bones, for the game-shader preview.
     /// The path the 3D preview draws the effect editor's open file under: the selected
-    /// fighter's own effect path when the editor has that fighter's file open, so the move's
+    /// fighter's own effect path when the editor has that same file open, so the move's
     /// effects pick up the edits, otherwise the file itself.
+    ///
+    /// Same file, not just same fighter: with Pac-Man's `ef_pacman.eff` as the fighter's and
+    /// Shy Guy's `ef_pacman_c40.eff` open in the editor, drawing the fighter's path showed the
+    /// wrong file, where none of Shy Guy's own effects exist.
     fn effect_editor_draw_path(&self) -> Option<(String, PathBuf)> {
         let rel = self.eff_editor.loaded_rel()?;
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
@@ -10777,8 +10792,12 @@ impl VisionaryApp {
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
             .map(|f| f.name.clone());
+        let same_file = |own: &Path| {
+            crate::mod_project::eff_game_rel(own, Some(self.eff_editor.export_root()))
+                .eq_ignore_ascii_case(&rel)
+        };
         let path = match (&self.current_eff_path, selected) {
-            (Some(own), Some(name)) if name == fighter => own.clone(),
+            (Some(own), Some(name)) if name == fighter && same_file(own) => own.clone(),
             _ => self.eff_editor.loaded_path()?.to_path_buf(),
         };
         Some((fighter, path))
@@ -10991,14 +11010,26 @@ impl VisionaryApp {
         egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
     }
 
-    /// The effect files a move can draw from: the fighter's own, then the shared one.
+    /// The effect files a move can draw from: the fighter's own, then the shared one. The
+    /// fighter's own is the one the Effects page has open for it when it has one, so a move
+    /// plays the effects being edited, from whichever of the fighter's files they are in.
     fn preview_effect_files(&self) -> Vec<std::path::PathBuf> {
         let common = self
             .state
             .data_root
             .as_ref()
             .map(|root| root.join("effect/system/common/ef_common.eff"));
-        [self.current_eff_path.clone(), common]
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.as_str());
+        let own = self
+            .effect_editor_draw_path()
+            .filter(|(fighter, _)| Some(fighter.as_str()) == selected)
+            .map(|(_, path)| path)
+            .or_else(|| self.current_eff_path.clone());
+        [own, common]
             .into_iter()
             .flatten()
             .collect()
@@ -32909,6 +32940,8 @@ impl VisionaryApp {
                 uses: HashMap::new(),
                 resolved_with: usize::MAX,
                 edited_sig: 0,
+                project: HashMap::new(),
+                project_stamp: None,
             };
             self.eff_editor.set_effect_uses(HashMap::new(), false);
         }
@@ -32925,6 +32958,32 @@ impl VisionaryApp {
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
+        }
+        // The linked moveset's own scripts play effects too, and the effects it adds (Shy
+        // Guy's `carrot_pull`) are played by nothing else. A moveset installed only on chosen
+        // costumes plays them only from those costumes' files, not the fighter's own.
+        let slot_file = rel
+            .rsplit('/')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|file| file.starts_with(&format!("ef_{}_c", index.fighter)));
+        let project = self.acmd_src.as_ref().filter(|source| {
+            slot_file || !source.costume_gated.contains(&index.fighter.to_ascii_lowercase())
+        });
+        // Each rebuild of the index makes new `consts`, so its address tells one build from
+        // the next without reading the scripts again on every frame.
+        let stamp = project.map(|source| std::sync::Arc::as_ptr(&source.consts) as usize);
+        if index.project_stamp != Some(stamp) {
+            index.project_stamp = Some(stamp);
+            index.project = project
+                .map(|source| {
+                    crate::effect_uses::project_uses(
+                        &index.fighter,
+                        &source.fighter_script_bodies(&index.fighter),
+                    )
+                })
+                .unwrap_or_default();
+            changed = true;
         }
         // Spawns the project added or pointed at another effect count too: a borrowed effect
         // redirected into three moves is used by them, though no game script names it.
@@ -32987,8 +33046,16 @@ impl VisionaryApp {
         if changed || index.resolved_with != moves_known || index.edited_sig != edited_sig {
             index.resolved_with = moves_known;
             index.edited_sig = edited_sig;
-            let mut resolved: HashMap<u64, Vec<crate::eff_editor::MoveUse>> = index
-                .uses
+            let mut all = index.uses.clone();
+            for (hash, uses) in &index.project {
+                let list = all.entry(*hash).or_default();
+                for found in uses {
+                    if !list.contains(found) {
+                        list.push(found.clone());
+                    }
+                }
+            }
+            let mut resolved: HashMap<u64, Vec<crate::eff_editor::MoveUse>> = all
                 .iter()
                 .map(|(hash, uses)| {
                     let moves = uses
@@ -39026,6 +39093,11 @@ struct EffectUseIndex {
     resolved_with: usize,
     /// The project's own spawns of the fighter's effects when the uses were last named.
     edited_sig: u64,
+    /// The uses the linked moveset's own scripts add (`effect_uses::project_uses`).
+    project: crate::effect_uses::Uses,
+    /// Which build of the linked source `project` was read from (`None` before the first
+    /// read, `Some(None)` with no source to read).
+    project_stamp: Option<Option<usize>>,
 }
 
 /// A use as the Effects page lists it: the move in plain words, and the motion that opens it.
@@ -40227,7 +40299,7 @@ mod motion_animation_tests {
 
 #[cfg(test)]
 mod fighter_forget_key_tests {
-    use super::{fighter_key_matches, path_is_fighter_eff};
+    use super::{fighter_eff_path, fighter_key_matches, path_is_fighter_eff};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
     use std::path::Path;
@@ -40254,6 +40326,38 @@ mod fighter_forget_key_tests {
             Path::new("effect/fighter/mariod/ef_mariod.eff"),
             "mario"
         ));
+    }
+
+    /// Shy Guy plays on Pac-Man's c40: his effects exist only in the project's
+    /// `ef_pacman_c40.eff`, while the dump has Pac-Man's own `ef_pacman.eff`.
+    #[test]
+    fn a_slot_character_plays_its_slot_file_before_the_fighters_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let romfs = tmp.path().join("romfs/effect/fighter/pacman");
+        let dump = tmp.path().join("dump/effect/fighter/pacman");
+        std::fs::create_dir_all(&romfs).unwrap();
+        std::fs::create_dir_all(&dump).unwrap();
+        std::fs::write(romfs.join("ef_pacman_c40.eff"), b"").unwrap();
+        std::fs::write(dump.join("ef_pacman.eff"), b"").unwrap();
+        let dirs = [romfs.clone(), dump.clone()];
+        assert_eq!(
+            fighter_eff_path("pacman", 40, &dirs),
+            Some(romfs.join("ef_pacman_c40.eff"))
+        );
+        // Pac-Man himself has no slot file and keeps the dump's.
+        assert_eq!(
+            fighter_eff_path("pacman", 0, &dirs),
+            Some(dump.join("ef_pacman.eff"))
+        );
+        // A slot file anywhere beats the fighter's own file in an earlier folder.
+        std::fs::write(romfs.join("ef_pacman.eff"), b"").unwrap();
+        std::fs::remove_file(romfs.join("ef_pacman_c40.eff")).unwrap();
+        std::fs::write(dump.join("ef_pacman_c40.eff"), b"").unwrap();
+        assert_eq!(
+            fighter_eff_path("pacman", 40, &dirs),
+            Some(dump.join("ef_pacman_c40.eff"))
+        );
+        assert_eq!(fighter_eff_path("mario", 0, &dirs), None);
     }
 }
 

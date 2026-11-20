@@ -938,6 +938,44 @@ impl SourceIndex {
         self.costume_gated.contains(&normalize_fighter(fighter))
     }
 
+    /// Every script the project has for `fighter` and for its objects (`pacman_bigpacman`), as
+    /// (agent, script name, body), the project's hash macros expanded so `Hash40::new` names
+    /// read as written in the game's own scripts. A forwarding script's body is what it runs.
+    pub fn fighter_script_bodies(&self, fighter: &str) -> Vec<(String, String, String)> {
+        let fighter = normalize_fighter(fighter);
+        let objects = format!("{fighter}_");
+        let unattributed = self.unattributed_scripts().is_some();
+        let mut texts: HashMap<&Path, Option<String>> = HashMap::new();
+        let mut out = Vec::new();
+        for (agent, table) in &self.fighters {
+            let own = *agent == fighter || (agent.is_empty() && unattributed);
+            if !own && !agent.starts_with(&objects) {
+                continue;
+            }
+            let agent = if own { &fighter } else { agent };
+            for (name, site) in &table.scripts {
+                let body = match &site.delegate {
+                    Some(delegate) => delegate.body.clone(),
+                    None => {
+                        let text = texts
+                            .entry(site.file.as_path())
+                            .or_insert_with(|| std::fs::read_to_string(&site.file).ok());
+                        // The span came from this file's text; a later edit can shrink it.
+                        let Some(source) = text.as_deref().and_then(|t| t.get(site.span.clone()))
+                        else {
+                            continue;
+                        };
+                        source.to_owned()
+                    }
+                };
+                let body = self.hash_macros.expand_in(&body).into_owned();
+                out.push((agent.clone(), name.clone(), body));
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Total number of indexed scripts, across every fighter.
     pub fn script_count(&self) -> usize {
         self.fighters.values().map(|f| f.scripts.len()).sum()
@@ -11395,6 +11433,47 @@ pub(super) fn install(agent: &mut Agent) {
         ;
 }
 "#;
+
+    /// The Effects page reads which moves play a moveset's own effects from these bodies:
+    /// the fighter's scripts and its objects', and nobody else's.
+    #[test]
+    fn script_bodies_cover_the_fighter_and_its_objects_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/pacman/acmd.rs",
+            r#"unsafe extern "C" fn effect_attack_lw3(agent: &mut L2CAgentBase) {
+    EFFECT(agent, Hash40::new("carrot_pull"), Hash40::new("top"), 0, 0, 6.8, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, true);
+}
+unsafe extern "C" fn effect_hop(agent: &mut L2CAgentBase) {
+    macros::EFFECT_FOLLOW(agent, Hash40::new("fryguy_fire"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 4.4, true);
+}
+unsafe extern "C" fn effect_win(agent: &mut L2CAgentBase) {
+    macros::EFFECT(agent, Hash40::new("mario_only"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+}
+pub fn install() {
+    Agent::new("pacman").acmd("effect_attacklw3", effect_attack_lw3, Priority::Low).install();
+    Agent::new("pacman_bigpacman").acmd("effect_specialnhop", effect_hop, Priority::Low).install();
+    Agent::new("mario").acmd("effect_win1", effect_win, Priority::Low).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let bodies = index.fighter_script_bodies("pacman");
+        let found: Vec<(&str, &str)> = bodies
+            .iter()
+            .map(|(agent, script, _)| (agent.as_str(), script.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("pacman", "effect_attacklw3"),
+                ("pacman_bigpacman", "effect_specialnhop")
+            ]
+        );
+        assert!(bodies[0].2.contains("carrot_pull"), "{}", bodies[0].2);
+        assert!(bodies[1].2.contains("fryguy_fire"), "{}", bodies[1].2);
+    }
 
     fn shared_smash_project(acmd: &str) -> (tempfile::TempDir, SourceIndex) {
         let tmp = tempfile::tempdir().unwrap();

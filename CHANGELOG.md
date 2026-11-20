@@ -64,7 +64,7 @@ The node system is still unfinished, so keep backups of your projects.
   animation. **Auto** picks the one that matches the throw.
 - **True-to-game size.** Characters that a mod makes bigger or smaller are drawn at that size,
   hitboxes included.
-- **Camera controls from SSBH Studio.** The camera turns around whatever is in the middle of
+- **Camera controls from SSBH Editor.** The camera turns around whatever is in the middle of
   the view, so something you pan to stays put while you orbit. Numpad 1, 3 and 7 look from the
   front, right and top (with Ctrl, from the other side; 9 flips the view), Home frames the
   fighter, Period frames the selected hitbox, and the arrow keys pan.
