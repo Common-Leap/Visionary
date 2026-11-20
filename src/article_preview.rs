@@ -28,6 +28,9 @@ pub struct Flight {
     pub bounce: Option<f32>,
     /// How far in front of the fighter it starts.
     pub start_ahead: f32,
+    /// Speed gained each frame, up to `max_speed`.
+    pub accel: f32,
+    pub max_speed: Option<f32>,
     /// For things that come back (Link's boomerang): it slows by `accel` a frame until it is
     /// down to `turn_speed`, then comes back speeding up by `accel` to `return_speed` until it
     /// is home.
@@ -51,6 +54,8 @@ impl Default for Flight {
             gravity: 0.0,
             bounce: None,
             start_ahead: 0.0,
+            accel: 0.0,
+            max_speed: None,
             returns: None,
         }
     }
@@ -65,7 +70,8 @@ impl Flight {
         }
         let radians = self.angle.to_radians();
         let (mut forward, mut up) = (self.start_ahead, 0.0);
-        let (step_forward, mut step_up) = (self.speed * radians.cos(), self.speed * radians.sin());
+        let (mut speed, mut step_up) = (self.speed, self.speed * radians.sin());
+        let mut step_forward = speed * radians.cos();
         let whole = frames.max(0.0).floor() as usize;
         for _ in 0..whole {
             // Gravity first, then the move: measured in game, Mario's fireball falls one
@@ -74,6 +80,12 @@ impl Flight {
             step_up -= self.gravity;
             forward += step_forward;
             up += step_up;
+            if self.accel > 0.0 {
+                let before = speed;
+                speed = (speed + self.accel).min(self.max_speed.unwrap_or(f32::MAX));
+                step_forward = speed * radians.cos();
+                step_up += (speed - before) * radians.sin();
+            }
             if up < -start_height {
                 match self.bounce {
                     Some(bounce) => {
@@ -267,6 +279,7 @@ pub struct PlacedObject {
     pub removed: Option<u32>,
     /// The frame the move throws it, when it is held first (Link's boomerang).
     pub shot: Option<u32>,
+    pub hand: Option<String>,
     /// Frames since it was spawned, from 0.
     pub age: f32,
     /// Object space to world space.
@@ -300,7 +313,7 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
         },
         _ => return flight,
     };
-    let values: HashMap<&str, f32> = fields
+    let listed: Vec<(&str, f32)> = fields
         .0
         .iter()
         .filter_map(|(hash, value)| {
@@ -318,21 +331,25 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
             Some((label.trim_end_matches('_'), number))
         })
         .collect();
-    let first = |names: &[&str]| names.iter().find_map(|name| values.get(name).copied());
+    let mut values: HashMap<String, f32> = listed
+        .iter()
+        .map(|(label, number)| ((*label).to_owned(), *number))
+        .collect();
+    if !SPEED_NAMES.iter().any(|name| values.contains_key(*name)) {
+        values.extend(first_variant(&listed));
+    }
+    let first = |names: &[&str]| names.iter().find_map(|name| values.get(*name).copied());
     if let Some(life) = first(&["life", "life_frame", "max_life"]).filter(|life| *life > 0.0) {
         flight.life = life;
     }
-    if let Some(speed) = first(&[
-        "speed",
-        "speed_x",
-        "init_speed",
-        "start_speed",
-        "speed_min",
-        "min_speed",
-        "speed_max",
-        "max_speed",
-    ]) {
+    if let Some(speed) = first(SPEED_NAMES) {
         flight.speed = speed.abs();
+    }
+    // Some speed up as they fly: Sephiroth's flare starts at 0.01 and gains 0.07 a frame up
+    // to 1.5.
+    if let Some(accel) = first(&["accel_x", "acceleration"]).filter(|accel| *accel > 0.0) {
+        flight.accel = accel;
+        flight.max_speed = first(&["max_speed_x", "full_speed", "limit_speed_x"]);
     }
     if let Some(angle) = first(&["angle", "shoot_angle", "start_angle"]) {
         // A few objects store the angle in radians.
@@ -370,6 +387,95 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
         flight.bounce = first(&["bounded_speed_y_min", "bound_speed_y"]).or(Some(flight.speed));
     }
     flight
+}
+
+/// The names an object's starting speed goes by, in the order they are trusted.
+const SPEED_NAMES: &[&str] = &[
+    "speed",
+    "speed_x",
+    "init_speed",
+    "init_speed_x",
+    "initial_speed_x",
+    "start_speed",
+    "start_speed_x",
+    "shot_speed_x",
+    "speed_min",
+    "min_speed",
+    "speed_max",
+    "max_speed",
+];
+
+/// Names that are part of how an object flies, without any variant tag.
+const FLIGHT_NAMES: &[&str] = &[
+    "life",
+    "life_frame",
+    "angle",
+    "gravity_accel",
+    "accel_x",
+    "acceleration",
+    "max_speed_x",
+    "full_speed",
+    "limit_speed_x",
+];
+
+/// Words that mark a value as something other than the plain shot: a bounce, a spin, a
+/// reflected or pulled-back speed.
+const NOT_THE_SHOT: &[&str] = &[
+    "rot", "angle", "reflect", "rewind", "back", "hop", "bound", "hold", "pull", "reach", "extend",
+    "damage", "dash", "final", "vacuum", "inhale", "follow", "fail", "sp", "y", "air", "fall",
+    "control",
+];
+
+/// Objects that come in sizes or stages keep one set of values per variant, tagged on the name:
+/// Sephiroth's flare has `speed_x_s`, `speed_x_m`, `speed_x_l`, Ryu's hadoken `speed_w`, Hero's
+/// spells `speed1`, Robin's thunder `special_n_thunder_speed`. This gives the first variant
+/// that has a speed, under the plain names.
+fn first_variant(listed: &[(&str, f32)]) -> HashMap<String, f32> {
+    let mut variants: Vec<(String, HashMap<String, f32>)> = Vec::new();
+    for (label, number) in listed {
+        let Some((base, tag)) = split_variant(label) else {
+            continue;
+        };
+        match variants.iter_mut().find(|(other, _)| *other == tag) {
+            Some((_, values)) => {
+                values.insert(base, *number);
+            }
+            None => variants.push((tag, HashMap::from([(base, *number)]))),
+        }
+    }
+    variants
+        .into_iter()
+        .map(|(_, values)| values)
+        .find(|values| {
+            SPEED_NAMES
+                .iter()
+                .any(|name| values.get(*name).is_some_and(|speed| *speed != 0.0))
+        })
+        .unwrap_or_default()
+}
+
+/// A tagged name as (plain name, tag): `speed_x_s` is ("speed_x", "s"), `speed1` is
+/// ("speed", "1"), `h_life` is ("life", "h").
+fn split_variant(label: &str) -> Option<(String, String)> {
+    let known = |name: &str| SPEED_NAMES.contains(&name) || FLIGHT_NAMES.contains(&name);
+    let plain = |tag: &str| tag.split('_').all(|word| !NOT_THE_SHOT.contains(&word));
+    let digits = label.trim_end_matches(|c: char| c.is_ascii_digit());
+    if digits.len() < label.len() && known(digits) {
+        return Some((digits.to_owned(), label[digits.len()..].to_owned()));
+    }
+    let words: Vec<&str> = label.split('_').collect();
+    // The longest plain name wins: `speed_x_s` is `speed_x` tagged `s`, not `speed` tagged `x_s`.
+    let split = |cut: usize| (words[..cut].join("_"), words[cut..].join("_"));
+    (1..words.len())
+        .rev()
+        .map(split)
+        .find(|(head, tail)| known(head) && plain(tail))
+        .or_else(|| {
+            (1..words.len())
+                .map(split)
+                .find(|(head, tail)| known(tail) && plain(head))
+                .map(|(head, tail)| (tail, head))
+        })
 }
 
 /// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
@@ -630,13 +736,15 @@ fn ride_bone(bones: &HashMap<String, glam::Mat4>, name: &str) -> glam::Mat4 {
 }
 
 /// Where the object starts: the fighter's hand for things that fly, its centre otherwise.
-fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool) -> glam::Vec3 {
+/// `hand` is the hand the move plays an effect on as it creates the object, when it does.
+fn spawn_point(bones: &HashMap<String, glam::Mat4>, flies: bool, hand: Option<&str>) -> glam::Vec3 {
     let top = bones
         .get("top")
         .map_or(glam::Vec3::ZERO, |matrix| matrix.col(3).truncate());
     if flies {
-        // Mario's fireball leaves the forward hand, where the move's shoot effect plays (havel).
-        for bone in ["havel", "haver", "handl", "handr"] {
+        // Mario's fireball leaves the forward hand, where the move's shoot effect plays (havel);
+        // Sephiroth's flare the hand his flame is in (haver).
+        for bone in hand.into_iter().chain(["havel", "haver", "handl", "handr"]) {
             if let Some(matrix) = bones.get(bone) {
                 return matrix.col(3).truncate();
             }
@@ -660,7 +768,12 @@ pub struct Spawn {
     /// Where the move shows or hides it (`set_visibility_whole`): (frame, shown), in order.
     /// Samus's grab beam is created hidden on frame 1 and shown on frame 8.
     pub shown: Vec<(u32, bool)>,
+    /// The hand it leaves from, when the move plays an effect on one as it creates it.
+    pub hand: Option<String>,
 }
+
+/// The hands an object can leave from.
+pub const HANDS: [&str; 4] = ["havel", "haver", "handl", "handr"];
 
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
 /// matrices at a game frame.
@@ -676,6 +789,7 @@ pub fn place(
         removed,
         shot,
         shown,
+        hand,
     } in spawns
     {
         let age = frame - *spawned as f32;
@@ -702,7 +816,10 @@ pub fn place(
                     .copied()
                     .unwrap_or(glam::Mat4::IDENTITY)
                     .to_scale_rotation_translation();
-                glam::Mat4::from_rotation_translation(rotation, spawn_point(&bones, true))
+                glam::Mat4::from_rotation_translation(
+                    rotation,
+                    spawn_point(&bones, true, hand.as_deref()),
+                )
             } else if kind.synced {
                 let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
                 let (_, rotation, position) = top.to_scale_rotation_translation();
@@ -715,6 +832,7 @@ pub fn place(
                 spawned: *spawned,
                 removed: *removed,
                 shot: *shot,
+                hand: hand.clone(),
                 age,
                 placement,
             });
@@ -732,7 +850,7 @@ pub fn place(
         let mut forward = top.z_axis.truncate();
         forward.y = 0.0;
         let forward = forward.try_normalize().unwrap_or(glam::Vec3::Z);
-        let start = spawn_point(&bones, kind.flight.speed > 0.0);
+        let start = spawn_point(&bones, kind.flight.speed > 0.0, hand.as_deref());
         let (ahead, up) = kind.flight.offset(flight_age, start.y - top_position.y);
         let position = start + forward * ahead + glam::Vec3::Y * up;
         placed.push(PlacedObject {
@@ -740,6 +858,7 @@ pub fn place(
             spawned: *spawned,
             removed: *removed,
             shot: *shot,
+            hand: hand.clone(),
             age,
             placement: glam::Mat4::from_rotation_translation(rotation, position),
         });
@@ -835,6 +954,97 @@ mod tests {
             Some("fireball")
         );
         assert_eq!(article_name("FIGHTER_MARIO_STATUS_KIND_X"), None);
+    }
+
+    /// The names in the game's own param files (Sephiroth's fire, Ryu's hadoken, Hero's
+    /// spells, Robin's thunder): before, none of them read as a speed and the shots stood still
+    /// at the fighter's feet.
+    #[test]
+    fn sized_and_staged_objects_read_their_first_variant() {
+        let edge = [
+            ("effect_check_frame_burst", 23.0),
+            ("life_s", 74.0),
+            ("speed_x_s", 0.01),
+            ("accel_x_s", 0.07),
+            ("max_speed_x_s", 1.5),
+            ("life_m", 28.0),
+            ("speed_x_m", 0.01),
+        ];
+        let values = first_variant(&edge);
+        assert_eq!(values.get("life"), Some(&74.0));
+        assert_eq!(values.get("speed_x"), Some(&0.01));
+        assert_eq!(values.get("accel_x"), Some(&0.07));
+        assert_eq!(values.get("max_speed_x"), Some(&1.5));
+        let ryu = [
+            ("speed_w", 1.1),
+            ("speed_m", 1.4),
+            ("life_w", 75.0),
+            ("speed_w_sp", 2.0),
+        ];
+        assert_eq!(first_variant(&ryu).get("speed"), Some(&1.1));
+        assert_eq!(first_variant(&ryu).get("life"), Some(&75.0));
+        let hero = [("speed1", 1.6), ("life1", 40.0), ("pillar_life1", 9.0)];
+        assert_eq!(first_variant(&hero).get("speed"), Some(&1.6));
+        let robin = [
+            ("special_n_thunder_speed", 2.0),
+            ("special_n_thunder_life", 30.0),
+        ];
+        assert_eq!(first_variant(&robin).get("life"), Some(&30.0));
+        // A bounce or a spin is not the shot.
+        let spin = [
+            ("rot_speed_x", 3.0),
+            ("hop_speed_y", 2.0),
+            ("speed_y_m", 1.0),
+        ];
+        assert!(first_variant(&spin).is_empty());
+    }
+
+    #[test]
+    fn a_shot_leaves_the_hand_the_move_s_effect_is_on() {
+        let kind = Arc::new(ObjectKind {
+            flight: Flight {
+                speed: 1.0,
+                ..Flight::default()
+            },
+            ..ObjectKind::default()
+        });
+        let left = glam::Vec3::new(0.0, 10.0, 2.0);
+        let right = glam::Vec3::new(0.0, 12.0, -2.0);
+        let bones = |_: f32| {
+            HashMap::from([
+                ("top".to_owned(), glam::Mat4::IDENTITY),
+                ("havel".to_owned(), glam::Mat4::from_translation(left)),
+                ("haver".to_owned(), glam::Mat4::from_translation(right)),
+            ])
+        };
+        let start = |hand: Option<&str>| {
+            let spawn = Spawn {
+                kind: kind.clone(),
+                hand: hand.map(str::to_owned),
+                ..Spawn::default()
+            };
+            place(&[spawn], 0.0, &bones)[0].placement.col(3).truncate()
+        };
+        assert_eq!(
+            start(None),
+            left,
+            "the forward hand when the move says nothing"
+        );
+        assert_eq!(start(Some("haver")), right);
+    }
+
+    #[test]
+    fn an_object_that_speeds_up_stops_at_its_top_speed() {
+        let flight = Flight {
+            speed: 0.0,
+            accel: 0.5,
+            max_speed: Some(1.0),
+            life: 60.0,
+            ..Flight::default()
+        };
+        // Speeds 0, 0.5, then 1 a frame from then on.
+        assert_eq!(flight.offset(2.0, 0.0), (0.5, 0.0));
+        assert_eq!(flight.offset(5.0, 0.0), (3.5, 0.0));
     }
 
     #[test]
@@ -968,6 +1178,7 @@ mod tests {
                             removed: None,
                             shot: None,
                             shown: Vec::new(),
+                            hand: None,
                         };
                         for object in place(&[spawn], frame, &bones) {
                             let _ = object_bones(&object);
@@ -1009,6 +1220,8 @@ mod tests {
             ("samus", "cshot"),
             ("link", "bowarrow"),
             ("fox", "blaster_bullet"),
+            ("edge", "fire"),
+            ("ryu", "hadoken"),
         ] {
             let fighter_dir = Path::new(&root).join("fighter").join(fighter);
             let dump = Path::new(&dump).join(format!("lua2cpp_{fighter}/{fighter}_{name}"));
@@ -1099,6 +1312,7 @@ mod thrown_object_tests {
             removed: None,
             shot: Some(27),
             shown: Vec::new(),
+            hand: None,
         };
         let at = |frame: f32| {
             place(std::slice::from_ref(&spawn), frame, &bones)[0]

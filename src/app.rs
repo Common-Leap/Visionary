@@ -10277,8 +10277,22 @@ impl VisionaryApp {
             {
                 kind = self.object_in_motion(&fighter, &name, kind, motion);
             }
+            // The hand the move's effect is on as the object appears: the flame in Sephiroth's
+            // hand as his flare leaves it.
+            let hand = self
+                .state
+                .effects
+                .iter()
+                .filter(|effect| {
+                    crate::article_preview::HANDS.contains(&effect.bone_name.as_str())
+                        && effect.active_start <= spawned
+                        && (effect.follows_bone || effect.active_end >= spawned)
+                })
+                .max_by_key(|effect| effect.active_start)
+                .map(|effect| effect.bone_name.clone());
             spawns.push(crate::article_preview::Spawn {
                 kind,
+                hand,
                 shown: shown
                     .iter()
                     .filter(|(at, other, _)| other == symbol && alive(*at))
@@ -10444,6 +10458,7 @@ impl VisionaryApp {
                         spawned: 0,
                         removed: None,
                         shot: None,
+                        hand: None,
                         age: 0.0,
                         placement: *at * have.inverse(),
                     });
@@ -10474,6 +10489,7 @@ impl VisionaryApp {
                     spawned: 0,
                     removed: None,
                     shot: None,
+                    hand: None,
                     age: 0.0,
                     placement: *hand * grip.inverse(),
                 });
@@ -10508,6 +10524,7 @@ impl VisionaryApp {
                     spawned: 0,
                     removed: None,
                     shot: None,
+                    hand: None,
                     age: animation_frame,
                     placement,
                 });
@@ -11164,6 +11181,7 @@ impl VisionaryApp {
                         removed: object.removed,
                         shot: object.shot,
                         shown: Vec::new(),
+                        hand: object.hand.clone(),
                     }],
                     at as f32,
                     &|f| (*bones_at(f.max(1.0) as u32)).clone(),
@@ -36799,11 +36817,14 @@ impl Hitbox {
 /// own frame, so on `top` X is sideways and Z forward (the forward smash's `sys_flame` at
 /// (0, 8, 12) is 12 in front of him); with `false` X is forward and Z sideways (the jab's
 /// `sys_attack_impact` at (12.8, 6.2, 0) is 12.8 in front of his fist, its random Z spread
-/// sideways). The vanilla scripts agree: on `top`, 65 `false` calls carry their big offset in
-/// X and 72 `true` calls in Z, against 3 each the other way. The flag moves only the
-/// position; the effect's turn is the same either way.
+/// sideways). The vanilla scripts agree: on `top`, 316 `EFFECT` calls flagged `false` carry
+/// their big offset in X against 32 in Z. The flag moves only the position; the effect's turn
+/// is the same either way. A following call's flag means something else: 146 `false` ones
+/// carry it in Z against 8 in X (Yoshi's dash attack impact is 14 in front of him).
 fn placement_offset(ec: &crate::data::EffectCall, offset: [f32; 3]) -> [f32; 3] {
-    let facing_space = is_system_bone(&ec.bone_name)
+    let follows = ec.spawn_func.contains("FOLLOW") || ec.spawn_func.contains("FLW");
+    let facing_space = !follows
+        && is_system_bone(&ec.bone_name)
         && ec
             .extra_args
             .as_ref()
@@ -50272,6 +50293,15 @@ mod placement_offset_tests {
         assert_eq!(
             super::placement_offset(&line, line.offset),
             [0.0, 6.2, -4.0]
+        );
+        // Yoshi's dash attack impact follows him, and its flag does not turn the offset.
+        let impact = call(
+            r#"macros::EFFECT_FOLLOW_ALPHA(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 10, 14, 0, 0, 0, 1.25, false, 1);"#,
+        );
+        assert_eq!(impact.spawn_func, "EFFECT_FOLLOW_ALPHA");
+        assert_eq!(
+            super::placement_offset(&impact, impact.offset),
+            [0.0, 10.0, 14.0]
         );
     }
 }
