@@ -700,10 +700,57 @@ enum ArticleJobResult {
     Failed(String),
 }
 
-/// Where the user was going when an object script with unsynced changes was open.
+/// Where the user was going when an object script with unsynced changes was open: every
+/// user action that replaces the editor's state, run as it was asked once the prompt allows it.
 enum PendingLeave {
     Script(Option<String>, MoveEntry),
     Fighter(usize),
+    ForgetFighter(String),
+    Hub(crate::project_hub::HubAction),
+    LoadProject(PathBuf),
+    NewProject(PathBuf),
+    SetDataRoot(PathBuf),
+    RescanSource,
+    LinkSource(PathBuf),
+    UnlinkSource,
+    SaveSourceBuffer,
+    ReloadSource,
+}
+
+impl PendingLeave {
+    /// What the action does, for the prompt ("open another move").
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Script(..) => "open another script",
+            Self::Fighter(_) => "choose another fighter",
+            Self::ForgetFighter(_) => "remove this fighter from the list",
+            Self::Hub(_) | Self::LoadProject(_) => "open another project",
+            Self::NewProject(_) => "start a new project",
+            Self::SetDataRoot(_) => "change the game dump",
+            Self::RescanSource => "rescan the linked source",
+            Self::LinkSource(_) => "link a moveset source",
+            Self::UnlinkSource => "unlink the moveset source",
+            Self::SaveSourceBuffer => "save the source editor's text and reload the script",
+            Self::ReloadSource => "reload this script from disk",
+        }
+    }
+}
+
+/// What an automatic refresh does when the open fighter vanished from the list (a re-index, a
+/// dump without `fighter/`): it clears the selection unless an object script has unsynced
+/// changes, which are kept on screen instead, since nobody asked to leave them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VanishedFighter {
+    Clear,
+    KeepEdits,
+}
+
+fn on_fighter_vanished(open_article: Option<&str>, edited_since_sync: bool) -> VanishedFighter {
+    if object_leave_needs_prompt(open_article, edited_since_sync) {
+        VanishedFighter::KeepEdits
+    } else {
+        VanishedFighter::Clear
+    }
 }
 
 /// What the user chose in the unsynced-changes prompt.
@@ -740,6 +787,46 @@ mod object_leave_tests {
         assert!(!object_leave_needs_prompt(Some("samus_lativolt"), false));
         // A fighter move's edits are already in the edit log, so leaving it never prompts.
         assert!(!object_leave_needs_prompt(None, true));
+    }
+
+    /// Every action that replaces the editor's state is a prompt target with its own words, and
+    /// none of them is let through while an object script has unsynced changes.
+    #[test]
+    fn every_state_replacing_action_is_a_target() {
+        let entry = MoveEntry {
+            name: "fly".into(),
+            hash: 0,
+            frame_count: 0,
+            anim_path: None,
+            cancel_frame: 0,
+        };
+        let targets = [
+            PendingLeave::Script(None, entry),
+            PendingLeave::Fighter(0),
+            PendingLeave::ForgetFighter("samus".into()),
+            PendingLeave::Hub(crate::project_hub::HubAction::BrowseWithoutProject),
+            PendingLeave::LoadProject(PathBuf::from("p.json")),
+            PendingLeave::NewProject(PathBuf::from("w")),
+            PendingLeave::SetDataRoot(PathBuf::from("dump")),
+            PendingLeave::RescanSource,
+            PendingLeave::LinkSource(PathBuf::from("src")),
+            PendingLeave::UnlinkSource,
+            PendingLeave::SaveSourceBuffer,
+            PendingLeave::ReloadSource,
+        ];
+        let mut words: Vec<&str> = targets.iter().map(PendingLeave::describe).collect();
+        assert!(words.iter().all(|w| !w.is_empty()));
+        words.dedup();
+        assert!(words.len() >= 10, "{words:?}");
+        // The gate is the same for all of them.
+        assert!(object_leave_needs_prompt(Some("samus_lativolt"), true));
+    }
+
+    #[test]
+    fn an_automatic_refresh_keeps_unsynced_object_edits() {
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true), VanishedFighter::KeepEdits);
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), false), VanishedFighter::Clear);
+        assert_eq!(on_fighter_vanished(None, true), VanishedFighter::Clear);
     }
 
     #[test]
@@ -5058,6 +5145,9 @@ impl VisionaryApp {
     }
 
     fn set_data_root(&mut self, path: PathBuf) {
+        if self.leave_gate(|| PendingLeave::SetDataRoot(path.clone())) {
+            return;
+        }
         save_config_path("data_root", &path);
         // The fighter list is left in place for `reindex_fighters`, which re-finds the selected
         // row by name in the new dump (and reloads it there); clearing it here first made the
@@ -5111,6 +5201,8 @@ impl VisionaryApp {
         // Index fighters
         let fighter_dir = path.join("fighter");
         if !fighter_dir.is_dir() {
+            // Reached through the prompt gate above, so unsynced object edits were already
+            // synced or discarded by the user.
             self.clear_fighter_selection();
             self.state.fighters.clear();
             self.state.status = "No fighter/ directory found.".to_string();
@@ -5330,7 +5422,19 @@ impl VisionaryApp {
                         self.select_fighter(idx);
                     }
                 }
-                None => self.clear_fighter_selection(),
+                None => match on_fighter_vanished(self.open_article.as_deref(), self.object_script_dirty()) {
+                    VanishedFighter::Clear => self.clear_fighter_selection(),
+                    VanishedFighter::KeepEdits => {
+                        // The fighter is gone, but the object script's unsynced edits stay on
+                        // screen (the sync goes by the object's own agent) until the user
+                        // syncs or discards them.
+                        self.state.selected_fighter = None;
+                        self.state.status = format!(
+                            "{}'s fighter is no longer in the list; its unsynced changes are kept — sync or discard them",
+                            self.open_article.clone().unwrap_or_default()
+                        );
+                    }
+                },
             }
         }
 
@@ -5381,6 +5485,9 @@ impl VisionaryApp {
     /// The data/mod roots are never modified: forgetting is a reversible roster action, not a
     /// request to delete the user's dump or installed mod files.
     fn forget_fighter(&mut self, requested: &str) {
+        if self.leave_gate(|| PendingLeave::ForgetFighter(requested.to_string())) {
+            return;
+        }
         let Some(index) = self
             .state
             .fighters
@@ -5557,6 +5664,10 @@ impl VisionaryApp {
         self.state.selected_move = None;
         self.open_article = None;
         self.article_settings = None;
+        // A prompt for a script that is no longer open must not Discard into a later one.
+        self.pending_leave = None;
+        self.object_baseline = None;
+        self.open_article_in_source = false;
         clear_move_state(&mut self.state);
         self.state.current_frame = FIRST_GAME_FRAME;
         self.state.total_frames = 0;
@@ -5591,10 +5702,7 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
-        if !std::mem::take(&mut self.leave_confirmed)
-            && object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
-        {
-            self.pending_leave = Some((PendingLeave::Fighter(idx), None));
+        if self.leave_gate(|| PendingLeave::Fighter(idx)) {
             return;
         }
         self.object_baseline = None;
@@ -5932,10 +6040,7 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
-        if !std::mem::take(&mut self.leave_confirmed)
-            && object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
-        {
-            self.pending_leave = Some((PendingLeave::Script(article, move_entry), None));
+        if self.leave_gate(|| PendingLeave::Script(article.clone(), move_entry.clone())) {
             return;
         }
         self.object_baseline = None;
@@ -6113,6 +6218,8 @@ impl VisionaryApp {
         self.acmd_error = None;
         self.pending_project_script = None;
         self.acmd_source_note = None;
+        // The editor is about to be refilled from disk: its baseline is taken again once loaded.
+        self.object_baseline = None;
 
         // A linked project is the authoritative script for anyone who has already modded the
         // move — but only for the categories it actually defines. The mirror still supplies
@@ -6269,6 +6376,9 @@ impl VisionaryApp {
 
     /// Index `root` as the ACMD source project and remember it for next session.
     fn link_acmd_source(&mut self, root: PathBuf) {
+        if self.leave_gate(|| PendingLeave::LinkSource(root.clone())) {
+            return;
+        }
         match crate::acmd_src::SourceIndex::build(&root) {
             Ok(index) => {
                 let scripts = index.script_count();
@@ -6325,6 +6435,9 @@ impl VisionaryApp {
 
     /// Re-read the linked project from disk, keeping the same root.
     fn rescan_acmd_source(&mut self) {
+        if self.leave_gate(|| PendingLeave::RescanSource) {
+            return;
+        }
         if self.refresh_linked_acmd_source_index() {
             if let Some(index) = self.acmd_src.as_ref() {
                 let ownership = if index.has_unattributed_scripts() {
@@ -6387,6 +6500,9 @@ impl VisionaryApp {
     }
 
     fn unlink_acmd_source(&mut self) {
+        if self.leave_gate(|| PendingLeave::UnlinkSource) {
+            return;
+        }
         self.acmd_src = None;
         self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
@@ -6512,6 +6628,9 @@ impl VisionaryApp {
     /// first: an external edit between checkout and save would otherwise have its text
     /// overwritten by whatever the stale span happened to point at.
     fn save_source_buffer(&mut self) {
+        if self.leave_gate(|| PendingLeave::SaveSourceBuffer) {
+            return;
+        }
         let Some(buffer) = self.acmd_src_buffer.as_mut() else {
             return;
         };
@@ -12820,8 +12939,7 @@ impl VisionaryApp {
                 if self.open_article_in_source {
                     "Edit it in the Classic editor; syncing saves its changes into the linked source."
                 } else {
-                    "Changes to this script can't be saved yet: it's the game's own script and the \
-                     moveset doesn't define it."
+                    self.unsaveable_object_script_words()
                 }
             ));
             return;
@@ -13159,7 +13277,9 @@ impl VisionaryApp {
                         )
                         .clicked()
                     {
-                        self.fetch_acmd();
+                        if !self.leave_gate(|| PendingLeave::ReloadSource) {
+                            self.fetch_acmd();
+                        }
                         ui.close();
                     }
                     let has_capture = self
@@ -20476,9 +20596,7 @@ impl VisionaryApp {
                          are not kept in the project or exported yet."
                     )
                 } else {
-                    "Changes to this script can't be saved yet: it's the game's own script and the \
-                     moveset doesn't define it."
-                        .to_string()
+                    self.unsaveable_object_script_words().to_string()
                 })
                 .small(),
             );
@@ -20934,8 +21052,12 @@ impl VisionaryApp {
         if let Some((site, changed)) = edit {
             if let Some(call) = self.state.script.article_stmt_mut(site) {
                 *call = changed;
-                self.state.status =
-                    "Object call edit staged — export or sync it into the linked source project.".into();
+                // Under R16 an object script's edits reach disk only through a sync.
+                self.state.status = if self.open_article.is_some() {
+                    "Object call edit staged — sync it into the linked source.".into()
+                } else {
+                    "Object call edit staged — export or sync it into the linked source project.".into()
+                };
             }
         }
         if let Some(path) = reveal {
@@ -20943,6 +21065,21 @@ impl VisionaryApp {
                 self.state.status = format!("Could not open {}: {error:#}", path.display());
             }
         }
+    }
+
+    /// Hold a state-replacing user action while an object script has unsynced changes: park it
+    /// for the prompt and return `true`. Inside an action the prompt already allowed
+    /// (`leave_confirmed`), everything goes through.
+    fn leave_gate(&mut self, target: impl FnOnce() -> PendingLeave) -> bool {
+        if self.leave_confirmed
+            || !object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            return false;
+        }
+        if self.pending_leave.is_none() {
+            self.pending_leave = Some((target(), None));
+        }
+        true
     }
 
     /// A fingerprint of everything an edit to the open script can change.
@@ -21001,7 +21138,8 @@ impl VisionaryApp {
             .show(ctx, |ui| {
                 ui.label(format!(
                     "{agent} · {move_name} has changes that aren't saved anywhere yet. An object's \
-                     script isn't kept in the project, so leaving it now loses them."
+                     script isn't kept in the project, so if you {} now they are lost.",
+                    pending.describe()
                 ));
                 if let Some(message) = &message {
                     ui.colored_label(egui::Color32::from_rgb(235, 170, 90), message);
@@ -21011,9 +21149,7 @@ impl VisionaryApp {
                     let sync = if can_sync {
                         sync.on_hover_text("Write the changes into the linked source, then go on")
                     } else {
-                        sync.on_disabled_hover_text(
-                            "This script can't be synced: it's the game's own script and the moveset doesn't define it.",
-                        )
+                        sync.on_disabled_hover_text(self.unsaveable_object_script_words())
                     };
                     if sync.clicked() {
                         choice = Some(LeaveChoice::SyncNow);
@@ -21046,8 +21182,30 @@ impl VisionaryApp {
         match pending {
             PendingLeave::Script(article, entry) => self.select_script(article, entry),
             PendingLeave::Fighter(index) => self.select_fighter(index),
+            PendingLeave::ForgetFighter(name) => self.forget_fighter(&name),
+            PendingLeave::Hub(action) => self.execute_hub_action_now(action),
+            PendingLeave::LoadProject(path) => self.load_project_from(&path),
+            PendingLeave::NewProject(path) => self.new_project_in(&path),
+            PendingLeave::SetDataRoot(path) => self.set_data_root(path),
+            PendingLeave::RescanSource => self.rescan_acmd_source(),
+            PendingLeave::LinkSource(root) => self.link_acmd_source(root),
+            PendingLeave::UnlinkSource => self.unlink_acmd_source(),
+            PendingLeave::SaveSourceBuffer => self.save_source_buffer(),
+            PendingLeave::ReloadSource => self.fetch_acmd(),
         }
         self.leave_confirmed = false;
+    }
+
+    /// Why the open object script can't be saved: the game's own script the moveset doesn't
+    /// define, or, for a clone (which has no game scripts), one the moveset hasn't written yet.
+    fn unsaveable_object_script_words(&self) -> &'static str {
+        if self.open_article_is_clone() {
+            "Changes to this script can't be saved yet: the moveset doesn't define this script for \
+             its clone yet."
+        } else {
+            "Changes to this script can't be saved yet: it's the game's own script and the moveset \
+             doesn't define it."
+        }
     }
 
     /// Whether the open object script is a clone's, which the game has no scripts for.
@@ -22982,6 +23140,9 @@ impl VisionaryApp {
     /// Start empty in a picked workspace folder: scaffold it so every edit has
     /// a home from the first save, then clear every edit store and the live game.
     fn new_project_in(&mut self, workspace: &std::path::Path) {
+        if self.leave_gate(|| PendingLeave::NewProject(workspace.to_path_buf())) {
+            return;
+        }
         let name = workspace
             .file_name()
             .and_then(|n| n.to_str())
@@ -23061,6 +23222,18 @@ impl VisionaryApp {
     }
 
     fn execute_hub_action(&mut self, action: crate::project_hub::HubAction) {
+        if self.leave_confirmed
+            || !object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            self.execute_hub_action_now(action);
+            return;
+        }
+        if self.pending_leave.is_none() {
+            self.pending_leave = Some((PendingLeave::Hub(action), None));
+        }
+    }
+
+    fn execute_hub_action_now(&mut self, action: crate::project_hub::HubAction) {
         match action {
             crate::project_hub::HubAction::ResumeLast(path)
             | crate::project_hub::HubAction::Open(path)
@@ -25124,6 +25297,9 @@ impl VisionaryApp {
     }
 
     fn load_project_from(&mut self, path: &std::path::Path) {
+        if self.leave_gate(|| PendingLeave::LoadProject(path.to_path_buf())) {
+            return;
+        }
         let mut project: crate::mod_project::ModProjectFile = match std::fs::read_to_string(path)
             .map_err(anyhow::Error::from)
             .and_then(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
