@@ -1214,23 +1214,25 @@ pub mod write {
         /// Change the const's definition (through [`crate::project_consts::apply_edits`], which
         /// spells the number the way the definition is written).
         Const(ConstEdit),
-        /// Write variant 0 of `block.field` in `file` (through
-        /// [`crate::articles::params::write_param_field`]).
-        Param { file: PathBuf, block: String, field: String },
+        /// Write `variant` of `block.field` in `file`, one of the moveset's own param files
+        /// (through [`crate::articles::params::write_param_field`]).
+        Param { file: PathBuf, block: String, field: String, variant: usize },
     }
 
-    /// Plan saving `new` for `setting`. `layers` are the param files the article reads, lowest
-    /// first, the moveset's own romfs file last.
+    /// Plan saving `new` for `setting`. `variant` is the list entry a `Param` value is read from (0
+    /// for a plain struct). `own` is the moveset's OWN param files (its romfs `vl.prc`/`vl.prcxml`),
+    /// lowest first: never the game dump or a reference mod, which a save must not change.
     ///
     /// - A `Literal` has its bytes in the status code replaced, written the way the literal was
     ///   (`30` → `45`, `30.0` → `45.0`, `1.6f32` → `2.0f32`); every other byte of the file is kept.
     /// - A `Const` becomes a [`ConstEdit`] on its definition.
-    /// - A `Param` goes to the top-most layer that already has the field, else to the moveset's
-    ///   own file (the last layer).
+    /// - A `Param` goes to the top-most of the moveset's own files that already has that block,
+    ///   variant and field. When none has it, this is an error: the param writer cannot add a
+    ///   field, and writing the dump or another mod would not change this moveset.
     /// - A `Computed` value, and anything this cannot write, is an error saying why.
     ///
     /// Nothing is written here: the caller applies the plan.
-    pub fn plan_setting_write(setting: &Setting, new: f64, layers: &[PathBuf]) -> Result<SettingWrite> {
+    pub fn plan_setting_write(setting: &Setting, new: f64, variant: usize, own: &[PathBuf]) -> Result<SettingWrite> {
         if !new.is_finite() {
             bail!("{new} is not a number Visionary can write");
         }
@@ -1279,13 +1281,10 @@ pub mod write {
                 Ok(SettingWrite::Const(ConstEdit { name: name.clone(), value: new.to_string() }))
             }
             SettingValue::Param { block, field } => {
-                let Some(own) = layers.last() else {
-                    bail!("{block}.{field} is read from params, but there is no param file to write it to");
-                };
-                for layer in layers.iter().rev() {
-                    // A layer that cannot be read may be the one the game reads, so choosing one
+                for layer in own.iter().rev() {
+                    // An own file that cannot be read may be the one the game reads, so choosing one
                     // below it could write a value the game never sees.
-                    let has = crate::articles::params::layer_has_field(layer, block, field, 0)
+                    let has = crate::articles::params::layer_has_field(layer, block, field, variant)
                         .map_err(|error| {
                             anyhow::anyhow!("{error}, so Visionary can't tell which file holds {block}.{field}")
                         })?;
@@ -1294,10 +1293,28 @@ pub mod write {
                             file: layer.clone(),
                             block: block.clone(),
                             field: field.clone(),
+                            variant,
                         });
                     }
                 }
-                Ok(SettingWrite::Param { file: own.clone(), block: block.clone(), field: field.clone() })
+                let entry = if variant == 0 { String::new() } else { format!(" (list entry {variant})") };
+                // The file to add it to: the moveset's prcxml when it has one.
+                let file = own
+                    .iter()
+                    .rev()
+                    .find(|file| file.extension().is_some_and(|e| e.eq_ignore_ascii_case("prcxml")))
+                    .or(own.last());
+                match file {
+                    Some(file) => bail!(
+                        "`{field}`{entry} isn't in {block} in this moveset's own param file yet, so \
+                         Visionary can't change it there; add it to {} first",
+                        file.display()
+                    ),
+                    None => bail!(
+                        "`{field}`{entry} is read from {block}, but this moveset has no param file of \
+                         its own, so Visionary can't change it; add a vl.prcxml with it first"
+                    ),
+                }
             }
         }
     }
@@ -1349,20 +1366,20 @@ pub mod write {
             let power = setting(&file, STATUS, SettingField::PowerMul, SettingValue::Literal(30.0), "30.0");
             let gravity = setting(&file, STATUS, SettingField::Gravity, SettingValue::Literal(0.08), "0.08");
 
-            let text = source_text(plan_setting_write(&life, 45.0, &[]).unwrap());
+            let text = source_text(plan_setting_write(&life, 45.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("set_life(30)", "set_life(45)"));
-            let text = source_text(plan_setting_write(&scale, 2.0, &[]).unwrap());
+            let text = source_text(plan_setting_write(&scale, 2.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("1.6f32", "2.0f32"));
-            let text = source_text(plan_setting_write(&power, 45.0, &[]).unwrap());
+            let text = source_text(plan_setting_write(&power, 45.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("30.0", "45.0"));
             // Gravity is the magnitude of a negated acceleration: the `-` stays where it is.
-            let text = source_text(plan_setting_write(&gravity, 0.1, &[]).unwrap());
+            let text = source_text(plan_setting_write(&gravity, 0.1, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("-0.08", "-0.1"));
             assert_eq!(text.matches("\r\n").count(), STATUS.matches("\r\n").count());
 
-            let error = plan_setting_write(&life, 45.5, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&life, 45.5, 0, &[]).unwrap_err().to_string();
             assert!(error.contains("whole number"), "{error}");
-            let error = plan_setting_write(&gravity, -0.1, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&gravity, -0.1, 0, &[]).unwrap_err().to_string();
             assert!(error.contains("negative"), "{error}");
             assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS, "planning writes nothing");
         }
@@ -1383,10 +1400,10 @@ pub mod write {
             };
             let settings = super::super::read_settings(&[(&site, STATUS.to_string())], &consts, &|_, _| None);
             let gravity = settings.iter().find(|s| s.field == SettingField::Gravity).unwrap();
-            let text = source_text(plan_setting_write(gravity, 0.5, &[]).unwrap());
+            let text = source_text(plan_setting_write(gravity, 0.5, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("-0.08", "-0.5"));
             let life = settings.iter().find(|s| s.field == SettingField::Life).unwrap();
-            let text = source_text(plan_setting_write(life, 90.0, &[]).unwrap());
+            let text = source_text(plan_setting_write(life, 90.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("set_life(30)", "set_life(90)"));
         }
 
@@ -1396,7 +1413,7 @@ pub mod write {
             let file = dir.path().join("shot.rs");
             std::fs::write(&file, STATUS.replace("1.6f32", "1.9f32")).unwrap();
             let scale = setting(&file, STATUS, SettingField::Scale, SettingValue::Literal(1.6), "1.6f32");
-            let error = plan_setting_write(&scale, 2.0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&scale, 2.0, 0, &[]).unwrap_err().to_string();
             assert!(error.contains("changed"), "{error}");
         }
 
@@ -1412,7 +1429,7 @@ pub mod write {
                 SettingValue::Computed("charge_boost + 1.0".into()),
                 "30.0",
             );
-            let error = plan_setting_write(&computed, 2.0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&computed, 2.0, 0, &[]).unwrap_err().to_string();
             assert!(error.contains("worked out"), "{error}");
             assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS);
         }
@@ -1423,14 +1440,14 @@ pub mod write {
             let value = SettingValue::Const { name: "FIREBALL_SCALE".into(), value: Some(1.4) };
             let scale = setting(&file, "FIREBALL_SCALE", SettingField::Scale, value, "FIREBALL_SCALE");
             assert_eq!(
-                plan_setting_write(&scale, 2.5, &[]).unwrap(),
+                plan_setting_write(&scale, 2.5, 0, &[]).unwrap(),
                 SettingWrite::Const(ConstEdit { name: "FIREBALL_SCALE".into(), value: "2.5".into() })
             );
             let unknown = Setting {
                 value: SettingValue::Const { name: "FROM_ELSEWHERE".into(), value: None },
                 ..scale
             };
-            let error = plan_setting_write(&unknown, 2.5, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&unknown, 2.5, 0, &[]).unwrap_err().to_string();
             assert!(error.contains("FROM_ELSEWHERE"), "{error}");
 
             // The definition keeps its own spelling when the edit is applied.
@@ -1459,7 +1476,9 @@ pub mod write {
         fn param_setting_targets_existing_layer() {
             let dir = tempfile::tempdir().unwrap();
             let (dump, romfs) = (dir.path().join("dump.prc"), dir.path().join("romfs.prcxml"));
-            prc_with(&dump, &[("speed", prc::ParamKind::Float(1.0)), ("life", prc::ParamKind::I32(60))]);
+            let dump_fields = [("speed", prc::ParamKind::Float(1.0)), ("life", prc::ParamKind::I32(60))];
+            prc_with(&dump, &dump_fields);
+            let dump_bytes = std::fs::read(&dump).unwrap();
             std::fs::write(
                 &romfs,
                 "<struct>\r\n  <struct hash=\"param_cshot\">\r\n    <float hash=\"speed\">2</float>\r\n  </struct>\r\n</struct>\r\n",
@@ -1475,34 +1494,63 @@ pub mod write {
                     "x",
                 )
             };
-            let planned = |file: &PathBuf, field: &str| SettingWrite::Param {
-                file: file.clone(),
-                block: "param_cshot".into(),
-                field: field.into(),
-            };
-            let layers = [dump.clone(), romfs.clone()];
-            // The moveset's own file has `speed`: it is written there, over the dump's.
-            assert_eq!(plan_setting_write(&param("speed"), 3.0, &layers).unwrap(), planned(&romfs, "speed"));
-            // Only the dump has `life`: the top-most layer that has it.
-            assert_eq!(plan_setting_write(&param("life"), 70.0, &layers).unwrap(), planned(&dump, "life"));
-            // No layer has it: the moveset's own romfs file.
-            assert_eq!(plan_setting_write(&param("gravity"), 1.0, &layers).unwrap(), planned(&romfs, "gravity"));
-            // A layer above the one that has the field could not be read: which file the game
-            // reads is unknown, so nothing is chosen.
+            let own = [romfs.clone()];
+            // The moveset's own prcxml has `speed`, and so does the dump: the prcxml is chosen.
+            assert_eq!(
+                plan_setting_write(&param("speed"), 3.0, 0, &own).unwrap(),
+                SettingWrite::Param { file: romfs.clone(), block: "param_cshot".into(), field: "speed".into(), variant: 0 }
+            );
+            // Only the dump has `life`: the dump is never chosen, and the error says what to do.
+            let error = plan_setting_write(&param("life"), 70.0, 0, &own).unwrap_err().to_string();
+            assert!(error.contains("`life` isn't in param_cshot in this moveset's own param file yet"), "{error}");
+            assert!(error.contains(&romfs.display().to_string()), "{error}");
+            // Not even when the moveset has no param file of its own.
+            let error = plan_setting_write(&param("life"), 70.0, 0, &[]).unwrap_err().to_string();
+            assert!(error.contains("no param file of its own"), "{error}");
+            // An own file above the one that has the field could not be read: which file the
+            // game reads is unknown, so nothing is chosen.
             let broken = dir.path().join("broken.prc");
             std::fs::write(&broken, b"not a param file").unwrap();
-            let error = plan_setting_write(&param("life"), 70.0, &[dump.clone(), broken]).unwrap_err().to_string();
+            let error = plan_setting_write(&param("speed"), 3.0, 0, &[romfs.clone(), broken]).unwrap_err().to_string();
             assert!(error.contains("could not read"), "{error}");
-            let error = plan_setting_write(&param("life"), 70.0, &[]).unwrap_err().to_string();
-            assert!(error.contains("no param file"), "{error}");
 
             // The planned write lands through the param writer, changing only that value.
-            let SettingWrite::Param { file, block, field } = plan_setting_write(&param("speed"), 3.0, &layers).unwrap()
+            let SettingWrite::Param { file, block, field, variant } =
+                plan_setting_write(&param("speed"), 3.0, 0, &own).unwrap()
             else {
                 unreachable!()
             };
-            crate::articles::params::write_param_field(&file, &block, &field, 0, 3.0, &HashMap::new()).unwrap();
+            crate::articles::params::write_param_field(&file, &block, &field, variant, 3.0, &HashMap::new()).unwrap();
             assert!(std::fs::read_to_string(&romfs).unwrap().contains("    <float hash=\"speed\">3</float>\r\n"));
+            assert_eq!(std::fs::read(&dump).unwrap(), dump_bytes, "the dump is untouched");
+        }
+
+        /// R11b: a list block's variant 2 of 3 is checked and written, not variant 0.
+        #[test]
+        fn param_setting_targets_a_list_variant() {
+            let dir = tempfile::tempdir().unwrap();
+            let romfs = dir.path().join("vl.prcxml");
+            let before = "<struct>\n<list hash=\"param_lativolt\">\n<struct index=\"0\"><float hash=\"speed\">1</float></struct>\n<struct index=\"1\"><float hash=\"speed\">2</float></struct>\n<struct index=\"2\"><float hash=\"speed\">3</float><int hash=\"life\">40</int></struct>\n</list>\n</struct>\n";
+            std::fs::write(&romfs, before).unwrap();
+            let file = PathBuf::from("shot.rs");
+            let life = setting(
+                &file,
+                "x",
+                SettingField::Life,
+                SettingValue::Param { block: "param_lativolt".into(), field: "life".into() },
+                "x",
+            );
+            let own = [romfs.clone()];
+            let planned = plan_setting_write(&life, 55.0, 2, &own).unwrap();
+            assert_eq!(
+                planned,
+                SettingWrite::Param { file: romfs.clone(), block: "param_lativolt".into(), field: "life".into(), variant: 2 }
+            );
+            let error = plan_setting_write(&life, 55.0, 1, &own).unwrap_err().to_string();
+            assert!(error.contains("(list entry 1)"), "{error}");
+            let SettingWrite::Param { file, block, field, variant } = planned else { unreachable!() };
+            crate::articles::params::write_param_field(&file, &block, &field, variant, 55.0, &HashMap::new()).unwrap();
+            assert_eq!(std::fs::read_to_string(&romfs).unwrap(), before.replace(">40<", ">55<"));
         }
     }
 }

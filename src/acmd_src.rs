@@ -8149,6 +8149,7 @@ fn article_pairing_mismatch(
     frame: u32,
     call: &crate::data::ArticleCall,
     edited_frame: u32,
+    edited_article: &str,
 ) -> Option<String> {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     if site.name != call.op.name() {
@@ -8162,7 +8163,8 @@ fn article_pairing_mismatch(
             call.args.len() + 2
         ));
     }
-    if squash(&text[site.args[1].clone()]) != squash(&call.article) {
+    let written = squash(&text[site.args[1].clone()]);
+    if written != squash(&call.article) && written != squash(edited_article) {
         return Some(format!(
             "the source's `{}` acts on `{}` where the editor has `{}`",
             site.name,
@@ -8181,13 +8183,68 @@ fn article_pairing_mismatch(
     None
 }
 
+/// For each source statement in `sites`, the index of the editor call (`pristine[i]` edited into
+/// `edited[i]`) it is.
+///
+/// By position while every pair agrees ([`article_pairing_mismatch`]); else each statement takes
+/// the one unpaired editor call it agrees with, as it was or as edited (so an edit that was
+/// already written still pairs). Several agreeing calls are accepted only when they are the same
+/// call, so a repeated call is never retuned in place of its neighbour.
+fn pair_article_calls(
+    text: &str,
+    sites: &[MacroSite],
+    pristine: &[(u32, crate::data::ArticleCall)],
+    edited: &[(u32, crate::data::ArticleCall)],
+) -> std::result::Result<Vec<usize>, String> {
+    let agrees = |site: &MacroSite, index: usize| {
+        let ((frame, before), (edited_frame, after)) = (&pristine[index], &edited[index]);
+        article_pairing_mismatch(text, site, *frame, before, *edited_frame, &after.article)
+    };
+    let mut first_mismatch = None;
+    for (index, site) in sites.iter().enumerate() {
+        if let Some(reason) = agrees(site, index) {
+            first_mismatch = Some((index, reason));
+            break;
+        }
+    }
+    let Some((at, reason)) = first_mismatch else {
+        return Ok((0..sites.len()).collect());
+    };
+    let interchangeable = |a: usize, b: usize| pristine[a] == pristine[b] && edited[a] == edited[b];
+    let mut used = vec![false; pristine.len()];
+    let mut assigned = Vec::with_capacity(sites.len());
+    for site in sites {
+        let candidates: Vec<usize> = (0..pristine.len())
+            .filter(|&index| !used[index] && agrees(site, index).is_none())
+            .collect();
+        let Some(&index) = candidates.first() else {
+            return Err(format!(
+                "article call #{} cannot be paired with the source by position: {reason}",
+                at + 1
+            ));
+        };
+        if candidates.iter().any(|&other| !interchangeable(index, other)) {
+            return Err(format!(
+                "the source's `{}` call could be more than one of the editor's article calls, so                  none was changed",
+                site.name
+            ));
+        }
+        used[index] = true;
+        assigned.push(index);
+    }
+    Ok(assigned)
+}
+
 /// Rewrite edited article calls into the user's own source.
 ///
 /// `pristine` and `edited` are the script's [`AcmdScript::to_article_calls`]
 /// (crate::data::AcmdScript::to_article_calls) before and after editing, as (script frame, call).
 /// They are paired with the file's own call statements **by position**, the way
-/// [`rewrite_motion_rates`] pairs rates, and every pair must agree on function, article and frame;
-/// when the counts differ or a pair disagrees nothing is written and the reason is reported.
+/// [`rewrite_motion_rates`] pairs rates, and every pair must agree on function, article and frame.
+/// Once an earlier sync has written a move or a rename, the file lists its calls differently;
+/// each statement then pairs with the one editor call it matches before or after editing (see
+/// [`pair_article_calls`]). When the counts differ or a statement does not pair exactly, nothing
+/// is written and the reason is reported.
 ///
 /// - An argument edit replaces only that argument's bytes, so the receiver, any `let` binding,
 ///   the module path and the spacing stay as written. A changed target keeps the file's own
@@ -8228,21 +8285,23 @@ pub fn rewrite_article_calls(
         ));
         return Ok((text.to_string(), report));
     }
-    for (index, (site, ((frame, before), (edited_frame, _)))) in
-        sites.iter().zip(pristine.iter().zip(edited)).enumerate()
-    {
-        if let Some(reason) = article_pairing_mismatch(text, site, *frame, before, *edited_frame) {
-            report.skipped.push(format!(
-                "{label}: article call #{} cannot be paired with the source by position: {reason}",
-                index + 1
-            ));
-            return Ok((text.to_string(), report));
+    // Which editor call each source statement is. A written frame move can carry a call past
+    // others and a written article change renames one, so a later sync of the same move reads a
+    // file that no longer lists the calls as the editor's pristine list does.
+    let Some(assigned) = (match pair_article_calls(text, &sites, pristine, edited) {
+        Ok(assigned) => Some(assigned),
+        Err(reason) => {
+            report.skipped.push(format!("{label}: {reason}"));
+            None
         }
-    }
+    }) else {
+        return Ok((text.to_string(), report));
+    };
 
     let mut edits = Vec::new();
     let mut moves = Vec::new();
-    for (index, (site, (was, now))) in sites.iter().zip(pristine.iter().zip(edited)).enumerate() {
+    for (site, &index) in sites.iter().zip(&assigned) {
+        let (was, now) = (&pristine[index], &edited[index]);
         if same(was, now) {
             continue;
         }
@@ -8292,7 +8351,7 @@ pub fn rewrite_article_calls(
     let mut out = apply(text, edits);
     // Which editor call each statement in `out` is, in document order: a move can carry a call
     // past others, and every later move must still find its own call.
-    let mut order: Vec<usize> = (0..sites.len()).collect();
+    let mut order: Vec<usize> = assigned;
     for (index, from, to) in moves {
         let number = index + 1;
         let current = article_call_sites(&out);
@@ -18889,12 +18948,92 @@ mod rewrite_article_tests {
     #[test]
     fn mispaired_calls_are_refused() {
         let pristine = calls(SPECIAL_N);
+        // An editor call the source does not hold, as it was or as edited.
+        let mut other = pristine.clone();
+        other[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let mut edited = other.clone();
+        edited[1].1.target = ArticleTarget::All;
+        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        assert_eq!(out, SPECIAL_N);
+        assert!(report.skipped[0].contains("cannot be paired"), "{report:?}");
+        assert!(report.skipped[0].contains("SUPERMISSILE"), "{report:?}");
+    }
+
+    /// The editor's list in another order than the file's pairs each statement with its own call.
+    #[test]
+    fn reordered_calls_pair_by_what_they_are() {
+        let pristine = calls(SPECIAL_N);
         let swapped = vec![pristine[1].clone(), pristine[0].clone()];
         let mut edited = swapped.clone();
         edited[0].1.target = ArticleTarget::All;
         let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
-        assert_eq!(out, SPECIAL_N);
-        assert!(report.skipped[0].contains("cannot be paired"), "{report:?}");
+        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+    }
+
+    /// I1: a written move carries a call past another; the next sync (same stale pristine list,
+    /// plus a new edit) still pairs and writes.
+    #[test]
+    fn second_sync_after_a_carry_past_move() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let (first, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let (again, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!((again.as_str(), report.changed), (first.as_str(), 0), "{report:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        edited[1].1.target = ArticleTarget::All;
+        edited[0].1.args[0] = "true".into();
+        let (second, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 2, "{report:?}");
+        assert_eq!(
+            second,
+            first.replace("TARGET_LAST", "TARGET_ALL").replace("CSHOT, false, -1", "CSHOT, true, -1")
+        );
+    }
+
+    /// I1: a written article change renames the call; a later edit to it still lands.
+    #[test]
+    fn second_edit_after_an_article_change() {
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
+        let (first, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited).unwrap();
+        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1), "{report:?}");
+        edited[0].1.args[1] = "0".into();
+        let (second, report) = rewrite_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(second, first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0"));
+    }
+
+    /// The same two syncs through the project on disk, as the editor runs them.
+    #[test]
+    fn two_syncs_on_disk_after_a_carry_past_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("src/samus/acmd.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, SPECIAL_N).unwrap();
+        std::fs::write(
+            tmp.path().join("src/samus/mod.rs"),
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"samus\"); }",
+        )
+        .unwrap();
+        let pristine = calls(SPECIAL_N);
+        let mut edited = pristine.clone();
+        edited[0].0 = 25;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert_eq!(report.changed, 1, "{report:?}");
+        edited[1].1.target = ArticleTarget::All;
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let report = sync_article_calls(&index, "samus", "special_n", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(report.changed, 1, "{report:?}");
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        let moved = calls(&on_disk);
+        assert_eq!((moved[0].0, moved[1].0), (20, 25), "{on_disk}");
+        assert_eq!(moved[0].1.target, ArticleTarget::All, "{on_disk}");
     }
 
     #[test]

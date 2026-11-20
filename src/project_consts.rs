@@ -511,6 +511,9 @@ pub(crate) fn format_literal_like(existing: &str, new: f64) -> Option<String> {
     if !new.is_finite() {
         return None;
     }
+    if let Some(radix_literal) = format_radix_like(existing, new) {
+        return radix_literal;
+    }
     let plain = strip_suffix(existing);
     let has_point = plain.contains('.') || plain.contains(['e', 'E']);
     let float_suffix = existing.ends_with("f32") || existing.ends_with("f64");
@@ -523,6 +526,40 @@ pub(crate) fn format_literal_like(existing: &str, new: f64) -> Option<String> {
     }
     let suffix = &existing[plain.len()..];
     Some(format!("{}{suffix}", new as i64))
+}
+
+/// For a `0x`/`0o`/`0b` integer literal, `new` in the same base, letter case and integer suffix
+/// (`0x1E` → `0x2D`, `0x1eu8` → `0x2du8`), or `Some(None)` when `new` has a fraction. `None` when
+/// `existing` is not such a literal. In these bases `e`, `E` and `f32` are digits, not an exponent
+/// or a float suffix. (Project consts are only read in decimal, so `format_like` never meets one.)
+fn format_radix_like(existing: &str, new: f64) -> Option<Option<String>> {
+    let body = existing.strip_prefix('-').unwrap_or(existing);
+    let prefix = body.get(..2)?;
+    let radix = match prefix {
+        "0x" | "0X" => 16,
+        "0o" => 8,
+        "0b" => 2,
+        _ => return None,
+    };
+    if new.fract() != 0.0 {
+        return Some(None);
+    }
+    let rest = &body[2..];
+    let suffix = ["u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize"]
+        .into_iter()
+        .find(|suffix| rest.ends_with(suffix))
+        .unwrap_or("");
+    let digits = &rest[..rest.len() - suffix.len()];
+    let separator = if digits.ends_with('_') { "_" } else { "" };
+    let magnitude = new.abs() as u64;
+    let value = match radix {
+        16 if digits.chars().any(|c| c.is_ascii_uppercase()) => format!("{magnitude:X}"),
+        16 => format!("{magnitude:x}"),
+        8 => format!("{magnitude:o}"),
+        _ => format!("{magnitude:b}"),
+    };
+    let sign = if new < 0.0 { "-" } else { "" };
+    Some(Some(format!("{sign}{prefix}{value}{separator}{suffix}")))
 }
 
 fn skip_literal_or_comment(text: &str, i: usize) -> Option<usize> {
@@ -553,6 +590,31 @@ fn skip_literal_or_comment(text: &str, i: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R11a: a literal keeps its own spelling; in hex, `e` and `f32` are digits.
+    #[test]
+    fn literals_are_respelled_in_their_own_style() {
+        let cases: [(&str, f64, Option<&str>); 12] = [
+            ("30", 45.0, Some("45")),
+            ("30.0", 45.0, Some("45.0")),
+            ("1.6f32", 2.0, Some("2.0f32")),
+            ("30f32", 45.5, Some("45.5f32")),
+            ("30", 45.5, None),
+            ("1e3", 45.0, Some("45.0")),
+            ("0x1E", 45.0, Some("0x2D")),
+            ("0x1e", 45.0, Some("0x2d")),
+            ("0x1Eu8", 45.0, Some("0x2Du8")),
+            ("0x1f32", 45.0, Some("0x2d")),
+            ("0b101", 6.0, Some("0b110")),
+            ("0x1E", 45.5, None),
+        ];
+        for (existing, new, expected) in cases {
+            assert_eq!(format_literal_like(existing, new).as_deref(), expected, "{existing} -> {new}");
+        }
+        // Project consts are read in decimal only, so a hex const is never an edit target.
+        let hex = ProjectConsts::scan(&[(PathBuf::from("c.rs"), "const X: i32 = 0x1E;\n".to_string())]);
+        assert!(hex.get("X").is_none());
+    }
 
     const SPECIALS: &str = "const WALK_LW_DAMAGE:       f32 = 4.0;\nconst WALK_LW_ANGLE:        i32 = 70;\nconst HITBOX_ID: u64 = 2;\npub(crate) const LIFTOFF: i32 = 6;\nlet p: *const u8 = 0 as *const u8;\n// const COMMENTED: f32 = 9.0;\nfn game_x(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, crate::a::LIFTOFF as f32);\n    macros::ATTACK(agent, HITBOX_ID, 0, Hash40::new(\"top\"), WALK_LW_DAMAGE, WALK_LW_ANGLE as u64, 1);\n}\n";
 
