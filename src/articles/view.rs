@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::clone_compat;
-use super::params::{ParamBlock, ParamValue};
+use super::params::{ParamBlock, ParamOverride, ParamValue};
 use super::settings::{Setting, SettingField, SettingValue};
 use super::{Article, ArticleCatalog, ArticleOrigin};
 use crate::acmd_src::StatusSite;
@@ -26,8 +26,57 @@ pub struct ObjectRow {
     /// "Game's", "Rewritten", or "Clone of Mario's fireball".
     pub badge: String,
     pub warnings: Vec<String>,
-    /// The article's scripts as moves (`fly` for `game_fly` and `effect_fly`), sorted.
+    /// The article's scripts in the moveset's source, as moves (`fly` for `game_fly` and
+    /// `effect_fly`), sorted.
     pub scripts: Vec<String>,
+    /// The game's own scripts for it that the source doesn't have, as moves (`fly_throw_b`). Empty
+    /// for a clone, which has no scripts in the game.
+    pub game_scripts: Vec<String>,
+}
+
+/// `FlyThrowB` (the dump's file name) gives `fly_throw_b`.
+pub fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A move name compared without case or underscores: the source's `flythrowb` is the game's
+/// `fly_throw_b`.
+fn loose(name: &str) -> String {
+    name.chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect()
+}
+
+/// [`object_rows`] with the game's own script names per agent (`dump`, Pascal case as the dump
+/// names its files) for the objects that are not clones.
+pub fn object_rows_with(catalog: &ArticleCatalog, dump: &HashMap<String, Vec<String>>) -> Vec<ObjectRow> {
+    let mut rows = object_rows(catalog);
+    for (row, article) in rows.iter_mut().zip(&catalog.articles) {
+        if matches!(article.origin, ArticleOrigin::Clone(_)) {
+            continue;
+        }
+        let Some(names) = dump.get(&article.agent) else {
+            continue;
+        };
+        let mut game: Vec<String> = names
+            .iter()
+            .map(|name| pascal_to_snake(name))
+            .filter(|name| !row.scripts.iter().any(|own| loose(own) == loose(name)))
+            .collect();
+        game.sort();
+        game.dedup();
+        row.game_scripts = game;
+    }
+    rows
 }
 
 fn capitalized(word: &str) -> String {
@@ -104,7 +153,13 @@ pub fn object_rows(catalog: &ArticleCatalog) -> Vec<ObjectRow> {
                 .collect();
             scripts.sort();
             scripts.dedup();
-            ObjectRow { title: article.name.clone(), badge: badge(article), warnings, scripts }
+            ObjectRow {
+                title: article.name.clone(),
+                badge: badge(article),
+                warnings,
+                scripts,
+                game_scripts: Vec::new(),
+            }
         })
         .collect()
 }
@@ -276,6 +331,31 @@ pub struct SettingContext<'a> {
     pub consts: Option<&'a ProjectConsts>,
     /// The project root, so file origins read relative to it.
     pub root: Option<&'a Path>,
+    /// The full name of the block `params` is (`param_lativolt`). When set, a setting that reads
+    /// another block is looked up in `other_blocks` instead, never in `params`.
+    pub block_name: Option<&'a str>,
+    /// The other blocks the settings read, by full name.
+    pub other_blocks: Option<&'a HashMap<String, ParamBlock>>,
+    /// The moveset's `param_config` overrides for the owner fighter: a value they set shows with
+    /// the call's place and is not edited here.
+    pub overrides: &'a [ParamOverride],
+}
+
+/// Where a param value was read, and whether the card may edit it: a `param_config` override
+/// (path empty) is shown at its call and kept read-only, since editing the file under it would
+/// not change what the game reads.
+fn param_origin(block: &str, field: &str, file: &Path, cx: &SettingContext) -> (String, bool) {
+    if !file.as_os_str().is_empty() {
+        return (layer_name(file), true);
+    }
+    let place = cx
+        .overrides
+        .iter()
+        .rev()
+        .find(|o| o.block == block && o.field.as_deref() == Some(field))
+        .map(|o| format!("param_config in {}:{}", short_path(&o.file, cx.root), o.line))
+        .unwrap_or_else(|| "param_config".into());
+    (place, false)
 }
 
 /// [`setting_rows_in`] for variant 0, with no consts or root: the form the card's tests read.
@@ -357,7 +437,6 @@ fn layer_name(file: &Path) -> String {
 
 pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingContext) -> Vec<SettingRow> {
     let mut texts = Texts::new();
-    let fields = params.variants.get(cx.variant).unwrap_or(&params.fields);
     settings
         .iter()
         .map(|setting| {
@@ -401,6 +480,20 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
                 }
                 SettingValue::Param { block, field } => {
                     let place = format!("{block} › {field}");
+                    let named = if cx.block_name.is_none_or(|name| name == block) {
+                        Some(params)
+                    } else {
+                        cx.other_blocks.and_then(|blocks| blocks.get(block))
+                    };
+                    let Some(params) = named else {
+                        return SettingRow {
+                            label,
+                            value: "not read here".into(),
+                            origin: format!("{place} (Visionary doesn't read `{block}` here)"),
+                            editable: false,
+                        };
+                    };
+                    let fields = params.variants.get(cx.variant).unwrap_or(&params.fields);
                     if !params.present {
                         return SettingRow {
                             label,
@@ -410,12 +503,15 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
                         };
                     }
                     match fields.get(field) {
-                        Some((value, file)) => SettingRow {
-                            label,
-                            value: format!("{}{facing}", param_text(value)),
-                            origin: format!("{place} ({})", layer_name(file)),
-                            editable: matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
-                        },
+                        Some((value, file)) => {
+                            let (from, writable) = param_origin(block, field, file, &cx);
+                            SettingRow {
+                                label,
+                                value: format!("{}{facing}", param_text(value)),
+                                origin: format!("{place} ({from})"),
+                                editable: writable && matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
+                            }
+                        }
                         None => SettingRow {
                             label,
                             value: "not set".into(),
@@ -439,8 +535,8 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
 }
 
 /// The fields of a param block nothing in the status code reads, so the card still shows them.
-pub fn unread_param_rows(settings: &[Setting], params: &ParamBlock, block_name: &str, variant: usize) -> Vec<SettingRow> {
-    let fields = params.variants.get(variant).unwrap_or(&params.fields);
+pub fn unread_param_rows(settings: &[Setting], params: &ParamBlock, block_name: &str, cx: SettingContext) -> Vec<SettingRow> {
+    let fields = params.variants.get(cx.variant).unwrap_or(&params.fields);
     fields
         .iter()
         .filter(|(field, _)| {
@@ -448,11 +544,14 @@ pub fn unread_param_rows(settings: &[Setting], params: &ParamBlock, block_name: 
                 matches!(&s.value, SettingValue::Param { block, field: f } if block == block_name && f == *field)
             })
         })
-        .map(|(field, (value, file))| SettingRow {
-            label: field.clone(),
-            value: param_text(value),
-            origin: format!("{block_name} › {field} ({})", layer_name(file)),
-            editable: matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
+        .map(|(field, (value, file))| {
+            let (from, writable) = param_origin(block_name, field, file, &cx);
+            SettingRow {
+                label: field.clone(),
+                value: param_text(value),
+                origin: format!("{block_name} › {field} ({from})"),
+                editable: writable && matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
+            }
         })
         .collect()
 }
@@ -781,11 +880,95 @@ mod tests {
                 }
             }
         }
+        // `lib.rs:158-161` set four `param_cshot` fields through `param_config`.
+        let overrides = crate::articles::param_overrides_for(&index, "samus");
+        let cshot: Vec<(String, f64, usize)> = overrides
+            .iter()
+            .filter(|o| o.block == "param_cshot")
+            .map(|o| (o.field.clone().unwrap_or_default(), o.value, o.line))
+            .collect();
+        assert_eq!(cshot.len(), 8, "{cshot:?}");
+        assert_eq!(
+            cshot[..4],
+            [
+                ("life".to_string(), 60.0, 158),
+                ("ground_effect_frame_span".to_string(), 8.0, 159),
+                ("is_penetration".to_string(), 0.0, 160),
+                ("angle".to_string(), 0.0, 161),
+            ]
+        );
         for row in status_call_rows(&index.status_bodies("samus"), &catalog, Some(root)) {
             labels.push(format!("status {}: {} ({})", row.status, row.label, row.origin));
         }
         eprintln!("{}", labels.join("
 "));
         assert!(labels.iter().all(|l| !l.contains("can't name")), "{labels:#?}");
+    }
+
+    #[test]
+    fn another_block_is_never_shown_as_the_articles_own() {
+        use crate::articles::params::ParamValue;
+        let mut own = ParamBlock { present: true, ..Default::default() };
+        own.fields.insert("x".into(), (ParamValue::Float(1.0), PathBuf::from("fighter/samus/param/vl.prc")));
+        let s = setting(
+            SettingValue::Param { block: "param_special_n".into(), field: "x".into() },
+            PathBuf::from("f.rs"),
+            0..1,
+        );
+        let cx = SettingContext { block_name: Some("param_lativolt"), ..Default::default() };
+        let rows = setting_rows_in(std::slice::from_ref(&s), &own, cx);
+        assert_eq!(rows[0].value, "not read here");
+        assert!(!rows[0].editable);
+        assert!(rows[0].origin.contains("Visionary doesn't read `param_special_n` here"), "{}", rows[0].origin);
+
+        let mut special = ParamBlock { present: true, ..Default::default() };
+        special.fields.insert("x".into(), (ParamValue::Float(7.0), PathBuf::from("fighter/samus/param/vl.prc")));
+        let others = HashMap::from([("param_special_n".to_string(), special)]);
+        let cx = SettingContext { block_name: Some("param_lativolt"), other_blocks: Some(&others), ..Default::default() };
+        let rows = setting_rows_in(&[s], &own, cx);
+        assert_eq!(rows[0].value, "7");
+        assert_eq!(rows[0].origin, "param_special_n › x (samus vl.prc)");
+    }
+
+    #[test]
+    fn param_config_override_shows_its_call_and_is_read_only() {
+        use crate::articles::params::{param_config_overrides, ParamValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("src/lib.rs");
+        let text = "fn f(s: Vec<i32>) {\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, s.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));\n}\n";
+        let overrides = param_config_overrides(&[(lib, text.to_string())]);
+        let mut block = ParamBlock { present: true, ..Default::default() };
+        // `param_block` gives an override an empty path.
+        block.fields.insert("life".into(), (ParamValue::Int(60), PathBuf::new()));
+        let s = setting(
+            SettingValue::Param { block: "param_cshot".into(), field: "life".into() },
+            PathBuf::from("f.rs"),
+            0..1,
+        );
+        let cx = SettingContext { root: Some(tmp.path()), overrides: &overrides, ..Default::default() };
+        let rows = setting_rows_in(&[s], &block, cx);
+        assert_eq!(rows[0].value, "60");
+        assert_eq!(rows[0].origin, "param_cshot › life (param_config in src/lib.rs:2)");
+        assert!(!rows[0].editable);
+        let unread = unread_param_rows(&[], &block, "param_cshot", cx);
+        assert_eq!(unread[0].origin, "param_cshot › life (param_config in src/lib.rs:2)");
+        assert!(!unread[0].editable);
+    }
+
+    #[test]
+    fn game_scripts_list_what_the_source_lacks() {
+        let mut rewritten = vanilla("falco", "blaster_bullet");
+        rewritten.origin = ArticleOrigin::Rewritten;
+        rewritten.source_scripts = vec!["game_fly".into()];
+        let clone = clone_of("WEAPON_KIND_MARIO_FIREBALL", "mario", "lativolt");
+        let c = catalog(vec![rewritten, clone]);
+        let dump = HashMap::from([
+            ("falco_blaster_bullet".to_string(), vec!["Fly".to_string(), "FlyThrowB".to_string()]),
+            ("samus_lativolt".to_string(), vec!["Regular".to_string()]),
+        ]);
+        let rows = object_rows_with(&c, &dump);
+        assert_eq!(rows[0].scripts, ["fly"]);
+        assert_eq!(rows[0].game_scripts, ["fly_throw_b"]);
+        assert!(rows[1].game_scripts.is_empty(), "a clone has no game scripts");
     }
 }

@@ -205,9 +205,26 @@ pub fn catalog_for(
     fighter_names: &[String],
     fighter_dir: &Path,
 ) -> ArticleCatalog {
-    let sources = rust_sources(index);
+    // Only a file that registers a clone or defines a const can matter to the clone reader (the
+    // consts name owners and kinds); the rest are not parsed.
+    let sources: Vec<(std::path::PathBuf, String)> = rust_sources(index)
+        .into_iter()
+        .filter(|(_, text)| text.contains("clone_weapon") || text.contains("const "))
+        .collect();
     let (clones, unresolved) = clones::read_clones(&sources, &index.consts, fighter_names);
     ArticleCatalog::build(fighter, Some(index), &clones, unresolved, fighter_dir)
+}
+
+/// The moveset's `param_config` overrides of `fighter`'s own params (article blocks included).
+pub fn param_overrides_for(index: &SourceIndex, fighter: &str) -> Vec<params::ParamOverride> {
+    let sources: Vec<(std::path::PathBuf, String)> = rust_sources(index)
+        .into_iter()
+        .filter(|(_, text)| text.contains("param_config"))
+        .collect();
+    params::param_config_overrides(&sources)
+        .into_iter()
+        .filter(|o| o.is_for_fighter(fighter))
+        .collect()
 }
 
 /// The settings an article's status scripts write, following the project functions they call

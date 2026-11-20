@@ -596,6 +596,62 @@ mod linked_acmd_index_tests {
     }
 }
 
+/// The agent an edit is logged under: the fighter's, or `None` while an object's script is open,
+/// because the edit log, the project file and the export are keyed by fighter and would carry an
+/// object's `game_fly` as the fighter's own `game_fly`.
+fn edit_log_target<'a>(open_article: Option<&str>, fighter: &'a str) -> Option<&'a str> {
+    open_article.is_none().then_some(fighter)
+}
+
+/// Remove everything keyed by an object agent from `project`, returning the agents removed.
+fn strip_object_agents(
+    project: &mut crate::mod_project::ModProjectFile,
+    agents: &BTreeSet<String>,
+) -> Vec<String> {
+    let dropped: Vec<String> = project
+        .fighters
+        .keys()
+        .filter(|name| agents.contains(*name))
+        .cloned()
+        .collect();
+    for agent in &dropped {
+        project.fighters.remove(agent);
+    }
+    dropped
+}
+
+#[cfg(test)]
+mod object_edit_tests {
+    use super::*;
+
+    /// While `samus_lativolt` is open nothing is logged under `samus`; a fighter move still is.
+    #[test]
+    fn object_script_edit_is_never_logged_under_the_fighter() {
+        assert_eq!(edit_log_target(Some("samus_lativolt"), "samus"), None);
+        assert_eq!(edit_log_target(None, "samus"), Some("samus"));
+    }
+
+    /// Whatever an object script left keyed by its agent (effect, sound or source snapshots)
+    /// never reaches the project or the export; the fighter's own entry stays.
+    #[test]
+    fn project_drops_object_agents_only() {
+        let mut project = crate::mod_project::ModProjectFile {
+            version: crate::mod_project::PROJECT_VERSION,
+            name: "t".into(),
+            fighters: HashMap::new(),
+            roster: Default::default(),
+            project_fighters: BTreeSet::new(),
+            moveset_source: None,
+        };
+        project.fighters.insert("samus".into(), Default::default());
+        project.fighters.insert("samus_lativolt".into(), Default::default());
+        let agents = BTreeSet::from(["samus_lativolt".to_string()]);
+        assert_eq!(strip_object_agents(&mut project, &agents), ["samus_lativolt"]);
+        assert!(project.fighters.contains_key("samus"));
+        assert!(!project.fighters.contains_key("samus_lativolt"));
+    }
+}
+
 /// The Settings card for one object: which list entry of its param block it shows, the text
 /// being typed per row, and the last save's result.
 struct ArticleSettingsCard {
@@ -606,18 +662,110 @@ struct ArticleSettingsCard {
     /// Read when the card opens and after each save, not every frame.
     settings: Vec<crate::articles::settings::Setting>,
     block: crate::articles::params::ParamBlock,
+    /// Other blocks the settings read (`param_special_n`), by full name.
+    other_blocks: HashMap<String, crate::articles::params::ParamBlock>,
     /// The moveset's own param files for the object's owner: the only files a save may change.
     own: Vec<PathBuf>,
 }
 
-/// The selected fighter's objects, read once per source index.
+/// The selected fighter's objects, read off the UI thread once per change of the source files.
 struct ArticleCache {
     fighter: String,
+    /// The index's files and their modification times when this was read; a rebuilt index with
+    /// the same files keeps the cache.
+    fingerprint: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     catalog: crate::articles::ArticleCatalog,
     /// Article calls in the fighter's own status code, read-only.
     status_rows: Vec<crate::articles::view::StatusCallRow>,
     /// Status registrations the index could not place, for the fighter or its objects.
     unresolved_statuses: Vec<crate::acmd_src::UnresolvedStatus>,
+    /// The moveset's `param_config` overrides for this fighter.
+    overrides: Vec<crate::articles::params::ParamOverride>,
+    /// The game's own script names (Pascal case) per object agent; filled in after the catalog,
+    /// since listing them may need the network.
+    dump_scripts: HashMap<String, Vec<String>>,
+    /// Why the game's scripts aren't listed, when they aren't.
+    dump_note: Option<String>,
+}
+
+/// What the background object reader sends back.
+enum ArticleJobResult {
+    Cache(ArticleCache),
+    Dump(HashMap<String, Vec<String>>, Option<String>),
+}
+
+/// The files and modification times an object catalog was read from (`None` index: none).
+fn source_fingerprint(index: Option<&crate::acmd_src::SourceIndex>) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let Some(index) = index else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, Option<std::time::SystemTime>)> = std::iter::once(index.root.clone())
+        .chain(index.files.iter().cloned())
+        .map(|file| {
+            let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+            (file, modified)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The param files of `owner` a Settings card may save to: those under the moveset's own roots
+/// (its `romfs/`, the open project's `romfs/`) that exist, never one inside the dump or a Mod
+/// Library root (`shared`), each once however it is spelled.
+fn own_param_files(owner: &str, own_roots: &[PathBuf], shared: &[PathBuf]) -> Vec<PathBuf> {
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let shared: Vec<PathBuf> = shared.iter().map(|root| canonical(root)).collect();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for root in own_roots {
+        for name in ["vl.prc", "vl.prcxml"] {
+            let file = root.join("fighter").join(owner).join("param").join(name);
+            if !file.is_file() {
+                continue;
+            }
+            let real = canonical(&file);
+            if shared.iter().any(|root| real.starts_with(root)) || seen.contains(&real) {
+                continue;
+            }
+            seen.push(real);
+            out.push(file);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod own_param_files_tests {
+    use super::*;
+
+    fn put(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn own_files_never_include_the_dump_or_the_mod_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dump = tmp.path().join("dump");
+        let library = tmp.path().join("library");
+        let moveset = tmp.path().join("moveset");
+        // A moveset whose romfs sits under the dump, and one that is a Mod Library root.
+        let under_dump = dump.join("mods").join("romfs");
+        put(&under_dump.join("fighter/samus/param/vl.prc"));
+        put(&library.join("fighter/samus/param/vl.prc"));
+        put(&moveset.join("romfs/fighter/samus/param/vl.prc"));
+        let shared = [dump.clone(), library.clone()];
+        assert!(own_param_files("samus", &[under_dump], &shared).is_empty());
+        assert!(own_param_files("samus", &[library.clone()], &shared).is_empty());
+        let own = moveset.join("romfs");
+        // The same root named twice (another spelling of it) gives the file once.
+        let again = moveset.join(".").join("romfs");
+        assert_eq!(
+            own_param_files("samus", &[own.clone(), again], &shared),
+            [own.join("fighter/samus/param/vl.prc")]
+        );
+    }
 }
 
 /// The primary editor is deliberately split into task-sized surfaces.  The underlying ACMD
@@ -4079,9 +4227,20 @@ pub struct VisionaryApp {
     /// The selected fighter's objects (fighter name, catalog), built from the linked source on
     /// first use after the index is (re)built. `None` until then; cleared with every new index.
     article_catalog: Option<ArticleCache>,
+    /// Bumped whenever `acmd_src` is replaced; the catalog is checked again when it changes.
+    acmd_src_generation: u64,
+    /// The generation the catalog was last checked against.
+    article_catalog_generation: u64,
+    /// The background read of a catalog: (fighter, generation, results).
+    article_catalog_job: Option<(String, u64, std::sync::mpsc::Receiver<ArticleJobResult>)>,
     /// The object agent (`samus_lativolt`) whose script is open as the move, instead of the
     /// selected fighter's own. Cleared when a fighter move or another fighter is chosen.
     open_article: Option<String>,
+    /// Every object agent opened as a move this session. Anything keyed by one of them is kept
+    /// out of the project file and the export (see [`strip_object_agents`]).
+    opened_object_agents: BTreeSet<String>,
+    /// Object-call argument text being typed on the timeline, by (statement, argument).
+    article_arg_edits: HashMap<(usize, usize), String>,
     /// The Settings card window for one object, when open.
     article_settings: Option<ArticleSettingsCard>,
     /// The fighters `acmd_src` installs only on chosen costume slots, refreshed with
@@ -4573,7 +4732,12 @@ impl VisionaryApp {
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
             article_catalog: None,
+            acmd_src_generation: 0,
+            article_catalog_generation: u64::MAX,
+            article_catalog_job: None,
             open_article: None,
+            opened_object_agents: BTreeSet::new(),
+            article_arg_edits: HashMap::new(),
             article_settings: None,
             acmd_src_costume_gated: BTreeSet::new(),
             edited_fighters: BTreeSet::new(),
@@ -4787,8 +4951,9 @@ impl VisionaryApp {
 
     /// Re-derive [`Self::acmd_src_fighters`] after `acmd_src` was replaced.
     fn refresh_acmd_src_fighters(&mut self) {
-        // A new index may add, drop or rename the moveset's objects.
-        self.article_catalog = None;
+        // A new index may add, drop or rename the moveset's objects; the catalog checks its
+        // files against it on next use and is kept when they are unchanged.
+        self.acmd_src_generation = self.acmd_src_generation.wrapping_add(1);
         self.acmd_src_fighters = self
             .acmd_src
             .as_ref()
@@ -5676,6 +5841,7 @@ impl VisionaryApp {
             anim_path: None,
             cancel_frame: 0,
         };
+        self.opened_object_agents.insert(agent.clone());
         self.select_script(Some(agent), move_entry);
     }
 
@@ -5688,6 +5854,7 @@ impl VisionaryApp {
         // the last drag or source-point edit.
         self.commit_current_edits();
         self.open_article = article;
+        self.article_arg_edits.clear();
 
         let fighter_name = self.script_agent();
         if let Some(fighter_name) = fighter_name {
@@ -5914,12 +6081,33 @@ impl VisionaryApp {
             self.pending_project_script = Some(project);
         }
 
+        // An object's script comes from the dump's folder for that object
+        // (`lua2cpp_samus/samus_cshot/Shoot.txt`), never the fighter-move URL, which would cache
+        // an empty file under the object's name. A clone has none in the game.
+        let object = self.open_article.as_ref().map(|agent| {
+            let owner = self
+                .article_catalog
+                .as_ref()
+                .and_then(|cache| cache.catalog.get(agent))
+                .map(|article| article.owner.clone())
+                .unwrap_or_else(|| agent.split('_').next().unwrap_or(agent).to_string());
+            (owner, self.open_article_is_clone())
+        });
         self.fetching_acmd = true;
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let body = crate::acmd::fetch_script_body_cached(&fighter_name, &move_name)
-                .map_err(|e| e.to_string());
+            let body = match &object {
+                Some((_, true)) => Ok(String::new()),
+                Some((owner, false)) => Ok(crate::acmd::fetch_object_script(
+                    owner,
+                    &fighter_name,
+                    &crate::acmd::move_name_to_pascal(&move_name),
+                )
+                .unwrap_or_default()),
+                None => crate::acmd::fetch_script_body_cached(&fighter_name, &move_name)
+                    .map_err(|e| e.to_string()),
+            };
             let _ = tx.send((fighter_name, move_name, body));
             // The app is reactive and may be sitting idle; without this the finished fetch
             // would not appear until the user happened to move the mouse.
@@ -6956,6 +7144,20 @@ impl VisionaryApp {
             return;
         };
         let move_name = move_entry.name.clone();
+        if self.open_article.is_some()
+            && self
+                .acmd_src
+                .as_ref()
+                .is_none_or(|index| index.script_source(&fighter, &move_name).is_none())
+        {
+            // Creating an object's first script would need its own agent registration, which
+            // the category writer doesn't make; refusing keeps the fighter's files untouched.
+            self.state.status = format!(
+                "{fighter}/{move_name} is the game's own script — add it to the moveset's source \
+                 before syncing changes to it"
+            );
+            return;
+        }
 
         // Rebuild spans before reading the source snapshot. A source edit made outside Visionary
         // can leave an old span in bounds while pointing at a different function.
@@ -9485,6 +9687,12 @@ impl VisionaryApp {
     }
 
     fn commit_current_edits(&mut self) {
+        if edit_log_target(self.open_article.as_deref(), "").is_none() {
+            // The edit log and the export are keyed by fighter: logging an object's script here
+            // would export it as the fighter's move of the same name. Its edits reach disk only
+            // through a source sync, and the editor says so while it is open.
+            return;
+        }
         let fighter = match self
             .state
             .selected_fighter
@@ -12494,6 +12702,14 @@ impl VisionaryApp {
             ui.weak("Select a move to author nodes.");
             return;
         };
+        if let Some(agent) = &self.open_article {
+            // Graphs, the edit log and the export are all keyed by fighter; an object's script
+            // saved there would land on the fighter's move of the same name.
+            ui.weak(format!(
+                "{agent} is an object's script. Move nodes don't edit object scripts yet — use the                  Classic editor and sync the change into the linked source."
+            ));
+            return;
+        }
         if self.fetching_acmd {
             ui.weak("Loading move scripts…");
             return;
@@ -19779,20 +19995,69 @@ impl VisionaryApp {
 
     // ── Objects (articles) ────────────────────────────────────────────────────
 
-    /// Build the selected fighter's object catalog if the index changed since it was last built.
-    /// It is read from the same source index the moves use, so it follows every rescan.
+    /// Keep the selected fighter's object catalog current: read it off the UI thread when the
+    /// source files changed since it was read (or the fighter changed), and keep it otherwise.
+    /// The game's own script names for its objects arrive after it, since they may need the
+    /// network.
     fn ensure_article_catalog(&mut self) {
         let Some(entry) = self
             .state
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
+            .cloned()
         else {
             self.article_catalog = None;
+            self.article_catalog_job = None;
             return;
         };
         let fighter = entry.name.clone();
-        if self.article_catalog.as_ref().is_some_and(|cache| cache.fighter == fighter) {
+        // Take what the background read has sent.
+        if let Some((job_fighter, job_generation, rx)) = self.article_catalog_job.take() {
+            let mut keep = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(ArticleJobResult::Cache(cache)) => {
+                        if cache.fighter == fighter {
+                            self.article_catalog = Some(cache);
+                            self.article_catalog_generation = job_generation;
+                        }
+                    }
+                    Ok(ArticleJobResult::Dump(scripts, note)) => {
+                        if let Some(cache) = self.article_catalog.as_mut().filter(|c| c.fighter == job_fighter) {
+                            cache.dump_scripts = scripts;
+                            cache.dump_note = note;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if keep && job_fighter == fighter {
+                self.article_catalog_job = Some((job_fighter, job_generation, rx));
+            }
+        }
+        let generation = self.acmd_src_generation;
+        let have = self.article_catalog.as_ref().is_some_and(|c| c.fighter == fighter);
+        if have && self.article_catalog_generation == generation {
             return;
+        }
+        if self
+            .article_catalog_job
+            .as_ref()
+            .is_some_and(|(f, g, _)| *f == fighter && *g == generation)
+        {
+            return;
+        }
+        let fingerprint = source_fingerprint(self.acmd_src.as_ref());
+        if have && self.article_catalog.as_ref().is_some_and(|c| c.fingerprint == fingerprint) {
+            self.article_catalog_generation = generation;
+            return;
+        }
+        if !have {
+            self.article_catalog = None;
         }
         // The game's own objects come from the dump's folders for this fighter.
         let fighter_dir = self
@@ -19803,29 +20068,72 @@ impl VisionaryApp {
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(|| entry.fighter_dir.clone());
         let names: Vec<String> = self.state.fighters.iter().map(|f| f.name.clone()).collect();
-        let (catalog, status_rows, unresolved_statuses) = match self.acmd_src.as_ref() {
-            Some(index) => {
-                let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
-                let bodies = index.status_bodies(&fighter);
-                let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
-                let agents: Vec<&str> = std::iter::once(fighter.as_str())
-                    .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
-                    .collect();
-                let unresolved = index
-                    .unresolved_statuses
-                    .iter()
-                    .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
-                    .cloned()
-                    .collect();
-                (catalog, rows, unresolved)
+        let index = self.acmd_src.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.egui_ctx.clone();
+        let job_fighter = fighter.clone();
+        std::thread::spawn(move || {
+            let fighter = job_fighter;
+            let (catalog, status_rows, unresolved_statuses, overrides) = match index.as_ref() {
+                Some(index) => {
+                    let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
+                    let bodies = index.status_bodies(&fighter);
+                    let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
+                    let agents: Vec<&str> = std::iter::once(fighter.as_str())
+                        .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
+                        .collect();
+                    let unresolved = index
+                        .unresolved_statuses
+                        .iter()
+                        .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
+                        .cloned()
+                        .collect();
+                    let overrides = crate::articles::param_overrides_for(index, &fighter);
+                    (catalog, rows, unresolved, overrides)
+                }
+                None => (
+                    crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+            let agents: Vec<(String, String)> = catalog
+                .articles
+                .iter()
+                .filter(|a| !matches!(a.origin, crate::articles::ArticleOrigin::Clone(_)))
+                .map(|a| (a.owner.clone(), a.agent.clone()))
+                .collect();
+            let _ = tx.send(ArticleJobResult::Cache(ArticleCache {
+                fighter,
+                fingerprint,
+                catalog,
+                status_rows,
+                unresolved_statuses,
+                overrides,
+                dump_scripts: HashMap::new(),
+                dump_note: None,
+            }));
+            ctx.request_repaint();
+            // The game's own scripts per object, from the script dump (cached after the first
+            // listing). An object the dump has no folder for simply has none.
+            let mut scripts = HashMap::new();
+            let mut failed = 0usize;
+            for (owner, agent) in agents {
+                match crate::effect_uses::script_names(&owner, &agent) {
+                    Ok(names) => {
+                        scripts.insert(agent, names);
+                    }
+                    Err(_) => failed += 1,
+                }
             }
-            None => (
-                crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
-                Vec::new(),
-                Vec::new(),
-            ),
-        };
-        self.article_catalog = Some(ArticleCache { fighter, catalog, status_rows, unresolved_statuses });
+            let note = (failed > 0 && scripts.is_empty()).then(|| {
+                "The game's own object scripts couldn't be listed (no connection to the script dump?)".to_string()
+            });
+            let _ = tx.send(ArticleJobResult::Dump(scripts, note));
+            ctx.request_repaint();
+        });
+        self.article_catalog_job = Some((fighter, generation, rx));
     }
 
     /// The param files the object's owner is read from, lowest first: the dump, the Mod Library,
@@ -19839,21 +20147,14 @@ impl VisionaryApp {
                 layers.push(param_dir(&root).join(name));
             }
         }
-        let mut own = Vec::new();
-        let own_roots = self
+        let own_roots: Vec<PathBuf> = self
             .acmd_src
             .as_ref()
             .map(|index| index.root.join("romfs"))
             .into_iter()
-            .chain(self.project_romfs());
-        for root in own_roots {
-            for name in ["vl.prc", "vl.prcxml"] {
-                let file = param_dir(&root).join(name);
-                if file.exists() && !own.contains(&file) {
-                    own.push(file);
-                }
-            }
-        }
+            .chain(self.project_romfs())
+            .collect();
+        let own = own_param_files(owner, &own_roots, &self.shared_roots());
         layers.retain(|file| file.exists() && !own.contains(file));
         layers.extend(own.iter().cloned());
         (layers, own)
@@ -19867,6 +20168,7 @@ impl VisionaryApp {
             message: None,
             settings: Vec::new(),
             block: Default::default(),
+            other_blocks: HashMap::new(),
             own: Vec::new(),
         };
         self.reload_article_settings(&mut card);
@@ -19889,8 +20191,36 @@ impl VisionaryApp {
             .map(|index| crate::articles::settings_for(index, &article.agent))
             .unwrap_or_default();
         let (layers, own) = self.article_param_layers(&article.owner);
+        let overrides: Vec<crate::articles::params::ParamOverride> = self
+            .article_catalog
+            .as_ref()
+            .map(|cache| cache.overrides.clone())
+            .unwrap_or_default();
+        let block_of = |name: &str| {
+            let full = format!("param_{name}");
+            let set = crate::articles::params::block_overrides(&overrides, &article.owner, &full);
+            crate::articles::params::param_block(&layers, &set, name, &self.state.labels)
+        };
         // A clone reads its NEW owner's `param_<new_name>`, which is `article.name` here.
-        card.block = crate::articles::params::param_block(&layers, &[], &article.name, &self.state.labels);
+        card.block = block_of(&article.name);
+        // Each other block a setting reads is loaded under its own name, never shown as this one.
+        let own_block = format!("param_{}", article.name);
+        card.other_blocks = card
+            .settings
+            .iter()
+            .filter_map(|s| match &s.value {
+                crate::articles::settings::SettingValue::Param { block, .. } if *block != own_block => {
+                    Some(block.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .filter_map(|full| {
+                let name = full.strip_prefix("param_")?.to_string();
+                Some((full, block_of(&name)))
+            })
+            .collect();
         card.own = own;
         if card.variant >= card.block.variants.len().max(1) {
             card.variant = 0;
@@ -19946,9 +20276,14 @@ impl VisionaryApp {
     fn draw_objects_list(&mut self, ui: &mut Ui, max_height: f32) {
         self.ensure_article_catalog();
         let Some(cache) = self.article_catalog.as_ref() else {
+            if self.article_catalog_job.is_some() {
+                ui.separator();
+                ui.weak("Reading this fighter's objects…");
+            }
             return;
         };
-        let rows = crate::articles::view::object_rows(&cache.catalog);
+        let rows = crate::articles::view::object_rows_with(&cache.catalog, &cache.dump_scripts);
+        let dump_note = cache.dump_note.clone();
         let agents: Vec<String> = cache.catalog.articles.iter().map(|a| a.agent.clone()).collect();
         let unresolved_clones = cache.catalog.unresolved_clones.clone();
         let unresolved_statuses = cache.unresolved_statuses.clone();
@@ -19959,6 +20294,15 @@ impl VisionaryApp {
             "Objects",
             "Projectiles and other objects this fighter can create: the game's own, ones the linked moveset rewrites, and clones it adds. Click a script to open it like a move.",
         );
+        if let Some(agent) = &self.open_article {
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 170, 90),
+                RichText::new(format!(
+                    "{agent} is open: its changes are saved by syncing them into the linked source.                      They are not kept in the project or exported yet."
+                ))
+                .small(),
+            );
+        }
         let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
         let mut to_open: Option<(String, String)> = None;
         let mut settings_for: Option<String> = None;
@@ -19971,6 +20315,9 @@ impl VisionaryApp {
                 if rows.is_empty() {
                     ui.weak("No objects found for this fighter");
                 }
+                if let Some(note) = &dump_note {
+                    ui.weak(RichText::new(note).small());
+                }
                 for (row, agent) in rows.iter().zip(&agents) {
                     egui::CollapsingHeader::new(format!("{}  ·  {}", row.title, row.badge))
                         .id_salt(("object", agent.as_str()))
@@ -19979,8 +20326,8 @@ impl VisionaryApp {
                             for warning in &row.warnings {
                                 ui.colored_label(warn, RichText::new(warning).small());
                             }
-                            if row.scripts.is_empty() {
-                                ui.weak(RichText::new("The linked source has no scripts for it; the game's own run.").small());
+                            if row.scripts.is_empty() && row.game_scripts.is_empty() {
+                                ui.weak(RichText::new("No scripts listed for it: the linked source has none, and the game's weren't found.").small());
                             }
                             for script in &row.scripts {
                                 let open = self.open_article.as_deref() == Some(agent.as_str())
@@ -19988,6 +20335,24 @@ impl VisionaryApp {
                                 if ui
                                     .selectable_label(open, format_move_name(script))
                                     .on_hover_text(format!("{agent} · {script}"))
+                                    .clicked()
+                                    && !open
+                                {
+                                    to_open = Some((agent.clone(), script.clone()));
+                                }
+                            }
+                            for script in &row.game_scripts {
+                                let open = self.open_article.as_deref() == Some(agent.as_str())
+                                    && selected_move.as_deref() == Some(script.as_str());
+                                if ui
+                                    .selectable_label(
+                                        open,
+                                        RichText::new(format!("{} · game's", format_move_name(script))).weak(),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{agent} · {script}: the game's own script. It opens like a vanilla move; \
+                                         to change it, add it to the moveset's source."
+                                    ))
                                     .clicked()
                                     && !open
                                 {
@@ -20052,6 +20417,7 @@ impl VisionaryApp {
 
     /// The Settings card window for one object.
     fn draw_article_settings_window(&mut self, ctx: &egui::Context) {
+        self.ensure_article_catalog();
         let Some(mut card) = self.article_settings.take() else {
             return;
         };
@@ -20061,8 +20427,15 @@ impl VisionaryApp {
             .and_then(|cache| cache.catalog.get(&card.agent))
             .cloned()
         else {
+            // Still being read (or re-read): keep the card for the next frame.
+            self.article_settings = Some(card);
             return;
         };
+        let overrides: Vec<crate::articles::params::ParamOverride> = self
+            .article_catalog
+            .as_ref()
+            .map(|cache| cache.overrides.clone())
+            .unwrap_or_default();
         let root = self.acmd_src.as_ref().map(|index| index.root.clone());
         let consts = self.acmd_src.as_ref().map(|index| index.consts.clone());
         let mut open = true;
@@ -20111,10 +20484,13 @@ impl VisionaryApp {
                     variant: card.variant,
                     consts: consts.as_deref(),
                     root: root.as_deref(),
+                    block_name: Some(&block_name),
+                    other_blocks: Some(&card.other_blocks),
+                    overrides: &overrides,
                 };
                 let rows = crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
                 // Params nothing in the status code reads still show, editable the same way.
-                let extra = crate::articles::view::unread_param_rows(&card.settings, &card.block, &block_name, card.variant);
+                let extra = crate::articles::view::unread_param_rows(&card.settings, &card.block, &block_name, cx);
                 let extra_settings: Vec<crate::articles::settings::Setting> = extra
                     .iter()
                     .map(|row| crate::articles::settings::Setting {
@@ -20233,6 +20609,7 @@ impl VisionaryApp {
             "ArticleModule",
         );
         let mut edit: Option<(usize, crate::data::ArticleCall)> = None;
+        let mut arg_edits = std::mem::take(&mut self.article_arg_edits);
         let mut site = 0usize;
         for ((frame, call), label) in calls.iter().zip(&labels) {
             let is_script = call.origin == crate::data::ArticleOrigin::Script;
@@ -20280,22 +20657,28 @@ impl VisionaryApp {
                     if Some(n) == call.op.target_index() {
                         continue;
                     }
-                    let mut text = arg.clone();
+                    // The text being typed lives across frames, keyed by statement and argument,
+                    // and is applied when the box loses focus.
+                    let text = arg_edits.entry((this_site, n)).or_insert_with(|| arg.clone());
                     let width = (text.len() as f32 * 7.0).clamp(30.0, 200.0);
-                    if ui
-                        .add(egui::TextEdit::singleline(&mut text).desired_width(width))
-                        .lost_focus()
-                        && text.trim() != arg.trim()
-                        && !text.trim().is_empty()
-                    {
-                        let mut changed = call.clone();
-                        changed.args[n] = text.trim().to_string();
-                        changed.edited = true;
-                        edit = Some((this_site, changed));
+                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(width));
+                    if response.lost_focus() {
+                        let typed = text.trim().to_string();
+                        arg_edits.remove(&(this_site, n));
+                        if typed != arg.trim() && !typed.is_empty() {
+                            let mut changed = call.clone();
+                            changed.args[n] = typed;
+                            changed.edited = true;
+                            edit = Some((this_site, changed));
+                        }
+                    } else if !response.has_focus() && text.as_str() == arg.as_str() {
+                        // Not being typed in: follow the script, so a later edit shows.
+                        arg_edits.remove(&(this_site, n));
                     }
                 }
             });
         }
+        self.article_arg_edits = arg_edits;
         let mut reveal: Option<PathBuf> = None;
         for row in &status_rows {
             ui.horizontal_wrapped(|ui| {
@@ -21949,6 +22332,15 @@ impl VisionaryApp {
                 .or_default()
                 .capture_branch_warnings
                 .insert(move_name.to_string(), warning.clone());
+        }
+        // An object script's edits are keyed by its agent (`samus_lativolt/fly`); the project and
+        // the export know only fighters, so they never carry one.
+        let dropped = strip_object_agents(&mut project, &self.opened_object_agents);
+        if !dropped.is_empty() {
+            self.state.status = format!(
+                "Object script edits ({}) are not kept in the project — sync them into the linked source",
+                dropped.join(", ")
+            );
         }
         // A fighter's first edit adds it to the project, and it stays after the edit is undone:
         // recorded on `self`, which outlives this build, then copied into the file.

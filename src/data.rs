@@ -2188,6 +2188,21 @@ impl ArticleOp {
         }
     }
 
+    /// How many arguments follow the article id, from the vanilla `lua_bind` signatures
+    /// (`generate_article(boma, id, bool, i32)` is 2). `None` for [`ArticleOp::Other`].
+    pub fn arity(&self) -> Option<usize> {
+        Some(match self {
+            Self::Remove | Self::RemoveExist | Self::ChangeStatusExist => 1,
+            Self::SetRate | Self::SetFrame | Self::SetPos => 1,
+            Self::Generate | Self::GenerateEnable | Self::Shoot | Self::ShootExist => 2,
+            Self::ChangeStatus | Self::SetVisibilityWhole => 2,
+            Self::SetFlag | Self::SetInt | Self::SetFloat => 2,
+            Self::ChangeMotion | Self::SetVisibility => 3,
+            Self::AddMotionPartial => 10,
+            Self::Other(_) => return Option::None,
+        })
+    }
+
     /// Where the `ArticleOperationTarget` sits in [`ArticleCall::args`], from the vanilla
     /// `lua_bind` signatures. `None` for functions that take no target.
     pub fn target_index(&self) -> Option<usize> {
