@@ -314,11 +314,11 @@ impl Reader<'_> {
     }
 
     /// Resolves one call into a declaration, or reports why it cannot.
-    fn resolve(&mut self, call: &syn::ExprCall) -> Option<usize> {
+    fn resolve(&mut self, call: &syn::ExprCall, discarded: bool) -> Option<usize> {
         use syn::spanned::Spanned;
         let args: Args = call.args.iter().collect();
         let built = match args.len() {
-            5 => self.resolve_old(&args),
+            5 => self.resolve_old(&args, discarded),
             4 => self.resolve_new(&args),
             n => Err(format!("clone_weapon takes 4 or 5 arguments, this call has {n}")),
         };
@@ -336,7 +336,7 @@ impl Reader<'_> {
         }
     }
 
-    fn resolve_old(&self, a: &Args) -> Result<CloneDecl, String> {
+    fn resolve_old(&self, a: &Args, discarded: bool) -> Result<CloneDecl, String> {
         Ok(CloneDecl {
             src_owner: Some(self.string_arg(a[0], "source owner")?),
             src_kind: self.kind_arg(a[1])?,
@@ -345,7 +345,7 @@ impl Reader<'_> {
             use_original_code: Self::bool_arg(a[4])?,
             id_bindings: Vec::new(),
             kind_bindings: Vec::new(),
-            id_note: None,
+            id_note: (!discarded).then(|| UNBOUND_ID.to_string()),
             file: PathBuf::new(),
             line: 0,
         })
@@ -389,9 +389,10 @@ impl Reader<'_> {
             return true;
         }
         let Some(call) = find_clone_call(value) else { return false };
-        let id = self.resolve(call);
+        let id = self.resolve(call, false);
         if let (Some(index), Some(name)) = (id, target_name(target)) {
             self.decls[index].id_bindings.push(name);
+            self.decls[index].id_note = None;
         }
         true
     }
@@ -399,7 +400,7 @@ impl Reader<'_> {
     /// `A.get_or_init(|| clone_weapon(..).generate_id)` / `A = clone_weapon(..).weapon_id`.
     fn inline_store(&mut self, target: &syn::Expr, value: &syn::Expr) -> bool {
         let Some((call, field)) = inline_field(value) else { return false };
-        if let Some(index) = self.resolve(call) {
+        if let Some(index) = self.resolve(call, false) {
             if let Some(name) = target_name(target) {
                 if field == "id" {
                     self.decls[index].id_bindings.push(name);
@@ -421,9 +422,11 @@ impl Reader<'_> {
             syn::Pat::Ident(p) => Some(p.ident.to_string()),
             _ => None,
         };
-        let Some(index) = self.resolve(call) else { return true };
+        let Some(index) = self.resolve(call, false) else { return true };
         if let Some(var) = var {
-            let mut finder = BindingFinder { var, aliases: Vec::new(), ids: Vec::new(), kinds: Vec::new() };
+            // The old signature returns the id itself, so the variable is the id.
+            let direct = call.args.len() == 5;
+            let mut finder = BindingFinder { var, direct, aliases: Vec::new(), ids: Vec::new(), kinds: Vec::new() };
             for stmt in rest {
                 syn::visit::Visit::visit_stmt(&mut finder, stmt);
             }
@@ -442,6 +445,13 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
         for (i, stmt) in block.stmts.iter().enumerate() {
             if let syn::Stmt::Local(local) = stmt {
                 if self.let_binding(local, &block.stmts[i + 1..]) {
+                    continue;
+                }
+            }
+            // `clone_weapon(..);` on its own: the id is discarded on purpose.
+            if let syn::Stmt::Expr(syn::Expr::Call(call), _) = stmt {
+                if is_clone_call(call) {
+                    self.resolve(call, true);
                     continue;
                 }
             }
@@ -475,7 +485,7 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if is_clone_call(call) {
-            self.resolve(call);
+            self.resolve(call, false);
             return;
         }
         syn::visit::visit_expr_call(self, call);
@@ -528,6 +538,8 @@ fn collect_pat_names(pat: &syn::Pat, out: &mut Vec<String>) {
 /// `A.set(v.generate_id)` or `A = v.generate_id`.
 struct BindingFinder {
     var: String,
+    /// Old signature: the variable itself is the generate id.
+    direct: bool,
     /// Names bound to a field read (`let id = v.generate_id;`), with which field.
     aliases: Vec<(String, &'static str)>,
     ids: Vec<String>,
@@ -539,6 +551,7 @@ impl BindingFinder {
     fn field_of(&self, expr: &syn::Expr) -> Option<&'static str> {
         struct Probe<'v> {
             var: &'v str,
+            direct: bool,
             aliases: &'v [(String, &'static str)],
             found: Option<&'static str>,
         }
@@ -546,6 +559,9 @@ impl BindingFinder {
             fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
                 if p.path.segments.len() == 1 {
                     let name = p.path.segments[0].ident.to_string();
+                    if self.direct && name == self.var {
+                        self.found = Some("id");
+                    }
                     if let Some((_, field)) = self.aliases.iter().find(|(n, _)| *n == name) {
                         self.found = Some(field);
                     }
@@ -565,7 +581,7 @@ impl BindingFinder {
                 syn::visit::visit_expr_field(self, f);
             }
         }
-        let mut probe = Probe { var: &self.var, aliases: &self.aliases, found: None };
+        let mut probe = Probe { var: &self.var, direct: self.direct, aliases: &self.aliases, found: None };
         syn::visit::Visit::visit_expr(&mut probe, expr);
         probe.found
     }
@@ -596,6 +612,13 @@ impl<'ast> syn::visit::Visit<'ast> for BindingFinder {
             }
         }
         syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::AddAssign(_)) {
+            self.store(&node.left, &node.right);
+        }
+        syn::visit::visit_expr_binary(self, node);
     }
 
     fn visit_expr_assign(&mut self, node: &'ast syn::ExprAssign) {
@@ -747,14 +770,50 @@ unsafe fn f(slot: *mut i32) {
     *slot = clone.generate_id;
     let b = smashline::clone_weapon("mario", "b", *WEAPON_KIND_LINK_SWORD_BEAM, false);
     let smashline::CloneWeapon { generate_id, .. } = b;
+    let (a, b) = smashline::clone_weapon("mario", "c", *WEAPON_KIND_LINK_SWORD_BEAM, false);
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 3);
+        for decl in &d {
+            assert!(decl.id_bindings.is_empty());
+            let note = decl.id_note.as_deref().expect("a reason");
+            assert!(note.contains("does not follow"), "{note}");
+        }
+    }
+
+    /// Old API result stored in a variable, then in a name (two-hop), with `=` and `+=`.
+    #[test]
+    fn old_api_two_hop_binds() {
+        let (d, u) = run(r#"
+fn f() {
+    let id = smashline::clone_weapon("link", *WEAPON_KIND_LINK_SWORD_BEAM, "samus", "a", false);
+    A.set(id).ok();
+    let id2 = smashline::clone_weapon("link", *WEAPON_KIND_LINK_SWORD_BEAM, "samus", "b", false);
+    unsafe { B += id2; }
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d[0].id_bindings, ["A"]);
+        assert_eq!(d[0].id_note, None);
+        assert_eq!(d[1].id_bindings, ["B"]);
+        assert_eq!(d[1].id_note, None);
+    }
+
+    /// Old API result stored through a pointer or destructured: kept with a reason.
+    #[test]
+    fn old_api_pointer_store_gets_note() {
+        let (d, u) = run(r#"
+unsafe fn f(slot: *mut i32) {
+    *slot = smashline::clone_weapon("link", *WEAPON_KIND_LINK_SWORD_BEAM, "samus", "a", false);
+    let (x, y) = smashline::clone_weapon("link", *WEAPON_KIND_LINK_SWORD_BEAM, "samus", "b", false);
 }
 "#);
         assert!(u.is_empty(), "{u:?}");
         assert_eq!(d.len(), 2);
         for decl in &d {
             assert!(decl.id_bindings.is_empty());
-            let note = decl.id_note.as_deref().expect("a reason");
-            assert!(note.contains("does not follow"), "{note}");
+            assert!(decl.id_note.as_deref().is_some_and(|n| n.contains("does not follow")));
         }
     }
 
@@ -771,6 +830,7 @@ fn f() {
         assert!(d[0].use_original_code);
         assert_eq!(d[0].src_kind, "WEAPON_KIND_LINK_SWORD_BEAM");
         assert!(d[0].id_bindings.is_empty());
+        assert_eq!(d[0].id_note, None);
     }
 
     /// Shy-Guy-Moveset · .temp/src(goomba)/goomba/redshell/mod.rs:9 and vars.rs:90.
