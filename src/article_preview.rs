@@ -421,9 +421,9 @@ const FLIGHT_NAMES: &[&str] = &[
 /// Words that mark a value as something other than the plain shot: a bounce, a spin, a
 /// reflected or pulled-back speed.
 const NOT_THE_SHOT: &[&str] = &[
-    "rot", "angle", "reflect", "rewind", "back", "hop", "bound", "hold", "pull", "reach",
-    "extend", "damage", "dash", "final", "vacuum", "inhale", "follow", "fail", "sp", "y",
-    "air", "fall", "control",
+    "rot", "angle", "reflect", "rewind", "back", "hop", "bound", "hold", "pull", "reach", "extend",
+    "damage", "dash", "final", "vacuum", "inhale", "follow", "fail", "sp", "y", "air", "fall",
+    "control",
 ];
 
 /// Objects that come in sizes or stages keep one set of values per variant, tagged on the name:
@@ -816,7 +816,10 @@ pub fn place(
                     .copied()
                     .unwrap_or(glam::Mat4::IDENTITY)
                     .to_scale_rotation_translation();
-                glam::Mat4::from_rotation_translation(rotation, spawn_point(&bones, true, hand.as_deref()))
+                glam::Mat4::from_rotation_translation(
+                    rotation,
+                    spawn_point(&bones, true, hand.as_deref()),
+                )
             } else if kind.synced {
                 let top = bones.get("top").copied().unwrap_or(glam::Mat4::IDENTITY);
                 let (_, rotation, position) = top.to_scale_rotation_translation();
@@ -971,15 +974,27 @@ mod tests {
         assert_eq!(values.get("speed_x"), Some(&0.01));
         assert_eq!(values.get("accel_x"), Some(&0.07));
         assert_eq!(values.get("max_speed_x"), Some(&1.5));
-        let ryu = [("speed_w", 1.1), ("speed_m", 1.4), ("life_w", 75.0), ("speed_w_sp", 2.0)];
+        let ryu = [
+            ("speed_w", 1.1),
+            ("speed_m", 1.4),
+            ("life_w", 75.0),
+            ("speed_w_sp", 2.0),
+        ];
         assert_eq!(first_variant(&ryu).get("speed"), Some(&1.1));
         assert_eq!(first_variant(&ryu).get("life"), Some(&75.0));
         let hero = [("speed1", 1.6), ("life1", 40.0), ("pillar_life1", 9.0)];
         assert_eq!(first_variant(&hero).get("speed"), Some(&1.6));
-        let robin = [("special_n_thunder_speed", 2.0), ("special_n_thunder_life", 30.0)];
+        let robin = [
+            ("special_n_thunder_speed", 2.0),
+            ("special_n_thunder_life", 30.0),
+        ];
         assert_eq!(first_variant(&robin).get("life"), Some(&30.0));
         // A bounce or a spin is not the shot.
-        let spin = [("rot_speed_x", 3.0), ("hop_speed_y", 2.0), ("speed_y_m", 1.0)];
+        let spin = [
+            ("rot_speed_x", 3.0),
+            ("hop_speed_y", 2.0),
+            ("speed_y_m", 1.0),
+        ];
         assert!(first_variant(&spin).is_empty());
     }
 
@@ -1009,7 +1024,11 @@ mod tests {
             };
             place(&[spawn], 0.0, &bones)[0].placement.col(3).truncate()
         };
-        assert_eq!(start(None), left, "the forward hand when the move says nothing");
+        assert_eq!(
+            start(None),
+            left,
+            "the forward hand when the move says nothing"
+        );
         assert_eq!(start(Some("haver")), right);
     }
 
