@@ -9195,7 +9195,9 @@ impl VisionaryApp {
             ) else {
                 continue;
             };
-            let steps = ((newest - oldest) * 4.0).ceil().max(1.0) as usize;
+            // A sword sweeps a long way in one frame; the game's ribbon is a smooth curve, so the
+            // blade is sampled finely and the ribbon smoothed between samples when drawn.
+            let steps = ((newest - oldest) * 12.0).ceil().max(1.0) as usize;
             let edges: Vec<[glam::Vec3; 2]> = (0..=steps)
                 .filter_map(|i| {
                     let at = oldest + (newest - oldest) * i as f32 / steps as f32;
