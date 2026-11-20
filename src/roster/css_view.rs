@@ -97,7 +97,7 @@ fn one_per_cell<'a>(entries: impl IntoIterator<Item = &'a RosterEntry>) -> Vec<&
 
 /// The cells of the select screen with echoes separate, as the game ships: every character
 /// but the one Mii Fighter cell that stands in for the three when echoes are stacked.
-fn filtered_visible<'a>(entries: Vec<&'a RosterEntry>) -> Vec<&'a RosterEntry> {
+fn filtered_visible(entries: Vec<&RosterEntry>) -> Vec<&RosterEntry> {
     one_per_cell(entries.into_iter().filter(|e| {
         !e.name_id
             .as_deref()

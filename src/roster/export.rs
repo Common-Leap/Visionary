@@ -819,7 +819,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ui_root = dir.path().join("ui_root");
         let mod_root = dir.path().join("mod");
-        let (index, db) = setup();
+        let (_, db) = setup();
         let source = ui_root.join(css::CHARA_DB_PATH);
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         db.save(&source).unwrap();

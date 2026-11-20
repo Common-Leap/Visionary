@@ -11394,7 +11394,6 @@ impl VisionaryApp {
         }
 
         if self.state.selected_move.is_none() && self.primary_tab != PrimaryEditorTab::Hurtboxes {
-            ui.weak("Select a move to edit");
             return;
         }
 
@@ -31929,7 +31928,6 @@ impl VisionaryApp {
             // Say which: a filter hiding events is fixed by changing the filters; a move with
             // no events at all (its actions are in the fighter's code) has nothing to show.
             if self.state.selected_move.is_none() {
-                ui.weak("Pick a move to play it here.");
             } else if effects_page {
                 ui.weak("This move spawns no effects from its script.");
             } else if self.timeline_rows(total).is_empty() {
