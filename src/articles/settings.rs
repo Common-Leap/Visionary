@@ -98,12 +98,13 @@ pub struct Setting {
 }
 
 /// The settings `statuses` write, each status's body read along with the project functions it
-/// calls (one level deep, through `helpers`, which maps a function name to its file, its byte
-/// span in that file, and its source text).
+/// calls (one level deep, through `helpers`, which maps the calling function's file and a function
+/// name to that function's file, its byte span in that file, and its source text). The caller's
+/// file is passed because per-module names (`main_loop`, `init`) repeat across a project.
 pub fn read_settings(
     statuses: &[(&StatusSite, String)],
     consts: &ProjectConsts,
-    helpers: &dyn Fn(&str) -> Option<(PathBuf, Range<usize>, String)>,
+    helpers: &dyn Fn(&Path, &str) -> Option<(PathBuf, Range<usize>, String)>,
 ) -> Vec<Setting> {
     let mut out = Vec::new();
     for (site, body) in statuses {
@@ -115,7 +116,7 @@ pub fn read_settings(
                 continue;
             }
             followed.push(name);
-            if let Some((file, span, text)) = helpers(name) {
+            if let Some((file, span, text)) = helpers(&site.file, name) {
                 // One level only: what the helper calls is not followed.
                 scan(&text, &file, span.start, consts, status, &mut out);
             }
@@ -140,13 +141,23 @@ fn scan(
     status: Status,
     out: &mut Vec<Setting>,
 ) -> Vec<String> {
-    let Ok(parsed) = syn::parse_file(text) else {
+    let Some((start, functions)) = parse_functions(text) else {
+        out.push(Setting {
+            field: SettingField::OtherMovement,
+            value: SettingValue::Computed("Visionary could not read this status function".into()),
+            status: status.kind.to_string(),
+            phase: status.phase.to_string(),
+            file: file.to_path_buf(),
+            span: base..base + text.len(),
+            facing_factor: false,
+            referenced_params: Vec::new(),
+        });
         return Vec::new();
     };
+    let (text, base) = (&text[start..], base + start);
     let lines = LineIndex::new(text);
     let mut called = Vec::new();
-    for item in &parsed.items {
-        let syn::Item::Fn(function) = item else { continue };
+    for function in &functions {
         let mut lets = LetCollector { lines: &lines, lets: Vec::new() };
         syn::visit::Visit::visit_item_fn(&mut lets, function);
         let mut scanner = Scanner {
@@ -161,6 +172,43 @@ fn scan(
         syn::visit::Visit::visit_block(&mut scanner, &function.block);
     }
     called
+}
+
+/// The functions in `text`, with the byte offset the parsed text starts at. A span can start
+/// before the item (`} unsafe extern "C" fn x(..)`), so when the whole text is not a file holding
+/// a function, parsing is retried from each keyword a function item can start with.
+fn parse_functions(text: &str) -> Option<(usize, Vec<syn::ItemFn>)> {
+    if let Ok(file) = syn::parse_file(text) {
+        let functions: Vec<syn::ItemFn> = file
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                syn::Item::Fn(function) => Some(function),
+                _ => None,
+            })
+            .collect();
+        if !functions.is_empty() {
+            return Some((0, functions));
+        }
+    }
+    let one_function = |input: syn::parse::ParseStream| -> syn::Result<syn::ItemFn> {
+        let function: syn::ItemFn = input.parse()?;
+        input.parse::<proc_macro2::TokenStream>()?;
+        Ok(function)
+    };
+    let starts = ["#[", "pub", "unsafe", "extern", "async", "const", "fn"];
+    let mut candidates: Vec<usize> = starts
+        .iter()
+        .flat_map(|keyword| text.match_indices(keyword).map(|(at, _)| at))
+        .filter(|&at| at == 0 || !text[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.into_iter().take(16).find_map(|at| {
+        use syn::parse::Parser;
+        let function = one_function.parse_str(&text[at..]).ok()?;
+        Some((at, vec![function]))
+    })
 }
 
 /// Line starts of a text, to turn a span's line and (character) column into a byte offset.
@@ -191,8 +239,8 @@ impl<'a> LineIndex<'a> {
     }
 }
 
-/// `let NAME = INIT;` bindings of a function, with the byte offset each starts at, so a use reads
-/// the binding in scope before it.
+/// `let NAME = INIT;` bindings of a function, with the byte offset each ends at, so a use reads the
+/// binding in scope: one that ends before it (a shadowing `let x = x * 2.0;` reads the earlier `x`).
 struct LetCollector<'a> {
     lines: &'a LineIndex<'a>,
     lets: Vec<(String, usize, syn::Expr)>,
@@ -205,7 +253,7 @@ impl<'ast> syn::visit::Visit<'ast> for LetCollector<'_> {
             pat = &typed.pat;
         }
         if let (syn::Pat::Ident(ident), Some(init)) = (pat, &local.init) {
-            let at = self.lines.offset(syn::spanned::Spanned::span(local).start());
+            let at = self.lines.offset(syn::spanned::Spanned::span(local).end());
             self.lets.push((ident.ident.to_string(), at, (*init.expr).clone()));
         }
         syn::visit::visit_local(self, local);
@@ -237,13 +285,13 @@ impl Ctx<'_> {
         self.text.get(self.range(node)).unwrap_or_default()
     }
 
-    /// The `let` binding `name` in scope at byte `at`, with the offset it starts at.
+    /// The `let` binding `name` in scope at byte `at`, with the offset it ends at.
     fn binding(&self, name: &str, at: usize) -> Option<(usize, &syn::Expr)> {
         self.lets
             .iter()
-            .filter(|(n, start, _)| n == name && *start < at)
-            .max_by_key(|(_, start, _)| *start)
-            .map(|(_, start, init)| (*start, init))
+            .filter(|(n, end, _)| n == name && *end <= at)
+            .max_by_key(|(_, end, _)| *end)
+            .map(|(_, end, init)| (*end, init))
     }
 
     /// A local name used as `expr`, with the expression it is bound to.
@@ -565,6 +613,14 @@ impl<'ast> syn::visit::Visit<'ast> for Scanner<'_, '_> {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if mac.path.segments.last().is_some_and(|s| s.ident == "lua_args") {
+            // `lua_args!(agent, a, b, ..)` pushes `a, b, ..` like `push_lua_stack` does.
+            use syn::parse::Parser;
+            let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+            if let Ok(args) = parser.parse2(mac.tokens.clone()) {
+                self.lua_stack.extend(args.into_iter().skip(1));
+            }
+        }
         if mac.path.segments.last().is_some_and(|s| s.ident == "sv_kinetic_energy") {
             use syn::parse::Parser;
             let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
@@ -727,13 +783,13 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
 
     /// Reads `name` in `text` as a Main status, following no helpers.
     fn read(text: &str, name: &str) -> Vec<Setting> {
-        read_with(text, name, &|_| None)
+        read_with(text, name, &|_, _| None)
     }
 
     fn read_with(
         text: &str,
         name: &str,
-        helpers: &dyn Fn(&str) -> Option<(PathBuf, Range<usize>, String)>,
+        helpers: &dyn Fn(&Path, &str) -> Option<(PathBuf, Range<usize>, String)>,
     ) -> Vec<Setting> {
         let consts = ProjectConsts::scan(&[(PathBuf::from("f.rs"), text.to_string())]);
         let site = site("f.rs", text, name);
@@ -919,7 +975,7 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
     #[test]
     fn follows_a_project_function_one_level() {
         let loop_file = PathBuf::from("loop.rs");
-        let helpers = |name: &str| match name {
+        let helpers = |_: &Path, name: &str| match name {
             "fireball_main_loop" => Some((
                 loop_file.clone(),
                 fn_span(SHYGUY_MAIN_LOOP, name),
@@ -984,5 +1040,131 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         assert_eq!(ax.value, SettingValue::Literal(-0.01));
         assert_eq!(&text[ax.span.clone()], "-0.01");
         assert_eq!(only(&s, SettingField::Scale).value, SettingValue::Literal(1.2));
+    }
+
+    /// A shadowing `let` reads the binding before it, so the param origin survives.
+    #[test]
+    fn shadowing_let_reads_the_earlier_binding() {
+        let text = r#"unsafe extern "C" fn main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    let x = WorkModule::get_param_float(weapon.module_accessor, hash40("b"), hash40("f"));
+    let x = x * 2.0;
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, x, 0.0);
+    0.into()
+}
+"#;
+        let s = read(text, "main");
+        let speed = only(&s, SettingField::SpeedX);
+        assert_eq!(speed.referenced_params, [("b".to_string(), "f".to_string())]);
+        let SettingValue::Computed(t) = &speed.value else { panic!("{speed:?}") };
+        assert!(t.contains("b.f"), "{t}");
+    }
+
+    /// A site span that starts mid-line, after the previous item's closing brace, still parses.
+    #[test]
+    fn body_starting_mid_line_parses() {
+        let text = "fn other() {\n} unsafe extern \"C\" fn main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    ModelModule::set_scale(weapon.module_accessor, 1.5);\n    0.into()\n}\n";
+        let start = text.find("} unsafe").unwrap();
+        let site = StatusSite {
+            kind_expr: "*KIND_MAIN".into(),
+            phase: "Main".into(),
+            function: "main".into(),
+            file: PathBuf::from("f.rs"),
+            span: start..text.len(),
+        };
+        let s = read_settings(&[(&site, text[site.span.clone()].to_string())], &ProjectConsts::default(), &|_, _| None);
+        let scale = only(&s, SettingField::Scale);
+        assert_eq!(scale.value, SettingValue::Literal(1.5));
+        assert_eq!(&text[scale.span.clone()], "1.5");
+    }
+
+    /// A body that cannot be read is reported, never dropped.
+    #[test]
+    fn unreadable_body_is_reported() {
+        let text = "unsafe extern \"C\" fn main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    ModelModule::set_scale(weapon.module_accessor, 1.5\n}\n";
+        let site = StatusSite {
+            kind_expr: "*KIND_MAIN".into(),
+            phase: "Main".into(),
+            function: "main".into(),
+            file: PathBuf::from("f.rs"),
+            span: 0..text.len(),
+        };
+        let s = read_settings(&[(&site, text.to_string())], &ProjectConsts::default(), &|_, _| None);
+        let other = only(&s, SettingField::OtherMovement);
+        assert_eq!(
+            other.value,
+            SettingValue::Computed("Visionary could not read this status function".into())
+        );
+        assert_eq!(other.span, 0..text.len());
+        assert_eq!(s.len(), 1);
+    }
+
+    /// Two modules each define `main_loop`: the helper read is the one the caller's file names.
+    #[test]
+    fn same_named_helpers_resolve_by_caller_file() {
+        let caller = |speed: &str| {
+            format!(
+                "unsafe extern \"C\" fn main(weapon: &mut L2CWeaponCommon) -> L2CValue {{\n    ModelModule::set_scale(weapon.module_accessor, {speed});\n    weapon.fast_shift_status(main_loop)\n}}\n"
+            )
+        };
+        let loop_body = |v: &str| {
+            format!("unsafe extern \"C\" fn main_loop(weapon: &mut L2CWeaponCommon) -> L2CValue {{\n    AttackModule::set_power_mul(weapon.module_accessor, {v});\n    0.into()\n}}\n")
+        };
+        let (a, b) = (caller("1.0"), caller("2.0"));
+        let (loop_a, loop_b) = (loop_body("1.1"), loop_body("2.2"));
+        let site_a = StatusSite { file: PathBuf::from("a/status.rs"), ..site("x", &a, "main") };
+        let site_b = StatusSite { file: PathBuf::from("b/status.rs"), ..site("x", &b, "main") };
+        let helpers = |from: &Path, name: &str| {
+            if name != "main_loop" {
+                return None;
+            }
+            let (file, text) = if from == Path::new("a/status.rs") {
+                ("a/status.rs", &loop_a)
+            } else {
+                ("b/status.rs", &loop_b)
+            };
+            Some((PathBuf::from(file), 0..text.len(), text.clone()))
+        };
+        let s = read_settings(
+            &[(&site_a, a.clone()), (&site_b, b.clone())],
+            &ProjectConsts::default(),
+            &helpers,
+        );
+        let powers: Vec<(&Path, &SettingValue)> = s
+            .iter()
+            .filter(|s| s.field == SettingField::PowerMul)
+            .map(|s| (s.file.as_path(), &s.value))
+            .collect();
+        assert_eq!(
+            powers,
+            [
+                (Path::new("a/status.rs"), &SettingValue::Literal(1.1)),
+                (Path::new("b/status.rs"), &SettingValue::Literal(2.2)),
+            ]
+        );
+    }
+
+    /// Potemkin-SL2 · src/moveset/articles/ryusensya/specialn.rs:109-112 — `lua_args!` fills the
+    /// lua stack the way `push_lua_stack` does.
+    #[test]
+    fn lua_args_speed_potemkin() {
+        let text = r#"pub unsafe extern "C" fn fly_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    let posture = PostureModule::lr(weapon.module_accessor);
+    weapon.clear_lua_stack();
+    lua_args!(weapon,*WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 2.0 * posture, 0.0);
+    sv_kinetic_energy::set_speed(weapon.lua_state_agent);
+    0.into()
+}
+"#;
+        let s = read(text, "fly_main");
+        assert!(s.iter().all(|s| s.field != SettingField::OtherMovement), "{s:#?}");
+        let x = only(&s, SettingField::SpeedX);
+        assert_eq!(x.value, SettingValue::Literal(2.0));
+        assert!(x.facing_factor, "`posture` is bound to `PostureModule::lr`");
+        let x_at = text.find("2.0 * posture").unwrap();
+        assert_eq!(x.span, x_at..x_at + 3);
+        let y = only(&s, SettingField::SpeedY);
+        assert_eq!(y.value, SettingValue::Literal(0.0));
+        let y_at = text.find("0.0);").unwrap();
+        assert_eq!(y.span, y_at..y_at + 3);
     }
 }
