@@ -44,6 +44,22 @@ pub struct EffectDraw {
     pub looping: Option<usize>,
 }
 
+/// The draw path the game gives its soft glows (3,389 fighter emitters, nearly all named flare,
+/// light or smoke).
+const GLOW_PATH: u8 = 21;
+
+/// The order an effect's emitters are drawn in. Captured in game (RenderDoc, Sephiroth's blue
+/// charge): the glows go into a half-size buffer that is laid over the scene first, then the
+/// other emitters draw in the order the file lists them.
+fn draw_order(emitters: &[Emitter]) -> Vec<usize> {
+    let glow = |index: &usize| emitters[*index].data.emitter_info.draw_path as u8 == GLOW_PATH;
+    let all = 0..emitters.len();
+    all.clone()
+        .filter(glow)
+        .chain(all.filter(|index| !glow(index)))
+        .collect()
+}
+
 /// Frames an effect has particles for, played on its own: until every emitter is empty after
 /// emitting at least once, up to 240.
 fn effect_length(emitters: &[Emitter]) -> usize {
@@ -450,7 +466,8 @@ impl VfxPreview {
             };
             let (_, rotation, translation) = placement.to_scale_rotation_translation();
             let rt = Mat4::from_rotation_translation(rotation, translation);
-            for (index, emitter) in file.emitters[set].iter().enumerate() {
+            for index in draw_order(&file.emitters[set]) {
+                let emitter = &file.emitters[set][index];
                 if draw.solo.is_some_and(|solo| solo != index) {
                     continue;
                 }
