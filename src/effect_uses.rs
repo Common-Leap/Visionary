@@ -81,16 +81,9 @@ fn object_agents(fighter: &str) -> Vec<String> {
     .collect()
 }
 
-/// The effects a script spawns, by name: the first name of every effect macro that makes one,
-/// in every branch (a left-facing fighter's `mario_fb_bullet_l` as well as the right's).
-fn spawned_effects(body: &str) -> Vec<String> {
-    let mut names: Vec<String> = spawns(body).into_iter().map(|(name, _)| name).collect();
-    names.dedup();
-    names
-}
-
-/// Each effect a script spawns with the bone it spawns it on (the second name in the call),
-/// sorted, once each.
+/// The effects a script spawns, each with the bone it spawns it on: the first and second names
+/// of every effect macro that makes one, in every branch (a left-facing fighter's
+/// `mario_fb_bullet_l` as well as the right's), sorted, once each.
 fn spawns(body: &str) -> Vec<(String, Option<String>)> {
     let mut found: Vec<(String, Option<String>)> = body
         .lines()
@@ -308,10 +301,6 @@ mod tests {
                     if PostureModule::lr(agent.module_accessor) < 0.0 {\n\
                     macros::EFFECT_FOLLOW(agent, Hash40::new(\"mario_fb_bullet_l\"), Hash40::new(\"rot\"), 0, 1.8, 0, 0, 0, 0, 1, true);\n\
                     }\n}\n";
-        assert_eq!(
-            spawned_effects(body),
-            vec!["mario_fb_bullet_l".to_owned(), "mario_fb_shoot".to_owned()]
-        );
         assert_eq!(
             spawns(body),
             vec![

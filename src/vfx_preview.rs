@@ -100,7 +100,7 @@ fn effect_loop(emitters: &[Emitter]) -> Loop {
     let mut particles_end = 0;
     for emitter in emitters.iter().filter(|e| !runs_on(e)) {
         let emission = &emitter.data.emission;
-        let stops = emission.start.max(0) as usize + emission.duration.max(1) as usize;
+        let stops = emission.start as usize + emission.duration.max(1) as usize;
         timed_end = Some(timed_end.unwrap_or(0).max(stops));
         let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
         for step in 1..=CAP {
@@ -125,7 +125,7 @@ fn effect_loop(emitters: &[Emitter]) -> Loop {
     let shown = emitters
         .iter()
         .filter(|e| runs_on(e))
-        .map(|e| e.data.emission.start.max(0) as usize + e.data.particle_data.life.max(1) as usize)
+        .map(|e| e.data.emission.start as usize + e.data.particle_data.life.max(1) as usize)
         .max()
         .unwrap_or(0);
     let kill = timed_end.max(shown).min(CAP);
