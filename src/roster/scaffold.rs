@@ -103,7 +103,14 @@ pub struct Copied {
 /// under `fighter/<donor>/model` and `/motion`, the fighter's effect file as the costume's own,
 /// its sound banks, and its portraits renamed to `name_id` and colour `k`. `ui_name` is the
 /// name the base fighter's portraits are filed under. Later `roots` win, as in the game.
-pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str, name_id: &str, slots: &[u8]) -> Result<Copied> {
+pub fn copy_base(
+    mod_root: &Path,
+    roots: &[PathBuf],
+    donor: &str,
+    ui_name: &str,
+    name_id: &str,
+    slots: &[u8],
+) -> Result<Copied> {
     let donor = donor.to_ascii_lowercase();
     let mut copied = Copied::default();
     let mut copy = |from: &Path, to: &Path| -> Result<()> {
@@ -115,13 +122,24 @@ pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str,
         Ok(())
     };
     fn files(dir: &Path) -> Vec<PathBuf> {
-        let mut found: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()).collect();
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
         found.sort();
         found
     }
-    fn tree(from: &Path, to: &Path, copy: &mut dyn FnMut(&Path, &Path) -> Result<()>) -> Result<()> {
+    fn tree(
+        from: &Path,
+        to: &Path,
+        copy: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+    ) -> Result<()> {
         for path in files(from) {
-            let Some(name) = path.file_name() else { continue };
+            let Some(name) = path.file_name() else {
+                continue;
+            };
             if path.is_dir() {
                 tree(&path, &to.join(name), copy)?;
             } else {
@@ -136,8 +154,15 @@ pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str,
             for kind in ["model", "motion"] {
                 let kind_dir = root.join("fighter").join(&donor).join(kind);
                 for part in files(&kind_dir) {
-                    let Some(name) = part.file_name() else { continue };
-                    let to = mod_root.join("fighter").join(&donor).join(kind).join(name).join(&own);
+                    let Some(name) = part.file_name() else {
+                        continue;
+                    };
+                    let to = mod_root
+                        .join("fighter")
+                        .join(&donor)
+                        .join(kind)
+                        .join(name)
+                        .join(&own);
                     tree(&part.join(&base), &to, &mut copy)?;
                 }
             }
@@ -148,19 +173,35 @@ pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str,
             for bank in ["fighter", "fighter_voice"] {
                 let dir = root.join("sound/bank").join(bank);
                 for path in files(&dir) {
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
                     let marker = format!("_{donor}_{base}.");
                     if let Some((stem, ext)) = name.split_once(&marker) {
-                        copy(&path, &mod_root.join("sound/bank").join(bank).join(format!("{stem}_{donor}_{own}.{ext}")))?;
+                        copy(
+                            &path,
+                            &mod_root
+                                .join("sound/bank")
+                                .join(bank)
+                                .join(format!("{stem}_{donor}_{own}.{ext}")),
+                        )?;
                     }
                 }
             }
             for area in ["ui/replace/chara", "ui/replace_patch/chara"] {
                 for set in files(&root.join(area)) {
-                    let Some(kind) = set.file_name().and_then(|name| name.to_str()) else { continue };
+                    let Some(kind) = set.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
                     let from = set.join(format!("{kind}_{ui_name}_{:02}.bntx", colour % 8));
                     if from.is_file() {
-                        copy(&from, &mod_root.join(area).join(kind).join(format!("{kind}_{name_id}_{colour:02}.bntx")))?;
+                        copy(
+                            &from,
+                            &mod_root
+                                .join(area)
+                                .join(kind)
+                                .join(format!("{kind}_{name_id}_{colour:02}.bntx")),
+                        )?;
                     }
                 }
             }
@@ -395,16 +436,48 @@ mod tests {
         put("sound/bank/fighter/se_mario_c01.nus3audio", b"se");
         put("ui/replace/chara/chara_1/chara_1_mario_01.bntx", b"face");
         put("ui/replace/chara/chara_1/chara_1_luigi_01.bntx", b"other");
-        let copied = copy_base(made.path(), &[game.path().to_path_buf()], "Mario", "mario", "vision", &[8, 9]).unwrap();
+        let copied = copy_base(
+            made.path(),
+            &[game.path().to_path_buf()],
+            "Mario",
+            "mario",
+            "vision",
+            &[8, 9],
+        )
+        .unwrap();
         let read = |path: &str| std::fs::read(made.path().join(path)).ok();
-        assert_eq!(read("fighter/mario/model/body/c08/model.numdlb").as_deref(), Some(&b"zero"[..]));
-        assert_eq!(read("fighter/mario/model/body/c09/model.numdlb").as_deref(), Some(&b"one"[..]));
-        assert_eq!(read("fighter/mario/model/fireball/c08/model.numdlb").as_deref(), Some(&b"ball"[..]));
-        assert_eq!(read("fighter/mario/motion/body/c08/deep/a.nuanmb").as_deref(), Some(&b"anim"[..]));
-        assert_eq!(read("effect/fighter/mario/ef_mario_c09.eff").as_deref(), Some(&b"eff"[..]));
-        assert_eq!(read("sound/bank/fighter/se_mario_c09.nus3audio").as_deref(), Some(&b"se"[..]));
-        assert_eq!(read("ui/replace/chara/chara_1/chara_1_vision_01.bntx").as_deref(), Some(&b"face"[..]));
-        assert!(read("ui/replace/chara/chara_1/chara_1_vision_00.bntx").is_none(), "the base has no such portrait");
+        assert_eq!(
+            read("fighter/mario/model/body/c08/model.numdlb").as_deref(),
+            Some(&b"zero"[..])
+        );
+        assert_eq!(
+            read("fighter/mario/model/body/c09/model.numdlb").as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            read("fighter/mario/model/fireball/c08/model.numdlb").as_deref(),
+            Some(&b"ball"[..])
+        );
+        assert_eq!(
+            read("fighter/mario/motion/body/c08/deep/a.nuanmb").as_deref(),
+            Some(&b"anim"[..])
+        );
+        assert_eq!(
+            read("effect/fighter/mario/ef_mario_c09.eff").as_deref(),
+            Some(&b"eff"[..])
+        );
+        assert_eq!(
+            read("sound/bank/fighter/se_mario_c09.nus3audio").as_deref(),
+            Some(&b"se"[..])
+        );
+        assert_eq!(
+            read("ui/replace/chara/chara_1/chara_1_vision_01.bntx").as_deref(),
+            Some(&b"face"[..])
+        );
+        assert!(
+            read("ui/replace/chara/chara_1/chara_1_vision_00.bntx").is_none(),
+            "the base has no such portrait"
+        );
         assert_eq!(copied.files, 9);
         assert_eq!(copied.bytes, 4 + 3 + 4 + 4 + 4 + 3 + 3 + 2 + 4);
     }

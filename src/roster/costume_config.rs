@@ -56,13 +56,20 @@ fn table() -> &'static HashMap<String, Vec<Entry>> {
                 ["D", group, costume, subdirs] => entries.push(Entry {
                     group: (*group).to_owned(),
                     costume: costume_of(costume),
-                    subdirs: subdirs.split(',').filter(|sub| !sub.is_empty()).map(str::to_owned).collect(),
+                    subdirs: subdirs
+                        .split(',')
+                        .filter(|sub| !sub.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
                     files: Vec::new(),
                 }),
                 // The same lists as another costume's entry of this set.
                 ["=", group, costume, like] => {
                     let like = costume_of(like);
-                    let Some(same) = entries.iter().find(|entry| entry.group == *group && entry.costume == like) else {
+                    let Some(same) = entries
+                        .iter()
+                        .find(|entry| entry.group == *group && entry.costume == like)
+                    else {
                         continue;
                     };
                     let copy = Entry {
@@ -92,7 +99,8 @@ pub fn known(fighter: &str) -> bool {
 /// `path` with its first costume number replaced by `costume`.
 fn recostumed(path: &str, costume: u8) -> String {
     let bytes = path.as_bytes();
-    let at = (0..bytes.len().saturating_sub(2)).find(|&i| bytes[i] == b'c' && bytes[i + 1] == b'0' && bytes[i + 2].is_ascii_digit());
+    let at = (0..bytes.len().saturating_sub(2))
+        .find(|&i| bytes[i] == b'c' && bytes[i + 1] == b'0' && bytes[i + 2].is_ascii_digit());
     match at {
         Some(at) => format!("{}c{costume:02}{}", &path[..at], &path[at + 3..]),
         None => path.to_owned(),
@@ -122,7 +130,10 @@ pub fn add(config: &mut Value, fighter: &str, costumes: &[(u8, u8)], provided: &
             let (info, base_info) = if entry.group == "." {
                 (format!("{root}/{own}"), format!("{root}/{from}"))
             } else {
-                (format!("{root}/{}/{own}", entry.group), format!("{root}/{}/{from}", entry.group))
+                (
+                    format!("{root}/{}/{own}", entry.group),
+                    format!("{root}/{}/{from}", entry.group),
+                )
             };
             infos.push(info.clone());
             for sub in &entry.subdirs {
@@ -145,10 +156,16 @@ pub fn add(config: &mut Value, fighter: &str, costumes: &[(u8, u8)], provided: &
                 // A texture is never borrowed into a folder the mod fills itself: its model
                 // names its own.
                 let folder = ours.rsplit_once('/').map_or("", |(folder, _)| folder);
-                if ours.ends_with(".nutexb") && provided.iter().any(|path| path.rsplit_once('/').is_some_and(|(dir, _)| dir == folder)) {
+                if ours.ends_with(".nutexb")
+                    && provided
+                        .iter()
+                        .any(|path| path.rsplit_once('/').is_some_and(|(dir, _)| dir == folder))
+                {
                     continue;
                 }
-                let animated = game.contains("motion/") || game.contains("camera/") || game.starts_with("sound/bank/fighter");
+                let animated = game.contains("motion/")
+                    || game.contains("camera/")
+                    || game.starts_with("sound/bank/fighter");
                 let shares = if animated { &mut added } else { &mut vanilla };
                 let targets = shares.entry(game).or_default();
                 if !targets.contains(&ours) {
@@ -168,7 +185,9 @@ pub fn add(config: &mut Value, fighter: &str, costumes: &[(u8, u8)], provided: &
             }
             let info = if path.starts_with(&camera) {
                 format!("{main}/camera")
-            } else if path.starts_with(&effect) || (path.contains(&marker) && path.starts_with(&format!("{root}/"))) {
+            } else if path.starts_with(&effect)
+                || (path.contains(&marker) && path.starts_with(&format!("{root}/")))
+            {
                 main.clone()
             } else {
                 continue;
@@ -190,7 +209,11 @@ pub fn add(config: &mut Value, fighter: &str, costumes: &[(u8, u8)], provided: &
         }
     }
     let mut merge = |key: &str, values: BTreeMap<String, Value>| {
-        let Some(map) = object.entry(key).or_insert_with(|| Value::Object(Map::new())).as_object_mut() else {
+        let Some(map) = object
+            .entry(key)
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+        else {
             return;
         };
         for (name, value) in values {
@@ -208,10 +231,34 @@ pub fn add(config: &mut Value, fighter: &str, costumes: &[(u8, u8)], provided: &
             }
         }
     };
-    merge("new-dir-infos-base", bases.into_iter().map(|(new, base)| (new, json!(base))).collect());
-    merge("share-to-vanilla", vanilla.into_iter().map(|(game, ours)| (game, json!(ours))).collect());
-    merge("share-to-added", added.into_iter().map(|(game, ours)| (game, json!(ours))).collect());
-    merge("new-dir-files", files.into_iter().map(|(info, held)| (info, json!(held))).collect());
+    merge(
+        "new-dir-infos-base",
+        bases
+            .into_iter()
+            .map(|(new, base)| (new, json!(base)))
+            .collect(),
+    );
+    merge(
+        "share-to-vanilla",
+        vanilla
+            .into_iter()
+            .map(|(game, ours)| (game, json!(ours)))
+            .collect(),
+    );
+    merge(
+        "share-to-added",
+        added
+            .into_iter()
+            .map(|(game, ours)| (game, json!(ours)))
+            .collect(),
+    );
+    merge(
+        "new-dir-files",
+        files
+            .into_iter()
+            .map(|(info, held)| (info, json!(held)))
+            .collect(),
+    );
 }
 
 #[cfg(test)]
@@ -219,7 +266,10 @@ mod tests {
     use super::*;
 
     fn strings(value: &Value) -> Vec<&str> {
-        value.as_array().map(|list| list.iter().filter_map(Value::as_str).collect()).unwrap_or_default()
+        value
+            .as_array()
+            .map(|list| list.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default()
     }
 
     /// Lucina's ninth costume standing on her first, with only a model file of its own.
@@ -235,11 +285,21 @@ mod tests {
         add(&mut config, "Lucina", &[(8, 0)], &provided);
 
         let infos = strings(&config["new-dir-infos"]);
-        for info in ["fighter/lucina/c08", "fighter/lucina/camera/c08", "fighter/lucina/kirbycopy/c08"] {
+        for info in [
+            "fighter/lucina/c08",
+            "fighter/lucina/camera/c08",
+            "fighter/lucina/kirbycopy/c08",
+        ] {
             assert!(infos.contains(&info), "{info} is missing from {infos:?}");
         }
-        assert_eq!(config["new-dir-infos-base"]["fighter/lucina/c08/cmn"], "fighter/lucina/c00/cmn");
-        assert_eq!(config["new-dir-infos-base"]["fighter/lucina/c08/camera"], "fighter/lucina/c00/camera");
+        assert_eq!(
+            config["new-dir-infos-base"]["fighter/lucina/c08/cmn"],
+            "fighter/lucina/c00/cmn"
+        );
+        assert_eq!(
+            config["new-dir-infos-base"]["fighter/lucina/c08/camera"],
+            "fighter/lucina/c00/camera"
+        );
 
         let held = strings(&config["new-dir-files"]["fighter/lucina/c08"]);
         // The game's table has 464 files for this costume. 32 of them are files it shares from
@@ -253,13 +313,29 @@ mod tests {
         assert_eq!(config["new-dir-files"]["kept"][0], "as it was");
 
         // Carried by the mod: not borrowed. Not carried: borrowed from the base costume.
-        assert!(config["share-to-vanilla"].get("fighter/lucina/model/body/c00/model.numdlb").is_none());
-        assert_eq!(strings(&config["share-to-vanilla"]["fighter/lucina/model/body/c00/model.numshb"]), ["fighter/lucina/model/body/c08/model.numshb"]);
+        assert!(config["share-to-vanilla"]
+            .get("fighter/lucina/model/body/c00/model.numdlb")
+            .is_none());
+        assert_eq!(
+            strings(&config["share-to-vanilla"]["fighter/lucina/model/body/c00/model.numshb"]),
+            ["fighter/lucina/model/body/c08/model.numshb"]
+        );
         // No texture is borrowed into a folder the mod fills itself.
-        assert!(config["share-to-vanilla"].as_object().unwrap().iter().all(|(game, _)| !(game.contains("model/body/") && game.ends_with(".nutexb"))));
+        assert!(config["share-to-vanilla"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .all(|(game, _)| !(game.contains("model/body/") && game.ends_with(".nutexb"))));
         // Animations and sounds are borrowed as added files.
-        assert_eq!(strings(&config["share-to-added"]["sound/bank/fighter/se_lucina_c00.nus3audio"]), ["sound/bank/fighter/se_lucina_c08.nus3audio"]);
-        assert!(config["share-to-added"].as_object().unwrap().keys().any(|game| game.starts_with("fighter/lucina/motion/body/c00/")));
+        assert_eq!(
+            strings(&config["share-to-added"]["sound/bank/fighter/se_lucina_c00.nus3audio"]),
+            ["sound/bank/fighter/se_lucina_c08.nus3audio"]
+        );
+        assert!(config["share-to-added"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|game| game.starts_with("fighter/lucina/motion/body/c00/")));
     }
 
     #[test]
@@ -270,13 +346,22 @@ mod tests {
         add(&mut config, "mario", &[(8, 0), (9, 1)], &BTreeSet::new());
         assert_eq!(config, once);
         assert!(strings(&config["new-dir-infos"]).contains(&"fighter/mario/c09"));
-        assert_eq!(config["new-dir-infos-base"]["fighter/mario/c09/cmn"], "fighter/mario/c01/cmn");
+        assert_eq!(
+            config["new-dir-infos-base"]["fighter/mario/c09/cmn"],
+            "fighter/mario/c01/cmn"
+        );
     }
 
     #[test]
     fn only_the_first_costume_number_in_a_path_changes() {
-        assert_eq!(recostumed("fighter/a/model/body/c06/x_c00.bin", 12), "fighter/a/model/body/c12/x_c00.bin");
-        assert_eq!(recostumed("sound/bank/fighter/se_a_c03.nus3bank", 8), "sound/bank/fighter/se_a_c08.nus3bank");
+        assert_eq!(
+            recostumed("fighter/a/model/body/c06/x_c00.bin", 12),
+            "fighter/a/model/body/c12/x_c00.bin"
+        );
+        assert_eq!(
+            recostumed("sound/bank/fighter/se_a_c03.nus3bank", 8),
+            "sound/bank/fighter/se_a_c08.nus3bank"
+        );
         assert_eq!(recostumed("no/costume/here", 8), "no/costume/here");
     }
 }

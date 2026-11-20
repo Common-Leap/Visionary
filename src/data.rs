@@ -9537,7 +9537,8 @@ fn eval_effect_stmts_unchecked(
                 }
                 if facing_else && header == "else {" {
                     walk.guard = Some(FACING_RIGHT_GUARD.into());
-                    frame = eval_effect_stmts_unchecked(&unwrap_execute_arms(body), frame, calls, walk);
+                    frame =
+                        eval_effect_stmts_unchecked(&unwrap_execute_arms(body), frame, calls, walk);
                     walk.guard = None;
                     continue;
                 }

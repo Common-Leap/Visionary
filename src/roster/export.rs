@@ -104,7 +104,10 @@ fn name_colours(entry: &crate::roster::RosterEntry) -> Vec<u8> {
     if slots.is_empty() {
         return vec![0];
     }
-    slots.iter().map(|slot| entry.backing.colour_of(*slot)).collect()
+    slots
+        .iter()
+        .map(|slot| entry.backing.colour_of(*slot))
+        .collect()
 }
 
 /// Resolve per-label name variants (`chr0`/`chr1`/`chr2` independently) into detailed overrides.
@@ -201,14 +204,19 @@ pub fn resolve_all_names(
     let (mut simple, mut unwritable) = resolve_names(index, project);
     // A character of its own has no name in the game to fall back on.
     for entry in &index.entries {
-        let (crate::roster::EntryOrigin::Authored, Some(name_id)) = (entry.origin, &entry.name_id) else {
+        let (crate::roster::EntryOrigin::Authored, Some(name_id)) = (entry.origin, &entry.name_id)
+        else {
             continue;
         };
         if project.names.contains_key(&entry.key) {
             continue;
         }
         for slot in name_colours(entry) {
-            simple.push(NameOverride { name_id: name_id.clone(), slot, display: entry.display_name.clone() });
+            simple.push(NameOverride {
+                name_id: name_id.clone(),
+                slot,
+                display: entry.display_name.clone(),
+            });
         }
     }
     let (detailed, unw2) = resolve_detailed_names(index, project);
@@ -365,8 +373,11 @@ pub fn export_roster(
         ));
     }
 
-    let added: Vec<&crate::mod_project::AuthoredEntry> =
-        project.authored.iter().filter(|entry| !entry.name_id.is_empty()).collect();
+    let added: Vec<&crate::mod_project::AuthoredEntry> = project
+        .authored
+        .iter()
+        .filter(|entry| !entry.name_id.is_empty())
+        .collect();
     let needs_db = !order.is_empty() || !chara_patches.is_empty() || !added.is_empty();
 
     if needs_db {
@@ -552,7 +563,11 @@ pub fn export_authored_files(
 
 /// Write the `config.json` that makes the game load each new character's costumes (see
 /// [`costume_config`](super::costume_config)), keeping whatever the mod's config already says.
-pub fn export_costume_config(mod_root: &Path, authored: &[crate::mod_project::AuthoredEntry], report: &mut RosterExport) -> Result<()> {
+pub fn export_costume_config(
+    mod_root: &Path,
+    authored: &[crate::mod_project::AuthoredEntry],
+    report: &mut RosterExport,
+) -> Result<()> {
     if authored.is_empty() {
         return Ok(());
     }
@@ -581,7 +596,12 @@ pub fn export_costume_config(mod_root: &Path, authored: &[crate::mod_project::Au
             ));
             continue;
         }
-        let costumes: Vec<(u8, u8)> = entry.all_slots().iter().enumerate().map(|(colour, slot)| (*slot, (colour % 8) as u8)).collect();
+        let costumes: Vec<(u8, u8)> = entry
+            .all_slots()
+            .iter()
+            .enumerate()
+            .map(|(colour, slot)| (*slot, (colour % 8) as u8))
+            .collect();
         super::costume_config::add(&mut config, &entry.donor, &costumes, &provided);
     }
     std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
@@ -818,41 +838,78 @@ mod tests {
             moveset_scaffolded: false,
             files_root: None,
         });
-        let index = RosterIndex::build(&[fighter("mario"), fighter("link")], &ModLibrary::default(), &project, Some(&db));
-        let labels: std::collections::HashMap<u64, String> =
-["disp_order", "can_select", "name_id", "color_num", "ui_chara_id", "ui_chara_mario", "ui_chara_link", css::COLOR_START_FIELD].iter().map(|name| (hash40::hash40(name).0, (*name).to_owned())).collect();
+        let index = RosterIndex::build(
+            &[fighter("mario"), fighter("link")],
+            &ModLibrary::default(),
+            &project,
+            Some(&db),
+        );
+        let labels: std::collections::HashMap<u64, String> = [
+            "disp_order",
+            "can_select",
+            "name_id",
+            "color_num",
+            "ui_chara_id",
+            "ui_chara_mario",
+            "ui_chara_link",
+            css::COLOR_START_FIELD,
+        ]
+        .iter()
+        .map(|name| (hash40::hash40(name).0, (*name).to_owned()))
+        .collect();
 
         let report = export_roster(&mod_root, Some(&ui_root), &index, &project, &labels).unwrap();
-        assert!(report.files.contains(&"ui/param/database/ui_chara_db.prcxml".to_owned()), "{:?}", report.files);
+        assert!(
+            report
+                .files
+                .contains(&"ui/param/database/ui_chara_db.prcxml".to_owned()),
+            "{:?}",
+            report.files
+        );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         // A patch, not the whole file: the game's own file is left for other mods to patch too.
         assert!(!mod_root.join(css::CHARA_DB_PATH).exists());
 
-        let xml = std::fs::read_to_string(mod_root.join("ui/param/database/ui_chara_db.prcxml")).unwrap();
+        let xml =
+            std::fs::read_to_string(mod_root.join("ui/param/database/ui_chara_db.prcxml")).unwrap();
         // Mario's entry carries only what changed; Link's, untouched, is not in the patch.
         let mario = db.row("mario").unwrap().index;
         assert!(xml.contains(&format!("<struct index=\"{mario}\">\n      <sbyte hash=\"disp_order\">5</sbyte>\n    </struct>")), "{xml}");
-        assert!(!xml.contains(&format!("<struct index=\"{}\">", db.row("link").unwrap().index)));
+        assert!(!xml.contains(&format!(
+            "<struct index=\"{}\">",
+            db.row("link").unwrap().index
+        )));
         // The new character is a whole entry past the end, in costumes c08 and c09.
         let added = db.entries().len();
-        assert!(xml.contains(&format!("<struct index=\"{added}\">")), "{xml}");
+        assert!(
+            xml.contains(&format!("<struct index=\"{added}\">")),
+            "{xml}"
+        );
         assert!(xml.contains("<string hash=\"name_id\">vision</string>"));
         assert!(xml.contains("<byte hash=\"color_num\">2</byte>"));
         assert!(xml.contains("<byte hash=\"color_start_index\">8</byte>"));
 
         // And the same for the CSK Collection: the moved entry by its id, the new one as a
         // copy of Link's with what differs.
-        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(mod_root.join("database/mod.json")).unwrap()).unwrap();
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mod_root.join("database/mod.json")).unwrap())
+                .unwrap();
         let entries = file["character_database_entries"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "{entries:?}");
-        assert_eq!(entries[0], serde_json::json!({"ui_chara_id": "ui_chara_mario", "disp_order": 5}));
+        assert_eq!(
+            entries[0],
+            serde_json::json!({"ui_chara_id": "ui_chara_mario", "disp_order": 5})
+        );
         assert_eq!(entries[1]["ui_chara_id"], "ui_chara_vision");
         assert_eq!(entries[1]["clone_from_ui_chara_id"], "ui_chara_link");
         assert_eq!(entries[1]["name_id"], "vision");
         assert_eq!(entries[1]["extra_index_maps"]["color_start_index"], 8);
         assert!(entries[1].get("color_start_index").is_none());
         assert_eq!(entries[1]["color_num"], 2);
-        assert!(entries[1].get("c00_index").is_none(), "per-colour fields are left to color_start_index");
+        assert!(
+            entries[1].get("c00_index").is_none(),
+            "per-colour fields are left to color_start_index"
+        );
     }
 
     /// Without a `ui/` dump there is no file to apply positions to. Treating that as "nothing
@@ -864,7 +921,8 @@ mod tests {
         let mut project = RosterMod::default();
         project.order.insert(RosterKey::fighter("mario"), 5);
 
-        let report = export_roster(dir.path(), None, &index, &project, &Default::default()).unwrap();
+        let report =
+            export_roster(dir.path(), None, &index, &project, &Default::default()).unwrap();
         assert!(report.files.is_empty());
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("no character select database"));
@@ -874,7 +932,14 @@ mod tests {
     fn a_project_with_no_roster_edits_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (index, _) = setup();
-        let report = export_roster(dir.path(), None, &index, &RosterMod::default(), &Default::default()).unwrap();
+        let report = export_roster(
+            dir.path(),
+            None,
+            &index,
+            &RosterMod::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert!(report.files.is_empty());
         assert!(report.warnings.is_empty());
     }

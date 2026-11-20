@@ -720,7 +720,13 @@ impl NodeEditor {
         }
         for source in &mut self.draft.tracks {
             source.nodes = if source.track == Track::Game {
-                plain::starter_nodes(starter, first, speed.clone(), shot.clone(), self.move_length)
+                plain::starter_nodes(
+                    starter,
+                    first,
+                    speed.clone(),
+                    shot.clone(),
+                    self.move_length,
+                )
             } else {
                 Vec::new()
             };

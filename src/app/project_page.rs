@@ -14,13 +14,28 @@ const CARD_WIDTH: f32 = 560.0;
 /// Characters the game shows as one that are several fighters underneath. Each gets one card,
 /// with its fighters to switch between: every part button then acts on the one picked.
 const GROUPS: [(&str, &[(&str, &str)]); 3] = [
-    ("Pokémon Trainer", &[("pzenigame", "Squirtle"), ("pfushigisou", "Ivysaur"), ("plizardon", "Charizard"), ("ptrainer", "Trainer")]),
+    (
+        "Pokémon Trainer",
+        &[
+            ("pzenigame", "Squirtle"),
+            ("pfushigisou", "Ivysaur"),
+            ("plizardon", "Charizard"),
+            ("ptrainer", "Trainer"),
+        ],
+    ),
     ("Pyra / Mythra", &[("eflame", "Pyra"), ("elight", "Mythra")]),
     ("Ice Climbers", &[("popo", "Popo"), ("nana", "Nana")]),
 ];
 
 fn group_of(fighter: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
-    GROUPS.iter().find(|(_, members)| members.iter().any(|(member, _)| member.eq_ignore_ascii_case(fighter))).copied()
+    GROUPS
+        .iter()
+        .find(|(_, members)| {
+            members
+                .iter()
+                .any(|(member, _)| member.eq_ignore_ascii_case(fighter))
+        })
+        .copied()
 }
 
 /// One card on the page.
@@ -123,13 +138,28 @@ fn paint_part_icon(painter: &egui::Painter, rect: egui::Rect, part: Part, colour
                     at + egui::vec2(-w, -w),
                 ]
             };
-            painter.add(egui::Shape::convex_polygon(star(p(-0.15, 0.1), s * 0.7), colour, egui::Stroke::NONE));
-            painter.add(egui::Shape::convex_polygon(star(p(0.55, -0.5), s * 0.3), colour, egui::Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(
+                star(p(-0.15, 0.1), s * 0.7),
+                colour,
+                egui::Stroke::NONE,
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                star(p(0.55, -0.5), s * 0.3),
+                colour,
+                egui::Stroke::NONE,
+            ));
         }
         Part::Sounds => {
             // A speaker with sound waves.
             painter.add(egui::Shape::convex_polygon(
-                vec![p(-0.8, -0.2), p(-0.5, -0.2), p(-0.15, -0.55), p(-0.15, 0.55), p(-0.5, 0.2), p(-0.8, 0.2)],
+                vec![
+                    p(-0.8, -0.2),
+                    p(-0.5, -0.2),
+                    p(-0.15, -0.55),
+                    p(-0.15, 0.55),
+                    p(-0.5, 0.2),
+                    p(-0.8, 0.2),
+                ],
                 colour,
                 egui::Stroke::NONE,
             ));
@@ -166,9 +196,20 @@ fn paint_part_icon(painter: &egui::Painter, rect: egui::Rect, part: Part, colour
             // A meter: a bar part filled, with a spark over it.
             let bar = egui::Rect::from_min_max(p(-0.8, 0.2), p(0.8, 0.65));
             painter.rect_stroke(bar, s * 0.12, stroke, egui::StrokeKind::Middle);
-            painter.rect_filled(egui::Rect::from_min_max(p(-0.8, 0.2), p(0.15, 0.65)), s * 0.12, colour);
+            painter.rect_filled(
+                egui::Rect::from_min_max(p(-0.8, 0.2), p(0.15, 0.65)),
+                s * 0.12,
+                colour,
+            );
             painter.add(egui::Shape::convex_polygon(
-                vec![p(0.1, -0.85), p(-0.35, -0.2), p(0.0, -0.2), p(-0.1, 0.05), p(0.4, -0.5), p(0.05, -0.5)],
+                vec![
+                    p(0.1, -0.85),
+                    p(-0.35, -0.2),
+                    p(0.0, -0.2),
+                    p(-0.1, 0.05),
+                    p(0.4, -0.5),
+                    p(0.05, -0.5),
+                ],
                 colour,
                 egui::Stroke::NONE,
             ));
@@ -197,18 +238,40 @@ fn paint_part_icon(painter: &egui::Painter, rect: egui::Rect, part: Part, colour
 /// A square part button: solid in the part's colour when the project changes it, dark and
 /// outlined while it is the game's. A ring when open; a dot when its files are in a folder of
 /// the author's.
-fn part_button(ui: &mut Ui, look: Look, part: Part, changed: bool, picked_folder: bool, open: bool, hover: &str) -> egui::Response {
+fn part_button(
+    ui: &mut Ui,
+    look: Look,
+    part: Part,
+    changed: bool,
+    picked_folder: bool,
+    open: bool,
+    hover: &str,
+) -> egui::Response {
     let size = egui::vec2(46.0, 46.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let colour = part_colour(part);
     let painter = ui.painter();
-    let (fill, icon) = if changed { (colour, Color32::from_rgb(18, 18, 22)) } else { (look.sunk, look.dim) };
+    let (fill, icon) = if changed {
+        (colour, Color32::from_rgb(18, 18, 22))
+    } else {
+        (look.sunk, look.dim)
+    };
     painter.rect_filled(rect, 9.0, fill);
     if !changed {
-        painter.rect_stroke(rect, 9.0, egui::Stroke::new(1.5, look.edge), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect,
+            9.0,
+            egui::Stroke::new(1.5, look.edge),
+            egui::StrokeKind::Inside,
+        );
     }
     if open || response.hovered() {
-        painter.rect_stroke(rect.expand(3.0), 11.0, egui::Stroke::new(2.0, if open { look.text } else { colour }), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            rect.expand(3.0),
+            11.0,
+            egui::Stroke::new(2.0, if open { look.text } else { colour }),
+            egui::StrokeKind::Inside,
+        );
     }
     paint_part_icon(painter, rect.shrink(10.0), part, icon);
     if picked_folder {
@@ -248,7 +311,15 @@ enum Tile {
 }
 
 /// A wide tile: icon, title and one line on what the project changes there.
-fn game_tile(ui: &mut Ui, look: Look, icon: Tile, title: &str, line: &str, changed: bool, open: bool) -> egui::Response {
+fn game_tile(
+    ui: &mut Ui,
+    look: Look,
+    icon: Tile,
+    title: &str,
+    line: &str,
+    changed: bool,
+    open: bool,
+) -> egui::Response {
     let colour = match icon {
         Tile::Part(part) => part_colour(part),
         Tile::Mods => Color32::from_rgb(190, 150, 255),
@@ -256,10 +327,26 @@ fn game_tile(ui: &mut Ui, look: Look, icon: Tile, title: &str, line: &str, chang
     let (rect, response) = ui.allocate_exact_size(egui::vec2(300.0, 64.0), egui::Sense::click());
     let painter = ui.painter();
     painter.rect_filled(rect, 12.0, look.card);
-    let edge = if open { look.text } else if response.hovered() { colour } else { look.edge };
-    painter.rect_stroke(rect, 12.0, egui::Stroke::new(2.0, edge), egui::StrokeKind::Inside);
-    let badge = egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(44.0, 44.0));
-    let (fill, ink) = if changed { (colour, Color32::from_rgb(18, 18, 22)) } else { (look.sunk, colour) };
+    let edge = if open {
+        look.text
+    } else if response.hovered() {
+        colour
+    } else {
+        look.edge
+    };
+    painter.rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(2.0, edge),
+        egui::StrokeKind::Inside,
+    );
+    let badge =
+        egui::Rect::from_min_size(rect.min + egui::vec2(10.0, 10.0), egui::vec2(44.0, 44.0));
+    let (fill, ink) = if changed {
+        (colour, Color32::from_rgb(18, 18, 22))
+    } else {
+        (look.sunk, colour)
+    };
     painter.rect_filled(badge, 9.0, fill);
     match icon {
         Tile::Part(part) => paint_part_icon(painter, badge.shrink(10.0), part, ink),
@@ -268,17 +355,43 @@ fn game_tile(ui: &mut Ui, look: Look, icon: Tile, title: &str, line: &str, chang
             let stroke = egui::Stroke::new(2.0, ink);
             for i in 0..3 {
                 let y = badge.top() + 12.0 + i as f32 * 7.0;
-                painter.rect_stroke(egui::Rect::from_min_size(egui::pos2(badge.left() + 11.0, y), egui::vec2(22.0, 5.0)), 1.5, stroke, egui::StrokeKind::Middle);
+                painter.rect_stroke(
+                    egui::Rect::from_min_size(
+                        egui::pos2(badge.left() + 11.0, y),
+                        egui::vec2(22.0, 5.0),
+                    ),
+                    1.5,
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
             }
         }
     }
     let x = badge.right() + 12.0;
     // The title sits alone until the project changes something here.
     if line.is_empty() {
-        painter.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(18.0), look.text);
+        painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
+            egui::FontId::proportional(18.0),
+            look.text,
+        );
     } else {
-        painter.text(egui::pos2(x, rect.top() + 12.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(18.0), look.text);
-        painter.text(egui::pos2(x, rect.top() + 36.0), egui::Align2::LEFT_TOP, line, egui::FontId::proportional(14.0), look.dim);
+        painter.text(
+            egui::pos2(x, rect.top() + 12.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(18.0),
+            look.text,
+        );
+        painter.text(
+            egui::pos2(x, rect.top() + 36.0),
+            egui::Align2::LEFT_TOP,
+            line,
+            egui::FontId::proportional(14.0),
+            look.dim,
+        );
     }
     response
 }
@@ -299,19 +412,28 @@ fn source_chip(from: &str) -> (String, Color32) {
 }
 
 fn folder_name(path: &Path) -> String {
-    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 impl VisionaryApp {
     pub(super) fn workspace(&self) -> Option<PathBuf> {
-        self.project_path.as_ref().and_then(|path| path.parent()).map(Path::to_path_buf)
+        self.project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
     }
 
     /// The open project's characters and folders, read from beside the project when it changes.
     pub(super) fn project_parts(&mut self) -> ProjectParts {
         let workspace = self.workspace();
         if self.project_parts_cache.as_ref().map(|(at, _)| at) != workspace.as_ref() {
-            let parts = workspace.as_deref().map(ProjectParts::load).unwrap_or_default();
+            let parts = workspace
+                .as_deref()
+                .map(ProjectParts::load)
+                .unwrap_or_default();
             // A project that names its own move code links it on opening.
             if let Some(folder) = parts.link("", Part::Moves, 0) {
                 if self.acmd_src.as_ref().map(|index| index.root.as_path()) != Some(folder) {
@@ -320,7 +442,10 @@ impl VisionaryApp {
             }
             self.project_parts_cache = workspace.map(|at| (at, parts));
         }
-        self.project_parts_cache.as_ref().map(|(_, parts)| parts.clone()).unwrap_or_default()
+        self.project_parts_cache
+            .as_ref()
+            .map(|(_, parts)| parts.clone())
+            .unwrap_or_default()
     }
 
     fn change_parts(&mut self, change: impl FnOnce(&mut ProjectParts)) {
@@ -343,12 +468,47 @@ impl VisionaryApp {
     fn project_cards(&mut self) -> Vec<Card> {
         let parts = self.project_parts();
         let mut names: BTreeSet<String> = parts.characters.keys().cloned().collect();
-        names.extend(self.state.edit_log.entries.iter().filter(|(_, moves)| !moves.is_empty()).map(|(name, _)| name.clone()));
-        names.extend(self.move_graphs.iter().filter(|(_, graphs)| !graphs.is_empty()).map(|(name, _)| name.clone()));
-        names.extend(self.eff_mods.iter().filter(|(_, eff)| !eff.is_empty()).map(|(name, _)| name.clone()));
-        names.extend(self.roster.params.iter().filter(|(_, params)| !params.is_empty()).map(|(name, _)| name.clone()));
-        names.extend(self.state.sound_script_edits.keys().filter_map(|key| key.split_once('/')).map(|(name, _)| name.to_owned()));
-        names.extend(parts.links.iter().filter(|link| link.part != Part::Moves).map(|link| link.fighter.clone()));
+        names.extend(
+            self.state
+                .edit_log
+                .entries
+                .iter()
+                .filter(|(_, moves)| !moves.is_empty())
+                .map(|(name, _)| name.clone()),
+        );
+        names.extend(
+            self.move_graphs
+                .iter()
+                .filter(|(_, graphs)| !graphs.is_empty())
+                .map(|(name, _)| name.clone()),
+        );
+        names.extend(
+            self.eff_mods
+                .iter()
+                .filter(|(_, eff)| !eff.is_empty())
+                .map(|(name, _)| name.clone()),
+        );
+        names.extend(
+            self.roster
+                .params
+                .iter()
+                .filter(|(_, params)| !params.is_empty())
+                .map(|(name, _)| name.clone()),
+        );
+        names.extend(
+            self.state
+                .sound_script_edits
+                .keys()
+                .filter_map(|key| key.split_once('/'))
+                .map(|(name, _)| name.to_owned()),
+        );
+        names.extend(
+            parts
+                .links
+                .iter()
+                .filter(|link| link.part != Part::Moves)
+                .map(|link| link.fighter.clone()),
+        );
         let mut cards: Vec<Card> = Vec::new();
         for name in names {
             // One card for all the fighters of a character, showing the one picked on it.
@@ -359,35 +519,68 @@ impl VisionaryApp {
                         continue;
                     }
                     let picked = self.project_member.get(title).cloned();
-                    picked.filter(|picked| members.iter().any(|(member, _)| member == picked)).unwrap_or(name)
+                    picked
+                        .filter(|picked| members.iter().any(|(member, _)| member == picked))
+                        .unwrap_or(name)
                 }
                 None => name,
             };
-            let Some(entry) = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(&name)) else {
+            let Some(entry) = self
+                .state
+                .fighters
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&name))
+            else {
                 continue;
             };
-            let slot = parts.characters.get(&entry.name).copied().filter(|slot| entry.slots.contains(slot)).unwrap_or(entry.base_slot());
+            let slot = parts
+                .characters
+                .get(&entry.name)
+                .copied()
+                .filter(|slot| entry.slots.contains(slot))
+                .unwrap_or(entry.base_slot());
             cards.push(Card {
                 fighter: entry.name.clone(),
                 slots: entry.slots.clone(),
                 slot,
                 // "Ice Climbers · Popo" is the Ice Climbers on a card of their own.
-                name: group.map_or_else(|| entry.display_name.split(" · ").next().unwrap_or(&entry.display_name).to_owned(), |(title, _)| title.to_owned()),
-                base: if entry.is_modded() { "Mod fighter".into() } else { "Base game".into() },
+                name: group.map_or_else(
+                    || {
+                        entry
+                            .display_name
+                            .split(" · ")
+                            .next()
+                            .unwrap_or(&entry.display_name)
+                            .to_owned()
+                    },
+                    |(title, _)| title.to_owned(),
+                ),
+                base: if entry.is_modded() {
+                    "Mod fighter".into()
+                } else {
+                    "Base game".into()
+                },
                 roster_key: crate::roster::RosterKey::fighter(&entry.name),
                 made_here: false,
                 members: group.map_or(&[], |(_, members)| members),
             });
         }
         for authored in &self.roster.project.authored {
-            let donor = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(&authored.donor));
+            let donor = self
+                .state
+                .fighters
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&authored.donor));
             let slots = authored.all_slots();
             cards.push(Card {
                 fighter: authored.donor.clone(),
                 slot: slots.first().copied().unwrap_or(authored.slot),
                 slots,
                 name: authored.display_name.clone(),
-                base: format!("Plays as {}", donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone())),
+                base: format!(
+                    "Plays as {}",
+                    donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone())
+                ),
                 roster_key: authored.key.clone(),
                 made_here: true,
                 members: &[],
@@ -398,13 +591,27 @@ impl VisionaryApp {
     }
 
     /// Whether the project changes `part` of a card, where it comes from, and a line of detail.
-    fn part_summary(&self, parts: &ProjectParts, card: &Card, part: Part) -> (bool, String, String) {
+    fn part_summary(
+        &self,
+        parts: &ProjectParts,
+        card: &Card,
+        part: Part,
+    ) -> (bool, String, String) {
         let fighter = card.fighter.to_ascii_lowercase();
         let picked = parts.link(&fighter, part, card.slot);
-        let from_folder = |default: &str| picked.map_or(default.to_owned(), |folder| format!("your folder {}", folder_name(folder)));
+        let from_folder = |default: &str| {
+            picked.map_or(default.to_owned(), |folder| {
+                format!("your folder {}", folder_name(folder))
+            })
+        };
         match part {
             Part::Moves => {
-                let moves = self.state.edit_log.entries.get(&fighter).map_or(0, HashMap::len);
+                let moves = self
+                    .state
+                    .edit_log
+                    .entries
+                    .get(&fighter)
+                    .map_or(0, HashMap::len);
                 let graphs = self.move_graphs.get(&fighter).map_or(0, BTreeMap::len);
                 let code = self.acmd_src.as_ref().map(|index| index.root.clone());
                 let from = match &code {
@@ -412,13 +619,21 @@ impl VisionaryApp {
                     None if moves + graphs > 0 => "this project".into(),
                     None => "the game".into(),
                 };
-                (moves + graphs > 0, from, format!("{moves} moves edited, {graphs} with nodes"))
+                (
+                    moves + graphs > 0,
+                    from,
+                    format!("{moves} moves edited, {graphs} with nodes"),
+                )
             }
             Part::Effects => {
                 let edits = self.eff_mods.get(&fighter).filter(|eff| !eff.is_empty());
                 let file = self.project_effect_file(&fighter);
                 let detail = edits.map_or(String::new(), |eff| {
-                    format!("{} effects edited, {} borrowed", eff.authored.len(), eff.transplants.len())
+                    format!(
+                        "{} effects edited, {} borrowed",
+                        eff.authored.len(),
+                        eff.transplants.len()
+                    )
                 });
                 let from = match (&file, picked) {
                     (Some(_), Some(_)) => from_folder(""),
@@ -429,13 +644,35 @@ impl VisionaryApp {
                 (edits.is_some() || file.is_some(), from, detail)
             }
             Part::Sounds => {
-                let scripts = self.state.sound_script_edits.keys().filter(|key| key.split_once('/').is_some_and(|(name, _)| name == fighter)).count();
-                let files = self.workspace().and_then(|workspace| parts.dir(&workspace, &fighter, part, card.slot)).map_or(0, |dir| count_files(&dir));
-                let from = if picked.is_some() { from_folder("") } else if scripts + files > 0 { "this project".into() } else { "the game".into() };
-                (scripts + files > 0, from, format!("{scripts} moves edited, {files} files"))
+                let scripts = self
+                    .state
+                    .sound_script_edits
+                    .keys()
+                    .filter(|key| key.split_once('/').is_some_and(|(name, _)| name == fighter))
+                    .count();
+                let files = self
+                    .workspace()
+                    .and_then(|workspace| parts.dir(&workspace, &fighter, part, card.slot))
+                    .map_or(0, |dir| count_files(&dir));
+                let from = if picked.is_some() {
+                    from_folder("")
+                } else if scripts + files > 0 {
+                    "this project".into()
+                } else {
+                    "the game".into()
+                };
+                (
+                    scripts + files > 0,
+                    from,
+                    format!("{scripts} moves edited, {files} files"),
+                )
             }
             Part::Model | Part::Animations => {
-                let words = if part == Part::Model { "model" } else { "motion" };
+                let words = if part == Part::Model {
+                    "model"
+                } else {
+                    "motion"
+                };
                 let found = self.skin_folder(&card.fighter, words, card.slot);
                 let from = found.map_or("the game".to_owned(), |(_, from)| from);
                 (from != "the game", from, String::new())
@@ -444,25 +681,67 @@ impl VisionaryApp {
                 let roster = &self.roster;
                 // Editing a move with nodes saves an empty first gimmick; only ones that do
                 // something count.
-                let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| graph.transitions.iter().any(|step| !step.actions.is_empty());
+                let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
+                    graph
+                        .transitions
+                        .iter()
+                        .any(|step| !step.actions.is_empty())
+                };
                 let main = roster.behaviors.get(&fighter).is_some_and(acts) as usize;
-                let charts = roster.controller_charts.get(&fighter).map_or(0, |charts| charts.values().filter(|chart| acts(&chart.graph)).count());
+                let charts = roster.controller_charts.get(&fighter).map_or(0, |charts| {
+                    charts.values().filter(|chart| acts(&chart.graph)).count()
+                });
                 let meters = roster.meters.get(&fighter).map_or(0, Vec::len);
                 let gimmicks = main + charts;
                 let changed = gimmicks + meters > 0;
-                let detail = if changed { format!("{gimmicks} gimmicks, {meters} meters") } else { String::new() };
-                (changed, if changed { "this project".into() } else { "the game".into() }, detail)
+                let detail = if changed {
+                    format!("{gimmicks} gimmicks, {meters} meters")
+                } else {
+                    String::new()
+                };
+                (
+                    changed,
+                    if changed {
+                        "this project".into()
+                    } else {
+                        "the game".into()
+                    },
+                    detail,
+                )
             }
             Part::Values => {
-                let values = self.roster.params.get(&fighter).map_or(0, |params| params.field_count());
-                (values > 0, if values > 0 { "this project".into() } else { "the game".into() }, format!("{values} values changed"))
+                let values = self
+                    .roster
+                    .params
+                    .get(&fighter)
+                    .map_or(0, |params| params.field_count());
+                (
+                    values > 0,
+                    if values > 0 {
+                        "this project".into()
+                    } else {
+                        "the game".into()
+                    },
+                    format!("{values} values changed"),
+                )
             }
             Part::SelectScreen => {
                 let project = &self.roster.project;
                 let changed = project.names.contains_key(&card.roster_key)
                     || project.ui_images.contains_key(&card.roster_key)
-                    || project.authored.iter().any(|entry| entry.key == card.roster_key);
-                (changed, if changed { "this project".into() } else { "the game".into() }, String::new())
+                    || project
+                        .authored
+                        .iter()
+                        .any(|entry| entry.key == card.roster_key);
+                (
+                    changed,
+                    if changed {
+                        "this project".into()
+                    } else {
+                        "the game".into()
+                    },
+                    String::new(),
+                )
             }
         }
     }
@@ -471,7 +750,9 @@ impl VisionaryApp {
     fn project_effect_file(&self, fighter: &str) -> Option<PathBuf> {
         let workspace = self.workspace()?;
         let parts = self.project_parts_cache.as_ref().map(|(_, parts)| parts)?;
-        let file = parts.dir(&workspace, fighter, Part::Effects, 0)?.join(format!("ef_{fighter}.eff"));
+        let file = parts
+            .dir(&workspace, fighter, Part::Effects, 0)?
+            .join(format!("ef_{fighter}.eff"));
         file.is_file().then_some(file)
     }
 
@@ -483,11 +764,18 @@ impl VisionaryApp {
         let mut actions = Vec::new();
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            let title = if self.project_name.is_empty() { "Untitled project" } else { &self.project_name };
+            let title = if self.project_name.is_empty() {
+                "Untitled project"
+            } else {
+                &self.project_name
+            };
             ui.label(RichText::new(title).size(30.0).strong().color(look.text));
             ui.add_space(12.0);
             if let Some(dir) = &workspace {
-                if act(ui, look, "Open folder", None).on_hover_text(dir.display().to_string()).clicked() {
+                if act(ui, look, "Open folder", None)
+                    .on_hover_text(dir.display().to_string())
+                    .clicked()
+                {
                     actions.push(PageAction::Reveal(dir.clone()));
                 }
             }
@@ -510,7 +798,11 @@ impl VisionaryApp {
 
         section_title(ui, look, "Across the game");
         self.draw_game_tiles(ui, look, &parts, &mut actions);
-        if self.project_open_part.as_ref().is_some_and(|(key, _)| key == OTHER_EFFECTS) {
+        if self
+            .project_open_part
+            .as_ref()
+            .is_some_and(|(key, _)| key == OTHER_EFFECTS)
+        {
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.set_width((card_width * columns as f32).min(width));
@@ -528,7 +820,12 @@ impl VisionaryApp {
                 .width(200.0)
                 .height(420.0)
                 .show_ui(ui, |ui| {
-                    let mut fighters: Vec<_> = self.state.fighters.iter().filter(|entry| !shown.contains(entry.name.as_str())).collect();
+                    let mut fighters: Vec<_> = self
+                        .state
+                        .fighters
+                        .iter()
+                        .filter(|entry| !shown.contains(entry.name.as_str()))
+                        .collect();
                     fighters.sort_by(|a, b| a.display_name.cmp(&b.display_name));
                     for entry in fighters {
                         if ui.selectable_label(false, &entry.display_name).clicked() {
@@ -536,7 +833,10 @@ impl VisionaryApp {
                         }
                     }
                 });
-            if act(ui, look, "New character", None).on_hover_text("Make a fighter of your own on top of a base one").clicked() {
+            if act(ui, look, "New character", None)
+                .on_hover_text("Make a fighter of your own on top of a base one")
+                .clicked()
+            {
                 self.roster.focus_new_character();
             }
         });
@@ -554,7 +854,14 @@ impl VisionaryApp {
             ui.add_space(10.0);
         }
 
-        let dropped: Vec<PathBuf> = ui.ctx().input(|input| input.raw.dropped_files.iter().map(|file| file.path().to_path_buf()).collect());
+        let dropped: Vec<PathBuf> = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
         if !dropped.is_empty() {
             let target = self
                 .project_open_part
@@ -580,12 +887,30 @@ impl VisionaryApp {
             .fill(look.card)
             .corner_radius(14.0)
             .inner_margin(egui::Margin::same(14))
-            .stroke(egui::Stroke::new(2.0, if selected { look.accent } else { look.edge }))
+            .stroke(egui::Stroke::new(
+                2.0,
+                if selected { look.accent } else { look.edge },
+            ))
     }
 
-    fn draw_character_card(&mut self, ui: &mut Ui, look: Look, card: &Card, parts: &ProjectParts, actions: &mut Vec<PageAction>) {
-        let selected = self.state.selected_fighter.and_then(|index| self.state.fighters.get(index)).is_some_and(|entry| entry.name == card.fighter);
-        let open = self.project_open_part.as_ref().filter(|(fighter, _)| *fighter == card.fighter).map(|(_, part)| *part);
+    fn draw_character_card(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        card: &Card,
+        parts: &ProjectParts,
+        actions: &mut Vec<PageAction>,
+    ) {
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .is_some_and(|entry| entry.name == card.fighter);
+        let open = self
+            .project_open_part
+            .as_ref()
+            .filter(|(fighter, _)| *fighter == card.fighter)
+            .map(|(_, part)| *part);
         Self::card_frame(look, selected).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -663,7 +988,15 @@ impl VisionaryApp {
         });
     }
 
-    fn draw_part_detail(&mut self, ui: &mut Ui, look: Look, card: &Card, part: Part, parts: &ProjectParts, actions: &mut Vec<PageAction>) {
+    fn draw_part_detail(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        card: &Card,
+        part: Part,
+        parts: &ProjectParts,
+        actions: &mut Vec<PageAction>,
+    ) {
         let (_, from, detail) = self.part_summary(parts, card, part);
         let fighter = &card.fighter;
         let slot = card.slot;
@@ -826,7 +1159,12 @@ impl VisionaryApp {
     /// Effects that belong to no fighter: common, item and stage effects.
     /// Effect files of no fighter the project edits, by where they live in the game.
     fn other_effect_edits(&self) -> Vec<(&'static str, String)> {
-        let fighters: BTreeSet<&str> = self.state.fighters.iter().map(|entry| entry.name.as_str()).collect();
+        let fighters: BTreeSet<&str> = self
+            .state
+            .fighters
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
         let mut edited: Vec<(&'static str, String)> = self
             .eff_mods
             .iter()
@@ -839,7 +1177,13 @@ impl VisionaryApp {
 
     /// One tile per game-wide part of the project: effects of no fighter, the select screen,
     /// fighter values and the installed mods, each saying what the project changes there.
-    fn draw_game_tiles(&mut self, ui: &mut Ui, look: Look, parts: &ProjectParts, actions: &mut Vec<PageAction>) {
+    fn draw_game_tiles(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        parts: &ProjectParts,
+        actions: &mut Vec<PageAction>,
+    ) {
         let edited = self.other_effect_edits();
         let picked = parts.link(OTHER_EFFECTS, Part::Effects, 0).is_some();
         let effects = {
@@ -876,13 +1220,31 @@ impl VisionaryApp {
             1 => "1 turned on".to_owned(),
             n => format!("{n} turned on"),
         };
-        let open = self.project_open_part.as_ref().is_some_and(|(key, _)| key == OTHER_EFFECTS);
+        let open = self
+            .project_open_part
+            .as_ref()
+            .is_some_and(|(key, _)| key == OTHER_EFFECTS);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
             let tiles: [(Tile, &str, &str, bool); 4] = [
-                (Tile::Part(Part::Effects), "Effects", &effects, !edited.is_empty() || picked),
-                (Tile::Part(Part::SelectScreen), "Select screen", &screen, summary.order + summary.hidden + summary.names > 0),
-                (Tile::Part(Part::Values), "Fighter values", &values, summary.params > 0),
+                (
+                    Tile::Part(Part::Effects),
+                    "Effects",
+                    &effects,
+                    !edited.is_empty() || picked,
+                ),
+                (
+                    Tile::Part(Part::SelectScreen),
+                    "Select screen",
+                    &screen,
+                    summary.order + summary.hidden + summary.names > 0,
+                ),
+                (
+                    Tile::Part(Part::Values),
+                    "Fighter values",
+                    &values,
+                    summary.params > 0,
+                ),
                 (Tile::Mods, "Installed mods", &mods, false),
             ];
             for (index, (icon, title, line, changed)) in tiles.into_iter().enumerate() {
@@ -898,9 +1260,17 @@ impl VisionaryApp {
         });
     }
 
-    fn draw_other_effects(&mut self, ui: &mut Ui, look: Look, parts: &ProjectParts, actions: &mut Vec<PageAction>) {
+    fn draw_other_effects(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        parts: &ProjectParts,
+        actions: &mut Vec<PageAction>,
+    ) {
         let edited = self.other_effect_edits();
-        let picked = parts.link(OTHER_EFFECTS, Part::Effects, 0).map(Path::to_path_buf);
+        let picked = parts
+            .link(OTHER_EFFECTS, Part::Effects, 0)
+            .map(Path::to_path_buf);
         let colour = part_colour(Part::Effects);
         egui::Frame::new()
             .fill(look.card)
@@ -909,10 +1279,19 @@ impl VisionaryApp {
             .stroke(egui::Stroke::new(1.5, colour))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new("Effects of no fighter").size(19.0).strong().color(look.text));
+                ui.label(
+                    RichText::new("Effects of no fighter")
+                        .size(19.0)
+                        .strong()
+                        .color(look.text),
+                );
                 ui.add_space(6.0);
                 for group in EFFECT_GROUPS {
-                    let files: Vec<&String> = edited.iter().filter(|(g, _)| *g == group).map(|(_, rel)| rel).collect();
+                    let files: Vec<&String> = edited
+                        .iter()
+                        .filter(|(g, _)| *g == group)
+                        .map(|(_, rel)| rel)
+                        .collect();
                     if files.is_empty() {
                         continue;
                     }
@@ -931,7 +1310,11 @@ impl VisionaryApp {
                 if let Some(dir) = &picked {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("Folder").strong().color(look.dim));
-                        ui.label(RichText::new(dir.display().to_string()).monospace().color(look.text));
+                        ui.label(
+                            RichText::new(dir.display().to_string())
+                                .monospace()
+                                .color(look.text),
+                        );
                     });
                 }
                 ui.add_space(4.0);
@@ -939,23 +1322,39 @@ impl VisionaryApp {
                     if act(ui, look, "Open .eff", Some(colour)).clicked() {
                         actions.push(PageAction::OpenEffectFile);
                     }
-                    if act(ui, look, "Choose folder", None).on_hover_text("Laid out like the game's effect folder").clicked() {
-                        actions.push(PageAction::PickFolder(OTHER_EFFECTS.into(), Part::Effects, 0));
+                    if act(ui, look, "Choose folder", None)
+                        .on_hover_text("Laid out like the game's effect folder")
+                        .clicked()
+                    {
+                        actions.push(PageAction::PickFolder(
+                            OTHER_EFFECTS.into(),
+                            Part::Effects,
+                            0,
+                        ));
                     }
                     if picked.is_some() && act(ui, look, "Use game files", None).clicked() {
-                        actions.push(PageAction::ForgetFolder(OTHER_EFFECTS.into(), Part::Effects, 0));
+                        actions.push(PageAction::ForgetFolder(
+                            OTHER_EFFECTS.into(),
+                            Part::Effects,
+                            0,
+                        ));
                     }
                 });
             });
     }
 
     fn fighter_index(&self, fighter: &str) -> Option<usize> {
-        self.state.fighters.iter().position(|entry| entry.name.eq_ignore_ascii_case(fighter))
+        self.state
+            .fighters
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
     }
 
     /// Pick the card's fighter in the editor, showing the costume picked on its card.
     fn focus_card(&mut self, fighter: &str, slot: Option<u8>) {
-        let Some(index) = self.fighter_index(fighter) else { return };
+        let Some(index) = self.fighter_index(fighter) else {
+            return;
+        };
         if self.state.selected_fighter != Some(index) {
             self.select_fighter(index);
         }
@@ -982,7 +1381,10 @@ impl VisionaryApp {
                 }
             }
             PageAction::Hide(fighter) => {
-                let members: Vec<&str> = group_of(&fighter).map_or(vec![fighter.as_str()], |(_, members)| members.iter().map(|(member, _)| *member).collect());
+                let members: Vec<&str> = group_of(&fighter)
+                    .map_or(vec![fighter.as_str()], |(_, members)| {
+                        members.iter().map(|(member, _)| *member).collect()
+                    });
                 self.change_parts(|parts| {
                     for member in &members {
                         parts.characters.remove(*member);
@@ -994,26 +1396,35 @@ impl VisionaryApp {
                     self.project_member.insert(title, fighter.clone());
                 }
                 // The card stays on the page whichever of its fighters is shown.
-                let slot = self.fighter_index(&fighter).map_or(0, |index| self.state.fighters[index].base_slot());
+                let slot = self
+                    .fighter_index(&fighter)
+                    .map_or(0, |index| self.state.fighters[index].base_slot());
                 self.change_parts(|parts| {
                     parts.characters.entry(fighter.clone()).or_insert(slot);
                 });
                 self.project_open_part = None;
             }
             PageAction::Add(fighter) => {
-                let slot = self.fighter_index(&fighter).map_or(0, |index| self.state.fighters[index].base_slot());
+                let slot = self
+                    .fighter_index(&fighter)
+                    .map_or(0, |index| self.state.fighters[index].base_slot());
                 self.change_parts(|parts| {
                     parts.characters.insert(fighter.clone(), slot);
                 });
                 self.project_open_part = Some((fighter, Part::Moves));
             }
             PageAction::PickFolder(fighter, part, slot) => {
-                let Some(folder) = rfd::FileDialog::new().set_title(format!("Folder for {}", part.title().to_lowercase())).pick_folder() else {
+                let Some(folder) = rfd::FileDialog::new()
+                    .set_title(format!("Folder for {}", part.title().to_lowercase()))
+                    .pick_folder()
+                else {
                     return;
                 };
                 if part == Part::Moves {
                     self.link_acmd_source(folder.clone());
-                    if self.acmd_src.as_ref().map(|index| index.root.as_path()) != Some(folder.as_path()) {
+                    if self.acmd_src.as_ref().map(|index| index.root.as_path())
+                        != Some(folder.as_path())
+                    {
                         return;
                     }
                 }
@@ -1042,7 +1453,11 @@ impl VisionaryApp {
                 self.roster.open = false;
                 self.eff_editor.open = false;
                 self.node_workspace = nodes;
-                self.primary_tab = if nodes { PrimaryEditorTab::Nodes } else { PrimaryEditorTab::Collisions };
+                self.primary_tab = if nodes {
+                    PrimaryEditorTab::Nodes
+                } else {
+                    PrimaryEditorTab::Collisions
+                };
                 if nodes {
                     self.node_editor.refresh_character();
                 }
@@ -1058,7 +1473,11 @@ impl VisionaryApp {
             }
             PageAction::OpenEffectFile => {
                 let start = self.eff_editor.export_root().join("effect");
-                if let Some(path) = rfd::FileDialog::new().add_filter("Effect file", &["eff"]).set_directory(start).pick_file() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Effect file", &["eff"])
+                    .set_directory(start)
+                    .pick_file()
+                {
                     self.open_external_eff(path);
                     self.open_effects_page();
                 }
@@ -1092,9 +1511,19 @@ impl VisionaryApp {
                 let sources = if matches!(what, FileAction::CopyGameCharacter) {
                     crate::project_hub::collect_base_character_files(&root, fighter, slot)
                 } else {
-                    let folder = root.join("fighter").join(fighter).join("model/body").join(format!("c{slot:02}"));
+                    let folder = root
+                        .join("fighter")
+                        .join(fighter)
+                        .join("model/body")
+                        .join(format!("c{slot:02}"));
                     std::fs::read_dir(&folder)
-                        .map(|entries| entries.flatten().map(|entry| entry.path()).filter(|path| path.is_file()).collect())
+                        .map(|entries| {
+                            entries
+                                .flatten()
+                                .map(|entry| entry.path())
+                                .filter(|path| path.is_file())
+                                .collect()
+                        })
                         .map_err(anyhow::Error::from)
                 };
                 let sources = match sources {
@@ -1107,38 +1536,79 @@ impl VisionaryApp {
                 // Copies go where the model and animations are kept, which may be a picked folder.
                 let picked: Vec<(PathBuf, PathBuf)> = [Part::Model, Part::Animations]
                     .into_iter()
-                    .filter_map(|part| Some((part.game_dir(fighter, slot)?, parts.link(fighter, part, slot)?.to_path_buf())))
+                    .filter_map(|part| {
+                        Some((
+                            part.game_dir(fighter, slot)?,
+                            parts.link(fighter, part, slot)?.to_path_buf(),
+                        ))
+                    })
                     .collect();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 self.workspace_copy_rx = Some(receiver);
                 self.state.status = "Copying the game's files.".into();
                 std::thread::spawn(move || {
-                    let result = crate::project_hub::copy_base_files(&workspace, &root, &sources, &picked)
-                        .map_err(|error| format!("{error:#}"));
+                    let result =
+                        crate::project_hub::copy_base_files(&workspace, &root, &sources, &picked)
+                            .map_err(|error| format!("{error:#}"));
                     let _ = sender.send(result);
                 });
                 return;
             }
             FileAction::AddModelFolder => {
-                let Some(source) = rfd::FileDialog::new().set_title("Choose model folder").pick_folder() else { return };
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose model folder")
+                    .pick_folder()
+                else {
+                    return;
+                };
                 crate::project_hub::import_model_folder(&workspace, fighter, slot, &source)
             }
             FileAction::AddModelFiles => {
-                let Some(sources) = rfd::FileDialog::new().set_title("Choose model files").add_filter("Model files", crate::project_hub::MODEL_ASSET_EXTENSIONS).pick_files() else { return };
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose model files")
+                    .add_filter("Model files", crate::project_hub::MODEL_ASSET_EXTENSIONS)
+                    .pick_files()
+                else {
+                    return;
+                };
                 crate::project_hub::import_model_files(&workspace, fighter, slot, &sources)
             }
             FileAction::AddAnimations => {
-                let Some(sources) = rfd::FileDialog::new().set_title("Choose animations").add_filter("Animation", &["nuanmb", "bin"]).pick_files() else { return };
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose animations")
+                    .add_filter("Animation", &["nuanmb", "bin"])
+                    .pick_files()
+                else {
+                    return;
+                };
                 crate::project_hub::import_animation_files(&workspace, fighter, slot, &sources)
             }
             FileAction::AddSwing => {
-                let Some(source) = rfd::FileDialog::new().set_title("Choose swing.prc").add_filter("Swing values", &["prc"]).pick_file() else { return };
-                crate::project_hub::import_swing_prc(&workspace, fighter, slot, &source).map(|path| vec![path])
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose swing.prc")
+                    .add_filter("Swing values", &["prc"])
+                    .pick_file()
+                else {
+                    return;
+                };
+                crate::project_hub::import_swing_prc(&workspace, fighter, slot, &source)
+                    .map(|path| vec![path])
             }
             FileAction::AddEffects | FileAction::AddSounds => {
-                let (part, filter): (Part, &[&str]) = if matches!(what, FileAction::AddEffects) { (Part::Effects, &["eff"]) } else { (Part::Sounds, &["nus3audio", "nus3bank"]) };
-                let Some(sources) = rfd::FileDialog::new().add_filter(part.title(), filter).pick_files() else { return };
-                let Some(dir) = parts.dir(&workspace, fighter, part, slot) else { return };
+                let (part, filter): (Part, &[&str]) = if matches!(what, FileAction::AddEffects) {
+                    (Part::Effects, &["eff"])
+                } else {
+                    (Part::Sounds, &["nus3audio", "nus3bank"])
+                };
+                let Some(sources) = rfd::FileDialog::new()
+                    .add_filter(part.title(), filter)
+                    .pick_files()
+                else {
+                    return;
+                };
+                let Some(dir) = parts.dir(&workspace, fighter, part, slot) else {
+                    return;
+                };
                 let linked = parts.link(fighter, part, slot).is_some();
                 sources
                     .iter()
@@ -1151,7 +1621,12 @@ impl VisionaryApp {
             }
             FileAction::Stop => {
                 let generation = self.next_workspace_asset_generation();
-                self.game_link.send_asset_bundle(&crate::game_link::AssetBundleWire { generation, target: String::new(), files: Vec::new() });
+                self.game_link
+                    .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                        generation,
+                        target: String::new(),
+                        files: Vec::new(),
+                    });
                 self.state.status = "Stopped the model preview in the game.".into();
                 return;
             }
@@ -1182,27 +1657,40 @@ impl VisionaryApp {
     /// Reload the open effect file when it changes on disk in the project or a picked folder:
     /// here at once, and in the game from the next match.
     pub(super) fn reload_changed_effect_file(&mut self) {
-        let Some(rel) = self.eff_editor.loaded_rel() else { return };
+        let Some(rel) = self.eff_editor.loaded_rel() else {
+            return;
+        };
         let path = self.resolve_eff_source(&rel);
         let primary = self.eff_editor.export_root().join(&rel);
         if path == primary {
             self.effect_file_stamp = None;
             return;
         }
-        let stamp = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        let stamp = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok();
         let before = self.effect_file_stamp.replace((path.clone(), stamp));
-        if before.as_ref().is_none_or(|(was, _)| *was != path) || before.as_ref().map(|(_, at)| *at) == Some(stamp) {
+        if before.as_ref().is_none_or(|(was, _)| *was != path)
+            || before.as_ref().map(|(_, at)| *at) == Some(stamp)
+        {
             return;
         }
         self.eff_editor.load_as(&path, rel.clone());
         let fighter = crate::mod_project::fighter_from_source_rel(&rel);
-        let staged = if self.eff_mods.get(&fighter).is_some_and(|eff| !eff.is_empty()) {
+        let staged = if self
+            .eff_mods
+            .get(&fighter)
+            .is_some_and(|eff| !eff.is_empty())
+        {
             self.deploy_live_eff(&fighter)
         } else {
             std::fs::read(&path).is_ok_and(|bytes| self.serve_live_eff(&fighter, &rel, &bytes))
         };
         self.state.status = if staged {
-            format!("Reloaded {}. The game uses it from the next match.", folder_name(&path))
+            format!(
+                "Reloaded {}. The game uses it from the next match.",
+                folder_name(&path)
+            )
         } else {
             format!("Reloaded {}.", folder_name(&path))
         };
@@ -1227,7 +1715,9 @@ fn count_files(dir: &Path) -> usize {
 /// Copy an effect or sound file into its part's folder. In the project's own copy of the game
 /// folders a sound goes into its bank; a picked folder keeps whatever layout it has.
 fn copy_part_file(dir: &Path, picked: bool, part: Part, source: &Path) -> anyhow::Result<PathBuf> {
-    let name = source.file_name().ok_or_else(|| anyhow::anyhow!("not a file"))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("not a file"))?;
     let dir = if part == Part::Sounds && !picked {
         dir.join(crate::project_parts::sound_target(&name.to_string_lossy()))
     } else {

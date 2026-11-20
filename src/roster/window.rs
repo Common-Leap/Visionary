@@ -336,8 +336,13 @@ impl RosterWindow {
         self.ensure_initialized(&[]);
         self.refresh(fighters, data_root);
         let ui_root = self.ui_root();
-        let mut report =
-            super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster, &self.labels)?;
+        let mut report = super::export::export_roster(
+            mod_root,
+            ui_root.as_deref(),
+            &self.index,
+            roster,
+            &self.labels,
+        )?;
         super::export::export_params(
             mod_root,
             self.param_root().as_deref(),
@@ -463,7 +468,9 @@ impl RosterWindow {
             .or_else(|| self.index.by_key(key)?.name_id.clone())
             .or_else(|| {
                 let entries = self.index.sorted();
-                let entry = entries.iter().find(|entry| entry.fighter.as_deref() == Some(fighter))?;
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.fighter.as_deref() == Some(fighter))?;
                 entry.name_id.clone()
             })
             // The Ice Climbers' select screen row is named for the pair, not either climber.
@@ -483,7 +490,13 @@ impl RosterWindow {
             .authored
             .iter()
             .find(|entry| &entry.key == key)
-            .map_or(slot, |entry| entry.all_slots().iter().position(|own| *own == slot).unwrap_or(0) as u8);
+            .map_or(slot, |entry| {
+                entry
+                    .all_slots()
+                    .iter()
+                    .position(|own| *own == slot)
+                    .unwrap_or(0) as u8
+            });
         let roots = self.roots.clone();
         self.card_portraits
             .get_with_gamma(ctx, &roots, &name_id, colour, true, picked.as_deref())?
@@ -659,16 +672,28 @@ impl RosterWindow {
                             }
                             RosterTab::NewCharacter => {
                                 let roots = self.roots.clone();
-                                let fighters: Vec<String> = self.index.entries.iter().filter_map(|entry| entry.fighter.clone()).collect();
-                                let faces: std::collections::HashMap<String, egui::TextureHandle> = fighters
-                                    .into_iter()
-                                    .filter_map(|fighter| {
-                                        let face = self.portrait(ui.ctx(), &RosterKey::fighter(&fighter), &fighter, 0)?;
-                                        Some((fighter, face))
-                                    })
+                                let fighters: Vec<String> = self
+                                    .index
+                                    .entries
+                                    .iter()
+                                    .filter_map(|entry| entry.fighter.clone())
                                     .collect();
+                                let faces: std::collections::HashMap<String, egui::TextureHandle> =
+                                    fighters
+                                        .into_iter()
+                                        .filter_map(|fighter| {
+                                            let face = self.portrait(
+                                                ui.ctx(),
+                                                &RosterKey::fighter(&fighter),
+                                                &fighter,
+                                                0,
+                                            )?;
+                                            Some((fighter, face))
+                                        })
+                                        .collect();
                                 let mut view = std::mem::take(&mut self.new_character);
-                                let action = view.ui(ui, &roots, &self.index, &self.project, &faces);
+                                let action =
+                                    view.ui(ui, &roots, &self.index, &self.project, &faces);
                                 self.new_character = view;
                                 self.handle_new_character(action);
                             }
@@ -696,7 +721,12 @@ impl RosterWindow {
                 self.tab = RosterTab::Project;
             }
             ui.add_space(8.0);
-            ui.label(RichText::new(self.tab.title()).size(30.0).strong().color(look.text));
+            ui.label(
+                RichText::new(self.tab.title())
+                    .size(30.0)
+                    .strong()
+                    .color(look.text),
+            );
             ui.add_space(12.0);
             for tab in RosterTab::ALL {
                 if tab == RosterTab::Project || tab == self.tab {
@@ -768,7 +798,8 @@ impl RosterWindow {
                             .authored
                             .retain(|existing| existing.key != entry.key);
                         self.project.authored.push(entry);
-                        self.new_character.note_created(&display_name, &scaffolded, copied);
+                        self.new_character
+                            .note_created(&display_name, &scaffolded, copied);
                         self.commit_library_change();
                     }
                     Err(error) => self.new_character.note_error(format!("{error:#}")),
@@ -777,10 +808,17 @@ impl RosterWindow {
             NewCharacterAction::SetEditTarget(target) => {
                 self.status = match &target {
                     Some(key) => {
-                        let name = self.project.authored.iter().find(|entry| &entry.key == key).map_or(key.to_string(), |entry| entry.display_name.clone());
+                        let name = self
+                            .project
+                            .authored
+                            .iter()
+                            .find(|entry| &entry.key == key)
+                            .map_or(key.to_string(), |entry| entry.display_name.clone());
                         format!("Moves you edit now change only {name}.")
                     }
-                    None => "Moves you edit now change every costume of the fighter again.".to_string(),
+                    None => {
+                        "Moves you edit now change every costume of the fighter again.".to_string()
+                    }
                 };
                 self.edit_target = target;
             }
@@ -795,7 +833,9 @@ impl RosterWindow {
                 self.project.hidden.remove(&key);
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
-                self.status = "Removed the character from the project. Its files are still in its folder.".to_string();
+                self.status =
+                    "Removed the character from the project. Its files are still in its folder."
+                        .to_string();
             }
         }
     }
@@ -806,10 +846,15 @@ impl RosterWindow {
         let look = look(ui);
         ui.horizontal(|ui| {
             if act(ui, look, "Add mod folder", Some(look.accent))
-                .on_hover_text("A folder with fighter, effect or ui in it, or one that holds such a folder")
+                .on_hover_text(
+                    "A folder with fighter, effect or ui in it, or one that holds such a folder",
+                )
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new().set_title("Add mod folder").pick_folder() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Add mod folder")
+                    .pick_folder()
+                {
                     self.start_import(vec![path]);
                 }
             }
@@ -831,10 +876,27 @@ impl RosterWindow {
         if let Some(job) = &self.import {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new(format!("Adding {} of {}: {}", job.done + 1, job.total, job.current)).strong().color(look.text));
+                ui.label(
+                    RichText::new(format!(
+                        "Adding {} of {}: {}",
+                        job.done + 1,
+                        job.total,
+                        job.current
+                    ))
+                    .strong()
+                    .color(look.text),
+                );
             });
-            let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
-            ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(ui.available_width().min(360.0)).desired_height(6.0));
+            let frac = if job.total > 0 {
+                job.done as f32 / job.total as f32
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                    .desired_width(ui.available_width().min(360.0))
+                    .desired_height(6.0),
+            );
             ui.add_space(8.0);
         }
 

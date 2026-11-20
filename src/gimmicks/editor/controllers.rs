@@ -188,7 +188,9 @@ impl GimmicksEditor {
                     if ui.button("Delete gimmick").clicked() {
                         command = Some(ChartCommand::Remove(id));
                     }
-                    if ui.button("Cancel").clicked() { self.pending_chart_delete = None; }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_chart_delete = None;
+                    }
                 });
             });
         }

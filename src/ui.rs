@@ -378,7 +378,11 @@ pub(crate) fn act(ui: &mut Ui, look: Look, label: &str, colour: Option<Color32>)
             state.corner_radius = egui::CornerRadius::same(6);
         }
         let label = RichText::new(label).color(text);
-        let label = if colour.is_some() { label.strong() } else { label };
+        let label = if colour.is_some() {
+            label.strong()
+        } else {
+            label
+        };
         ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 28.0)))
     })
     .inner

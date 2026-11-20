@@ -71,8 +71,12 @@ impl Part {
     pub fn game_dir(self, fighter: &str, slot: u8) -> Option<PathBuf> {
         let costume = format!("c{slot:02}");
         Some(match self {
-            Self::Model => ["fighter", fighter, "model", "body", &costume].iter().collect(),
-            Self::Animations => ["fighter", fighter, "motion", "body", &costume].iter().collect(),
+            Self::Model => ["fighter", fighter, "model", "body", &costume]
+                .iter()
+                .collect(),
+            Self::Animations => ["fighter", fighter, "motion", "body", &costume]
+                .iter()
+                .collect(),
             Self::Effects if fighter == OTHER_EFFECTS => PathBuf::from("effect"),
             Self::Effects => ["effect", "fighter", fighter].iter().collect(),
             Self::Sounds => ["sound", "bank"].iter().collect(),
@@ -138,12 +142,21 @@ impl ProjectParts {
     }
 
     pub fn set_link(&mut self, fighter: &str, part: Part, slot: u8, folder: Option<PathBuf>) {
-        let fighter = if part == Part::Moves { String::new() } else { fighter.to_ascii_lowercase() };
+        let fighter = if part == Part::Moves {
+            String::new()
+        } else {
+            fighter.to_ascii_lowercase()
+        };
         let slot = Self::key(part, slot);
         self.links
             .retain(|link| !(link.part == part && link.fighter == fighter && link.slot == slot));
         if let Some(folder) = folder {
-            self.links.push(PartLink { fighter, part, slot, folder });
+            self.links.push(PartLink {
+                fighter,
+                part,
+                slot,
+                folder,
+            });
         }
     }
 
@@ -180,7 +193,11 @@ pub fn sound_target(file_name: &str) -> &'static str {
 /// Copy a picked folder into an exported mod at `target` (a game folder). Sound files are
 /// sorted into their bank; every other part keeps its subfolders as they are. Files the
 /// export already wrote win, and are returned so the export can say so.
-pub fn ship_folder(folder: &Path, target: &Path, dest: &Path) -> anyhow::Result<(usize, Vec<String>)> {
+pub fn ship_folder(
+    folder: &Path,
+    target: &Path,
+    dest: &Path,
+) -> anyhow::Result<(usize, Vec<String>)> {
     let sounds = target == Path::new("sound/bank");
     let mut copied = 0;
     let mut kept = Vec::new();
@@ -239,7 +256,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("visionary_parts_{name}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("visionary_parts_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -250,17 +268,26 @@ mod tests {
         let workspace = scratch("link");
         let mut parts = ProjectParts::default();
         parts.set_link("Pickel", Part::Model, 7, Some(PathBuf::from("/mods/cape")));
-        assert_eq!(parts.dir(&workspace, "pickel", Part::Model, 7), Some(PathBuf::from("/mods/cape")));
+        assert_eq!(
+            parts.dir(&workspace, "pickel", Part::Model, 7),
+            Some(PathBuf::from("/mods/cape"))
+        );
         assert_eq!(
             parts.dir(&workspace, "pickel", Part::Model, 0),
             Some(workspace.join("romfs/fighter/pickel/model/body/c00"))
         );
         // Effects are one folder per fighter, whatever costume is shown.
         parts.set_link("pickel", Part::Effects, 3, Some(PathBuf::from("/fx")));
-        assert_eq!(parts.link("pickel", Part::Effects, 5), Some(Path::new("/fx")));
+        assert_eq!(
+            parts.link("pickel", Part::Effects, 5),
+            Some(Path::new("/fx"))
+        );
         // Move code is one folder for the project.
         parts.set_link("mario", Part::Moves, 0, Some(PathBuf::from("/src")));
-        assert_eq!(parts.link("pickel", Part::Moves, 0), Some(Path::new("/src")));
+        assert_eq!(
+            parts.link("pickel", Part::Moves, 0),
+            Some(Path::new("/src"))
+        );
         parts.save(&workspace).unwrap();
         assert_eq!(ProjectParts::load(&workspace), parts);
         parts.set_link("pickel", Part::Model, 7, None);
@@ -287,13 +314,23 @@ mod tests {
 
         let (copied, kept) = ship_folder(&sounds, Path::new("sound/bank"), &dest).unwrap();
         assert_eq!((copied, kept.len()), (2, 0));
-        assert!(dest.join("sound/bank/fighter/se_pickel.nus3audio").is_file());
-        assert!(dest.join("sound/bank/fighter_voice/vc_pickel.nus3audio").is_file());
+        assert!(dest
+            .join("sound/bank/fighter/se_pickel.nus3audio")
+            .is_file());
+        assert!(dest
+            .join("sound/bank/fighter_voice/vc_pickel.nus3audio")
+            .is_file());
 
-        let (copied, kept) = ship_folder(&effects, Path::new("effect/fighter/pickel"), &dest).unwrap();
+        let (copied, kept) =
+            ship_folder(&effects, Path::new("effect/fighter/pickel"), &dest).unwrap();
         assert_eq!(copied, 1);
         assert_eq!(kept, vec!["effect/fighter/pickel/ef_pickel.eff".to_owned()]);
-        assert_eq!(std::fs::read(dest.join("effect/fighter/pickel/ef_pickel.eff")).unwrap(), b"built");
-        assert!(dest.join("effect/fighter/pickel/trail/tex.nutexb").is_file());
+        assert_eq!(
+            std::fs::read(dest.join("effect/fighter/pickel/ef_pickel.eff")).unwrap(),
+            b"built"
+        );
+        assert!(dest
+            .join("effect/fighter/pickel/trail/tex.nutexb")
+            .is_file());
     }
 }

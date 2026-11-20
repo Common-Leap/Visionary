@@ -733,8 +733,13 @@ impl GimmicksEditor {
         if graphs.get(fighter).is_none_or(BehaviorGraph::is_empty) {
             ui.weak("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Start from a ready-made one, or build the rules in Move nodes.");
         } else if let Some(graph) = graphs.get(fighter) {
-            let names: Vec<&str> = graph.states.iter().map(|state| state.name.as_str()).collect();
-            let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+            let names: Vec<&str> = graph
+                .states
+                .iter()
+                .map(|state| state.name.as_str())
+                .collect();
+            let plural =
+                |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
             ui.weak(format!(
                 "Has {} ({}), {} and {}.",
                 plural(names.len(), "stage"),
@@ -810,9 +815,7 @@ impl GimmicksEditor {
                     ui.weak(about);
                 }
                 if graphs.get(fighter).is_some_and(|graph| !graph.is_empty()) {
-                    ui.weak(
-                        "This replaces the rules this gimmick has now.",
-                    );
+                    ui.weak("This replaces the rules this gimmick has now.");
                 }
                 ui.horizontal(|ui| {
                     apply = ui.button("Apply").clicked();
@@ -826,7 +829,9 @@ impl GimmicksEditor {
                 {
                     Ok(graph) => {
                         graphs.insert(fighter.to_string(), graph);
-                        self.status = "Added. It runs in the game right away when the game is connected.".into();
+                        self.status =
+                            "Added. It runs in the game right away when the game is connected."
+                                .into();
                     }
                     Err(error) => self.status = error,
                 }
@@ -2411,7 +2416,6 @@ fn projectile_inputs(fighter: &str) -> Vec<NativeInput> {
         .filter(|input| input.projectile_article().is_some())
         .collect()
 }
-
 
 /// What a ready-made gimmick does, looked up by the name it was staged under.
 fn preset_about(name: &str) -> Option<String> {

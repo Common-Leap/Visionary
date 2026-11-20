@@ -378,7 +378,11 @@ mod census {
             // Which command keeps a whole `is_excute` block preserved.
             AcmdStmt::Excute(commands) => format!(
                 "Excute[{}]",
-                commands.iter().map(excute_text).collect::<Vec<_>>().join(",")
+                commands
+                    .iter()
+                    .map(excute_text)
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             other => key(&format!("{other:?}")),
         }
@@ -387,14 +391,22 @@ mod census {
     fn excute_text(stmt: &crate::data::ExcuteStmt) -> String {
         match stmt {
             crate::data::ExcuteStmt::Raw(line) => key(line),
-            other => format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("").into(),
+            other => format!("{other:?}")
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap_or("")
+                .into(),
         }
     }
 
     fn effect_text(stmt: &crate::data::EffectMacro) -> String {
         match stmt {
             crate::data::EffectMacro::Raw(line) => key(line),
-            other => format!("{other:?}").split(['(', ' ', '{']).next().unwrap_or("").into(),
+            other => format!("{other:?}")
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap_or("")
+                .into(),
         }
     }
 
@@ -407,7 +419,9 @@ mod census {
         use crate::data::{AcmdStmt, ExcuteStmt};
         let mut note = |line: &str| {
             let key = format!("in  {}", key(line));
-            samples.entry(key.clone()).or_insert_with(|| line.chars().take(300).collect());
+            samples
+                .entry(key.clone())
+                .or_insert_with(|| line.chars().take(300).collect());
             *ranking.entry(key).or_default() += 1;
         };
         match stmt {
@@ -428,19 +442,33 @@ mod census {
         }
     }
 
-    fn note_raw(line: Option<String>, ranking: &mut BTreeMap<String, u64>, samples: &mut BTreeMap<String, String>) {
+    fn note_raw(
+        line: Option<String>,
+        ranking: &mut BTreeMap<String, u64>,
+        samples: &mut BTreeMap<String, String>,
+    ) {
         if let Some(line) = line {
-            let line = line.trim_start_matches("SourceLine { source: \"").to_owned();
+            let line = line
+                .trim_start_matches("SourceLine { source: \"")
+                .to_owned();
             let key = format!("raw {}", key(&line));
-            samples.entry(key.clone()).or_insert_with(|| line.chars().take(300).collect());
+            samples
+                .entry(key.clone())
+                .or_insert_with(|| line.chars().take(300).collect());
             *ranking.entry(key).or_default() += 1;
         }
     }
 
-    fn walk(nodes: &[MoveNode], ranking: &mut BTreeMap<String, u64>, samples: &mut BTreeMap<String, String>) {
+    fn walk(
+        nodes: &[MoveNode],
+        ranking: &mut BTreeMap<String, u64>,
+        samples: &mut BTreeMap<String, String>,
+    ) {
         fn raw_line(command: &crate::data::ExcuteStmt) -> Option<String> {
             match command {
-                crate::data::ExcuteStmt::NativeCall(call) => call.source_line.as_ref().map(|l| format!("{l:?}")),
+                crate::data::ExcuteStmt::NativeCall(call) => {
+                    call.source_line.as_ref().map(|l| format!("{l:?}"))
+                }
                 _ => None,
             }
         }
@@ -455,7 +483,11 @@ mod census {
                 NodeKind::EffectExecute { commands } => {
                     for command in commands {
                         if let crate::data::EffectMacro::NativeCall(call) = command {
-                            note_raw(call.source_line.as_ref().map(|l| format!("{l:?}")), ranking, samples);
+                            note_raw(
+                                call.source_line.as_ref().map(|l| format!("{l:?}")),
+                                ranking,
+                                samples,
+                            );
                         }
                     }
                 }
@@ -466,7 +498,9 @@ mod census {
                         }
                         if let MoveCommand::Preserved(command) = command {
                             let key = format!("cmd {}", excute_text(command));
-                            samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
+                            samples.entry(key.clone()).or_insert_with(|| {
+                                format!("{command:?}").chars().take(300).collect()
+                            });
                             *ranking.entry(key).or_default() += 1;
                         }
                     }
@@ -477,11 +511,18 @@ mod census {
                             crate::data::EffectMacro::NativeCall(call),
                         ) = command
                         {
-                            note_raw(call.source_line.as_ref().map(|l| format!("{l:?}")), ranking, samples);
+                            note_raw(
+                                call.source_line.as_ref().map(|l| format!("{l:?}")),
+                                ranking,
+                                samples,
+                            );
                         }
-                        if let super::super::model::EffectCommandSlot::Preserved(command) = command {
+                        if let super::super::model::EffectCommandSlot::Preserved(command) = command
+                        {
                             let key = format!("cmd {}", effect_text(command));
-                            samples.entry(key.clone()).or_insert_with(|| format!("{command:?}").chars().take(300).collect());
+                            samples.entry(key.clone()).or_insert_with(|| {
+                                format!("{command:?}").chars().take(300).collect()
+                            });
                             *ranking.entry(key).or_default() += 1;
                         }
                     }
@@ -489,11 +530,17 @@ mod census {
                 NodeKind::Preserved { statement } => {
                     inner(statement, ranking, samples);
                     let key = format!("blk {}", stmt_text(statement));
-                    samples.entry(key.clone()).or_insert_with(|| format!("{statement:?}").chars().take(300).collect());
+                    samples
+                        .entry(key.clone())
+                        .or_insert_with(|| format!("{statement:?}").chars().take(300).collect());
                     *ranking.entry(key).or_default() += 1;
                 }
                 NodeKind::Repeat { body, .. } => walk(body, ranking, samples),
-                NodeKind::Branch { then_nodes, else_nodes, .. } => {
+                NodeKind::Branch {
+                    then_nodes,
+                    else_nodes,
+                    ..
+                } => {
                     walk(then_nodes, ranking, samples);
                     walk(else_nodes, ranking, samples);
                 }
@@ -517,7 +564,10 @@ mod census {
         let mut ranking: BTreeMap<String, u64> = BTreeMap::new();
         let mut sole: BTreeMap<String, u64> = BTreeMap::new();
         let mut samples = BTreeMap::new();
-        let mut dirs: Vec<_> = std::fs::read_dir(&root).expect("corpus").flatten().collect();
+        let mut dirs: Vec<_> = std::fs::read_dir(&root)
+            .expect("corpus")
+            .flatten()
+            .collect();
         dirs.sort_by_key(|entry| entry.path());
         for package in dirs {
             let Some(fighter) = package
@@ -528,10 +578,14 @@ mod census {
             else {
                 continue;
             };
-            let mut agents: Vec<_> = std::fs::read_dir(package.path()).unwrap().flatten().collect();
+            let mut agents: Vec<_> = std::fs::read_dir(package.path())
+                .unwrap()
+                .flatten()
+                .collect();
             agents.sort_by_key(|entry| entry.path());
             for agent in agents {
-                let mut files: Vec<_> = std::fs::read_dir(agent.path()).unwrap().flatten().collect();
+                let mut files: Vec<_> =
+                    std::fs::read_dir(agent.path()).unwrap().flatten().collect();
                 files.sort_by_key(|entry| entry.path());
                 for file in files {
                     let Ok(text) = std::fs::read_to_string(file.path()) else {
@@ -585,7 +639,8 @@ mod census {
                         // fully editable: typing that kind flips the function.
                         let mut own = BTreeMap::new();
                         walk(&imported.nodes, &mut own, &mut samples);
-                        let blockers: Vec<_> = own.keys().filter(|key| !key.starts_with("in ")).collect();
+                        let blockers: Vec<_> =
+                            own.keys().filter(|key| !key.starts_with("in ")).collect();
                         if let [only] = blockers.as_slice() {
                             *sole.entry((*only).clone()).or_default() += 1;
                         }
@@ -602,14 +657,20 @@ mod census {
         let mut ranked: Vec<_> = ranking.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         for (name, count) in ranked.iter().take(80) {
-            println!("RANK {count:>6} {name}\n       {}", samples.get(name).map_or("", String::as_str));
+            println!(
+                "RANK {count:>6} {name}\n       {}",
+                samples.get(name).map_or("", String::as_str)
+            );
         }
         let mut sole: Vec<_> = sole.into_iter().collect();
         sole.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         for (name, count) in sole.iter().take(40) {
             println!("SOLE {count:>6} {name}");
         }
-        assert!(functions > 70_000, "corpus incomplete: {functions} functions");
+        assert!(
+            functions > 70_000,
+            "corpus incomplete: {functions} functions"
+        );
     }
 
     /// Every vanilla effect script with a facing test: both arms reach the flat call list, and
@@ -623,9 +684,19 @@ mod census {
         let (mut checked, mut spawns) = (0, 0);
         let mut failures = Vec::new();
         for package in std::fs::read_dir(&root).unwrap().flatten() {
-            for agent in std::fs::read_dir(package.path()).into_iter().flatten().flatten() {
-                for file in std::fs::read_dir(agent.path()).into_iter().flatten().flatten() {
-                    let Ok(text) = std::fs::read_to_string(file.path()) else { continue };
+            for agent in std::fs::read_dir(package.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                for file in std::fs::read_dir(agent.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let Ok(text) = std::fs::read_to_string(file.path()) else {
+                        continue;
+                    };
                     for function in text.split("unsafe extern \"C\" fn ").skip(1) {
                         // Decompiler-broken conditions (`L2CValue::operator`) never wrote back.
                         if !function.starts_with("effect_")
@@ -643,7 +714,9 @@ mod census {
                         let (calls, residue) = script.to_effect_calls_and_residue();
                         let facing: Vec<_> = calls
                             .iter()
-                            .filter(|call| crate::data::facing_arm_of(call.guard.as_deref()).is_some())
+                            .filter(|call| {
+                                crate::data::facing_arm_of(call.guard.as_deref()).is_some()
+                            })
                             .collect();
                         let name = format!("{}", file.path().display());
                         spawns += facing.len();
@@ -658,7 +731,14 @@ mod census {
                         let key = |calls: &[crate::data::EffectCall]| -> Vec<_> {
                             let mut keys: Vec<_> = calls
                                 .iter()
-                                .map(|c| (c.effect_name.clone(), c.active_start, c.guard.clone(), c.rotation.map(f32::to_bits)))
+                                .map(|c| {
+                                    (
+                                        c.effect_name.clone(),
+                                        c.active_start,
+                                        c.guard.clone(),
+                                        c.rotation.map(f32::to_bits),
+                                    )
+                                })
                                 .collect();
                             keys.sort_by(|a, b| a.partial_cmp(b).unwrap());
                             keys
@@ -670,15 +750,25 @@ mod census {
                 }
             }
         }
-        println!("FACING {checked} scripts, {spawns} facing spawns, {} failures", failures.len());
+        println!(
+            "FACING {checked} scripts, {spawns} facing spawns, {} failures",
+            failures.len()
+        );
         for failure in failures.iter().take(10) {
             println!("{failure}\n");
         }
         // Three dumps put an `else {` after an unrelated block; they wrote back broken before
         // facing tests were read too, and still do.
-        let known = ["trail/AppealHiR.txt", "trail/AppealHiL.txt", "bayonetta/AttackAirN.txt"];
+        let known = [
+            "trail/AppealHiR.txt",
+            "trail/AppealHiL.txt",
+            "bayonetta/AttackAirN.txt",
+        ];
         failures.retain(|failure| !known.iter().any(|name| failure.contains(name)));
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-        assert!(spawns > 1000, "only {spawns} facing spawns reached the flat list");
+        assert!(
+            spawns > 1000,
+            "only {spawns} facing spawns reached the flat list"
+        );
     }
 }

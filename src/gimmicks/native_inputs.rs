@@ -1270,7 +1270,9 @@ impl NativeInput {
             Self::Fighter { value, .. } => value.label(),
             Self::OwnedObject { field, .. } => field.label(),
             Self::ParamFloat { .. } => "Cape gravity acceleration",
-            Self::ParamInt { table, .. } if table == JUMP_COUNT_PARAM => "Max jumps (fighter's own setting)",
+            Self::ParamInt { table, .. } if table == JUMP_COUNT_PARAM => {
+                "Max jumps (fighter's own setting)"
+            }
             Self::ParamInt { .. } => "Reflector air stop frames",
             Self::EnergySpeed { energy, axis, .. } => match (energy, axis) {
                 (super::status_commands::Energy::Stop, Axis::X) => "Stop speed X",

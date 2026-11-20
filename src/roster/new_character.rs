@@ -107,15 +107,35 @@ impl NewCharacterView {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 96.0), egui::Sense::hover());
             ui.painter().rect_filled(rect, 10.0, look.sunk);
             if let Some(face) = self.donor.as_ref().and_then(|donor| faces.get(donor)) {
-                egui::Image::new(face).corner_radius(10.0).paint_at(ui, rect);
+                egui::Image::new(face)
+                    .corner_radius(10.0)
+                    .paint_at(ui, rect);
             }
-            ui.painter().rect_stroke(rect, 10.0, egui::Stroke::new(1.5, look.edge), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(
+                rect,
+                10.0,
+                egui::Stroke::new(1.5, look.edge),
+                egui::StrokeKind::Inside,
+            );
             ui.add_space(8.0);
             ui.vertical(|ui| {
                 let name = self.display_name.trim();
-                ui.label(RichText::new(if name.is_empty() { "New character" } else { name }).size(26.0).strong().color(look.text));
+                ui.label(
+                    RichText::new(if name.is_empty() {
+                        "New character"
+                    } else {
+                        name
+                    })
+                    .size(26.0)
+                    .strong()
+                    .color(look.text),
+                );
                 if let Some(base) = &base {
-                    ui.label(RichText::new(format!("Plays as {base}")).size(15.0).color(look.dim));
+                    ui.label(
+                        RichText::new(format!("Plays as {base}"))
+                            .size(15.0)
+                            .color(look.dim),
+                    );
                 }
             });
         });
@@ -125,21 +145,41 @@ impl NewCharacterView {
             ui.label(RichText::new(label).strong().color(look.dim));
         };
         field(ui, "Name");
-        ui.add(egui::TextEdit::singleline(&mut self.display_name).desired_width(f32::INFINITY).hint_text("As the game shows it"));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.display_name)
+                .desired_width(f32::INFINITY)
+                .hint_text("As the game shows it"),
+        );
         ui.add_space(8.0);
 
         field(ui, "Skins");
         let mut range = self.slot_range.map(clamp_range);
         ui.horizontal(|ui| {
             let mut count = range.map_or(MAX_SKINS, range_count).clamp(1, MAX_SKINS);
-            let changed = ui.add(egui::DragValue::new(&mut count).range(1..=MAX_SKINS).speed(0.05)).changed();
+            let changed = ui
+                .add(
+                    egui::DragValue::new(&mut count)
+                        .range(1..=MAX_SKINS)
+                        .speed(0.05),
+                )
+                .changed();
             match &mut range {
                 Some(range) => {
                     if changed {
                         range.1 = range.0.saturating_add(count - 1);
                     }
-                    ui.label(RichText::new(format!("costumes c{:02} to c{:02}", range.0, range.1)).color(look.text));
-                    if act(ui, look, if self.show_slot_map { "Done" } else { "Change" }, None).clicked() {
+                    ui.label(
+                        RichText::new(format!("costumes c{:02} to c{:02}", range.0, range.1))
+                            .color(look.text),
+                    );
+                    if act(
+                        ui,
+                        look,
+                        if self.show_slot_map { "Done" } else { "Change" },
+                        None,
+                    )
+                    .clicked()
+                    {
                         self.show_slot_map = !self.show_slot_map;
                     }
                 }
@@ -170,21 +210,29 @@ impl NewCharacterView {
         ui.add_space(8.0);
 
         field(ui, "Files");
-        let home = self.folder.clone().or_else(|| self.project_dir.as_ref().map(|dir| dir.join("characters")));
-        ui.horizontal_wrapped(|ui| {
-            match &home {
-                Some(home) => {
-                    let name = crate::mod_export::slugify(self.display_name.trim());
-                    ui.label(RichText::new(home.join(name).display().to_string()).monospace().color(look.text));
-                }
-                None => {
-                    ui.label(RichText::new("Save the project first (File, Save as).").color(look.dim));
-                }
+        let home = self
+            .folder
+            .clone()
+            .or_else(|| self.project_dir.as_ref().map(|dir| dir.join("characters")));
+        ui.horizontal_wrapped(|ui| match &home {
+            Some(home) => {
+                let name = crate::mod_export::slugify(self.display_name.trim());
+                ui.label(
+                    RichText::new(home.join(name).display().to_string())
+                        .monospace()
+                        .color(look.text),
+                );
+            }
+            None => {
+                ui.label(RichText::new("Save the project first (File, Save as).").color(look.dim));
             }
         });
         ui.horizontal(|ui| {
             if act(ui, look, "Choose folder", None).clicked() {
-                if let Some(picked) = rfd::FileDialog::new().set_title("Folder for this character's files").pick_folder() {
+                if let Some(picked) = rfd::FileDialog::new()
+                    .set_title("Folder for this character's files")
+                    .pick_folder()
+                {
                     self.folder = Some(picked);
                 }
             }
@@ -230,11 +278,27 @@ impl NewCharacterView {
     }
 
     /// Every fighter as a portrait tile, as many to a row as fit.
-    fn draw_fighters(&mut self, ui: &mut Ui, look: Look, roots: &[PathBuf], index: &RosterIndex, faces: &HashMap<String, egui::TextureHandle>) {
+    fn draw_fighters(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        roots: &[PathBuf],
+        index: &RosterIndex,
+        faces: &HashMap<String, egui::TextureHandle>,
+    ) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Plays as").size(21.0).strong().color(look.text));
+            ui.label(
+                RichText::new("Plays as")
+                    .size(21.0)
+                    .strong()
+                    .color(look.text),
+            );
             ui.add_space(8.0);
-            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0).hint_text("Find a fighter"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .desired_width(220.0)
+                    .hint_text("Find a fighter"),
+            );
         });
         ui.add_space(6.0);
         let wanted = self.search.trim().to_lowercase();
@@ -243,7 +307,11 @@ impl NewCharacterView {
             .into_iter()
             .filter(|entry| !entry.backing.shares_engine_fighter())
             .filter_map(|entry| Some((entry.fighter.as_deref()?, entry.display_name.as_str())))
-            .filter(|(fighter, name)| wanted.is_empty() || name.to_lowercase().contains(&wanted) || fighter.contains(&wanted))
+            .filter(|(fighter, name)| {
+                wanted.is_empty()
+                    || name.to_lowercase().contains(&wanted)
+                    || fighter.contains(&wanted)
+            })
             .collect();
         let tile = egui::vec2(104.0, 128.0);
         ui.horizontal_wrapped(|ui| {
@@ -258,18 +326,46 @@ impl NewCharacterView {
                 painter.rect_filled(rect, 10.0, look.sunk);
                 let face = egui::Rect::from_min_size(rect.min, egui::vec2(tile.x, tile.x));
                 if let Some(texture) = faces.get(fighter) {
-                    egui::Image::new(texture).corner_radius(10.0).paint_at(ui, face);
+                    egui::Image::new(texture)
+                        .corner_radius(10.0)
+                        .paint_at(ui, face);
                 }
-                let edge = if picked { look.accent } else if response.hovered() { look.text } else { look.edge };
-                painter.rect_stroke(rect, 10.0, egui::Stroke::new(if picked { 3.0 } else { 1.5 }, edge), egui::StrokeKind::Inside);
-                let label = egui::Rect::from_min_max(egui::pos2(rect.left() + 4.0, face.bottom()), rect.max - egui::vec2(4.0, 0.0));
-                let galley = painter.layout_no_wrap(name.to_owned(), egui::FontId::proportional(13.0), look.text);
-                let at = egui::pos2(label.center().x - galley.size().x.min(label.width()) / 2.0, label.center().y - galley.size().y / 2.0);
+                let edge = if picked {
+                    look.accent
+                } else if response.hovered() {
+                    look.text
+                } else {
+                    look.edge
+                };
+                painter.rect_stroke(
+                    rect,
+                    10.0,
+                    egui::Stroke::new(if picked { 3.0 } else { 1.5 }, edge),
+                    egui::StrokeKind::Inside,
+                );
+                let label = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.0, face.bottom()),
+                    rect.max - egui::vec2(4.0, 0.0),
+                );
+                let galley = painter.layout_no_wrap(
+                    name.to_owned(),
+                    egui::FontId::proportional(13.0),
+                    look.text,
+                );
+                let at = egui::pos2(
+                    label.center().x - galley.size().x.min(label.width()) / 2.0,
+                    label.center().y - galley.size().y / 2.0,
+                );
                 painter.with_clip_rect(label).galley(at, galley, look.text);
                 if response.on_hover_text(name).clicked() && !picked {
                     self.donor = Some(fighter.to_owned());
-                    let width = self.slot_range.map_or(MAX_SKINS, range_count).clamp(1, MAX_SKINS);
-                    self.slot_range = Some(lowest_free_run(roots, index, fighter, width).unwrap_or((8, 7 + width)));
+                    let width = self
+                        .slot_range
+                        .map_or(MAX_SKINS, range_count)
+                        .clamp(1, MAX_SKINS);
+                    self.slot_range = Some(
+                        lowest_free_run(roots, index, fighter, width).unwrap_or((8, 7 + width)),
+                    );
                     self.show_slot_map = false;
                     self.error = None;
                 }
@@ -278,25 +374,52 @@ impl NewCharacterView {
     }
 
     /// Every costume of the fighter, eight to a row. Clicking a free one moves the block there.
-    fn draw_slot_map(&mut self, ui: &mut Ui, look: Look, statuses: &[SlotStatus], range: SlotRange) {
+    fn draw_slot_map(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        statuses: &[SlotStatus],
+        range: SlotRange,
+    ) {
         let count = range_count(range);
         let map_end = range.1.saturating_add(8).clamp(31, 63) as usize;
-        egui::Frame::new().fill(look.sunk).corner_radius(8.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
-            ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 4.0);
-            for row in statuses.iter().take(map_end + 1).enumerate().collect::<Vec<_>>().chunks(8) {
-                ui.horizontal(|ui| {
-                    for (i, status) in row {
-                        let slot = *i as u8;
-                        slot_chip(ui, slot, status, slot >= range.0 && slot <= range.1, count, &mut self.slot_range);
-                    }
-                });
-            }
-        });
+        egui::Frame::new()
+            .fill(look.sunk)
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 4.0);
+                for row in statuses
+                    .iter()
+                    .take(map_end + 1)
+                    .enumerate()
+                    .collect::<Vec<_>>()
+                    .chunks(8)
+                {
+                    ui.horizontal(|ui| {
+                        for (i, status) in row {
+                            let slot = *i as u8;
+                            slot_chip(
+                                ui,
+                                slot,
+                                status,
+                                slot >= range.0 && slot <= range.1,
+                                count,
+                                &mut self.slot_range,
+                            );
+                        }
+                    });
+                }
+            });
     }
 
     /// Turn the form into the create action. A range that overlaps a character already in the
     /// project is refused: it would put the same files in the project twice.
-    fn build_create_action(&mut self, project: &RosterMod, destination: PathBuf) -> NewCharacterAction {
+    fn build_create_action(
+        &mut self,
+        project: &RosterMod,
+        destination: PathBuf,
+    ) -> NewCharacterAction {
         let (Some(donor), Some(range)) = (self.donor.clone(), self.slot_range) else {
             return NewCharacterAction::None;
         };
@@ -305,12 +428,17 @@ impl NewCharacterView {
             return NewCharacterAction::None;
         }
         let donor_lc = donor.to_ascii_lowercase();
-        let overlaps = project
-            .authored
-            .iter()
-            .any(|entry| entry.donor == donor_lc && entry.all_slots().iter().any(|slot| *slot >= range.0 && *slot <= range.1));
+        let overlaps = project.authored.iter().any(|entry| {
+            entry.donor == donor_lc
+                && entry
+                    .all_slots()
+                    .iter()
+                    .any(|slot| *slot >= range.0 && *slot <= range.1)
+        });
         if overlaps {
-            self.error = Some(format!("{display_name} would take costumes another character of this project already has."));
+            self.error = Some(format!(
+                "{display_name} would take costumes another character of this project already has."
+            ));
             return NewCharacterAction::None;
         }
         NewCharacterAction::Create {
@@ -322,7 +450,12 @@ impl NewCharacterView {
         }
     }
 
-    pub fn note_created(&mut self, display_name: &str, scaffolded: &scaffold::Scaffold, copied: scaffold::Copied) {
+    pub fn note_created(
+        &mut self,
+        display_name: &str,
+        scaffolded: &scaffold::Scaffold,
+        copied: scaffold::Copied,
+    ) {
         self.error = None;
         self.display_name.clear();
         self.donor = None;
@@ -637,7 +770,9 @@ mod tests {
     fn game() -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         for costume in 0..8 {
-            let model = dir.path().join(format!("fighter/mario/model/body/c{costume:02}"));
+            let model = dir
+                .path()
+                .join(format!("fighter/mario/model/body/c{costume:02}"));
             std::fs::create_dir_all(&model).unwrap();
             std::fs::write(model.join("model.numdlb"), b"model").unwrap();
         }
@@ -645,9 +780,25 @@ mod tests {
         (dir, roots)
     }
 
-    fn create(library: &mut ModLibrary, destination: &std::path::Path, slots: &[u8], name: &str) -> scaffold::Scaffold {
+    fn create(
+        library: &mut ModLibrary,
+        destination: &std::path::Path,
+        slots: &[u8],
+        name: &str,
+    ) -> scaffold::Scaffold {
         let (_game, roots) = game();
-        create_and_import_range(library, destination, &roots, "mario", "mario", slots, name, &name_id_for(name)).unwrap().0
+        create_and_import_range(
+            library,
+            destination,
+            &roots,
+            "mario",
+            "mario",
+            slots,
+            name,
+            &name_id_for(name),
+        )
+        .unwrap()
+        .0
     }
 
     #[test]
@@ -680,18 +831,34 @@ mod tests {
             ..Default::default()
         };
         let mut project = RosterMod::default();
-        project.authored.push(authored_entry_multi("mario", &[8, 9, 10, 11, 12, 13, 14, 15], "Vision", "vision"));
-        assert!(matches!(view.build_create_action(&project, PathBuf::from("nowhere")), NewCharacterAction::None));
+        project.authored.push(authored_entry_multi(
+            "mario",
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "Vision",
+            "vision",
+        ));
+        assert!(matches!(
+            view.build_create_action(&project, PathBuf::from("nowhere")),
+            NewCharacterAction::None
+        ));
         assert!(view.error.is_some());
         view.slot_range = Some((16, 23));
-        assert!(matches!(view.build_create_action(&project, PathBuf::from("nowhere")), NewCharacterAction::Create { .. }));
+        assert!(matches!(
+            view.build_create_action(&project, PathBuf::from("nowhere")),
+            NewCharacterAction::Create { .. }
+        ));
     }
 
     #[test]
     fn a_multi_skin_range_creates_every_skin_directory() {
         let dir = tempfile::tempdir().unwrap();
         let mut library = ModLibrary::default();
-        let scaffolded = create(&mut library, dir.path(), &[8, 9, 10, 11, 12, 13, 14, 15], "Vision");
+        let scaffolded = create(
+            &mut library,
+            dir.path(),
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "Vision",
+        );
 
         assert_eq!(scaffolded.slots, vec![8, 9, 10, 11, 12, 13, 14, 15]);
         assert_eq!(scaffolded.slots[0], 8);
@@ -777,11 +944,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         for slot in [8, 10] {
-            std::fs::create_dir_all(root.join(format!("fighter/mario/model/body/c{slot:02}"))).unwrap();
+            std::fs::create_dir_all(root.join(format!("fighter/mario/model/body/c{slot:02}")))
+                .unwrap();
         }
         let index = RosterIndex::default();
         let statuses = slot_statuses(&[root.to_path_buf()], &index, "mario");
-        let taken: Vec<u8> = conflicts_in_range(&statuses, (8, 15)).iter().map(|(slot, _)| *slot).collect();
+        let taken: Vec<u8> = conflicts_in_range(&statuses, (8, 15))
+            .iter()
+            .map(|(slot, _)| *slot)
+            .collect();
         assert_eq!(taken, vec![8, 10]);
         assert!(conflicts_in_range(&statuses, (11, 15)).is_empty());
     }
@@ -844,8 +1015,7 @@ mod tests {
     fn creating_a_character_also_makes_it_visible_to_the_editor() {
         let dir = tempfile::tempdir().unwrap();
         let mut library = ModLibrary::default();
-        let scaffolded =
-            create(&mut library, dir.path(), &[8], "Vision");
+        let scaffolded = create(&mut library, dir.path(), &[8], "Vision");
 
         assert_eq!(scaffolded.slots[0], 8);
         assert_eq!(library.mods.len(), 1);
@@ -863,8 +1033,7 @@ mod tests {
     fn on_the_fly_creation_is_properly_scoped_per_slot() {
         let mut library = ModLibrary::default();
         let dir = tempfile::tempdir().unwrap();
-        let a =
-            create(&mut library, &dir.path().join("a"), &[8], "Vision");
+        let a = create(&mut library, &dir.path().join("a"), &[8], "Vision");
         let b = create(&mut library, &dir.path().join("b"), &[9], "Vision2");
         assert_eq!(a.slots, vec![8]);
         assert_eq!(b.slots, vec![9]);
@@ -894,7 +1063,11 @@ mod tests {
         let mut library = ModLibrary::default();
         let root = dir.path().join("authored").join("vision");
         let s = crate::roster::scaffold::create_many(&root, "mario", &[12]).unwrap();
-        std::fs::write(root.join("fighter/mario/model/body/c12/model.numdlb"), b"model").unwrap();
+        std::fs::write(
+            root.join("fighter/mario/model/body/c12/model.numdlb"),
+            b"model",
+        )
+        .unwrap();
         library
             .import_directory(ModSource::Folder(root), Some("Vision".into()))
             .unwrap();

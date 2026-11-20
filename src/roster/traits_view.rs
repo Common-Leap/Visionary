@@ -64,7 +64,12 @@ impl TraitsView {
         // Header with picker and global controls — same group styling as the main editor
         self.draw_traits_header(ui, index, params);
         let Some(key) = self.selected.clone() else {
-            ui.label(RichText::new("No fighter picked").size(19.0).strong().color(crate::ui::look(ui).dim));
+            ui.label(
+                RichText::new("No fighter picked")
+                    .size(19.0)
+                    .strong()
+                    .color(crate::ui::look(ui).dim),
+            );
             return;
         };
         let Some(entry) = index.by_key(&key) else {
@@ -173,11 +178,9 @@ impl TraitsView {
         ui.horizontal(|ui| {
             ui.colored_label(Color32::from_rgb(120, 185, 235), "ⓘ");
             ui.label(
-                RichText::new(
-                    "Saved with the project and exported with it.",
-                )
-                .small()
-                .weak(),
+                RichText::new("Saved with the project and exported with it.")
+                    .small()
+                    .weak(),
             );
         });
         ui.add_space(4.0);

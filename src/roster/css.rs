@@ -234,13 +234,24 @@ impl CharaDb {
 
     /// The highest position any character on the select screen holds.
     pub fn last_position(&self) -> i8 {
-        self.entries.iter().filter(|row| row.on_roster()).map(|row| row.disp_order).max().unwrap_or(0)
+        self.entries
+            .iter()
+            .filter(|row| row.on_roster())
+            .map(|row| row.disp_order)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Add a character of its own that plays as `fighter` in the costumes `slots`: a copy of
     /// that fighter's entry under `name_id`, at `order` on the select screen. Colour `k` of the
     /// new character is costume `slots[k]`, which the CSK Collection plugin acts on.
-    pub fn add_character(&mut self, fighter: &str, name_id: &str, slots: &[u8], order: i8) -> Result<()> {
+    pub fn add_character(
+        &mut self,
+        fighter: &str,
+        name_id: &str,
+        slots: &[u8],
+        order: i8,
+    ) -> Result<()> {
         use prc::hash40::Hash40;
         if self.row(name_id).is_some() {
             anyhow::bail!("the select screen already has a character called {name_id}");
@@ -269,7 +280,10 @@ impl CharaDb {
                 None => entry.0.push((wanted, value)),
             }
         };
-        set("ui_chara_id", ParamKind::Hash(hash(&format!("ui_chara_{name_id}"))));
+        set(
+            "ui_chara_id",
+            ParamKind::Hash(hash(&format!("ui_chara_{name_id}"))),
+        );
         set("name_id", ParamKind::Str(name_id.to_owned()));
         // Not an echo of anyone, whatever the base fighter is.
         set("alt_chara_id", ParamKind::Hash(Hash40(0)));
@@ -344,7 +358,10 @@ impl CharaDb {
 /// Give each added character the portrait layout of the fighter it plays as: `ui_layout_db`
 /// read from `source`, with a copy of that fighter's rows per `(its ui_chara_id, name_id)`.
 /// Returns the file as it was and as it is with them.
-pub fn add_layouts(source: &Path, added: &[(u64, String)]) -> Result<(prc::ParamStruct, prc::ParamStruct)> {
+pub fn add_layouts(
+    source: &Path,
+    added: &[(u64, String)],
+) -> Result<(prc::ParamStruct, prc::ParamStruct)> {
     use prc::hash40::Hash40;
     let base = prc::open(source)
         .map_err(|error| anyhow::anyhow!("{error:?}"))
@@ -358,7 +375,9 @@ pub fn add_layouts(source: &Path, added: &[(u64, String)]) -> Result<(prc::Param
             .0
             .iter()
             .filter_map(|row| match row {
-                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(*own) => Some(row.clone()),
+                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(*own) => {
+                    Some(row.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -366,9 +385,12 @@ pub fn add_layouts(source: &Path, added: &[(u64, String)]) -> Result<(prc::Param
             let colour = u8_field(&row, "chara_color").unwrap_or(0);
             for (field, value) in row.0.iter_mut() {
                 if field.0 == hash40::hash40("ui_chara_id").0 {
-                    *value = ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}")).0));
+                    *value =
+                        ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}")).0));
                 } else if field.0 == hash40::hash40("ui_layout_id").0 {
-                    *value = ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}_{colour:02}")).0));
+                    *value = ParamKind::Hash(Hash40(
+                        hash40::hash40(&format!("ui_chara_{name_id}_{colour:02}")).0,
+                    ));
                 }
             }
             list.0.push(ParamKind::Struct(row));
@@ -380,15 +402,37 @@ pub fn add_layouts(source: &Path, added: &[(u64, String)]) -> Result<(prc::Param
 /// What `edited` changes in the `db_root` of `base`, as a `.prcxml` patch: each changed entry
 /// by its index with only the fields that differ, and each added entry in full. `None` when
 /// nothing differs. `labels` names the fields; one it does not know is written as its hash.
-pub fn patch_xml(base: &prc::ParamStruct, edited: &prc::ParamStruct, labels: &std::collections::HashMap<u64, String>) -> Option<String> {
-    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) = (db_root(base), db_root(edited)) else {
+pub fn patch_xml(
+    base: &prc::ParamStruct,
+    edited: &prc::ParamStruct,
+    labels: &std::collections::HashMap<u64, String>,
+) -> Option<String> {
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) =
+        (db_root(base), db_root(edited))
+    else {
         return None;
     };
-    let name = |hash: u64| labels.get(&hash).cloned().unwrap_or_else(|| format!("0x{hash:010x}"));
-    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let name = |hash: u64| {
+        labels
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| format!("0x{hash:010x}"))
+    };
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     let field = |hash: u64, value: &ParamKind| -> Option<String> {
         let (tag, text) = match value {
-            ParamKind::Bool(value) => ("bool", if *value { "True".to_owned() } else { "False".to_owned() }),
+            ParamKind::Bool(value) => (
+                "bool",
+                if *value {
+                    "True".to_owned()
+                } else {
+                    "False".to_owned()
+                },
+            ),
             ParamKind::I8(value) => ("sbyte", value.to_string()),
             ParamKind::U8(value) => ("byte", value.to_string()),
             ParamKind::I16(value) => ("short", value.to_string()),
@@ -401,11 +445,16 @@ pub fn patch_xml(base: &prc::ParamStruct, edited: &prc::ParamStruct, labels: &st
             // No entry of these databases nests another.
             ParamKind::List(_) | ParamKind::Struct(_) => return None,
         };
-        Some(format!("      <{tag} hash=\"{}\">{text}</{tag}>", name(hash)))
+        Some(format!(
+            "      <{tag} hash=\"{}\">{text}</{tag}>",
+            name(hash)
+        ))
     };
     let mut rows = Vec::new();
     for (index, row) in edited.0.iter().enumerate() {
-        let ParamKind::Struct(row) = row else { continue };
+        let ParamKind::Struct(row) = row else {
+            continue;
+        };
         let before = match base.0.get(index) {
             Some(ParamKind::Struct(before)) => Some(before),
             _ => None,
@@ -413,11 +462,23 @@ pub fn patch_xml(base: &prc::ParamStruct, edited: &prc::ParamStruct, labels: &st
         let fields: Vec<String> = row
             .0
             .iter()
-            .filter(|(hash, value)| before.is_none_or(|before| before.0.iter().find(|(known, _)| known == hash).map(|(_, old)| old) != Some(value)))
+            .filter(|(hash, value)| {
+                before.is_none_or(|before| {
+                    before
+                        .0
+                        .iter()
+                        .find(|(known, _)| known == hash)
+                        .map(|(_, old)| old)
+                        != Some(value)
+                })
+            })
             .filter_map(|(hash, value)| field(hash.0, value))
             .collect();
         if !fields.is_empty() {
-            rows.push(format!("    <struct index=\"{index}\">\n{}\n    </struct>", fields.join("\n")));
+            rows.push(format!(
+                "    <struct index=\"{index}\">\n{}\n    </struct>",
+                fields.join("\n")
+            ));
         }
     }
     if rows.is_empty() {
@@ -442,19 +503,27 @@ pub fn csk_entries(
     id_field: &str,
 ) -> Vec<serde_json::Value> {
     use serde_json::{json, Map, Value};
-    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) = (db_root(base), db_root(edited)) else {
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) =
+        (db_root(base), db_root(edited))
+    else {
         return Vec::new();
     };
     let id_hash = hash40::hash40(id_field).0;
     let name = |hash: u64| match hash {
         0 => String::new(),
-        hash => labels.get(&hash).cloned().unwrap_or_else(|| format!("0x{hash:010x}")),
+        hash => labels
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| format!("0x{hash:010x}")),
     };
     // Per-colour tables (`c00_index`, `characall_label_c00`, ...) are maps in the plugin's
     // format, which `color_start_index` fills; they are not written field by field.
     let per_colour = |field: &str| {
         field.starts_with("characall_label")
-            || (field.len() > 4 && matches!(field.as_bytes()[0], b'c' | b'n') && field[1..3].bytes().all(|b| b.is_ascii_digit()) && field.as_bytes()[3] == b'_')
+            || (field.len() > 4
+                && matches!(field.as_bytes()[0], b'c' | b'n')
+                && field[1..3].bytes().all(|b| b.is_ascii_digit())
+                && field.as_bytes()[3] == b'_')
     };
     let value = |value: &ParamKind| -> Option<Value> {
         Some(match value {
@@ -475,30 +544,63 @@ pub fn csk_entries(
         row.0
             .iter()
             .filter(|(hash, _)| hash.0 != id_hash)
-            .filter(|(hash, new)| from.0.iter().find(|(known, _)| known == hash).map(|(_, old)| old) != Some(new))
+            .filter(|(hash, new)| {
+                from.0
+                    .iter()
+                    .find(|(known, _)| known == hash)
+                    .map(|(_, old)| old)
+                    != Some(new)
+            })
             .filter_map(|(hash, new)| Some((name(hash.0), value(new)?)))
             .filter(|(field, _)| !per_colour(field))
             // The plugin keeps the first costume in its map of per-colour numbers (seen in
             // game: as a field of the entry it is ignored and the base costumes load).
-            .map(|(field, value)| if field == COLOR_START_FIELD { ("extra_index_maps".to_owned(), json!({ COLOR_START_FIELD: value })) } else { (field, value) })
+            .map(|(field, value)| {
+                if field == COLOR_START_FIELD {
+                    (
+                        "extra_index_maps".to_owned(),
+                        json!({ COLOR_START_FIELD: value }),
+                    )
+                } else {
+                    (field, value)
+                }
+            })
             .collect()
     };
     let rows = |list: &prc::ParamList| -> Vec<prc::ParamStruct> {
-        list.0.iter().filter_map(|row| if let ParamKind::Struct(row) = row { Some(row.clone()) } else { None }).collect()
+        list.0
+            .iter()
+            .filter_map(|row| {
+                if let ParamKind::Struct(row) = row {
+                    Some(row.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     };
     let (base, edited) = (rows(base), rows(edited));
     let mut entries = Vec::new();
     for (index, row) in edited.iter().enumerate() {
-        let Some(id) = hash_field(row, id_field) else { continue };
+        let Some(id) = hash_field(row, id_field) else {
+            continue;
+        };
         let mut entry = Map::new();
         entry.insert(id_field.to_owned(), json!(name(id)));
         let fields = match base.get(index) {
             Some(before) => differing(row, before),
             None => {
-                let Some((like, fields)) = base.iter().map(|like| (like, differing(row, like))).min_by_key(|(_, fields)| fields.len()) else {
+                let Some((like, fields)) = base
+                    .iter()
+                    .map(|like| (like, differing(row, like)))
+                    .min_by_key(|(_, fields)| fields.len())
+                else {
                     continue;
                 };
-                entry.insert(format!("clone_from_{id_field}"), json!(name(hash_field(like, id_field).unwrap_or(0))));
+                entry.insert(
+                    format!("clone_from_{id_field}"),
+                    json!(name(hash_field(like, id_field).unwrap_or(0))),
+                );
                 fields
             }
         };
@@ -749,14 +851,25 @@ mod tests {
 
     #[test]
     fn an_added_character_is_a_copy_of_its_fighter_in_its_own_costumes() {
-        let mut db = test_db(&[("mario", 0, fighter_kind_hash("mario"), true), ("lucina", 23, fighter_kind_hash("lucina"), true)]);
-        db.add_character("lucina", "shade", &[8, 9, 10], 24).unwrap();
+        let mut db = test_db(&[
+            ("mario", 0, fighter_kind_hash("mario"), true),
+            ("lucina", 23, fighter_kind_hash("lucina"), true),
+        ]);
+        db.add_character("lucina", "shade", &[8, 9, 10], 24)
+            .unwrap();
         let row = db.row("shade").unwrap().clone();
         assert_eq!(row.fighter_kind, fighter_kind_hash("lucina"));
         assert_eq!(row.ui_chara_id, hash40::hash40("ui_chara_shade").0);
-        assert_eq!((row.disp_order, row.can_select, row.color_num), (24, true, 3));
-        let Some(ParamKind::List(list)) = db_root(&db.root) else { panic!() };
-        let Some(ParamKind::Struct(entry)) = list.0.last() else { panic!() };
+        assert_eq!(
+            (row.disp_order, row.can_select, row.color_num),
+            (24, true, 3)
+        );
+        let Some(ParamKind::List(list)) = db_root(&db.root) else {
+            panic!()
+        };
+        let Some(ParamKind::Struct(entry)) = list.0.last() else {
+            panic!()
+        };
         assert_eq!(u8_field(entry, COLOR_START_FIELD), Some(8));
         assert_eq!(u8_field(entry, "c02_index"), Some(10));
         // The base fighter's own entry is untouched, and a second one of the same name refused.

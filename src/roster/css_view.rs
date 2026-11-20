@@ -98,7 +98,11 @@ fn one_per_cell<'a>(entries: impl IntoIterator<Item = &'a RosterEntry>) -> Vec<&
 /// The cells of the select screen with echoes separate, as the game ships: every character
 /// but the one Mii Fighter cell that stands in for the three when echoes are stacked.
 fn filtered_visible<'a>(entries: Vec<&'a RosterEntry>) -> Vec<&'a RosterEntry> {
-    one_per_cell(entries.into_iter().filter(|e| !e.name_id.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("miiall"))))
+    one_per_cell(entries.into_iter().filter(|e| {
+        !e.name_id
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case("miiall"))
+    }))
 }
 
 /// The game lays the select screen out 13 cells across, each row centred, and this page does
@@ -113,7 +117,8 @@ const CELL_MAX_W: f32 = 150.0;
 
 /// The width of one cell when `GAME_COLUMNS` of them fill `avail_w`.
 fn cell_width(avail_w: f32) -> f32 {
-    (((avail_w - 4.0) - (GAME_COLUMNS - 1) as f32 * GRID_SPACING) / GAME_COLUMNS as f32).clamp(CELL_MIN_W, CELL_MAX_W)
+    (((avail_w - 4.0) - (GAME_COLUMNS - 1) as f32 * GRID_SPACING) / GAME_COLUMNS as f32)
+        .clamp(CELL_MIN_W, CELL_MAX_W)
 }
 
 /// The character an entry is a part of, for the entries the game folds into another's cell.
@@ -128,11 +133,25 @@ fn part_of(name_id: &str) -> Option<&'static str> {
 
 /// The Random cell the game puts after the last character. Nothing here edits it.
 fn random_cell(ui: &mut Ui, look: crate::ui::Look, cell_w: f32) {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_w, (cell_w * CELL_ASPECT).round()), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(cell_w, (cell_w * CELL_ASPECT).round()),
+        egui::Sense::hover(),
+    );
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, look.sunk);
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, look.edge), egui::StrokeKind::Inside);
-    painter.text(rect.center(), egui::Align2::CENTER_CENTER, "RANDOM", egui::FontId::proportional((rect.height() * 0.2).clamp(8.0, 14.0)), look.dim);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, look.edge),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "RANDOM",
+        egui::FontId::proportional((rect.height() * 0.2).clamp(8.0, 14.0)),
+        look.dim,
+    );
     response.on_hover_text("The game's Random cell, always last");
 }
 
@@ -315,18 +334,26 @@ impl CssView {
     }
 
     fn stacking(&self, entry: &RosterEntry) -> css::Stacking {
-        let row = entry.name_id.as_deref().and_then(|name_id| self.db.as_ref()?.row(name_id));
+        let row = entry
+            .name_id
+            .as_deref()
+            .and_then(|name_id| self.db.as_ref()?.row(name_id));
         row.map_or(css::Stacking::Always, css::CharaRow::stacking)
     }
 
     /// The cells the game shows, in order, with echoes stacked or separate as picked here.
     fn stage<'a>(&self, index: &'a RosterIndex) -> Vec<&'a RosterEntry> {
         let stacked = self.echo_stacked;
-        one_per_cell(index.visible().into_iter().filter(|entry| match self.stacking(entry) {
-            css::Stacking::Always => true,
-            css::Stacking::SeparateOnly => !stacked,
-            css::Stacking::StackedOnly => stacked,
-        }))
+        one_per_cell(
+            index
+                .visible()
+                .into_iter()
+                .filter(|entry| match self.stacking(entry) {
+                    css::Stacking::Always => true,
+                    css::Stacking::SeparateOnly => !stacked,
+                    css::Stacking::StackedOnly => stacked,
+                }),
+        )
     }
 
     /// The echo that shares `entry`'s cell when echoes are stacked.
@@ -336,8 +363,13 @@ impl CssView {
         if row.alt_chara_id == 0 || row.stacking() != css::Stacking::Always {
             return None;
         }
-        let echo = db.entries().iter().find(|other| other.ui_chara_id == row.alt_chara_id && other.stacking() == css::Stacking::SeparateOnly)?;
-        index.visible().into_iter().find(|other| other.name_id.as_deref() == Some(echo.name_id.as_str()))
+        let echo = db.entries().iter().find(|other| {
+            other.ui_chara_id == row.alt_chara_id && other.stacking() == css::Stacking::SeparateOnly
+        })?;
+        index
+            .visible()
+            .into_iter()
+            .find(|other| other.name_id.as_deref() == Some(echo.name_id.as_str()))
     }
 
     pub fn ui(
@@ -418,7 +450,13 @@ impl CssView {
         // screen beside it. Stacked when the page is too narrow for both.
         ui.add_space(8.0);
         let look = crate::ui::look(ui);
-        let panel = move || egui::Frame::new().fill(look.sunk).stroke(egui::Stroke::new(1.0, look.edge)).corner_radius(10.0).inner_margin(egui::Margin::same(12));
+        let panel = move || {
+            egui::Frame::new()
+                .fill(look.sunk)
+                .stroke(egui::Stroke::new(1.0, look.edge))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(12))
+        };
         let (width, side) = (ui.available_width(), 360.0);
         let beside = width >= 900.0;
         let editor = |view: &mut Self, ui: &mut Ui, project: &mut RosterMod| {
@@ -465,19 +503,40 @@ impl CssView {
     }
 
     /// The editor for the picked cell, or what to do when none is.
-    fn draw_picked(&mut self, ui: &mut Ui, look: crate::ui::Look, roots: &[PathBuf], index: &RosterIndex, project: &mut RosterMod) {
-        let picked = self.last_selected.clone().or_else(|| self.selected.iter().next().cloned()).filter(|_| !self.selected.is_empty());
+    fn draw_picked(
+        &mut self,
+        ui: &mut Ui,
+        look: crate::ui::Look,
+        roots: &[PathBuf],
+        index: &RosterIndex,
+        project: &mut RosterMod,
+    ) {
+        let picked = self
+            .last_selected
+            .clone()
+            .or_else(|| self.selected.iter().next().cloned())
+            .filter(|_| !self.selected.is_empty());
         let Some(entry) = picked.as_ref().and_then(|key| index.by_key(key)) else {
-            ui.label(RichText::new("No cell picked").size(19.0).strong().color(look.dim));
+            ui.label(
+                RichText::new("No cell picked")
+                    .size(19.0)
+                    .strong()
+                    .color(look.dim),
+            );
             return;
         };
         if self.focus_detail {
             self.focus_detail = false;
-            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover()).scroll_to_me(Some(egui::Align::TOP));
+            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                .scroll_to_me(Some(egui::Align::TOP));
         }
         if self.selected.len() > 1 {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} picked", self.selected.len())).strong().color(look.text));
+                ui.label(
+                    RichText::new(format!("{} picked", self.selected.len()))
+                        .strong()
+                        .color(look.text),
+                );
                 if crate::ui::act(ui, look, "Pick none", None).clicked() {
                     self.selected.clear();
                     self.last_selected = None;
@@ -491,7 +550,9 @@ impl CssView {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("In this cell").strong().color(look.dim));
                     ui.label(RichText::new(&entry.display_name).strong().color(look.text));
-                    if crate::ui::act(ui, look, &format!("Edit {}", echo.display_name), None).clicked() {
+                    if crate::ui::act(ui, look, &format!("Edit {}", echo.display_name), None)
+                        .clicked()
+                    {
                         self.selected = BTreeSet::from([echo.key.clone()]);
                         self.last_selected = Some(echo.key.clone());
                     }
@@ -675,64 +736,68 @@ impl CssView {
                 ui.horizontal(|ui| {
                     ui.add_space(missing * (cell_w + GRID_SPACING) / 2.0);
                     for position in range {
-                    let Some(entry) = shown.get(position) else {
-                        random_cell(ui, look, cell_w);
-                        continue;
-                    };
-                    let echo = if self.echo_stacked { self.echo_of(entry, index) } else { None };
-                    let response = self.draw_cell(ui, roots, entry, project, cell_w, echo);
-                    cell_rects.push((entry.key.clone(), response.rect));
+                        let Some(entry) = shown.get(position) else {
+                            random_cell(ui, look, cell_w);
+                            continue;
+                        };
+                        let echo = if self.echo_stacked {
+                            self.echo_of(entry, index)
+                        } else {
+                            None
+                        };
+                        let response = self.draw_cell(ui, roots, entry, project, cell_w, echo);
+                        cell_rects.push((entry.key.clone(), response.rect));
 
-                    if response.drag_started() {
-                        if !self.selected.contains(&entry.key) {
-                            // Dragging an unselected entry -> select it alone
-                            self.selected.clear();
-                            self.selected.insert(entry.key.clone());
-                            self.last_selected = Some(entry.key.clone());
-                        }
-                        self.dragging = Some(self.selected.clone());
-                    }
-                    if self.dragging.is_some() && response.hovered() && pointer_released {
-                        drop_on = Some(entry.key.clone());
-                    }
-                    // A drag that ends over a cell also produces a click; ignore
-                    // clicks while a reorder drag is in flight so dropping does
-                    // not reselect to just the target.
-                    if response.clicked() && self.dragging.is_none() {
-                        let mods = ui.input(|i| i.modifiers);
-                        if mods.ctrl || mods.command {
-                            if self.selected.contains(&entry.key) {
-                                self.selected.remove(&entry.key);
-                            } else {
+                        if response.drag_started() {
+                            if !self.selected.contains(&entry.key) {
+                                // Dragging an unselected entry -> select it alone
+                                self.selected.clear();
                                 self.selected.insert(entry.key.clone());
+                                self.last_selected = Some(entry.key.clone());
                             }
-                            self.last_selected = Some(entry.key.clone());
-                        } else if mods.shift {
-                            if let Some(last) = self.last_selected.clone() {
-                                if let (Some(a), Some(b)) = (
-                                    shown.iter().position(|e| e.key == last),
-                                    shown.iter().position(|e| e.key == entry.key),
-                                ) {
-                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                    for e in &shown[lo..=hi] {
-                                        self.selected.insert(e.key.clone());
+                            self.dragging = Some(self.selected.clone());
+                        }
+                        if self.dragging.is_some() && response.hovered() && pointer_released {
+                            drop_on = Some(entry.key.clone());
+                        }
+                        // A drag that ends over a cell also produces a click; ignore
+                        // clicks while a reorder drag is in flight so dropping does
+                        // not reselect to just the target.
+                        if response.clicked() && self.dragging.is_none() {
+                            let mods = ui.input(|i| i.modifiers);
+                            if mods.ctrl || mods.command {
+                                if self.selected.contains(&entry.key) {
+                                    self.selected.remove(&entry.key);
+                                } else {
+                                    self.selected.insert(entry.key.clone());
+                                }
+                                self.last_selected = Some(entry.key.clone());
+                            } else if mods.shift {
+                                if let Some(last) = self.last_selected.clone() {
+                                    if let (Some(a), Some(b)) = (
+                                        shown.iter().position(|e| e.key == last),
+                                        shown.iter().position(|e| e.key == entry.key),
+                                    ) {
+                                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                        for e in &shown[lo..=hi] {
+                                            self.selected.insert(e.key.clone());
+                                        }
+                                    } else {
+                                        self.selected.insert(entry.key.clone());
                                     }
                                 } else {
                                     self.selected.insert(entry.key.clone());
                                 }
+                                self.last_selected = Some(entry.key.clone());
                             } else {
+                                self.selected.clear();
                                 self.selected.insert(entry.key.clone());
+                                self.last_selected = Some(entry.key.clone());
+                                // A fresh single selection almost always wants the
+                                // editor below; bring it into view.
+                                self.focus_detail = true;
                             }
-                            self.last_selected = Some(entry.key.clone());
-                        } else {
-                            self.selected.clear();
-                            self.selected.insert(entry.key.clone());
-                            self.last_selected = Some(entry.key.clone());
-                            // A fresh single selection almost always wants the
-                            // editor below; bring it into view.
-                            self.focus_detail = true;
                         }
-                    }
                     }
                 });
             }
@@ -834,7 +899,6 @@ impl CssView {
                 self.focus_detail = true;
             }
         }
-
     }
 
     /// One cell, drawn as the game draws it: the character's cell art with its name across the
@@ -855,7 +919,10 @@ impl CssView {
             return response;
         }
         let selected = self.selected.contains(&entry.key);
-        let dragging = self.dragging.as_ref().is_some_and(|set| set.contains(&entry.key));
+        let dragging = self
+            .dragging
+            .as_ref()
+            .is_some_and(|set| set.contains(&entry.key));
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, look.sunk);
 
@@ -864,54 +931,119 @@ impl CssView {
             .get(&entry.key)
             .and_then(|map| {
                 let own = entry.backing.slot().unwrap_or(0);
-                ["chara_7", "chara_1", "chara_2", "chara_0"].into_iter().find_map(|kind| crate::roster::ui_images::find_override(map, kind, own, own))
+                ["chara_7", "chara_1", "chara_2", "chara_0"]
+                    .into_iter()
+                    .find_map(|kind| crate::roster::ui_images::find_override(map, kind, own, own))
             })
             .map(|picked| std::path::PathBuf::from(&picked.png_path));
         // A character made here files its art under its own first colour.
         let art = entry.name_id.as_deref().and_then(|name_id| {
-            self.portraits.get_image_with_gamma(ui.ctx(), roots, "chara_7", name_id, 0, true, png_override.as_deref())
+            self.portraits.get_image_with_gamma(
+                ui.ctx(),
+                roots,
+                "chara_7",
+                name_id,
+                0,
+                true,
+                png_override.as_deref(),
+            )
         });
         match art {
             Some(Ok(texture)) => {
                 // Fill the cell, cropping whichever way the picture overhangs.
                 let [w, h] = texture.size();
                 let (picture, cell) = (w as f32 / h.max(1) as f32, rect.width() / rect.height());
-                let (u, v) = if picture > cell { (cell / picture, 1.0) } else { (1.0, picture / cell) };
+                let (u, v) = if picture > cell {
+                    (cell / picture, 1.0)
+                } else {
+                    (1.0, picture / cell)
+                };
                 let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(u, v));
                 painter.image(texture.id(), rect, uv, Color32::WHITE);
             }
             _ => {
-                painter.text(rect.center() - egui::vec2(0.0, rect.height() * 0.12), egui::Align2::CENTER_CENTER, initials(&entry.display_name), egui::FontId::proportional(rect.height() * 0.34), look.dim);
+                painter.text(
+                    rect.center() - egui::vec2(0.0, rect.height() * 0.12),
+                    egui::Align2::CENTER_CENTER,
+                    initials(&entry.display_name),
+                    egui::FontId::proportional(rect.height() * 0.34),
+                    look.dim,
+                );
             }
         }
 
         // The name, in capitals across the bottom, shrunk to fit like the game's.
-        let name = if is_aegis_group(entry) && entry.css_order == Some(80) { "PYRA / MYTHRA".to_owned() } else { entry.display_name.to_uppercase() };
-        let band = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.30), rect.max);
+        let name = if is_aegis_group(entry) && entry.css_order == Some(80) {
+            "PYRA / MYTHRA".to_owned()
+        } else {
+            entry.display_name.to_uppercase()
+        };
+        let band = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.30),
+            rect.max,
+        );
         painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
         let mut font = (band.height() * 0.72).clamp(8.0, 15.0);
-        let mut galley = painter.layout_no_wrap(name.clone(), egui::FontId::proportional(font), Color32::WHITE);
+        let mut galley = painter.layout_no_wrap(
+            name.clone(),
+            egui::FontId::proportional(font),
+            Color32::WHITE,
+        );
         while galley.size().x > band.width() - 6.0 && font > 7.0 {
             font -= 0.5;
-            galley = painter.layout_no_wrap(name.clone(), egui::FontId::proportional(font), Color32::WHITE);
+            galley = painter.layout_no_wrap(
+                name.clone(),
+                egui::FontId::proportional(font),
+                Color32::WHITE,
+            );
         }
         painter.galley(band.center() - galley.size() / 2.0, galley, Color32::WHITE);
 
         // Where it stands in the order, and whether this project moved it.
         if let Some(order) = entry.css_order {
             let moved = self.moved(entry);
-            let tag = egui::Rect::from_min_size(rect.min + egui::vec2(3.0, 3.0), egui::vec2(20.0, 13.0));
-            painter.rect_filled(tag, 3.0, if moved { Color32::from_rgb(240, 190, 70) } else { Color32::from_rgba_unmultiplied(0, 0, 0, 150) });
-            painter.text(tag.center(), egui::Align2::CENTER_CENTER, order.to_string(), egui::FontId::monospace(9.0), if moved { Color32::from_rgb(18, 18, 22) } else { Color32::WHITE });
+            let tag =
+                egui::Rect::from_min_size(rect.min + egui::vec2(3.0, 3.0), egui::vec2(20.0, 13.0));
+            painter.rect_filled(
+                tag,
+                3.0,
+                if moved {
+                    Color32::from_rgb(240, 190, 70)
+                } else {
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 150)
+                },
+            );
+            painter.text(
+                tag.center(),
+                egui::Align2::CENTER_CENTER,
+                order.to_string(),
+                egui::FontId::monospace(9.0),
+                if moved {
+                    Color32::from_rgb(18, 18, 22)
+                } else {
+                    Color32::WHITE
+                },
+            );
         }
         if let Some(echo) = echo {
-            let words = painter.layout_no_wrap(format!("+ {}", echo.display_name), egui::FontId::proportional(9.5), Color32::from_rgb(18, 18, 22));
-            let tag = egui::Rect::from_min_size(egui::pos2(rect.right() - words.size().x - 9.0, rect.top() + 3.0), words.size() + egui::vec2(6.0, 2.0));
+            let words = painter.layout_no_wrap(
+                format!("+ {}", echo.display_name),
+                egui::FontId::proportional(9.5),
+                Color32::from_rgb(18, 18, 22),
+            );
+            let tag = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - words.size().x - 9.0, rect.top() + 3.0),
+                words.size() + egui::vec2(6.0, 2.0),
+            );
             if tag.left() > rect.left() + 26.0 {
                 painter.rect_filled(tag, 3.0, Color32::from_rgb(255, 115, 160));
                 painter.galley(tag.min + egui::vec2(3.0, 1.0), words, Color32::BLACK);
             } else {
-                painter.circle_filled(egui::pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, Color32::from_rgb(255, 115, 160));
+                painter.circle_filled(
+                    egui::pos2(rect.right() - 8.0, rect.top() + 8.0),
+                    4.5,
+                    Color32::from_rgb(255, 115, 160),
+                );
             }
         }
 
@@ -927,14 +1059,27 @@ impl CssView {
                 other => origin_color(other),
             }
         };
-        let width = if selected || dragging { 3.0 } else if entry.origin == EntryOrigin::Vanilla { 1.0 } else { 2.0 };
-        painter.rect_stroke(rect, 4.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
+        let width = if selected || dragging {
+            3.0
+        } else if entry.origin == EntryOrigin::Vanilla {
+            1.0
+        } else {
+            2.0
+        };
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(width, edge),
+            egui::StrokeKind::Inside,
+        );
 
         let echo_name = echo.map(|echo| echo.display_name.clone());
         response.on_hover_ui(|ui| {
             self.hover_details(ui, entry);
             if let Some(echo) = &echo_name {
-                ui.label(format!("{echo} shares this cell when echo fighters are stacked."));
+                ui.label(format!(
+                    "{echo} shares this cell when echo fighters are stacked."
+                ));
             }
         })
     }
@@ -1147,14 +1292,22 @@ impl CssView {
             || project.ui_images.contains_key(&entry.key);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(RichText::new(&entry.display_name).size(24.0).strong().color(look.text));
+                ui.label(
+                    RichText::new(&entry.display_name)
+                        .size(24.0)
+                        .strong()
+                        .color(look.text),
+                );
                 let mut line = match entry.origin {
                     EntryOrigin::Vanilla => "Base game".to_owned(),
                     EntryOrigin::Imported => "From a mod".to_owned(),
                     EntryOrigin::Authored => "Made in this project".to_owned(),
                 };
                 if let (EntryOrigin::Authored, Some(fighter)) = (entry.origin, &entry.fighter) {
-                    line = format!("Made in this project, plays as {}", crate::data::fighter_display_name(fighter));
+                    line = format!(
+                        "Made in this project, plays as {}",
+                        crate::data::fighter_display_name(fighter)
+                    );
                 }
                 if let Some(order) = entry.css_order {
                     line.push_str(&format!(", place {order}"));
@@ -1165,11 +1318,21 @@ impl CssView {
                 ui.label(RichText::new(line).color(look.dim));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                if crate::ui::act(ui, look, "Hide", None).on_hover_text("Take it off the select screen").clicked() {
+                if crate::ui::act(ui, look, "Hide", None)
+                    .on_hover_text("Take it off the select screen")
+                    .clicked()
+                {
                     self.pending_hide = true;
                 }
-                let undo = ui.add_enabled_ui(has_edits, |ui| crate::ui::act(ui, look, "Undo changes", None)).inner;
-                if undo.on_hover_text("Its name, place, skin count and pictures go back to the game's").clicked() {
+                let undo = ui
+                    .add_enabled_ui(has_edits, |ui| {
+                        crate::ui::act(ui, look, "Undo changes", None)
+                    })
+                    .inner;
+                if undo
+                    .on_hover_text("Its name, place, skin count and pictures go back to the game's")
+                    .clicked()
+                {
                     project.order.remove(&entry.key);
                     project.names.remove(&entry.key);
                     project.name_variants.remove(&entry.key);
@@ -1184,10 +1347,18 @@ impl CssView {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("Name").strong().color(look.dim));
-            let mut name = project.names.get(&entry.key).cloned().unwrap_or_else(|| entry.display_name.clone());
+            let mut name = project
+                .names
+                .get(&entry.key)
+                .cloned()
+                .unwrap_or_else(|| entry.display_name.clone());
             let is_edited = project.names.contains_key(&entry.key);
             let width = (ui.available_width() - 160.0).clamp(120.0, 320.0);
-            let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(width).text_color(if is_edited { changed_colour } else { look.text }));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .desired_width(width)
+                    .text_color(if is_edited { changed_colour } else { look.text }),
+            );
             if response.changed() {
                 if name.trim().is_empty() || name == entry.display_name {
                     project.names.remove(&entry.key);
@@ -1203,27 +1374,57 @@ impl CssView {
 
         // The rest in sections, most used first, each saying how much of it is changed.
         let title = |words: &str, changed: usize| {
-            let text = if changed > 0 { format!("{words} ({changed} changed)") } else { words.to_owned() };
-            RichText::new(text).size(15.0).strong().color(if changed > 0 { changed_colour } else { look.text })
+            let text = if changed > 0 {
+                format!("{words} ({changed} changed)")
+            } else {
+                words.to_owned()
+            };
+            RichText::new(text)
+                .size(15.0)
+                .strong()
+                .color(if changed > 0 {
+                    changed_colour
+                } else {
+                    look.text
+                })
         };
         if let Some(fighter) = entry.fighter.clone() {
-            let named = project.per_costume_names.get(&fighter).map_or(0, |names| names.len());
-            egui::CollapsingHeader::new(title("Skins", named)).default_open(true).id_salt(format!("costume_names_{fighter}")).show(ui, |ui| {
-                self.draw_per_costume_names(ui, entry, &fighter, project, roots);
-            });
+            let named = project
+                .per_costume_names
+                .get(&fighter)
+                .map_or(0, |names| names.len());
+            egui::CollapsingHeader::new(title("Skins", named))
+                .default_open(true)
+                .id_salt(format!("costume_names_{fighter}"))
+                .show(ui, |ui| {
+                    self.draw_per_costume_names(ui, entry, &fighter, project, roots);
+                });
         }
-        let pictures = project.ui_images.get(&entry.key).map_or(0, |images| images.len());
-        egui::CollapsingHeader::new(title("Pictures", pictures)).default_open(pictures > 0).id_salt(format!("images_{}", entry.key.as_str())).show(ui, |ui| {
-            self.draw_images(ui, entry, project, roots);
+        let pictures = project
+            .ui_images
+            .get(&entry.key)
+            .map_or(0, |images| images.len());
+        egui::CollapsingHeader::new(title("Pictures", pictures))
+            .default_open(pictures > 0)
+            .id_salt(format!("images_{}", entry.key.as_str()))
+            .show(ui, |ui| {
+                self.draw_images(ui, entry, project, roots);
+            });
+        let placed = project.order.contains_key(&entry.key) as usize
+            + project.chara_overrides.contains_key(&entry.key) as usize;
+        egui::CollapsingHeader::new(title("Place and skin count", placed))
+            .id_salt(format!("roster_row_{}", entry.key.as_str()))
+            .show(ui, |ui| {
+                self.draw_roster_row(ui, entry, project);
+            });
+        let variants = project.name_variants.get(&entry.key).map_or(0, |v| {
+            v.chr0.is_some() as usize + v.chr1.is_some() as usize + v.chr2.is_some() as usize
         });
-        let placed = project.order.contains_key(&entry.key) as usize + project.chara_overrides.contains_key(&entry.key) as usize;
-        egui::CollapsingHeader::new(title("Place and skin count", placed)).id_salt(format!("roster_row_{}", entry.key.as_str())).show(ui, |ui| {
-            self.draw_roster_row(ui, entry, project);
-        });
-        let variants = project.name_variants.get(&entry.key).map_or(0, |v| v.chr0.is_some() as usize + v.chr1.is_some() as usize + v.chr2.is_some() as usize);
-        egui::CollapsingHeader::new(title("A different name per screen", variants)).id_salt(format!("name_variants_{}", entry.key.as_str())).show(ui, |ui| {
-            self.draw_name_variants(ui, entry, project);
-        });
+        egui::CollapsingHeader::new(title("A different name per screen", variants))
+            .id_salt(format!("name_variants_{}", entry.key.as_str()))
+            .show(ui, |ui| {
+                self.draw_name_variants(ui, entry, project);
+            });
 
         if entry.name_id.is_none() {
             ui.add_space(4.0);
@@ -1239,7 +1440,6 @@ impl CssView {
     }
 
     fn draw_name_variants(&mut self, ui: &mut Ui, entry: &RosterEntry, project: &mut RosterMod) {
-        
         ui.add_space(4.0);
         let variants = project
             .name_variants
@@ -1339,7 +1539,6 @@ impl CssView {
             .find(|a| a.key == entry.key)
             .and_then(|a| a.files_root.clone());
         ui.horizontal_wrapped(|ui| {
-            
             if let Some(root) = files_root {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -1775,9 +1974,7 @@ impl CssView {
                         }
                         _ => {
                             ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new("no game file. Custom only").small().weak(),
-                                );
+                                ui.label(RichText::new("no game file. Custom only").small().weak());
                             });
                         }
                     }
@@ -2078,7 +2275,12 @@ impl CssView {
             });
         });
         ui.add_space(4.0);
-        crate::ui::search_field(ui, "roster_names_search", &mut self.bulk_filter, "Find a character");
+        crate::ui::search_field(
+            ui,
+            "roster_names_search",
+            &mut self.bulk_filter,
+            "Find a character",
+        );
         ui.add_space(4.0);
 
         let query = self.bulk_filter.clone();
@@ -2151,7 +2353,8 @@ impl CssView {
         let look = crate::ui::look(ui);
         if self.focus_off_roster {
             self.focus_off_roster = false;
-            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover()).scroll_to_me(Some(egui::Align::TOP));
+            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
+                .scroll_to_me(Some(egui::Align::TOP));
         }
         let mut entries = index.off_roster();
         // The half of a shared cell that is not its face (Mythra) can be added on its own too.
@@ -2159,17 +2362,33 @@ impl CssView {
         let faces = filtered_visible(raw.clone());
         for e in raw {
             let mii_cell = e.name_id.as_deref() == Some("miiall");
-            if !mii_cell && !faces.iter().any(|f| f.key == e.key) && !entries.iter().any(|x| x.key == e.key) {
+            if !mii_cell
+                && !faces.iter().any(|f| f.key == e.key)
+                && !entries.iter().any(|x| x.key == e.key)
+            {
                 entries.push(e);
             }
         }
         entries.sort_by_key(|e| (e.css_order.is_none(), e.css_order.unwrap_or(0), e.id.0));
 
-        ui.label(RichText::new("Not on the screen").size(19.0).strong().color(look.text));
-        crate::ui::search_field(ui, "roster_off_search", &mut self.off_roster_filter, "Find a character");
+        ui.label(
+            RichText::new("Not on the screen")
+                .size(19.0)
+                .strong()
+                .color(look.text),
+        );
+        crate::ui::search_field(
+            ui,
+            "roster_off_search",
+            &mut self.off_roster_filter,
+            "Find a character",
+        );
         ui.add_space(4.0);
         let query = self.off_roster_filter.clone();
-        let (hidden, never): (Vec<&RosterEntry>, Vec<&RosterEntry>) = entries.into_iter().filter(|e| matches_grid_filter(e, &query)).partition(|e| e.hidden);
+        let (hidden, never): (Vec<&RosterEntry>, Vec<&RosterEntry>) = entries
+            .into_iter()
+            .filter(|e| matches_grid_filter(e, &query))
+            .partition(|e| e.hidden);
         if hidden.is_empty() && never.is_empty() {
             ui.label(RichText::new("None found.").color(look.dim));
             return;
@@ -2178,7 +2397,12 @@ impl CssView {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(elide(name, 22)).strong().color(look.text));
                 ui.label(RichText::new(note).color(look.dim));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::ui::act(ui, look, button, None).on_hover_text(hover).clicked()).inner
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    crate::ui::act(ui, look, button, None)
+                        .on_hover_text(hover)
+                        .clicked()
+                })
+                .inner
             })
             .inner
         };
@@ -2499,7 +2723,10 @@ mod tests {
         for width in [800.0_f32, 1100.0, 1400.0, 1900.0] {
             let cell = cell_width(width);
             let row = GAME_COLUMNS as f32 * cell + (GAME_COLUMNS - 1) as f32 * GRID_SPACING;
-            assert!(row <= width - 3.9 && row > width - 4.1, "{width}: row of {row}");
+            assert!(
+                row <= width - 3.9 && row > width - 4.1,
+                "{width}: row of {row}"
+            );
         }
         // Narrower than that the cells stop shrinking and the grid scrolls; wider, they stop
         // growing and the page keeps its margins.

@@ -151,7 +151,11 @@ impl RosterBacking {
     pub fn colour_of(&self, slot: u8) -> u8 {
         match self {
             Self::Fighter => slot,
-            Self::SlotClone { .. } => self.all_slots().iter().position(|own| *own == slot).unwrap_or(0) as u8,
+            Self::SlotClone { .. } => self
+                .all_slots()
+                .iter()
+                .position(|own| *own == slot)
+                .unwrap_or(0) as u8,
         }
     }
 

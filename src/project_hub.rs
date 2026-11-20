@@ -204,7 +204,10 @@ pub fn copy_base_files(
         let (base, relative) = picked
             .iter()
             .find_map(|(game_dir, folder)| {
-                Some((folder.clone(), relative.strip_prefix(game_dir).ok()?.to_path_buf()))
+                Some((
+                    folder.clone(),
+                    relative.strip_prefix(game_dir).ok()?.to_path_buf(),
+                ))
             })
             .unwrap_or((overlay.clone(), relative));
         std::fs::create_dir_all(&base)?;
@@ -321,7 +324,6 @@ pub const MODEL_ASSET_EXTENSIONS: &[&str] = &[
     "nutexb",
     "xmb",
 ];
-
 
 fn fighter_component(fighter: &str) -> anyhow::Result<String> {
     let fighter = fighter.trim().to_ascii_lowercase();

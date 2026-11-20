@@ -813,9 +813,7 @@ impl TimelineCategory {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Collisions => {
-                "Show or hide hitbox, grab box and wind box rows on the timeline."
-            }
+            Self::Collisions => "Show or hide hitbox, grab box and wind box rows on the timeline.",
             Self::Hurtboxes => {
                 "Show or hide invincibility, intangibility and armor rows on the timeline."
             }
@@ -1091,10 +1089,7 @@ mod picker_state_tests {
 enum TimelineSelection {
     Hitbox(usize),
     Effect(usize),
-    Command {
-        family: String,
-        site: usize,
-    },
+    Command { family: String, site: usize },
 }
 
 /// A sound command's plain name, or `None` for one this table does not know.
@@ -1128,8 +1123,14 @@ fn sound_words(id: &str) -> String {
     let id = id.trim_matches('"');
     let rest = id
         .strip_prefix("se_common_")
-        .or_else(|| id.strip_prefix("se_").map(|r| r.split_once('_').map_or(r, |(_, r)| r)))
-        .or_else(|| id.strip_prefix("vc_").map(|r| r.split_once('_').map_or(r, |(_, r)| r)))
+        .or_else(|| {
+            id.strip_prefix("se_")
+                .map(|r| r.split_once('_').map_or(r, |(_, r)| r))
+        })
+        .or_else(|| {
+            id.strip_prefix("vc_")
+                .map(|r| r.split_once('_').map_or(r, |(_, r)| r))
+        })
         .unwrap_or(id);
     rest.replace('_', " ")
 }
@@ -1233,7 +1234,16 @@ impl MoveClock {
             script
                 .motion_rate_sites()
                 .into_iter()
-                .map(|(_, at, rate)| (at, if rate.is_finite() && rate > 0.0 { rate } else { 1.0 }))
+                .map(|(_, at, rate)| {
+                    (
+                        at,
+                        if rate.is_finite() && rate > 0.0 {
+                            rate
+                        } else {
+                            1.0
+                        },
+                    )
+                })
                 .collect(),
         )
     }
@@ -4304,11 +4314,24 @@ impl VisionaryApp {
         // The project's own copy, or a folder picked for the effects, comes before the game.
         if let Some((workspace, parts)) = &self.project_parts_cache {
             let rel = source_rel.replace('\\', "/");
-            let picked = match rel.strip_prefix("effect/fighter/").and_then(|rest| rest.split_once('/')) {
-                Some((fighter, rest)) => parts.link(fighter, crate::project_parts::Part::Effects, 0).map(|dir| dir.join(rest)),
-                None => rel
-                    .strip_prefix("effect/")
-                    .and_then(|rest| Some(parts.link(crate::project_parts::OTHER_EFFECTS, crate::project_parts::Part::Effects, 0)?.join(rest))),
+            let picked = match rel
+                .strip_prefix("effect/fighter/")
+                .and_then(|rest| rest.split_once('/'))
+            {
+                Some((fighter, rest)) => parts
+                    .link(fighter, crate::project_parts::Part::Effects, 0)
+                    .map(|dir| dir.join(rest)),
+                None => rel.strip_prefix("effect/").and_then(|rest| {
+                    Some(
+                        parts
+                            .link(
+                                crate::project_parts::OTHER_EFFECTS,
+                                crate::project_parts::Part::Effects,
+                                0,
+                            )?
+                            .join(rest),
+                    )
+                }),
             };
             let own = crate::project_hub::workspace_romfs(workspace).join(&rel);
             if let Some(found) = picked.into_iter().chain([own]).find(|path| path.is_file()) {
@@ -9778,7 +9801,8 @@ impl VisionaryApp {
                 self.eff_editor.selected_entry_name().map(str::to_owned),
                 self.effect_editor_draw_path(),
             ) {
-                let clock = (self.effect_loop_started.elapsed().as_secs_f32() * self.playback_fps) as usize;
+                let clock =
+                    (self.effect_loop_started.elapsed().as_secs_f32() * self.playback_fps) as usize;
                 let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
                 out.push(crate::vfx_preview::EffectDraw {
                     file,
@@ -10231,7 +10255,11 @@ impl VisionaryApp {
                                     ui.painter().text(
                                         label_pos + egui::vec2(5.0, -5.0),
                                         egui::Align2::LEFT_BOTTOM,
-                                        format!("{} · {}", crate::ui::bone_label(&volume.bone_name), status.label()),
+                                        format!(
+                                            "{} · {}",
+                                            crate::ui::bone_label(&volume.bone_name),
+                                            status.label()
+                                        ),
                                         egui::FontId::monospace(10.0),
                                         Color32::WHITE,
                                     );
@@ -13577,7 +13605,8 @@ impl VisionaryApp {
                         if active { "◆" } else { "◇" },
                     );
                     ui.add(
-                        egui::Label::new(format!("Frame {} · {}", event.frame, event.source)).truncate(),
+                        egui::Label::new(format!("Frame {} · {}", event.frame, event.source))
+                            .truncate(),
                     )
                     .on_hover_text(event.source);
                 });
@@ -13596,9 +13625,7 @@ impl VisionaryApp {
                         .expression_script_edits
                         .insert(key, self.state.expression_script.clone());
                 }
-                self.state.status =
-                    EDIT_KEPT
-                        .into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_expression_motion_module_set_rate_partial_rules();
             }
         }
@@ -13622,9 +13649,7 @@ impl VisionaryApp {
                         .expression_script_edits
                         .insert(key, self.state.expression_script.clone());
                 }
-                self.state.status =
-                    EDIT_KEPT
-                        .into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_expression_motion_module_set_frame_partial_rules();
             }
         }
@@ -13887,9 +13912,7 @@ impl VisionaryApp {
                         .expression_script_edits
                         .insert(key, self.state.expression_script.clone());
                 }
-                self.state.status =
-                    EDIT_KEPT
-                        .into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_expression_rules();
             }
         }
@@ -14351,9 +14374,7 @@ impl VisionaryApp {
                 call.sync = (!omitted
                     || sync != crate::data::MotionModuleSetFramePartialCall::OMITTED_SYNC)
                     .then_some(sync);
-                self.state.status =
-                    EDIT_KEPT
-                        .into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_motion_module_set_frame_partial_rules();
             }
         }
@@ -14919,9 +14940,7 @@ impl VisionaryApp {
             if let Some(call) = self.state.script.work_module_set_stmt_mut(site) {
                 call.value = value;
                 call.slot = slot;
-                self.state.status =
-                    EDIT_KEPT
-                        .into();
+                self.state.status = EDIT_KEPT.into();
                 self.push_work_module_set_rules();
             }
         }
@@ -18149,7 +18168,9 @@ impl VisionaryApp {
                     })
                     .unwrap_or_default();
                 rules.iter().cloned().map(move |mut rule| {
-                    if let Some(inject) = rule.inject.as_mut().filter(|inject| inject.guard.is_none()) {
+                    if let Some(inject) =
+                        rule.inject.as_mut().filter(|inject| inject.guard.is_none())
+                    {
                         inject.guard = guards
                             .iter()
                             .find(|(frame, _)| *frame == inject.frame)
@@ -18550,11 +18571,18 @@ impl VisionaryApp {
         let key = self.current_move_key();
         // Older projects stored every graph's sound track, changed or not.
         if let Some(key) = &key {
-            if self.state.sound_script_edits.get(key).is_some_and(|edit| same_script(edit, &self.state.sound_script)) {
+            if self
+                .state
+                .sound_script_edits
+                .get(key)
+                .is_some_and(|edit| same_script(edit, &self.state.sound_script))
+            {
                 self.state.sound_script_edits.remove(key);
             }
         }
-        let saved = key.and_then(|key| self.state.sound_script_edits.get(&key)).cloned();
+        let saved = key
+            .and_then(|key| self.state.sound_script_edits.get(&key))
+            .cloned();
         let (script, shown, baseline) = resolve_sound_state(&self.state.sound_script, saved);
         self.state.sound_script = script;
         self.state.sounds = shown;
@@ -19947,9 +19975,9 @@ impl VisionaryApp {
                 dir.join("model.numdlb").is_file()
             } else {
                 std::fs::read_dir(dir).is_ok_and(|entries| {
-                    entries.flatten().any(|entry| {
-                        entry.path().extension().is_some_and(|ext| ext == "nuanmb")
-                    })
+                    entries
+                        .flatten()
+                        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "nuanmb"))
                 })
             }
         };
@@ -19963,7 +19991,10 @@ impl VisionaryApp {
                     let from = if dir == romfs {
                         "this project".to_owned()
                     } else {
-                        format!("your folder {}", dir.file_name().unwrap_or_default().to_string_lossy())
+                        format!(
+                            "your folder {}",
+                            dir.file_name().unwrap_or_default().to_string_lossy()
+                        )
                     };
                     return Some((dir, from));
                 }
@@ -19979,7 +20010,10 @@ impl VisionaryApp {
                         .ancestors()
                         .find(|dir| dir.parent().is_some_and(|up| up.ends_with("mods")))
                         .unwrap_or(root);
-                    format!("the mod {}", name.file_name().unwrap_or_default().to_string_lossy())
+                    format!(
+                        "the mod {}",
+                        name.file_name().unwrap_or_default().to_string_lossy()
+                    )
                 };
                 (dir, from)
             })
@@ -20044,7 +20078,10 @@ impl VisionaryApp {
     fn reload_changed_skin_files(&mut self) {
         let (Some((fighter, slot)), Some(workspace)) = (
             self.preview_skin.clone(),
-            self.project_path.as_ref().and_then(|path| path.parent()).map(PathBuf::from),
+            self.project_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .map(PathBuf::from),
         ) else {
             return;
         };
@@ -20053,7 +20090,10 @@ impl VisionaryApp {
         else {
             return;
         };
-        let newest = [model, motion].iter().filter_map(|dir| crate::project_parts::newest_change(dir)).max();
+        let newest = [model, motion]
+            .iter()
+            .filter_map(|dir| crate::project_parts::newest_change(dir))
+            .max();
         // The first look only records what is there; any later difference is a change.
         let before = self.skin_files_stamp.replace(newest);
         if before.is_none() || before == Some(newest) {
@@ -20080,7 +20120,13 @@ impl VisionaryApp {
     }
 
     /// Put dropped files where the game reads them, by kind, for the picked skin.
-    fn import_dropped_files(&mut self, workspace: &std::path::Path, fighter: &str, slot: u8, paths: Vec<PathBuf>) {
+    fn import_dropped_files(
+        &mut self,
+        workspace: &std::path::Path,
+        fighter: &str,
+        slot: u8,
+        paths: Vec<PathBuf>,
+    ) {
         let mut done = Vec::new();
         let mut refused = Vec::new();
         for path in paths {
@@ -20093,11 +20139,21 @@ impl VisionaryApp {
                 crate::project_hub::import_model_folder(workspace, fighter, slot, &path)
                     .map(|files| format!("{} model files", files.len()))
             } else if crate::project_hub::MODEL_ASSET_EXTENSIONS.contains(&extension.as_str()) {
-                crate::project_hub::import_model_files(workspace, fighter, slot, std::slice::from_ref(&path))
-                    .map(|_| format!("{name} to the model"))
+                crate::project_hub::import_model_files(
+                    workspace,
+                    fighter,
+                    slot,
+                    std::slice::from_ref(&path),
+                )
+                .map(|_| format!("{name} to the model"))
             } else if extension == "nuanmb" || name == "motion_list.bin" {
-                crate::project_hub::import_animation_files(workspace, fighter, slot, std::slice::from_ref(&path))
-                    .map(|_| format!("{name} to the animations"))
+                crate::project_hub::import_animation_files(
+                    workspace,
+                    fighter,
+                    slot,
+                    std::slice::from_ref(&path),
+                )
+                .map(|_| format!("{name} to the animations"))
             } else if extension == "prc" {
                 crate::project_hub::import_swing_prc(workspace, fighter, slot, &path)
                     .map(|_| "swing.prc".to_owned())
@@ -20108,8 +20164,12 @@ impl VisionaryApp {
                 } else {
                     crate::project_parts::Part::Sounds
                 };
-                let mut dir = parts.dir(workspace, fighter, part, slot).unwrap_or_default();
-                if part == crate::project_parts::Part::Sounds && parts.link(fighter, part, slot).is_none() {
+                let mut dir = parts
+                    .dir(workspace, fighter, part, slot)
+                    .unwrap_or_default();
+                if part == crate::project_parts::Part::Sounds
+                    && parts.link(fighter, part, slot).is_none()
+                {
                     dir = dir.join(crate::project_parts::sound_target(&name));
                 }
                 std::fs::create_dir_all(&dir)
@@ -20117,7 +20177,9 @@ impl VisionaryApp {
                     .map(|_| format!("{name} to the {}", part.title().to_lowercase()))
                     .map_err(anyhow::Error::from)
             } else {
-                Err(anyhow::anyhow!("not a model, animation, swing, effect or sound file"))
+                Err(anyhow::anyhow!(
+                    "not a model, animation, swing, effect or sound file"
+                ))
             };
             match result {
                 Ok(what) => done.push(what),
@@ -20127,7 +20189,11 @@ impl VisionaryApp {
         self.state.status = match (done.is_empty(), refused.is_empty()) {
             (_, true) => format!("Added {} for {fighter} c{slot:02}.", done.join(", ")),
             (true, false) => format!("Nothing added. {}", refused.join("; ")),
-            (false, false) => format!("Added {}. Not added: {}", done.join(", "), refused.join("; ")),
+            (false, false) => format!(
+                "Added {}. Not added: {}",
+                done.join(", "),
+                refused.join("; ")
+            ),
         };
     }
 
@@ -20496,14 +20562,23 @@ impl VisionaryApp {
                 }
             }
             // Folders picked for a part ship at that part's place in the game.
-            for (folder, target) in crate::project_parts::ProjectParts::load(&workspace).shipped_folders() {
+            for (folder, target) in
+                crate::project_parts::ProjectParts::load(&workspace).shipped_folders()
+            {
                 match crate::project_parts::ship_folder(&folder, &target, &dest) {
                     Ok((copied, kept)) => {
                         if copied > 0 {
-                            report.push(format!("{copied} file(s) from {} to {}", folder.display(), target.display()));
+                            report.push(format!(
+                                "{copied} file(s) from {} to {}",
+                                folder.display(),
+                                target.display()
+                            ));
                         }
                         for path in kept {
-                            errors.push(format!("{path}: kept the file the export built over the one in {}", folder.display()));
+                            errors.push(format!(
+                                "{path}: kept the file the export built over the one in {}",
+                                folder.display()
+                            ));
                         }
                     }
                     Err(e) => errors.push(format!("{}: {e:#}", folder.display())),
@@ -31503,12 +31578,7 @@ impl VisionaryApp {
             push_motion("reverse_lr", event.site, event.frame, "Reverse facing");
         }
         for event in self.state.script.to_speed_ex_events() {
-            push_motion(
-                "speed_ex",
-                event.site,
-                event.frame,
-                "Set movement speed",
-            );
+            push_motion("speed_ex", event.site, event.frame, "Set movement speed");
         }
         for event in self.state.script.to_speed_events() {
             push_motion("speed", event.site, event.frame, "Set speed");
@@ -31525,7 +31595,12 @@ impl VisionaryApp {
             push_motion("correct", event.site, event.frame, "Ground snap");
         }
         for event in self.state.script.to_ft_catch_stop_events() {
-            push_motion("ft_catch_stop", event.site, event.frame, "Stop sliding into the grab");
+            push_motion(
+                "ft_catch_stop",
+                event.site,
+                event.frame,
+                "Stop sliding into the grab",
+            );
         }
         for event in self.state.script.to_ft_start_adjust_motion_frame_events() {
             push_motion(
@@ -31551,12 +31626,7 @@ impl VisionaryApp {
             .script
             .to_motion_module_set_helper_calculation_events()
         {
-            push_motion(
-                "motion_helper",
-                event.site,
-                event.frame,
-                "Animation helper",
-            );
+            push_motion("motion_helper", event.site, event.frame, "Animation helper");
         }
         for event in self.state.script.to_motion_module_set_rate_partial_events() {
             push_motion(
@@ -31589,12 +31659,7 @@ impl VisionaryApp {
             );
         }
         for event in self.state.script.to_kinetic_add_speed_events() {
-            push_motion(
-                "kinetic_add_speed",
-                event.site,
-                event.frame,
-                "Add speed",
-            );
+            push_motion("kinetic_add_speed", event.site, event.frame, "Add speed");
         }
         for event in self.state.script.to_kinetic_clear_speed_all_events() {
             push_motion(
@@ -31761,7 +31826,9 @@ impl VisionaryApp {
                 .integer()
                 .suffix(" fps"),
         )
-        .on_hover_text("How fast the preview plays. 60 is the game's speed; lower plays in slow motion.");
+        .on_hover_text(
+            "How fast the preview plays. 60 is the game's speed; lower plays in slow motion.",
+        );
     }
 
     fn draw_scrubber(&mut self, ui: &mut Ui) {

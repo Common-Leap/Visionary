@@ -1582,15 +1582,26 @@ mod tests {
             }]
         };
         let mut state = program.initial_state();
-        assert_eq!(tick(&mut state, 6), write(7), "the first tick reads vanilla's six");
+        assert_eq!(
+            tick(&mut state, 6),
+            write(7),
+            "the first tick reads vanilla's six"
+        );
         assert!(
             tick(&mut state, 7).is_empty(),
             "held at the raised maximum, nothing is written"
         );
-        assert_eq!(tick(&mut state, 6), write(7), "a reset to vanilla is repaired");
+        assert_eq!(
+            tick(&mut state, 6),
+            write(7),
+            "a reset to vanilla is repaired"
+        );
         // A live re-send starts a fresh controller while the game still holds 7.
         let mut resent = program.initial_state();
-        assert!(tick(&mut resent, 7).is_empty(), "a re-send must not stack an eighth jump");
+        assert!(
+            tick(&mut resent, 7).is_empty(),
+            "a re-send must not stack an eighth jump"
+        );
     }
 
     #[test]
@@ -1708,12 +1719,19 @@ mod tests {
         let graph = serde_json::to_string(&extra_jump("pickel").unwrap()).unwrap();
         let measure = graph.find("\"Measure\",\"to\"").unwrap();
         let measured = &graph[measure..];
-        assert!(measured.contains("param_int:pickel:jump_count_max:"), "{graph}");
+        assert!(
+            measured.contains("param_int:pickel:jump_count_max:"),
+            "{graph}"
+        );
         assert!(graph.contains("\"SetNative\":{\"input\":\"work_int:pickel:FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT_MAX\""), "{graph}");
         let own: super::super::native_inputs::NativeInput =
             serde_json::from_str("\"param_int:pickel:jump_count_max:\"").unwrap();
         assert!(own.valid_for("pickel"), "the plugin would refuse {own:?}");
-        assert_eq!(super::super::native_inputs::hash40(""), 0, "the key must reach the game as 0");
+        assert_eq!(
+            super::super::native_inputs::hash40(""),
+            0,
+            "the key must reach the game as 0"
+        );
     }
 
     #[test]

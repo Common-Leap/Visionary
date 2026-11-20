@@ -75,7 +75,9 @@ impl Preset {
             Self::Charge => "Fills a gauge to 100, then empties it and fills again.",
             Self::Meter => "A 0 to 100 meter. Moves you pick fill it or spend it.",
             Self::Stance => "Three stances. A move you pick switches to the next one.",
-            Self::Ammo => "Three charges. A move you pick spends one, and they refill one at a time.",
+            Self::Ammo => {
+                "Three charges. A move you pick spends one, and they refill one at a time."
+            }
             Self::Rage => "A 0 to 100 gauge that fills with the damage this character deals.",
             Self::Combo => "Counts hits landed less than 1.5 seconds apart.",
         }
