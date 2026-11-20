@@ -17,13 +17,19 @@ pub enum ParamValue {
     Other(String),
 }
 
+type Fields = BTreeMap<String, (ParamValue, PathBuf)>;
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParamBlock {
-    /// Some layer holds a `param_<name>` struct.
+    /// Some layer holds a `param_<name>` struct or list.
     pub present: bool,
-    /// Field name (label, else `0x…` hash) to its final value and the file it came from
-    /// (an empty path for a `param_config` override).
-    pub fields: BTreeMap<String, (ParamValue, PathBuf)>,
+    /// Variant 0 of a list block, or the plain struct. Field names are the label, else `0x…`; the
+    /// path is the layer the value came from (empty for a `param_config` override).
+    pub fields: Fields,
+    /// Every variant of a list block, variant 0 included; empty for a plain struct.
+    pub variants: Vec<Fields>,
+    /// What was not read, as (field path or "variant N" or a file path, one-sentence reason).
+    pub skipped: Vec<(String, String)>,
 }
 
 fn is_xml(path: &Path) -> bool {
@@ -42,8 +48,29 @@ fn name_of(hash: u64, labels: &HashMap<u64, String>) -> String {
     labels.get(&hash).cloned().unwrap_or_else(|| format!("{hash:#x}"))
 }
 
-/// The merged `param_<name>` block of `layers` (lowest first; later layers win per field), with
-/// `param_config` `overrides` (block, field, value) applied on top when some layer has the block.
+/// One layer's view of a block.
+struct LayerBlock {
+    is_list: bool,
+    variants: Vec<Vec<(String, ParamValue)>>,
+    skipped: Vec<(String, String)>,
+}
+
+fn skip_path(is_list: bool, variant: usize, field: &str) -> String {
+    if is_list {
+        format!("variant {variant}/{field}")
+    } else {
+        field.to_string()
+    }
+}
+
+fn nested_reason(count: usize) -> String {
+    format!("a nested group of {count} values Visionary doesn't edit")
+}
+
+/// The merged `param_<name>` block of `layers` (lowest first; later layers win per field and per
+/// variant), with `param_config` `overrides` (block, field, value) applied to variant 0 when some
+/// layer has the block. A layer that cannot be read is recorded in `skipped` and the rest still
+/// merge.
 pub fn param_block(
     layers: &[PathBuf],
     overrides: &[(String, String, f64)],
@@ -53,93 +80,132 @@ pub fn param_block(
     let full = format!("param_{name}");
     let target = hash_of(&full);
     let mut out = ParamBlock::default();
+    let mut is_list = false;
+    let mut variants: Vec<Fields> = Vec::new();
     for layer in layers {
-        let Some(fields) = (if is_xml(layer) {
+        if !layer.exists() {
+            continue;
+        }
+        let read = if is_xml(layer) {
             read_xml_block(layer, target)
         } else {
             read_prc_block(layer, target, labels)
-        }) else {
-            continue;
+        };
+        let found = match read {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(error) => {
+                out.skipped.push((
+                    layer.display().to_string(),
+                    format!("Visionary could not read this param file: {error}"),
+                ));
+                continue;
+            }
         };
         out.present = true;
-        for (field, value) in fields {
-            out.fields.insert(field, (value, layer.clone()));
+        is_list |= found.is_list;
+        for entry in found.skipped {
+            if !out.skipped.contains(&entry) {
+                out.skipped.push(entry);
+            }
+        }
+        for (index, fields) in found.variants.into_iter().enumerate() {
+            if variants.len() <= index {
+                variants.resize_with(index + 1, Fields::new);
+            }
+            for (field, value) in fields {
+                variants[index].insert(field, (value, layer.clone()));
+            }
         }
     }
     if out.present {
+        if variants.is_empty() {
+            variants.push(Fields::new());
+        }
         for (block, field, value) in overrides {
             if block != &full && block != name {
                 continue;
             }
             let key = name_of(hash_of(field), labels);
-            let existing_int = matches!(out.fields.get(&key), Some((ParamValue::Int(_), _)));
+            let existing_int = matches!(variants[0].get(&key), Some((ParamValue::Int(_), _)));
             let value = if existing_int && value.fract() == 0.0 {
                 ParamValue::Int(*value as i32)
             } else {
                 ParamValue::Float(*value as f32)
             };
-            out.fields.insert(key, (value, PathBuf::new()));
+            variants[0].insert(key, (value, PathBuf::new()));
+        }
+        out.fields = variants[0].clone();
+        if is_list {
+            out.variants = variants;
         }
     }
     out
 }
 
-/// The fields of a block value. Vanilla blocks are usually a list of structs, one per variant, and
-/// the first is the article's own; a plain struct is its own fields.
-fn block_struct(value: &prc::ParamKind) -> Option<&prc::ParamStruct> {
-    match value {
-        prc::ParamKind::Struct(inner) => Some(inner),
-        prc::ParamKind::List(list) => match list.0.first()? {
-            prc::ParamKind::Struct(inner) => Some(inner),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn block_struct_mut(value: &mut prc::ParamKind) -> Option<&mut prc::ParamStruct> {
-    match value {
-        prc::ParamKind::Struct(inner) => Some(inner),
-        prc::ParamKind::List(list) => match list.0.first_mut()? {
-            prc::ParamKind::Struct(inner) => Some(inner),
-            _ => None,
-        },
-        _ => None,
-    }
+fn prc_number(value: &prc::ParamKind, labels: &HashMap<u64, String>) -> Option<ParamValue> {
+    Some(match value {
+        prc::ParamKind::Float(v) => ParamValue::Float(*v),
+        prc::ParamKind::I8(v) => ParamValue::Int(*v as i32),
+        prc::ParamKind::U8(v) => ParamValue::Int(*v as i32),
+        prc::ParamKind::I16(v) => ParamValue::Int(*v as i32),
+        prc::ParamKind::U16(v) => ParamValue::Int(*v as i32),
+        prc::ParamKind::I32(v) => ParamValue::Int(*v),
+        prc::ParamKind::U32(v) => ParamValue::Int(*v as i32),
+        prc::ParamKind::Bool(v) => ParamValue::Other(v.to_string()),
+        prc::ParamKind::Hash(h) => ParamValue::Other(name_of(h.0, labels)),
+        prc::ParamKind::Str(s) => ParamValue::Other(s.clone()),
+        _ => return None,
+    })
 }
 
 fn read_prc_block(
     path: &Path,
     target: u64,
     labels: &HashMap<u64, String>,
-) -> Option<Vec<(String, ParamValue)>> {
-    let root = prc::open(path).ok()?;
-    let block = root
-        .0
-        .iter()
-        .find_map(|(key, value)| (key.0 == target).then(|| block_struct(value)).flatten())?;
-    Some(
-        block
-            .0
-            .iter()
-            .filter_map(|(key, value)| {
-                let value = match value {
-                    prc::ParamKind::Float(v) => ParamValue::Float(*v),
-                    prc::ParamKind::I8(v) => ParamValue::Int(*v as i32),
-                    prc::ParamKind::U8(v) => ParamValue::Int(*v as i32),
-                    prc::ParamKind::I16(v) => ParamValue::Int(*v as i32),
-                    prc::ParamKind::U16(v) => ParamValue::Int(*v as i32),
-                    prc::ParamKind::I32(v) => ParamValue::Int(*v),
-                    prc::ParamKind::U32(v) => ParamValue::Int(*v as i32),
-                    prc::ParamKind::Bool(v) => ParamValue::Other(v.to_string()),
-                    prc::ParamKind::Hash(h) => ParamValue::Other(name_of(h.0, labels)),
-                    prc::ParamKind::Str(s) => ParamValue::Other(s.clone()),
-                    _ => return None,
-                };
-                Some((name_of(key.0, labels), value))
-            })
-            .collect(),
-    )
+) -> std::result::Result<Option<LayerBlock>, String> {
+    let root = prc::open(path).map_err(|e| e.to_string())?;
+    let Some(block) = root.0.iter().find_map(|(key, value)| (key.0 == target).then_some(value)) else {
+        return Ok(None);
+    };
+    let (is_list, structs): (bool, Vec<Option<&prc::ParamStruct>>) = match block {
+        prc::ParamKind::Struct(inner) => (false, vec![Some(inner)]),
+        prc::ParamKind::List(list) => (
+            true,
+            list.0
+                .iter()
+                .map(|v| match v {
+                    prc::ParamKind::Struct(inner) => Some(inner),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => return Ok(None),
+    };
+    let mut out = LayerBlock { is_list, variants: Vec::new(), skipped: Vec::new() };
+    for (index, inner) in structs.into_iter().enumerate() {
+        let mut fields = Vec::new();
+        match inner {
+            None => out.skipped.push((format!("variant {index}"), "this list entry is not a struct".into())),
+            Some(inner) => {
+                for (key, value) in &inner.0 {
+                    let field = name_of(key.0, labels);
+                    if let Some(value) = prc_number(value, labels) {
+                        fields.push((field, value));
+                        continue;
+                    }
+                    let reason = match value {
+                        prc::ParamKind::Struct(s) => nested_reason(s.0.len()),
+                        prc::ParamKind::List(l) => nested_reason(l.0.len()),
+                        _ => "a value type Visionary doesn't edit".to_string(),
+                    };
+                    out.skipped.push((skip_path(is_list, index, &field), reason));
+                }
+            }
+        }
+        out.variants.push(fields);
+    }
+    Ok(Some(out))
 }
 
 /// One tag of an XML file, with its byte range in the source.
@@ -226,12 +292,63 @@ fn unescape(text: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// A leaf element of a block: its `hash` attribute, its element name, and the byte range of its text.
+/// A leaf element of a block: its `hash` attribute, its element name, and the byte range of its
+/// text with surrounding whitespace excluded.
 type Leaf = (String, String, std::ops::Range<usize>);
 
-/// The leaf children of the struct (or first struct of the list) `target` directly under the root; `None` if there is no such
-/// struct. Nested structs and lists are skipped.
-fn xml_block_leaves(src: &str, target: u64) -> Option<Vec<Leaf>> {
+/// A block of a prcxml: leaves per variant, nested entries as (field, child count) per variant,
+/// and list entries that are not structs.
+struct XmlBlock {
+    is_list: bool,
+    variants: Vec<(Vec<Leaf>, Vec<(String, usize)>)>,
+    bad_entries: Vec<usize>,
+}
+
+/// The direct child open tags of element `n`, and the index just past its close tag.
+fn children(tags: &[Tag], n: usize) -> (Vec<usize>, usize) {
+    if tags[n].self_closing {
+        return (Vec::new(), n + 1);
+    }
+    let (mut found, mut depth, mut m) = (Vec::new(), 1usize, n + 1);
+    while m < tags.len() && depth > 0 {
+        if tags[m].open {
+            if depth == 1 {
+                found.push(m);
+            }
+            if !tags[m].self_closing {
+                depth += 1;
+            }
+        } else {
+            depth -= 1;
+        }
+        m += 1;
+    }
+    (found, m)
+}
+
+fn xml_variant(src: &str, tags: &[Tag], n: usize) -> (Vec<Leaf>, Vec<(String, usize)>) {
+    let (mut leaves, mut nested) = (Vec::new(), Vec::new());
+    for child in children(tags, n).0 {
+        let tag = &tags[child];
+        let leaf = !tag.self_closing && tags.get(child + 1).is_some_and(|c| !c.open && c.name == tag.name);
+        let label = tag.hash.clone().unwrap_or_else(|| tag.name.clone());
+        if leaf {
+            if let Some(h) = &tag.hash {
+                let (from, to) = (tag.end, tags[child + 1].start);
+                let raw = &src[from..to];
+                let lead = raw.len() - raw.trim_start().len();
+                let start = from + lead;
+                leaves.push((h.clone(), tag.name.clone(), start..start + raw.trim().len()));
+            }
+        } else {
+            nested.push((label, children(tags, child).0.len()));
+        }
+    }
+    (leaves, nested)
+}
+
+/// The struct or list `target` directly under the root; `None` if there is no such element.
+fn xml_block(src: &str, target: u64) -> Option<XmlBlock> {
     let tags = scan_tags(src);
     let mut depth = 0usize;
     let mut idx = None;
@@ -251,82 +368,84 @@ fn xml_block_leaves(src: &str, target: u64) -> Option<Vec<Leaf>> {
             depth = depth.saturating_sub(1);
         }
     }
-    let mut idx = idx?;
-    let mut leaves = Vec::new();
-    if tags[idx].self_closing {
-        return Some(leaves);
+    let idx = idx?;
+    if tags[idx].name == "struct" {
+        return Some(XmlBlock {
+            is_list: false,
+            variants: vec![xml_variant(src, &tags, idx)],
+            bad_entries: Vec::new(),
+        });
     }
-    if tags[idx].name == "list" {
-        // The first struct of the list, as with the binary form.
-        match tags.get(idx + 1) {
-            Some(t) if t.open && !t.self_closing && t.name == "struct" => idx += 1,
-            _ => return Some(leaves),
-        }
-    }
-    let mut depth = 1usize;
-    let mut n = idx + 1;
-    while n < tags.len() && depth > 0 {
-        let tag = &tags[n];
-        if tag.open {
-            let leaf = depth == 1
-                && !tag.self_closing
-                && tags.get(n + 1).is_some_and(|c| !c.open && c.name == tag.name);
-            if let (true, Some(h)) = (leaf, &tag.hash) {
-                leaves.push((h.clone(), tag.name.clone(), tag.end..tags[n + 1].start));
-            }
-            if !tag.self_closing {
-                depth += 1;
-            }
+    let mut block = XmlBlock { is_list: true, variants: Vec::new(), bad_entries: Vec::new() };
+    for (index, child) in children(&tags, idx).0.into_iter().enumerate() {
+        if tags[child].name == "struct" {
+            block.variants.push(xml_variant(src, &tags, child));
         } else {
-            depth -= 1;
+            block.bad_entries.push(index);
+            block.variants.push((Vec::new(), Vec::new()));
         }
-        n += 1;
     }
-    Some(leaves)
+    Some(block)
 }
 
-fn read_xml_block(path: &Path, target: u64) -> Option<Vec<(String, ParamValue)>> {
-    let src = std::fs::read_to_string(path).ok()?;
-    let leaves = xml_block_leaves(&src, target)?;
-    Some(
-        leaves
-            .into_iter()
-            .map(|(field, element, range)| {
-                let text = unescape(src[range].trim());
-                let value = match element.as_str() {
-                    "float" => text.parse().map(ParamValue::Float).unwrap_or(ParamValue::Other(text)),
-                    "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => text
-                        .parse::<i64>()
-                        .map(|v| ParamValue::Int(v as i32))
-                        .unwrap_or(ParamValue::Other(text)),
-                    _ => ParamValue::Other(text),
-                };
-                (field, value)
-            })
-            .collect(),
-    )
+fn read_xml_block(path: &Path, target: u64) -> std::result::Result<Option<LayerBlock>, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let Some(block) = xml_block(&src, target) else { return Ok(None) };
+    let mut out = LayerBlock { is_list: block.is_list, variants: Vec::new(), skipped: Vec::new() };
+    for (index, (leaves, nested)) in block.variants.into_iter().enumerate() {
+        if block.bad_entries.contains(&index) {
+            out.skipped.push((format!("variant {index}"), "this list entry is not a struct".into()));
+        }
+        for (field, count) in nested {
+            out.skipped.push((skip_path(block.is_list, index, &field), nested_reason(count)));
+        }
+        out.variants.push(
+            leaves
+                .into_iter()
+                .map(|(field, element, range)| {
+                    let text = unescape(&src[range]);
+                    let value = match element.as_str() {
+                        "float" => text.parse().map(ParamValue::Float).unwrap_or(ParamValue::Other(text)),
+                        "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => text
+                            .parse::<i64>()
+                            .map(|v| ParamValue::Int(v as i32))
+                            .unwrap_or(ParamValue::Other(text)),
+                        _ => ParamValue::Other(text),
+                    };
+                    (field, value)
+                })
+                .collect(),
+        );
+    }
+    Ok(Some(out))
 }
 
-/// Set `block.field` (`block` a full `param_…` name; `field` a label or `0x…` hash) to `value` in
-/// `file`, keeping the field's type. A `.prcxml` has only that element's text replaced, so every
-/// other byte (CRLF included) is kept and no binary `.prc` appears beside it; anything else is
-/// rewritten through `prc::save`. The block and field must already exist.
+/// Set `block.field` of `variant` (`block` a full `param_…` name; `field` a label or `0x…` hash;
+/// `variant` 0 for a plain struct) to `value` in `file`, keeping the field's type. A `.prcxml` has
+/// only that element's text replaced, so every other byte (CRLF and padding included) is kept and no
+/// binary `.prc` appears beside it; anything else is rewritten through `prc::save`. The block,
+/// variant and field must already exist.
 pub fn write_param_field(
     file: &Path,
     block: &str,
     field: &str,
+    variant: usize,
     value: f64,
     _labels: &HashMap<u64, String>,
 ) -> Result<()> {
     let (block_h, field_h) = (hash_of(block), hash_of(field));
     if is_xml(file) {
         let src = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let leaves = xml_block_leaves(&src, block_h)
-            .ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
+        let found = xml_block(&src, block_h).ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
+        let (leaves, _) = found
+            .variants
+            .into_iter()
+            .nth(variant)
+            .ok_or_else(|| anyhow!("{block} has no variant {variant}"))?;
         let (_, element, range) = leaves
             .into_iter()
             .find(|(name, _, _)| hash_of(name) == field_h)
-            .ok_or_else(|| anyhow!("{field} is not in {block}"))?;
+            .ok_or_else(|| anyhow!("{field} is not in {block} variant {variant}"))?;
         let text = match element.as_str() {
             "float" => (value as f32).to_string(),
             "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => (value.round() as i64).to_string(),
@@ -336,16 +455,26 @@ pub fn write_param_field(
         return std::fs::write(file, out).with_context(|| format!("writing {}", file.display()));
     }
     let mut root = prc::open(file).map_err(|e| anyhow!("reading {}: {e}", file.display()))?;
-    let inner = root
+    let value_of_block = root
         .0
         .iter_mut()
-        .find_map(|(key, v)| (key.0 == block_h).then(|| block_struct_mut(v)).flatten())
+        .find_map(|(key, v)| (key.0 == block_h).then_some(v))
         .ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
+    let inner = match value_of_block {
+        prc::ParamKind::Struct(s) if variant == 0 => s,
+        prc::ParamKind::Struct(_) => bail!("{block} is a plain struct and has no variant {variant}"),
+        prc::ParamKind::List(list) => match list.0.get_mut(variant) {
+            Some(prc::ParamKind::Struct(s)) => s,
+            Some(_) => bail!("{block} variant {variant} is not a struct"),
+            None => bail!("{block} has no variant {variant}"),
+        },
+        _ => bail!("{block} is not a struct or list"),
+    };
     let slot = inner
         .0
         .iter_mut()
         .find_map(|(key, v)| (key.0 == field_h).then_some(v))
-        .ok_or_else(|| anyhow!("{field} is not in {block}"))?;
+        .ok_or_else(|| anyhow!("{field} is not in {block} variant {variant}"))?;
     let int = value.round();
     match slot {
         prc::ParamKind::Float(v) => *v = value as f32,
@@ -379,12 +508,31 @@ mod tests {
         ["speed", "life"].iter().map(|n| (hash40::hash40(n).0, n.to_string())).collect()
     }
 
+    fn speed_variant(speed: f32) -> prc::ParamKind {
+        prc::ParamKind::Struct(prc::ParamStruct(vec![
+            (hash40::hash40("speed"), prc::ParamKind::Float(speed)),
+            (hash40::hash40("life"), prc::ParamKind::I32(60)),
+        ]))
+    }
+
+    fn list_root(speeds: &[f32]) -> prc::ParamStruct {
+        prc::ParamStruct(vec![(
+            hash40::hash40("param_x"),
+            prc::ParamKind::List(prc::ParamList(speeds.iter().map(|s| speed_variant(*s)).collect())),
+        )])
+    }
+
+    fn speed_of(block: &ParamBlock, variant: usize) -> ParamValue {
+        block.variants[variant]["speed"].0.clone()
+    }
+
     #[test]
     fn clone_block_present_latios() {
         let dir = tempfile::tempdir().unwrap();
         let file = prc_file(dir.path(), "vl.prc", "param_lativolt", 1.6);
         let block = param_block(&[file], &[], "lativolt", &labels());
         assert!(block.present);
+        assert!(block.variants.is_empty());
         assert_eq!(block.fields["speed"].0, ParamValue::Float(1.6));
         assert_eq!(block.fields["life"].0, ParamValue::Int(60));
     }
@@ -417,41 +565,146 @@ mod tests {
     }
 
     #[test]
-    fn list_of_structs_block_uses_its_first_struct() {
+    fn list_block_reads_every_variant() {
         let dir = tempfile::tempdir().unwrap();
-        let variant = |speed: f32| {
-            prc::ParamKind::Struct(prc::ParamStruct(vec![(hash40::hash40("speed"), prc::ParamKind::Float(speed))]))
-        };
-        let root = prc::ParamStruct(vec![(
-            hash40::hash40("param_x"),
-            prc::ParamKind::List(prc::ParamList(vec![variant(2.8), variant(0.0)])),
-        )]);
         let file = dir.path().join("vl.prc");
-        prc::save(&file, &root).unwrap();
-        assert_eq!(param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(2.8));
-        write_param_field(&file, "param_x", "speed", 3.5, &labels()).unwrap();
-        assert_eq!(param_block(&[file], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(3.5));
+        prc::save(&file, &list_root(&[2.8, 0.5, 7.0])).unwrap();
+        let block = param_block(&[file], &[], "x", &labels());
+        assert_eq!(block.variants.len(), 3);
+        assert_eq!(speed_of(&block, 0), ParamValue::Float(2.8));
+        assert_eq!(speed_of(&block, 1), ParamValue::Float(0.5));
+        assert_eq!(speed_of(&block, 2), ParamValue::Float(7.0));
+        assert_eq!(block.fields["speed"].0, ParamValue::Float(2.8));
+    }
+
+    #[test]
+    fn variants_merge_per_index_across_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (low, high) = (dir.path().join("low.prc"), dir.path().join("high.prc"));
+        prc::save(&low, &list_root(&[1.0, 2.0, 3.0])).unwrap();
+        prc::save(&high, &list_root(&[9.0])).unwrap();
+        let block = param_block(&[low, high], &[], "x", &labels());
+        assert_eq!(block.variants.len(), 3);
+        assert_eq!(speed_of(&block, 0), ParamValue::Float(9.0));
+        assert_eq!(speed_of(&block, 2), ParamValue::Float(3.0));
+    }
+
+    #[test]
+    fn writing_a_variant_changes_only_that_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vl.prc");
+        prc::save(&file, &list_root(&[2.8, 0.5, 7.0])).unwrap();
+        write_param_field(&file, "param_x", "speed", 2, 1.25, &labels()).unwrap();
+        assert_eq!(prc::open(&file).unwrap(), list_root(&[2.8, 0.5, 1.25]));
+        assert!(write_param_field(&file, "param_x", "speed", 3, 1.0, &labels()).is_err());
 
         let xml = dir.path().join("vl.prcxml");
-        std::fs::write(&xml, "<struct>
-<list size=\"2\" hash=\"param_x\">
-<struct index=\"0\"><float hash=\"speed\">2.8</float></struct>
-<struct index=\"1\"><float hash=\"speed\">0</float></struct>
-</list>
-</struct>").unwrap();
-        assert_eq!(param_block(&[xml.clone()], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(2.8));
-        write_param_field(&xml, "param_x", "speed", 1.0, &labels()).unwrap();
-        assert!(std::fs::read_to_string(&xml).unwrap().contains("<float hash=\"speed\">1</float></struct>
-<struct index=\"1\"><float hash=\"speed\">0<"));
+        let before = "<struct>\n<list size=\"3\" hash=\"param_x\">\n<struct index=\"0\"><float hash=\"speed\">2.8</float></struct>\n<struct index=\"1\"><float hash=\"speed\">0.5</float></struct>\n<struct index=\"2\"><float hash=\"speed\">7</float></struct>\n</list>\n</struct>";
+        std::fs::write(&xml, before).unwrap();
+        write_param_field(&xml, "param_x", "speed", 2, 1.25, &labels()).unwrap();
+        assert_eq!(std::fs::read_to_string(&xml).unwrap(), before.replace(">7<", ">1.25<"));
+        assert!(write_param_field(&xml, "param_x", "speed", 3, 1.0, &labels()).is_err());
+    }
+
+    #[test]
+    fn nested_entries_are_reported_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = prc::ParamStruct(vec![
+            (hash40::hash40("speed"), prc::ParamKind::Float(1.0)),
+            (
+                hash40::hash40("group"),
+                prc::ParamKind::Struct(prc::ParamStruct(vec![
+                    (hash40::hash40("a"), prc::ParamKind::Float(1.0)),
+                    (hash40::hash40("b"), prc::ParamKind::Float(2.0)),
+                ])),
+            ),
+        ]);
+        let file = dir.path().join("vl.prc");
+        prc::save(&file, &prc::ParamStruct(vec![(hash40::hash40("param_x"), prc::ParamKind::Struct(inner))])).unwrap();
+        let xml = dir.path().join("vl.prcxml");
+        std::fs::write(&xml, "<struct><struct hash=\"param_y\"><float hash=\"speed\">1</float><struct hash=\"group\"><float hash=\"a\">1</float></struct></struct></struct>").unwrap();
+
+        let mut names = labels();
+        names.insert(hash40::hash40("group").0, "group".into());
+        let block = param_block(&[file], &[], "x", &names);
+        assert_eq!(block.fields.len(), 1);
+        assert_eq!(
+            block.skipped,
+            vec![("group".to_string(), "a nested group of 2 values Visionary doesn't edit".to_string())]
+        );
+        let block = param_block(&[xml], &[], "y", &names);
+        assert_eq!(block.skipped[0], ("group".to_string(), "a nested group of 1 values Visionary doesn't edit".to_string()));
+    }
+
+    #[test]
+    fn unreadable_layer_is_reported_and_the_rest_still_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = prc_file(dir.path(), "good.prc", "param_x", 2.0);
+        let corrupt = dir.path().join("corrupt.prc");
+        std::fs::write(&corrupt, b"not a param file").unwrap();
+        let bad_xml = dir.path().join("bad.prcxml");
+        std::fs::write(&bad_xml, [0xff, 0xfe, 0x00, 0xc3, 0x28]).unwrap();
+        let block = param_block(&[corrupt.clone(), bad_xml, good], &[], "x", &labels());
+        assert!(block.present);
+        assert_eq!(block.fields["speed"].0, ParamValue::Float(2.0));
+        assert_eq!(block.skipped.len(), 2);
+        assert_eq!(block.skipped[0].0, corrupt.display().to_string());
+        assert!(block.skipped[0].1.starts_with("Visionary could not read this param file: "));
     }
 
     #[test]
     fn prc_write_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let file = prc_file(dir.path(), "vl.prc", "param_x", 1.0);
-        write_param_field(&file, "param_x", "speed", 4.5, &labels()).unwrap();
+        write_param_field(&file, "param_x", "speed", 0, 4.5, &labels()).unwrap();
         let block = param_block(&[file], &[], "x", &labels());
         assert_eq!(block.fields["speed"].0, ParamValue::Float(4.5));
+    }
+
+    fn mixed_root(speed: f32) -> prc::ParamStruct {
+        let hash = hash40::hash40;
+        prc::ParamStruct(vec![
+            (
+                hash("param_x"),
+                prc::ParamKind::Struct(prc::ParamStruct(vec![
+                    (hash("speed"), prc::ParamKind::Float(speed)),
+                    (hash("life"), prc::ParamKind::I32(60)),
+                    (hash("tiny"), prc::ParamKind::U8(7)),
+                    (hash("flag"), prc::ParamKind::Bool(true)),
+                    (hash("kind"), prc::ParamKind::Hash(hash("shape_circle"))),
+                    (hash("tag"), prc::ParamKind::Str("hello".into())),
+                ])),
+            ),
+            (
+                hash("param_other"),
+                prc::ParamKind::Struct(prc::ParamStruct(vec![
+                    (hash("speed"), prc::ParamKind::Float(9.0)),
+                    (hash("name"), prc::ParamKind::Str("keep".into())),
+                ])),
+            ),
+            (hash("loose"), prc::ParamKind::I16(-3)),
+        ])
+    }
+
+    #[test]
+    fn prc_write_leaves_every_other_value_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vl.prc");
+        prc::save(&file, &mixed_root(1.0)).unwrap();
+        write_param_field(&file, "param_x", "speed", 0, 4.5, &labels()).unwrap();
+        assert_eq!(prc::open(&file).unwrap(), mixed_root(4.5));
+    }
+
+    /// prc-rs reorders or re-lays-out the file on save, so an unedited open+save may not be byte
+    /// identical to the original. Known limitation of the binary write; values are still preserved
+    /// (see `prc_write_leaves_every_other_value_alone`).
+    #[test]
+    fn prc_open_save_without_edit_is_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.prc"), dir.path().join("b.prc"));
+        prc::save(&first, &mixed_root(1.0)).unwrap();
+        prc::save(&second, &prc::open(&first).unwrap()).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
     }
 
     #[test]
@@ -464,10 +717,21 @@ mod tests {
         assert_eq!(block.fields["speed"].0, ParamValue::Float(1.6));
         assert_eq!(block.fields["life"].0, ParamValue::Int(60));
 
-        write_param_field(&file, "param_lativolt", "speed", 2.5, &labels()).unwrap();
+        write_param_field(&file, "param_lativolt", "speed", 0, 2.5, &labels()).unwrap();
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(after, before.replace("<float hash=\"speed\">1.6<", "<float hash=\"speed\">2.5<"));
         assert!(!dir.path().join("vl.prc").exists());
+    }
+
+    #[test]
+    fn prcxml_write_keeps_padding_around_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("vl.prcxml");
+        let before = "<struct><struct hash=\"param_x\"><float hash=\"speed\"> \r\n 1.6\t </float></struct></struct>";
+        std::fs::write(&file, before).unwrap();
+        assert_eq!(param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(1.6));
+        write_param_field(&file, "param_x", "speed", 0, 2.5, &labels()).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before.replace("1.6", "2.5"));
     }
 
     #[test]
@@ -476,5 +740,6 @@ mod tests {
         let file = PathBuf::from("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset/romfs/fighter/samus/param/vl.prc");
         let block = param_block(&[file], &[], "lativolt", &HashMap::new());
         assert!(block.present);
+        assert_eq!(block.variants.len(), 4);
     }
 }
