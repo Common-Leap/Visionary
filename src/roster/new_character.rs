@@ -145,11 +145,7 @@ impl NewCharacterView {
             ui.label(RichText::new(label).strong().color(look.dim));
         };
         field(ui, "Name");
-        ui.add(
-            egui::TextEdit::singleline(&mut self.display_name)
-                .desired_width(f32::INFINITY)
-                .hint_text("As the game shows it"),
-        );
+        ui.add(egui::TextEdit::singleline(&mut self.display_name).desired_width(f32::INFINITY));
         ui.add_space(8.0);
 
         field(ui, "Skins");
@@ -163,27 +159,24 @@ impl NewCharacterView {
                         .speed(0.05),
                 )
                 .changed();
-            match &mut range {
-                Some(range) => {
-                    if changed {
-                        range.1 = range.0.saturating_add(count - 1);
-                    }
-                    ui.label(
-                        RichText::new(format!("costumes c{:02} to c{:02}", range.0, range.1))
-                            .color(look.text),
-                    );
-                    if act(
-                        ui,
-                        look,
-                        if self.show_slot_map { "Done" } else { "Change" },
-                        None,
-                    )
-                    .clicked()
-                    {
-                        self.show_slot_map = !self.show_slot_map;
-                    }
+            if let Some(range) = &mut range {
+                if changed {
+                    range.1 = range.0.saturating_add(count - 1);
                 }
-                None => {}
+                ui.label(
+                    RichText::new(format!("costumes c{:02} to c{:02}", range.0, range.1))
+                        .color(look.text),
+                );
+                if act(
+                    ui,
+                    look,
+                    if self.show_slot_map { "Done" } else { "Change" },
+                    None,
+                )
+                .clicked()
+                {
+                    self.show_slot_map = !self.show_slot_map;
+                }
             }
         });
         if range.is_some() {
@@ -216,9 +209,15 @@ impl NewCharacterView {
             .or_else(|| self.project_dir.as_ref().map(|dir| dir.join("characters")));
         ui.horizontal_wrapped(|ui| match &home {
             Some(home) => {
-                let name = crate::mod_export::slugify(self.display_name.trim());
+                // The character's own folder appears once it has a name.
+                let name = self.display_name.trim();
+                let shown = if name.is_empty() {
+                    home.clone()
+                } else {
+                    home.join(crate::mod_export::slugify(name))
+                };
                 ui.label(
-                    RichText::new(home.join(name).display().to_string())
+                    RichText::new(shown.display().to_string())
                         .monospace()
                         .color(look.text),
                 );
@@ -254,18 +253,17 @@ impl NewCharacterView {
         let mut action = NewCharacterAction::None;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(reason.is_none(), |ui| {
-                let create = act(ui, look, "Create character", Some(look.accent)).on_hover_text(
-                    "Copies the base fighter's model, animations, effects, sounds and portraits into the character's own folder. Its own place on the select screen needs the CSK Collection plugin in the game.",
-                );
+                let create = act(ui, look, "Create character", Some(look.accent))
+                    .on_hover_text(
+                        "Copies the base fighter's model, animations, effects, sounds and portraits into the character's own folder. Its own place on the select screen needs the CSK Collection plugin in the game.",
+                    )
+                    .on_disabled_hover_text(reason.unwrap_or_default());
                 if create.clicked() {
                     if let Some(home) = &home {
                         action = self.build_create_action(project, home.clone());
                     }
                 }
             });
-            if let Some(reason) = reason {
-                ui.label(RichText::new(reason).color(look.dim));
-            }
         });
         if let Some(error) = &self.error {
             ui.add_space(8.0);
@@ -313,7 +311,12 @@ impl NewCharacterView {
                     || fighter.contains(&wanted)
             })
             .collect();
-        let tile = egui::vec2(104.0, 128.0);
+        // Tiles share the row exactly, about 104 wide each.
+        let across = ((ui.available_width() + 8.0) / (104.0 + 8.0))
+            .floor()
+            .max(1.0);
+        let tile_w = ((ui.available_width() + 8.0) / across - 8.0).floor();
+        let tile = egui::vec2(tile_w, tile_w + 24.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             for (fighter, name) in fighters {

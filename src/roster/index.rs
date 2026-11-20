@@ -303,7 +303,7 @@ impl RosterIndex {
         let mut ordered: Vec<&RosterEntry> = self.entries.iter().collect();
         ordered.sort_by_key(|entry| {
             (
-                entry.css_order.is_none(),
+                entry.css_order.is_none() || !entry.on_roster,
                 entry.css_order.unwrap_or(0),
                 entry.id.0,
             )
