@@ -6,6 +6,7 @@
 
 pub mod clone_compat;
 pub mod clones;
+pub mod settings;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
