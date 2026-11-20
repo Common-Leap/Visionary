@@ -9534,15 +9534,103 @@ pub fn build_mod_project_full(
     )
 }
 
-/// One move that belongs to a single costume rather than to the fighter as a whole:
-/// `(fighter, move) → (slots, the fighter's own script source)`.
+/// An edit carried by a gate arm, in the same form the edit lists carry it.
+#[derive(Debug, Clone)]
+pub enum ArmPayload {
+    Game(crate::data::AcmdScript),
+    EffectCalls(
+        Vec<crate::data::EffectCall>,
+        std::collections::BTreeMap<u32, Vec<String>>,
+    ),
+    EffectScript(crate::data::AcmdScript),
+    Sound(crate::data::AcmdScript),
+    Expression(crate::data::AcmdScript),
+}
+
+/// What one arm of a gate runs.
+#[derive(Debug, Clone)]
+pub enum GateBody {
+    /// The game's own function: [`GateArms::original`].
+    Game,
+    /// The edit in the edit list for this fighter, category and move.
+    Primary,
+    /// An edit that is in no list: rendered here for its arm only.
+    Edit(ArmPayload),
+}
+
+/// One move whose version depends on the costume: each character on the fighter that has its
+/// own version gets an arm over its costumes, and every other costume runs `fallback`.
 ///
-/// The original source is not optional. A Smashline script replaces the move for *every*
-/// costume, so a gate with no else arm removes the move from the donor and every other costume
-/// of it — a break that only shows up when someone plays the donor normally.
-/// `slots` holds every costume the gate covers, ascending (one entry for a
-/// single-slot character, 8 for a c08–c15 one).
-pub type SlotGates = std::collections::HashMap<(String, String), (Vec<u8>, String)>;
+/// `original` is the game's own function source. It is not optional whenever an arm or the
+/// fallback runs it: a Smashline script replaces the move for *every* costume, so a gate with no
+/// game arm removes the move from those costumes — a break that only shows up when someone plays
+/// them.
+#[derive(Debug, Clone)]
+pub struct GateArms {
+    pub arms: Vec<(Vec<u8>, GateBody)>,
+    pub fallback: GateBody,
+    pub original: Option<String>,
+}
+
+/// Gates by `(engine fighter, key)`, where key is the move name for `game_` and
+/// `"<category>:<move>"` for the other categories.
+pub type SlotGates = std::collections::HashMap<(String, String), GateArms>;
+
+/// Render a gate's arms around the primary edit's emitted source.
+fn gated_source(
+    gate: &GateArms,
+    registered_name: &str,
+    primary_source: &str,
+    script_move: &str,
+    tweaks: &std::collections::HashMap<u64, crate::mod_project::LiveTweak>,
+) -> String {
+    let render = |body: &GateBody| -> Option<String> {
+        match body {
+            GateBody::Game => None,
+            GateBody::Primary => Some(primary_source.to_owned()),
+            GateBody::Edit(payload) => Some(match payload {
+                ArmPayload::Game(script) => emit_move_fn(script, script_move).1,
+                ArmPayload::EffectCalls(calls, residue) => {
+                    emit_effect_move_fn(calls, script_move, tweaks, residue).1
+                }
+                ArmPayload::EffectScript(script) => {
+                    preview_effect_structure_fn(script, script_move)
+                }
+                ArmPayload::Sound(script) => emit_sound_move_fn(script, script_move).1,
+                ArmPayload::Expression(script) => emit_expression_move_fn(script, script_move).1,
+            }),
+        }
+    };
+    let rendered: Vec<(Vec<u8>, Option<String>)> = gate
+        .arms
+        .iter()
+        .map(|(slots, body)| (slots.clone(), render(body)))
+        .collect();
+    let fallback = render(&gate.fallback);
+    let arms: Vec<(Vec<u8>, crate::roster::scaffold::ArmBody<'_>)> = rendered
+        .iter()
+        .map(|(slots, source)| {
+            (
+                slots.clone(),
+                source
+                    .as_deref()
+                    .map_or(crate::roster::scaffold::ArmBody::Game, |source| {
+                        crate::roster::scaffold::ArmBody::Own(source)
+                    }),
+            )
+        })
+        .collect();
+    crate::roster::scaffold::costume_gate(
+        registered_name,
+        &arms,
+        fallback
+            .as_deref()
+            .map_or(crate::roster::scaffold::ArmBody::Game, |source| {
+                crate::roster::scaffold::ArmBody::Own(source)
+            }),
+        gate.original.as_deref(),
+    )
+}
 
 /// Like [`build_mod_project_full`] with editable `expression_` scripts included.
 #[cfg(test)]
@@ -9574,16 +9662,17 @@ fn append_category_source(
     category: &str,
     registered_name: &str,
     source: &str,
+    script_move: &str,
+    tweaks: &std::collections::HashMap<u64, crate::mod_project::LiveTweak>,
 ) {
     match gates.get(&(fighter.to_string(), format!("{category}:{move_name}"))) {
-        Some((slots, original)) => {
-            output.push_str(&crate::roster::scaffold::costume_gated_source_multi(
-                registered_name,
-                slots,
-                source,
-                original,
-            ))
-        }
+        Some(gate) => output.push_str(&gated_source(
+            gate,
+            registered_name,
+            source,
+            script_move,
+            tweaks,
+        )),
         None => output.push_str(source),
     }
 }
@@ -9812,8 +9901,9 @@ pub fn install() {{
             // `game_attacks3s` excepted): resolve the motion to the script's
             // spelling so the emitted function is the one the game calls.
             let mut script_move = resolve_script_move_name(fighter, move_name);
-            if let Some((_, original)) =
-                slot_gates.get(&((*fighter).to_string(), (*move_name).to_string()))
+            if let Some(original) = slot_gates
+                .get(&((*fighter).to_string(), (*move_name).to_string()))
+                .and_then(|gate| gate.original.as_ref())
             {
                 // A costume gate carries the donor's own script as the else arm;
                 // its declared name is the spelling that fighter actually runs.
@@ -9831,13 +9921,15 @@ pub fn install() {{
             // The acmd script name used in agent.acmd() is "game_{movename_no_underscores}"
             let acmd_name = script_function_name("game", &script_move);
             match slot_gates.get(&((*fighter).to_string(), (*move_name).to_string())) {
-                Some((slots, original)) => {
-                    // The registered name stays `fn_name`; the authored body moves to a
-                    // private name and the fighter's own script becomes the other arm.
-                    acmd_src.push_str(&crate::roster::scaffold::costume_gated_source_multi(
-                        &fn_name, slots, &fn_src, original,
-                    ));
-                }
+                // The registered name stays `fn_name`; each version moves to a private name
+                // and a dispatcher picks between them by costume.
+                Some(gate) => acmd_src.push_str(&gated_source(
+                    gate,
+                    &fn_name,
+                    &fn_src,
+                    &script_move,
+                    &tweaks,
+                )),
                 None => acmd_src.push_str(&fn_src),
             }
             acmd_src.push('\n');
@@ -9859,6 +9951,8 @@ pub fn install() {{
                     "effect",
                     &fn_name,
                     &fn_src,
+                    &script_move,
+                    &tweaks,
                 );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
@@ -9880,6 +9974,8 @@ pub fn install() {{
                     "effect",
                     &name,
                     &preview_effect_structure_fn(script, &script_move),
+                    &script_move,
+                    &tweaks,
                 );
                 acmd_src.push('\n');
                 fn_entries.push((name.clone(), name));
@@ -9900,6 +9996,8 @@ pub fn install() {{
                     "sound",
                     &fn_name,
                     &fn_src,
+                    &script_move,
+                    &tweaks,
                 );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));
@@ -9921,6 +10019,8 @@ pub fn install() {{
                     "expression",
                     &fn_name,
                     &fn_src,
+                    &script_move,
+                    &tweaks,
                 );
                 acmd_src.push('\n');
                 fn_entries.push((fn_name.clone(), fn_name));

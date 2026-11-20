@@ -302,69 +302,120 @@ pub fn inventory(roots: &[PathBuf], donor: &str, slot: u8, name_id: Option<&str>
     out
 }
 
-/// Emit an authored function, the fighter's own function, and a dispatcher between them.
+/// What one arm of a costume gate runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArmBody<'a> {
+    /// An edited function: a whole `unsafe extern "C" fn …` definition.
+    Own(&'a str),
+    /// The fighter's own (game) function for the move.
+    Game,
+}
+
+/// Emit every arm's function and a dispatcher that picks one by costume.
 ///
-/// The dispatcher keeps the **registered** name, so the `agent.acmd` line the exporter already
-/// writes needs no change. The authored body moves to `<name>_costume` and the fighter's own
-/// script becomes `<name>_original`.
+/// A Smashline script replaces a move for every costume of a fighter, so a move that differs
+/// between characters on one fighter (a base fighter and the characters made on it) is shipped
+/// as one dispatcher under the **registered** name, so the `agent.acmd` line the exporter
+/// writes needs no change. Each arm runs when the costume is one of its slots; every other
+/// costume runs `fallback`.
 ///
-/// `authored_source` and `original_source` are whole `unsafe extern "C" fn …` definitions. Both
-/// are renamed by replacing their declared name, which is exact rather than a substring
-/// rewrite: the name appears once, in the declaration.
+/// Arms are named after what they run: an edited arm `<name>_c<NN>_costume` after its first
+/// slot, an edited fallback `<name>_costume`, and the game's own function `<name>_original`
+/// (emitted once, however many arms run it). A gate with one edited arm and the game's version
+/// for everything else names its arm `<name>_costume`, as single-character gates always were. Each source is renamed by replacing its declared
+/// name, which is exact rather than a substring rewrite: the name appears once, in the
+/// declaration, and the game's function is not always spelled as the exporter spells the move.
 ///
-/// Emit an authored function, the fighter's own function, and a dispatcher between them,
-/// gated to every slot in `slots`.
-///
-/// The dispatcher keeps the **registered** name, so the `agent.acmd` line the exporter already
-/// writes needs no change. The authored body moves to `<name>_costume` and the fighter's own
-/// script becomes `<name>_original`. A multi-skin character shares one moveset across all its
-/// costumes, so the gate is an OR over its slots (`color == 8 || color == 9 …`).
-///
-/// `authored_source` and `original_source` are whole `unsafe extern "C" fn …` definitions. Both
-/// are renamed by replacing their declared name, which is exact rather than a substring
-/// rewrite: the name appears once, in the declaration.
-///
-/// The original arm is mandatory in the same way it is in [`wrap_with_slot_guard`]: without it
-/// this move would be removed from every other costume of the donor.
-pub fn costume_gated_source_multi(
+/// `original` is the game's own function, required whenever any arm or the fallback runs it:
+/// without it the costumes it stands for would lose the move entirely.
+pub fn costume_gate(
     registered_name: &str,
-    slots: &[u8],
-    authored_source: &str,
-    original_source: &str,
+    arms: &[(Vec<u8>, ArmBody<'_>)],
+    fallback: ArmBody<'_>,
+    original: Option<&str>,
 ) -> String {
-    let mut sorted: Vec<u8> = slots.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    debug_assert!(!sorted.is_empty(), "a costume gate needs at least one slot");
-    let condition = sorted
-        .iter()
-        .map(|slot| format!("color == {slot}"))
-        .collect::<Vec<_>>()
-        .join(" || ");
-    let authored_name = format!("{registered_name}_costume");
     let original_name = format!("{registered_name}_original");
+    let lone_arm = arms.len() == 1
+        && matches!(arms[0].1, ArmBody::Own(_))
+        && matches!(fallback, ArmBody::Game);
+    let mut functions = String::new();
+    let mut branches: Vec<(String, String)> = Vec::new();
+    let mut uses_original = matches!(fallback, ArmBody::Game);
+    for (slots, body) in arms {
+        let mut sorted = slots.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let Some(first) = sorted.first().copied() else {
+            continue;
+        };
+        let condition = sorted
+            .iter()
+            .map(|slot| format!("color == {slot}"))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        let target = match body {
+            ArmBody::Own(source) => {
+                let name = if lone_arm {
+                    format!("{registered_name}_costume")
+                } else {
+                    format!("{registered_name}_c{first:02}_costume")
+                };
+                functions.push_str(&rename_declared_function(source, &name));
+                functions.push('\n');
+                name
+            }
+            ArmBody::Game => {
+                uses_original = true;
+                original_name.clone()
+            }
+        };
+        branches.push((condition, target));
+    }
+    let fallback_target = match fallback {
+        ArmBody::Own(source) => {
+            let name = format!("{registered_name}_costume");
+            functions.push_str(&rename_declared_function(source, &name));
+            functions.push('\n');
+            name
+        }
+        ArmBody::Game => original_name.clone(),
+    };
+    debug_assert!(
+        !uses_original || original.is_some(),
+        "an arm runs the game's own function, so it must be given"
+    );
+    if uses_original {
+        if let Some(original) = original {
+            functions.push_str(&rename_declared_function(original, &original_name));
+            functions.push('\n');
+        }
+    }
+    let mut dispatch = String::new();
+    for (index, (condition, target)) in branches.iter().enumerate() {
+        let keyword = if index == 0 { "if" } else { "} else if" };
+        dispatch.push_str(&format!(
+            "    {keyword} {condition} {{\n        {target}(agent);\n"
+        ));
+    }
+    if branches.is_empty() {
+        dispatch.push_str(&format!("    {fallback_target}(agent);\n"));
+    } else {
+        dispatch.push_str(&format!(
+            "    }} else {{\n        {fallback_target}(agent);\n    }}\n"
+        ));
+    }
     format!(
-        "{authored}\n{original}\n\
+        "{functions}\
          unsafe extern \"C\" fn {registered_name}(agent: &mut L2CAgentBase) {{\n\
          \x20   // Costume gate, generated by Visionary. This script replaces the move for EVERY\n\
-         \x20   // costume of this fighter, so the else arm runs the fighter's own script —\n\
-         \x20   // without it, every other costume would lose this move entirely.\n\
+         \x20   // costume of this fighter, so each character's costumes run their own version\n\
+         \x20   // and every other costume runs the fighter's.\n\
          \x20   let color = smash::app::lua_bind::WorkModule::get_int(\n\
          \x20       agent.module_accessor,\n\
          \x20       *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,\n\
          \x20   );\n\
-         \x20   if {condition} {{\n\
-         \x20       {authored_name}(agent);\n\
-         \x20   }} else {{\n\
-         \x20       {original_name}(agent);\n\
-         \x20   }}\n\
-         }}\n",
-        authored = rename_function(authored_source, registered_name, &authored_name),
-        original = rename_declared_function(original_source, &original_name),
-        registered_name = registered_name,
-        condition = condition,
-        authored_name = authored_name,
-        original_name = original_name,
+         {dispatch}\
+         }}\n"
     )
 }
 
@@ -372,11 +423,18 @@ pub fn costume_gated_source_multi(
 ///
 /// Used by the export verifier so that "did this body reach disk" is still asked of a gated
 /// move, rather than the check being skipped for it.
+///
+/// Arms are named `<name>_costume` or `<name>_c<NN>_costume`, so what is returned is the part
+/// every edited arm shares: `_costume` and the function from its parameter list on. Shipped
+/// text containing it carries this exact body under a gate arm's name.
 pub fn costume_arm_source(source: &str) -> String {
     let Some(name) = declared_name(source) else {
         return source.to_string();
     };
-    rename_function(source, &name, &format!("{name}_costume"))
+    let Some(start) = source.find(&format!("fn {name}(")) else {
+        return source.to_string();
+    };
+    format!("_costume{}", &source[start + 3 + name.len()..])
 }
 
 /// The name of the first function a source declares.
@@ -536,7 +594,12 @@ mod tests {
 
     #[test]
     fn a_costume_gate_keeps_the_registered_name_and_renames_both_arms() {
-        let generated = costume_gated_source_multi("game_attack11", &[8], AUTHORED, ORIGINAL);
+        let generated = costume_gate(
+            "game_attack11",
+            &[(vec![8], ArmBody::Own(AUTHORED))],
+            ArmBody::Game,
+            Some(ORIGINAL),
+        );
         assert!(generated.contains("fn game_attack11_costume(agent"));
         assert!(generated.contains("fn game_attack11_original(agent"));
         assert!(generated.contains("unsafe extern \"C\" fn game_attack11(agent"));
@@ -551,13 +614,70 @@ mod tests {
     /// registered name. Two definitions, or none, both fail to build.
     #[test]
     fn exactly_one_function_carries_the_registered_name() {
-        let generated = costume_gated_source_multi("game_attack11", &[8], AUTHORED, ORIGINAL);
+        let generated = costume_gate(
+            "game_attack11",
+            &[(vec![8], ArmBody::Own(AUTHORED))],
+            ArmBody::Game,
+            Some(ORIGINAL),
+        );
         assert_eq!(generated.matches("fn game_attack11(").count(), 1);
+    }
+
+    /// Two characters made on one fighter, plus the fighter's own edit: one dispatcher, an arm
+    /// each, the fighter's edit for every other costume, and each body reachable by the
+    /// verifier's arm spelling.
+    #[test]
+    fn two_made_characters_and_the_base_edit_share_one_dispatcher() {
+        let other = AUTHORED.replace("4.0", "6.0");
+        let base = AUTHORED.replace("4.0", "9.0");
+        let generated = costume_gate(
+            "game_attack11",
+            &[
+                ((8..=15).collect(), ArmBody::Own(AUTHORED)),
+                ((16..=17).collect(), ArmBody::Own(&other)),
+            ],
+            ArmBody::Own(&base),
+            None,
+        );
+        assert!(generated.contains("if color == 8 || color == 9"));
+        assert!(generated.contains("} else if color == 16 || color == 17 {"));
+        assert!(generated.contains("game_attack11_c08_costume(agent);"));
+        assert!(generated.contains("game_attack11_c16_costume(agent);"));
+        assert!(generated.contains("    } else {\n        game_attack11_costume(agent);"));
+        assert!(
+            !generated.contains("_original"),
+            "nothing runs the game's version"
+        );
+        for body in [AUTHORED, other.as_str(), base.as_str()] {
+            assert!(generated.contains(&costume_arm_source(body)));
+        }
+        let source = format!("mod generated {{ use smash::lib::lua_const::*; {generated} }}");
+        syn::parse_file(&source).unwrap();
+    }
+
+    /// The game's own function is emitted once however many arms run it.
+    #[test]
+    fn the_game_version_is_emitted_once() {
+        let generated = costume_gate(
+            "game_attack11",
+            &[
+                ((8..=15).collect(), ArmBody::Game),
+                ((16..=17).collect(), ArmBody::Own(AUTHORED)),
+            ],
+            ArmBody::Game,
+            Some(ORIGINAL),
+        );
+        assert_eq!(generated.matches("fn game_attack11_original(").count(), 1);
     }
 
     #[test]
     fn a_costume_gated_function_set_parses_as_rust() {
-        let generated = costume_gated_source_multi("game_attack11", &[8], AUTHORED, ORIGINAL);
+        let generated = costume_gate(
+            "game_attack11",
+            &[(vec![8], ArmBody::Own(AUTHORED))],
+            ArmBody::Game,
+            Some(ORIGINAL),
+        );
         let source = format!("mod generated {{ use smash::lib::lua_const::*; {generated} }}");
         if let Err(error) = syn::parse_file(&source) {
             panic!("costume-gated source does not parse: {error}\n\n{generated}");

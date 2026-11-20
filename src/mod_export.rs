@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use crate::acmd::ModProject;
-use crate::mod_project::{EffMod, LiveTweak, ModProjectFile, PROJECT_VERSION};
+use crate::mod_project::{EffMod, FighterMod, LiveTweak, ModProjectFile, PROJECT_VERSION};
 
 /// A filesystem-, Cargo-, and Rust-friendly project name.
 pub fn slugify(name: &str) -> String {
@@ -293,7 +293,22 @@ fn drop_unchanged_scripts(
 ) {
     use crate::move_nodes::model::{MoveGraph, Track};
     let same = |a: &dyn erased_json::Json, b: &dyn erased_json::Json| a.json() == b.json();
-    for (fighter, edits) in project.fighters.iter_mut() {
+    // A made character's edit is compared with the game's version of its engine fighter's
+    // move, like any other: matching it means its costumes run the game's version anyway.
+    let owners = project
+        .fighters
+        .iter_mut()
+        .map(|(fighter, edits)| (fighter.clone(), edits))
+        .chain(project.characters.iter_mut().map(|(key, edits)| {
+            (
+                crate::character::CharacterKey::made(key.clone())
+                    .engine_fighter()
+                    .to_owned(),
+                edits,
+            )
+        }));
+    for (fighter, edits) in owners {
+        let fighter = &fighter;
         let mut moves: Vec<String> = edits
             .acmd
             .keys()
@@ -480,166 +495,268 @@ fn active_gimmicks(project: &ModProjectFile) -> Vec<String> {
 /// collision using exactly the same source-emitting semantics as the normal
 /// exporter.
 fn render_ordinary_source(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+    render_ordinary_source_with(project, &crate::acmd::cached_script_body)
+}
+
+/// [`render_ordinary_source`] with the local script cache given: `vanilla` answers the game's
+/// own source for a move when no saved snapshot holds it.
+fn render_ordinary_source_with(
+    project: &ModProjectFile,
+    vanilla: &dyn Fn(&str, &str) -> Option<String>,
+) -> Result<Option<GeneratedSource>> {
+    use crate::acmd::{ArmPayload, GateArms, GateBody};
+
     let mut acmd_edits = Vec::new();
     let mut effect_edits = Vec::new();
     let mut effect_scripts = Vec::new();
     let mut sound_edits = Vec::new();
     let mut expression_edits = Vec::new();
+    // Made characters' edits that ship only as a gate arm. They are in no list above, so they
+    // are verified alongside the lists rather than skipped.
+    let mut arm_acmd = Vec::new();
+    let mut arm_effects = Vec::new();
+    let mut arm_effect_scripts = Vec::new();
+    let mut arm_sounds = Vec::new();
+    let mut arm_expressions = Vec::new();
     let mut tweaks: Vec<LiveTweak> = Vec::new();
     let mut dropped: HashMap<String, Vec<String>> = HashMap::new();
     let mut incomplete = Vec::new();
     let mut exported_effect_names = HashSet::new();
     let mut capture_warnings = Vec::new();
+    let mut gate_warnings = Vec::new();
     let mut slot_gates = crate::acmd::SlotGates::new();
 
-    let mut fighters: Vec<_> = project.fighters.iter().collect();
-    fighters.sort_by(|a, b| a.0.cmp(b.0));
-    for (fighter, edits) in fighters {
-        let mut moves: Vec<_> = edits.acmd.iter().collect();
-        moves.sort_by(|a, b| a.0.cmp(b.0));
-        for (move_name, record) in moves {
-            // A move scoped to costumes needs the fighter's own script as the other arm.
-            // Without it the generated script would remove this move from every other costume
-            // of the fighter, so a missing original is refused rather than exported wide.
-            let scopes = record.effective_scopes();
-            if !scopes.is_empty() {
-                let original_body = edits
-                    .move_sources
-                    .get(move_name)
-                    .map(|snapshot| snapshot.body.trim())
-                    .filter(|body| !body.is_empty());
-                let Some(body) = original_body else {
-                    bail!(
-                        "{fighter}'s {move_name} is set to costume(s) {}, but the fighter's own version of it was not saved with the project. Exporting it now would remove {move_name} from every other costume of {fighter}. Open the move in the editor once so its original is recorded, then export again.",
-                        format_slots(&scopes)
-                    )
-                };
-                let game_original = matching_category_original(body, fighter, move_name, "game")?;
-                slot_gates.insert(
-                    (fighter.clone(), move_name.clone()),
-                    (scopes.clone(), game_original),
-                );
-
-                for (category, replaced) in [
-                    (
-                        "effect",
-                        edits.effect_calls_full.contains_key(move_name)
-                            || edits.effect_scripts.contains_key(move_name),
-                    ),
-                    ("sound", edits.sound_scripts.contains_key(move_name)),
-                    (
-                        "expression",
-                        edits.expression_scripts.contains_key(move_name),
-                    ),
-                ] {
-                    if !replaced {
-                        continue;
-                    }
-                    let original = matching_category_original(body, fighter, move_name, category)?;
-                    slot_gates.insert(
-                        (fighter.clone(), format!("{category}:{move_name}")),
-                        (scopes.clone(), original),
-                    );
-                }
-            }
-            acmd_edits.push((fighter.clone(), move_name.clone(), record.script.clone()));
-        }
-
-        let mut effect_moves: Vec<_> = edits.effect_calls_full.iter().collect();
-        effect_moves.sort_by(|a, b| a.0.cmp(b.0));
-        for (move_name, calls) in effect_moves {
-            if let Some(snapshot) = edits.move_sources.get(move_name) {
-                let original = crate::acmd::parse_effect_script(&snapshot.body);
-                if let Some(reason) = original.preview_budget_error() {
-                    bail!("{fighter}/{move_name}: legacy Effect source cannot be flattened safely: {reason}. Retain the source or reduce its repeat expansion before exporting");
-                }
-            }
-            let calls = calls
-                .iter()
-                .cloned()
-                .map(crate::data::EffectCall::normalized_timing)
-                .collect::<Vec<_>>();
-            exported_effect_names.extend(
-                calls
-                    .iter()
-                    .map(|call| call.effect_name.to_ascii_lowercase()),
+    // Every character's edits, grouped by the engine fighter that runs them: the base fighter's
+    // own edits and those of each character made on it, with that character's costumes.
+    let mut engines: std::collections::BTreeSet<String> =
+        project.fighters.keys().cloned().collect();
+    let mut made_edits: HashMap<String, Vec<MadeEdits<'_>>> = HashMap::new();
+    for (key, edits) in &project.characters {
+        let character = crate::character::CharacterKey::made(key.clone());
+        let Some(entry) = character.authored(&project.roster) else {
+            bail!(
+                "{key} has move edits but is not one of this project's characters any more, so the costumes they belong to are unknown"
             );
-            effect_edits.push((
-                fighter.clone(),
-                move_name.clone(),
-                calls,
-                edits
-                    .effect_frame_residue
-                    .get(move_name)
-                    .cloned()
-                    .unwrap_or_default(),
-            ));
-        }
-        let mut structured_effects: Vec<_> = edits.effect_scripts.iter().collect();
-        structured_effects.sort_by(|a, b| a.0.cmp(b.0));
-        for (move_name, script) in structured_effects {
-            if edits.effect_calls_full.contains_key(move_name)
-                || edits
-                    .effect_calls
-                    .get(move_name)
-                    .is_some_and(|calls| !calls.is_empty())
-                || edits
-                    .effect_frame_residue
-                    .get(move_name)
-                    .is_some_and(|lines| !lines.is_empty())
-            {
-                bail!("{fighter}/{move_name}: structured and legacy effect edits overlap; reimport the current move and Apply nodes to choose one source");
+        };
+        let fighter = character.engine_fighter().to_owned();
+        engines.insert(fighter.clone());
+        made_edits.entry(fighter).or_default().push(MadeEdits {
+            name: entry.display_name.clone(),
+            slots: entry.all_slots(),
+            edits,
+        });
+    }
+
+    for fighter in &engines {
+        let base = project.fighters.get(fighter);
+        let made = made_edits.remove(fighter).unwrap_or_default();
+        // Every character made on this fighter, whether or not it has edits: a base edit must
+        // not reach any of their costumes.
+        let made_slots: Vec<Vec<u8>> = crate::character::made_on(fighter, &project.roster)
+            .map(crate::mod_project::AuthoredEntry::all_slots)
+            .collect();
+        let owners: Vec<&FighterMod> = base
+            .into_iter()
+            .chain(made.iter().map(|m| m.edits))
+            .collect();
+
+        for edits in &owners {
+            check_effect_sources(fighter, edits)?;
+            for (move_name, lost) in &edits.effect_dropped_lines {
+                // Re-keyed to match what the report looks moves up by, and otherwise passed
+                // through whole. A note for a move this build ships no function for needs no
+                // filtering here: `verify_export` walks the exported moves and asks the map
+                // about each, so an orphan note is never consulted.
+                dropped
+                    .entry(format!("{fighter}/{move_name}"))
+                    .or_default()
+                    .extend(lost.iter().cloned());
             }
-            effect_scripts.push((fighter.clone(), move_name.clone(), script.clone()));
-        }
-        for (move_name, lost) in &edits.effect_dropped_lines {
-            // Re-keyed to match what the report looks moves up by, and otherwise passed through
-            // whole. A note for a move this build ships no function for needs no filtering here:
-            // `verify_export` walks the exported moves and asks the map about each, so an orphan
-            // note is never consulted. C6c wrote that filter first and removed it once a mutation
-            // showed it could not change an outcome.
-            dropped.insert(format!("{fighter}/{move_name}"), lost.clone());
-        }
-        // Sound scripts. An empty script is intentional when the user removed every call; it
-        // must be emitted so the generated replacement silences the stock category. A missing
-        // map entry, not an empty script, means the category was never edited.
-        let mut sound_moves: Vec<_> = edits.sound_scripts.iter().collect();
-        sound_moves.sort_by(|a, b| a.0.cmp(b.0));
-        for (move_name, script) in sound_moves {
-            sound_edits.push((fighter.clone(), move_name.clone(), script.clone()));
-        }
-        let mut expression_moves: Vec<_> = edits.expression_scripts.iter().collect();
-        expression_moves.sort_by(|a, b| a.0.cmp(b.0));
-        for (move_name, script) in expression_moves {
-            expression_edits.push((fighter.clone(), move_name.clone(), script.clone()));
+            // A provenance note is useful only beside a function this export actually ships.
+            for (move_name, warning) in &edits.capture_branch_warnings {
+                let exported = edits.acmd.contains_key(move_name)
+                    || edits.effect_calls_full.contains_key(move_name)
+                    || edits.effect_scripts.contains_key(move_name)
+                    || edits.sound_scripts.contains_key(move_name)
+                    || edits.expression_scripts.contains_key(move_name);
+                if exported {
+                    capture_warnings.push(warning.clone());
+                }
+            }
+            for (move_name, deltas) in &edits.effect_calls {
+                if !deltas.is_empty() && !edits.effect_calls_full.contains_key(move_name) {
+                    incomplete.push(format!("{fighter}/{move_name}"));
+                }
+            }
+            for tweak in &edits.live_tweaks {
+                if !tweaks
+                    .iter()
+                    .any(|existing| existing.effect_name == tweak.effect_name)
+                {
+                    tweaks.push(tweak.clone());
+                }
+            }
+            for calls in edits.effect_calls_full.values() {
+                exported_effect_names.extend(
+                    calls
+                        .iter()
+                        .map(|call| call.effect_name.to_ascii_lowercase()),
+                );
+            }
         }
 
-        // A provenance note is useful only beside a function this export actually ships. A
-        // saved project may retain a note for a move whose edit was later removed, and reporting
-        // that orphan would make the warning impossible to act on.
-        for (move_name, warning) in &edits.capture_branch_warnings {
-            let exported = edits.acmd.contains_key(move_name)
-                || edits.effect_calls_full.contains_key(move_name)
-                || edits.effect_scripts.contains_key(move_name)
-                || edits.sound_scripts.contains_key(move_name);
-            let exported = exported || edits.expression_scripts.contains_key(move_name);
-            if exported {
-                capture_warnings.push(warning.clone());
-            }
-        }
+        // A base `game_` record scoped to costumes was saved before made characters had their
+        // own store and matched none of them. It keeps its old gate: its costumes run it, every
+        // other costume the game's version, and so do the same move's other categories.
+        let legacy_scopes = |move_name: &str| -> Vec<u8> {
+            base.and_then(|edits| edits.acmd.get(move_name))
+                .map(crate::data::EditRecord::effective_scopes)
+                .unwrap_or_default()
+        };
 
-        for (move_name, deltas) in &edits.effect_calls {
-            if !deltas.is_empty() && !edits.effect_calls_full.contains_key(move_name) {
-                incomplete.push(format!("{fighter}/{move_name}"));
+        for category in ["game", "effect", "sound", "expression"] {
+            let mut moves: std::collections::BTreeSet<&String> = Default::default();
+            for edits in &owners {
+                moves.extend(category_moves(edits, category));
+            }
+            for move_name in moves {
+                let base_payload = base
+                    .map(|edits| category_payload(edits, category, move_name))
+                    .transpose()?
+                    .flatten();
+                let legacy = legacy_scopes(move_name);
+                let (base_edit, legacy_arm) = if legacy.is_empty() {
+                    (base_payload, None)
+                } else {
+                    gate_warnings.push(format!(
+                        "{fighter}/{move_name} only changes costumes {}, which match none of this project's characters",
+                        format_slots(&legacy)
+                    ));
+                    (None, base_payload.map(|payload| (legacy.clone(), payload)))
+                };
+                let mut own_arms: Vec<(Vec<u8>, ArmPayload)> = legacy_arm.into_iter().collect();
+                for character in &made {
+                    if let Some(payload) = category_payload(character.edits, category, move_name)? {
+                        own_arms.push((character.slots.clone(), payload));
+                    }
+                }
+                let forks = base_edit.is_some() && !made_slots.is_empty();
+                if own_arms.is_empty() && !forks {
+                    if let Some(payload) = base_edit {
+                        push_payload(
+                            fighter,
+                            move_name,
+                            payload,
+                            &mut acmd_edits,
+                            &mut effect_edits,
+                            &mut effect_scripts,
+                            &mut sound_edits,
+                            &mut expression_edits,
+                        );
+                    }
+                    continue;
+                }
+
+                // One function ships under the registered name; it carries one edit itself
+                // (the base fighter's when there is one) and dispatches to the rest.
+                let base_is_primary = base_edit.is_some();
+                let mut arms: Vec<(Vec<u8>, GateBody)> = Vec::new();
+                let primary = match base_edit {
+                    Some(payload) => payload,
+                    None => {
+                        let (slots, payload) = own_arms.remove(0);
+                        arms.push((slots, GateBody::Primary));
+                        payload
+                    }
+                };
+                for (slots, payload) in own_arms {
+                    push_arm_payload(
+                        fighter,
+                        move_name,
+                        &payload,
+                        &mut arm_acmd,
+                        &mut arm_effects,
+                        &mut arm_effect_scripts,
+                        &mut arm_sounds,
+                        &mut arm_expressions,
+                    );
+                    arms.push((slots, GateBody::Edit(payload)));
+                }
+                if base_is_primary {
+                    // A base edit never reaches a made character's costumes: each one without a
+                    // version of its own runs the game's.
+                    let taken: Vec<u8> = arms.iter().flat_map(|(slots, _)| slots.clone()).collect();
+                    let vanilla: Vec<u8> = made_slots
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .filter(|slot| !taken.contains(slot))
+                        .collect();
+                    if !vanilla.is_empty() {
+                        arms.push((vanilla, GateBody::Game));
+                    }
+                }
+                let fallback = if base_is_primary {
+                    GateBody::Primary
+                } else {
+                    GateBody::Game
+                };
+                let needs_original = matches!(fallback, GateBody::Game)
+                    || arms.iter().any(|(_, body)| matches!(body, GateBody::Game));
+                let original = if needs_original {
+                    let Some(body) = original_body(fighter, move_name, base, &made, vanilla) else {
+                        bail!(
+                            "{fighter}'s {move_name} differs between {}, but the game's own version of it was not saved with the project. Exporting it now would remove {move_name} from the other costumes. Open the move in the editor once so its original is recorded, then export again.",
+                            characters_named(fighter, base_is_primary, &made, move_name, category, base)
+                        )
+                    };
+                    Some(matching_category_original(
+                        &body, fighter, move_name, category,
+                    )?)
+                } else {
+                    None
+                };
+                let key = if category == "game" {
+                    move_name.clone()
+                } else {
+                    format!("{category}:{move_name}")
+                };
+                slot_gates.insert(
+                    (fighter.clone(), key),
+                    GateArms {
+                        arms,
+                        fallback,
+                        original,
+                    },
+                );
+                push_payload(
+                    fighter,
+                    move_name,
+                    primary,
+                    &mut acmd_edits,
+                    &mut effect_edits,
+                    &mut effect_scripts,
+                    &mut sound_edits,
+                    &mut expression_edits,
+                );
             }
         }
-        for tweak in &edits.live_tweaks {
-            if !tweaks
-                .iter()
-                .any(|existing| existing.effect_name == tweak.effect_name)
-            {
-                tweaks.push(tweak.clone());
-            }
+    }
+    for list in [
+        &mut acmd_edits,
+        &mut effect_scripts,
+        &mut sound_edits,
+        &mut expression_edits,
+    ] {
+        list.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    }
+    effect_edits.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (fighter, move_name, _) in &effect_scripts {
+        if effect_edits
+            .iter()
+            .any(|(other, name, _, _)| other == fighter && name == move_name)
+        {
+            bail!("{fighter}/{move_name}: structured and legacy effect edits overlap; reimport the current move and Apply nodes to choose one source");
         }
     }
     if !incomplete.is_empty() {
@@ -649,7 +766,7 @@ fn render_ordinary_source(project: &ModProjectFile) -> Result<Option<GeneratedSo
             incomplete.join(", ")
         );
     }
-    if !effect_scripts.is_empty() && !tweaks.is_empty() {
+    if !(effect_scripts.is_empty() && arm_effect_scripts.is_empty()) && !tweaks.is_empty() {
         bail!("structured effect tracks cannot be combined with global live color/speed overrides; put color and rate commands in the Effect nodes and remove the global overrides before exporting");
     }
     let mut uncovered_tweaks: Vec<_> = tweaks
@@ -686,7 +803,13 @@ fn render_ordinary_source(project: &ModProjectFile) -> Result<Option<GeneratedSo
 
     // Nothing reaches disk until the generated code has been read back and matched against the
     // edits it came from. A mod that will not compile, or that ships numbers other than the
-    // ones on screen, is worse than an export that stops and says why.
+    // ones on screen, is worse than an export that stops and says why. Gate arms are checked
+    // with the lists: each must reach disk under its arm's name.
+    acmd_edits.extend(arm_acmd);
+    effect_edits.extend(arm_effects);
+    effect_scripts.extend(arm_effect_scripts);
+    sound_edits.extend(arm_sounds);
+    expression_edits.extend(arm_expressions);
     let mut report = crate::acmd_verify::verify_export_with_expression(
         &built,
         &acmd_edits,
@@ -705,12 +828,207 @@ fn render_ordinary_source(project: &ModProjectFile) -> Result<Option<GeneratedSo
     }
     let mut warnings = report.warning_summary();
     warnings.extend(capture_warnings);
+    warnings.extend(gate_warnings);
     warnings.sort();
     warnings.dedup();
     Ok(Some(GeneratedSource {
         project: built,
         warnings,
     }))
+}
+
+/// A made character's edits, with the costumes they run on.
+struct MadeEdits<'a> {
+    name: String,
+    slots: Vec<u8>,
+    edits: &'a FighterMod,
+}
+
+/// Effect moves whose saved source would need flattening beyond what the preview allows.
+fn check_effect_sources(fighter: &str, edits: &FighterMod) -> Result<()> {
+    let mut effect_moves: Vec<_> = edits.effect_calls_full.keys().collect();
+    effect_moves.sort();
+    for move_name in effect_moves {
+        if let Some(snapshot) = edits.move_sources.get(move_name) {
+            let original = crate::acmd::parse_effect_script(&snapshot.body);
+            if let Some(reason) = original.preview_budget_error() {
+                bail!("{fighter}/{move_name}: legacy Effect source cannot be flattened safely: {reason}. Retain the source or reduce its repeat expansion before exporting");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The moves one character changes in one category.
+fn category_moves<'a>(edits: &'a FighterMod, category: &str) -> Vec<&'a String> {
+    match category {
+        "game" => edits.acmd.keys().collect(),
+        "effect" => edits
+            .effect_calls_full
+            .keys()
+            .chain(edits.effect_scripts.keys())
+            .collect(),
+        // An empty script is intentional when the user removed every call; it must be emitted
+        // so the generated replacement silences the stock category. A missing map entry, not
+        // an empty script, means the category was never edited.
+        "sound" => edits.sound_scripts.keys().collect(),
+        "expression" => edits.expression_scripts.keys().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One character's edit of one move in one category, in the form the export lists carry.
+fn category_payload(
+    edits: &FighterMod,
+    category: &str,
+    move_name: &str,
+) -> Result<Option<crate::acmd::ArmPayload>> {
+    use crate::acmd::ArmPayload;
+    Ok(match category {
+        "game" => edits
+            .acmd
+            .get(move_name)
+            .map(|record| ArmPayload::Game(record.script.clone())),
+        "effect" => match (
+            edits.effect_calls_full.get(move_name),
+            edits.effect_scripts.get(move_name),
+        ) {
+            (Some(calls), None) => Some(ArmPayload::EffectCalls(
+                calls
+                    .iter()
+                    .cloned()
+                    .map(crate::data::EffectCall::normalized_timing)
+                    .collect(),
+                edits
+                    .effect_frame_residue
+                    .get(move_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            )),
+            (None, Some(script)) => {
+                if edits
+                    .effect_calls
+                    .get(move_name)
+                    .is_some_and(|calls| !calls.is_empty())
+                    || edits
+                        .effect_frame_residue
+                        .get(move_name)
+                        .is_some_and(|lines| !lines.is_empty())
+                {
+                    bail!("{move_name}: structured and legacy effect edits overlap; reimport the current move and Apply nodes to choose one source");
+                }
+                Some(ArmPayload::EffectScript(script.clone()))
+            }
+            (Some(_), Some(_)) => {
+                bail!("{move_name}: structured and legacy effect edits overlap; reimport the current move and Apply nodes to choose one source")
+            }
+            (None, None) => None,
+        },
+        "sound" => edits
+            .sound_scripts
+            .get(move_name)
+            .map(|script| ArmPayload::Sound(script.clone())),
+        "expression" => edits
+            .expression_scripts
+            .get(move_name)
+            .map(|script| ArmPayload::Expression(script.clone())),
+        _ => None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_payload(
+    fighter: &str,
+    move_name: &str,
+    payload: crate::acmd::ArmPayload,
+    acmd: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    effects: &mut Vec<crate::acmd::EffectExport>,
+    effect_scripts: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    sounds: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    expressions: &mut Vec<(String, String, crate::data::AcmdScript)>,
+) {
+    use crate::acmd::ArmPayload;
+    let (fighter, move_name) = (fighter.to_owned(), move_name.to_owned());
+    match payload {
+        ArmPayload::Game(script) => acmd.push((fighter, move_name, script)),
+        ArmPayload::EffectCalls(calls, residue) => {
+            effects.push((fighter, move_name, calls, residue))
+        }
+        ArmPayload::EffectScript(script) => effect_scripts.push((fighter, move_name, script)),
+        ArmPayload::Sound(script) => sounds.push((fighter, move_name, script)),
+        ArmPayload::Expression(script) => expressions.push((fighter, move_name, script)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_arm_payload(
+    fighter: &str,
+    move_name: &str,
+    payload: &crate::acmd::ArmPayload,
+    acmd: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    effects: &mut Vec<crate::acmd::EffectExport>,
+    effect_scripts: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    sounds: &mut Vec<(String, String, crate::data::AcmdScript)>,
+    expressions: &mut Vec<(String, String, crate::data::AcmdScript)>,
+) {
+    push_payload(
+        fighter,
+        move_name,
+        payload.clone(),
+        acmd,
+        effects,
+        effect_scripts,
+        sounds,
+        expressions,
+    );
+}
+
+/// The game's own source for a move: from any character's saved snapshot, else the local
+/// script cache. Never the network.
+fn original_body(
+    fighter: &str,
+    move_name: &str,
+    base: Option<&FighterMod>,
+    made: &[MadeEdits<'_>],
+    vanilla: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<String> {
+    base.into_iter()
+        .chain(made.iter().map(|character| character.edits))
+        .filter_map(|edits| edits.move_sources.get(move_name))
+        .map(|snapshot| snapshot.body.trim().to_owned())
+        .find(|body| !body.is_empty())
+        .or_else(|| vanilla(fighter, move_name).filter(|body| !body.is_empty()))
+}
+
+/// "Mario and Vision" — who has a version of the move, for an export refusal.
+fn characters_named(
+    fighter: &str,
+    base_is_primary: bool,
+    made: &[MadeEdits<'_>],
+    move_name: &str,
+    category: &str,
+    base: Option<&FighterMod>,
+) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if base_is_primary {
+        names.push(
+            base.map(|edits| edits.display.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| fighter.to_owned()),
+        );
+    }
+    for character in made {
+        if category_moves(character.edits, category)
+            .iter()
+            .any(|name| name.as_str() == move_name)
+        {
+            names.push(character.name.clone());
+        }
+    }
+    if names.len() < 2 {
+        names.push("its other costumes".into());
+    }
+    names.join(" and ")
 }
 
 fn format_slots(scopes: &[u8]) -> String {
@@ -2131,11 +2449,11 @@ unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n    // o
     /// Refusing, with a message that says what to do, is the only safe answer.
     #[test]
     fn a_costume_scoped_move_with_no_original_is_refused_rather_than_exported_wide() {
-        let message = match source_project(&project(Some(8), None)) {
+        let message = match without_cache(&project(Some(8), None)) {
             Ok(_) => panic!("a scoped move with no original must be refused"),
             Err(error) => error.to_string(),
         };
-        assert!(message.contains("every other costume"), "{message}");
+        assert!(message.contains("other costumes"), "{message}");
         assert!(message.contains("attack_11"), "{message}");
     }
 
@@ -2143,7 +2461,14 @@ unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n    // o
     /// from a move that never loaded its source actually contains.
     #[test]
     fn an_empty_stored_original_counts_as_missing() {
-        assert!(source_project(&project(Some(8), Some("   \n"))).is_err());
+        assert!(without_cache(&project(Some(8), Some("   \n"))).is_err());
+    }
+
+    /// The export with no local script cache to fall back on, as on a machine that never
+    /// fetched the move.
+    fn without_cache(project: &ModProjectFile) -> Result<Option<GeneratedSource>> {
+        let expanded = crate::move_nodes::project::expand(project).map_err(node_errors)?;
+        render_ordinary_source_with(&expanded, &|_, _| None)
     }
 
     #[test]
@@ -2325,5 +2650,474 @@ unsafe extern "C" fn effect_attackairn(agent: &mut L2CAgentBase) {
             ),
             "the follow effect's end must still close it:\n{acmd}"
         );
+    }
+}
+
+#[cfg(test)]
+mod made_character_export_tests {
+    //! A character made on Mario is its own character: its edits gate onto its costumes, Mario's
+    //! edits never reach them, and a project with no made characters exports as it always did.
+    use super::*;
+    use crate::data::EditRecord;
+    use crate::mod_project::{AuthoredEntry, FighterMod, MoveSourceSnapshot};
+    use crate::roster::RosterKey;
+
+    /// Mario's jab as the game ships it, lifted whole from the script cache
+    /// (`script-cache/mario/Attack11.txt`): all four categories.
+    const MARIO_ATTACK11: &str = r##"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 2.2, 361, 30, 0, 20, 1.2, 0.0, 6.3, 6.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 1, 0, Hash40::new("top"), 2.2, 361, 30, 0, 20, 1.5, 0.0, 6.3, 8.7, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 2, 0, Hash40::new("top"), 2.2, 180, 20, 0, 15, 1.8, 0.0, 6.3, 12.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_FIGHTER, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+        macros::ATTACK(agent, 3, 0, Hash40::new("top"), 2.2, 361, 20, 0, 15, 1.8, 0.0, 6.3, 12.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO);
+    }
+    frame(agent.lua_state_agent, 7.0);
+    if macros::is_excute(agent) {
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_RESTART);
+    }
+}
+
+unsafe extern "C" fn effect_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLIP(agent, Hash40::new("sys_attack_line"), Hash40::new("sys_attack_line"), Hash40::new("top"), -4, 6.2, 0, 0, 0, 0, 0.95, 0, 1, 0, 0, 0, 0, false, *EF_FLIP_YZ);
+    }
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_impact"), Hash40::new("top"), 12.8, 6.2, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 360, false);
+        macros::LAST_EFFECT_SET_ALPHA(agent, 0.7);
+    }
+}
+
+unsafe extern "C" fn sound_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_common_punch_kick_swing_s"));
+    }
+}
+
+unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        AttackModule::set_attack_reference_joint_id(agent.module_accessor, Hash40::new("top"), AttackDirectionAxis(*ATTACK_DIRECTION_Z), AttackDirectionAxis(*ATTACK_DIRECTION_NONE), AttackDirectionAxis(*ATTACK_DIRECTION_NONE));
+        ItemModule::set_have_item_visibility(agent.module_accessor, false, 0);
+        slope!(agent, *MA_MSC_CMD_SLOPE_SLOPE, *SLOPE_STATUS_LR);
+    }
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_nohits"), 4, false, *BATTLE_OBJECT_ID_INVALID as u32);
+    }
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::RUMBLE_HIT(agent, Hash40::new("rbkind_attacks"), 0);
+    }
+}"##;
+
+    fn made(slot: u8, slots: std::ops::RangeInclusive<u8>, name: &str) -> AuthoredEntry {
+        let all: Vec<u8> = slots.collect();
+        AuthoredEntry {
+            key: RosterKey::slot("mario", slot),
+            donor: "mario".into(),
+            slot: all[0],
+            slots: all[1..].to_vec(),
+            display_name: name.into(),
+            name_id: name.to_ascii_lowercase(),
+            moveset_scaffolded: false,
+            files_root: None,
+        }
+    }
+
+    /// The game's jab with its first hit's damage changed, the way an edit changes it.
+    fn jab(damage: &str) -> crate::data::AcmdScript {
+        let edited = MARIO_ATTACK11.replacen("2.2, 361, 30", &format!("{damage}, 361, 30"), 1);
+        assert_ne!(
+            edited, MARIO_ATTACK11,
+            "the fixture must contain the first hit"
+        );
+        crate::acmd::parse_acmd_script(&edited)
+    }
+
+    fn record(script: crate::data::AcmdScript) -> EditRecord {
+        EditRecord {
+            fighter: "mario".into(),
+            fighter_display: "Mario".into(),
+            move_name: "attack_11".into(),
+            hitboxes: script.to_hitboxes(),
+            script,
+            hitboxes_pristine: Vec::new(),
+            slot_scope: None,
+            slot_scopes: Vec::new(),
+        }
+    }
+
+    fn with_source(mut edits: FighterMod) -> FighterMod {
+        edits.move_sources.insert(
+            "attack_11".into(),
+            MoveSourceSnapshot {
+                body: MARIO_ATTACK11.into(),
+                captures: Vec::new(),
+            },
+        );
+        edits
+    }
+
+    fn game_edit(damage: &str) -> FighterMod {
+        with_source(FighterMod {
+            display: "Mario".into(),
+            acmd: HashMap::from([("attack_11".to_string(), record(jab(damage)))]),
+            ..Default::default()
+        })
+    }
+
+    fn project() -> ModProjectFile {
+        ModProjectFile {
+            name: "made_characters".into(),
+            ..Default::default()
+        }
+    }
+
+    fn export(project: &ModProjectFile) -> GeneratedSource {
+        let expanded = crate::move_nodes::project::expand(project).expect("expands");
+        render_ordinary_source_with(&expanded, &|_, _| None)
+            .expect("exports")
+            .expect("has source")
+    }
+
+    fn acmd(source: &GeneratedSource) -> String {
+        let text = source
+            .project
+            .files
+            .iter()
+            .find(|file| file.rel_path == "src/mario/acmd.rs")
+            .expect("mario's acmd.rs")
+            .contents
+            .clone();
+        // Every gated file must still be Rust, with each move registered once.
+        syn::parse_file(&text).unwrap_or_else(|error| panic!("{error}\n{text}"));
+        text
+    }
+
+    /// The text of one generated function, by name.
+    fn function<'a>(text: &'a str, name: &str) -> &'a str {
+        let start = text
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("no fn {name}:\n{text}"));
+        let rest = &text[start..];
+        &rest[..rest.find("\n}\n").map_or(rest.len(), |end| end + 3)]
+    }
+
+    fn registered_once(text: &str, name: &str) {
+        assert_eq!(
+            text.matches(&format!("agent.acmd(\"{name}\", {name}, "))
+                .count(),
+            1,
+            "{name} must be registered exactly once:\n{text}"
+        );
+    }
+
+    #[test]
+    fn base_and_made_edits_give_an_arm_each_with_the_base_edit_for_every_other_costume() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), game_edit("14.0"));
+        let text = acmd(&export(&project));
+        assert!(function(&text, "game_attack11_c08_costume").contains("14.0, 361, 30"));
+        assert!(function(&text, "game_attack11_costume").contains("9.0, 361, 30"));
+        let dispatcher = function(&text, "game_attack11");
+        assert!(
+            dispatcher.contains("if color == 8 || color == 9"),
+            "{dispatcher}"
+        );
+        assert!(dispatcher.contains("color == 15 {\n        game_attack11_c08_costume(agent);\n    } else {\n        game_attack11_costume(agent);"), "{dispatcher}");
+        assert!(
+            !text.contains("_original"),
+            "nobody runs the game's jab:\n{text}"
+        );
+        registered_once(&text, "game_attack11");
+    }
+
+    #[test]
+    fn a_made_characters_edit_alone_runs_the_game_version_on_every_other_costume() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), game_edit("14.0"));
+        let text = acmd(&export(&project));
+        assert!(function(&text, "game_attack11_costume").contains("14.0, 361, 30"));
+        assert!(function(&text, "game_attack11_original").contains("2.2, 361, 30"));
+        assert!(function(&text, "game_attack11")
+            .contains("} else {\n        game_attack11_original(agent);"));
+        registered_once(&text, "game_attack11");
+    }
+
+    /// Two characters made on Mario and Mario himself: one dispatcher, three versions.
+    #[test]
+    fn two_made_characters_and_the_base_edit_give_three_arms() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.roster.authored.push(made(16, 16..=17, "Luna"));
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), game_edit("14.0"));
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 16), game_edit("6.5"));
+        let text = acmd(&export(&project));
+        assert!(function(&text, "game_attack11_c08_costume").contains("14.0, 361, 30"));
+        assert!(function(&text, "game_attack11_c16_costume").contains("6.5, 361, 30"));
+        assert!(function(&text, "game_attack11_costume").contains("9.0, 361, 30"));
+        let dispatcher = function(&text, "game_attack11");
+        assert!(
+            dispatcher.contains(
+                "} else if color == 16 || color == 17 {\n        game_attack11_c16_costume(agent);"
+            ),
+            "{dispatcher}"
+        );
+        registered_once(&text, "game_attack11");
+        // Each arm is called, so nothing generated is dead.
+        for arm in [
+            "game_attack11_c08_costume",
+            "game_attack11_c16_costume",
+            "game_attack11_costume",
+        ] {
+            assert!(
+                text.contains(&format!("{arm}(agent);")),
+                "{arm} is never called"
+            );
+        }
+    }
+
+    /// Fork: Mario's edit never reaches a character made on him, even one with no edits.
+    #[test]
+    fn a_base_edit_does_not_reach_a_made_characters_costumes() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let text = acmd(&export(&project));
+        let dispatcher = function(&text, "game_attack11");
+        assert!(dispatcher.contains("color == 15 {\n        game_attack11_original(agent);\n    } else {\n        game_attack11_costume(agent);"), "{dispatcher}");
+        assert!(function(&text, "game_attack11_original").contains("2.2, 361, 30"));
+        registered_once(&text, "game_attack11");
+    }
+
+    /// The paired positive: with no character made on Mario, his edit ships plainly.
+    #[test]
+    fn a_base_edit_with_no_made_characters_ships_ungated() {
+        let mut project = project();
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let text = acmd(&export(&project));
+        assert!(
+            !text.contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR"),
+            "{text}"
+        );
+        assert!(function(&text, "game_attack11").contains("9.0, 361, 30"));
+    }
+
+    /// A sound-only edit on a made character is gated on its own: no game edit is needed.
+    #[test]
+    fn a_made_characters_sound_only_edit_is_gated() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        let sound = crate::acmd::parse_sound_script(&MARIO_ATTACK11.replace(
+            "se_common_punch_kick_swing_s",
+            "se_common_punch_kick_swing_l",
+        ));
+        project.characters.insert(
+            RosterKey::slot("mario", 8),
+            with_source(FighterMod {
+                sound_scripts: HashMap::from([("attack_11".to_string(), sound)]),
+                ..Default::default()
+            }),
+        );
+        let text = acmd(&export(&project));
+        assert!(function(&text, "sound_attack11_costume").contains("swing_l"));
+        assert!(function(&text, "sound_attack11_original").contains("swing_s"));
+        registered_once(&text, "sound_attack11");
+        assert!(
+            !text.contains("fn game_attack11"),
+            "the game script is untouched:\n{text}"
+        );
+    }
+
+    /// A move edited only as nodes on a made character is its edit, gated like any other.
+    #[test]
+    fn a_made_characters_graph_only_edit_is_gated() {
+        use crate::move_nodes::model::{MoveGraph, Track};
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        let graph = MoveGraph {
+            tracks: vec![crate::move_nodes::timeline::import_for_fighter(
+                "mario",
+                Track::Game,
+                &jab("14.0"),
+            )],
+            ..MoveGraph::default()
+        };
+        project.characters.insert(
+            RosterKey::slot("mario", 8),
+            with_source(FighterMod {
+                move_graphs: std::collections::BTreeMap::from([("attack_11".to_string(), graph)]),
+                ..Default::default()
+            }),
+        );
+        let text = acmd(&export(&project));
+        assert!(
+            function(&text, "game_attack11_costume").contains("14.0"),
+            "{text}"
+        );
+        assert!(function(&text, "game_attack11").contains("game_attack11_original(agent);"));
+        registered_once(&text, "game_attack11");
+    }
+
+    #[test]
+    fn edits_of_a_character_no_longer_in_the_project_are_refused() {
+        let mut project = project();
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), game_edit("14.0"));
+        let expanded = crate::move_nodes::project::expand(&project).unwrap();
+        let error = render_ordinary_source_with(&expanded, &|_, _| None)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("mario#c08"), "{error}");
+    }
+
+    /// Without the game's version the made character's other costumes would lose the move.
+    #[test]
+    fn a_made_characters_edit_without_the_game_version_is_refused() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        let mut edits = game_edit("14.0");
+        edits.move_sources.clear();
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), edits);
+        let expanded = crate::move_nodes::project::expand(&project).unwrap();
+        let error = render_ordinary_source_with(&expanded, &|_, _| None)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("other costumes"), "{error}");
+        // The paired positive: the same project exports once the game's version is known.
+        render_ordinary_source_with(&expanded, &|fighter, name| {
+            (fighter == "mario" && name == "attack_11").then(|| MARIO_ATTACK11.to_string())
+        })
+        .expect("exports with the game's version")
+        .expect("has source");
+    }
+
+    /// Legacy records scoped to exactly a made character's costumes move into that character;
+    /// any other scope stays where it is, still gated, and is reported on load and on export.
+    #[test]
+    fn scoped_records_migrate_into_the_character_whose_costumes_they_match() {
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        let mut mario = game_edit("14.0");
+        let scoped = mario.acmd.get_mut("attack_11").unwrap();
+        scoped.slot_scope = Some(8);
+        scoped.slot_scopes = (9..=15).collect();
+        mario.sound_scripts.insert(
+            "attack_11".into(),
+            crate::acmd::parse_sound_script(MARIO_ATTACK11),
+        );
+        let mut partial = record(jab("3.0"));
+        partial.move_name = "attack_12".into();
+        partial.slot_scope = Some(8);
+        partial.slot_scopes = vec![9];
+        mario.acmd.insert("attack_12".into(), partial);
+        mario.move_sources.insert(
+            "attack_12".into(),
+            MoveSourceSnapshot {
+                body: MARIO_ATTACK11.replace("attack11", "attack12"),
+                captures: Vec::new(),
+            },
+        );
+        project.fighters.insert("mario".into(), mario);
+
+        let findings = project.migrate_scoped_records();
+        let vision = &project.characters[&RosterKey::slot("mario", 8)];
+        let moved = &vision.acmd["attack_11"];
+        assert!(
+            moved.effective_scopes().is_empty(),
+            "moved records are the character's own"
+        );
+        assert!(
+            vision.sound_scripts.contains_key("attack_11"),
+            "its gated sound went with it"
+        );
+        assert!(!project.fighters["mario"].acmd.contains_key("attack_11"));
+        assert!(!project.fighters["mario"]
+            .sound_scripts
+            .contains_key("attack_11"));
+        // The partial overlap stays, scoped, and is reported.
+        assert_eq!(
+            project.fighters["mario"].acmd["attack_12"].effective_scopes(),
+            vec![8, 9]
+        );
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("attack_12"), "{findings:?}");
+
+        let source = export(&project);
+        assert!(
+            source
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attack_12")),
+            "{:?}",
+            source.warnings
+        );
+        let text = acmd(&source);
+        assert!(function(&text, "game_attack11_costume").contains("14.0"));
+        assert!(function(&text, "game_attack12").contains("color == 8 || color == 9 {"));
+    }
+
+    /// A project with no made characters saves as it always did: no `characters` field, and
+    /// its export is exactly what the edit lists give the generator with no gates at all.
+    #[test]
+    fn a_project_without_made_characters_saves_and_exports_unchanged() {
+        let mut project = project();
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let sound = crate::acmd::parse_sound_script(MARIO_ATTACK11);
+        project
+            .fighters
+            .get_mut("mario")
+            .unwrap()
+            .sound_scripts
+            .insert("attack_11".into(), sound.clone());
+        let json = serde_json::to_string_pretty(&project).unwrap();
+        assert!(!json.contains("\"characters\""), "{json}");
+        let reloaded: ModProjectFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string_pretty(&reloaded).unwrap(), json);
+
+        let rendered = export(&project);
+        let plain = crate::acmd::build_mod_project_with_effect_structures(
+            &[("mario".into(), "attack_11".into(), jab("9.0"))],
+            &[],
+            &[],
+            &[("mario".into(), "attack_11".into(), sound)],
+            &[],
+            &[],
+            &plugin_name(&project),
+            &crate::acmd::SlotGates::new(),
+        );
+        let files = |project: &crate::acmd::ModProject| {
+            project
+                .files
+                .iter()
+                .map(|file| (file.rel_path.clone(), file.contents.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(files(&rendered.project), files(&plain));
     }
 }

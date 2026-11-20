@@ -3,7 +3,7 @@ use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
@@ -1738,21 +1738,6 @@ fn wind_area_world_point(root: glam::Mat4, horizontal: f32, vertical: f32) -> gl
 }
 
 /// Every fighter as a picker choice, in roster order.
-fn fighter_picks(fighters: &[crate::data::FighterEntry]) -> Vec<crate::ui::Pick> {
-    fighters
-        .iter()
-        .map(|fighter| crate::ui::Pick {
-            label: if fighter.is_modded() {
-                format!("{}  [mod]", fighter.display_name)
-            } else {
-                fighter.display_name.clone()
-            },
-            hover: fighter.name.clone(),
-            group: None,
-        })
-        .collect()
-}
-
 /// Moves in the order players think of them: neutral, forward/side, back, up, down, then the rest.
 fn move_list_order(name: &str) -> (u8, String) {
     let rank = match name.split(' ').next().unwrap_or("") {
@@ -2772,8 +2757,52 @@ fn fighter_kind_id(name: &str) -> Option<i32> {
 
 /// True when a persisted per-move key belongs to one fighter. Rule-store keys append a family
 /// suffix after the move name, so matching only the first path component also covers those keys.
+/// The edits store for `owner` in a project being built: a made character's under its own key,
+/// a base fighter's under its name. A made character no longer in the project has nowhere to go
+/// and gets `None` (removing a character drops its edits anyway).
+fn project_owner_mod<'a>(
+    project: &'a mut crate::mod_project::ModProjectFile,
+    roster: &crate::mod_project::RosterMod,
+    owner: &str,
+) -> Option<&'a mut crate::mod_project::FighterMod> {
+    let character = crate::character::CharacterKey::parse(owner);
+    if character.is_made() {
+        character.authored(roster)?;
+        Some(
+            project
+                .characters
+                .entry(character.roster_key().clone())
+                .or_default(),
+        )
+    } else {
+        Some(project.fighters.entry(owner.to_string()).or_default())
+    }
+}
+
+/// Where Move nodes' Back goes: the page it was opened from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodesReturn {
+    Project,
+    Page(crate::character::CharacterPage),
+}
+
+/// A live rule-store key without its family suffix: `"mario#c08/attack_11#hurt"` →
+/// `"mario#c08/attack_11"`. The character part may carry a `#` of its own, so the suffix is the
+/// one after the move.
+fn rule_move_key(key: &str) -> String {
+    match crate::character::split_move_key(key) {
+        Some((owner, rest)) => {
+            let move_name = rest.split('#').next().unwrap_or(rest);
+            format!("{owner}/{move_name}")
+        }
+        None => key.to_owned(),
+    }
+}
+
+/// A made character's keys never match its donor: forgetting a fighter keeps the characters made
+/// on it.
 fn fighter_key_matches(key: &str, fighter: &str) -> bool {
-    key.split_once('/')
+    crate::character::split_move_key(key)
         .is_some_and(|(owner, _)| owner.eq_ignore_ascii_case(fighter))
 }
 
@@ -3606,6 +3635,15 @@ pub struct VisionaryApp {
     gimmicks_editor: crate::gimmicks::editor::GimmicksEditor,
     node_editor: crate::move_nodes::view::NodeEditor,
     node_workspace: bool,
+    /// The character being edited: a base fighter or a character made in Visionary. Its engine
+    /// fighter is the selected fighter; every per-move store is keyed by it. `None` (or a key
+    /// for another fighter) means the selected fighter itself.
+    active_character: Option<crate::character::CharacterKey>,
+    /// The made characters the project had last frame, to notice one being created (it starts
+    /// as a copy of its donor) or removed (its edits go with it). `None` until first seen.
+    known_made: Option<BTreeMap<crate::roster::RosterKey, Vec<u8>>>,
+    /// Where Move nodes' Back returns to.
+    nodes_back: Option<NodesReturn>,
     node_preview: bool,
     move_graphs: BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     node_effect_scripts: HashMap<String, crate::data::AcmdScript>,
@@ -4098,6 +4136,9 @@ impl VisionaryApp {
             gimmicks_editor: crate::gimmicks::editor::GimmicksEditor::default(),
             node_editor: Default::default(),
             node_workspace: false,
+            active_character: None,
+            known_made: None,
+            nodes_back: None,
             node_preview: true,
             move_graphs: Default::default(),
             node_effect_scripts: Default::default(),
@@ -5025,12 +5066,14 @@ impl VisionaryApp {
     /// temporarily uses selection-dependent rule builders; it must never leave one of those
     /// temporary selections highlighted in the sidebar without loading its model or scripts.
     fn restore_project_editor_selection(&mut self, target: Option<(String, String)>) {
-        let Some((fighter_name, move_name)) = target else {
+        let Some((owner, move_name)) = target else {
             self.state.selected_fighter = None;
             self.state.selected_move = None;
             clear_move_state(&mut self.state);
             return;
         };
+        let owner = crate::character::CharacterKey::parse(&owner);
+        let fighter_name = owner.engine_fighter().to_owned();
         let Some(fighter_index) = self
             .state
             .fighters
@@ -5043,6 +5086,10 @@ impl VisionaryApp {
             return;
         };
 
+        self.active_character = (owner.is_made()
+            && owner.authored(&self.roster.project).is_some()
+            && self.acmd_src.is_none())
+        .then_some(owner);
         self.select_fighter(fighter_index);
         self.pending_project_move_selection = Some((fighter_name, move_name));
     }
@@ -5063,7 +5110,7 @@ impl VisionaryApp {
             .map(|fighter| fighter.name.clone());
         if let Some(fighter_name) = fighter_name {
             self.refresh_linked_acmd_source_index();
-            let key = Self::move_key(&fighter_name, &move_entry.name);
+            let key = Self::move_key(&self.owner_spelling(&fighter_name), &move_entry.name);
             if let Some(saved) = self.move_source_cache.get(&key).cloned() {
                 if let Some((body, _)) = self.warm_source_body(&fighter_name, &move_entry.name) {
                     if body != saved.body {
@@ -5145,7 +5192,7 @@ impl VisionaryApp {
         clear_move_state(&mut self.state);
         self.acmd_error = None;
         // Path was resolved at move list build time — no disk scan needed
-        self.current_anim_path = move_entry.anim_path.clone();
+        self.current_anim_path = self.costume_anim_path(move_entry.anim_path.clone());
         self.state.selected_move = Some(move_entry);
         if let (Some(key), Some(snapshot)) = (self.current_move_key(), snapshot.as_ref()) {
             // Store even an empty-body capture snapshot before choosing the body/capture load
@@ -5297,7 +5344,7 @@ impl VisionaryApp {
         body: String,
         source_label: &str,
     ) {
-        let key = Self::move_key(fighter, move_name);
+        let key = Self::move_key(&self.owner_spelling(fighter), move_name);
         if let Some(saved) = self.move_source_cache.get(&key).cloned() {
             if saved.body != body {
                 let Some(move_entry) = self
@@ -6275,7 +6322,7 @@ impl VisionaryApp {
         // source-only changes are never silently overwritten by a panel sync.
         let source_snapshot_changed = self
             .move_source_cache
-            .get(&Self::move_key(&fighter, &move_name))
+            .get(&Self::move_key(&self.owner_spelling(&fighter), &move_name))
             .and_then(|saved| {
                 self.source_body_for_sync(&fighter, &move_name)
                     .map(|(body, _)| (saved, body))
@@ -6920,9 +6967,8 @@ impl VisionaryApp {
                 // loads deliberately retain a saved note, allowing an exported project to
                 // preserve the provenance it was created from.
                 if matches!(source_label, "GitHub" | "Current source") {
-                    self.state
-                        .capture_branch_warnings
-                        .remove(&format!("{fighter_name}/{move_name}"));
+                    let key = Self::move_key(&self.owner_spelling(fighter_name), move_name);
+                    self.state.capture_branch_warnings.remove(&key);
                 }
                 let script = crate::acmd::parse_acmd_script(&body);
                 let effect_script = crate::acmd::parse_effect_script(&body);
@@ -7135,8 +7181,8 @@ impl VisionaryApp {
                     .or_else(|| self.state.labels.get(&row.motion).cloned());
                 let cached_source = fighter.and_then(|fighter| {
                     self.move_source_cache.keys().find_map(|key| {
-                        let (owner, motion_name) = key.split_once('/')?;
-                        (owner.eq_ignore_ascii_case(fighter)
+                        let (owner, motion_name) = crate::character::parse_move_key(key)?;
+                        (owner.engine_fighter().eq_ignore_ascii_case(fighter)
                             && hash40::hash40(&motion_name.to_ascii_lowercase()).0 == row.motion)
                             .then(|| motion_name.to_string())
                     })
@@ -7657,7 +7703,9 @@ impl VisionaryApp {
             if !has_delta && !has_complete_list {
                 continue;
             }
-            let fighter = key.split_once('/').map(|(f, _)| f).unwrap_or(key.as_str());
+            let fighter = crate::character::split_move_key(key)
+                .map(|(f, _)| f)
+                .unwrap_or(key.as_str());
             fighters
                 .entry(fighter.to_string())
                 .or_insert_with(|| crate::data::fighter_display_name(fighter));
@@ -7668,7 +7716,9 @@ impl VisionaryApp {
             .keys()
             .chain(self.state.expression_script_edits.keys())
         {
-            let fighter = key.split_once('/').map(|(f, _)| f).unwrap_or(key.as_str());
+            let fighter = crate::character::split_move_key(key)
+                .map(|(f, _)| f)
+                .unwrap_or(key.as_str());
             fighters
                 .entry(fighter.to_string())
                 .or_insert_with(|| crate::data::fighter_display_name(fighter));
@@ -7702,6 +7752,14 @@ impl VisionaryApp {
                 fighters
                     .entry(fighter.clone())
                     .or_insert_with(|| crate::data::fighter_display_name(fighter));
+            }
+        }
+
+        // A made character's edits are its own group, under its own name.
+        for (key, display) in fighters.iter_mut() {
+            let character = crate::character::CharacterKey::parse(key);
+            if character.is_made() {
+                *display = self.character_name(&character);
             }
         }
 
@@ -7943,7 +8001,7 @@ impl VisionaryApp {
                         .iter()
                         .filter(|(k, v)| {
                             !v.is_empty()
-                                && k.split_once('/')
+                                && crate::character::split_move_key(k)
                                     .map(|(f, _)| f == fighter_name)
                                     .unwrap_or(false)
                         })
@@ -7957,8 +8015,7 @@ impl VisionaryApp {
                                         .effect_call_full
                                         .get(*key)
                                         .is_some_and(|calls| !calls.is_empty())
-                                        && key
-                                            .split_once('/')
+                                        && crate::character::split_move_key(key)
                                             .is_some_and(|(fighter, _)| fighter == fighter_name)
                                 })
                                 .cloned(),
@@ -7969,8 +8026,7 @@ impl VisionaryApp {
                             .iter()
                             .filter(|(key, script)| {
                                 !script.stmts.is_empty()
-                                    && key
-                                        .split_once('/')
+                                    && crate::character::split_move_key(key)
                                         .is_some_and(|(fighter, _)| fighter == fighter_name)
                             })
                             .map(|(key, _)| key.clone())
@@ -8075,7 +8131,7 @@ impl VisionaryApp {
                         if !call_keys.is_empty() {
                             ui.label(egui::RichText::new("Effect spawns").small().strong());
                             for key in &call_keys {
-                                let mv = key.split_once('/').map(|(_, m)| m).unwrap_or(key);
+                                let mv = crate::character::split_move_key(key).map(|(_, m)| m).unwrap_or(key);
                                 let edits = self
                                     .state
                                     .effect_call_edits
@@ -8134,7 +8190,7 @@ impl VisionaryApp {
                         if !sound_keys.is_empty() {
                             ui.label(egui::RichText::new("Sounds").small().strong());
                             for key in &sound_keys {
-                                let move_name = key.split_once('/').map(|(_, m)| m).unwrap_or(key);
+                                let move_name = crate::character::split_move_key(key).map(|(_, m)| m).unwrap_or(key);
                                 let count = self.state.sound_script_edits[key].to_sound_events().len();
                                 ui.horizontal(|ui| {
                                     ui.add_space(12.0);
@@ -8161,7 +8217,7 @@ impl VisionaryApp {
                         if !expression_keys.is_empty() {
                             ui.label(egui::RichText::new("Expression").small().strong());
                             for key in &expression_keys {
-                                let move_name = key.split_once('/').map(|(_, m)| m).unwrap_or(key);
+                                let move_name = crate::character::split_move_key(key).map(|(_, m)| m).unwrap_or(key);
                                 let count = self.state.expression_script_edits[key]
                                     .to_expression_events()
                                     .len();
@@ -8247,17 +8303,24 @@ impl VisionaryApp {
                     });
                     ui.add_space(2.0);
 
-                    // Fighter-wide discard (hitbox log only keeps its own remove API)
-                    if move_names.len() > 1 {
+                    // Fighter-wide discard (hitbox log only keeps its own remove API). A made
+                    // character's discard takes every edit it owns.
+                    let made_group = crate::character::CharacterKey::parse(fighter_name).is_made();
+                    if move_names.len() > 1 || made_group {
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
-                            if ui
-                                .small_button(format!("↶ Restore all {fighter_display} hitboxes"))
-                                .on_hover_text(
+                            let (label, hover) = if made_group {
+                                (
+                                    format!("↶ Restore all {fighter_display}'s moves"),
+                                    "Discard every move edit this character owns",
+                                )
+                            } else {
+                                (
+                                    format!("↶ Restore all {fighter_display} hitboxes"),
                                     "Discard every hitbox edit for this fighter and restore source data",
                                 )
-                                .clicked()
-                            {
+                            };
+                            if ui.small_button(label).on_hover_text(hover).clicked() {
                                 remove_fighter = Some(fighter_name.clone());
                             }
                         });
@@ -8313,9 +8376,24 @@ impl VisionaryApp {
             }
             let all: Vec<_> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
-            self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
+            let name = self.character_name(&crate::character::CharacterKey::parse(&f));
+            self.state.status = format!(
+                "Restored {name}'s {} hitboxes to the source data.",
+                format_move_name(&m)
+            );
         }
-        if let Some(f) = remove_fighter {
+        if let Some(f) = remove_fighter
+            .as_ref()
+            .filter(|f| crate::character::CharacterKey::parse(f).is_made())
+        {
+            // A made character's group holds every edit it owns; restoring it drops them all.
+            let character = crate::character::CharacterKey::parse(f);
+            self.remove_character_edits(&character);
+            self.state.status = format!(
+                "Restored {}'s moves to the game's.",
+                self.character_name(&character)
+            );
+        } else if let Some(f) = remove_fighter {
             let active_key = self.current_move_key();
             let active_is_removed = active_key
                 .as_deref()
@@ -8333,7 +8411,8 @@ impl VisionaryApp {
             }
             let all: Vec<_> = self.live_hitbox_rule_union();
             self.game_link.send_hitbox_rules(&all);
-            self.state.status = format!("Restored all {f} hitboxes to their source data.");
+            let name = self.character_name(&crate::character::CharacterKey::parse(&f));
+            self.state.status = format!("Restored all {name}'s hitboxes to their source data.");
         }
         if let Some(key) = remove_call_key {
             self.state.effect_call_edits.remove(&key);
@@ -8468,6 +8547,9 @@ impl VisionaryApp {
             Some(f) => f.clone(),
             None => return,
         };
+        let Some(owner) = self.active_key() else {
+            return;
+        };
         let move_name = match &self.state.selected_move {
             Some(m) => m.name.clone(),
             None => return,
@@ -8479,7 +8561,7 @@ impl VisionaryApp {
             .state
             .edit_log
             .entries
-            .get(&fighter.name)
+            .get(owner.as_str())
             .map(|m| m.contains_key(&move_name))
             .unwrap_or(false);
         let hurtbox_states_edited = self.state.script.to_hurtboxes()
@@ -8496,28 +8578,26 @@ impl VisionaryApp {
         // Capture-sourced moves have no base script text — synthesize one from the hitboxes
         // so the export path works the same as for GitHub-fetched scripts.
         let script = game_script_for_edits(&self.state.script, &self.state.hitboxes);
-        // When the Roster window has a character you added set as the edit target, this move
-        // belongs to that costume rather than to the fighter as a whole. The export then gates
-        // it, so the donor's other costumes keep their own version of the move. A multi-skin
-        // character scopes to every slot it owns, so one moveset covers c08–c15.
-        let slot_scopes = self.roster.slot_scopes_for(&fighter.name);
-        self.state.edit_log.save_scoped_multi(
+        // The edit belongs to the character being edited. A made character's edits live under
+        // its own key, so the export gives its costumes their own version of the move; saving
+        // never changes which costumes an existing record covers.
+        self.state.edit_log.save(
+            owner.as_str(),
             &fighter.name,
             &fighter.display_name,
             &move_name,
             script,
             self.state.hitboxes_pristine.clone(),
             self.state.hitboxes.clone(),
-            &slot_scopes,
         );
     }
 
     /// When the user explicitly chooses a newer source body, keep the edited payload but make
     /// the newly parsed collision list the baseline exported with the next project save.
     fn rebase_current_edit_record(&mut self) {
-        let Some((fighter, move_name)) = self.current_move_key().and_then(|key| {
-            key.split_once('/')
-                .map(|(fighter, move_name)| (fighter.to_string(), move_name.to_string()))
+        let Some((owner, move_name)) = self.current_move_key().and_then(|key| {
+            crate::character::parse_move_key(&key)
+                .map(|(owner, move_name)| (owner, move_name.to_string()))
         }) else {
             return;
         };
@@ -8525,7 +8605,7 @@ impl VisionaryApp {
             .state
             .edit_log
             .entries
-            .get_mut(&fighter)
+            .get_mut(owner.as_str())
             .and_then(|moves| moves.get_mut(&move_name))
         {
             record.hitboxes_pristine = self.state.hitboxes_pristine.clone();
@@ -8537,7 +8617,7 @@ impl VisionaryApp {
         if let Some(edits) = self
             .state
             .effect_call_edits
-            .get_mut(&Self::move_key(&fighter, &move_name))
+            .get_mut(&crate::character::move_key(&owner, &move_name))
         {
             for edit in edits {
                 edit.pristine = match &edit.op {
@@ -8625,8 +8705,23 @@ impl VisionaryApp {
                 if fighters.is_empty() {
                     ui.weak("No matching fighters");
                 }
-                for (i, fighter_name, name, modded, slot_count, base) in fighters {
-                    let selected = self.state.selected_fighter == Some(i);
+                let active = self.active_key();
+                let mut pick_character: Option<crate::character::CharacterKey> = None;
+                let mut open_on: Option<(
+                    crate::character::CharacterKey,
+                    crate::character::CharacterPage,
+                )> = None;
+                for (i, fighter_name, name, modded, _, base) in fighters {
+                    let base_key = crate::character::CharacterKey::base(&fighter_name);
+                    let selected = self.state.selected_fighter == Some(i)
+                        && active.as_ref() == Some(&base_key);
+                    // A donor lists only its own costumes; its made characters have theirs.
+                    let slot_count = crate::character::base_costumes(
+                        &fighter_name,
+                        &self.state.fighters[i].slots,
+                        &self.roster.project,
+                    )
+                    .len();
                     let mut label = name.clone();
                     if modded {
                         label.push_str("  [mod]");
@@ -8659,8 +8754,52 @@ impl VisionaryApp {
                         }
                     });
                     if clicked && !selected {
-                        { let t = self.perf.start(); self.select_fighter(i); self.perf.end("select_fighter", t); }
+                        pick_character = Some(base_key);
                     }
+                    // Characters made on this fighter, under it, each with its own costumes.
+                    let made: Vec<(crate::character::CharacterKey, String)> =
+                        crate::character::made_on(&fighter_name, &self.roster.project)
+                            .map(|entry| {
+                                let key = crate::character::CharacterKey::made(entry.key.clone());
+                                let range = key.costume_range(&self.roster.project).unwrap_or_default();
+                                (key, range)
+                            })
+                            .collect();
+                    for (key, range) in made {
+                        let selected = self.state.selected_fighter == Some(i)
+                            && active.as_ref() == Some(&key);
+                        let label = format!("    {}", self.character_name(&key));
+                        let counts = self.character_edit_counts(&key);
+                        let mut hover = format!("{name} {range}");
+                        if !counts.is_empty() {
+                            hover.push_str(&format!(
+                                "\n{} moves edited, {} with nodes",
+                                counts.game_moves, counts.node_graphs
+                            ));
+                        }
+                        let response = ui.selectable_label(selected, label).on_hover_text(hover);
+                        if response.clicked() && !selected {
+                            pick_character = Some(key.clone());
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Edit as nodes").clicked() {
+                                open_on = Some((key.clone(), crate::character::CharacterPage::MoveNodes));
+                                ui.close();
+                            }
+                            if ui.button("Edit gimmicks").clicked() {
+                                open_on = Some((key.clone(), crate::character::CharacterPage::Gimmicks));
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+                if let Some(key) = pick_character {
+                    let t = self.perf.start();
+                    self.select_character(key);
+                    self.perf.end("select_fighter", t);
+                }
+                if let Some((key, page)) = open_on {
+                    self.open_character(key, None, page);
                 }
             });
         if let Some(fighter) = forget_fighter {
@@ -10779,7 +10918,7 @@ impl VisionaryApp {
     }
 
     fn draw_node_workspace(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
-        let mut fighter_choice = self.state.selected_fighter;
+        let mut character_choice: Option<crate::character::CharacterKey> = None;
         let mut move_choice = None;
         // Escape closes an open dropdown or menu first; only a bare Escape leaves the workspace.
         let escape = !ui.ctx().text_edit_focused()
@@ -10787,24 +10926,24 @@ impl VisionaryApp {
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         ui.horizontal(|ui| {
             if ui.button("← Back").clicked() || escape {
-                self.node_workspace = false;
+                self.leave_move_nodes();
             }
             ui.separator();
-            let fighters = fighter_picks(&self.state.fighters);
-            let current = self
-                .state
-                .selected_fighter
-                .and_then(|index| self.state.fighters.get(index))
-                .map_or("Character", |fighter| fighter.display_name.as_str());
+            let (characters, keys) = self.character_picks();
+            let active = self.active_key();
+            let current = active
+                .as_ref()
+                .map_or_else(|| "Character".to_owned(), |key| self.character_name(key));
+            let selected = keys.iter().position(|key| Some(key) == active.as_ref());
             if let Some(index) = crate::ui::picker(
                 ui,
                 "workspace_character",
                 160.0,
-                current,
-                &fighters,
-                self.state.selected_fighter,
+                &current,
+                &characters,
+                selected,
             ) {
-                fighter_choice = Some(index);
+                character_choice = keys.get(index).cloned();
             }
             let (moves, order) = move_picks(&self.move_list);
             let selected_move = self.state.selected_move.as_ref().and_then(|selected| {
@@ -10856,10 +10995,8 @@ impl VisionaryApp {
             );
             self.node_editor.set_toolbar_rect(rest);
         });
-        if fighter_choice != self.state.selected_fighter {
-            if let Some(index) = fighter_choice {
-                self.select_fighter(index);
-            }
+        if let Some(key) = character_choice.filter(|key| Some(key) != self.active_key().as_ref()) {
+            self.select_character(key);
         }
         if let Some(entry) = move_choice {
             self.select_move(entry);
@@ -10963,6 +11100,11 @@ impl VisionaryApp {
             ui.weak("Loading move scripts…");
             return;
         }
+        // Graphs belong to the character being edited; behavior and controllers to its fighter.
+        let Some(owner) = self.active_key() else {
+            return;
+        };
+        let owner = owner.as_str().to_owned();
         let base = self
             .roster
             .behaviors
@@ -10975,7 +11117,7 @@ impl VisionaryApp {
         if self.state.script.to_hitboxes() != self.state.hitboxes {
             if let Some(graph) = self
                 .move_graphs
-                .get_mut(&fighter.name)
+                .get_mut(&owner)
                 .and_then(|graphs| graphs.get_mut(&move_entry.name))
             {
                 let game = crate::move_nodes::timeline::import_for_fighter(
@@ -10993,13 +11135,9 @@ impl VisionaryApp {
                 self.node_editor.reload_move();
             }
         }
-        let siblings = self
-            .move_graphs
-            .get(&fighter.name)
-            .cloned()
-            .unwrap_or_default();
+        let siblings = self.move_graphs.get(&owner).cloned().unwrap_or_default();
         self.restore_node_effects_to_current();
-        let key = Self::move_key(&fighter.name, &move_entry.name);
+        let key = Self::move_key(&owner, &move_entry.name);
         let current_effects = if !self.node_effect_scripts.contains_key(&key)
             && (self.state.effect_call_full.contains_key(&key)
                 || self.state.effect_call_edits.contains_key(&key))
@@ -11088,21 +11226,21 @@ impl VisionaryApp {
             }
         };
         let tracks = compiled.tracks.remove(&move_entry.name).unwrap_or_default();
-        let key = Self::move_key(&fighter.name, &move_entry.name);
+        let key = Self::move_key(&owner, &move_entry.name);
         for (track, script) in tracks {
             match track {
                 crate::move_nodes::model::Track::Game => {
                     // Never rebaseline native/live provenance when applying an authored edit.
                     self.state.hitboxes = script.to_hitboxes();
                     self.state.script = script.clone();
-                    self.state.edit_log.save_scoped_multi(
+                    self.state.edit_log.save(
+                        &owner,
                         &fighter.name,
                         &fighter.display_name,
                         &move_entry.name,
                         script,
                         self.state.hitboxes_pristine.clone(),
                         self.state.hitboxes.clone(),
-                        &self.roster.slot_scopes_for(&fighter.name),
                     );
                 }
                 crate::move_nodes::model::Track::Sound => {
@@ -11145,11 +11283,11 @@ impl VisionaryApp {
                 .behavior_layouts
                 .insert(fighter.name.clone(), layout);
         }
-        let recipes = self.move_graphs.entry(fighter.name).or_default();
+        let recipes = self.move_graphs.entry(owner).or_default();
         recipes.insert(move_entry.name, graph);
         self.node_live_cache = None;
         // Set first, so a limit the live rules report stays on screen.
-        self.state.status = "Move updated.".into();
+        self.state.status = format!("{}: move updated.", self.active_name());
         self.refresh_current_live_rules();
     }
 
@@ -11185,6 +11323,11 @@ impl VisionaryApp {
             let mut errors = Vec::new();
             let mut recipe_errors = BTreeMap::new();
             for (fighter, graphs) in &self.move_graphs {
+                // A made character's graphs run against its fighter's behavior; they add no
+                // behavior of their own, and the export checks them against that behavior.
+                if crate::character::CharacterKey::parse(fighter).is_made() {
+                    continue;
+                }
                 let base = self
                     .roster
                     .behaviors
@@ -11269,13 +11412,25 @@ impl VisionaryApp {
                 ui.weak("Select a character to edit gimmicks");
                 return;
             };
+            let active = self.active_key().filter(|key| key.is_made());
             let context = self.gimmicks_editor.character_context(
                 ui,
                 &fighter.name,
                 &fighter.display_name,
                 &self.roster.project.authored,
-                &self.roster.slot_scopes_for(&fighter.name),
+                active
+                    .as_ref()
+                    .map(crate::character::CharacterKey::roster_key),
             );
+            // Picking a character here opens it everywhere.
+            let picked = context.character.clone().map_or_else(
+                || crate::character::CharacterKey::base(&context.fighter),
+                crate::character::CharacterKey::made,
+            );
+            if Some(&picked) != self.active_key().as_ref() {
+                self.select_character(picked);
+                return;
+            }
             let roots = self.roster.gimmick_roots(self.state.data_root.as_ref());
             self.gimmicks_editor.ui(
                 ui,
@@ -17476,18 +17631,572 @@ impl VisionaryApp {
         format!("{fighter}/{move_name}")
     }
 
+    /// The open move's key in every per-move store: the active character's, not the fighter's.
     fn current_move_key(&self) -> Option<String> {
+        let character = self.active_key()?;
+        let mv = self.state.selected_move.as_ref()?.name.clone();
+        Some(crate::character::move_key(&character, &mv))
+    }
+
+    /// The character being edited: the made character picked for the selected fighter, or the
+    /// selected fighter itself.
+    fn active_key(&self) -> Option<crate::character::CharacterKey> {
         let fighter = self
             .state
             .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|f| f.name.clone())?;
-        let mv = self.state.selected_move.as_ref()?.name.clone();
-        Some(Self::move_key(&fighter, &mv))
+            .and_then(|i| self.state.fighters.get(i))?;
+        Some(
+            self.active_character
+                .clone()
+                .filter(|key| key.engine_fighter().eq_ignore_ascii_case(&fighter.name))
+                .unwrap_or_else(|| crate::character::CharacterKey::base(&fighter.name)),
+        )
+    }
+
+    /// The store spelling for an engine fighter's moves right now: the active character when it
+    /// plays as `fighter`, otherwise the fighter itself. Source loads and fetches name the engine
+    /// fighter; what they load belongs to whoever is being edited.
+    fn owner_spelling(&self, fighter: &str) -> String {
+        match self.active_key() {
+            Some(key) if key.engine_fighter().eq_ignore_ascii_case(fighter) => {
+                key.as_str().to_owned()
+            }
+            _ => fighter.to_owned(),
+        }
+    }
+
+    /// Make `key` the character being edited: select its fighter, show its first costume, and
+    /// reopen the open move with its own edits. A made character cannot be edited while the
+    /// user's move code is linked: linked code changes every costume of the fighter.
+    pub(crate) fn select_character(&mut self, key: crate::character::CharacterKey) -> bool {
+        if self.source_mismatch_prompt.is_some() {
+            return false;
+        }
+        let Some(index) = self
+            .state
+            .fighters
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))
+        else {
+            self.state.status = format!("{} is not in the fighter list.", key.engine_fighter());
+            return false;
+        };
+        if key.is_made() {
+            if key.authored(&self.roster.project).is_none() {
+                self.state.status = format!("{key} is not one of this project's characters.");
+                return false;
+            }
+            if self.acmd_src.is_some() {
+                self.state.status = format!(
+                    "{} can't be edited while your move code is linked: linked code changes every {} costume. Unlink it on the Project page first.",
+                    self.character_name(&key),
+                    self.state.fighters[index].display_name
+                );
+                return false;
+            }
+        }
+        let same_fighter = self.state.selected_fighter == Some(index);
+        if same_fighter && self.active_key().as_ref() == Some(&key) {
+            return true;
+        }
+        // Save the open move under the character it was opened for, then close it before the
+        // switch, so nothing of one character is ever saved as the other's.
+        self.commit_current_edits();
+        let reopen = if same_fighter {
+            let entry = self.state.selected_move.take();
+            clear_move_state(&mut self.state);
+            entry
+        } else {
+            None
+        };
+        self.active_character = key.is_made().then(|| key.clone());
+        if !same_fighter {
+            self.select_fighter(index);
+        }
+        if let Some(entry) = reopen {
+            self.select_move(entry);
+        }
+        let slot = key
+            .made_slots(&self.roster.project)
+            .first()
+            .copied()
+            .unwrap_or_else(|| self.state.fighters[index].base_slot());
+        self.workspace_asset_slot = slot;
+        self.show_skin(key.engine_fighter(), slot);
+        self.node_editor.invalidate();
+        self.node_live_cache = None;
+        // The game shows the open character's version of each move it has one of.
+        self.publish_live_rule_union();
+        true
+    }
+
+    /// Open `key` on `page`, showing `costume` (or the character's first), remembering where
+    /// Move nodes' Back returns to.
+    pub(crate) fn open_character(
+        &mut self,
+        key: crate::character::CharacterKey,
+        costume: Option<u8>,
+        page: crate::character::CharacterPage,
+    ) {
+        use crate::character::CharacterPage;
+        let came_from = if self.roster.open {
+            Some(NodesReturn::Project)
+        } else {
+            self.current_page().map(NodesReturn::Page)
+        };
+        if !self.select_character(key.clone()) {
+            return;
+        }
+        if let Some(slot) = costume {
+            self.workspace_asset_slot = slot;
+            self.show_skin(key.engine_fighter(), slot);
+        }
+        self.roster.open = false;
+        self.eff_editor.open = false;
+        self.node_workspace = false;
+        match page {
+            CharacterPage::ClassicCollisions => self.primary_tab = PrimaryEditorTab::Collisions,
+            CharacterPage::ClassicEffects => self.primary_tab = PrimaryEditorTab::Effects,
+            CharacterPage::ClassicAudio => self.primary_tab = PrimaryEditorTab::AudioFeedback,
+            CharacterPage::Gimmicks => self.primary_tab = PrimaryEditorTab::Gimmicks,
+            CharacterPage::Effects => self.open_effects_page(),
+            CharacterPage::MoveNodes => {
+                self.nodes_back = came_from.filter(|from| *from != NodesReturn::Page(page));
+                self.node_workspace = true;
+                self.primary_tab = PrimaryEditorTab::Nodes;
+                self.node_editor.refresh_character();
+            }
+        }
+    }
+
+    /// The page on screen, when it is one a character can be opened on.
+    fn current_page(&self) -> Option<crate::character::CharacterPage> {
+        use crate::character::CharacterPage;
+        if self.roster.open {
+            return None;
+        }
+        if self.eff_editor.open {
+            return Some(CharacterPage::Effects);
+        }
+        if self.node_workspace {
+            return Some(CharacterPage::MoveNodes);
+        }
+        Some(match self.primary_tab {
+            PrimaryEditorTab::Gimmicks => CharacterPage::Gimmicks,
+            PrimaryEditorTab::Effects => CharacterPage::ClassicEffects,
+            PrimaryEditorTab::AudioFeedback => CharacterPage::ClassicAudio,
+            _ => CharacterPage::ClassicCollisions,
+        })
+    }
+
+    /// Leave Move nodes for the page it was opened from (the Classic editor by default).
+    fn leave_move_nodes(&mut self) {
+        use crate::character::CharacterPage;
+        self.node_workspace = false;
+        match self.nodes_back.take() {
+            Some(NodesReturn::Project) => self.roster.open = true,
+            Some(NodesReturn::Page(CharacterPage::Effects)) => self.open_effects_page(),
+            Some(NodesReturn::Page(CharacterPage::Gimmicks)) => {
+                self.primary_tab = PrimaryEditorTab::Gimmicks
+            }
+            Some(NodesReturn::Page(CharacterPage::ClassicEffects)) => {
+                self.primary_tab = PrimaryEditorTab::Effects
+            }
+            Some(NodesReturn::Page(CharacterPage::ClassicAudio)) => {
+                self.primary_tab = PrimaryEditorTab::AudioFeedback
+            }
+            _ => {
+                if matches!(
+                    self.primary_tab,
+                    PrimaryEditorTab::Nodes | PrimaryEditorTab::Gimmicks
+                ) {
+                    self.primary_tab = PrimaryEditorTab::Collisions;
+                }
+            }
+        }
+    }
+
+    /// Every per-move store key that belongs to `key` (its own edits only).
+    fn character_move_keys(&self, key: &crate::character::CharacterKey) -> BTreeSet<String> {
+        let owned = |store_key: &String| {
+            crate::character::split_move_key(store_key)
+                .is_some_and(|(owner, _)| owner == key.as_str())
+        };
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        keys.extend(
+            self.state
+                .effect_call_edits
+                .keys()
+                .filter(|k| owned(k))
+                .cloned(),
+        );
+        keys.extend(
+            self.state
+                .effect_call_full
+                .keys()
+                .filter(|k| owned(k))
+                .cloned(),
+        );
+        keys.extend(
+            self.state
+                .sound_script_edits
+                .keys()
+                .filter(|k| owned(k))
+                .cloned(),
+        );
+        keys.extend(
+            self.state
+                .expression_script_edits
+                .keys()
+                .filter(|k| owned(k))
+                .cloned(),
+        );
+        keys.extend(
+            self.node_effect_scripts
+                .keys()
+                .filter(|k| owned(k))
+                .cloned(),
+        );
+        keys
+    }
+
+    /// How many edits of each family `key` owns. A made character's edits are never counted on
+    /// its donor and the donor's never on it.
+    pub(crate) fn character_edit_counts(
+        &self,
+        key: &crate::character::CharacterKey,
+    ) -> crate::character::CharacterEditCounts {
+        let owned = |store_key: &String| {
+            crate::character::split_move_key(store_key)
+                .is_some_and(|(owner, _)| owner == key.as_str())
+        };
+        let effect_moves: BTreeSet<&String> = self
+            .state
+            .effect_call_edits
+            .iter()
+            .filter(|(k, edits)| owned(k) && !edits.is_empty())
+            .map(|(k, _)| k)
+            .chain(
+                self.state
+                    .effect_call_full
+                    .iter()
+                    .filter(|(k, calls)| owned(k) && !calls.is_empty())
+                    .map(|(k, _)| k),
+            )
+            .chain(self.node_effect_scripts.keys().filter(|k| owned(k)))
+            .collect();
+        let mut counts = crate::character::CharacterEditCounts {
+            game_moves: self
+                .state
+                .edit_log
+                .entries
+                .get(key.as_str())
+                .map_or(0, HashMap::len),
+            node_graphs: self.move_graphs.get(key.as_str()).map_or(0, BTreeMap::len),
+            sound_moves: self
+                .state
+                .sound_script_edits
+                .keys()
+                .filter(|k| owned(k))
+                .count(),
+            expression_moves: self
+                .state
+                .expression_script_edits
+                .keys()
+                .filter(|k| owned(k))
+                .count(),
+            effect_call_moves: effect_moves.len(),
+            ..Default::default()
+        };
+        let fighter = key.engine_fighter();
+        let made_slots = key.made_slots(&self.roster.project);
+        // The effect file and gimmicks are kept per fighter. A gimmick limited to exactly a made
+        // character's costumes is that character's; any other is the base fighter's.
+        if !key.is_made() {
+            if let Some(eff) = self.eff_mods.get(fighter) {
+                counts.authored_effects = eff.authored.len();
+                counts.borrowed_effects = eff.transplants.len();
+            }
+        }
+        if let Some(graph) = self
+            .roster
+            .behaviors
+            .get(fighter)
+            .filter(|graph| !graph.is_empty())
+        {
+            let made_owner = crate::character::made_on(fighter, &self.roster.project)
+                .any(|entry| entry.all_slots() == graph.costumes);
+            let owns = if key.is_made() {
+                !made_slots.is_empty() && graph.costumes == made_slots
+            } else {
+                !made_owner
+            };
+            if owns {
+                counts.gimmicks = 1 + self
+                    .roster
+                    .controller_charts
+                    .get(fighter)
+                    .map_or(0, BTreeMap::len);
+                counts.meters = self.roster.meters.get(fighter).map_or(0, |meters| {
+                    meters.iter().filter(|meter| meter.enabled).count()
+                });
+            }
+        }
+        counts
+    }
+
+    /// Drop every edit `key` owns: moves, node graphs, sounds, expressions, effect calls, its
+    /// source snapshots, live rules and undo history, and a gimmick limited to its costumes.
+    /// A base fighter's key drops only that fighter's own edits.
+    pub(crate) fn remove_character_edits(&mut self, key: &crate::character::CharacterKey) {
+        let slots = key.made_slots(&self.roster.project);
+        self.remove_character_edits_on(key, &slots);
+    }
+
+    /// [`Self::remove_character_edits`] for a character whose costumes are `slots` (it may
+    /// already be gone from the project).
+    fn remove_character_edits_on(&mut self, key: &crate::character::CharacterKey, slots: &[u8]) {
+        let mine = |store_key: &str| {
+            crate::character::split_move_key(store_key)
+                .is_some_and(|(owner, _)| owner == key.as_str())
+        };
+        if self.active_key().as_ref() == Some(key) {
+            // Close the open move first so the next frame cannot save it back.
+            self.state.selected_move = None;
+            clear_move_state(&mut self.state);
+        }
+        if key.is_made() && self.active_character.as_ref() == Some(key) {
+            self.active_character = None;
+        }
+        self.state.edit_log.entries.remove(key.as_str());
+        self.state.effect_call_edits.retain(|k, _| !mine(k));
+        self.state.effect_call_full.retain(|k, _| !mine(k));
+        self.state.effect_dropped_lines.retain(|k, _| !mine(k));
+        self.state.effect_frame_residue.retain(|k, _| !mine(k));
+        self.state.sound_script_edits.retain(|k, _| !mine(k));
+        self.state.expression_script_edits.retain(|k, _| !mine(k));
+        self.state.capture_branch_warnings.retain(|k, _| !mine(k));
+        self.move_source_cache.retain(|k, _| !mine(k));
+        self.node_effect_scripts.retain(|k, _| !mine(k));
+        self.move_graphs.remove(key.as_str());
+        self.edit_history.retain(|k, _| !mine(k));
+        self.hitbox_rules_store.retain(|k, _| !mine(k));
+        self.effect_rules_store.retain(|k, _| !mine(k));
+        self.effect_control_rules_store.retain(|k, _| !mine(k));
+        if key.is_made() {
+            let fighter = key.engine_fighter().to_owned();
+            let owned_gimmick = self
+                .roster
+                .behaviors
+                .get(&fighter)
+                .is_some_and(|graph| !slots.is_empty() && graph.costumes == slots);
+            if owned_gimmick {
+                self.roster.behaviors.remove(&fighter);
+                self.roster.behavior_layouts.remove(&fighter);
+                self.roster.controller_charts.remove(&fighter);
+                self.roster.meters.remove(&fighter);
+            }
+        }
+        self.node_editor.invalidate();
+        self.node_live_cache = None;
+        self.gimmicks_editor.invalidate();
+        self.publish_live_rule_union();
+    }
+
+    /// Copy every move edit `donor` has into the new character `key`: a made character starts as
+    /// a full copy of its donor and from then on owns its own edits.
+    fn fork_donor_edits(&mut self, key: &crate::character::CharacterKey) {
+        let donor = key.engine_fighter().to_owned();
+        let from_donor = |store_key: &str| -> Option<String> {
+            let (owner, move_name) = crate::character::split_move_key(store_key)?;
+            (owner == donor).then(|| crate::character::move_key(key, move_name))
+        };
+        if let Some(moves) = self.state.edit_log.entries.get(&donor).cloned() {
+            let target = self
+                .state
+                .edit_log
+                .entries
+                .entry(key.as_str().to_owned())
+                .or_default();
+            for (move_name, mut record) in moves {
+                // A record scoped to other costumes is not part of the donor as a whole.
+                if !record.effective_scopes().is_empty() {
+                    continue;
+                }
+                record.slot_scope = None;
+                record.slot_scopes.clear();
+                target.entry(move_name).or_insert(record);
+            }
+        }
+        fn fork<V: Clone>(store: &mut HashMap<String, V>, rename: &dyn Fn(&str) -> Option<String>) {
+            let copies: Vec<(String, V)> = store
+                .iter()
+                .filter_map(|(k, v)| rename(k).map(|new| (new, v.clone())))
+                .collect();
+            for (k, v) in copies {
+                store.entry(k).or_insert(v);
+            }
+        }
+        fork(&mut self.state.effect_call_edits, &from_donor);
+        fork(&mut self.state.effect_call_full, &from_donor);
+        fork(&mut self.state.effect_dropped_lines, &from_donor);
+        fork(&mut self.state.effect_frame_residue, &from_donor);
+        fork(&mut self.state.sound_script_edits, &from_donor);
+        fork(&mut self.state.expression_script_edits, &from_donor);
+        fork(&mut self.state.capture_branch_warnings, &from_donor);
+        fork(&mut self.move_source_cache, &from_donor);
+        fork(&mut self.node_effect_scripts, &from_donor);
+        if let Some(graphs) = self.move_graphs.get(&donor).cloned() {
+            let target = self.move_graphs.entry(key.as_str().to_owned()).or_default();
+            for (move_name, graph) in graphs {
+                target.entry(move_name).or_insert(graph);
+            }
+        }
+    }
+
+    /// Notice characters made or removed since last frame: a new one starts as a copy of its
+    /// donor's edits, a removed one's edits go with it. A project load resets the baseline
+    /// rather than counting its characters as new.
+    fn sync_made_characters(&mut self) {
+        // A made character cannot be edited while move code is linked.
+        if self.acmd_src.is_some()
+            && self
+                .active_character
+                .as_ref()
+                .is_some_and(|key| key.is_made())
+        {
+            if let Some(key) = self.active_character.clone() {
+                self.select_character(crate::character::CharacterKey::base(key.engine_fighter()));
+                self.state.status = format!(
+                    "Back to {}: {} can't be edited while your move code is linked.",
+                    self.active_name(),
+                    self.character_name(&key)
+                );
+            }
+        }
+        let now: BTreeMap<crate::roster::RosterKey, Vec<u8>> = self
+            .roster
+            .project
+            .authored
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.all_slots()))
+            .collect();
+        let Some(before) = self.known_made.replace(now.clone()) else {
+            return;
+        };
+        if before == now {
+            return;
+        }
+        for added in now.keys().filter(|key| !before.contains_key(*key)) {
+            let key = crate::character::CharacterKey::made(added.clone());
+            self.fork_donor_edits(&key);
+        }
+        for (removed, slots) in before.iter().filter(|(key, _)| !now.contains_key(*key)) {
+            let key = crate::character::CharacterKey::made(removed.clone());
+            self.remove_character_edits_on(&key, slots);
+        }
+    }
+
+    /// Every character the pickers offer: each fighter, then the characters made on it, indented
+    /// under it with their own costumes. Returned with the key each row opens.
+    fn character_picks(&self) -> (Vec<crate::ui::Pick>, Vec<crate::character::CharacterKey>) {
+        let mut picks = Vec::new();
+        let mut keys = Vec::new();
+        for fighter in &self.state.fighters {
+            picks.push(crate::ui::Pick {
+                label: if fighter.is_modded() {
+                    format!("{}  [mod]", fighter.display_name)
+                } else {
+                    fighter.display_name.clone()
+                },
+                hover: fighter.name.clone(),
+                group: None,
+            });
+            keys.push(crate::character::CharacterKey::base(&fighter.name));
+            for entry in crate::character::made_on(&fighter.name, &self.roster.project) {
+                let key = crate::character::CharacterKey::made(entry.key.clone());
+                picks.push(crate::ui::Pick {
+                    label: format!("    {}", self.character_name(&key)),
+                    hover: format!(
+                        "{} {}",
+                        fighter.display_name,
+                        key.costume_range(&self.roster.project).unwrap_or_default()
+                    ),
+                    group: None,
+                });
+                keys.push(key);
+            }
+        }
+        (picks, keys)
+    }
+
+    /// "Vision c08–c15", "Mario c00–c07": who is open and which costumes it covers.
+    fn character_chip_text(&self) -> Option<String> {
+        let key = self.active_key()?;
+        let slots = if key.is_made() {
+            key.made_slots(&self.roster.project)
+        } else {
+            let fighter = self
+                .state
+                .fighters
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))?;
+            crate::character::base_costumes(&fighter.name, &fighter.slots, &self.roster.project)
+        };
+        let name = self.character_name(&key);
+        Some(match crate::character::slot_range(&slots) {
+            Some(range) => format!("{name} {range}"),
+            None => name,
+        })
+    }
+
+    /// A made character plays its own costume's animation of a move when it has one: the
+    /// move list is read from the fighter's base costume.
+    fn costume_anim_path(&self, base: Option<PathBuf>) -> Option<PathBuf> {
+        let Some(key) = self.active_key().filter(|key| key.is_made()) else {
+            return base;
+        };
+        let base = base?;
+        let own = key
+            .made_slots(&self.roster.project)
+            .first()
+            .and_then(|slot| self.skin_folder(key.engine_fighter(), "motion", *slot))
+            .map(|(dir, _)| dir.join(base.file_name().unwrap_or_default()))
+            .filter(|path| path.is_file());
+        own.or(Some(base))
+    }
+
+    /// Who wears costume `slot` of `fighter`: the made character that owns it, or the fighter.
+    fn slot_owner_name(&self, fighter: &str, slot: u8) -> String {
+        let owner = crate::character::made_on(fighter, &self.roster.project)
+            .find(|entry| entry.all_slots().contains(&slot))
+            .map_or_else(
+                || crate::character::CharacterKey::base(fighter),
+                |entry| crate::character::CharacterKey::made(entry.key.clone()),
+            );
+        self.character_name(&owner)
+    }
+
+    /// The name a character is shown by in titles and status lines.
+    pub(crate) fn character_name(&self, key: &crate::character::CharacterKey) -> String {
+        let display = self
+            .state
+            .fighters
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(key.engine_fighter()))
+            .map(|entry| entry.display_name.as_str());
+        key.display_name(&self.roster.project, display)
+    }
+
+    /// The active character's name, for status lines.
+    fn active_name(&self) -> String {
+        self.active_key()
+            .map(|key| self.character_name(&key))
+            .unwrap_or_default()
     }
 
     fn remember_move_source_body(&mut self, fighter: &str, move_name: &str, body: String) {
-        let key = Self::move_key(fighter, move_name);
+        let key = Self::move_key(&self.owner_spelling(fighter), move_name);
         let captures = self
             .move_source_cache
             .get(&key)
@@ -17507,7 +18216,7 @@ impl VisionaryApp {
         captures: Vec<crate::game_link::CaptureLine>,
     ) {
         self.move_source_cache.insert(
-            Self::move_key(fighter, move_name),
+            Self::move_key(&self.owner_spelling(fighter), move_name),
             crate::mod_project::MoveSourceSnapshot { body, captures },
         );
     }
@@ -17526,7 +18235,7 @@ impl VisionaryApp {
         else {
             return;
         };
-        let key = Self::move_key(&fighter, &move_name);
+        let key = Self::move_key(&self.owner_spelling(&fighter), &move_name);
         let body = body_if_missing
             .or_else(|| self.move_source_cache.get(&key).map(|s| s.body.clone()))
             .unwrap_or_default();
@@ -17606,7 +18315,7 @@ impl VisionaryApp {
                 "could not read the linked source for {fighter}/{move_name}"
             ));
         };
-        let key = Self::move_key(fighter, move_name);
+        let key = Self::move_key(&self.owner_spelling(fighter), move_name);
         if self
             .move_source_cache
             .get(&key)
@@ -17726,7 +18435,7 @@ impl VisionaryApp {
             .expression_script_edits
             .get(key)
             .map(Self::json_bytes);
-        let edit_record = key.split_once('/').and_then(|(fighter, move_name)| {
+        let edit_record = crate::character::split_move_key(key).and_then(|(fighter, move_name)| {
             self.state
                 .edit_log
                 .entries
@@ -17749,8 +18458,7 @@ impl VisionaryApp {
             expression_script_edit,
             edit_record,
             structured_effect_edit: self.node_effect_scripts.get(key).map(Self::json_bytes),
-            move_graph: key
-                .split_once('/')
+            move_graph: crate::character::split_move_key(key)
                 .and_then(|(fighter, move_name)| {
                     self.move_graphs
                         .get(fighter)
@@ -17794,7 +18502,7 @@ impl VisionaryApp {
         self.state.sounds = self.state.sound_script.to_sound_events();
         self.state.expressions = self.state.expression_script.to_expression_events();
 
-        if let Some((fighter, move_name)) = key.split_once('/') {
+        if let Some((fighter, move_name)) = crate::character::split_move_key(key) {
             if let Some(graph) = snapshot.move_graph.as_deref().and_then(Self::decode_json) {
                 self.move_graphs
                     .entry(fighter.to_string())
@@ -17931,10 +18639,10 @@ impl VisionaryApp {
             return;
         };
         let store_key = format!("{key}#node_steps");
-        let rules = key.split_once('/').and_then(|(fighter, move_name)| {
-            let graph = self.move_graphs.get(fighter)?.get(move_name)?;
+        let rules = crate::character::parse_move_key(&key).and_then(|(owner, move_name)| {
+            let graph = self.move_graphs.get(owner.as_str())?.get(move_name)?;
             Some(crate::move_nodes::live_steps::rules(
-                fighter,
+                owner.engine_fighter(),
                 motion,
                 &self.state.source_script,
                 graph,
@@ -17976,14 +18684,15 @@ impl VisionaryApp {
     /// the boundary between project data and the stateful live-rule builders below it.
     fn materialize_move_replay_context(
         &self,
-        fighter: &str,
+        owner: &crate::character::CharacterKey,
         move_name: &str,
         source: &crate::mod_project::MoveSourceSnapshot,
     ) -> Option<MoveReplayContext> {
+        let fighter = owner.engine_fighter();
         if fighter.is_empty() || move_name.is_empty() {
             return None;
         }
-        let key = Self::move_key(fighter, move_name);
+        let key = crate::character::move_key(owner, move_name);
         let game_pristine = crate::acmd::parse_acmd_script(&source.body);
         let mut hitboxes_pristine = game_pristine.to_hitboxes();
         self.normalize_hitbox_bones(&mut hitboxes_pristine);
@@ -18025,7 +18734,7 @@ impl VisionaryApp {
             .state
             .edit_log
             .entries
-            .get(fighter)
+            .get(owner.as_str())
             .and_then(|moves| moves.get(move_name));
         let game = record
             .map(|record| record.script.clone())
@@ -18064,7 +18773,7 @@ impl VisionaryApp {
     /// avoids a second source lookup while keeping the existing loader's error handling, source
     /// notes, loss tracking, and rule-family baseline setup in one place.
     fn apply_move_replay_context(&mut self, context: MoveReplayContext) {
-        let key = Self::move_key(&context.fighter, &context.move_name);
+        let key = Self::move_key(&self.owner_spelling(&context.fighter), &context.move_name);
         self.move_source_cache.insert(key, context.source.clone());
         if context.source.body.is_empty() {
             if !context.captures.is_empty() {
@@ -18111,24 +18820,18 @@ impl VisionaryApp {
     fn live_hitbox_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::HitboxRuleWire>> {
+        let shown = self.live_owner_keys(self.hitbox_rules_store.keys());
         self.hitbox_rules_store
             .iter()
-            .filter(|(key, _)| {
-                crate::move_nodes::live_support::allows_flat_live_rules(&self.move_graphs, key)
-            })
+            .filter(|(key, _)| shown.contains(key.as_str()))
+            .filter(|(key, _)| self.allows_flat(key, false))
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
-                let (fighter, move_name) = key
-                    .split('#')
-                    .next()
-                    .and_then(|key| key.split_once('/'))
-                    .unzip();
-                let guards = fighter
-                    .zip(move_name)
-                    .and_then(|(fighter, name)| {
+                let guards = crate::character::parse_move_key(&rule_move_key(key))
+                    .and_then(|(owner, name)| {
                         Some(crate::move_nodes::live_steps::guards(
-                            fighter,
-                            self.move_graphs.get(fighter)?.get(name)?,
+                            owner.engine_fighter(),
+                            self.move_graphs.get(owner.as_str())?.get(name)?,
                         ))
                     })
                     .unwrap_or_default();
@@ -18148,23 +18851,93 @@ impl VisionaryApp {
     }
 
     fn allows_flat_effect_rules(&self, key: &str) -> bool {
-        crate::move_nodes::live_support::allows_flat_effect_rules(&self.move_graphs, key)
+        self.allows_flat(key, true)
+    }
+
+    /// Whether a rule-store key's flat rules may go live (a node graph for the move may own
+    /// them instead). A made character's key is asked as its engine fighter's, over its own
+    /// graphs, since the check reads fighter names.
+    fn allows_flat(&self, key: &str, effect: bool) -> bool {
+        let check =
+            |graphs: &BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
+             key: &str| {
+                if effect {
+                    crate::move_nodes::live_support::allows_flat_effect_rules(graphs, key)
+                } else {
+                    crate::move_nodes::live_support::allows_flat_live_rules(graphs, key)
+                }
+            };
+        let Some((owner, rest)) = crate::character::split_move_key(key) else {
+            return check(&self.move_graphs, key);
+        };
+        let character = crate::character::CharacterKey::parse(owner);
+        if !character.is_made() {
+            return check(&self.move_graphs, key);
+        }
+        let engine = character.engine_fighter().to_owned();
+        let view = BTreeMap::from([(
+            engine.clone(),
+            self.move_graphs.get(owner).cloned().unwrap_or_default(),
+        )]);
+        check(&view, &format!("{engine}/{rest}"))
+    }
+
+    /// The rule-store keys whose rules go to the game. The game cannot tell costumes apart
+    /// yet, so each move of a fighter sends one character's version: the open character's when
+    /// it has one, else the fighter's own, else the first made character's.
+    fn live_owner_keys<'a>(&self, keys: impl Iterator<Item = &'a String>) -> HashSet<String> {
+        let active = self.active_key();
+        let mut by_move: BTreeMap<(String, String), Vec<&'a String>> = BTreeMap::new();
+        for key in keys {
+            let move_key = rule_move_key(key);
+            let Some((owner, move_name)) = crate::character::parse_move_key(&move_key) else {
+                continue;
+            };
+            by_move
+                .entry((owner.engine_fighter().to_owned(), move_name.to_owned()))
+                .or_default()
+                .push(key);
+        }
+        let mut shown = HashSet::new();
+        for keys in by_move.values() {
+            let owner_of = |key: &String| {
+                crate::character::split_move_key(key)
+                    .map(|(owner, _)| owner.to_owned())
+                    .unwrap_or_default()
+            };
+            let mut owners: Vec<String> = keys.iter().map(|key| owner_of(key)).collect();
+            owners.sort();
+            owners.dedup();
+            let chosen = active
+                .as_ref()
+                .map(|key| key.as_str().to_owned())
+                .filter(|key| owners.contains(key))
+                .or_else(|| owners.iter().find(|owner| !owner.contains('#')).cloned())
+                .or_else(|| owners.first().cloned());
+            shown.extend(
+                keys.iter()
+                    .filter(|key| Some(owner_of(key)) == chosen)
+                    .map(|key| (*key).clone()),
+            );
+        }
+        shown
     }
 
     fn live_effect_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::SpawnRuleWire>> {
+        let shown = self.live_owner_keys(self.effect_rules_store.keys());
         self.effect_rules_store
             .iter()
+            .filter(|(key, _)| shown.contains(key.as_str()))
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
-                let guards = key
-                    .split_once('/')
-                    .and_then(|(fighter, name)| {
+                let guards = crate::character::parse_move_key(key)
+                    .and_then(|(owner, name)| {
                         Some(crate::move_nodes::live_steps::effect_guards(
-                            fighter,
-                            self.move_graphs.get(fighter)?.get(name)?,
+                            owner.engine_fighter(),
+                            self.move_graphs.get(owner.as_str())?.get(name)?,
                         ))
                     })
                     .unwrap_or_default();
@@ -18186,8 +18959,10 @@ impl VisionaryApp {
     fn live_effect_control_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
+        let shown = self.live_owner_keys(self.effect_control_rules_store.keys());
         self.effect_control_rules_store
             .iter()
+            .filter(|(key, _)| shown.contains(key.as_str()))
             .filter(|(key, _)| self.allows_flat_effect_rules(key))
             .flat_map(|(key, rules)| {
                 rules
@@ -18215,10 +18990,6 @@ impl VisionaryApp {
     /// existing builders all take their identity and capture set from the current move, while
     /// their keyed stores keep the resulting rules alive after the next iteration.
     fn rebuild_all_saved_live_rules(&mut self) -> LiveApplyReport {
-        let selected = (
-            self.state.selected_fighter,
-            self.state.selected_move.clone(),
-        );
         let mut keys = BTreeSet::new();
         keys.extend(self.move_source_cache.keys().cloned());
         keys.extend(self.state.effect_call_edits.keys().cloned());
@@ -18243,22 +19014,17 @@ impl VisionaryApp {
         self.effect_control_rules_store.clear();
         self.replay_missing_capture.clear();
         self.replay_missing_constant.clear();
-        self.replay_live_fallback_key = selected.0.and_then(|fighter_index| {
-            selected.1.as_ref().and_then(|move_entry| {
-                self.state
-                    .fighters
-                    .get(fighter_index)
-                    .map(|fighter| Self::move_key(&fighter.name, &move_entry.name))
-            })
-        });
+        self.replay_live_fallback_key = self.current_move_key();
         self.rebuilding_project_live = true;
         self.game_link.begin_rule_batch();
         let mut report = LiveApplyReport::default();
 
+        let active_before = self.active_character.clone();
         for key in keys {
-            let Some((fighter, move_name)) = key.split_once('/') else {
+            let Some((owner, move_name)) = crate::character::parse_move_key(&key) else {
                 continue;
             };
+            let fighter = owner.engine_fighter();
             let Some(fighter_index) = self
                 .state
                 .fighters
@@ -18268,19 +19034,30 @@ impl VisionaryApp {
                 report.missing_fighter.insert(fighter.to_string());
                 continue;
             };
-            let Some(snapshot) = self.move_source_cache.get(&key).cloned() else {
+            // A made character's move may have been opened only on its donor: the game's source
+            // is the same either way.
+            let Some(snapshot) = self
+                .move_source_cache
+                .get(&key)
+                .or_else(|| {
+                    self.move_source_cache
+                        .get(&Self::move_key(fighter, move_name))
+                })
+                .cloned()
+            else {
                 report.missing_source.insert(key);
                 continue;
             };
-            let Some(context) = self.materialize_move_replay_context(fighter, move_name, &snapshot)
+            let Some(context) = self.materialize_move_replay_context(&owner, move_name, &snapshot)
             else {
                 report.missing_source.insert(key);
                 continue;
             };
             report
                 .resume_target
-                .get_or_insert_with(|| (fighter.to_string(), move_name.to_string()));
+                .get_or_insert_with(|| (owner.as_str().to_string(), move_name.to_string()));
             self.state.selected_fighter = Some(fighter_index);
+            self.active_character = Some(owner.clone());
             self.state.selected_move = Some(MoveEntry {
                 name: move_name.to_string(),
                 hash: context.motion,
@@ -18323,6 +19100,7 @@ impl VisionaryApp {
         // retaining one would highlight a fighter or move whose assets were never loaded.
         self.state.selected_fighter = None;
         self.state.selected_move = None;
+        self.active_character = active_before;
         clear_move_state(&mut self.state);
 
         self.rebuilding_project_live = false;
@@ -18446,7 +19224,7 @@ impl VisionaryApp {
             || self.node_effect_scripts.contains_key(&key)
             || self.state.sound_script_edits.contains_key(&key)
             || self.state.expression_script_edits.contains_key(&key)
-            || key.split_once('/').is_some_and(|(fighter, move_name)| {
+            || crate::character::split_move_key(&key).is_some_and(|(fighter, move_name)| {
                 self.move_graphs
                     .get(fighter)
                     .is_some_and(|graphs| graphs.contains_key(move_name))
@@ -18483,7 +19261,7 @@ impl VisionaryApp {
         self.state.sound_script_edits.remove(&key);
         self.state.expression_script_edits.remove(&key);
         self.node_effect_scripts.remove(&key);
-        if let Some((fighter, move_name)) = key.split_once('/') {
+        if let Some((fighter, move_name)) = crate::character::split_move_key(&key) {
             if let Some(graphs) = self.move_graphs.get_mut(fighter) {
                 graphs.remove(move_name);
                 if graphs.is_empty() {
@@ -18735,7 +19513,9 @@ impl VisionaryApp {
         let Some(script) = self.node_effect_scripts.get(&key) else {
             return false;
         };
-        let move_name = key.split_once('/').map(|(_, name)| name).unwrap_or("move");
+        let move_name = crate::character::split_move_key(&key)
+            .map(|(_, name)| name)
+            .unwrap_or("move");
         self.state.effect_script = crate::acmd::parse_effect_script(
             &crate::acmd::preview_effect_structure_fn(script, move_name),
         );
@@ -18779,7 +19559,7 @@ impl VisionaryApp {
         let Some(key) = self.current_move_key() else {
             return false;
         };
-        let Some((fighter, move_name)) = key.split_once('/') else {
+        let Some((fighter, move_name)) = crate::character::split_move_key(&key) else {
             return false;
         };
         let Some(record) = self
@@ -18848,8 +19628,10 @@ impl VisionaryApp {
             version: crate::mod_project::PROJECT_VERSION,
             name: self.project_name.clone(),
             fighters: HashMap::new(),
+            characters: Default::default(),
             roster: self.roster.project.clone(),
         };
+        let roster = self.roster.project.clone();
         // Trait edits are authored in the Roster window and have no edit-log entry, so a
         // fighter whose only change is a value edit would otherwise be absent from the project
         // entirely — the edit would be saved nowhere and exported nowhere.
@@ -18892,25 +19674,23 @@ impl VisionaryApp {
         }
         for (fighter, graphs) in &self.move_graphs {
             if !graphs.is_empty() {
-                project
-                    .fighters
-                    .entry(fighter.clone())
-                    .or_default()
-                    .move_graphs = graphs.clone();
+                if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                    fm.move_graphs = graphs.clone();
+                }
             }
         }
         for (key, script) in &self.node_effect_scripts {
-            if let Some((fighter, move_name)) = key.split_once('/') {
-                project
-                    .fighters
-                    .entry(fighter.to_string())
-                    .or_default()
-                    .effect_scripts
-                    .insert(move_name.to_string(), script.clone());
+            if let Some((fighter, move_name)) = crate::character::split_move_key(key) {
+                if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                    fm.effect_scripts
+                        .insert(move_name.to_string(), script.clone());
+                }
             }
         }
         for (fighter, moves) in &self.state.edit_log.entries {
-            let fm = project.fighters.entry(fighter.clone()).or_default();
+            let Some(fm) = project_owner_mod(&mut project, &roster, fighter) else {
+                continue;
+            };
             fm.display = moves
                 .values()
                 .next()
@@ -18925,8 +19705,11 @@ impl VisionaryApp {
             .chain(self.state.effect_call_full.keys())
             .collect();
         for key in effect_keys {
-            let (fighter, mv) = key.split_once('/').unwrap_or(("unknown", key.as_str()));
-            let fm = project.fighters.entry(fighter.to_string()).or_default();
+            let (fighter, mv) =
+                crate::character::split_move_key(key).unwrap_or(("unknown", key.as_str()));
+            let Some(fm) = project_owner_mod(&mut project, &roster, fighter) else {
+                continue;
+            };
             if let Some(edits) = self
                 .state
                 .effect_call_edits
@@ -18949,36 +19732,30 @@ impl VisionaryApp {
             }
         }
         for (key, script) in &self.state.sound_script_edits {
-            let (fighter, mv) = key.split_once('/').unwrap_or(("unknown", key.as_str()));
-            project
-                .fighters
-                .entry(fighter.to_string())
-                .or_default()
-                .sound_scripts
-                .insert(mv.to_string(), script.clone());
+            let (fighter, mv) =
+                crate::character::split_move_key(key).unwrap_or(("unknown", key.as_str()));
+            if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                fm.sound_scripts.insert(mv.to_string(), script.clone());
+            }
         }
         for (key, script) in &self.state.expression_script_edits {
-            let (fighter, mv) = key.split_once('/').unwrap_or(("unknown", key.as_str()));
-            project
-                .fighters
-                .entry(fighter.to_string())
-                .or_default()
-                .expression_scripts
-                .insert(mv.to_string(), script.clone());
+            let (fighter, mv) =
+                crate::character::split_move_key(key).unwrap_or(("unknown", key.as_str()));
+            if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                fm.expression_scripts.insert(mv.to_string(), script.clone());
+            }
         }
         // Keep every source visited during the session. `ModProjectFile::is_empty` deliberately
         // ignores this provenance-only field, so browsing without edits still does not create a
         // mod, while an edited project can be reopened without fetching any visited move again.
         for (key, snapshot) in &self.move_source_cache {
-            let Some((fighter, move_name)) = key.split_once('/') else {
+            let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
                 continue;
             };
-            project
-                .fighters
-                .entry(fighter.to_string())
-                .or_default()
-                .move_sources
-                .insert(move_name.to_string(), snapshot.clone());
+            if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                fm.move_sources
+                    .insert(move_name.to_string(), snapshot.clone());
+            }
         }
         for (fighter, eff) in &self.eff_mods {
             if eff.is_empty() {
@@ -19009,7 +19786,7 @@ impl VisionaryApp {
                             .any(|c| effect_name_hash(&c.effect_name) == hash)
                     })
                     .filter_map(|(key, calls)| {
-                        key.split_once('/').map(|(fighter, move_name)| {
+                        crate::character::split_move_key(key).map(|(fighter, move_name)| {
                             (fighter.to_string(), move_name.to_string(), calls.clone())
                         })
                     })
@@ -19029,7 +19806,9 @@ impl VisionaryApp {
                     }
                 }
                 for (fighter, move_name, calls) in owners {
-                    let fm = project.fighters.entry(fighter).or_default();
+                    let Some(fm) = project_owner_mod(&mut project, &roster, &fighter) else {
+                        continue;
+                    };
                     // A live tweak is emitted immediately after each affected ACMD spawn. Keep
                     // the complete effect script even when the spawn itself was not edited, or
                     // a tweak-only project would serialize correctly but export no code.
@@ -19048,15 +19827,13 @@ impl VisionaryApp {
         // exported. The warning is not itself an edit, so it must not make an otherwise empty
         // project non-empty; `mod_export::source_project` filters notes to functions it ships.
         for (key, warning) in &self.state.capture_branch_warnings {
-            let Some((fighter, move_name)) = key.split_once('/') else {
+            let Some((fighter, move_name)) = crate::character::split_move_key(key) else {
                 continue;
             };
-            project
-                .fighters
-                .entry(fighter.to_string())
-                .or_default()
-                .capture_branch_warnings
-                .insert(move_name.to_string(), warning.clone());
+            if let Some(fm) = project_owner_mod(&mut project, &roster, fighter) {
+                fm.capture_branch_warnings
+                    .insert(move_name.to_string(), warning.clone());
+            }
         }
         project
     }
@@ -19349,6 +20126,8 @@ impl VisionaryApp {
         self.eff_mods.clear();
         self.live_overrides = crate::game_link::LiveOverrides::default();
         self.roster.project = crate::mod_project::RosterMod::default();
+        self.active_character = None;
+        self.known_made = None;
         self.roster.params.clear();
         self.roster.behaviors.clear();
         self.roster.behavior_layouts.clear();
@@ -20108,12 +20887,7 @@ impl VisionaryApp {
         if sent {
             self.send_workspace_asset_bundle(&workspace, &fighter, slot);
         }
-        let shown = self
-            .state
-            .fighters
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(&fighter))
-            .map_or(fighter.clone(), |entry| entry.display_name.clone());
+        let shown = self.slot_owner_name(&fighter, slot);
         self.state.status = format!(
             "Reloaded {shown} c{slot:02} in the preview{}.",
             if sent { " and the game" } else { "" }
@@ -20188,7 +20962,11 @@ impl VisionaryApp {
             }
         }
         self.state.status = match (done.is_empty(), refused.is_empty()) {
-            (_, true) => format!("Added {} for {fighter} c{slot:02}.", done.join(", ")),
+            (_, true) => format!(
+                "Added {} for {} c{slot:02}.",
+                done.join(", "),
+                self.slot_owner_name(fighter, slot)
+            ),
             (true, false) => format!("Nothing added. {}", refused.join("; ")),
             (false, false) => format!(
                 "Added {}. Not added: {}",
@@ -20300,6 +21078,22 @@ impl VisionaryApp {
                         std::env::current_exe().ok(),
                     )
                     .is_none());
+            // The rule pack replays live rules, which cannot tell costumes apart yet: a made
+            // character's moves would change every costume of its fighter.
+            if rule_pack && !project.characters.is_empty() {
+                let names: Vec<String> = project
+                    .characters
+                    .keys()
+                    .map(|key| {
+                        self.character_name(&crate::character::CharacterKey::made(key.clone()))
+                    })
+                    .collect();
+                self.state.status = format!(
+                    "Export needs Rust and the plugin source to ship {}'s moves on their own costumes.",
+                    names.join(", ")
+                );
+                return;
+            }
             let plan = if rule_pack {
                 crate::mod_export::NormalExportPlan {
                     generated_source: None,
@@ -20740,9 +21534,14 @@ impl VisionaryApp {
         // Before anything reads the project: bring it to the current format, and refuse a file
         // written by a newer build. Loading one of those would present it as complete and then
         // re-save it with whatever this build cannot read silently removed.
-        if let Err(error) = project
-            .migrate()
-            .and_then(|_| crate::mod_export::validate_project(&project))
+        if let Err(error) = project.migrate() {
+            self.state.status = format!("Project load failed: {error}");
+            return;
+        }
+        // Edits saved for a made character before it had its own store move into it; any that
+        // match no character stay limited to their costumes and are reported.
+        let migration_findings = project.migrate_scoped_records();
+        if let Err(error) = crate::mod_export::validate_project(&project)
             .and_then(|_| crate::mod_export::resolve_project_assets(&mut project, path))
         {
             self.state.status = format!("Project load failed: {error}");
@@ -20754,6 +21553,13 @@ impl VisionaryApp {
             .iter()
             .filter(|(_, fm)| !fm.move_graphs.is_empty())
             .map(|(fighter, fm)| (fighter.clone(), fm.move_graphs.clone()))
+            .chain(
+                project
+                    .characters
+                    .iter()
+                    .filter(|(_, fm)| !fm.move_graphs.is_empty())
+                    .map(|(key, fm)| (key.as_str().to_owned(), fm.move_graphs.clone())),
+            )
             .collect();
         let stored_behaviors = project
             .fighters
@@ -20814,6 +21620,8 @@ impl VisionaryApp {
         // Loading is replacement here too: the roster window's edits belong to the project
         // that was open, not to the one being loaded.
         self.roster.project = std::mem::take(&mut project.roster);
+        self.active_character = None;
+        self.known_made = None;
         self.roster.params = project
             .fighters
             .iter()
@@ -20846,7 +21654,22 @@ impl VisionaryApp {
         let mut n_acmd = 0;
         let mut n_calls = 0;
         let mut n_eff = 0;
-        for (fighter, mut fm) in project.fighters {
+        // Base fighters' edits under their names, made characters' under their own keys; the
+        // game's source for either comes from the engine fighter.
+        let owners: Vec<(String, crate::mod_project::FighterMod)> = project
+            .fighters
+            .into_iter()
+            .chain(
+                project
+                    .characters
+                    .into_iter()
+                    .map(|(key, fm)| (key.as_str().to_owned(), fm)),
+            )
+            .collect();
+        for (fighter, mut fm) in owners {
+            let engine = crate::character::CharacterKey::parse(&fighter)
+                .engine_fighter()
+                .to_owned();
             for (move_name, snapshot) in &fm.move_sources {
                 self.move_source_cache
                     .insert(Self::move_key(&fighter, move_name), snapshot.clone());
@@ -20857,10 +21680,10 @@ impl VisionaryApp {
                 // legacy edit can still be replayed live; an unavailable body remains an
                 // explicit source-only limitation in LiveApplyReport.
                 let local_body = if !fm.move_sources.contains_key(move_name) {
-                    self.warm_source_body(&fighter, move_name)
+                    self.warm_source_body(&engine, move_name)
                         .map(|(body, _)| body)
                         .filter(|body| !body.is_empty())
-                        .or_else(|| crate::acmd::cached_script_body(&fighter, move_name))
+                        .or_else(|| crate::acmd::cached_script_body(&engine, move_name))
                 } else {
                     None
                 };
@@ -20880,7 +21703,7 @@ impl VisionaryApp {
                         .map(|snapshot| snapshot.body.clone())
                         .filter(|body| !body.is_empty())
                         .or_else(|| local_body.clone())
-                        .or_else(|| crate::acmd::cached_script_body(&fighter, move_name));
+                        .or_else(|| crate::acmd::cached_script_body(&engine, move_name));
                     if let Some(body) = body {
                         record.hitboxes_pristine =
                             crate::acmd::parse_acmd_script(&body).to_hitboxes();
@@ -21045,6 +21868,11 @@ impl VisionaryApp {
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
+        if !migration_findings.is_empty() {
+            self.state
+                .status
+                .push_str(&format!(" | {}", migration_findings.join(" | ")));
+        }
         // Effect edits and borrowed effects from a saved project have not been sent to the game
         // in this session, so Send edits says so.
         if n_eff > 0 || !self.eff_mods.is_empty() {
@@ -23825,10 +24653,10 @@ impl VisionaryApp {
         let newly_guarded = self
             .current_move_key()
             .and_then(|key| {
-                let (fighter, name) = key.split_once('/')?;
+                let (owner, name) = crate::character::parse_move_key(&key)?;
                 Some(crate::move_nodes::live_steps::newly_guarded_frames(
-                    fighter,
-                    self.move_graphs.get(fighter)?.get(name)?,
+                    owner.engine_fighter(),
+                    self.move_graphs.get(owner.as_str())?.get(name)?,
                     &self.state.source_script,
                 ))
             })
@@ -26603,8 +27431,12 @@ impl VisionaryApp {
                     let allow_live = !self.rebuilding_project_live
                         || self.replay_live_fallback_key.as_deref() == Some(key.as_str());
                     if allow_live {
-                        self.game_link
-                            .latest_run_for(motion, fighter_kind_id(&fighter))
+                        self.game_link.latest_run_for(
+                            motion,
+                            fighter_kind_id(
+                                crate::character::CharacterKey::parse(&fighter).engine_fighter(),
+                            ),
+                        )
                     } else {
                         Vec::new()
                     }
@@ -29545,7 +30377,7 @@ impl VisionaryApp {
                 let Some(name) = motion_name.get(&m) else {
                     continue;
                 };
-                let key = format!("{fighter}/{name}");
+                let key = Self::move_key(&self.owner_spelling(fighter), name);
                 if self.state.effect_call_full.contains_key(&key) {
                     continue;
                 }
@@ -29854,7 +30686,7 @@ impl VisionaryApp {
                             )
                         })
                         .map_or(mv, |m| m.name.clone());
-                    let key = format!("{fighter}/{motion}");
+                    let key = Self::move_key(&self.owner_spelling(&fighter), &motion);
                     if self.state.effect_call_full.contains_key(&key) {
                         continue; // captured/opened already — its uses are listed
                     }
@@ -30036,7 +30868,9 @@ impl VisionaryApp {
                     }
                     // Live swap rule for this other move (needs that move captured in-game).
                     let donor_hash = effect_name_hash(&prompt.donor_name);
-                    if let Some(mname) = u.move_key.split_once('/').map(|(_, m)| m) {
+                    if let Some(mname) =
+                        crate::character::split_move_key(&u.move_key).map(|(_, m)| m)
+                    {
                         let motion = hash40::hash40(&mname.to_lowercase()).0;
                         if let Some(inject) =
                             self.build_effect_inject(&call, Some(motion), Some(donor_hash), 0)
@@ -30682,8 +31516,7 @@ impl VisionaryApp {
             self.build_effect_control_rules(&effects, &pristines, motion);
         // Spawns inside the game's own `if`s never reach the flat list above. A move that no
         // longer has one anywhere stops it for the whole motion.
-        if let Some(graph) = mv_key
-            .split_once('/')
+        if let Some(graph) = crate::character::split_move_key(&mv_key)
             .and_then(|(fighter, name)| self.move_graphs.get(fighter)?.get(name))
         {
             for name in crate::move_nodes::live_steps::removed_spawns(
@@ -32383,6 +33216,7 @@ impl eframe::App for VisionaryApp {
                     self.roster.open = false;
                 }
                 if nodes.clicked() && !self.node_workspace {
+                    self.nodes_back = None;
                     self.node_workspace = true;
                     self.primary_tab = PrimaryEditorTab::Nodes;
                     self.node_editor.refresh_character();
@@ -32423,6 +33257,31 @@ impl eframe::App for VisionaryApp {
                     self.eff_editor.open = false;
                 }
                 ui.separator();
+                // Who the editor pages are open on, and its costumes. Click to switch between
+                // the fighter and the characters made on it.
+                if !self.roster.open {
+                    if let Some(chip) = self.character_chip_text() {
+                        let fighter = self.active_key().map(|key| key.engine_fighter().to_owned());
+                        let mut pick = None;
+                        ui.menu_button(egui::RichText::new(chip).strong(), |ui| {
+                            let (picks, keys) = self.character_picks();
+                            for (row, key) in picks.iter().zip(&keys) {
+                                if Some(key.engine_fighter()) != fighter.as_deref() {
+                                    continue;
+                                }
+                                let open = self.active_key().as_ref() == Some(key);
+                                if ui.selectable_label(open, &row.label).on_hover_text(&row.hover).clicked() {
+                                    pick = Some(key.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if let Some(key) = pick {
+                            self.select_character(key);
+                        }
+                        ui.separator();
+                    }
+                }
 
                 egui::containers::menu::MenuButton::new("File")
                     .config(menu_config.clone())
@@ -32903,7 +33762,40 @@ impl eframe::App for VisionaryApp {
         }
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
-        self.roster.authored_moves = self.roster.replaced_moves(&self.state.edit_log);
+        self.sync_made_characters();
+        // Each made character's own moved edits, for its card.
+        let authored_moves = self
+            .roster
+            .project
+            .authored
+            .iter()
+            .filter_map(|entry| {
+                let key = crate::character::CharacterKey::made(entry.key.clone());
+                let mut moves: BTreeSet<String> = self
+                    .state
+                    .edit_log
+                    .entries
+                    .get(key.as_str())
+                    .map(|moves| moves.keys().cloned().collect())
+                    .unwrap_or_default();
+                moves.extend(
+                    self.move_graphs
+                        .get(key.as_str())
+                        .into_iter()
+                        .flat_map(|graphs| graphs.keys().cloned()),
+                );
+                moves.extend(
+                    self.character_move_keys(&key)
+                        .iter()
+                        .filter_map(|store_key| {
+                            crate::character::split_move_key(store_key)
+                                .map(|(_, name)| name.to_owned())
+                        }),
+                );
+                (!moves.is_empty()).then(|| (entry.key.clone(), moves))
+            })
+            .collect();
+        self.roster.authored_moves = authored_moves;
         // ArcExplorer's export folder is a valid source of base fighter files.
         // Keep it separate from the primary data root so that root retains
         // precedence while partial extractions can fill missing paths.
@@ -35719,7 +36611,7 @@ fn unswitchable_uses(
             found.object.is_some()
                 || !found.script.as_deref().is_some_and(|script| {
                     offered.iter().any(|u| {
-                        u.move_key.split_once('/').is_some_and(|(_, motion)| {
+                        crate::character::split_move_key(&u.move_key).is_some_and(|(_, motion)| {
                             crate::effect_uses::script_is_for_motion(script, motion)
                         })
                     })
@@ -35735,9 +36627,7 @@ fn unswitchable_uses(
 
 /// A spawn the borrow question offers, in plain words: "Up throw, frame 17".
 fn redirect_label(move_key: &str, call: &crate::data::EffectCall) -> String {
-    let motion = move_key
-        .split_once('/')
-        .map_or(move_key, |(_, motion)| motion);
+    let motion = crate::character::split_move_key(move_key).map_or(move_key, |(_, motion)| motion);
     let facing = match crate::data::facing_arm_of(call.guard.as_deref()) {
         Some(true) => ", facing left",
         Some(false) => ", facing right",
@@ -45924,15 +46814,24 @@ mod game_script_save_tests {
             serde_json::to_value(&compiled).unwrap()
         );
         let mut log = crate::data::EditLog::default();
-        log.save_scoped_multi(
+        log.save(
+            "mario",
             "mario",
             "Mario",
             "attack12",
             saved,
             hitboxes.clone(),
             hitboxes,
-            &[2, 3],
         );
+        // A record saved before made characters had their own store, scoped to costumes.
+        let record = log
+            .entries
+            .get_mut("mario")
+            .unwrap()
+            .get_mut("attack12")
+            .unwrap();
+        record.slot_scope = Some(2);
+        record.slot_scopes = vec![3];
         let mut project = crate::mod_project::ModProjectFile::default();
         let fighter = project.fighters.entry("mario".into()).or_default();
         fighter.acmd = log.entries.remove("mario").unwrap();
@@ -46396,6 +47295,93 @@ mod placement_offset_tests {
         assert_eq!(
             super::placement_offset(&impact, impact.offset),
             [0.0, 10.0, 14.0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod move_key_guard_tests {
+    /// Lines of `source` that split a key on '/' by hand.
+    fn raw_splits(source: &str) -> Vec<&str> {
+        let needle = concat!("split_once(", "'/'", ")");
+        source
+            .lines()
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+
+    /// A made character's move keys are `"mario#c08/attack_11"`. Splitting one by hand and
+    /// treating the first half as a fighter asks the game about a fighter named "mario#c08";
+    /// every split goes through `character::parse_move_key` (or its raw form) instead.
+    #[test]
+    fn move_keys_are_split_only_through_parse_move_key() {
+        let source = include_str!("app.rs");
+        let raw = raw_splits(source);
+        // The one allowed split is an effect file path, not a move key.
+        let unexpected: Vec<&&str> = raw
+            .iter()
+            .filter(|line| !line.contains(".and_then(|rest| rest."))
+            .collect();
+        assert!(unexpected.is_empty(), "{unexpected:#?}");
+        assert!(raw.len() <= 1, "{raw:#?}");
+        // The guard reads the routes it requires, so it cannot pass on an empty file.
+        assert!(source.matches("crate::character::parse_move_key(").count() >= 5);
+        assert!(source.matches("crate::character::split_move_key(").count() >= 10);
+    }
+
+    /// The paired positive: the scan finds a hand split when one is there.
+    #[test]
+    fn the_scan_finds_a_hand_split() {
+        let planted = concat!("let (f, m) = key.split_once(", "'/'", ")?;");
+        assert_eq!(raw_splits(planted).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod character_store_tests {
+    use super::{project_owner_mod, rule_move_key};
+
+    #[test]
+    fn rule_keys_drop_their_family_but_keep_a_made_characters_key() {
+        assert_eq!(rule_move_key("mario/attack_11#hurt"), "mario/attack_11");
+        assert_eq!(
+            rule_move_key("mario#c08/attack_11#hurt"),
+            "mario#c08/attack_11"
+        );
+        assert_eq!(rule_move_key("mario#c08/attack_11"), "mario#c08/attack_11");
+    }
+
+    /// A made character's edits are saved in its own store, a base fighter's under its name,
+    /// and a character that is no longer in the project gets no store at all.
+    #[test]
+    fn edits_are_saved_under_their_owner() {
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let mut project = crate::mod_project::ModProjectFile::default();
+        project_owner_mod(&mut project, &roster, "mario")
+            .unwrap()
+            .display = "Mario".into();
+        project_owner_mod(&mut project, &roster, "mario#c08")
+            .unwrap()
+            .display = "Vision".into();
+        assert!(project_owner_mod(&mut project, &roster, "mario#c16").is_none());
+        assert_eq!(project.fighters.keys().collect::<Vec<_>>(), ["mario"]);
+        assert_eq!(
+            project
+                .characters
+                .keys()
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>(),
+            ["mario#c08"]
         );
     }
 }

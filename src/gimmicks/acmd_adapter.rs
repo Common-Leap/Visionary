@@ -304,6 +304,7 @@ mod tests {
             version: crate::mod_project::PROJECT_VERSION,
             name: "adapter-placement".into(),
             fighters: std::collections::HashMap::from([("mario".into(), fighter)]),
+            characters: Default::default(),
             roster: RosterMod::default(),
         };
         let generated = crate::mod_export::source_project(&project)

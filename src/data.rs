@@ -7379,38 +7379,34 @@ impl EditRecord {
     }
 }
 
+/// The costume scope a re-saved record carries: exactly the one it had.
+pub fn kept_scope(existing: Option<&EditRecord>) -> (Option<u8>, Vec<u8>) {
+    existing.map_or((None, Vec::new()), |record| {
+        (record.slot_scope, record.slot_scopes.clone())
+    })
+}
+
 impl EditLog {
-    /// Record an edit scoped to every slot in `slots` (empty = every costume).
-    /// A re-save with an empty scope keeps the existing scopes: widening to
-    /// every costume must be explicit, since an unscoped save of a move that
-    /// was scoped would silently widen it to every costume of the donor, which
-    /// is the one direction of this change nobody would notice until they
-    /// played the donor.
+    /// Record an edit under `owner`, the character it belongs to (a base fighter's name or a
+    /// made character's key). `fighter` is the engine fighter written into the record.
+    ///
+    /// Saving never changes a record's costume scope. An existing record keeps the scope it has,
+    /// and a new one has none: a made character's edits live under its own key instead of being
+    /// scoped on its donor. Re-scoping on save is how browsing a donor's move while a made
+    /// character was the edit target once moved the donor's edit onto that character.
     #[allow(clippy::too_many_arguments)]
-    pub fn save_scoped_multi(
+    pub fn save(
         &mut self,
+        owner: &str,
         fighter: &str,
         fighter_display: &str,
         move_name: &str,
         script: AcmdScript,
         hitboxes_pristine: Vec<Hitbox>,
         hitboxes: Vec<Hitbox>,
-        slots: &[u8],
     ) {
-        let moves = self.entries.entry(fighter.to_string()).or_default();
-        let (slot_scope, slot_scopes) = if slots.is_empty() {
-            match moves.get(move_name) {
-                Some(existing) => (existing.slot_scope, existing.slot_scopes.clone()),
-                None => (None, Vec::new()),
-            }
-        } else {
-            let mut sorted: Vec<u8> = slots.to_vec();
-            sorted.sort_unstable();
-            sorted.dedup();
-            let primary = sorted.first().copied();
-            let rest: Vec<u8> = sorted.into_iter().skip(1).collect();
-            (primary, rest)
-        };
+        let moves = self.entries.entry(owner.to_string()).or_default();
+        let (slot_scope, slot_scopes) = kept_scope(moves.get(move_name));
         moves.insert(
             move_name.to_string(),
             EditRecord {
@@ -11927,5 +11923,102 @@ mod tests {
                 }
             ]
         ));
+    }
+}
+
+#[cfg(test)]
+mod save_scope_tests {
+    use super::*;
+
+    fn scoped_record(scopes: (Option<u8>, Vec<u8>)) -> EditRecord {
+        EditRecord {
+            fighter: "mario".into(),
+            fighter_display: "Mario".into(),
+            move_name: "attack_11".into(),
+            script: AcmdScript::default(),
+            hitboxes_pristine: Vec::new(),
+            hitboxes: Vec::new(),
+            slot_scope: scopes.0,
+            slot_scopes: scopes.1,
+        }
+    }
+
+    /// Browsing a donor's move while another character is open re-saves the move every frame.
+    /// The save must not move the record to anyone's costumes.
+    #[test]
+    fn saving_keeps_an_unscoped_record_unscoped() {
+        let mut log = EditLog::default();
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        let record = &log.entries["mario"]["attack_11"];
+        assert!(record.effective_scopes().is_empty());
+        assert_eq!(record.hitboxes.len(), 1, "the save itself still landed");
+    }
+
+    /// The paired positive: a record that already has a scope keeps exactly that scope, so the
+    /// test above is not passing because scopes are always cleared.
+    #[test]
+    fn saving_keeps_an_existing_scope_exactly() {
+        let mut log = EditLog::default();
+        log.entries
+            .entry("mario".into())
+            .or_default()
+            .insert("attack_11".into(), scoped_record((Some(8), vec![9, 10])));
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        let record = &log.entries["mario"]["attack_11"];
+        assert_eq!(record.effective_scopes(), vec![8, 9, 10]);
+        assert_eq!(record.hitboxes.len(), 1);
+        assert_eq!(kept_scope(None), (None, Vec::new()));
+    }
+
+    /// A made character's edit lives under its own key and leaves the donor's record alone.
+    #[test]
+    fn a_made_character_saves_beside_its_donor() {
+        let mut log = EditLog::default();
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        log.save(
+            "mario#c08",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        assert!(log.entries["mario"]["attack_11"].hitboxes.is_empty());
+        assert_eq!(log.entries["mario#c08"]["attack_11"].hitboxes.len(), 1);
+        assert_eq!(log.entries["mario#c08"]["attack_11"].fighter, "mario");
     }
 }

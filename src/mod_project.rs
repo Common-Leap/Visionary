@@ -41,6 +41,13 @@ pub struct ModProjectFile {
     /// fighter name (e.g. "mario") → all edits for that fighter
     #[serde(default)]
     pub fighters: HashMap<String, FighterMod>,
+    /// Characters made in Visionary, by roster key ("mario#c08") → that character's own move
+    /// edits. A made character is its own character: these never apply to its donor's costumes,
+    /// and the donor's edits in `fighters` never apply to its costumes. `fighters` holds engine
+    /// fighters only. Left out of the file when empty, so a project with no made characters is
+    /// written exactly as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub characters: BTreeMap<crate::roster::RosterKey, FighterMod>,
     /// Character select screen edits: ordering, names, hidden entries, and entries this
     /// project created. Added in v3.
     #[serde(default, skip_serializing_if = "RosterMod::is_empty")]
@@ -78,6 +85,7 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
         version: project.version,
         name: project.name.clone(),
         fighters: HashMap::new(),
+        characters: BTreeMap::new(),
         // Roster edits are dropped here for the same reason EFF records are: a Smashline
         // source export cannot carry a character select screen. They ship through the mod
         // folder path instead.
@@ -91,8 +99,7 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
     let all_retained_effects = match scope {
         AcmdProjectScope::All => {
             let mut retained = project
-                .fighters
-                .values()
+                .all_move_edits()
                 .flat_map(|fighter| fighter.effect_calls_full.values())
                 .flat_map(|calls| calls.iter())
                 .filter(|call| !call.disabled)
@@ -100,8 +107,7 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
                 .filter(|name| !name.is_empty())
                 .collect::<HashSet<_>>();
             if project
-                .fighters
-                .values()
+                .all_move_edits()
                 .any(|fighter| has_structured_effects(fighter, None))
             {
                 retained.extend(all_live_tweak_names(project));
@@ -119,12 +125,27 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
                     scoped_fighter(fighter, None, &all_retained_effects),
                 );
             }
+            for (key, character) in &project.characters {
+                scoped.characters.insert(
+                    key.clone(),
+                    scoped_fighter(character, None, &all_retained_effects),
+                );
+            }
+            // A made character's arm needs its authored entry for its costumes.
+            scoped.roster.authored = project.roster.authored.clone();
         }
         AcmdProjectScope::Move {
             fighter: selected_fighter,
             move_name: selected_move,
         } => {
-            if let Some(fighter) = project.fighters.get(selected_fighter) {
+            // `fighter` is a character key: a base fighter's name or a made character's key.
+            let character = crate::character::CharacterKey::parse(selected_fighter);
+            let source = if character.is_made() {
+                project.characters.get(character.roster_key())
+            } else {
+                project.fighters.get(selected_fighter)
+            };
+            if let Some(fighter) = source {
                 let structured_effects = has_structured_effects(fighter, Some(selected_move));
                 let retained_effects = fighter
                     .effect_calls_full
@@ -138,14 +159,26 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
                 let mut selected = scoped_fighter(fighter, Some(selected_move), &retained_effects);
                 if structured_effects {
                     selected.live_tweaks = project
-                        .fighters
-                        .values()
+                        .all_move_edits()
                         .flat_map(|fighter| fighter.live_tweaks.iter().cloned())
                         .collect();
                 }
-                scoped
-                    .fighters
-                    .insert(selected_fighter.to_string(), selected);
+                if character.is_made() {
+                    scoped
+                        .characters
+                        .insert(character.roster_key().clone(), selected);
+                    scoped.roster.authored = project
+                        .roster
+                        .authored
+                        .iter()
+                        .filter(|entry| &entry.key == character.roster_key())
+                        .cloned()
+                        .collect();
+                } else {
+                    scoped
+                        .fighters
+                        .insert(selected_fighter.to_string(), selected);
+                }
             }
         }
     }
@@ -169,8 +202,7 @@ fn has_structured_effects(fighter: &FighterMod, selected_move: Option<&str>) -> 
 
 fn all_live_tweak_names(project: &ModProjectFile) -> HashSet<String> {
     project
-        .fighters
-        .values()
+        .all_move_edits()
         .flat_map(|fighter| fighter.live_tweaks.iter())
         .map(|tweak| tweak.effect_name.to_ascii_lowercase())
         .collect()
@@ -223,12 +255,19 @@ fn scope_move_map<V: Clone>(
         .collect()
 }
 
+fn move_entry<V>(from: &mut HashMap<String, V>, to: &mut HashMap<String, V>, move_name: &str) {
+    if let Some(value) = from.remove(move_name) {
+        to.insert(move_name.to_owned(), value);
+    }
+}
+
 impl Default for ModProjectFile {
     fn default() -> Self {
         Self {
             version: PROJECT_VERSION,
             name: "unnamed_mod".into(),
             fighters: HashMap::new(),
+            characters: BTreeMap::new(),
             roster: RosterMod::default(),
         }
     }
@@ -240,7 +279,7 @@ impl ModProjectFile {
     /// still count as empty — otherwise "No edits to export yet" turns into an export that
     /// produces no files.
     pub fn is_empty(&self) -> bool {
-        self.fighters.values().all(|f| {
+        self.all_move_edits().all(|f| {
             f.acmd.is_empty()
                 && f.effect_calls.values().all(|v| v.is_empty())
                 && f.effect_calls_full.values().all(|v| v.is_empty())
@@ -258,6 +297,134 @@ impl ModProjectFile {
                 && f.move_graphs.is_empty()
                 && f.controller_charts.is_empty()
         }) && self.roster.is_empty()
+    }
+
+    /// Every fighter's and every made character's edits. Anything that asks a question of all
+    /// of a project's edits reads through this, so a made character's edits are never left out
+    /// of a check written when only fighters held edits.
+    pub fn all_move_edits(&self) -> impl Iterator<Item = &FighterMod> {
+        self.fighters.values().chain(self.characters.values())
+    }
+
+    /// Move edits saved before made characters had their own store: a `game_` record in the
+    /// donor's edits, scoped to costumes. One whose costumes are exactly a made character's
+    /// moves into that character's store, unscoped, with the same move's sound, expression and
+    /// effect edits, which the old export gated with it. One that only partly matches stays
+    /// where it is, still exported behind its own gate, and is reported. Returns the reports.
+    pub fn migrate_scoped_records(&mut self) -> Vec<String> {
+        let mut findings = Vec::new();
+        let authored = self.roster.authored.clone();
+        let mut donors: Vec<String> = self.fighters.keys().cloned().collect();
+        donors.sort();
+        for donor in donors {
+            let Some(fighter) = self.fighters.get_mut(&donor) else {
+                continue;
+            };
+            let mut scoped: Vec<(String, Vec<u8>)> = fighter
+                .acmd
+                .iter()
+                .map(|(move_name, record)| (move_name.clone(), record.effective_scopes()))
+                .filter(|(_, scopes)| !scopes.is_empty())
+                .collect();
+            scoped.sort();
+            let mut moved: Vec<(crate::roster::RosterKey, String)> = Vec::new();
+            for (move_name, scopes) in scoped {
+                let owner = authored.iter().find(|entry| {
+                    entry.donor.eq_ignore_ascii_case(&donor) && entry.all_slots() == scopes
+                });
+                match owner {
+                    Some(entry) => moved.push((entry.key.clone(), move_name)),
+                    None => findings.push(format!(
+                        "{donor}/{move_name} is set to costumes {} that match none of this \
+                         project's characters; it stays limited to those costumes",
+                        crate::character::slot_range(&scopes).unwrap_or_default()
+                    )),
+                }
+            }
+            for (key, move_name) in moved {
+                let fighter = self.fighters.get_mut(&donor).expect("checked above");
+                let mut taken = FighterMod {
+                    display: fighter.display.clone(),
+                    ..FighterMod::default()
+                };
+                if let Some(mut record) = fighter.acmd.remove(&move_name) {
+                    record.slot_scope = None;
+                    record.slot_scopes.clear();
+                    taken.acmd.insert(move_name.clone(), record);
+                }
+                move_entry(
+                    &mut fighter.effect_calls,
+                    &mut taken.effect_calls,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.effect_calls_full,
+                    &mut taken.effect_calls_full,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.effect_scripts,
+                    &mut taken.effect_scripts,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.effect_dropped_lines,
+                    &mut taken.effect_dropped_lines,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.effect_frame_residue,
+                    &mut taken.effect_frame_residue,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.sound_scripts,
+                    &mut taken.sound_scripts,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.expression_scripts,
+                    &mut taken.expression_scripts,
+                    &move_name,
+                );
+                move_entry(
+                    &mut fighter.capture_branch_warnings,
+                    &mut taken.capture_branch_warnings,
+                    &move_name,
+                );
+                // A node graph saved for the move expanded into that same scoped record, so it
+                // was the made character's too.
+                if let Some(graph) = fighter.move_graphs.remove(&move_name) {
+                    taken.move_graphs.insert(move_name.clone(), graph);
+                }
+                // The game's own version stays with the donor too: both arms of a gate read it.
+                if let Some(source) = fighter.move_sources.get(&move_name) {
+                    taken.move_sources.insert(move_name.clone(), source.clone());
+                }
+                let target = self.characters.entry(key).or_default();
+                if target.display.is_empty() {
+                    target.display = taken.display.clone();
+                }
+                target.acmd.extend(taken.acmd);
+                target.effect_calls.extend(taken.effect_calls);
+                target.effect_calls_full.extend(taken.effect_calls_full);
+                target.effect_scripts.extend(taken.effect_scripts);
+                target
+                    .effect_dropped_lines
+                    .extend(taken.effect_dropped_lines);
+                target
+                    .effect_frame_residue
+                    .extend(taken.effect_frame_residue);
+                target.sound_scripts.extend(taken.sound_scripts);
+                target.expression_scripts.extend(taken.expression_scripts);
+                target
+                    .capture_branch_warnings
+                    .extend(taken.capture_branch_warnings);
+                target.move_sources.extend(taken.move_sources);
+                target.move_graphs.extend(taken.move_graphs);
+            }
+        }
+        findings
     }
 
     /// Bring a just-loaded project up to the current version.
@@ -1747,5 +1914,68 @@ mod older_project_tests {
         }
         println!("checked {checked} older projects");
         assert!(checked > 0);
+    }
+}
+
+#[cfg(test)]
+mod made_character_tests {
+    use super::*;
+
+    fn with_vision_edit() -> ModProjectFile {
+        let mut project = ModProjectFile::default();
+        project.roster.authored.push(AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: Vec::new(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        project
+            .characters
+            .entry(crate::roster::RosterKey::slot("mario", 8))
+            .or_default()
+            .sound_scripts
+            .insert("attack_11".into(), crate::data::AcmdScript::default());
+        project
+    }
+
+    /// A project whose only edit is a made character's is not empty: it exports.
+    #[test]
+    fn a_made_characters_edit_makes_the_project_non_empty() {
+        let mut project = with_vision_edit();
+        let authored = std::mem::take(&mut project.roster.authored);
+        assert!(!project.is_empty());
+        project.characters.clear();
+        assert!(project.is_empty());
+        project.roster.authored = authored;
+        assert!(
+            !project.is_empty(),
+            "the roster entry alone is still an edit"
+        );
+    }
+
+    /// One move of a made character exports with that character and its costumes; a whole
+    /// project keeps every character.
+    #[test]
+    fn acmd_scopes_keep_made_characters() {
+        let project = with_vision_edit();
+        let one = scope_acmd_project(
+            &project,
+            AcmdProjectScope::Move {
+                fighter: "mario#c08",
+                move_name: "attack_11",
+            },
+        );
+        assert!(one.fighters.is_empty());
+        assert!(one.characters[&crate::roster::RosterKey::slot("mario", 8)]
+            .sound_scripts
+            .contains_key("attack_11"));
+        assert_eq!(one.roster.authored.len(), 1);
+        let all = scope_acmd_project(&project, AcmdProjectScope::All);
+        assert_eq!(all.characters.len(), 1);
+        assert_eq!(all.roster.authored.len(), 1);
     }
 }

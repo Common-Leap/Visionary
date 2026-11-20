@@ -25,6 +25,9 @@ pub struct CharacterContext {
     pub fighter: String,
     pub name: String,
     pub costume_slots: Vec<u8>,
+    /// The made character picked here, when it is one. The app makes it the character being
+    /// edited, so every page agrees on who is open.
+    pub character: Option<crate::roster::RosterKey>,
 }
 
 impl CharacterContext {
@@ -33,6 +36,7 @@ impl CharacterContext {
             fighter: fighter.to_string(),
             name: name.to_string(),
             costume_slots,
+            character: None,
         }
     }
 }
@@ -44,6 +48,13 @@ fn costume_scope_ui(
     roots: &[PathBuf],
     behaviors: &mut BTreeMap<String, BehaviorGraph>,
 ) {
+    // A made character's gimmick runs on its own costumes: a new one starts limited to them.
+    if !context.costume_slots.is_empty() {
+        let graph = behaviors.entry(context.fighter.clone()).or_default();
+        if graph.costumes.is_empty() && graph.is_empty() {
+            graph.costumes = context.costume_slots.clone();
+        }
+    }
     let current = behaviors
         .get(&context.fighter)
         .map(|graph| graph.costumes.clone())
@@ -287,14 +298,10 @@ impl GimmicksEditor {
         fighter: &str,
         name: &str,
         authored: &[crate::mod_project::AuthoredEntry],
-        suggested_slots: &[u8],
+        active: Option<&crate::roster::RosterKey>,
     ) -> CharacterContext {
-        if self.fighter != fighter {
-            self.character = authored
-                .iter()
-                .find(|entry| entry.donor == fighter && entry.all_slots() == suggested_slots)
-                .map(|entry| entry.key.clone());
-        }
+        // The character open in the editor is the one shown here.
+        self.character = active.cloned();
         if self.character.as_ref().is_some_and(|key| {
             !authored
                 .iter()
@@ -326,11 +333,14 @@ impl GimmicksEditor {
             .character
             .as_ref()
             .and_then(|key| authored.iter().find(|entry| &entry.key == key));
-        CharacterContext::new(
-            fighter,
-            selected.map_or(name, |entry| entry.display_name.as_str()),
-            selected.map_or_else(Vec::new, |entry| entry.all_slots()),
-        )
+        CharacterContext {
+            character: selected.map(|entry| entry.key.clone()),
+            ..CharacterContext::new(
+                fighter,
+                selected.map_or(name, |entry| entry.display_name.as_str()),
+                selected.map_or_else(Vec::new, |entry| entry.all_slots()),
+            )
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, context: &CharacterContext, mut data: EditorData<'_>) {

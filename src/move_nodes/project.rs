@@ -338,6 +338,33 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
             }
         }
     }
+    for (key, data) in &project.characters {
+        // A made character's store carries its moves only. Fighter-wide values, gimmicks and
+        // the effect file stay with the engine fighter; anything here would be saved and never
+        // exported, so it is refused rather than dropped.
+        if !data.params.is_empty()
+            || !data.behavior.is_unset()
+            || !data.meters.is_empty()
+            || !data.controller_charts.is_empty()
+            || data.eff.is_some()
+        {
+            errors.push(NodeError {
+                subject: format!("character {key}"),
+                reason: "fighter values, gimmicks and effect files belong to the base fighter, not to a made character's moves".into(),
+            });
+        }
+        for (move_name, graph) in &data.move_graphs {
+            if let Err(reason) = super::block_clipboard::preflight_graph(graph) {
+                errors.push(NodeError {
+                    subject: format!(
+                        "character {key} move {}",
+                        move_name.chars().take(64).collect::<String>()
+                    ),
+                    reason,
+                });
+            }
+        }
+    }
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -345,6 +372,62 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
 
     let mut fighter_names = project.fighters.keys().collect::<Vec<_>>();
     fighter_names.sort();
+
+    // A made character's graphs compile as its engine fighter into its own store. Gimmick
+    // receivers are the engine fighter's, since its behavior is.
+    for (key, source_character) in &project.characters {
+        if source_character.move_graphs.is_empty() {
+            continue;
+        }
+        let character = crate::character::CharacterKey::made(key.clone());
+        let fighter_name = character.engine_fighter();
+        let start = errors.len();
+        validate_identifier(fighter_name, "fighter", &mut errors);
+        for move_name in source_character.move_graphs.keys() {
+            validate_identifier(move_name, &format!("character {key} move"), &mut errors);
+        }
+        if errors.len() != start {
+            continue;
+        }
+        let empty = FighterMod::default();
+        let engine = project.fighters.get(fighter_name).unwrap_or(&empty);
+        let compiled = match compile_recipes_with_controllers_internal(
+            fighter_name,
+            &engine.behavior,
+            &engine.controller_charts,
+            &source_character.move_graphs,
+            has_persisted_chart_event(engine),
+        ) {
+            Ok(compiled) => compiled,
+            Err(compile_errors) => {
+                errors.extend(compile_errors);
+                continue;
+            }
+        };
+        let Some(output) = expanded.characters.get_mut(key) else {
+            continue;
+        };
+        for (move_name, tracks) in compiled.tracks {
+            let mut generated_categories = BTreeSet::new();
+            for (track, script) in tracks {
+                let category = match track {
+                    Track::Game => "game",
+                    Track::Sound => "sound",
+                    Track::Expression => "expression",
+                    Track::Effect => "effect",
+                };
+                if !generated_categories.insert(category) {
+                    errors.push(NodeError {
+                        subject: format!("character {key} move {move_name}"),
+                        reason: format!("compiler produced more than one {category} track"),
+                    });
+                    continue;
+                }
+                merge_track(output, fighter_name, &move_name, track, script, &mut errors);
+            }
+        }
+        output.move_graphs.clear();
+    }
 
     for fighter_name in fighter_names {
         let Some(source_fighter) = project.fighters.get(fighter_name) else {

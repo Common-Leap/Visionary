@@ -10,6 +10,7 @@ mod asset_snapshots;
 mod capture_hitbox;
 mod carrier_motion;
 mod carrier_support;
+mod character;
 mod credits;
 mod data;
 mod eff_attrs;
