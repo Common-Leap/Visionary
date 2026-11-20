@@ -356,13 +356,32 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, colour: Color32) {
     ui.label(RichText::new(text).color(colour).strong());
 }
 
-/// A page button: solid in `colour` for the main action, outlined for the rest.
+/// A page button: solid in `colour` for the main action, outlined for the rest. Every state
+/// draws the same outline width with no growth, so hovering only recolours it: egui sizes a
+/// button's padding by its state's outline, and an outline set on top moved it on hover.
 pub(crate) fn act(ui: &mut Ui, look: Look, label: &str, colour: Option<Color32>) -> egui::Response {
-    let button = match colour {
-        Some(colour) => egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(18, 18, 22))).fill(colour),
-        None => egui::Button::new(RichText::new(label).color(look.text)).fill(look.sunk).stroke(egui::Stroke::new(1.0, look.edge)),
-    };
-    ui.add(button.corner_radius(6.0).min_size(egui::vec2(0.0, 28.0)))
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        let (fill, text) = match colour {
+            Some(colour) => (colour, Color32::from_rgb(18, 18, 22)),
+            None => (look.sunk, look.text),
+        };
+        for (state, edge) in [
+            (&mut widgets.inactive, colour.unwrap_or(look.edge)),
+            (&mut widgets.hovered, look.accent),
+            (&mut widgets.active, look.accent),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_fill = fill;
+            state.bg_stroke = egui::Stroke::new(1.5, edge);
+            state.expansion = 0.0;
+            state.corner_radius = egui::CornerRadius::same(6);
+        }
+        let label = RichText::new(label).color(text);
+        let label = if colour.is_some() { label.strong() } else { label };
+        ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 28.0)))
+    })
+    .inner
 }
 
 #[cfg(test)]

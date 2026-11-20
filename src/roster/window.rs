@@ -10,6 +10,8 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use egui::{Color32, RichText, Ui};
 
+use crate::ui::{act, look};
+
 use super::css_view::CssView;
 use super::index::RosterIndex;
 use super::library::{self, ModLibrary, ModSource, PreparedMod, ProviderId};
@@ -596,7 +598,7 @@ impl RosterWindow {
             if let Some(small) = style.text_styles.get_mut(&egui::TextStyle::Small) {
                 small.size = small.size.max(13.0);
             }
-            let look = crate::ui::look(ui);
+            let look = look(ui);
             let style = ui.style_mut();
             style.visuals.weak_text_color = Some(look.dim);
             style.visuals.widgets.noninteractive.fg_stroke.color = look.text;
@@ -609,7 +611,7 @@ impl RosterWindow {
         if self.tab == RosterTab::Project {
             return;
         }
-        let look = crate::ui::look(ui);
+        let look = look(ui);
         ui.painter().rect_filled(ui.max_rect(), 0.0, look.page);
         ui.add_space(4.0);
         self.draw_top_bar(ui, look);
@@ -684,7 +686,7 @@ impl RosterWindow {
     /// The page title, a way back to the project, and the other pages.
     fn draw_top_bar(&mut self, ui: &mut Ui, look: crate::ui::Look) {
         ui.horizontal_wrapped(|ui| {
-            if crate::ui::act(ui, look, "Project", None).clicked() {
+            if act(ui, look, "Project", None).clicked() {
                 self.tab = RosterTab::Project;
             }
             ui.add_space(8.0);
@@ -698,7 +700,7 @@ impl RosterWindow {
                 if let Some(n) = tab.badge_count(self) {
                     text.push_str(&format!(" ({n})"));
                 }
-                if crate::ui::act(ui, look, &text, None).clicked() {
+                if act(ui, look, &text, None).clicked() {
                     self.tab = tab;
                 }
             }
@@ -787,23 +789,17 @@ impl RosterWindow {
     // ── Library tab ─────────────────────────────────────────────────────────
 
     fn draw_library(&mut self, ui: &mut Ui) {
+        let look = look(ui);
         ui.horizontal(|ui| {
-            if ui
-                .button("Add mod folder")
-                .on_hover_text(
-                    "A folder with fighter/, effect/ or ui/ in it, or one that holds such a folder",
-                )
+            if act(ui, look, "Add mod folder", Some(look.accent))
+                .on_hover_text("A folder with fighter, effect or ui in it, or one that holds such a folder")
                 .clicked()
             {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Add mod folder")
-                    .pick_folder()
-                {
+                if let Some(path) = rfd::FileDialog::new().set_title("Add mod folder").pick_folder() {
                     self.start_import(vec![path]);
                 }
             }
-            if ui
-                .button("Add mod archives")
+            if act(ui, look, "Add mod archives", None)
                 .on_hover_text(".zip or .7z files; Visionary unpacks them for you")
                 .clicked()
             {
@@ -816,47 +812,22 @@ impl RosterWindow {
                 }
             }
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
         if let Some(job) = &self.import {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Importing {} of {}. {}",
-                                    job.done + 1,
-                                    job.total,
-                                    job.current
-                                ))
-                                .small()
-                                .strong(),
-                            );
-                            let frac = if job.total > 0 {
-                                (job.done as f32) / job.total as f32
-                            } else {
-                                0.0
-                            };
-                            ui.add(
-                                egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-                                    .desired_width(ui.available_width().min(320.0))
-                                    .desired_height(4.0),
-                            );
-                        });
-                    });
-                });
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new(format!("Adding {} of {}: {}", job.done + 1, job.total, job.current)).strong().color(look.text));
+            });
+            let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).desired_width(ui.available_width().min(360.0)).desired_height(6.0));
+            ui.add_space(8.0);
         }
 
         self.draw_notes(ui);
 
         if self.library.is_empty() {
-            ui.weak("No mods added yet. Mods you add here show up in the fighter list with their skins and effects.");
-            // Still surface stale overrides even with empty library so hidden project state is not invisible
+            ui.label(RichText::new("No mods added yet. Mods you add here show up in the fighter list with their skins and effects.").color(look.dim));
             self.draw_stale_overrides(ui);
             return;
         }
@@ -864,210 +835,125 @@ impl RosterWindow {
         self.draw_stale_overrides(ui);
         self.draw_conflicts(ui);
         ui.add_space(6.0);
-
-        ui.label(
-            RichText::new("When two mods change the same file, the lower one in the list wins.")
-                .small()
-                .weak(),
-        );
-        ui.add_space(4.0);
+        ui.label(RichText::new("Load order: when two mods change the same file, the one lower in the list wins.").color(look.dim));
+        ui.add_space(6.0);
         self.draw_mod_rows(ui);
     }
 
     fn draw_mod_rows(&mut self, ui: &mut Ui) {
+        let look = look(ui);
         let ids: Vec<ProviderId> = self.library.mods.iter().map(|entry| entry.id).collect();
+        let count = ids.len();
         let mut changed = false;
         let mut remove: Option<ProviderId> = None;
         let mut move_later: Option<ProviderId> = None;
         let mut move_earlier: Option<ProviderId> = None;
 
-        for id in ids {
+        for (place, id) in ids.into_iter().enumerate() {
             let Some(index) = self.library.mods.iter().position(|entry| entry.id == id) else {
                 continue;
             };
             let is_enabled = self.library.mods[index].enabled;
-            // Disabled mods use the theme's faint background so they read as muted
-            // without a custom grey; enabled uses the standard group frame.
-            let mut frame = egui::Frame::group(ui.style());
-            if !is_enabled {
-                frame = frame.fill(ui.visuals().faint_bg_color.gamma_multiply(0.6));
-            }
-            frame
-                .inner_margin(egui::Margin::symmetric(10, 8))
+            egui::Frame::new()
+                .fill(if is_enabled { look.card } else { look.sunk })
+                .stroke(egui::Stroke::new(1.5, if is_enabled { look.accent } else { look.edge }))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        let entry = &mut self.library.mods[index];
-                        let mut enabled = entry.enabled;
-                        if ui.checkbox(&mut enabled, "").on_hover_text("Enable / disable this mod").changed() {
-                            entry.enabled = enabled;
+                        ui.label(RichText::new(format!("{}", place + 1)).size(20.0).strong().color(look.dim));
+                        ui.add_space(6.0);
+                        let (word, colour) = if is_enabled { ("On", Some(Color32::from_rgb(80, 220, 120))) } else { ("Off", None) };
+                        if act(ui, look, word, colour).on_hover_text("Turn this mod on or off").clicked() {
+                            self.library.mods[index].enabled = !is_enabled;
                             changed = true;
                         }
-
+                        ui.add_space(6.0);
                         let renaming = matches!(&self.rename, Some((rid, _)) if *rid == id);
-                        if renaming {
-                            if let Some((_, buffer)) = &mut self.rename {
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(buffer)
-                                        .desired_width(160.0)
-                                        .hint_text("mod name"),
-                                );
-                                if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    let name = buffer.trim().to_string();
-                                    if !name.is_empty() {
-                                        self.library.mods[index].name = name;
-                                        changed = true;
+                        ui.vertical(|ui| {
+                            if renaming {
+                                if let Some((_, buffer)) = &mut self.rename {
+                                    let response = ui.add(egui::TextEdit::singleline(buffer).desired_width(260.0).hint_text("Mod name"));
+                                    if response.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        let name = buffer.trim().to_string();
+                                        if !name.is_empty() {
+                                            self.library.mods[index].name = name;
+                                            changed = true;
+                                        }
+                                        self.rename = None;
                                     }
-                                    self.rename = None;
+                                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                        self.rename = None;
+                                    }
                                 }
-                                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                    self.rename = None;
+                            } else {
+                                let entry = &self.library.mods[index];
+                                let name = ui.add(egui::Label::new(RichText::new(&entry.name).size(17.0).strong().color(look.text)).sense(egui::Sense::click()));
+                                if name.on_hover_text("Click to rename").clicked() {
+                                    self.rename = Some((id, entry.name.clone()));
                                 }
                             }
-                        } else {
-                            let entry = &self.library.mods[index];
-                            let label = ui.selectable_label(false, RichText::new(&entry.name).strong());
-                            if label.on_hover_text("Click to rename").clicked() {
-                                self.rename = Some((id, entry.name.clone()));
-                            }
-                        }
-
-                        let entry = &self.library.mods[index];
-                        ui.label(
-                            RichText::new(entry.summary())
-                                .small()
-                                .weak(),
-                        );
-
+                            ui.label(RichText::new(self.library.mods[index].summary()).color(look.dim));
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button(RichText::new("Remove").small())
-                                .on_hover_text("Remove this mod from the library")
-                                .clicked()
-                            {
+                            if act(ui, look, "Remove", None).on_hover_text("Take this mod out of the list").clicked() {
                                 remove = Some(id);
                             }
-                            ui.add_space(4.0);
-                            if ui
-                                .add_enabled(
-                                    index + 1 < self.library.mods.len(),
-                                    egui::Button::new(RichText::new(" ▼ ").small()),
-                                )
-                                .on_hover_text("Later in load order. Wins more conflicts")
-                                .clicked()
-                            {
+                            let expanded = self.expanded == Some(id);
+                            if act(ui, look, if expanded { "Hide files" } else { "Files" }, None).clicked() {
+                                self.expanded = (!expanded).then_some(id);
+                            }
+                            if place + 1 < count && act(ui, look, "Down", None).on_hover_text("Later in the load order: wins more").clicked() {
                                 move_later = Some(id);
                             }
-                            if ui
-                                .add_enabled(index > 0, egui::Button::new(RichText::new(" ▲ ").small()))
-                                .on_hover_text("Earlier in load order. Wins fewer conflicts")
-                                .clicked()
-                            {
+                            if place > 0 && act(ui, look, "Up", None).on_hover_text("Earlier in the load order: wins less").clicked() {
                                 move_earlier = Some(id);
-                            }
-                            if !is_enabled {
-                                ui.colored_label(Color32::from_rgb(180, 160, 120), RichText::new("disabled").small());
                             }
                         });
                     });
 
                     let entry = &self.library.mods[index];
-
-                    // Safety-critical and always visible: a shipped plugin
-                    // means its movesets read as vanilla in the editor.
+                    // Always visible: a shipped plugin means its movesets read as the game's.
                     if entry.ships_plugin() {
-                        ui.add_space(2.0);
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Has a compiled plugin ({}). The editor cannot read it, so its moves show as the game's.",
+                                entry.manifest.plugins.join(", ")
+                            ))
+                            .color(Color32::from_rgb(240, 190, 90)),
+                        );
+                    }
+                    if self.expanded != Some(id) {
+                        return;
+                    }
+                    ui.add_space(6.0);
+                    if !matches!(entry.detection, library::RootDetection::AsGiven) {
+                        ui.label(RichText::new(format!("Mod folder: {}", entry.detection.describe())).color(look.dim));
+                    }
+                    for (fighter, provision) in &entry.manifest.fighters {
+                        let slots = provision.slots.iter().map(|slot| format!("c{slot:02}")).collect::<Vec<_>>().join(", ");
                         ui.horizontal(|ui| {
-                            ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
-                            ui.label(
-                                RichText::new(format!(
-                                    "Ships a compiled plugin ({}). The editor cannot read it, so its movesets appear as vanilla.",
-                                    entry.manifest.plugins.join(", ")
-                                ))
-                                .small()
-                                .weak(),
-                            );
+                            ui.label(RichText::new(fighter).strong().color(look.text));
+                            ui.label(RichText::new(slots).color(look.dim));
                         });
                     }
-
-                    // Everything else about the mod — root guess, fighter
-                    // list, ignored files, file list — lives behind one
-                    // expander so the load-order list scans as one row per
-                    // mod instead of a paragraph each.
+                    if entry.manifest.unrecognized > 0 {
+                        ui.label(RichText::new(format!("{} files outside the game's folders were left out (readmes, pictures).", entry.manifest.unrecognized)).color(look.dim));
+                    }
                     ui.add_space(4.0);
-                    let expanded = self.expanded == Some(id);
-                    if ui
-                        .small_button(if expanded { "▾ Hide details" } else { "▸ Details & files" })
-                        .on_hover_text("Root detection, fighters, and the file list")
-                        .clicked()
-                    {
-                        self.expanded = (!expanded).then_some(id);
-                    }
-                    if expanded {
-                        ui.add_space(4.0);
-                        let entry = &self.library.mods[index];
-                        // A mod whose root was guessed one level too high provides nothing and looks
-                        // identical to a mod that contains no fighters. Say which happened.
-                        if !matches!(entry.detection, library::RootDetection::AsGiven) {
-                            ui.label(
-                                RichText::new(format!("↳ Root: {}", entry.detection.describe()))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                        if !entry.manifest.fighters.is_empty() {
-                            let summary = entry
-                                .manifest
-                                .fighters
-                                .iter()
-                                .map(|(fighter, provision)| {
-                                    if provision.slots.is_empty() {
-                                        fighter.clone()
-                                    } else {
-                                        let slots = provision
-                                            .slots
-                                            .iter()
-                                            .map(|slot| format!("c{slot:02}"))
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        format!("{fighter} ({slots})")
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("  ·  ");
-                            ui.label(RichText::new(summary).small().weak());
-                        }
-                        if entry.manifest.unrecognized > 0 {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} file(s) outside game folders were ignored (readmes, screenshots, etc.).",
-                                    entry.manifest.unrecognized
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        }
-                        ui.add_space(4.0);
-                        let paths: Vec<String> = self.library.mods[index]
-                            .manifest
-                            .paths
-                            .iter()
-                            .cloned()
-                            .collect();
-                        egui::Frame::group(ui.style())
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt(("roster_mod_files", id.0))
-                                    .max_height(180.0)
-                                    .show(ui, |ui| {
-                                        for path in paths {
-                                            ui.label(RichText::new(path).small().monospace().weak());
-                                        }
-                                    });
-                            });
-                    }
+                    let paths: Vec<String> = entry.manifest.paths.iter().cloned().collect();
+                    egui::Frame::new().fill(look.sunk).corner_radius(6.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical().id_salt(("roster_mod_files", id.0)).max_height(200.0).show(ui, |ui| {
+                            for path in paths {
+                                ui.label(RichText::new(path).monospace().color(look.text));
+                            }
+                        });
+                    });
                 });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
 
         if let Some(id) = move_later {

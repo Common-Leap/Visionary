@@ -353,17 +353,18 @@ impl ImportedMod {
         let fighters = self.manifest.fighters.len();
         let files = self.manifest.paths.len();
         let mut parts = vec![format!(
-            "{files} file{} across {fighters} fighter{}",
+            "{files} file{} for {fighters} fighter{}",
             if files == 1 { "" } else { "s" },
             if fighters == 1 { "" } else { "s" }
         )];
         if self.manifest.provides_ui {
-            parts.push("ships UI files".to_string());
+            parts.push("select screen images".to_string());
         }
         if self.ships_plugin() {
-            parts.push(format!("{} plugin(s)", self.manifest.plugins.len()));
+            let n = self.manifest.plugins.len();
+            parts.push(format!("{n} plugin{}", if n == 1 { "" } else { "s" }));
         }
-        parts.join(" · ")
+        parts.join(", ")
     }
 }
 

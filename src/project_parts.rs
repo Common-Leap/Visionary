@@ -24,6 +24,7 @@ pub enum Part {
     Moves,
     Effects,
     Sounds,
+    Gimmicks,
     Values,
     Model,
     Animations,
@@ -31,8 +32,9 @@ pub enum Part {
 }
 
 impl Part {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Moves,
+        Self::Gimmicks,
         Self::Effects,
         Self::Sounds,
         Self::Model,
@@ -46,6 +48,7 @@ impl Part {
             Self::Moves => "Moves",
             Self::Effects => "Effects",
             Self::Sounds => "Sounds",
+            Self::Gimmicks => "Gimmicks",
             Self::Values => "Fighter values",
             Self::Model => "Model",
             Self::Animations => "Animations",
@@ -55,7 +58,7 @@ impl Part {
 
     /// Whether this part's files can live in a folder the author picks.
     pub fn has_folder(self) -> bool {
-        !matches!(self, Self::Values | Self::SelectScreen)
+        !matches!(self, Self::Gimmicks | Self::Values | Self::SelectScreen)
     }
 
     /// Whether the folder belongs to one costume rather than the whole fighter.
@@ -73,7 +76,7 @@ impl Part {
             Self::Effects if fighter == OTHER_EFFECTS => PathBuf::from("effect"),
             Self::Effects => ["effect", "fighter", fighter].iter().collect(),
             Self::Sounds => ["sound", "bank"].iter().collect(),
-            Self::Moves | Self::Values | Self::SelectScreen => return None,
+            Self::Moves | Self::Gimmicks | Self::Values | Self::SelectScreen => return None,
         })
     }
 }
