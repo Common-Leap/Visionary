@@ -704,7 +704,8 @@ enum ArticleJobResult {
 /// user action that replaces the editor's state, run as it was asked once the prompt allows it.
 enum PendingLeave {
     Script(Option<String>, MoveEntry),
-    Fighter(usize),
+    /// Kept by name, not row: the list can be re-indexed while the prompt is open.
+    Fighter(crate::mod_project::ProjectFighter),
     ForgetFighter(String),
     Hub(crate::project_hub::HubAction),
     LoadProject(PathBuf),
@@ -736,21 +737,42 @@ impl PendingLeave {
     }
 }
 
-/// What an automatic refresh does when the open fighter vanished from the list (a re-index, a
-/// dump without `fighter/`): it clears the selection unless an object script has unsynced
-/// changes, which are kept on screen instead, since nobody asked to leave them.
+/// What a refresh does when the open fighter vanished from the list (a re-index, a dump without
+/// `fighter/`): it clears the selection unless an object script has unsynced changes, which are
+/// kept on screen instead, since nobody asked to leave them. Inside an action the user allowed in
+/// the prompt (`leave_confirmed`: Discard, or a clean Sync now) the selection is cleared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VanishedFighter {
     Clear,
     KeepEdits,
 }
 
-fn on_fighter_vanished(open_article: Option<&str>, edited_since_sync: bool) -> VanishedFighter {
-    if object_leave_needs_prompt(open_article, edited_since_sync) {
+fn on_fighter_vanished(
+    open_article: Option<&str>,
+    edited_since_sync: bool,
+    leave_confirmed: bool,
+) -> VanishedFighter {
+    if !leave_confirmed && object_leave_needs_prompt(open_article, edited_since_sync) {
         VanishedFighter::KeepEdits
     } else {
         VanishedFighter::Clear
     }
+}
+
+/// The row of a fighter parked behind the unsynced-changes prompt in the current list, found by
+/// name and slot character (the list is rebuilt and re-sorted by a re-index), or `None` when it
+/// is no longer listed.
+fn resolve_parked_fighter<'a>(
+    rows: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    key: &crate::mod_project::ProjectFighter,
+) -> Option<usize> {
+    rows.into_iter()
+        .position(|(name, character)| name == key.name && character == key.character.as_deref())
+}
+
+/// How a fighter parked behind the prompt is named in a status line.
+fn parked_fighter_label(key: &crate::mod_project::ProjectFighter) -> &str {
+    key.character.as_deref().unwrap_or(&key.name)
 }
 
 /// What the user chose in the unsynced-changes prompt.
@@ -802,7 +824,10 @@ mod object_leave_tests {
         };
         let targets = [
             PendingLeave::Script(None, entry),
-            PendingLeave::Fighter(0),
+            PendingLeave::Fighter(crate::mod_project::ProjectFighter {
+                name: "samus".into(),
+                character: None,
+            }),
             PendingLeave::ForgetFighter("samus".into()),
             PendingLeave::Hub(crate::project_hub::HubAction::BrowseWithoutProject),
             PendingLeave::LoadProject(PathBuf::from("p.json")),
@@ -824,9 +849,32 @@ mod object_leave_tests {
 
     #[test]
     fn an_automatic_refresh_keeps_unsynced_object_edits() {
-        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true), VanishedFighter::KeepEdits);
-        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), false), VanishedFighter::Clear);
-        assert_eq!(on_fighter_vanished(None, true), VanishedFighter::Clear);
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, false), VanishedFighter::KeepEdits);
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), false, false), VanishedFighter::Clear);
+        assert_eq!(on_fighter_vanished(None, true, false), VanishedFighter::Clear);
+        // The user chose Discard (e.g. on changing the game dump): the edits go with the fighter.
+        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, true), VanishedFighter::Clear);
+    }
+
+    /// A fighter parked behind the prompt is found again by name after the list is rebuilt, so a
+    /// re-index while the prompt is open can't open another fighter or a row that's gone.
+    #[test]
+    fn a_parked_fighter_target_follows_its_name() {
+        let samus = crate::mod_project::ProjectFighter { name: "samus".into(), character: None };
+        let toad = crate::mod_project::ProjectFighter {
+            name: "samus".into(),
+            character: Some("Toad".into()),
+        };
+        let before = [("mario", None), ("samus", None)];
+        assert_eq!(resolve_parked_fighter(before, &samus), Some(1));
+        // A mod root came in: the list grew and re-sorted around the parked fighter.
+        let shifted = [("bayonetta", None), ("mario", None), ("samus", Some("Toad")), ("samus", None)];
+        assert_eq!(resolve_parked_fighter(shifted, &samus), Some(3));
+        assert_eq!(resolve_parked_fighter(shifted, &toad), Some(2));
+        // The root went away: the fighter is gone, not some other row.
+        let removed = [("bayonetta", None), ("mario", None)];
+        assert_eq!(resolve_parked_fighter(removed, &samus), None);
+        assert_eq!(resolve_parked_fighter(removed, &toad), None);
     }
 
     #[test]
@@ -5401,6 +5449,8 @@ impl VisionaryApp {
             None => BTreeMap::new(),
         };
 
+        // Said after the fighter count, which would otherwise overwrite them.
+        let mut notes: Vec<String> = Vec::new();
         if let Some((selected, files)) = selected {
             let found = self.state.fighters.iter().position(|entry| {
                 entry.name == selected.name && entry.custom_name == selected.character
@@ -5422,19 +5472,35 @@ impl VisionaryApp {
                         self.select_fighter(idx);
                     }
                 }
-                None => match on_fighter_vanished(self.open_article.as_deref(), self.object_script_dirty()) {
+                None => match on_fighter_vanished(
+                    self.open_article.as_deref(),
+                    self.object_script_dirty(),
+                    self.leave_confirmed,
+                ) {
                     VanishedFighter::Clear => self.clear_fighter_selection(),
                     VanishedFighter::KeepEdits => {
                         // The fighter is gone, but the object script's unsynced edits stay on
                         // screen (the sync goes by the object's own agent) until the user
                         // syncs or discards them.
                         self.state.selected_fighter = None;
-                        self.state.status = format!(
+                        // A parked move belongs to the fighter that is gone.
+                        if matches!(self.pending_leave, Some((PendingLeave::Script(..), _))) {
+                            self.pending_leave = None;
+                        }
+                        notes.push(format!(
                             "{}'s fighter is no longer in the list; its unsynced changes are kept — sync or discard them",
                             self.open_article.clone().unwrap_or_default()
-                        );
+                        ));
                     }
                 },
+            }
+        }
+        // A fighter parked behind the prompt is kept by name; drop it if it's no longer listed.
+        if let Some((PendingLeave::Fighter(key), _)) = &self.pending_leave {
+            let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+            if resolve_parked_fighter(rows, key).is_none() {
+                notes.push(format!("{} is no longer in the list, so it won't be opened", parked_fighter_label(key)));
+                self.pending_leave = None;
             }
         }
 
@@ -5456,6 +5522,11 @@ impl VisionaryApp {
             status.push_str(&format!(", {extra_slots} with slots past c07"));
         }
         status.push('.');
+        for note in notes {
+            status.push(' ');
+            status.push_str(&note);
+            status.push('.');
+        }
         self.state.status = status;
     }
 
@@ -5702,7 +5773,10 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
-        if self.leave_gate(|| PendingLeave::Fighter(idx)) {
+        let Some(key) = self.project_fighter_key(idx) else {
+            return;
+        };
+        if self.leave_gate(|| PendingLeave::Fighter(key)) {
             return;
         }
         self.object_baseline = None;
@@ -7378,10 +7452,7 @@ impl VisionaryApp {
         {
             // Creating an object's first script would need its own agent registration, which
             // the category writer doesn't make; refusing keeps the fighter's files untouched.
-            self.state.status = format!(
-                "{fighter}/{move_name} is the game's own script — add it to the moveset's source \
-                 before syncing changes to it"
-            );
+            self.state.status = format!("{fighter}/{move_name} wasn't synced. {}", self.unsaveable_object_script_words());
             return;
         }
 
@@ -21078,6 +21149,8 @@ impl VisionaryApp {
         }
         if self.pending_leave.is_none() {
             self.pending_leave = Some((target(), None));
+        } else {
+            self.state.status = "Finish the open 'Unsynced changes' prompt first".into();
         }
         true
     }
@@ -21181,8 +21254,23 @@ impl VisionaryApp {
         self.leave_confirmed = true;
         match pending {
             PendingLeave::Script(article, entry) => self.select_script(article, entry),
-            PendingLeave::Fighter(index) => self.select_fighter(index),
-            PendingLeave::ForgetFighter(name) => self.forget_fighter(&name),
+            PendingLeave::Fighter(key) => {
+                let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+                match resolve_parked_fighter(rows, &key) {
+                    Some(index) => self.select_fighter(index),
+                    None => {
+                        self.state.status =
+                            format!("{} is no longer in the list, so it wasn't opened", parked_fighter_label(&key));
+                    }
+                }
+            }
+            PendingLeave::ForgetFighter(name) => {
+                if self.state.fighters.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
+                    self.forget_fighter(&name);
+                } else {
+                    self.state.status = format!("{name} is no longer in the list");
+                }
+            }
             PendingLeave::Hub(action) => self.execute_hub_action_now(action),
             PendingLeave::LoadProject(path) => self.load_project_from(&path),
             PendingLeave::NewProject(path) => self.new_project_in(&path),
@@ -23230,6 +23318,8 @@ impl VisionaryApp {
         }
         if self.pending_leave.is_none() {
             self.pending_leave = Some((PendingLeave::Hub(action), None));
+        } else {
+            self.state.status = "Finish the open 'Unsynced changes' prompt first".into();
         }
     }
 
