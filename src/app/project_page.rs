@@ -1,11 +1,17 @@
 //! The Project page: one card per character the project touches, each with a button per
-//! part (moves, effects, sounds, model, animations, values, select screen). A part's button
-//! is coloured when the project changes it and grey while it is still the game's; opening
-//! it shows where its files are, lets the author pick another folder for them, and holds
-//! that part's tools.
+//! part (moves, gimmicks, effects, sounds, model, animations, values, select screen). A part's
+//! button is solid when the project changes that part of that character and dark while it is
+//! still the game's; opening it shows the part's numbers, where its files are, and its tools.
+//!
+//! A card is one character: a base fighter, a group of fighters the game shows as one, or a
+//! character made in the project. Its open panel, its costume and every page it opens are its
+//! own, never another card's that shares its fighter. Every page a card opens goes through
+//! [`VisionaryApp::go`], every count through [`VisionaryApp::card_counts`], and removing a made
+//! character through [`VisionaryApp::remove_character`].
 
 use super::*;
 use crate::project_parts::{Part, ProjectParts, OTHER_EFFECTS};
+use crate::roster::RosterKey;
 use crate::ui::{act, chip, look, Look};
 
 /// The narrowest a card is laid out; wider windows fit more columns.
@@ -38,51 +44,68 @@ fn group_of(fighter: &str) -> Option<(&'static str, &'static [(&'static str, &'s
         .copied()
 }
 
+/// The page a card action opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CardPage {
+    ClassicCollisions,
+    ClassicEffects,
+    ClassicAudio,
+    MoveNodes,
+    Gimmicks,
+    Effects,
+    Values,
+    SelectScreen,
+}
+
 /// One card on the page.
 #[derive(Clone)]
 pub(super) struct Card {
-    /// The fighter whose files the card is about (the donor, for a character you added).
+    /// The character: `"mario"` for a fighter, `"mario#c08"` for one made in the project. For
+    /// a group, the fighter it shows.
+    key: RosterKey,
+    /// What the card's open panel is stored under: its key, or a group's title.
+    id: String,
+    /// The fighter whose files the card is about: the base fighter, for a made character.
     fighter: String,
+    /// This character's costumes alone.
     slots: Vec<u8>,
     slot: u8,
     name: String,
-    base: String,
-    /// The select screen entry, when the card is a character you added.
-    roster_key: crate::roster::RosterKey,
-    /// A character made in this project, on top of `fighter`.
-    made_here: bool,
+    /// The line under the name: "c00–c07", "Mario c08–c15", "Mod fighter c00–c11".
+    line: String,
+    made: bool,
+    /// The fighter a made character plays as, by name.
+    base_name: String,
     /// The fighters this card stands for, with their names, when it is more than one.
     members: &'static [(&'static str, &'static str)],
+    /// Whether the project edits this character, so it cannot be hidden.
+    has_edits: bool,
 }
 
 /// Something a card asked for, done once the page is drawn.
 enum PageAction {
-    Select(String, u8),
+    Go(RosterKey, u8, CardPage),
     Open(String, Part),
-    PickSlot(String, u8),
+    /// The costume a card shows: (card key, fighter, costume).
+    PickSlot(String, String, u8),
     Hide(String),
     Add(String),
     PickFolder(String, Part, u8),
     ForgetFolder(String, Part, u8),
+    LinkMoveCode,
+    UnlinkMoveCode,
     Reveal(PathBuf),
-    EditMoves(String, bool),
-    EditEffects(String),
     EditOtherEffect(String),
     OpenEffectFile,
-    EditValues(String),
-    /// Show another fighter of a card that stands for several: (card name, fighter).
-    Member(String, String),
-    /// Something a character made in this project asked for.
-    Made(crate::roster::new_character::NewCharacterAction),
-    EditGimmicks(String),
-    EditSelectScreen(crate::roster::RosterKey),
-    Files(String, u8, FileAction),
+    /// Show another fighter of a card that stands for several: (group title, fighter).
+    Member(&'static str, String),
+    Remove(RosterKey),
+    Files(Card, FileAction),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FileAction {
-    CopyGameModel,
-    CopyGameCharacter,
+    CopyBase(Part),
     AddModelFolder,
     AddModelFiles,
     AddAnimations,
@@ -91,6 +114,360 @@ enum FileAction {
     AddSounds,
     Send,
     Stop,
+}
+
+/// How much of each kind of edit the project makes to one character.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CardCounts {
+    /// Moves edited, in any way.
+    pub moves: usize,
+    /// Moves built or changed with nodes.
+    pub nodes: usize,
+    pub gimmicks: usize,
+    pub meters: usize,
+    /// Effects whose look is changed, and effects borrowed from another file.
+    pub effects_changed: usize,
+    pub effects_borrowed: usize,
+    /// Moves whose effects (which effects play, where) are changed.
+    pub effect_moves: usize,
+    /// Moves whose sounds are changed.
+    pub sound_moves: usize,
+    /// Fighter values changed, as the Fighter values page counts them.
+    pub values: usize,
+}
+
+impl CardCounts {
+    fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// A part's files: how many the project has, whether in a folder the author picked, and
+/// where the game's come from otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FolderFacts {
+    files: usize,
+    picked: bool,
+    /// The mod the costume's files come from, when not the project's or the game's.
+    from_mod: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SelectFacts {
+    renamed: bool,
+    portraits: usize,
+    moved: bool,
+    hidden: bool,
+}
+
+/// Everything a card's buttons and panels say, gathered once per frame.
+#[derive(Debug, Clone, Default)]
+struct CardFacts {
+    counts: CardCounts,
+    made: bool,
+    /// The fighter a made character plays as.
+    base_name: String,
+    /// Characters made on this fighter, which share its values.
+    sharing: Vec<String>,
+    /// The folder of the move code the project uses, by name.
+    move_code: Option<String>,
+    /// The project has the character's own effect file.
+    effect_file: bool,
+    effect_folder: bool,
+    sound_files: usize,
+    sound_folder: bool,
+    model: FolderFacts,
+    animations: FolderFacts,
+    select: SelectFacts,
+}
+
+/// What a part's button and panel say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartSummary {
+    /// The project changes this part of this character.
+    changed: bool,
+    chips: Vec<String>,
+}
+
+/// The fighters each kind of edit touches, by engine fighter name. Every kind is a field, so a
+/// new kind of edit has to be named here to give a fighter its card.
+#[derive(Debug, Default)]
+struct EditFamilies {
+    moves: Vec<String>,
+    graphs: Vec<String>,
+    expressions: Vec<String>,
+    effect_calls: Vec<String>,
+    node_effects: Vec<String>,
+    sounds: Vec<String>,
+    effects: Vec<String>,
+    values: Vec<String>,
+    gimmicks: Vec<String>,
+    controllers: Vec<String>,
+    meters: Vec<String>,
+    live_rules: Vec<String>,
+    folders: Vec<String>,
+}
+
+/// Every fighter any kind of edit touches.
+fn fighters_with_edits(families: &EditFamilies) -> BTreeSet<String> {
+    // Listed in full rather than with `..`: a kind added to the struct and not here fails to
+    // build instead of silently giving its fighters no card.
+    let EditFamilies {
+        moves,
+        graphs,
+        expressions,
+        effect_calls,
+        node_effects,
+        sounds,
+        effects,
+        values,
+        gimmicks,
+        controllers,
+        meters,
+        live_rules,
+        folders,
+    } = families;
+    [
+        moves,
+        graphs,
+        expressions,
+        effect_calls,
+        node_effects,
+        sounds,
+        effects,
+        values,
+        gimmicks,
+        controllers,
+        meters,
+        live_rules,
+        folders,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|fighter| fighter.to_ascii_lowercase())
+    .collect()
+}
+
+/// The fighter a "fighter/move" key belongs to. Live rule keys may carry a `#` part.
+fn fighter_of_move_key(key: &str) -> Option<String> {
+    let (fighter, _) = key.split_once('/')?;
+    let fighter = fighter.split('#').next().unwrap_or(fighter);
+    (!fighter.is_empty()).then(|| fighter.to_owned())
+}
+
+/// Costumes as ranges: "c00–c07", "c08–c15, c20".
+fn slot_ranges(slots: &[u8]) -> String {
+    let mut sorted = slots.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(u8, u8)> = Vec::new();
+    for slot in sorted {
+        match runs.last_mut() {
+            Some((_, end)) if end.checked_add(1) == Some(slot) => *end = slot,
+            _ => runs.push((slot, slot)),
+        }
+    }
+    runs.iter()
+        .map(|(start, end)| {
+            if start == end {
+                format!("c{start:02}")
+            } else {
+                format!("c{start:02}–c{end:02}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// What a part's button and panel say about one character.
+fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
+    let counts = &facts.counts;
+    let mut chips = Vec::new();
+    fn add(chips: &mut Vec<String>, n: usize, text: String) {
+        if n > 0 {
+            chips.push(text);
+        }
+    }
+    let changed = match part {
+        Part::Moves => {
+            add(&mut chips, counts.moves, format!("{} edited", counts.moves));
+            add(
+                &mut chips,
+                counts.nodes,
+                format!("{} with nodes", counts.nodes),
+            );
+            if let Some(code) = &facts.move_code {
+                chips.push(format!("Move code: {code}"));
+            }
+            counts.moves + counts.nodes > 0
+        }
+        Part::Gimmicks => {
+            add(
+                &mut chips,
+                counts.gimmicks,
+                counted(counts.gimmicks, "gimmick"),
+            );
+            add(&mut chips, counts.meters, counted(counts.meters, "meter"));
+            counts.gimmicks + counts.meters > 0
+        }
+        Part::Effects => {
+            add(
+                &mut chips,
+                counts.effects_changed,
+                format!("{} changed", counts.effects_changed),
+            );
+            add(
+                &mut chips,
+                counts.effects_borrowed,
+                format!("{} borrowed", counts.effects_borrowed),
+            );
+            add(
+                &mut chips,
+                counts.effect_moves,
+                counted(counts.effect_moves, "move"),
+            );
+            if facts.effect_folder {
+                chips.push("Your folder".into());
+            } else if facts.effect_file {
+                chips.push("Own file".into());
+            }
+            counts.effects_changed + counts.effects_borrowed + counts.effect_moves > 0
+                || facts.effect_file
+                || facts.effect_folder
+        }
+        Part::Sounds => {
+            add(
+                &mut chips,
+                counts.sound_moves,
+                counted(counts.sound_moves, "move"),
+            );
+            add(
+                &mut chips,
+                facts.sound_files,
+                counted(facts.sound_files, "file"),
+            );
+            if facts.sound_folder {
+                chips.push("Your folder".into());
+            }
+            counts.sound_moves + facts.sound_files > 0
+        }
+        Part::Model | Part::Animations => {
+            let folder = if part == Part::Model {
+                &facts.model
+            } else {
+                &facts.animations
+            };
+            add(&mut chips, folder.files, counted(folder.files, "file"));
+            if folder.picked {
+                chips.push("Your folder".into());
+            } else if folder.files == 0 {
+                chips.push(match &folder.from_mod {
+                    Some(name) => format!("Mod: {name}"),
+                    None => "Game".into(),
+                });
+            }
+            folder.files > 0
+        }
+        Part::Values => {
+            if facts.made {
+                chips.push(format!("Shared with {}", facts.base_name));
+                false
+            } else {
+                add(
+                    &mut chips,
+                    counts.values,
+                    format!("{} changed", counts.values),
+                );
+                if !facts.sharing.is_empty() {
+                    chips.push(format!("Also used by {}", facts.sharing.join(", ")));
+                }
+                counts.values > 0
+            }
+        }
+        Part::SelectScreen => {
+            let select = &facts.select;
+            if facts.made {
+                chips.push("Own cell".into());
+            }
+            if select.renamed {
+                chips.push("Renamed".into());
+            }
+            add(
+                &mut chips,
+                select.portraits,
+                counted(select.portraits, "portrait"),
+            );
+            if select.moved {
+                chips.push("Moved".into());
+            }
+            if select.hidden {
+                chips.push("Hidden".into());
+            }
+            facts.made || select.renamed || select.portraits > 0 || select.moved || select.hidden
+        }
+    };
+    PartSummary { changed, chips }
+}
+
+/// A part button's hover: "Moves: 4 edited, 2 with nodes".
+fn part_hover(part: Part, summary: &PartSummary) -> String {
+    if summary.chips.is_empty() {
+        part.title().to_owned()
+    } else {
+        format!("{}: {}", part.title(), summary.chips.join(", "))
+    }
+}
+
+/// The name an effect or sound file gets in a made character's folder: the base fighter's
+/// files are per fighter (`ef_mario.eff`), the character's per costume (`ef_mario_c08.eff`),
+/// or the file would replace the base fighter's for every costume.
+fn made_file_name(name: &str, fighter: &str, slot: u8) -> String {
+    let lower = name.to_ascii_lowercase();
+    let fighter = fighter.to_ascii_lowercase();
+    let own = format!("_c{slot:02}");
+    let Some((stem, ext)) = lower.rsplit_once('.') else {
+        return lower;
+    };
+    let tag = format!("_{fighter}");
+    // Already a costume's file: `…_mario_c03.ext` becomes `…_mario_c08.ext`.
+    if let Some(at) = stem.rfind(&format!("{tag}_c")) {
+        let digits = &stem[at + tag.len() + 2..];
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("{}{tag}{own}.{ext}", &stem[..at]);
+        }
+    }
+    if stem.ends_with(&tag) {
+        return format!("{stem}{own}.{ext}");
+    }
+    lower
+}
+
+/// A disk look-up redone at most every two seconds: the page is drawn every frame, and
+/// reading folders that often is slow on some systems.
+fn cached<T: Clone + Send + Sync + 'static>(
+    ctx: &egui::Context,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    read: impl FnOnce() -> T,
+) -> T {
+    let id = egui::Id::unique(("project_page_disk", key));
+    let now = ctx.input(|input| input.time);
+    if let Some((at, value)) = ctx.data(|data| data.get_temp::<(f64, T)>(id)) {
+        if now - at < 2.0 && now >= at {
+            return value;
+        }
+    }
+    let value = read();
+    ctx.data_mut(|data| data.insert_temp(id, (now, value.clone())));
+    value
+}
+
+/// Forget every cached disk look-up, after the page changed files itself.
+fn forget_cached(ctx: &egui::Context) {
+    ctx.data_mut(|data| {
+        data.remove_by_type::<(f64, usize)>();
+        data.remove_by_type::<(f64, bool)>();
+        data.remove_by_type::<(f64, Option<String>)>();
+    });
 }
 
 /// Each part's colour on its button.
@@ -398,23 +775,6 @@ fn game_tile(
     response
 }
 
-/// Where a part comes from, short, with its colour.
-fn source_chip(from: &str) -> (String, Color32) {
-    if from == "this project" {
-        ("Project".into(), Color32::from_rgb(80, 220, 120))
-    } else if let Some(name) = from.strip_prefix("your folder ") {
-        (format!("Folder: {name}"), Color32::from_rgb(90, 175, 255))
-    } else if let Some(name) = from.strip_prefix("your move code in ") {
-        (format!("Code: {name}"), Color32::from_rgb(90, 175, 255))
-    } else if let Some(name) = from.strip_prefix("the mod ") {
-        (format!("Mod: {name}"), Color32::from_rgb(190, 150, 255))
-    } else if from == "the base fighter" {
-        ("Base fighter".into(), Color32::from_rgb(150, 154, 164))
-    } else {
-        ("Game".into(), Color32::from_rgb(150, 154, 164))
-    }
-}
-
 fn folder_name(path: &Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -430,7 +790,9 @@ impl VisionaryApp {
             .map(Path::to_path_buf)
     }
 
-    /// The open project's characters and folders, read from beside the project when it changes.
+    /// The open project's characters and folders, read from beside the project when it
+    /// changes. Its made characters' folders are kept in step with the project here, so code
+    /// that reads `parts.json` itself finds their files too.
     pub(super) fn project_parts(&mut self) -> ProjectParts {
         let workspace = self.workspace();
         if self.project_parts_cache.as_ref().map(|(at, _)| at) != workspace.as_ref() {
@@ -445,6 +807,15 @@ impl VisionaryApp {
                 }
             }
             self.project_parts_cache = workspace.map(|at| (at, parts));
+        }
+        let made = self.roster.made_folders();
+        if let Some((workspace, parts)) = &mut self.project_parts_cache {
+            if parts.set_made(made) {
+                if let Err(error) = parts.save(workspace) {
+                    self.state.status = format!("Could not save parts.json: {error:#}");
+                }
+                self.preview_skin = None;
+            }
         }
         self.project_parts_cache
             .as_ref()
@@ -467,59 +838,146 @@ impl VisionaryApp {
         self.preview_skin = None;
     }
 
-    /// Every character the project touches: picked onto the page, edited anywhere, given a
-    /// folder, or added as a new character.
-    fn project_cards(&mut self) -> Vec<Card> {
-        let parts = self.project_parts();
-        let mut names: BTreeSet<String> = parts.characters.keys().cloned().collect();
-        names.extend(
-            self.state
+    /// Costumes of each fighter that characters made in the project own.
+    fn made_slots(&self) -> BTreeMap<String, Vec<u8>> {
+        let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for made in &self.roster.project.authored {
+            out.entry(made.donor.to_ascii_lowercase())
+                .or_default()
+                .extend(made.all_slots());
+        }
+        out
+    }
+
+    /// The fighters each kind of edit touches. Edits made for a made character's costumes
+    /// alone are that character's, not its base fighter's.
+    fn edit_families(&self, parts: &ProjectParts) -> EditFamilies {
+        let made = self.made_slots();
+        let made_only = |fighter: &str, scopes: &[u8]| {
+            !scopes.is_empty()
+                && made
+                    .get(fighter)
+                    .is_some_and(|slots| scopes.iter().all(|slot| slots.contains(slot)))
+        };
+        let of_keys = |keys: &mut dyn Iterator<Item = &String>| -> Vec<String> {
+            keys.filter_map(|key| fighter_of_move_key(key)).collect()
+        };
+        let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
+            graph
+                .transitions
+                .iter()
+                .any(|step| !step.actions.is_empty())
+        };
+        let roster = &self.roster;
+        EditFamilies {
+            moves: self
+                .state
                 .edit_log
                 .entries
                 .iter()
-                .filter(|(_, moves)| !moves.is_empty())
-                .map(|(name, _)| name.clone()),
-        );
-        names.extend(
-            self.move_graphs
+                .filter(|(fighter, log)| {
+                    log.values()
+                        .any(|record| !made_only(fighter, &record.effective_scopes()))
+                })
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            graphs: self
+                .move_graphs
                 .iter()
                 .filter(|(_, graphs)| !graphs.is_empty())
-                .map(|(name, _)| name.clone()),
-        );
-        names.extend(
-            self.eff_mods
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            expressions: of_keys(&mut self.state.expression_script_edits.keys()),
+            effect_calls: of_keys(
+                &mut self
+                    .state
+                    .effect_call_edits
+                    .iter()
+                    .filter(|(_, edits)| !edits.is_empty())
+                    .map(|(key, _)| key),
+            ),
+            node_effects: of_keys(&mut self.node_effect_scripts.keys()),
+            sounds: of_keys(&mut self.state.sound_script_edits.keys()),
+            effects: self
+                .eff_mods
                 .iter()
                 .filter(|(_, eff)| !eff.is_empty())
-                .map(|(name, _)| name.clone()),
-        );
-        names.extend(
-            self.roster
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            values: roster
                 .params
                 .iter()
                 .filter(|(_, params)| !params.is_empty())
-                .map(|(name, _)| name.clone()),
-        );
-        names.extend(
-            self.state
-                .sound_script_edits
-                .keys()
-                .filter_map(|key| key.split_once('/'))
-                .map(|(name, _)| name.to_owned()),
-        );
-        names.extend(
-            parts
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            gimmicks: roster
+                .behaviors
+                .iter()
+                .filter(|(fighter, graph)| acts(graph) && !made_only(fighter, &graph.costumes))
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            controllers: roster
+                .controller_charts
+                .iter()
+                .filter(|(_, charts)| charts.values().any(|chart| acts(&chart.graph)))
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            meters: roster
+                .meters
+                .iter()
+                .filter(|(_, meters)| !meters.is_empty())
+                .map(|(fighter, _)| fighter.clone())
+                .collect(),
+            live_rules: of_keys(
+                &mut self
+                    .hitbox_rules_store
+                    .iter()
+                    .filter(|(_, rules)| !rules.is_empty())
+                    .map(|(key, _)| key)
+                    .chain(
+                        self.effect_rules_store
+                            .iter()
+                            .filter(|(_, rules)| !rules.is_empty())
+                            .map(|(key, _)| key),
+                    )
+                    .chain(
+                        self.effect_control_rules_store
+                            .iter()
+                            .filter(|(_, rules)| !rules.is_empty())
+                            .map(|(key, _)| key),
+                    ),
+            ),
+            folders: parts
                 .links
                 .iter()
                 .filter(|link| link.part != Part::Moves)
-                .map(|link| link.fighter.clone()),
-        );
+                .filter(|link| {
+                    !made_only(&link.fighter, &link.slot.into_iter().collect::<Vec<_>>())
+                })
+                .map(|link| link.fighter.clone())
+                .collect(),
+        }
+    }
+
+    /// Every character the project touches: picked onto the page, edited anywhere, given a
+    /// folder, or made in the project.
+    fn project_cards(&self, parts: &ProjectParts) -> Vec<Card> {
+        let made = self.made_slots();
+        let edited = fighters_with_edits(&self.edit_families(parts));
+        let mut names: BTreeSet<String> = parts
+            .characters
+            .keys()
+            .filter(|key| !key.contains('#'))
+            .cloned()
+            .collect();
+        names.extend(edited.iter().cloned());
         let mut cards: Vec<Card> = Vec::new();
         for name in names {
             // One card for all the fighters of a character, showing the one picked on it.
             let group = group_of(&name);
             let name = match group {
                 Some((title, members)) => {
-                    if cards.iter().any(|card| card.name == title) {
+                    if cards.iter().any(|card| card.id == title) {
                         continue;
                     }
                     let picked = self.project_member.get(title).cloned();
@@ -537,284 +995,332 @@ impl VisionaryApp {
             else {
                 continue;
             };
+            // Costumes a made character owns are on its own card, not this one.
+            let taken = made.get(&entry.name).cloned().unwrap_or_default();
+            let mut slots: Vec<u8> = entry
+                .slots
+                .iter()
+                .copied()
+                .filter(|slot| !taken.contains(slot))
+                .collect();
+            if slots.is_empty() {
+                slots = entry.slots.clone();
+            }
             let slot = parts
                 .characters
                 .get(&entry.name)
                 .copied()
-                .filter(|slot| entry.slots.contains(slot))
-                .unwrap_or(entry.base_slot());
+                .filter(|slot| slots.contains(slot))
+                .unwrap_or(slots.first().copied().unwrap_or(0));
+            let key = RosterKey::fighter(&entry.name);
+            let ranges = slot_ranges(&slots);
             cards.push(Card {
+                id: group.map_or_else(|| key.to_string(), |(title, _)| title.to_owned()),
                 fighter: entry.name.clone(),
-                slots: entry.slots.clone(),
                 slot,
                 // "Ice Climbers · Popo" is the Ice Climbers on a card of their own.
-                name: group.map_or_else(
-                    || {
+                name: match group {
+                    Some((title, _)) => title.to_owned(),
+                    None => self.roster.shown_name(&key).unwrap_or_else(|| {
                         entry
                             .display_name
                             .split(" · ")
                             .next()
                             .unwrap_or(&entry.display_name)
                             .to_owned()
-                    },
-                    |(title, _)| title.to_owned(),
-                ),
-                base: if entry.is_modded() {
-                    "Mod fighter".into()
-                } else {
-                    "Base game".into()
+                    }),
                 },
-                roster_key: crate::roster::RosterKey::fighter(&entry.name),
-                made_here: false,
+                line: if entry.is_modded() {
+                    format!("Mod fighter {ranges}")
+                } else {
+                    ranges
+                },
+                slots,
+                key,
+                made: false,
+                base_name: String::new(),
                 members: group.map_or(&[], |(_, members)| members),
+                has_edits: match group {
+                    Some((_, members)) => {
+                        members.iter().any(|(member, _)| edited.contains(*member))
+                    }
+                    None => edited.contains(&entry.name),
+                },
             });
         }
         for authored in &self.roster.project.authored {
-            let donor = self
+            let base_name = self
                 .state
                 .fighters
                 .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(&authored.donor));
+                .find(|entry| entry.name.eq_ignore_ascii_case(&authored.donor))
+                .map_or_else(
+                    || crate::data::fighter_display_name(&authored.donor),
+                    |entry| entry.display_name.clone(),
+                );
             let slots = authored.all_slots();
+            let slot = parts
+                .characters
+                .get(authored.key.as_str())
+                .copied()
+                .filter(|slot| slots.contains(slot))
+                .unwrap_or(slots.first().copied().unwrap_or(authored.slot));
             cards.push(Card {
+                id: authored.key.to_string(),
                 fighter: authored.donor.clone(),
-                slot: slots.first().copied().unwrap_or(authored.slot),
+                slot,
+                name: self
+                    .roster
+                    .shown_name(&authored.key)
+                    .unwrap_or_else(|| authored.display_name.clone()),
+                line: format!("{base_name} {}", slot_ranges(&slots)),
                 slots,
-                name: authored.display_name.clone(),
-                base: format!(
-                    "Plays as {}",
-                    donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone())
-                ),
-                roster_key: authored.key.clone(),
-                made_here: true,
+                key: authored.key.clone(),
+                made: true,
+                base_name,
                 members: &[],
+                has_edits: true,
             });
         }
         cards.sort_by(|a, b| a.name.cmp(&b.name));
         cards
     }
 
-    /// Whether the project changes `part` of a card, where it comes from, and a line of detail.
-    fn part_summary(
-        &self,
-        parts: &ProjectParts,
-        card: &Card,
-        part: Part,
-    ) -> (bool, String, String) {
+    /// How much of each kind of edit the project makes to `card`'s character.
+    ///
+    /// Edits are stored per fighter, so a made character's are told apart by the costumes
+    /// they are limited to: move edits and gimmicks limited to its costumes are its own, and
+    /// its base fighter's card leaves them out. Its other edits cannot be told apart yet and
+    /// count on the base fighter's card.
+    fn card_counts(&self, card: &Card) -> CardCounts {
         let fighter = card.fighter.to_ascii_lowercase();
-        // A character made here plays as its base fighter: its moves are the ones edited for its
-        // own costumes; sounds, effects and gimmicks are the fighter's, shown on that card.
-        if card.made_here {
-            return match part {
-                Part::Moves => {
-                    let own = self
-                        .roster
-                        .authored_moves
-                        .get(&card.roster_key)
-                        .map_or(0, |moves| moves.len());
-                    let from = if own > 0 {
-                        "this project"
-                    } else {
-                        "the base fighter"
-                    };
-                    (
-                        own > 0,
-                        from.into(),
-                        format!("{} edited for this character", counted(own, "move")),
-                    )
-                }
-                Part::Model | Part::Animations | Part::SelectScreen => {
-                    self.fighter_part_summary(parts, card, part, &fighter)
-                }
-                _ => (false, "the base fighter".into(), String::new()),
+        let made = self.made_slots();
+        let made_slots = made.get(&fighter).cloned().unwrap_or_default();
+        // An edit is this card's when its costumes are all this made character's, or, on the
+        // base fighter's card, when they are not all some made character's.
+        let mine = |scopes: &[u8]| {
+            if card.made {
+                !scopes.is_empty() && scopes.iter().all(|slot| card.slots.contains(slot))
+            } else {
+                scopes.is_empty() || !scopes.iter().all(|slot| made_slots.contains(slot))
+            }
+        };
+        let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
+            graph
+                .transitions
+                .iter()
+                .any(|step| !step.actions.is_empty())
+        };
+        let roster = &self.roster;
+        let gimmicks = roster
+            .behaviors
+            .get(&fighter)
+            .is_some_and(|graph| acts(graph) && mine(&graph.costumes))
+            as usize;
+        let mut moves: BTreeSet<&str> = self
+            .state
+            .edit_log
+            .entries
+            .get(&fighter)
+            .into_iter()
+            .flatten()
+            .filter(|(_, record)| mine(&record.effective_scopes()))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if card.made {
+            return CardCounts {
+                moves: moves.len(),
+                gimmicks,
+                ..CardCounts::default()
             };
         }
-        self.fighter_part_summary(parts, card, part, &fighter)
-    }
-
-    fn fighter_part_summary(
-        &self,
-        parts: &ProjectParts,
-        card: &Card,
-        part: Part,
-        fighter: &str,
-    ) -> (bool, String, String) {
-        let fighter = fighter.to_owned();
-        let picked = parts.link(&fighter, part, card.slot);
-        let from_folder = |default: &str| {
-            picked.map_or(default.to_owned(), |folder| {
-                format!("your folder {}", folder_name(folder))
-            })
+        let moves_of = |keys: &mut dyn Iterator<Item = &String>| -> BTreeSet<String> {
+            keys.filter_map(|key| key.split_once('/'))
+                .filter(|(owner, _)| owner.eq_ignore_ascii_case(&fighter))
+                .map(|(_, name)| name.to_owned())
+                .collect()
         };
-        match part {
-            Part::Moves => {
-                // An edit scoped only to a made character's costumes is that character's.
-                let made: Vec<u8> = self
-                    .roster
-                    .project
-                    .authored
-                    .iter()
-                    .filter(|authored| authored.donor == fighter)
-                    .flat_map(|authored| authored.all_slots())
-                    .collect();
-                let moves = self.state.edit_log.entries.get(&fighter).map_or(0, |log| {
-                    log.values()
-                        .filter(|record| {
-                            let scopes = record.effective_scopes();
-                            scopes.is_empty() || !scopes.iter().all(|slot| made.contains(slot))
-                        })
-                        .count()
-                });
-                let graphs = self.move_graphs.get(&fighter).map_or(0, BTreeMap::len);
-                let code = self.acmd_src.as_ref().map(|index| index.root.clone());
-                let from = match &code {
-                    Some(root) => format!("your move code in {}", folder_name(root)),
-                    None if moves + graphs > 0 => "this project".into(),
-                    None => "the game".into(),
-                };
-                (
-                    moves + graphs > 0,
-                    from,
-                    format!("{} edited, {graphs} with nodes", counted(moves, "move")),
-                )
-            }
-            Part::Effects => {
-                let edits = self.eff_mods.get(&fighter).filter(|eff| !eff.is_empty());
-                let file = self.project_effect_file(&fighter);
-                let detail = edits.map_or(String::new(), |eff| {
-                    format!(
-                        "{} edited, {} borrowed",
-                        counted(eff.authored.len(), "effect"),
-                        eff.transplants.len()
-                    )
-                });
-                let from = match (&file, picked) {
-                    (Some(_), Some(_)) => from_folder(""),
-                    (Some(_), None) => "this project".into(),
-                    (None, _) if edits.is_some() => "this project".into(),
-                    (None, _) => "the game".into(),
-                };
-                (edits.is_some() || file.is_some(), from, detail)
-            }
-            Part::Sounds => {
-                let scripts = self
-                    .state
-                    .sound_script_edits
-                    .keys()
-                    .filter(|key| key.split_once('/').is_some_and(|(name, _)| name == fighter))
-                    .count();
-                let files = self
-                    .workspace()
-                    .and_then(|workspace| parts.dir(&workspace, &fighter, part, card.slot))
-                    .map_or(0, |dir| count_files(&dir));
-                let from = if picked.is_some() {
-                    from_folder("")
-                } else if scripts + files > 0 {
-                    "this project".into()
-                } else {
-                    "the game".into()
-                };
-                (
-                    scripts + files > 0,
-                    from,
-                    format!(
-                        "{} edited, {}",
-                        counted(scripts, "move"),
-                        counted(files, "file")
-                    ),
-                )
-            }
-            Part::Model | Part::Animations => {
-                let words = if part == Part::Model {
-                    "model"
-                } else {
-                    "motion"
-                };
-                let found = self.skin_folder(&card.fighter, words, card.slot);
-                let from = found.map_or("the game".to_owned(), |(_, from)| from);
-                (from != "the game", from, String::new())
-            }
-            Part::Gimmicks => {
-                let roster = &self.roster;
-                // Editing a move with nodes saves an empty first gimmick; only ones that do
-                // something count.
-                let acts = |graph: &crate::gimmicks::behavior::BehaviorGraph| {
-                    graph
-                        .transitions
-                        .iter()
-                        .any(|step| !step.actions.is_empty())
-                };
-                let main = roster.behaviors.get(&fighter).is_some_and(acts) as usize;
-                let charts = roster.controller_charts.get(&fighter).map_or(0, |charts| {
+        let graphs = self.move_graphs.get(&fighter);
+        moves.extend(
+            graphs
+                .into_iter()
+                .flat_map(|graphs| graphs.keys().map(String::as_str)),
+        );
+        let expressions = moves_of(&mut self.state.expression_script_edits.keys());
+        let mut moves: BTreeSet<String> = moves.into_iter().map(str::to_owned).collect();
+        moves.extend(expressions);
+        let mut effect_moves = moves_of(
+            &mut self
+                .state
+                .effect_call_edits
+                .iter()
+                .filter(|(_, edits)| !edits.is_empty())
+                .map(|(key, _)| key),
+        );
+        effect_moves.extend(moves_of(&mut self.node_effect_scripts.keys()));
+        let eff = self.eff_mods.get(&fighter);
+        CardCounts {
+            moves: moves.len(),
+            nodes: graphs.map_or(0, BTreeMap::len),
+            gimmicks: gimmicks
+                + roster.controller_charts.get(&fighter).map_or(0, |charts| {
                     charts.values().filter(|chart| acts(&chart.graph)).count()
-                });
-                let meters = roster.meters.get(&fighter).map_or(0, Vec::len);
-                let gimmicks = main + charts;
-                let changed = gimmicks + meters > 0;
-                let detail = if changed {
-                    format!(
-                        "{}, {}",
-                        counted(gimmicks, "gimmick"),
-                        counted(meters, "meter")
-                    )
-                } else {
-                    String::new()
-                };
-                (
-                    changed,
-                    if changed {
-                        "this project".into()
-                    } else {
-                        "the game".into()
-                    },
-                    detail,
-                )
-            }
-            Part::Values => {
-                let values = self
-                    .roster
-                    .params
-                    .get(&fighter)
-                    .map_or(0, |params| params.field_count());
-                (
-                    values > 0,
-                    if values > 0 {
-                        "this project".into()
-                    } else {
-                        "the game".into()
-                    },
-                    format!("{} changed", counted(values, "value")),
-                )
-            }
-            Part::SelectScreen => {
-                let project = &self.roster.project;
-                let changed = project.names.contains_key(&card.roster_key)
-                    || project.ui_images.contains_key(&card.roster_key)
-                    || project
-                        .authored
-                        .iter()
-                        .any(|entry| entry.key == card.roster_key);
-                (
-                    changed,
-                    if changed {
-                        "this project".into()
-                    } else {
-                        "the game".into()
-                    },
-                    String::new(),
-                )
-            }
+                }),
+            meters: roster.meters.get(&fighter).map_or(0, Vec::len),
+            effects_changed: eff.map_or(0, |eff| eff.authored.len()),
+            effects_borrowed: eff.map_or(0, |eff| eff.transplants.len()),
+            effect_moves: effect_moves.len(),
+            sound_moves: moves_of(&mut self.state.sound_script_edits.keys()).len(),
+            values: roster.fighter_value_count(&fighter),
         }
     }
 
-    /// The fighter's effect file in the project or a folder picked for its effects.
-    fn project_effect_file(&self, fighter: &str) -> Option<PathBuf> {
-        let workspace = self.workspace()?;
-        let parts = self.project_parts_cache.as_ref().map(|(_, parts)| parts)?;
-        let file = parts
-            .dir(&workspace, fighter, Part::Effects, 0)?
-            .join(format!("ef_{fighter}.eff"));
-        file.is_file().then_some(file)
+    /// The select screen cell a card stands for.
+    fn card_cell(&self, card: &Card) -> RosterKey {
+        if card.made {
+            return card.key.clone();
+        }
+        let members: Vec<&str> = if card.members.is_empty() {
+            vec![card.fighter.as_str()]
+        } else {
+            card.members.iter().map(|(member, _)| *member).collect()
+        };
+        self.roster
+            .select_screen_cell(&members)
+            .unwrap_or_else(|| card.key.clone())
+    }
+
+    /// Where a costume's model or animations come from when the project has none of its own:
+    /// the mod that last provides them, or `None` for the game.
+    fn costume_source(
+        &self,
+        ctx: &egui::Context,
+        fighter: &str,
+        kind: &str,
+        slot: u8,
+    ) -> Option<String> {
+        cached(
+            ctx,
+            ("source", fighter, kind, slot, self.all_roots()),
+            || {
+                let (_, from) = self.skin_folder(fighter, kind, slot)?;
+                from.strip_prefix("the mod ").map(str::to_owned)
+            },
+        )
+    }
+
+    /// Everything `card`'s buttons and panels say.
+    fn card_facts(&self, ctx: &egui::Context, card: &Card, parts: &ProjectParts) -> CardFacts {
+        let workspace = self.workspace();
+        let dir = |part: Part| {
+            workspace
+                .as_deref()
+                .and_then(|workspace| parts.dir(workspace, &card.fighter, part, card.slot))
+        };
+        let picked = |part: Part| parts.link(&card.fighter, part, card.slot).is_some();
+        let files = |part: Part| {
+            dir(part).map_or(0, |dir| {
+                cached(ctx, ("files", dir.clone()), || count_files(&dir))
+            })
+        };
+        let folder = |part: Part, kind: &str| {
+            let files = files(part);
+            FolderFacts {
+                files,
+                picked: picked(part),
+                from_mod: if files == 0 {
+                    self.costume_source(ctx, &card.fighter, kind, card.slot)
+                } else {
+                    None
+                },
+            }
+        };
+        let fighter = card.fighter.to_ascii_lowercase();
+        // The base fighter's effect file, or a made character's own one for this costume.
+        let effect_name = if card.made {
+            format!("ef_{fighter}_c{:02}.eff", card.slot)
+        } else {
+            format!("ef_{fighter}.eff")
+        };
+        let effect_file = dir(Part::Effects).is_some_and(|dir| {
+            let file = dir.join(&effect_name);
+            cached(ctx, ("file", file.clone()), || file.is_file())
+        });
+        // A base fighter's sound files sit with every other fighter's in the project's bank.
+        let sound_files = dir(Part::Sounds).map_or(0, |dir| {
+            let tag = format!("_{fighter}");
+            let only_own = !card.made && !picked(Part::Sounds);
+            cached(ctx, ("sounds", dir.clone(), only_own), || {
+                count_matching(&dir, |name| !only_own || name.contains(&tag))
+            })
+        });
+        let cell = self.card_cell(card);
+        let project = &self.roster.project;
+        let own_name = project
+            .authored
+            .iter()
+            .find(|entry| entry.key == cell)
+            .map(|entry| entry.display_name.clone());
+        CardFacts {
+            counts: self.card_counts(card),
+            made: card.made,
+            base_name: card.base_name.clone(),
+            sharing: if card.made {
+                Vec::new()
+            } else {
+                project
+                    .authored
+                    .iter()
+                    .filter(|entry| entry.donor.eq_ignore_ascii_case(&fighter))
+                    .map(|entry| {
+                        self.roster
+                            .shown_name(&entry.key)
+                            .unwrap_or_else(|| entry.display_name.clone())
+                    })
+                    .collect()
+            },
+            move_code: self.acmd_src.as_ref().map(|index| folder_name(&index.root)),
+            effect_file,
+            effect_folder: picked(Part::Effects),
+            sound_files,
+            sound_folder: picked(Part::Sounds),
+            model: folder(Part::Model, "model"),
+            animations: folder(Part::Animations, "motion"),
+            select: SelectFacts {
+                // A made character's own name is not a rename.
+                renamed: project
+                    .names
+                    .get(&cell)
+                    .is_some_and(|name| Some(name) != own_name.as_ref()),
+                portraits: project
+                    .ui_images
+                    .get(&cell)
+                    .map_or(0, |images| images.len()),
+                moved: project.order.contains_key(&cell),
+                hidden: project.hidden.contains(&cell),
+            },
+        }
+    }
+
+    /// The character the editors have open: a made character when move edits go to it, else
+    /// the picked fighter.
+    fn card_is_active(&self, card: &Card) -> bool {
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .is_some_and(|entry| entry.name.eq_ignore_ascii_case(&card.fighter));
+        let target = self.roster.edit_target();
+        fighter
+            && if card.made {
+                target == Some(&card.key)
+            } else {
+                target.is_none_or(|key| {
+                    !self.roster.project.authored.iter().any(|made| {
+                        &made.key == key && made.donor.eq_ignore_ascii_case(&card.fighter)
+                    })
+                })
+            }
     }
 
     /// Project > Characters.
@@ -846,13 +1352,44 @@ impl VisionaryApp {
             if act(ui, look, "Export mod", Some(look.accent)).clicked() {
                 self.export_full_mod();
             }
+            let code = self.acmd_src.as_ref().map(|index| index.root.clone());
+            ui.menu_button(RichText::new("⋯").size(20.0).strong(), |ui| match &code {
+                None => {
+                    if ui
+                        .button("Use my Smashline project")
+                        .on_hover_text(
+                            "Edit the move code of a Smashline plugin you write yourself",
+                        )
+                        .clicked()
+                    {
+                        actions.push(PageAction::LinkMoveCode);
+                        ui.close();
+                    }
+                }
+                Some(_) => {
+                    if ui.button("Stop using it").clicked() {
+                        actions.push(PageAction::UnlinkMoveCode);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Project options");
+            if let Some(root) = &code {
+                ui.label(
+                    RichText::new(format!("Move code: {}", folder_name(root)))
+                        .color(look.accent)
+                        .strong(),
+                )
+                .on_hover_text(root.display().to_string());
+            }
         });
         if workspace.is_none() {
             ui.label(RichText::new("Not saved yet").color(look.dim));
         }
         ui.add_space(10.0);
-        let cards = self.project_cards();
         let parts = self.project_parts();
+        let cards = self.project_cards(&parts);
         let width = ui.available_width();
         let columns = ((width / CARD_WIDTH) as usize).clamp(1, 3);
         // The cards share the whole row, however many fit.
@@ -876,7 +1413,15 @@ impl VisionaryApp {
         ui.horizontal(|ui| {
             section_title(ui, look, "Characters");
             ui.add_space(12.0);
-            let shown: BTreeSet<&str> = cards.iter().map(|card| card.fighter.as_str()).collect();
+            // Fighters with a card of their own; a made character's base fighter is not one.
+            let shown: BTreeSet<&str> = cards
+                .iter()
+                .filter(|card| !card.made)
+                .flat_map(|card| {
+                    std::iter::once(card.fighter.as_str())
+                        .chain(card.members.iter().map(|(member, _)| *member))
+                })
+                .collect();
             egui::ComboBox::from_id_salt("project_add_character")
                 .selected_text(RichText::new("Add character").strong().color(look.text))
                 .width(200.0)
@@ -925,22 +1470,32 @@ impl VisionaryApp {
                 .collect()
         });
         if !dropped.is_empty() {
-            let target = self
-                .project_open_part
-                .as_ref()
-                .and_then(|(fighter, _)| cards.iter().find(|card| &card.fighter == fighter))
-                .or(cards.first());
+            // Dropped files go to the card whose files are open, and nowhere else.
+            let target = self.project_open_part.as_ref().and_then(|(id, part)| {
+                part.has_folder()
+                    .then(|| cards.iter().find(|card| &card.id == id))
+                    .flatten()
+            });
             match (&workspace, target) {
-                (Some(workspace), Some(card)) => {
-                    let (fighter, slot) = (card.fighter.clone(), card.slot);
-                    self.import_dropped_files(workspace, &fighter, slot, dropped);
-                }
                 (None, _) => self.state.status = "Save the project before adding files.".into(),
-                (_, None) => self.state.status = "Add a character first.".into(),
+                (_, None) => {
+                    self.state.status = "Open a card's Model or Animations first.".into();
+                }
+                (Some(workspace), Some(card)) => {
+                    self.import_dropped_files(workspace, &card.fighter, card.slot, dropped);
+                    // Said with the character's name, not its base fighter's.
+                    let said = format!("{} c{:02}", card.fighter, card.slot);
+                    self.state.status = self
+                        .state
+                        .status
+                        .replace(&said, &format!("{} c{:02}", card.name, card.slot));
+                    forget_cached(ui.ctx());
+                }
             }
         }
+        let ctx = ui.ctx().clone();
         for action in actions {
-            self.run_page_action(action);
+            self.run_page_action(&ctx, action);
         }
     }
 
@@ -963,258 +1518,434 @@ impl VisionaryApp {
         parts: &ProjectParts,
         actions: &mut Vec<PageAction>,
     ) {
-        let selected = self
-            .state
-            .selected_fighter
-            .and_then(|index| self.state.fighters.get(index))
-            .is_some_and(|entry| entry.name == card.fighter);
+        let selected = self.card_is_active(card);
         let open = self
             .project_open_part
             .as_ref()
-            .filter(|(fighter, _)| *fighter == card.fighter)
+            .filter(|(id, _)| *id == card.id)
             .map(|(_, part)| *part);
+        let facts = self.card_facts(ui.ctx(), card, parts);
+        let confirm_id = egui::Id::unique(("project_remove_confirm", card.key.as_str()));
+        let confirming = ui.ctx().data(|data| data.get_temp::<bool>(confirm_id)) == Some(true);
         Self::card_frame(look, selected).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                let portrait = self.roster.portrait(ui.ctx(), &card.roster_key, &card.fighter, card.slot);
+                let portrait = self
+                    .roster
+                    .portrait(ui.ctx(), &card.key, &card.fighter, card.slot);
                 let size = egui::vec2(112.0, 112.0);
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
                 ui.painter().rect_filled(rect, 10.0, look.sunk);
                 match portrait {
                     Some(texture) => {
-                        egui::Image::new(&texture).corner_radius(10.0).paint_at(ui, rect);
+                        egui::Image::new(&texture)
+                            .corner_radius(10.0)
+                            .paint_at(ui, rect);
                     }
                     None => paint_part_icon(ui.painter(), rect.shrink(32.0), Part::Model, look.dim),
                 }
-                ui.painter().rect_stroke(rect, 10.0, egui::Stroke::new(1.5, if response.hovered() { look.accent } else { look.edge }), egui::StrokeKind::Inside);
-                if response.on_hover_text("Show in the editor").clicked() {
-                    actions.push(PageAction::Select(card.fighter.clone(), card.slot));
+                let edge = if response.hovered() {
+                    look.accent
+                } else {
+                    look.edge
+                };
+                ui.painter().rect_stroke(
+                    rect,
+                    10.0,
+                    egui::Stroke::new(1.5, edge),
+                    egui::StrokeKind::Inside,
+                );
+                if response
+                    .on_hover_text("Open in the editor")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    actions.push(PageAction::Go(
+                        card.key.clone(),
+                        card.slot,
+                        CardPage::ClassicCollisions,
+                    ));
                 }
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&card.name).size(28.0).strong().color(look.text));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&card.name)
+                                    .size(28.0)
+                                    .strong()
+                                    .color(look.text),
+                            )
+                            .truncate(),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if card.made_here {
-                                if act(ui, look, "Remove", None).on_hover_text("Take this character out of the project. Its files stay in its folder.").clicked() {
-                                    actions.push(PageAction::Made(crate::roster::new_character::NewCharacterAction::Remove(card.roster_key.clone())));
-                                }
-                            } else if act(ui, look, "Hide", None).clicked() {
-                                actions.push(PageAction::Hide(card.fighter.clone()));
-                            }
-                            egui::ComboBox::from_id_salt(("card_slot", &card.fighter, &card.name))
-                                .selected_text(RichText::new(format!("c{:02}", card.slot)).strong().color(look.text))
+                            let has_edits = card.has_edits || facts.counts.any();
+                            self.draw_card_menu(ui, card, has_edits, confirm_id, actions);
+                            egui::ComboBox::from_id_salt(("card_slot", card.id.as_str()))
+                                .selected_text(
+                                    RichText::new(format!("c{:02}", card.slot))
+                                        .strong()
+                                        .color(look.text),
+                                )
                                 .width(64.0)
                                 .show_ui(ui, |ui| {
                                     for slot in &card.slots {
-                                        if ui.selectable_label(*slot == card.slot, format!("c{slot:02}")).clicked() {
-                                            actions.push(PageAction::PickSlot(card.fighter.clone(), *slot));
+                                        if ui
+                                            .selectable_label(
+                                                *slot == card.slot,
+                                                format!("c{slot:02}"),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(PageAction::PickSlot(
+                                                card.key.to_string(),
+                                                card.fighter.clone(),
+                                                *slot,
+                                            ));
                                         }
                                     }
-                                });
+                                })
+                                .response
+                                .on_hover_text("Costume");
                         });
                     });
-                    if card.members.is_empty() {
-                        ui.label(RichText::new(&card.base).size(15.0).color(look.dim));
-                    } else {
-                        ui.horizontal_wrapped(|ui| {
-                            for (member, label) in card.members {
-                                if self.fighter_index(member).is_none() {
-                                    continue;
-                                }
-                                let shown = member.eq_ignore_ascii_case(&card.fighter);
-                                if act(ui, look, label, shown.then_some(look.accent)).clicked() && !shown {
-                                    actions.push(PageAction::Member(card.name.clone(), (*member).to_owned()));
+                    ui.horizontal_wrapped(|ui| {
+                        for (member, label) in card.members {
+                            if self.fighter_index(member).is_none() {
+                                continue;
+                            }
+                            let shown = member.eq_ignore_ascii_case(&card.fighter);
+                            if act(ui, look, label, shown.then_some(look.accent)).clicked()
+                                && !shown
+                            {
+                                if let Some((title, _)) = group_of(member) {
+                                    actions.push(PageAction::Member(title, (*member).to_owned()));
                                 }
                             }
-                        });
-                    }
+                        }
+                        ui.label(RichText::new(&card.line).size(15.0).color(look.dim));
+                    });
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         for part in Part::ALL {
-                            let (changed, from, detail) = self.part_summary(parts, card, part);
-                            let picked = parts.link(&card.fighter, part, card.slot).is_some();
-                            let hover = if detail.is_empty() { format!("{}: {}", part.title(), source_chip(&from).0) } else { format!("{}: {}, {}", part.title(), source_chip(&from).0, detail) };
-                            if part_button(ui, look, part, changed, picked, open == Some(part), &hover).clicked() {
-                                actions.push(PageAction::Open(card.fighter.clone(), part));
+                            let summary = part_summary(part, &facts);
+                            let picked = part.has_folder()
+                                && parts.link(&card.fighter, part, card.slot).is_some();
+                            let hover = part_hover(part, &summary);
+                            if part_button(
+                                ui,
+                                look,
+                                part,
+                                summary.changed,
+                                picked,
+                                open == Some(part),
+                                &hover,
+                            )
+                            .clicked()
+                            {
+                                actions.push(PageAction::Open(card.id.clone(), part));
                             }
                         }
                     });
                 });
             });
+            if confirming {
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    let danger = Color32::from_rgb(235, 95, 95);
+                    if act(
+                        ui,
+                        look,
+                        &format!("Remove {} and its edits", card.name),
+                        Some(danger),
+                    )
+                    .on_hover_text("Its files stay in its folder")
+                    .clicked()
+                    {
+                        ui.ctx().data_mut(|data| data.remove::<bool>(confirm_id));
+                        actions.push(PageAction::Remove(card.key.clone()));
+                    }
+                    if act(ui, look, "Cancel", None).clicked() {
+                        ui.ctx().data_mut(|data| data.remove::<bool>(confirm_id));
+                    }
+                });
+            }
             if let Some(part) = open {
                 ui.add_space(10.0);
-                self.draw_part_detail(ui, look, card, part, parts, actions);
+                self.draw_part_detail(ui, look, card, part, &facts, parts, actions);
             }
         });
     }
 
+    /// The card's "⋯" menu: hide a fighter's card, or remove a made character.
+    fn draw_card_menu(
+        &self,
+        ui: &mut Ui,
+        card: &Card,
+        has_edits: bool,
+        confirm_id: egui::Id,
+        actions: &mut Vec<PageAction>,
+    ) {
+        ui.menu_button(RichText::new("⋯").size(20.0).strong(), |ui| {
+            if card.made {
+                if ui.button(format!("Remove {}", card.name)).clicked() {
+                    ui.ctx().data_mut(|data| data.insert_temp(confirm_id, true));
+                    ui.close();
+                }
+            } else {
+                let hide = ui
+                    .add_enabled(!has_edits, egui::Button::new("Hide from page"))
+                    .on_disabled_hover_text("Has edits");
+                if hide.clicked() {
+                    actions.push(PageAction::Hide(card.fighter.clone()));
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text(format!("{} options", card.name));
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_part_detail(
         &mut self,
         ui: &mut Ui,
         look: Look,
         card: &Card,
         part: Part,
+        facts: &CardFacts,
         parts: &ProjectParts,
         actions: &mut Vec<PageAction>,
     ) {
-        let (_, from, detail) = self.part_summary(parts, card, part);
+        let summary = part_summary(part, facts);
         let fighter = &card.fighter;
         let slot = card.slot;
         let colour = part_colour(part);
+        let name = &card.name;
         egui::Frame::new()
             .fill(look.sunk)
             .corner_radius(10.0)
             .inner_margin(egui::Margin::same(12))
             .stroke(egui::Stroke::new(1.5, colour))
             .show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-            paint_part_icon(ui.painter(), rect, part, colour);
-            ui.label(RichText::new(part.title()).size(19.0).strong().color(look.text));
-            // A picked folder is named in full just below.
-            if parts.link(fighter, part, slot).is_none() {
-                let (label, tint) = source_chip(&from);
-                chip(ui, &label, tint);
-            }
-            if !detail.is_empty() {
-                ui.label(RichText::new(&detail).color(look.dim));
-            }
-        });
-        if part.has_folder() {
-            let workspace = self.workspace();
-            let picked = parts.link(fighter, part, slot).map(Path::to_path_buf);
-            let folder = if part == Part::Moves {
-                self.acmd_src.as_ref().map(|index| index.root.clone())
-            } else {
-                workspace.as_deref().and_then(|workspace| parts.dir(workspace, fighter, part, slot))
-            };
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Folder").strong().color(look.dim));
-                let shown = match &folder {
-                    Some(dir) => dir.display().to_string(),
-                    None if part == Part::Moves => "Game scripts".into(),
-                    None => "Save the project first".into(),
-                };
-                ui.label(RichText::new(shown).monospace().color(look.text));
-            });
-            ui.horizontal_wrapped(|ui| {
-                let pick = if part == Part::Moves { "Link move code" } else { "Choose folder" };
-                if act(ui, look, pick, None).clicked() {
-                    actions.push(PageAction::PickFolder(fighter.clone(), part, slot));
-                }
-                if let Some(dir) = folder.clone() {
-                    if act(ui, look, "Open", None).clicked() {
-                        actions.push(PageAction::Reveal(dir));
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    paint_part_icon(ui.painter(), rect, part, colour);
+                    ui.label(RichText::new(part.title()).size(19.0).strong().color(look.text));
+                    for text in &summary.chips {
+                        chip(ui, text, if summary.changed { colour } else { look.dim });
                     }
+                });
+                // Where the part's files are, for the parts that have files.
+                if part.has_folder() && part != Part::Moves {
+                    let workspace = self.workspace();
+                    let folder = workspace
+                        .as_deref()
+                        .and_then(|workspace| parts.dir(workspace, fighter, part, slot));
+                    let picked = parts.link(fighter, part, slot).is_some();
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let shown = folder.as_ref().map_or_else(
+                            || "Save the project first".to_owned(),
+                            |dir| dir.display().to_string(),
+                        );
+                        ui.label(RichText::new(shown).monospace().color(look.text));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(dir) = folder.clone() {
+                            if act(ui, look, "Open folder", None).clicked() {
+                                actions.push(PageAction::Reveal(dir));
+                            }
+                        }
+                        // A made character's effects and sounds live in its own folder.
+                        let own_only = card.made && !part.per_costume();
+                        if picked {
+                            if act(ui, look, "Use project folder", None).clicked() {
+                                actions.push(PageAction::ForgetFolder(fighter.clone(), part, slot));
+                            }
+                        } else if !own_only
+                            && act(ui, look, "Use another folder", None)
+                                .on_hover_text(if part.per_costume() {
+                                    format!("Keep c{slot:02}'s files in a folder of yours")
+                                } else {
+                                    format!("Keep {name}'s files in a folder of yours")
+                                })
+                                .clicked()
+                        {
+                            actions.push(PageAction::PickFolder(fighter.clone(), part, slot));
+                        }
+                    });
                 }
-                if picked.is_some() || (part == Part::Moves && folder.is_some()) {
-                    let words = if part == Part::Moves { "Unlink" } else { "Use project folder" };
-                    if act(ui, look, words, None).clicked() {
-                        actions.push(PageAction::ForgetFolder(fighter.clone(), part, slot));
+                ui.add_space(6.0);
+                let go = |page| PageAction::Go(card.key.clone(), slot, page);
+                let files = |what| PageAction::Files(card.clone(), what);
+                let main = Some(colour);
+                ui.horizontal_wrapped(|ui| match part {
+                    Part::Moves => {
+                        if act(ui, look, "Edit", main)
+                            .on_hover_text(format!("{name} c{slot:02} in the Classic editor"))
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::ClassicCollisions));
+                        }
+                        if act(ui, look, "Edit as nodes", None)
+                            .on_hover_text(format!("{name} c{slot:02} in Move nodes"))
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::MoveNodes));
+                        }
                     }
-                }
-            });
-        }
-        ui.add_space(6.0);
-        let files = |what| PageAction::Files(fighter.clone(), slot, what);
-        let main = Some(colour);
-        ui.horizontal_wrapped(|ui| match part {
-            Part::Moves => {
-                if act(ui, look, "Edit moves", main).clicked() {
-                    actions.push(PageAction::EditMoves(fighter.clone(), false));
-                }
-                if act(ui, look, "Edit with nodes", None).clicked() {
-                    actions.push(PageAction::EditMoves(fighter.clone(), true));
-                }
-                if card.made_here {
-                    let alone = self.roster.edit_target() == Some(&card.roster_key);
-                    let base = crate::data::fighter_display_name(fighter);
-                    let (words, tip) = if alone {
-                        ("Edits change only this character", format!("Click to make move edits change every {base} again."))
-                    } else {
-                        ("Edits change every costume", format!("Move edits change every {base}. Click to make them change only this character."))
-                    };
-                    if act(ui, look, words, alone.then_some(colour)).on_hover_text(tip).clicked() {
-                        let target = (!alone).then(|| card.roster_key.clone());
-                        actions.push(PageAction::Made(crate::roster::new_character::NewCharacterAction::SetEditTarget(target)));
+                    Part::Gimmicks => {
+                        if act(ui, look, "Edit", main)
+                            .on_hover_text(format!("{name} in Gimmicks"))
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::Gimmicks));
+                        }
                     }
+                    Part::Effects => {
+                        let ready = self.page_ready(card, CardPage::Effects);
+                        let edit = ui
+                            .add_enabled_ui(ready.is_ok(), |ui| act(ui, look, "Edit effects", main))
+                            .inner
+                            .on_hover_text(format!("{name}'s effect file on the Effects page"))
+                            .on_disabled_hover_text(ready.err().unwrap_or_default());
+                        if edit.clicked() {
+                            actions.push(go(CardPage::Effects));
+                        }
+                        if act(ui, look, "Edit in moves", None)
+                            .on_hover_text("Which effects a move plays, and where")
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::ClassicEffects));
+                        }
+                        let add = act(ui, look, "Add effect file", None);
+                        let add = if card.made {
+                            add.on_hover_text(format!(
+                                "Saved as ef_{fighter}_c{slot:02}.eff, {name} c{slot:02}'s own"
+                            ))
+                        } else {
+                            add
+                        };
+                        if add.clicked() {
+                            actions.push(files(FileAction::AddEffects));
+                        }
+                    }
+                    Part::Sounds => {
+                        if act(ui, look, "Edit move sounds", main)
+                            .on_hover_text(format!("{name} c{slot:02} on the Classic editor's sound tab"))
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::ClassicAudio));
+                        }
+                        let add = act(ui, look, "Add sound files", None);
+                        let add = if card.made {
+                            add.on_hover_text(format!(
+                                "Named for {name} c{slot:02}, as se_{fighter}_c{slot:02}.nus3audio"
+                            ))
+                        } else {
+                            add
+                        };
+                        if add.clicked() {
+                            actions.push(files(FileAction::AddSounds));
+                        }
+                    }
+                    Part::Model | Part::Animations => {
+                        let base = if card.made {
+                            format!(
+                                "{}'s c{:02}; files already here are kept",
+                                card.base_name,
+                                card.slots.iter().position(|own| *own == slot).unwrap_or(0) % 8
+                            )
+                        } else {
+                            "The game's files; files already here are kept".to_owned()
+                        };
+                        let busy = self.workspace_copy_rx.is_some()
+                            || (!card.made && self.state.data_root.is_none());
+                        if ui
+                            .add_enabled_ui(!busy, |ui| act(ui, look, "Copy base costume", main))
+                            .inner
+                            .on_hover_text(base)
+                            .clicked()
+                        {
+                            actions.push(files(FileAction::CopyBase(part)));
+                        }
+                        if part == Part::Model {
+                            if act(ui, look, "Add files", None).clicked() {
+                                actions.push(files(FileAction::AddModelFiles));
+                            }
+                            if act(ui, look, "Add folder", None)
+                                .on_hover_text("Every model file in a folder")
+                                .clicked()
+                            {
+                                actions.push(files(FileAction::AddModelFolder));
+                            }
+                        } else {
+                            if act(ui, look, "Add animations", None).clicked() {
+                                actions.push(files(FileAction::AddAnimations));
+                            }
+                            if act(ui, look, "Add swing.prc", None).clicked() {
+                                actions.push(files(FileAction::AddSwing));
+                            }
+                        }
+                    }
+                    Part::Values => {
+                        if card.made {
+                            if act(ui, look, &format!("Edit {}'s values", card.base_name), main)
+                                .on_hover_text(
+                                    "The game keeps one set of values per fighter; every costume uses them",
+                                )
+                                .clicked()
+                            {
+                                actions.push(go(CardPage::Values));
+                            }
+                        } else if act(ui, look, "Edit", main).clicked() {
+                            actions.push(go(CardPage::Values));
+                        }
+                    }
+                    Part::SelectScreen => {
+                        if act(ui, look, "Edit", main)
+                            .on_hover_text("Name and portraits")
+                            .clicked()
+                        {
+                            actions.push(go(CardPage::SelectScreen));
+                        }
+                    }
+                });
+                if matches!(part, Part::Model | Part::Animations) {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if act(ui, look, "Show in game", None)
+                            .on_hover_text("The fighter must not hold an item while it loads")
+                            .clicked()
+                        {
+                            actions.push(files(FileAction::Send));
+                        }
+                        let status = self.game_link.asset_bundle_status();
+                        let sent = status.target == fighter.to_ascii_lowercase()
+                            && self.workspace_asset_sent_slot == Some(slot);
+                        if sent
+                            && act(ui, look, "Stop", None)
+                                .on_hover_text("Back to the game's own files")
+                                .clicked()
+                        {
+                            actions.push(files(FileAction::Stop));
+                        }
+                        if sent && status.generation == self.workspace_asset_generation {
+                            let state = if status.ready {
+                                "In game"
+                            } else if status.phase == "ready" {
+                                "Waiting for the game"
+                            } else {
+                                status.phase.as_str()
+                            };
+                            chip(ui, &format!("{state} {}/{}", status.served, status.staged), look.accent);
+                        }
+                    });
                 }
-            }
-            Part::Effects => {
-                if act(ui, look, "Edit effects", main).clicked() {
-                    actions.push(PageAction::EditEffects(fighter.clone()));
-                }
-                if act(ui, look, "Add .eff", None).clicked() {
-                    actions.push(files(FileAction::AddEffects));
-                }
-            }
-            Part::Sounds => {
-                if act(ui, look, "Edit move sounds", main).clicked() {
-                    actions.push(PageAction::EditMoves(fighter.clone(), false));
-                }
-                if act(ui, look, "Add sound files", None).clicked() {
-                    actions.push(files(FileAction::AddSounds));
-                }
-            }
-            Part::Model => {
-                let busy = self.workspace_copy_rx.is_some() || self.state.data_root.is_none();
-                if ui.add_enabled_ui(!busy, |ui| act(ui, look, "Copy from game", main)).inner.on_hover_text("Model and textures; files already here are kept").clicked() {
-                    actions.push(files(FileAction::CopyGameModel));
-                }
-                if ui.add_enabled_ui(!busy, |ui| act(ui, look, "Copy model + animations", None)).inner.clicked() {
-                    actions.push(files(FileAction::CopyGameCharacter));
-                }
-                if act(ui, look, "Add folder", None).clicked() {
-                    actions.push(files(FileAction::AddModelFolder));
-                }
-                if act(ui, look, "Add files", None).clicked() {
-                    actions.push(files(FileAction::AddModelFiles));
-                }
-            }
-            Part::Animations => {
-                if act(ui, look, "Add animations", main).clicked() {
-                    actions.push(files(FileAction::AddAnimations));
-                }
-                if act(ui, look, "Add swing.prc", None).clicked() {
-                    actions.push(files(FileAction::AddSwing));
-                }
-            }
-            Part::Gimmicks => {
-                if act(ui, look, "Edit gimmicks", main).clicked() {
-                    actions.push(PageAction::EditGimmicks(fighter.clone()));
-                }
-            }
-            Part::Values => {
-                if act(ui, look, "Edit values", main).clicked() {
-                    actions.push(PageAction::EditValues(fighter.clone()));
-                }
-            }
-            Part::SelectScreen => {
-                if act(ui, look, "Edit name and portraits", main).clicked() {
-                    actions.push(PageAction::EditSelectScreen(card.roster_key.clone()));
-                }
-            }
-        });
-        if matches!(part, Part::Model | Part::Animations) {
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                if act(ui, look, "Show in game", None).on_hover_text("The fighter must not hold an item while it loads").clicked() {
-                    actions.push(files(FileAction::Send));
-                }
-                if act(ui, look, "Stop", None).clicked() {
-                    actions.push(files(FileAction::Stop));
-                }
-                let status = self.game_link.asset_bundle_status();
-                if status.target == fighter.to_ascii_lowercase() && status.generation == self.workspace_asset_generation && self.workspace_asset_sent_slot == Some(slot) {
-                    let state = if status.ready { "In game" } else if status.phase == "ready" { "Waiting for the game" } else { status.phase.as_str() };
-                    chip(ui, &format!("{state} {}/{}", status.served, status.staged), look.accent);
-                }
-            });
-        }
             });
     }
 
@@ -1272,11 +2003,19 @@ impl VisionaryApp {
                 .collect::<Vec<_>>()
                 .join(", "),
         };
-        let values = match summary.params {
+        // Counted as the Fighter values page counts them.
+        let value_count: usize = self
+            .roster
+            .params
+            .keys()
+            .map(|fighter| self.roster.fighter_value_count(fighter))
+            .sum();
+        let values = match value_count {
             0 => String::new(),
             n => format!("{} changed", counted(n, "value")),
         };
-        let mods = match self.roster.enabled_roots().len() {
+        // Installed mods only: a made character's folder is the project's own.
+        let mods = match self.roster.library.enabled_roots().len() {
             0 => String::new(),
             1 => "1 turned on".to_owned(),
             n => format!("{n} turned on"),
@@ -1304,7 +2043,7 @@ impl VisionaryApp {
                     Tile::Part(Part::Values),
                     "Fighter values",
                     &values,
-                    summary.params > 0,
+                    value_count > 0,
                 ),
                 (Tile::Mods, "Installed mods", &mods, false),
             ];
@@ -1431,30 +2170,155 @@ impl VisionaryApp {
             .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
     }
 
-    /// Pick the card's fighter in the editor, showing the costume picked on its card.
-    fn focus_card(&mut self, fighter: &str, slot: Option<u8>) {
+    /// Pick the fighter in the editor, showing `slot` of it.
+    fn focus_card(&mut self, fighter: &str, slot: u8) {
         let Some(index) = self.fighter_index(fighter) else {
             return;
         };
         if self.state.selected_fighter != Some(index) {
             self.select_fighter(index);
         }
-        if let Some(slot) = slot.or_else(|| self.project_parts().characters.get(fighter).copied()) {
-            self.workspace_asset_slot = slot;
-            self.show_skin(fighter, slot);
+        self.workspace_asset_slot = slot;
+        let fighter = self.state.fighters[index].name.clone();
+        self.show_skin(&fighter, slot);
+    }
+
+    /// Whether `card` can open `page` yet, and why not.
+    fn page_ready(&self, card: &Card, page: CardPage) -> Result<(), String> {
+        // A made character's own effect file is not opened on the Effects page yet: the page
+        // keeps its edits per fighter, so editing it would mix them with the base fighter's.
+        if card.made && page == CardPage::Effects {
+            return Err(format!(
+                "{}'s own effect file opens here once its effects are kept apart from {}'s",
+                card.name, card.base_name
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open `page` with `key`'s character active and its costume `costume` shown. Every page a
+    /// card opens goes through here.
+    fn go(&mut self, key: &RosterKey, costume: u8, page: CardPage) {
+        let made = self
+            .roster
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)
+            .cloned();
+        let fighter = made
+            .as_ref()
+            .map_or_else(|| key.as_str().to_owned(), |entry| entry.donor.clone());
+        match page {
+            CardPage::Values => {
+                self.roster.focus_traits_for(&fighter);
+                return;
+            }
+            CardPage::SelectScreen => {
+                let cell = match &made {
+                    Some(_) => key.clone(),
+                    None => {
+                        let members: Vec<&str> = group_of(&fighter).map_or_else(
+                            || vec![fighter.as_str()],
+                            |(_, members)| members.iter().map(|(member, _)| *member).collect(),
+                        );
+                        self.roster
+                            .select_screen_cell(&members)
+                            .unwrap_or_else(|| key.clone())
+                    }
+                };
+                self.roster.select_css(cell);
+                return;
+            }
+            _ => {}
+        }
+        // The character opened is the one edited: a made character's own costumes, or the
+        // whole fighter.
+        self.roster
+            .set_edit_target(made.as_ref().map(|entry| entry.key.clone()));
+        self.focus_card(&fighter, costume);
+        self.roster.open = false;
+        self.eff_editor.open = false;
+        self.node_workspace = page == CardPage::MoveNodes;
+        match page {
+            CardPage::ClassicCollisions => self.primary_tab = PrimaryEditorTab::Collisions,
+            CardPage::ClassicEffects => self.primary_tab = PrimaryEditorTab::Effects,
+            CardPage::ClassicAudio => self.primary_tab = PrimaryEditorTab::AudioFeedback,
+            CardPage::Gimmicks => self.primary_tab = PrimaryEditorTab::Gimmicks,
+            CardPage::MoveNodes => {
+                self.primary_tab = PrimaryEditorTab::Nodes;
+                self.node_editor.refresh_character();
+            }
+            CardPage::Effects => {
+                let rel = format!("effect/fighter/{fighter}/ef_{fighter}.eff");
+                if self.eff_editor.loaded_rel().as_deref() != Some(rel.as_str()) {
+                    self.reopen_fighter_effects(&fighter);
+                }
+                self.open_effects_page();
+            }
+            CardPage::Values | CardPage::SelectScreen => {}
         }
     }
 
-    fn run_page_action(&mut self, action: PageAction) {
+    /// Take a made character out of the project, with the edits made for it alone.
+    fn remove_character(&mut self, key: &RosterKey) {
+        let Some(made) = self
+            .roster
+            .project
+            .authored
+            .iter()
+            .find(|made| &made.key == key)
+            .cloned()
+        else {
+            return;
+        };
+        let slots = made.all_slots();
+        let only_its =
+            |scopes: &[u8]| !scopes.is_empty() && scopes.iter().all(|slot| slots.contains(slot));
+        if let Some(log) = self.state.edit_log.entries.get_mut(&made.donor) {
+            log.retain(|_, record| !only_its(&record.effective_scopes()));
+        }
+        if self
+            .roster
+            .behaviors
+            .get(&made.donor)
+            .is_some_and(|graph| only_its(&graph.costumes))
+        {
+            self.roster.behaviors.remove(&made.donor);
+        }
+        let status = self.roster.handle_new_character(
+            crate::roster::new_character::NewCharacterAction::Remove(key.clone()),
+        );
+        let donor = made.donor.clone();
+        self.change_parts(|parts| {
+            parts.characters.remove(key.as_str());
+            parts.links.retain(|link| {
+                !(link.fighter.eq_ignore_ascii_case(&donor)
+                    && link.slot.is_some_and(|slot| slots.contains(&slot)))
+            });
+        });
+        if self
+            .project_open_part
+            .as_ref()
+            .is_some_and(|(id, _)| id == key.as_str())
+        {
+            self.project_open_part = None;
+        }
+        if let Some(status) = status {
+            self.state.status = status;
+        }
+    }
+
+    fn run_page_action(&mut self, ctx: &egui::Context, action: PageAction) {
         match action {
-            PageAction::Select(fighter, slot) => self.focus_card(&fighter, Some(slot)),
-            PageAction::Open(fighter, part) => {
-                let again = self.project_open_part.as_ref() == Some(&(fighter.clone(), part));
-                self.project_open_part = (!again).then_some((fighter, part));
+            PageAction::Go(key, slot, page) => self.go(&key, slot, page),
+            PageAction::Open(id, part) => {
+                let again = self.project_open_part.as_ref() == Some(&(id.clone(), part));
+                self.project_open_part = (!again).then_some((id, part));
             }
-            PageAction::PickSlot(fighter, slot) => {
+            PageAction::PickSlot(key, fighter, slot) => {
                 self.change_parts(|parts| {
-                    parts.characters.insert(fighter.clone(), slot);
+                    parts.characters.insert(key, slot);
                 });
                 if self.fighter_index(&fighter) == self.state.selected_fighter {
                     self.workspace_asset_slot = slot;
@@ -1472,10 +2336,8 @@ impl VisionaryApp {
                     }
                 });
             }
-            PageAction::Member(card, fighter) => {
-                if let Some((title, _)) = GROUPS.iter().find(|(title, _)| *title == card) {
-                    self.project_member.insert(title, fighter.clone());
-                }
+            PageAction::Member(title, fighter) => {
+                self.project_member.insert(title, fighter.clone());
                 // The card stays on the page whichever of its fighters is shown.
                 let slot = self
                     .fighter_index(&fighter)
@@ -1483,7 +2345,6 @@ impl VisionaryApp {
                 self.change_parts(|parts| {
                     parts.characters.entry(fighter.clone()).or_insert(slot);
                 });
-                self.project_open_part = None;
             }
             PageAction::Add(fighter) => {
                 let slot = self
@@ -1492,7 +2353,26 @@ impl VisionaryApp {
                 self.change_parts(|parts| {
                     parts.characters.insert(fighter.clone(), slot);
                 });
-                self.project_open_part = Some((fighter, Part::Moves));
+                let id = group_of(&fighter).map_or(fighter, |(title, _)| title.to_owned());
+                self.project_open_part = Some((id, Part::Moves));
+            }
+            PageAction::LinkMoveCode => {
+                let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Your Smashline project")
+                    .pick_folder()
+                else {
+                    return;
+                };
+                self.link_acmd_source(folder.clone());
+                if self.acmd_src.as_ref().map(|index| index.root.as_path())
+                    == Some(folder.as_path())
+                {
+                    self.change_parts(|parts| parts.set_link("", Part::Moves, 0, Some(folder)));
+                }
+            }
+            PageAction::UnlinkMoveCode => {
+                self.unlink_acmd_source();
+                self.change_parts(|parts| parts.set_link("", Part::Moves, 0, None));
             }
             PageAction::PickFolder(fighter, part, slot) => {
                 let Some(folder) = rfd::FileDialog::new()
@@ -1501,51 +2381,24 @@ impl VisionaryApp {
                 else {
                     return;
                 };
-                if part == Part::Moves {
-                    self.link_acmd_source(folder.clone());
-                    if self.acmd_src.as_ref().map(|index| index.root.as_path())
-                        != Some(folder.as_path())
-                    {
-                        return;
-                    }
-                }
                 self.change_parts(|parts| parts.set_link(&fighter, part, slot, Some(folder)));
                 if part == Part::Effects {
                     self.reopen_fighter_effects(&fighter);
                 }
+                forget_cached(ctx);
             }
             PageAction::ForgetFolder(fighter, part, slot) => {
-                if part == Part::Moves {
-                    self.unlink_acmd_source();
-                }
                 self.change_parts(|parts| parts.set_link(&fighter, part, slot, None));
                 if part == Part::Effects {
                     self.reopen_fighter_effects(&fighter);
                 }
+                forget_cached(ctx);
             }
             PageAction::Reveal(dir) => {
                 let _ = std::fs::create_dir_all(&dir);
                 if let Err(error) = crate::roster::reveal::reveal(&dir) {
                     self.state.status = format!("Could not open {}: {error:#}", dir.display());
                 }
-            }
-            PageAction::EditMoves(fighter, nodes) => {
-                self.focus_card(&fighter, None);
-                self.roster.open = false;
-                self.eff_editor.open = false;
-                self.node_workspace = nodes;
-                self.primary_tab = if nodes {
-                    PrimaryEditorTab::Nodes
-                } else {
-                    PrimaryEditorTab::Collisions
-                };
-                if nodes {
-                    self.node_editor.refresh_character();
-                }
-            }
-            PageAction::EditEffects(fighter) => {
-                self.focus_card(&fighter, None);
-                self.open_effects_page();
             }
             PageAction::EditOtherEffect(rel) => {
                 let path = self.resolve_eff_source(&rel);
@@ -1563,96 +2416,103 @@ impl VisionaryApp {
                     self.open_effects_page();
                 }
             }
-            PageAction::EditValues(fighter) => self.roster.focus_traits_for(&fighter),
-            PageAction::Made(action) => {
-                // Move edits made for only this character go with it.
-                if let crate::roster::new_character::NewCharacterAction::Remove(key) = &action {
-                    if let Some(made) = self
-                        .roster
-                        .project
-                        .authored
-                        .iter()
-                        .find(|made| &made.key == key)
-                    {
-                        let slots = made.all_slots();
-                        if let Some(log) = self.state.edit_log.entries.get_mut(&made.donor) {
-                            log.retain(|_, record| {
-                                let scopes = record.effective_scopes();
-                                scopes.is_empty() || !scopes.iter().all(|slot| slots.contains(slot))
-                            });
-                        }
-                    }
-                }
-                self.roster.handle_new_character(action);
+            PageAction::Remove(key) => self.remove_character(&key),
+            PageAction::Files(card, what) => {
+                self.run_file_action(&card, what);
+                forget_cached(ctx);
             }
-            PageAction::EditGimmicks(fighter) => {
-                self.focus_card(&fighter, None);
-                self.roster.open = false;
-                self.eff_editor.open = false;
-                self.node_workspace = false;
-                self.primary_tab = PrimaryEditorTab::Gimmicks;
-            }
-            PageAction::EditSelectScreen(key) => self.roster.select_css(key),
-            PageAction::Files(fighter, slot, what) => self.run_file_action(&fighter, slot, what),
         }
     }
 
-    fn run_file_action(&mut self, fighter: &str, slot: u8, what: FileAction) {
+    /// Copy the base costume into `card`'s costume: for a made character, its base fighter's
+    /// costume of the same colour; for a fighter, the game's own files into the project.
+    /// Files already there are kept. Returns (copied, kept).
+    fn copy_base_costume(
+        &self,
+        workspace: &Path,
+        parts: &ProjectParts,
+        card: &Card,
+        part: Part,
+    ) -> anyhow::Result<(usize, usize)> {
+        let kind = if part == Part::Model {
+            "model"
+        } else {
+            "motion"
+        };
+        let picked = parts
+            .link(&card.fighter, part, card.slot)
+            .map(Path::to_path_buf);
+        if card.made {
+            let root = self
+                .roster
+                .made_root(&card.key)
+                .ok_or_else(|| anyhow::anyhow!("{} has no folder", card.name))?;
+            // Colour k of the character started as the base fighter's costume k.
+            let colour = card
+                .slots
+                .iter()
+                .position(|own| *own == card.slot)
+                .unwrap_or(0)
+                % 8;
+            let roots: Vec<PathBuf> = self
+                .all_roots()
+                .into_iter()
+                .filter(|known| *known != root)
+                .collect();
+            return crate::project_hub::copy_base_costume(
+                &roots,
+                &card.fighter,
+                kind,
+                colour as u8,
+                card.slot,
+                &root,
+                picked.as_deref(),
+            );
+        }
+        let root = self
+            .state
+            .data_root
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("set the game folder in File first"))?;
+        let only = root.join("fighter").join(&card.fighter).join(kind);
+        let sources: Vec<PathBuf> =
+            crate::project_hub::collect_base_character_files(&root, &card.fighter, card.slot)?
+                .into_iter()
+                .filter(|source| source.starts_with(&only))
+                .collect();
+        anyhow::ensure!(
+            !sources.is_empty(),
+            "the game has no {kind} files for {} c{:02}",
+            card.name,
+            card.slot
+        );
+        let picked: Vec<(PathBuf, PathBuf)> = picked
+            .into_iter()
+            .filter_map(|folder| Some((part.game_dir(&card.fighter, card.slot)?, folder)))
+            .collect();
+        crate::project_hub::copy_base_files(workspace, &root, &sources, &picked)
+    }
+
+    fn run_file_action(&mut self, card: &Card, what: FileAction) {
         let Some(workspace) = self.workspace() else {
             self.state.status = "Save the project first.".into();
             return;
         };
         let parts = self.project_parts();
+        let (fighter, slot) = (card.fighter.as_str(), card.slot);
+        let shown = format!("{} c{slot:02}", card.name);
         let result: anyhow::Result<Vec<PathBuf>> = match what {
-            FileAction::CopyGameModel | FileAction::CopyGameCharacter => {
-                let Some(root) = self.state.data_root.clone() else {
-                    self.state.status = "Set the game folder in File first.".into();
-                    return;
+            FileAction::CopyBase(part) => {
+                self.state.status = match self.copy_base_costume(&workspace, &parts, card, part) {
+                    Ok((copied, 0)) => format!("Copied {} to {shown}.", counted(copied, "file")),
+                    Ok((copied, kept)) => format!(
+                        "Copied {} to {shown}. Kept {kept} already there.",
+                        counted(copied, "file")
+                    ),
+                    Err(error) => format!("Could not copy the base costume: {error:#}"),
                 };
-                let sources = if matches!(what, FileAction::CopyGameCharacter) {
-                    crate::project_hub::collect_base_character_files(&root, fighter, slot)
-                } else {
-                    let folder = root
-                        .join("fighter")
-                        .join(fighter)
-                        .join("model/body")
-                        .join(format!("c{slot:02}"));
-                    std::fs::read_dir(&folder)
-                        .map(|entries| {
-                            entries
-                                .flatten()
-                                .map(|entry| entry.path())
-                                .filter(|path| path.is_file())
-                                .collect()
-                        })
-                        .map_err(anyhow::Error::from)
-                };
-                let sources = match sources {
-                    Ok(files) => files,
-                    Err(error) => {
-                        self.state.status = format!("Could not read the game's files: {error:#}");
-                        return;
-                    }
-                };
-                // Copies go where the model and animations are kept, which may be a picked folder.
-                let picked: Vec<(PathBuf, PathBuf)> = [Part::Model, Part::Animations]
-                    .into_iter()
-                    .filter_map(|part| {
-                        Some((
-                            part.game_dir(fighter, slot)?,
-                            parts.link(fighter, part, slot)?.to_path_buf(),
-                        ))
-                    })
-                    .collect();
-                let (sender, receiver) = std::sync::mpsc::channel();
-                self.workspace_copy_rx = Some(receiver);
-                self.state.status = "Copying the game's files.".into();
-                std::thread::spawn(move || {
-                    let result =
-                        crate::project_hub::copy_base_files(&workspace, &root, &sources, &picked)
-                            .map_err(|error| format!("{error:#}"));
-                    let _ = sender.send(result);
-                });
+                self.preview_skin = None;
+                self.show_skin(fighter, slot);
                 return;
             }
             FileAction::AddModelFolder => {
@@ -1696,7 +2556,7 @@ impl VisionaryApp {
                     .map(|path| vec![path])
             }
             FileAction::AddEffects | FileAction::AddSounds => {
-                let (part, filter): (Part, &[&str]) = if matches!(what, FileAction::AddEffects) {
+                let (part, filter): (Part, &[&str]) = if what == FileAction::AddEffects {
                     (Part::Effects, &["eff"])
                 } else {
                     (Part::Sounds, &["nus3audio", "nus3bank"])
@@ -1711,9 +2571,10 @@ impl VisionaryApp {
                     return;
                 };
                 let linked = parts.link(fighter, part, slot).is_some();
+                let made = card.made.then_some((fighter, slot));
                 sources
                     .iter()
-                    .map(|source| copy_part_file(&dir, linked, part, source))
+                    .map(|source| copy_part_file(&dir, linked, part, source, made))
                     .collect()
             }
             FileAction::Send => {
@@ -1733,10 +2594,7 @@ impl VisionaryApp {
             }
         };
         self.state.status = match result {
-            Ok(files) => format!(
-                "Added {} to {fighter} c{slot:02}.",
-                counted(files.len(), "file")
-            ),
+            Ok(files) => format!("Added {} to {shown}.", counted(files.len(), "file")),
             Err(error) => format!("Could not add the files: {error:#}"),
         };
     }
@@ -1816,14 +2674,43 @@ fn count_files(dir: &Path) -> usize {
     count
 }
 
+/// How many files under `dir` have a name `wanted` accepts.
+fn count_matching(dir: &Path, wanted: impl Fn(&str) -> bool) -> usize {
+    let mut count = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            } else if wanted(&entry.file_name().to_string_lossy().to_ascii_lowercase()) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Copy an effect or sound file into its part's folder. In the project's own copy of the game
-/// folders a sound goes into its bank; a picked folder keeps whatever layout it has.
-fn copy_part_file(dir: &Path, picked: bool, part: Part, source: &Path) -> anyhow::Result<PathBuf> {
+/// folders a sound goes into its bank; a picked folder keeps whatever layout it has. A made
+/// character's copy is named for its costume (`made` is its fighter and costume).
+fn copy_part_file(
+    dir: &Path,
+    picked: bool,
+    part: Part,
+    source: &Path,
+    made: Option<(&str, u8)>,
+) -> anyhow::Result<PathBuf> {
     let name = source
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("not a file"))?;
+        .ok_or_else(|| anyhow::anyhow!("not a file"))?
+        .to_string_lossy()
+        .into_owned();
+    let name = match made {
+        Some((fighter, slot)) => made_file_name(&name, fighter, slot),
+        None => name,
+    };
     let dir = if part == Part::Sounds && !picked {
-        dir.join(crate::project_parts::sound_target(&name.to_string_lossy()))
+        dir.join(crate::project_parts::sound_target(&name))
     } else {
         dir.to_path_buf()
     };
@@ -1838,5 +2725,208 @@ fn counted(n: usize, noun: &str) -> String {
         format!("1 {noun}")
     } else {
         format!("{n} {noun}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn costumes_read_as_ranges() {
+        assert_eq!(slot_ranges(&[0, 1, 2, 3, 4, 5, 6, 7]), "c00–c07");
+        assert_eq!(slot_ranges(&[15, 8, 9, 10, 11, 12, 13, 14]), "c08–c15");
+        assert_eq!(slot_ranges(&[0, 1, 2, 5, 9, 10]), "c00–c02, c05, c09–c10");
+        assert_eq!(slot_ranges(&[3]), "c03");
+        assert_eq!(slot_ranges(&[]), "");
+        assert_eq!(slot_ranges(&[254, 255]), "c254–c255");
+    }
+
+    #[test]
+    fn every_kind_of_edit_gives_its_fighter_a_card() {
+        let one = |name: &str| vec![name.to_owned()];
+        let families = EditFamilies {
+            moves: one("mario"),
+            graphs: one("luigi"),
+            expressions: one("peach"),
+            effect_calls: one("daisy"),
+            node_effects: one("bowser"),
+            sounds: one("yoshi"),
+            effects: one("dk"),
+            values: one("link"),
+            gimmicks: one("samus"),
+            controllers: one("kirby"),
+            meters: one("fox"),
+            live_rules: one("ness"),
+            folders: one("pickel"),
+        };
+        let named = fighters_with_edits(&families);
+        for fighter in [
+            "mario", "luigi", "peach", "daisy", "bowser", "yoshi", "dk", "link", "samus", "kirby",
+            "fox", "ness", "pickel",
+        ] {
+            assert!(named.contains(fighter), "{fighter} got no card");
+        }
+        assert_eq!(named.len(), 13);
+        assert!(fighters_with_edits(&EditFamilies::default()).is_empty());
+    }
+
+    #[test]
+    fn move_keys_name_their_fighter() {
+        assert_eq!(
+            fighter_of_move_key("mario/attack11").as_deref(),
+            Some("mario")
+        );
+        assert_eq!(
+            fighter_of_move_key("mario#c08/attack11").as_deref(),
+            Some("mario")
+        );
+        assert_eq!(fighter_of_move_key("attack11"), None);
+    }
+
+    fn facts() -> CardFacts {
+        CardFacts {
+            base_name: "Mario".into(),
+            ..CardFacts::default()
+        }
+    }
+
+    #[test]
+    fn a_part_is_solid_only_when_the_project_changes_it_for_this_character() {
+        let mut base = facts();
+        let untouched = part_summary(Part::Moves, &base);
+        assert!(!untouched.changed);
+        assert!(untouched.chips.is_empty());
+        assert_eq!(part_hover(Part::Moves, &untouched), "Moves");
+
+        base.counts.moves = 4;
+        base.counts.nodes = 2;
+        let moves = part_summary(Part::Moves, &base);
+        assert!(moves.changed);
+        assert_eq!(
+            part_hover(Part::Moves, &moves),
+            "Moves: 4 edited, 2 with nodes"
+        );
+
+        // A costume another mod provides is not the project's change.
+        base.model.from_mod = Some("cape".into());
+        let model = part_summary(Part::Model, &base);
+        assert!(!model.changed);
+        assert_eq!(model.chips, vec!["Mod: cape".to_owned()]);
+        base.model = FolderFacts {
+            files: 12,
+            picked: false,
+            from_mod: None,
+        };
+        let model = part_summary(Part::Model, &base);
+        assert!(model.changed);
+        assert_eq!(model.chips, vec!["12 files".to_owned()]);
+        let animations = part_summary(Part::Animations, &base);
+        assert_eq!(animations.chips, vec!["Game".to_owned()]);
+    }
+
+    #[test]
+    fn values_say_who_shares_them() {
+        let mut base = facts();
+        base.counts.values = 12;
+        base.sharing = vec!["Vision".into()];
+        let values = part_summary(Part::Values, &base);
+        assert!(values.changed);
+        assert_eq!(
+            values.chips,
+            vec!["12 changed".to_owned(), "Also used by Vision".to_owned()]
+        );
+        // A made character's values are its base fighter's: never its own change.
+        let mut made = facts();
+        made.made = true;
+        made.counts.values = 12;
+        let values = part_summary(Part::Values, &made);
+        assert!(!values.changed);
+        assert_eq!(values.chips, vec!["Shared with Mario".to_owned()]);
+    }
+
+    #[test]
+    fn effects_count_looks_borrowed_effects_and_moves() {
+        let mut base = facts();
+        base.counts.effects_changed = 3;
+        base.counts.effects_borrowed = 1;
+        base.counts.effect_moves = 5;
+        let effects = part_summary(Part::Effects, &base);
+        assert!(effects.changed);
+        assert_eq!(effects.chips, vec!["3 changed", "1 borrowed", "5 moves"]);
+        let mut sounds = facts();
+        sounds.counts.sound_moves = 2;
+        sounds.sound_files = 3;
+        assert_eq!(
+            part_summary(Part::Sounds, &sounds).chips,
+            vec!["2 moves", "3 files"]
+        );
+        let mut made = facts();
+        made.made = true;
+        made.effect_file = true;
+        let effects = part_summary(Part::Effects, &made);
+        assert!(effects.changed);
+        assert_eq!(effects.chips, vec!["Own file"]);
+    }
+
+    #[test]
+    fn the_select_screen_says_what_changed() {
+        let mut base = facts();
+        assert!(!part_summary(Part::SelectScreen, &base).changed);
+        base.select = SelectFacts {
+            renamed: true,
+            portraits: 2,
+            moved: true,
+            hidden: false,
+        };
+        let select = part_summary(Part::SelectScreen, &base);
+        assert!(select.changed);
+        assert_eq!(select.chips, vec!["Renamed", "2 portraits", "Moved"]);
+        let mut made = facts();
+        made.made = true;
+        assert_eq!(
+            part_summary(Part::SelectScreen, &made).chips,
+            vec!["Own cell"]
+        );
+    }
+
+    #[test]
+    fn a_made_characters_files_are_named_for_its_costume() {
+        assert_eq!(
+            made_file_name("ef_mario.eff", "mario", 8),
+            "ef_mario_c08.eff"
+        );
+        assert_eq!(
+            made_file_name("ef_mario_c03.eff", "mario", 9),
+            "ef_mario_c09.eff"
+        );
+        assert_eq!(
+            made_file_name("se_mario_c00.nus3audio", "mario", 12),
+            "se_mario_c12.nus3audio"
+        );
+        assert_eq!(
+            made_file_name("vc_mario.nus3bank", "mario", 8),
+            "vc_mario_c08.nus3bank"
+        );
+        // A file of no fighter keeps its name.
+        assert_eq!(
+            made_file_name("se_custom.nus3audio", "mario", 8),
+            "se_custom.nus3audio"
+        );
+        // `_mario_cape` is not a costume number.
+        assert_eq!(
+            made_file_name("se_mario_cape.nus3audio", "mario", 8),
+            "se_mario_cape.nus3audio"
+        );
+    }
+
+    #[test]
+    fn counts_with_nothing_are_no_edits() {
+        assert!(!CardCounts::default().any());
+        assert!(CardCounts {
+            meters: 1,
+            ..CardCounts::default()
+        }
+        .any());
     }
 }

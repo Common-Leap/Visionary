@@ -509,12 +509,23 @@ pub fn export_roster(
 /// A character with no files yet is reported rather than skipped, because a mod containing a
 /// costume-gated moveset and no model is a character that appears as the donor wearing the
 /// donor's clothes, running the wrong moveset — which looks like the gate being broken.
+///
+/// Runs after the rest of the export has written its files, and never replaces one: a file the
+/// export generated (a costume's own effect file rebuilt with its edits, say) is newer than the
+/// copy made with the character, so the generated one ships and the clash is reported.
+/// `project_dir` resolves folders stored relative to the project.
 pub fn export_authored_files(
     mod_root: &Path,
     roots: &[PathBuf],
+    project_dir: Option<&Path>,
     authored: &[crate::mod_project::AuthoredEntry],
     report: &mut RosterExport,
 ) -> Result<()> {
+    let mut copy = Copier {
+        written: Default::default(),
+        kept: Vec::new(),
+        mod_root,
+    };
     for entry in authored {
         // Every skin ships, not just the primary slot: a multi-skin character
         // whose extra costumes are missing plays the donor's files (or
@@ -523,24 +534,23 @@ pub fn export_authored_files(
         let mut copied = 0;
         // Everything in the character's own folder is the character: the other model parts,
         // sounds and portraits copied in when it was made, as well as what is listed below.
-        if let Some(own) = entry.files_root.as_deref().filter(|own| own.is_dir()) {
-            copied += copy_tree(own, mod_root)?;
+        let own = entry.files_root.as_deref().map(|root| match project_dir {
+            Some(dir) => crate::project_parts::project_absolute(dir, root),
+            None => root.to_path_buf(),
+        });
+        if let Some(own) = own.as_deref().filter(|own| own.is_dir()) {
+            copied += copy.tree(own, mod_root)?;
         }
         for relative in super::scaffold::directories_for_slots(&entry.donor, &all) {
             for root in roots {
-                copied += copy_tree(&root.join(&relative), &mod_root.join(&relative))?;
+                copied += copy.tree(&root.join(&relative), &mod_root.join(&relative))?;
             }
         }
         for effect in super::scaffold::effect_files(&entry.donor, &all) {
             for root in roots {
                 let source = root.join(&effect);
                 if source.is_file() {
-                    let destination = mod_root.join(&effect);
-                    if let Some(parent) = destination.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::copy(&source, &destination)?;
-                    copied += 1;
+                    copied += copy.file(&source, &mod_root.join(&effect))?;
                 }
             }
         }
@@ -557,6 +567,11 @@ pub fn export_authored_files(
                 .files
                 .push(format!("{} ({copied} file(s))", entry.display_name));
         }
+    }
+    for kept in copy.kept {
+        report.warnings.push(format!(
+            "{kept}: the export built its own version, so the copy in the character's folder was not shipped."
+        ));
     }
     Ok(())
 }
@@ -624,33 +639,66 @@ fn slot_span(slots: &[u8]) -> String {
     }
 }
 
-/// Copy a directory's files, returning how many were copied.
-///
-/// Visionary's own placement note is skipped: it is a hint for the author, not content, and
-/// shipping it inside a released mod would be noise.
-fn copy_tree(source: &Path, destination: &Path) -> Result<usize> {
-    let Ok(entries) = std::fs::read_dir(source) else {
-        return Ok(0);
-    };
-    let mut copied = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_dir() {
-            copied += copy_tree(&path, &destination.join(&name))?;
-            continue;
+/// Copies characters' files into an export without replacing what the export wrote.
+struct Copier<'a> {
+    /// Files this copy wrote: a later root offering the same file is skipped quietly.
+    written: std::collections::HashSet<PathBuf>,
+    /// Files the export had already written, kept, by path in the mod.
+    kept: Vec<String>,
+    mod_root: &'a Path,
+}
+
+impl Copier<'_> {
+    /// Copy one file unless the export already has it. Returns how many were copied.
+    fn file(&mut self, source: &Path, destination: &Path) -> Result<usize> {
+        if self.written.contains(destination) {
+            return Ok(0);
         }
-        if name
-            .to_string_lossy()
-            .eq_ignore_ascii_case("PUT_YOUR_MODEL_HERE.txt")
-        {
-            continue;
+        if destination.exists() {
+            let shown = destination
+                .strip_prefix(self.mod_root)
+                .unwrap_or(destination)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !self.kept.contains(&shown) {
+                self.kept.push(shown);
+            }
+            return Ok(0);
         }
-        std::fs::create_dir_all(destination)?;
-        std::fs::copy(&path, destination.join(&name))?;
-        copied += 1;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source, destination)?;
+        self.written.insert(destination.to_path_buf());
+        Ok(1)
     }
-    Ok(copied)
+
+    /// Copy a directory's files, returning how many were copied.
+    ///
+    /// Visionary's own placement note is skipped: it is a hint for the author, not content,
+    /// and shipping it inside a released mod would be noise.
+    fn tree(&mut self, source: &Path, destination: &Path) -> Result<usize> {
+        let Ok(entries) = std::fs::read_dir(source) else {
+            return Ok(0);
+        };
+        let mut copied = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if path.is_dir() {
+                copied += self.tree(&path, &destination.join(&name))?;
+                continue;
+            }
+            if name
+                .to_string_lossy()
+                .eq_ignore_ascii_case("PUT_YOUR_MODEL_HERE.txt")
+            {
+                continue;
+            }
+            copied += self.file(&path, &destination.join(&name))?;
+        }
+        Ok(copied)
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1020,7 @@ mod authored_file_tests {
         export_authored_files(
             &mod_root,
             std::slice::from_ref(&source),
+            None,
             &[authored_entry_multi("mario", &[8], "Vision", "vision")],
             &mut report,
         )
@@ -1012,6 +1061,7 @@ mod authored_file_tests {
         export_authored_files(
             &dir.path().join("mod"),
             &[source],
+            None,
             &[authored_entry_multi(
                 "mario",
                 &[8, 9, 10, 11, 12, 13, 14, 15],
@@ -1034,6 +1084,63 @@ mod authored_file_tests {
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
+    /// The export rebuilds a costume's own effect file with its edits before the character's
+    /// folder is copied in. The copy made when the character was created is older; replacing
+    /// the built file with it shipped the character without its effect edits.
+    #[test]
+    fn a_file_the_export_built_is_kept_and_the_clash_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let own = project.join("characters/vision");
+        scaffold::create_many(&own, "mario", &[8]).unwrap();
+        std::fs::write(own.join(scaffold::effect_file("mario", 8)), b"created").unwrap();
+        std::fs::write(
+            own.join("fighter/mario/model/body/c08/model.numdlb"),
+            b"model",
+        )
+        .unwrap();
+        let mut entry = authored_entry_multi("mario", &[8], "Vision", "vision");
+        // Stored relative to the project, as new projects store it.
+        entry.files_root = Some(PathBuf::from("characters/vision"));
+        let export = |built: bool| {
+            let mod_root = dir.path().join(if built { "built" } else { "plain" });
+            if built {
+                let eff = mod_root.join(scaffold::effect_file("mario", 8));
+                std::fs::create_dir_all(eff.parent().unwrap()).unwrap();
+                std::fs::write(&eff, b"built").unwrap();
+            }
+            let mut report = RosterExport::default();
+            // The folder is also one of the roots, as it is while the project is open.
+            export_authored_files(
+                &mod_root,
+                std::slice::from_ref(&own),
+                Some(&project),
+                std::slice::from_ref(&entry),
+                &mut report,
+            )
+            .unwrap();
+            (mod_root, report)
+        };
+        let (mod_root, report) = export(true);
+        assert_eq!(
+            std::fs::read(mod_root.join(scaffold::effect_file("mario", 8))).unwrap(),
+            b"built"
+        );
+        assert!(mod_root
+            .join("fighter/mario/model/body/c08/model.numdlb")
+            .is_file());
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("ef_mario_c08.eff"));
+        // Paired: with nothing built, the character's own copy ships, and the same file
+        // offered by its folder and by the roots is not a clash.
+        let (mod_root, report) = export(false);
+        assert_eq!(
+            std::fs::read(mod_root.join(scaffold::effect_file("mario", 8))).unwrap(),
+            b"created"
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
     /// A mod with the moveset and no model is a character that appears as the donor running
     /// the wrong moveset, which looks like the costume gate being broken.
     #[test]
@@ -1045,6 +1152,7 @@ mod authored_file_tests {
         export_authored_files(
             &dir.path().join("mod"),
             &[source],
+            None,
             &[authored_entry_multi("mario", &[8], "Vision", "vision")],
             &mut report,
         )

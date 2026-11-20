@@ -1537,7 +1537,15 @@ impl CssView {
             .authored
             .iter()
             .find(|a| a.key == entry.key)
-            .and_then(|a| a.files_root.clone());
+            .and_then(|a| a.files_root.clone())
+            // Stored relative to the project; the project's roots hold it on disk.
+            .map(|root| {
+                roots
+                    .iter()
+                    .find(|known| root.is_relative() && known.ends_with(&root))
+                    .cloned()
+                    .unwrap_or(root)
+            });
         ui.horizontal_wrapped(|ui| {
             if let Some(root) = files_root {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

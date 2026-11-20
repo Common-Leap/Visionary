@@ -90,13 +90,8 @@ impl RosterTab {
             Self::Traits => {
                 let n: usize = window
                     .params
-                    .values()
-                    .map(|params| {
-                        params
-                            .files
-                            .get(super::traits::FIGHTER_PARAM_PATH)
-                            .map_or(0, std::collections::BTreeMap::len)
-                    })
+                    .keys()
+                    .map(|fighter| window.fighter_value_count(fighter))
                     .sum();
                 (n > 0).then_some(n)
             }
@@ -199,6 +194,14 @@ pub struct RosterWindow {
     /// ArcExplorer's export folder, which may contain parameter files absent
     /// from the main data root.
     export_root: Option<PathBuf>,
+    /// The open project's made characters' folders, on disk. Roots of this project only: they
+    /// join the lookup roots while it is open and leave with it.
+    project_roots: Vec<PathBuf>,
+    /// Whether the page was shown last frame, so coming back to it from another page starts
+    /// on the Project tab.
+    was_open: bool,
+    /// A page asked for a tab this frame; coming back keeps that one.
+    tab_requested: bool,
     /// hash40 → parameter field name, supplied by `app.rs` from the label download. The
     /// parameter files store hashes, and the full-field view has nothing to show without them.
     labels: std::collections::HashMap<u64, String>,
@@ -233,6 +236,9 @@ impl Default for RosterWindow {
             rename: None,
             roots: Vec::new(),
             export_root: None,
+            project_roots: Vec::new(),
+            was_open: false,
+            tab_requested: false,
             labels: Default::default(),
         }
     }
@@ -275,7 +281,7 @@ impl RosterWindow {
             .into_iter()
             .cloned()
             .chain(self.export_root.iter().cloned())
-            .chain(self.library.enabled_roots())
+            .chain(self.enabled_roots())
             .fold(Vec::new(), |mut roots, root| {
                 if !roots.contains(&root) {
                     roots.push(root);
@@ -358,7 +364,13 @@ impl RosterWindow {
             &self.params,
             &mut report,
         )?;
-        super::export::export_authored_files(mod_root, &self.roots, &roster.authored, &mut report)?;
+        super::export::export_authored_files(
+            mod_root,
+            &self.roots,
+            self.new_character.project_dir.as_deref(),
+            &roster.authored,
+            &mut report,
+        )?;
         super::export::export_costume_config(mod_root, &roster.authored, &mut report)?;
         Ok(report)
     }
@@ -435,20 +447,97 @@ impl RosterWindow {
         out
     }
 
+    fn show_tab(&mut self, tab: RosterTab) {
+        self.tab = tab;
+        self.tab_requested = true;
+    }
+
     /// Show the trait tab next time the window draws.
     pub fn focus_traits(&mut self) {
-        self.tab = RosterTab::Traits;
+        self.show_tab(RosterTab::Traits);
     }
 
     /// Show one fighter's values.
     pub fn focus_traits_for(&mut self, fighter: &str) {
-        self.tab = RosterTab::Traits;
+        self.show_tab(RosterTab::Traits);
         self.traits.select(super::RosterKey::fighter(fighter));
     }
 
     /// Show the installed mods.
     pub fn focus_library(&mut self) {
-        self.tab = RosterTab::Library;
+        self.show_tab(RosterTab::Library);
+    }
+
+    /// How many of `fighter`'s values in its fighter values file the project changes: the
+    /// count the Fighter values page shows. Gimmick values files are not counted here.
+    pub fn fighter_value_count(&self, fighter: &str) -> usize {
+        self.params.get(fighter).map_or(0, |params| {
+            params
+                .files
+                .get(super::traits::FIGHTER_PARAM_PATH)
+                .map_or(0, std::collections::BTreeMap::len)
+        })
+    }
+
+    /// The select screen cell that stands for one of `fighters`, earliest on the screen
+    /// first: the Pokémon Trainer cell for the Trainer and the three Pokémon, for example.
+    pub fn select_screen_cell(&self, fighters: &[&str]) -> Option<RosterKey> {
+        let member = |name: Option<&String>| {
+            name.is_some_and(|name| fighters.iter().any(|f| f.eq_ignore_ascii_case(name)))
+        };
+        self.index
+            .sorted()
+            .into_iter()
+            .filter(|entry| entry.on_roster && !entry.backing.shares_engine_fighter())
+            .find(|entry| member(entry.fighter.as_ref()) || member(entry.name_id.as_ref()))
+            .map(|entry| entry.key.clone())
+    }
+
+    /// Make move edits go to `key`'s costumes alone, or (with `None`) to every costume.
+    /// Set by the Project page when it opens a character in an editor.
+    pub fn set_edit_target(&mut self, key: Option<RosterKey>) {
+        self.edit_target = key;
+    }
+
+    /// The name a character shows on the select screen: a rename, else its own name.
+    pub fn shown_name(&self, key: &RosterKey) -> Option<String> {
+        self.project.names.get(key).cloned().or_else(|| {
+            self.project
+                .authored
+                .iter()
+                .find(|entry| &entry.key == key)
+                .map(|entry| entry.display_name.clone())
+        })
+    }
+
+    /// The made characters' folders, as the project page's `parts.json` records them.
+    pub fn made_folders(&self) -> Vec<crate::project_parts::MadeFolder> {
+        self.project
+            .authored
+            .iter()
+            .filter_map(|entry| {
+                Some(crate::project_parts::MadeFolder {
+                    key: entry.key.to_string(),
+                    fighter: entry.donor.clone(),
+                    slots: entry.all_slots(),
+                    root: entry.files_root.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    /// A made character's folder on disk.
+    pub fn made_root(&self, key: &RosterKey) -> Option<PathBuf> {
+        let entry = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)?;
+        let root = entry.files_root.as_deref()?;
+        Some(match &self.new_character.project_dir {
+            Some(dir) => crate::project_parts::project_absolute(dir, root),
+            None => root.to_path_buf(),
+        })
     }
 
     /// A character's select screen portrait for `slot`, with any picture the project gives it.
@@ -526,18 +615,18 @@ impl RosterWindow {
 
     /// Show the character select tab next time the window draws.
     pub fn focus_character_select(&mut self) {
-        self.tab = RosterTab::CharacterSelect;
+        self.show_tab(RosterTab::CharacterSelect);
     }
 
     /// Show the new-character tab next time the window draws.
     pub fn focus_new_character(&mut self) {
-        self.tab = RosterTab::NewCharacter;
+        self.show_tab(RosterTab::NewCharacter);
     }
 
     /// Jump to Character Select with one entry selected and its editor
     /// scrolled into view — the landing end of cross-tab "finish look" jumps.
     pub fn select_css(&mut self, key: crate::roster::RosterKey) {
-        self.tab = RosterTab::CharacterSelect;
+        self.show_tab(RosterTab::CharacterSelect);
         self.css.select_key(key);
     }
 
@@ -548,9 +637,16 @@ impl RosterWindow {
         self.css.clear_order_drafts();
     }
 
-    /// Enabled mod roots in load order — what the fighter scan consumes.
+    /// Enabled mod roots in load order, then the open project's made characters' folders —
+    /// what the fighter scan consumes.
     pub fn enabled_roots(&self) -> Vec<PathBuf> {
-        self.library.enabled_roots()
+        let mut roots = self.library.enabled_roots();
+        for root in &self.project_roots {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        roots
     }
 
     /// Summary for the export tree: how many roster edits this project holds.
@@ -600,8 +696,16 @@ impl RosterWindow {
         labels: &std::collections::HashMap<u64, String>,
     ) {
         if !self.open {
+            self.was_open = false;
             return;
         }
+        // Coming back to the page from another one starts on the Project tab, unless whatever
+        // brought it back asked for a tab of its own.
+        if !self.was_open && !self.tab_requested {
+            self.tab = RosterTab::Project;
+        }
+        self.was_open = true;
+        self.tab_requested = false;
         // Labels arrive asynchronously and grow; clone when contents differ rather
         // than only on length – two maps of the same length with different keys
         // would otherwise keep showing stale names.
@@ -617,8 +721,36 @@ impl RosterWindow {
         self.edit_target.as_ref()
     }
 
+    /// Called every frame with the open project's folder. Keeps the made characters' folders
+    /// stored relative to it, and registers those folders as this project's roots: added when
+    /// the project opens or makes a character, dropped when it closes or removes one. Only a
+    /// change touches the disk.
     pub fn set_project_dir(&mut self, dir: Option<PathBuf>) {
+        if let Some(dir) = &dir {
+            for entry in &mut self.project.authored {
+                if let Some(root) = &entry.files_root {
+                    let relative = crate::project_parts::project_relative(dir, root);
+                    if relative != *root {
+                        entry.files_root = Some(relative);
+                    }
+                }
+            }
+        }
         self.new_character.project_dir = dir;
+        let roots: Vec<PathBuf> = self
+            .project
+            .authored
+            .iter()
+            .filter_map(|entry| self.made_root(&entry.key))
+            .collect();
+        if roots == self.project_roots {
+            return;
+        }
+        if self.initialized && self.library.release_project_folders(&roots) {
+            library::save(&self.library);
+        }
+        self.project_roots = roots;
+        self.library_dirty = true;
     }
 
     /// The Characters page, drawn in the main window.
@@ -715,7 +847,9 @@ impl RosterWindow {
                                 let action =
                                     view.ui(ui, &roots, &self.index, &self.project, &faces);
                                 self.new_character = view;
-                                self.handle_new_character(action);
+                                if let Some(status) = self.handle_new_character(action) {
+                                    self.status = status;
+                                }
                             }
                             RosterTab::Traits => {
                                 let roots = self.roots.clone();
@@ -776,9 +910,10 @@ impl RosterWindow {
     /// the project goes through one place — the library has to be saved and the fighter index
     /// invalidated on any change, and a second path that forgot either would leave the new
     /// character invisible until the next restart.
-    pub fn handle_new_character(&mut self, action: NewCharacterAction) {
+    /// Returns what to tell the author, for a page that shows it.
+    pub fn handle_new_character(&mut self, action: NewCharacterAction) -> Option<String> {
         match action {
-            NewCharacterAction::None => {}
+            NewCharacterAction::None => None,
             NewCharacterAction::Create {
                 donor,
                 slots,
@@ -793,8 +928,7 @@ impl RosterWindow {
                     .by_key(&RosterKey::fighter(&donor))
                     .and_then(|entry| entry.name_id.clone())
                     .unwrap_or_else(|| donor.to_ascii_lowercase());
-                let create_res = new_character::create_and_import_range(
-                    &mut self.library,
+                let create_res = new_character::create_range(
                     &destination,
                     &self.roots,
                     &donor,
@@ -811,10 +945,13 @@ impl RosterWindow {
                             &display_name,
                             &name_id,
                         );
-                        // Remember where the files went: the panels reveal
-                        // this folder and report on its contents. Computed the
-                        // same way `create_and_import` computes it.
-                        entry.files_root = Some(root);
+                        // Remember where the files went, relative to the project when inside
+                        // it so the project still finds them after it moves. Its folder joins
+                        // this project's roots on the next frame (see `set_project_dir`).
+                        entry.files_root = Some(match &self.new_character.project_dir {
+                            Some(dir) => crate::project_parts::project_relative(dir, &root),
+                            None => root,
+                        });
                         // The name is recorded as a roster edit as well as on the entry, so it
                         // reaches the .xmsbt the export writes. The entry's own field is what
                         // the panel shows; the override is what the game reads.
@@ -827,46 +964,21 @@ impl RosterWindow {
                         self.project.authored.push(entry);
                         self.new_character
                             .note_created(&display_name, &scaffolded, copied);
-                        self.commit_library_change();
                     }
                     Err(error) => self.new_character.note_error(format!("{error:#}")),
                 }
-            }
-            NewCharacterAction::SetEditTarget(target) => {
-                self.status = match &target {
-                    Some(key) => {
-                        let name = self
-                            .project
-                            .authored
-                            .iter()
-                            .find(|entry| &entry.key == key)
-                            .map_or(key.to_string(), |entry| entry.display_name.clone());
-                        format!("Moves you edit now change only {name}.")
-                    }
-                    None => {
-                        "Moves you edit now change every costume of the fighter again.".to_string()
-                    }
-                };
-                self.edit_target = target;
+                None
             }
             NewCharacterAction::Remove(key) => {
                 if self.edit_target.as_ref() == Some(&key) {
                     self.edit_target = None;
                 }
-                // Its folder was added to the installed mods when it was made; it goes too, or
-                // the character's files would still load and ship.
-                let folder = self
-                    .project
-                    .authored
-                    .iter()
-                    .find(|entry| entry.key == key)
-                    .and_then(|entry| entry.files_root.clone());
-                if let Some(folder) = folder {
-                    let before = self.library.mods.len();
-                    self.library.mods.retain(
-                        |entry| !matches!(&entry.source, ModSource::Folder(dir) if *dir == folder),
-                    );
-                    if self.library.mods.len() != before {
+                let name = self.shown_name(&key).unwrap_or_else(|| key.to_string());
+                // Older versions installed its folder as a mod; that goes too, or the
+                // character's files would still load and ship. Its place among this project's
+                // roots goes on the next frame (see `set_project_dir`).
+                if let Some(folder) = self.made_root(&key) {
+                    if self.library.release_project_folders(&[folder]) {
                         self.commit_library_change();
                     }
                 }
@@ -877,8 +989,9 @@ impl RosterWindow {
                 self.project.hidden.remove(&key);
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
-                self.status =
-                    "Removed the character. Its files are still in its folder.".to_string();
+                Some(format!(
+                    "Removed {name}. Its files are still in its folder."
+                ))
             }
         }
     }
@@ -1597,5 +1710,110 @@ mod gimmick_root_tests {
             ParamValue::Float(7.0)
         );
         assert_eq!(std::fs::read(custom.join(relative)).unwrap(), source_before);
+    }
+}
+
+#[cfg(test)]
+mod project_root_tests {
+    use super::*;
+    use crate::mod_project::ParamValue;
+
+    fn vision(files_root: PathBuf) -> crate::mod_project::AuthoredEntry {
+        let mut entry = new_character::authored_entry_multi(
+            "mario",
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "Vision",
+            "vision",
+        );
+        entry.files_root = Some(files_root);
+        entry
+    }
+
+    /// A made character's folder is a root of its project while that project is open, never an
+    /// installed mod: another project must not see Mario with its costumes.
+    #[test]
+    fn a_made_characters_folder_is_a_root_of_its_project_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let own = project.join("characters/vision");
+        std::fs::create_dir_all(&own).unwrap();
+        let mut window = RosterWindow::default();
+        // Written by an older version: absolute.
+        window.project.authored.push(vision(own.clone()));
+        window.set_project_dir(Some(project.clone()));
+        assert_eq!(
+            window.project.authored[0].files_root,
+            Some(PathBuf::from("characters/vision")),
+            "stored relative to the project"
+        );
+        assert_eq!(
+            window.made_root(&RosterKey::slot("mario", 8)),
+            Some(own.clone())
+        );
+        assert!(window.enabled_roots().contains(&own));
+        assert!(window.library.enabled_roots().is_empty());
+        assert!(std::mem::take(&mut window.library_dirty));
+        // Nothing changed: nothing to rescan.
+        window.set_project_dir(Some(project.clone()));
+        assert!(!window.library_dirty);
+        // Closing the project drops its roots.
+        window.project = RosterMod::default();
+        window.set_project_dir(None);
+        assert!(window.enabled_roots().is_empty());
+        assert!(window.library_dirty);
+        // Paired: with the character back, so is its root.
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        window.set_project_dir(Some(project));
+        assert_eq!(window.enabled_roots(), vec![own]);
+    }
+
+    #[test]
+    fn removing_a_made_character_says_so_and_takes_its_root_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut window = RosterWindow::default();
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        let key = RosterKey::slot("mario", 8);
+        window.project.names.insert(key.clone(), "Vision X".into());
+        window.set_project_dir(Some(dir.path().to_path_buf()));
+        assert_eq!(window.shown_name(&key).as_deref(), Some("Vision X"));
+        assert_eq!(window.made_folders().len(), 1);
+        let said = window.handle_new_character(NewCharacterAction::Remove(key.clone()));
+        assert_eq!(
+            said.as_deref(),
+            Some("Removed Vision X. Its files are still in its folder.")
+        );
+        assert!(window.project.authored.is_empty());
+        assert!(!window.project.names.contains_key(&key));
+        window.set_project_dir(Some(dir.path().to_path_buf()));
+        assert!(window.enabled_roots().is_empty());
+        assert!(window.made_folders().is_empty());
+    }
+
+    /// The Fighter values badge, the card's count and the tile all count one way: values of the
+    /// fighter values file, not a gimmick's own values file.
+    #[test]
+    fn fighter_values_are_counted_one_way() {
+        let mut window = RosterWindow::default();
+        let params = window.params.entry("mario".into()).or_default();
+        for (file, field) in [
+            (super::super::traits::FIGHTER_PARAM_PATH, "weight"),
+            (super::super::traits::FIGHTER_PARAM_PATH, "walk_speed_max"),
+            ("fighter/mario/param/vl.prc", "gimmick_power"),
+        ] {
+            params
+                .files
+                .entry(file.into())
+                .or_default()
+                .insert(field.into(), ParamValue::Float(1.0));
+        }
+        assert_eq!(window.fighter_value_count("mario"), 2);
+        assert_eq!(RosterTab::Traits.badge_count(&window), Some(2));
+        assert_eq!(window.fighter_value_count("luigi"), 0);
     }
 }

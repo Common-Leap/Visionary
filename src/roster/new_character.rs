@@ -13,7 +13,6 @@ use crate::mod_project::{AuthoredEntry, RosterMod};
 use crate::ui::{act, look, Look};
 
 use super::index::RosterIndex;
-use super::library::{ModLibrary, ModSource};
 use super::{scaffold, RosterKey};
 
 /// The select screen gives one character at most eight colours.
@@ -50,8 +49,6 @@ pub struct NewCharacterView {
 /// the project.
 pub enum NewCharacterAction {
     None,
-    /// Send move edits to this character's costumes, or (with `None`) back to the whole fighter.
-    SetEditTarget(Option<RosterKey>),
     Create {
         donor: String,
         /// Every costume this character takes, ascending.
@@ -260,7 +257,7 @@ impl NewCharacterView {
                     .on_disabled_hover_text(reason.unwrap_or_default());
                 if create.clicked() {
                     if let Some(home) = &home {
-                        action = self.build_create_action(project, home.clone());
+                        action = self.build_create_action(project, index, home.clone());
                     }
                 }
             });
@@ -421,6 +418,7 @@ impl NewCharacterView {
     fn build_create_action(
         &mut self,
         project: &RosterMod,
+        index: &RosterIndex,
         destination: PathBuf,
     ) -> NewCharacterAction {
         let (Some(donor), Some(range)) = (self.donor.clone(), self.slot_range) else {
@@ -444,8 +442,13 @@ impl NewCharacterView {
             ));
             return NewCharacterAction::None;
         }
+        let name_id = name_id_for(&display_name);
+        if let Some(clash) = name_clash(project, index, &destination, &display_name, &name_id) {
+            self.error = Some(clash);
+            return NewCharacterAction::None;
+        }
         NewCharacterAction::Create {
-            name_id: name_id_for(&display_name),
+            name_id,
             donor,
             slots: range_slots(range),
             display_name,
@@ -641,6 +644,45 @@ fn next_free_run_after(statuses: &[SlotStatus], width: u8, after: u8) -> Option<
     None
 }
 
+/// Why a new character may not be called `display_name`, if it may not: its id must not be a
+/// select screen row's or a fighter's already (the export would replace that character's
+/// entry), and its folder must not be another character's.
+fn name_clash(
+    project: &RosterMod,
+    index: &RosterIndex,
+    destination: &std::path::Path,
+    display_name: &str,
+    name_id: &str,
+) -> Option<String> {
+    let taken_by = index
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.name_id.as_deref() == Some(name_id) || entry.fighter.as_deref() == Some(name_id)
+        })
+        .map(|entry| entry.display_name.clone())
+        .or_else(|| {
+            project
+                .authored
+                .iter()
+                .find(|entry| entry.name_id == name_id)
+                .map(|entry| entry.display_name.clone())
+        });
+    if let Some(other) = taken_by {
+        return Some(format!(
+            "{other} already uses the name {name_id}. Pick another name."
+        ));
+    }
+    let folder = destination.join(crate::mod_export::slugify(display_name));
+    let used = std::fs::read_dir(&folder).is_ok_and(|mut entries| entries.next().is_some());
+    used.then(|| {
+        format!(
+            "{} already has files in it. Pick another name.",
+            folder.display()
+        )
+    })
+}
+
 /// One slot chip in the map grid. Two visual states only — white for free,
 /// grey for taken — with the taken reason on hover. A free chip inside the
 /// current block is green so the block reads as one shape. Clicking a free
@@ -738,12 +780,11 @@ pub fn authored_entry_multi(
     }
 }
 
-/// Make a new character's folder, fill it with the base fighter's files (`roots` are the game
-/// files and the mods on top; `ui_name` is the name its portraits are filed under) and add the
-/// folder as a mod, so every skin can be edited at once. One mod folder holds all the skins.
-#[allow(clippy::too_many_arguments)]
-pub fn create_and_import_range(
-    library: &mut ModLibrary,
+/// Make a new character's folder and fill it with the base fighter's files (`roots` are the
+/// game files and the mods on top; `ui_name` is the name its portraits are filed under). One
+/// folder holds all its skins. It belongs to the project, which adds it to the roots it reads
+/// while open; it is not installed as a mod.
+pub fn create_range(
     destination: &std::path::Path,
     roots: &[std::path::PathBuf],
     donor: &str,
@@ -761,7 +802,6 @@ pub fn create_and_import_range(
     if copied.files == 0 {
         anyhow::bail!("none of {donor}'s game files were found, so there is nothing to make the character from");
     }
-    library.import_directory(ModSource::Folder(root), Some(display_name.to_string()))?;
     Ok((scaffolded, copied))
 }
 
@@ -783,15 +823,9 @@ mod tests {
         (dir, roots)
     }
 
-    fn create(
-        library: &mut ModLibrary,
-        destination: &std::path::Path,
-        slots: &[u8],
-        name: &str,
-    ) -> scaffold::Scaffold {
+    fn create(destination: &std::path::Path, slots: &[u8], name: &str) -> scaffold::Scaffold {
         let (_game, roots) = game();
-        create_and_import_range(
-            library,
+        create_range(
             destination,
             &roots,
             "mario",
@@ -840,32 +874,93 @@ mod tests {
             "Vision",
             "vision",
         ));
+        let index = RosterIndex::default();
         assert!(matches!(
-            view.build_create_action(&project, PathBuf::from("nowhere")),
+            view.build_create_action(&project, &index, PathBuf::from("nowhere")),
             NewCharacterAction::None
         ));
         assert!(view.error.is_some());
         view.slot_range = Some((16, 23));
+        view.display_name = "Nova".into();
         assert!(matches!(
-            view.build_create_action(&project, PathBuf::from("nowhere")),
+            view.build_create_action(&project, &index, PathBuf::from("nowhere")),
             NewCharacterAction::Create { .. }
         ));
+    }
+
+    /// "Mario" would become the id `mario`, the base game's own row, and the export would put
+    /// the new character in Mario's place. Two characters of one name would share a folder.
+    #[test]
+    fn create_refuses_a_name_whose_id_is_a_fighters_or_another_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let fighter = |name: &str, shown: &str| crate::data::FighterEntry {
+            name: name.into(),
+            display_name: shown.into(),
+            param_path: PathBuf::new(),
+            motion_dir: PathBuf::new(),
+            model_dir: PathBuf::new(),
+            effect_dir: None,
+            slots: vec![0],
+            fighter_dir: PathBuf::new(),
+            source: crate::data::FighterSource::DataRoot,
+        };
+        let mut project = RosterMod::default();
+        project.authored.push(authored_entry_multi(
+            "mario",
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            "Vision",
+            "vision",
+        ));
+        let index = RosterIndex::build(
+            &[fighter("mario", "Mario"), fighter("luigi", "Luigi")],
+            &crate::roster::library::ModLibrary::default(),
+            &project,
+            None,
+        );
+        let mut view = NewCharacterView {
+            donor: Some("luigi".into()),
+            slot_range: Some((8, 15)),
+            ..Default::default()
+        };
+        for (name, taken) in [("Mario", "Mario"), ("vision", "Vision")] {
+            view.display_name = name.into();
+            view.error = None;
+            assert!(matches!(
+                view.build_create_action(&project, &index, dir.path().to_path_buf()),
+                NewCharacterAction::None
+            ));
+            let error = view.error.clone().unwrap_or_default();
+            assert!(error.contains(taken), "{name}: {error}");
+        }
+        // A folder already holding files is not reused either.
+        std::fs::create_dir_all(dir.path().join("nova/fighter")).unwrap();
+        view.display_name = "Nova".into();
+        view.error = None;
+        assert!(matches!(
+            view.build_create_action(&project, &index, dir.path().to_path_buf()),
+            NewCharacterAction::None
+        ));
+        assert!(view
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("nova")));
+        // A free name is made.
+        view.display_name = "Dark Luigi".into();
+        view.error = None;
+        assert!(matches!(
+            view.build_create_action(&project, &index, dir.path().to_path_buf()),
+            NewCharacterAction::Create { ref name_id, .. } if name_id == "dark_luigi"
+        ));
+        assert_eq!(view.error, None);
     }
 
     #[test]
     fn a_multi_skin_range_creates_every_skin_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let mut library = ModLibrary::default();
-        let scaffolded = create(
-            &mut library,
-            dir.path(),
-            &[8, 9, 10, 11, 12, 13, 14, 15],
-            "Vision",
-        );
+        let scaffolded = create(dir.path(), &[8, 9, 10, 11, 12, 13, 14, 15], "Vision");
 
         assert_eq!(scaffolded.slots, vec![8, 9, 10, 11, 12, 13, 14, 15]);
         assert_eq!(scaffolded.slots[0], 8);
-        assert_eq!(library.mods.len(), 1);
         let mod_root = dir.path().join(crate::mod_export::slugify("Vision"));
         for slot in 8..=15 {
             assert!(
@@ -1015,68 +1110,25 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_character_also_makes_it_visible_to_the_editor() {
+    fn creating_a_character_fills_its_own_folder_from_the_base_costume() {
         let dir = tempfile::tempdir().unwrap();
-        let mut library = ModLibrary::default();
-        let scaffolded = create(&mut library, dir.path(), &[8], "Vision");
-
-        assert_eq!(scaffolded.slots[0], 8);
-        assert_eq!(library.mods.len(), 1);
-        let imported = &library.mods[0];
-        assert_eq!(imported.name, "Vision");
-        assert!(imported.enabled);
-        let provision = &imported.manifest.fighters["mario"];
-        assert!(
-            provision.slots.contains(&8),
-            "the new slot was not visible in the imported mod's manifest"
-        );
-    }
-
-    #[test]
-    fn on_the_fly_creation_is_properly_scoped_per_slot() {
-        let mut library = ModLibrary::default();
-        let dir = tempfile::tempdir().unwrap();
-        let a = create(&mut library, &dir.path().join("a"), &[8], "Vision");
-        let b = create(&mut library, &dir.path().join("b"), &[9], "Vision2");
-        assert_eq!(a.slots, vec![8]);
-        assert_eq!(b.slots, vec![9]);
-        assert_ne!(
-            RosterKey::slot("mario", 8),
-            RosterKey::slot("mario", 9),
-            "slot keys must not collide"
-        );
-        assert_eq!(library.mods.len(), 2);
-        assert!(library.mods[0].manifest.fighters["mario"]
-            .slots
-            .contains(&8));
-        assert!(!library.mods[0].manifest.fighters["mario"]
-            .slots
-            .contains(&9));
-        assert!(library.mods[1].manifest.fighters["mario"]
-            .slots
-            .contains(&9));
-        let k8 = RosterKey::slot("mario", 8);
-        let k9 = RosterKey::slot("mario", 9);
-        assert_ne!(k8, k9);
-    }
-
-    #[test]
-    fn quick_create_uses_authored_cache_without_picker() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut library = ModLibrary::default();
-        let root = dir.path().join("authored").join("vision");
-        let s = crate::roster::scaffold::create_many(&root, "mario", &[12]).unwrap();
-        std::fs::write(
-            root.join("fighter/mario/model/body/c12/model.numdlb"),
-            b"model",
-        )
-        .unwrap();
-        library
-            .import_directory(ModSource::Folder(root), Some("Vision".into()))
-            .unwrap();
-        assert_eq!(s.slots, vec![12]);
-        assert!(library.mods[0].manifest.fighters["mario"]
-            .slots
-            .contains(&12));
+        let scaffolded = create(dir.path(), &[8, 9], "Vision");
+        assert_eq!(scaffolded.slots, vec![8, 9]);
+        let root = dir.path().join("vision");
+        // Colour k of the character starts as base costume k.
+        assert!(root
+            .join("fighter/mario/model/body/c08/model.numdlb")
+            .is_file());
+        assert!(root
+            .join("fighter/mario/model/body/c09/model.numdlb")
+            .is_file());
+        // Two characters made one after the other get folders of their own.
+        let other = create(dir.path(), &[10], "Vision2");
+        assert_eq!(other.slots, vec![10]);
+        assert!(dir
+            .path()
+            .join("vision2/fighter/mario/model/body/c10")
+            .is_dir());
+        assert!(!root.join("fighter/mario/model/body/c10").exists());
     }
 }

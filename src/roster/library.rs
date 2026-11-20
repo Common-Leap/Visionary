@@ -433,6 +433,10 @@ pub struct ModLibrary {
     pub mods: Vec<ImportedMod>,
     #[serde(default)]
     next_id: u32,
+    /// Folders of characters made in a project. The project adds them while it is open; they
+    /// are never installed mods, so no other project sees their costumes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub project_owned: std::collections::BTreeSet<PathBuf>,
 }
 
 impl ModLibrary {
@@ -561,6 +565,19 @@ impl ModLibrary {
             .collect()
     }
 
+    /// Mark `folders` as belonging to a project, taking any of them out of the installed mods
+    /// (older versions added a made character's folder there). True when anything changed.
+    pub fn release_project_folders(&mut self, folders: &[PathBuf]) -> bool {
+        let before = (self.mods.len(), self.project_owned.len());
+        self.mods.retain(|entry| {
+            !folders
+                .iter()
+                .any(|folder| entry.source.scan_base() == folder || entry.root == *folder)
+        });
+        self.project_owned.extend(folders.iter().cloned());
+        before != (self.mods.len(), self.project_owned.len())
+    }
+
     /// Enabled roots, earliest first — what the existing fighter scan consumes as extra roots.
     pub fn enabled_roots(&self) -> Vec<PathBuf> {
         self.enabled().map(|entry| entry.root.clone()).collect()
@@ -616,14 +633,16 @@ pub fn load() -> ModLibrary {
 }
 
 /// Adopt paths from the pre-library `mod_roots` config so an upgrading user keeps their
-/// setup. Paths already present as a mod root are skipped.
+/// setup. Paths already present as a mod root are skipped, and so are made characters'
+/// folders: the open project lists those among the roots it saves, but they are its own.
 pub fn adopt_legacy_roots(library: &mut ModLibrary, roots: &[PathBuf]) -> Vec<String> {
     let mut notes = Vec::new();
     for root in roots {
-        if library
-            .mods
-            .iter()
-            .any(|entry| entry.source.scan_base() == root.as_path())
+        if library.project_owned.contains(root)
+            || library
+                .mods
+                .iter()
+                .any(|entry| entry.source.scan_base() == root.as_path())
         {
             continue;
         }
@@ -642,6 +661,38 @@ mod tests {
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn a_made_characters_folder_leaves_the_installed_mods_and_is_never_adopted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let vision = dir.path().join("project/characters/vision");
+        let other = dir.path().join("skins");
+        touch(&vision.join("fighter/mario/model/body/c08/model.numdlb"));
+        touch(&other.join("fighter/mario/model/body/c01/model.numdlb"));
+        let mut library = ModLibrary::default();
+        library
+            .import_directory(ModSource::Folder(vision.clone()), Some("Vision".into()))
+            .unwrap();
+        library
+            .import_directory(ModSource::Folder(other.clone()), None)
+            .unwrap();
+        assert!(library.release_project_folders(std::slice::from_ref(&vision)));
+        assert_eq!(library.enabled_roots(), vec![other.clone()]);
+        // Doing it again changes nothing, so nothing is saved again.
+        assert!(!library.release_project_folders(std::slice::from_ref(&vision)));
+        // The open project's roots are saved as the old root list; reading them back on the
+        // next start must not install the character's folder for every project.
+        let notes = adopt_legacy_roots(&mut library, &[other.clone(), vision.clone()]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(library.enabled_roots(), vec![other]);
+        // A folder of no project is still adopted, so the old migration keeps working.
+        let third = dir.path().join("third");
+        touch(&third.join("fighter/link/model/body/c00/model.numdlb"));
+        assert_eq!(adopt_legacy_roots(&mut library, &[third]).len(), 1);
+        let saved: ModLibrary =
+            serde_json::from_str(&serde_json::to_string(&library).unwrap()).unwrap();
+        assert!(saved.project_owned.contains(&vision));
     }
 
     #[test]

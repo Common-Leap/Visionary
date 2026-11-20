@@ -209,12 +209,33 @@ impl TraitsView {
             ui.label(RichText::new("No fighter behind this entry").color(look.dim));
             return;
         };
-        ui.label(
-            RichText::new(&entry.display_name)
-                .size(24.0)
-                .strong()
-                .color(look.text),
-        );
+        // The game keeps one set of values per fighter: characters made on this one use them.
+        let sharing: Vec<&str> = index
+            .entries
+            .iter()
+            .filter(|other| {
+                other.backing.shares_engine_fighter() && other.fighter.as_ref() == Some(&fighter)
+            })
+            .map(|other| other.display_name.as_str())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&entry.display_name)
+                    .size(24.0)
+                    .strong()
+                    .color(look.text),
+            );
+            if !sharing.is_empty() {
+                ui.label(
+                    RichText::new(format!("Also used by {}", sharing.join(", ")))
+                        .color(look.accent)
+                        .strong(),
+                )
+                .on_hover_text(
+                    "The game keeps one set of values per fighter; every costume uses them",
+                );
+            }
+        });
 
         // Reload when the selection moved to a different fighter.
         if self.loaded.as_ref().map(|traits| traits.fighter.as_str()) != Some(fighter.as_str()) {
@@ -241,10 +262,6 @@ impl TraitsView {
         let Some(loaded) = self.loaded.take() else {
             return;
         };
-
-        if entry.backing.shares_engine_fighter() {
-            self.draw_shared_notice(ui, entry.display_name.as_str(), &fighter);
-        }
 
         let edits = params.entry(fighter.clone()).or_default();
         let count = traits::edits_for(edits).len();
@@ -346,35 +363,6 @@ impl TraitsView {
                     .weak(),
                 );
             });
-    }
-
-    /// The one notice that matters for a slot-backed character.
-    fn draw_shared_notice(&self, ui: &mut Ui, display_name: &str, donor: &str) {
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
-                    ui.label(
-                        RichText::new(format!(
-                            "{display_name} is a costume of {donor}. These values belong to {donor} as a whole."
-                        ))
-                        .strong(),
-                    );
-                });
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(
-                        "The game stores them per fighter, not per costume — there is no \
-                         per-costume version of any of them. Changing a value here changes it \
-                         for the donor and for every other costume of the donor, in the same \
-                         match.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-        ui.add_space(6.0);
     }
 
     fn draw_sections(

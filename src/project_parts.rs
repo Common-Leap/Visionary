@@ -94,13 +94,46 @@ pub struct PartLink {
     pub folder: PathBuf,
 }
 
+/// A character made in the project: its own folder holds every file of its costumes, so its
+/// model, animation, effect and sound folders are inside it, never the base fighter's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MadeFolder {
+    /// Its select screen key, `"mario#c08"`.
+    pub key: String,
+    /// The fighter it plays as.
+    pub fighter: String,
+    pub slots: Vec<u8>,
+    /// Its folder, relative to the project when inside it.
+    pub root: PathBuf,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectParts {
-    /// Characters shown on the project page, with the costume each one shows.
+    /// Characters shown on the project page, with the costume each one shows. Keyed by the
+    /// card's select screen key: `"mario"` for a fighter, `"mario#c08"` for a made character.
     #[serde(default)]
     pub characters: BTreeMap<String, u8>,
     #[serde(default)]
     pub links: Vec<PartLink>,
+    /// The project's made characters and their folders, written from the project whenever it
+    /// changes so code that only has the project folder resolves their files too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub made: Vec<MadeFolder>,
+}
+
+/// `path` as stored in the project: relative when it is inside `workspace`.
+pub fn project_relative(workspace: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(workspace)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
+}
+
+/// A path stored in the project, on disk. Older projects stored absolute paths, which stay.
+pub fn project_absolute(workspace: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    }
 }
 
 impl ProjectParts {
@@ -127,9 +160,29 @@ impl ProjectParts {
         part.per_costume().then_some(slot)
     }
 
+    /// The made character owning costume `slot` of `fighter`, if any.
+    pub fn made_for(&self, fighter: &str, slot: u8) -> Option<&MadeFolder> {
+        self.made
+            .iter()
+            .find(|made| made.fighter.eq_ignore_ascii_case(fighter) && made.slots.contains(&slot))
+    }
+
+    /// Replace the made characters' folders; true when that changed anything.
+    pub fn set_made(&mut self, made: Vec<MadeFolder>) -> bool {
+        if self.made == made {
+            return false;
+        }
+        self.made = made;
+        true
+    }
+
     /// The folder the author picked for this part, if any. Move code is one folder for the
-    /// whole project, so it is stored once, under no fighter.
+    /// whole project, so it is stored once, under no fighter. A made character's effects and
+    /// sounds are always its own: a folder picked for the base fighter's is not theirs.
     pub fn link(&self, fighter: &str, part: Part, slot: u8) -> Option<&Path> {
+        if part != Part::Moves && !part.per_costume() && self.made_for(fighter, slot).is_some() {
+            return None;
+        }
         let fighter = if part == Part::Moves { "" } else { fighter };
         self.links
             .iter()
@@ -160,13 +213,17 @@ impl ProjectParts {
         }
     }
 
-    /// Where this part's files are read from and added to: the picked folder, else the
-    /// project's own copy of the game folder.
+    /// Where this part's files are read from and added to: the picked folder, else a made
+    /// character's own folder, else the project's own copy of the game folder.
     pub fn dir(&self, workspace: &Path, fighter: &str, part: Part, slot: u8) -> Option<PathBuf> {
         if let Some(folder) = self.link(fighter, part, slot) {
             return Some(folder.to_path_buf());
         }
-        Some(crate::project_hub::workspace_romfs(workspace).join(part.game_dir(fighter, slot)?))
+        let game = part.game_dir(&fighter.to_ascii_lowercase(), slot)?;
+        Some(match self.made_for(fighter, slot) {
+            Some(made) => project_absolute(workspace, &made.root).join(game),
+            None => crate::project_hub::workspace_romfs(workspace).join(game),
+        })
     }
 
     /// Each picked folder and the game folder its files ship to.
@@ -295,6 +352,78 @@ mod tests {
         // An empty layout leaves no file behind.
         ProjectParts::default().save(&workspace).unwrap();
         assert!(!workspace.join(PARTS_FILE).exists());
+    }
+
+    #[test]
+    fn a_made_characters_parts_live_in_its_own_folder_and_the_base_fighters_do_not() {
+        let workspace = scratch("made");
+        let mut parts = ProjectParts::default();
+        parts.set_link("mario", Part::Effects, 0, Some(PathBuf::from("/fx")));
+        assert!(parts.set_made(vec![MadeFolder {
+            key: "mario#c08".into(),
+            fighter: "mario".into(),
+            slots: (8..=15).collect(),
+            root: PathBuf::from("characters/vision"),
+        }]));
+        let own = workspace.join("characters/vision");
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Model, 9),
+            Some(own.join("fighter/mario/model/body/c09"))
+        );
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Animations, 15),
+            Some(own.join("fighter/mario/motion/body/c15"))
+        );
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Sounds, 8),
+            Some(own.join("sound/bank"))
+        );
+        // The base fighter's picked effect folder is the base fighter's alone.
+        assert_eq!(parts.link("mario", Part::Effects, 8), None);
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Effects, 8),
+            Some(own.join("effect/fighter/mario"))
+        );
+        assert_eq!(
+            parts.link("mario", Part::Effects, 0),
+            Some(Path::new("/fx"))
+        );
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Model, 0),
+            Some(workspace.join("romfs/fighter/mario/model/body/c00"))
+        );
+        // A costume folder picked for the made character still wins.
+        parts.set_link(
+            "mario",
+            Part::Model,
+            8,
+            Some(PathBuf::from("/skins/vision")),
+        );
+        assert_eq!(
+            parts.dir(&workspace, "mario", Part::Model, 8),
+            Some(PathBuf::from("/skins/vision"))
+        );
+        // Unchanged folders are not a change.
+        assert!(!parts.set_made(parts.made.clone()));
+        parts.save(&workspace).unwrap();
+        assert_eq!(ProjectParts::load(&workspace), parts);
+    }
+
+    #[test]
+    fn project_paths_are_stored_relative_and_old_absolute_ones_still_resolve() {
+        let workspace = Path::new("/projects/mine");
+        let inside = Path::new("/projects/mine/characters/vision");
+        assert_eq!(
+            project_relative(workspace, inside),
+            PathBuf::from("characters/vision")
+        );
+        assert_eq!(
+            project_absolute(workspace, Path::new("characters/vision")),
+            inside
+        );
+        assert_eq!(project_absolute(workspace, inside), inside);
+        let outside = Path::new("/elsewhere/vision");
+        assert_eq!(project_relative(workspace, outside), outside);
     }
 
     #[test]

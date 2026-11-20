@@ -394,18 +394,100 @@ pub fn workspace_fighter_slot_dirs(
     slot: u8,
 ) -> anyhow::Result<(PathBuf, PathBuf)> {
     let fighter = fighter_component(fighter)?;
-    let costume = format!("c{slot:02}");
-    let base = workspace_romfs(workspace).join("fighter").join(&fighter);
     // A folder the author picked for the model or the animations stands in for the project's
-    // own copy, so adding, previewing and sending all use it.
+    // own copy, and a made character's costumes are in its own folder, so adding, previewing
+    // and sending all use the same place.
     let parts = crate::project_parts::ProjectParts::load(workspace);
-    let picked = |part| parts.link(&fighter, part, slot).map(Path::to_path_buf);
+    let dir = |part: crate::project_parts::Part| {
+        parts
+            .dir(workspace, &fighter, part, slot)
+            .ok_or_else(|| anyhow::anyhow!("{} has no folder", part.title()))
+    };
     Ok((
-        picked(crate::project_parts::Part::Model)
-            .unwrap_or_else(|| base.join("model").join("body").join(&costume)),
-        picked(crate::project_parts::Part::Animations)
-            .unwrap_or_else(|| base.join("motion").join("body").join(costume)),
+        dir(crate::project_parts::Part::Model)?,
+        dir(crate::project_parts::Part::Animations)?,
     ))
+}
+
+/// Copy base costume `base` of `fighter` into costume `own` of the same fighter, under
+/// `dest_root` (a made character's folder), for one kind: `"model"` or `"motion"`. Every part
+/// (`body`, and any others) comes across; a part's `body` files go to `body_dir` when given
+/// (a folder picked for that costume). Later `roots` win, as in the game. Files already there
+/// are kept. Returns (copied, kept).
+pub fn copy_base_costume(
+    roots: &[PathBuf],
+    fighter: &str,
+    kind: &str,
+    base: u8,
+    own: u8,
+    dest_root: &Path,
+    body_dir: Option<&Path>,
+) -> anyhow::Result<(usize, usize)> {
+    let fighter = fighter_component(fighter)?;
+    anyhow::ensure!(
+        kind == "model" || kind == "motion",
+        "unknown costume part {kind}"
+    );
+    let (base, own) = (format!("c{base:02}"), format!("c{own:02}"));
+    let mut copied = 0;
+    let mut kept = 0;
+    let mut found = false;
+    let mut written = std::collections::HashSet::new();
+    for root in roots.iter().rev() {
+        let kind_dir = root.join("fighter").join(&fighter).join(kind);
+        let Ok(parts) = std::fs::read_dir(&kind_dir) else {
+            continue;
+        };
+        for part in parts.flatten() {
+            let from = part.path().join(&base);
+            if !from.is_dir() {
+                continue;
+            }
+            let name = part.file_name();
+            let to = match body_dir {
+                Some(dir) if name == "body" => dir.to_path_buf(),
+                _ => dest_root
+                    .join("fighter")
+                    .join(&fighter)
+                    .join(kind)
+                    .join(&name)
+                    .join(&own),
+            };
+            let mut stack = vec![(from, to)];
+            while let Some((from, to)) = stack.pop() {
+                for entry in std::fs::read_dir(&from)?.flatten() {
+                    let path = entry.path();
+                    let meta = std::fs::symlink_metadata(&path)?;
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    let out = to.join(entry.file_name());
+                    if meta.is_dir() {
+                        stack.push((path, out));
+                        continue;
+                    }
+                    found = true;
+                    if written.contains(&out) {
+                        continue;
+                    }
+                    if out.exists() {
+                        kept += 1;
+                        written.insert(out);
+                        continue;
+                    }
+                    std::fs::create_dir_all(&to)?;
+                    std::fs::copy(&path, &out)?;
+                    written.insert(out);
+                    copied += 1;
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        found,
+        "no {kind} files of {fighter} {base} were found in the game or mod folders"
+    );
+    Ok((copied, kept))
 }
 
 fn regular_asset_files(directory: &Path, kind: &str) -> anyhow::Result<BTreeMap<String, PathBuf>> {
@@ -1759,6 +1841,99 @@ mod tests {
             b"generated",
             "generated wins; the conflict is reported, not overwritten"
         );
+    }
+
+    #[test]
+    fn a_made_characters_costume_folders_are_its_own_and_imports_land_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.set_made(vec![crate::project_parts::MadeFolder {
+            key: "mario#c08".into(),
+            fighter: "mario".into(),
+            slots: (8..=15).collect(),
+            root: PathBuf::from("characters/vision"),
+        }]);
+        parts.save(workspace).unwrap();
+        let (model, motion) = workspace_fighter_slot_dirs(workspace, "mario", 9).unwrap();
+        let own = workspace.join("characters/vision/fighter/mario");
+        assert_eq!(model, own.join("model/body/c09"));
+        assert_eq!(motion, own.join("motion/body/c09"));
+        // The base fighter's costumes stay in the project's copy of the game folders.
+        let (model, _) = workspace_fighter_slot_dirs(workspace, "mario", 1).unwrap();
+        assert_eq!(model, workspace.join("romfs/fighter/mario/model/body/c01"));
+        // What the Model button adds goes where the export reads the character from.
+        let source = workspace.join("in/model.numdlb");
+        touch(&source);
+        let added = import_model_files(workspace, "mario", 9, &[source]).unwrap();
+        assert_eq!(added, vec![own.join("model/body/c09/model.numdlb")]);
+        assert!(!workspace
+            .join("romfs/fighter/mario/model/body/c09")
+            .exists());
+    }
+
+    #[test]
+    fn copying_a_base_costume_maps_its_colour_onto_the_made_costume_and_keeps_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("game");
+        let skins = dir.path().join("skins");
+        for (root, file, body) in [
+            (
+                &game,
+                "fighter/mario/model/body/c01/model.numdlb",
+                "game c01",
+            ),
+            (
+                &game,
+                "fighter/mario/model/body/c01/def_mario_001_col.nutexb",
+                "game tex",
+            ),
+            (&game, "fighter/mario/model/cappy/c01/model.numdlb", "cap"),
+            (
+                &game,
+                "fighter/mario/model/body/c00/model.numdlb",
+                "game c00",
+            ),
+            (
+                &game,
+                "fighter/mario/motion/body/c01/a00wait1.nuanmb",
+                "wait",
+            ),
+            (
+                &skins,
+                "fighter/mario/model/body/c01/model.numdlb",
+                "mod c01",
+            ),
+        ] {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let own = dir.path().join("vision");
+        let edited = own.join("fighter/mario/model/body/c09/def_mario_001_col.nutexb");
+        std::fs::create_dir_all(edited.parent().unwrap()).unwrap();
+        std::fs::write(&edited, "mine").unwrap();
+        let roots = vec![game.clone(), skins.clone()];
+        let (copied, kept) = copy_base_costume(&roots, "mario", "model", 1, 9, &own, None).unwrap();
+        assert_eq!((copied, kept), (2, 1));
+        let read = |rel: &str| std::fs::read_to_string(own.join(rel)).unwrap();
+        // The later root wins, as in the game; the author's own file is kept.
+        assert_eq!(read("fighter/mario/model/body/c09/model.numdlb"), "mod c01");
+        assert_eq!(
+            read("fighter/mario/model/body/c09/def_mario_001_col.nutexb"),
+            "mine"
+        );
+        assert_eq!(read("fighter/mario/model/cappy/c09/model.numdlb"), "cap");
+        // Only the model came across.
+        assert!(!own.join("fighter/mario/motion").exists());
+        // A costume picked into another folder gets its body files there.
+        let picked = dir.path().join("picked");
+        let (copied, _) =
+            copy_base_costume(&roots, "mario", "motion", 1, 9, &own, Some(&picked)).unwrap();
+        assert_eq!(copied, 1);
+        assert!(picked.join("a00wait1.nuanmb").is_file());
+        // Nothing to copy is an error, not a silent zero.
+        assert!(copy_base_costume(&roots, "mario", "model", 5, 9, &own, None).is_err());
     }
 
     #[test]
