@@ -596,6 +596,30 @@ mod linked_acmd_index_tests {
     }
 }
 
+/// The Settings card for one object: which list entry of its param block it shows, the text
+/// being typed per row, and the last save's result.
+struct ArticleSettingsCard {
+    agent: String,
+    variant: usize,
+    edits: HashMap<usize, String>,
+    message: Option<String>,
+    /// Read when the card opens and after each save, not every frame.
+    settings: Vec<crate::articles::settings::Setting>,
+    block: crate::articles::params::ParamBlock,
+    /// The moveset's own param files for the object's owner: the only files a save may change.
+    own: Vec<PathBuf>,
+}
+
+/// The selected fighter's objects, read once per source index.
+struct ArticleCache {
+    fighter: String,
+    catalog: crate::articles::ArticleCatalog,
+    /// Article calls in the fighter's own status code, read-only.
+    status_rows: Vec<crate::articles::view::StatusCallRow>,
+    /// Status registrations the index could not place, for the fighter or its objects.
+    unresolved_statuses: Vec<crate::acmd_src::UnresolvedStatus>,
+}
+
 /// The primary editor is deliberately split into task-sized surfaces.  The underlying ACMD
 /// model is still one move; this enum only controls which part of that model is in front of the
 /// user at a time.
@@ -4052,6 +4076,14 @@ pub struct VisionaryApp {
     /// The fighters `acmd_src` has scripts for, cached for `row_membership`, which runs per
     /// row per frame. Refreshed wherever `acmd_src` is replaced.
     acmd_src_fighters: BTreeSet<String>,
+    /// The selected fighter's objects (fighter name, catalog), built from the linked source on
+    /// first use after the index is (re)built. `None` until then; cleared with every new index.
+    article_catalog: Option<ArticleCache>,
+    /// The object agent (`samus_lativolt`) whose script is open as the move, instead of the
+    /// selected fighter's own. Cleared when a fighter move or another fighter is chosen.
+    open_article: Option<String>,
+    /// The Settings card window for one object, when open.
+    article_settings: Option<ArticleSettingsCard>,
     /// The fighters `acmd_src` installs only on chosen costume slots, refreshed with
     /// `acmd_src_fighters`. Their scripts and edits belong to the project's slot characters.
     acmd_src_costume_gated: BTreeSet<String>,
@@ -4540,6 +4572,9 @@ impl VisionaryApp {
             project_moveset: None,
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
+            article_catalog: None,
+            open_article: None,
+            article_settings: None,
             acmd_src_costume_gated: BTreeSet::new(),
             edited_fighters: BTreeSet::new(),
             authored_characters: BTreeSet::new(),
@@ -4752,6 +4787,8 @@ impl VisionaryApp {
 
     /// Re-derive [`Self::acmd_src_fighters`] after `acmd_src` was replaced.
     fn refresh_acmd_src_fighters(&mut self) {
+        // A new index may add, drop or rename the moveset's objects.
+        self.article_catalog = None;
         self.acmd_src_fighters = self
             .acmd_src
             .as_ref()
@@ -5277,6 +5314,8 @@ impl VisionaryApp {
     fn clear_fighter_selection(&mut self) {
         self.state.selected_fighter = None;
         self.state.selected_move = None;
+        self.open_article = None;
+        self.article_settings = None;
         clear_move_state(&mut self.state);
         self.state.current_frame = FIRST_GAME_FRAME;
         self.state.total_frames = 0;
@@ -5318,6 +5357,8 @@ impl VisionaryApp {
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
         self.state.selected_move = None;
+        self.open_article = None;
+        self.article_settings = None;
         // A fighter switch is also a move-state boundary.  Clearing only the editable hitboxes
         // left the previous fighter's ACMD script alive, so a stale WHOLE_HIT/HIT_NODE OFF event
         // could hide every newly loaded parameter volume until the next move was opened.
@@ -5622,6 +5663,23 @@ impl VisionaryApp {
     }
 
     fn select_move(&mut self, move_entry: MoveEntry) {
+        self.select_script(None, move_entry);
+    }
+
+    /// Open one of an object's scripts (`agent` such as `samus_lativolt`, `move_entry` named
+    /// after the script without its category, `fly`) as the move, the way a fighter move opens.
+    fn open_article_script(&mut self, agent: String, move_name: &str) {
+        let move_entry = MoveEntry {
+            name: move_name.to_string(),
+            hash: hash40::hash40(&format!("{agent}/{move_name}")).0,
+            frame_count: 0,
+            anim_path: None,
+            cancel_frame: 0,
+        };
+        self.select_script(Some(agent), move_entry);
+    }
+
+    fn select_script(&mut self, article: Option<String>, move_entry: MoveEntry) {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
@@ -5629,12 +5687,9 @@ impl VisionaryApp {
         // pass runs. Commit explicitly at the navigation boundary so leaving a move cannot lose
         // the last drag or source-point edit.
         self.commit_current_edits();
+        self.open_article = article;
 
-        let fighter_name = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|fighter| fighter.name.clone());
+        let fighter_name = self.script_agent();
         if let Some(fighter_name) = fighter_name {
             self.refresh_linked_acmd_source_index();
             let key = Self::move_key(&fighter_name, &move_entry.name);
@@ -5792,13 +5847,9 @@ impl VisionaryApp {
         // edited record current before a mismatch prompt or the eventual source apply rebuilds
         // the visible move from its keyed maps.
         self.commit_current_edits();
-        let (fighter_name, move_name) = match (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            &self.state.selected_move,
-        ) {
-            (Some(f), Some(m)) => (f.name.clone(), m.name.clone()),
+        // An open object script (`samus_lativolt`) is fetched under its own agent.
+        let (fighter_name, move_name) = match (self.script_agent(), &self.state.selected_move) {
+            (Some(agent), Some(m)) => (agent, m.name.clone()),
             _ => return,
         };
 
@@ -5833,7 +5884,8 @@ impl VisionaryApp {
             // A complete override needs nothing else, and a warm disk cache is a local file
             // read — either way this resolves inline instead of paying for a thread and a
             // repaint.
-            let mirror = if project.needs_mirror() {
+            // A cloned object has no game script of its own to fill gaps from.
+            let mirror = if project.needs_mirror() && !self.open_article_is_clone() {
                 crate::acmd::cached_script_body(&fighter_name, &move_name)
             } else {
                 Some(String::new())
@@ -6071,15 +6123,11 @@ impl VisionaryApp {
         let Some(index) = self.acmd_src.as_ref() else {
             return;
         };
-        let (Some(fighter), Some(move_entry)) = (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            self.state.selected_move.as_ref(),
-        ) else {
+        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        else {
             return;
         };
-        let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
+        let move_name = move_entry.name.clone();
         // Resolve the motion to the spelling the project carries (`game_attacks3`
         // for `attack_s3_s`) so the opened buffer names the function it shows.
         let mut script: Option<String> = None;
@@ -6226,12 +6274,7 @@ impl VisionaryApp {
         let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) else {
             return (String::new(), Default::default());
         };
-        let fighter_name = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .map(|fighter| fighter.name.clone())
-            .unwrap_or_default();
+        let fighter_name = self.script_agent().unwrap_or_default();
         // `attack_s3_s` is installed as `game_attacks3` upstream: preview the
         // spelling the export will write so the two cannot drift apart.
         let script_move = crate::acmd::resolve_script_move_name(&fighter_name, &move_name);
@@ -6907,15 +6950,12 @@ impl VisionaryApp {
         if self.acmd_src.is_none() {
             return;
         }
-        let (Some(fighter), Some(move_entry)) = (
-            self.state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i)),
-            self.state.selected_move.as_ref(),
-        ) else {
+        // An open object script saves under its own agent, which the index keys it by.
+        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        else {
             return;
         };
-        let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
+        let move_name = move_entry.name.clone();
 
         // Rebuild spans before reading the source snapshot. A source edit made outside Visionary
         // can leave an old span in bounds while pointing at a different function.
@@ -7490,11 +7530,7 @@ impl VisionaryApp {
 
         // The user can switch fighter or move while a fetch is in flight; applying a stale
         // result would silently overwrite the new selection's hitboxes.
-        let still_current = self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-            .is_some_and(|f| f.name == fighter_name)
+        let still_current = self.script_agent().is_some_and(|agent| agent == fighter_name)
             && self
                 .state
                 .selected_move
@@ -9732,8 +9768,14 @@ impl VisionaryApp {
 
         let available = ui.available_height();
         // Keep both lists proportional to the panel while retaining a usable minimum when the
-        // window is compressed below its normal height.
-        let half = ((available - 80.0) / 2.0).max(1.0);
+        // window is compressed below its normal height. With a fighter selected, a share goes
+        // to its Objects list below the moves.
+        let objects_height = if self.state.selected_fighter.is_some() {
+            ((available - 80.0) * 0.25).max(60.0)
+        } else {
+            0.0
+        };
+        let half = ((available - 80.0 - objects_height) / 2.0).max(1.0);
 
         let mut restore_forgotten = false;
         let mut forget_fighter: Option<String> = None;
@@ -10032,6 +10074,9 @@ impl VisionaryApp {
                     }
                 }
             });
+        if self.state.selected_fighter.is_some() {
+            self.draw_objects_list(ui, objects_height);
+        }
     }
 
     /// The selected move's frame data, from the hitboxes as currently edited.
@@ -13882,6 +13927,7 @@ impl VisionaryApp {
             self.draw_work_module_inc_int_section(ui);
             self.draw_work_module_set_section(ui);
             self.draw_motion_rate_section(ui);
+            self.draw_article_calls_section(ui);
         }
         if matches!(self.primary_tab, PrimaryEditorTab::AudioFeedback) {
             self.draw_sound_section(ui);
@@ -19719,12 +19765,576 @@ impl VisionaryApp {
         format!("{fighter}/{move_name}")
     }
 
-    fn current_move_key(&self) -> Option<String> {
-        let fighter = self
+    /// The agent the open move's scripts belong to: the open object's (`samus_lativolt`) when
+    /// one is open, else the selected fighter's.
+    fn script_agent(&self) -> Option<String> {
+        if let Some(agent) = &self.open_article {
+            return Some(agent.clone());
+        }
+        self.state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| fighter.name.clone())
+    }
+
+    // ── Objects (articles) ────────────────────────────────────────────────────
+
+    /// Build the selected fighter's object catalog if the index changed since it was last built.
+    /// It is read from the same source index the moves use, so it follows every rescan.
+    fn ensure_article_catalog(&mut self) {
+        let Some(entry) = self
             .state
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
-            .map(|f| f.name.clone())?;
+        else {
+            self.article_catalog = None;
+            return;
+        };
+        let fighter = entry.name.clone();
+        if self.article_catalog.as_ref().is_some_and(|cache| cache.fighter == fighter) {
+            return;
+        }
+        // The game's own objects come from the dump's folders for this fighter.
+        let fighter_dir = self
+            .state
+            .data_root
+            .as_ref()
+            .map(|root| root.join("fighter").join(&fighter))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(|| entry.fighter_dir.clone());
+        let names: Vec<String> = self.state.fighters.iter().map(|f| f.name.clone()).collect();
+        let (catalog, status_rows, unresolved_statuses) = match self.acmd_src.as_ref() {
+            Some(index) => {
+                let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
+                let bodies = index.status_bodies(&fighter);
+                let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
+                let agents: Vec<&str> = std::iter::once(fighter.as_str())
+                    .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
+                    .collect();
+                let unresolved = index
+                    .unresolved_statuses
+                    .iter()
+                    .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
+                    .cloned()
+                    .collect();
+                (catalog, rows, unresolved)
+            }
+            None => (
+                crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
+        self.article_catalog = Some(ArticleCache { fighter, catalog, status_rows, unresolved_statuses });
+    }
+
+    /// The param files the object's owner is read from, lowest first: the dump, the Mod Library,
+    /// then the moveset's own (its `romfs/`, then the open project's `romfs/`). The second list is
+    /// only the moveset's own, which is all a save may change.
+    fn article_param_layers(&self, owner: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let param_dir = |root: &Path| root.join("fighter").join(owner).join("param");
+        let mut layers = Vec::new();
+        for root in self.shared_roots() {
+            for name in ["vl.prc", "vl.prcxml"] {
+                layers.push(param_dir(&root).join(name));
+            }
+        }
+        let mut own = Vec::new();
+        let own_roots = self
+            .acmd_src
+            .as_ref()
+            .map(|index| index.root.join("romfs"))
+            .into_iter()
+            .chain(self.project_romfs());
+        for root in own_roots {
+            for name in ["vl.prc", "vl.prcxml"] {
+                let file = param_dir(&root).join(name);
+                if file.exists() && !own.contains(&file) {
+                    own.push(file);
+                }
+            }
+        }
+        layers.retain(|file| file.exists() && !own.contains(file));
+        layers.extend(own.iter().cloned());
+        (layers, own)
+    }
+
+    fn open_article_settings(&mut self, agent: String) {
+        let mut card = ArticleSettingsCard {
+            agent,
+            variant: 0,
+            edits: HashMap::new(),
+            message: None,
+            settings: Vec::new(),
+            block: Default::default(),
+            own: Vec::new(),
+        };
+        self.reload_article_settings(&mut card);
+        self.article_settings = Some(card);
+    }
+
+    /// Re-read a card's settings and param block from disk.
+    fn reload_article_settings(&self, card: &mut ArticleSettingsCard) {
+        let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(&card.agent))
+            .cloned()
+        else {
+            return;
+        };
+        card.settings = self
+            .acmd_src
+            .as_ref()
+            .map(|index| crate::articles::settings_for(index, &article.agent))
+            .unwrap_or_default();
+        let (layers, own) = self.article_param_layers(&article.owner);
+        // A clone reads its NEW owner's `param_<new_name>`, which is `article.name` here.
+        card.block = crate::articles::params::param_block(&layers, &[], &article.name, &self.state.labels);
+        card.own = own;
+        if card.variant >= card.block.variants.len().max(1) {
+            card.variant = 0;
+        }
+    }
+
+    /// Save one Settings card value, through the setting writer: only the moveset's own files.
+    fn save_article_setting(&mut self, card: &mut ArticleSettingsCard, setting: &crate::articles::settings::Setting, text: &str) {
+        let Ok(value) = text.trim().parse::<f64>() else {
+            card.message = Some(format!("`{}` is not a number", text.trim()));
+            return;
+        };
+        let plan = crate::articles::settings::plan_setting_write(setting, value, card.variant, &card.own);
+        let result: anyhow::Result<String> = match plan {
+            Err(error) => Err(error),
+            Ok(crate::articles::settings::SettingWrite::Source { file, text }) => std::fs::write(&file, text)
+                .map(|_| format!("Saved {} in {}", setting.field.label(), file.display()))
+                .map_err(Into::into),
+            Ok(crate::articles::settings::SettingWrite::Const(edit)) => {
+                let Some(index) = self.acmd_src.as_ref() else {
+                    return;
+                };
+                let (files, notes, _) = crate::project_consts::apply_edits(&index.consts, &[edit]);
+                if files.is_empty() {
+                    Err(anyhow::anyhow!("nothing was written: {}", notes.join("; ")))
+                } else {
+                    let mut said = format!("Saved {} in {}", setting.field.label(), files[0].display());
+                    if !notes.is_empty() {
+                        said.push_str(&format!(" — {}", notes.join("; ")));
+                    }
+                    Ok(said)
+                }
+            }
+            Ok(crate::articles::settings::SettingWrite::Param { file, block, field, variant }) => {
+                crate::articles::params::write_param_field(&file, &block, &field, variant, value, &self.state.labels)
+                    .map(|_| format!("Saved {block} › {field} in {}", file.display()))
+            }
+        };
+        match result {
+            Ok(said) => {
+                card.message = Some(said);
+                card.edits.clear();
+                self.rebuild_acmd_index();
+                self.ensure_article_catalog();
+                self.reload_article_settings(card);
+            }
+            Err(error) => card.message = Some(format!("Not saved: {error}")),
+        }
+    }
+
+    /// The Objects list under the fighter's moves: each object with where it comes from, its
+    /// scripts as moves, and its Settings card; then what the source has that isn't modelled.
+    fn draw_objects_list(&mut self, ui: &mut Ui, max_height: f32) {
+        self.ensure_article_catalog();
+        let Some(cache) = self.article_catalog.as_ref() else {
+            return;
+        };
+        let rows = crate::articles::view::object_rows(&cache.catalog);
+        let agents: Vec<String> = cache.catalog.articles.iter().map(|a| a.agent.clone()).collect();
+        let unresolved_clones = cache.catalog.unresolved_clones.clone();
+        let unresolved_statuses = cache.unresolved_statuses.clone();
+        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
+        ui.separator();
+        sidebar_section_heading(
+            ui,
+            "Objects",
+            "Projectiles and other objects this fighter can create: the game's own, ones the linked moveset rewrites, and clones it adds. Click a script to open it like a move.",
+        );
+        let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
+        let mut to_open: Option<(String, String)> = None;
+        let mut settings_for: Option<String> = None;
+        let warn = egui::Color32::from_rgb(235, 170, 90);
+        ScrollArea::vertical()
+            .id_salt("objects")
+            .max_height(max_height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if rows.is_empty() {
+                    ui.weak("No objects found for this fighter");
+                }
+                for (row, agent) in rows.iter().zip(&agents) {
+                    egui::CollapsingHeader::new(format!("{}  ·  {}", row.title, row.badge))
+                        .id_salt(("object", agent.as_str()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for warning in &row.warnings {
+                                ui.colored_label(warn, RichText::new(warning).small());
+                            }
+                            if row.scripts.is_empty() {
+                                ui.weak(RichText::new("The linked source has no scripts for it; the game's own run.").small());
+                            }
+                            for script in &row.scripts {
+                                let open = self.open_article.as_deref() == Some(agent.as_str())
+                                    && selected_move.as_deref() == Some(script.as_str());
+                                if ui
+                                    .selectable_label(open, format_move_name(script))
+                                    .on_hover_text(format!("{agent} · {script}"))
+                                    .clicked()
+                                    && !open
+                                {
+                                    to_open = Some((agent.clone(), script.clone()));
+                                }
+                            }
+                            if ui
+                                .small_button("Settings…")
+                                .on_hover_text("Size, speed, life and params, each with where it is set")
+                                .clicked()
+                            {
+                                settings_for = Some(agent.clone());
+                            }
+                        });
+                }
+                if !unresolved_clones.is_empty() || !unresolved_statuses.is_empty() {
+                    egui::CollapsingHeader::new(format!(
+                        "Not read ({})",
+                        unresolved_clones.len() + unresolved_statuses.len()
+                    ))
+                    .id_salt("objects_unread")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let short = |file: &Path| crate::articles::view::short_path(file, root.as_deref());
+                        for clone in &unresolved_clones {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A clone at {}:{} isn't listed: {}",
+                                    short(&clone.file),
+                                    clone.line,
+                                    clone.reason
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(&clone.text);
+                        }
+                        for status in &unresolved_statuses {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A status script at {}:{} ({} {}) isn't read: {}",
+                                    short(&status.file),
+                                    status.line,
+                                    status.kind_expr,
+                                    status.phase,
+                                    status.reason
+                                ))
+                                .small(),
+                            );
+                        }
+                    });
+                }
+            });
+        if let Some((agent, script)) = to_open {
+            self.open_article_script(agent, &script);
+        }
+        if let Some(agent) = settings_for {
+            self.open_article_settings(agent);
+        }
+    }
+
+    /// The Settings card window for one object.
+    fn draw_article_settings_window(&mut self, ctx: &egui::Context) {
+        let Some(mut card) = self.article_settings.take() else {
+            return;
+        };
+        let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(&card.agent))
+            .cloned()
+        else {
+            return;
+        };
+        let root = self.acmd_src.as_ref().map(|index| index.root.clone());
+        let consts = self.acmd_src.as_ref().map(|index| index.consts.clone());
+        let mut open = true;
+        let mut save: Option<(crate::articles::settings::Setting, String)> = None;
+        let mut reveal: Option<PathBuf> = None;
+        let block_name = format!("param_{}", article.name);
+        egui::Window::new(format!("{} settings", article.name))
+            .id(egui::Id::unique(("article_settings", card.agent.as_str())))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([620.0, 420.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(crate::articles::view::badge(&article)).strong());
+                for note in crate::articles::view::clone_notes(&article) {
+                    ui.label(RichText::new(note).small());
+                }
+                if matches!(article.origin, crate::articles::ArticleOrigin::Clone(_)) {
+                    ui.hyperlink_to(
+                        RichText::new("Clone compatibility sheet (community-verified)").small(),
+                        crate::articles::clone_compat::SOURCE_URL,
+                    );
+                }
+                if let Some(note) = crate::articles::view::missing_block_note(&article, &card.block, &card.settings) {
+                    ui.colored_label(egui::Color32::from_rgb(235, 170, 90), note);
+                }
+                let variants = card.block.variants.len();
+                if variants > 1 {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(("article_variant", card.agent.as_str()))
+                            .selected_text(format!("variant {} of {variants}", card.variant))
+                            .show_ui(ui, |ui| {
+                                for v in 0..variants {
+                                    if ui.selectable_label(card.variant == v, format!("variant {v}")).clicked() {
+                                        card.variant = v;
+                                        card.edits.clear();
+                                    }
+                                }
+                            });
+                    });
+                    ui.label(RichText::new(crate::articles::view::VARIANT_NOTE).small().weak());
+                }
+                for (path, reason) in &card.block.skipped {
+                    ui.label(RichText::new(format!("Not read: {path} — {reason}")).small().weak());
+                }
+                let cx = crate::articles::view::SettingContext {
+                    variant: card.variant,
+                    consts: consts.as_deref(),
+                    root: root.as_deref(),
+                };
+                let rows = crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
+                // Params nothing in the status code reads still show, editable the same way.
+                let extra = crate::articles::view::unread_param_rows(&card.settings, &card.block, &block_name, card.variant);
+                let extra_settings: Vec<crate::articles::settings::Setting> = extra
+                    .iter()
+                    .map(|row| crate::articles::settings::Setting {
+                        field: crate::articles::settings::SettingField::OtherMovement,
+                        value: crate::articles::settings::SettingValue::Param {
+                            block: block_name.clone(),
+                            field: row.label.clone(),
+                        },
+                        status: String::new(),
+                        phase: String::new(),
+                        file: PathBuf::new(),
+                        span: 0..0,
+                        facing_factor: false,
+                        referenced_params: Vec::new(),
+                    })
+                    .collect();
+                if rows.is_empty() && extra.is_empty() {
+                    ui.weak("Nothing in the linked source or the param files sets this object's size, speed or life.");
+                }
+                ScrollArea::vertical().id_salt("article_settings_rows").show(ui, |ui| {
+                    egui::Grid::new(("article_settings_grid", card.agent.as_str()))
+                        .striped(true)
+                        .num_columns(4)
+                        .show(ui, |ui| {
+                            let all = rows
+                                .iter()
+                                .zip(card.settings.iter())
+                                .chain(extra.iter().zip(extra_settings.iter()));
+                            for (n, (row, setting)) in all.enumerate() {
+                                ui.label(&row.label);
+                                if row.editable {
+                                    let text = card.edits.entry(n).or_insert_with(|| {
+                                        row.value.trim_end_matches(" × facing").to_string()
+                                    });
+                                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(80.0));
+                                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                        save = Some((setting.clone(), text.clone()));
+                                    }
+                                } else {
+                                    ui.label(&row.value);
+                                }
+                                ui.label(RichText::new(&row.origin).small().weak());
+                                ui.horizontal(|ui| {
+                                    if row.editable && ui.small_button("Save").clicked() {
+                                        if let Some(text) = card.edits.get(&n) {
+                                            save = Some((setting.clone(), text.clone()));
+                                        }
+                                    }
+                                    if !setting.file.as_os_str().is_empty()
+                                        && ui.small_button("Open").on_hover_text(setting.file.display().to_string()).clicked()
+                                    {
+                                        reveal = Some(setting.file.clone());
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+                if let Some(message) = &card.message {
+                    ui.separator();
+                    ui.label(message);
+                }
+            });
+        if let Some((setting, text)) = save {
+            self.save_article_setting(&mut card, &setting, &text);
+        }
+        if let Some(path) = reveal {
+            if let Err(error) = crate::roster::reveal::reveal(&path) {
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+        if open {
+            self.article_settings = Some(card);
+        }
+    }
+
+    /// The open move's object calls in plain words: the script's own (editable on the game
+    /// track) and, read-only, the ones its status code makes.
+    fn draw_article_calls_section(&mut self, ui: &mut Ui) {
+        self.ensure_article_catalog();
+        let calls = self.state.script.to_article_calls();
+        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let Some(cache) = self.article_catalog.as_ref() else {
+            return;
+        };
+        let status_rows: Vec<crate::articles::view::StatusCallRow> = if self.open_article.is_some() {
+            Vec::new()
+        } else {
+            cache
+                .status_rows
+                .iter()
+                .filter(|row| crate::articles::view::status_matches_move(&row.status, &move_name))
+                .cloned()
+                .collect()
+        };
+        if calls.is_empty() && status_rows.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = calls
+            .iter()
+            .map(|(_, call)| crate::articles::view::timeline_label(call, &cache.catalog))
+            .collect();
+        // A script call is edited through its statement; that needs the calls in running order to
+        // be the statements in source order, which a loop or a timeline form breaks.
+        let script_calls = calls
+            .iter()
+            .filter(|(_, call)| call.origin == crate::data::ArticleOrigin::Script)
+            .count();
+        let addressable = script_calls == self.state.script.article_site_count();
+        ui.separator();
+        editor_command_subsection_heading(
+            ui,
+            "Objects",
+            "What this move does with its objects, in plain words. Calls in the game_ script can be changed here and synced; calls made from status code are shown with where they are and open in your editor.",
+            egui::Color32::from_rgb(200, 180, 240),
+            "ArticleModule",
+        );
+        let mut edit: Option<(usize, crate::data::ArticleCall)> = None;
+        let mut site = 0usize;
+        for ((frame, call), label) in calls.iter().zip(&labels) {
+            let is_script = call.origin == crate::data::ArticleOrigin::Script;
+            let this_site = site;
+            if is_script {
+                site += 1;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("f{frame}"));
+                ui.label(label).on_hover_text(&call.source);
+                if !(is_script && addressable) {
+                    ui.weak(RichText::new(match call.origin {
+                        crate::data::ArticleOrigin::Script => "inside a loop, kept as written",
+                        crate::data::ArticleOrigin::Native => "edited as a native call",
+                        crate::data::ArticleOrigin::Timeline => "edited in its timeline form",
+                    }).small());
+                    return;
+                }
+                if let Some(slot) = call.op.target_index() {
+                    let mut target = call.target;
+                    egui::ComboBox::from_id_salt(("article_target", this_site))
+                        .selected_text(match target {
+                            crate::data::ArticleTarget::All => "every one",
+                            crate::data::ArticleTarget::Last => "the last",
+                            crate::data::ArticleTarget::First => "the first",
+                            _ => "as written",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (choice, words) in [
+                                (crate::data::ArticleTarget::All, "every one"),
+                                (crate::data::ArticleTarget::Last, "the last"),
+                                (crate::data::ArticleTarget::First, "the first"),
+                            ] {
+                                ui.selectable_value(&mut target, choice, words);
+                            }
+                        });
+                    if target != call.target && call.args.get(slot).is_some() {
+                        let mut changed = call.clone();
+                        changed.target = target;
+                        changed.edited = true;
+                        edit = Some((this_site, changed));
+                    }
+                }
+                for (n, arg) in call.args.iter().enumerate() {
+                    if Some(n) == call.op.target_index() {
+                        continue;
+                    }
+                    let mut text = arg.clone();
+                    let width = (text.len() as f32 * 7.0).clamp(30.0, 200.0);
+                    if ui
+                        .add(egui::TextEdit::singleline(&mut text).desired_width(width))
+                        .lost_focus()
+                        && text.trim() != arg.trim()
+                        && !text.trim().is_empty()
+                    {
+                        let mut changed = call.clone();
+                        changed.args[n] = text.trim().to_string();
+                        changed.edited = true;
+                        edit = Some((this_site, changed));
+                    }
+                }
+            });
+        }
+        let mut reveal: Option<PathBuf> = None;
+        for row in &status_rows {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&row.label);
+                ui.weak(RichText::new(&row.origin).small());
+                if ui.small_button("Open").on_hover_text(row.file.display().to_string()).clicked() {
+                    reveal = Some(row.file.clone());
+                }
+            });
+        }
+        if let Some((site, changed)) = edit {
+            if let Some(call) = self.state.script.article_stmt_mut(site) {
+                *call = changed;
+                self.state.status =
+                    "Object call edit staged — export or sync it into the linked source project.".into();
+            }
+        }
+        if let Some(path) = reveal {
+            if let Err(error) = crate::roster::reveal::reveal(&path) {
+                self.state.status = format!("Could not open {}: {error:#}", path.display());
+            }
+        }
+    }
+
+    /// Whether the open object script is a clone's, which the game has no scripts for.
+    fn open_article_is_clone(&self) -> bool {
+        let Some(agent) = &self.open_article else {
+            return false;
+        };
+        self.article_catalog.as_ref().is_some_and(|cache| {
+            cache
+                .catalog
+                .get(agent)
+                .is_some_and(|a| matches!(a.origin, crate::articles::ArticleOrigin::Clone(_)))
+        })
+    }
+
+    fn current_move_key(&self) -> Option<String> {
+        let fighter = self.script_agent()?;
         let mv = self.state.selected_move.as_ref()?.name.clone();
         Some(Self::move_key(&fighter, &mv))
     }
@@ -24723,6 +25333,11 @@ impl VisionaryApp {
     ///
     /// (Frame-space helpers live just below — see [`Self::motion_to_script_frame`].)
     fn current_motion_hash(&self) -> Option<u64> {
+        // An object's script is not one of the fighter's motions: no live rule or capture is
+        // keyed to it (sending one live is a later step), so it has no motion here.
+        if self.open_article.is_some() {
+            return None;
+        }
         self.state
             .selected_move
             .as_ref()
@@ -35657,6 +36272,10 @@ impl eframe::App for VisionaryApp {
 
         if self.show_motion_list {
             self.draw_motion_list_window(&ctx);
+        }
+
+        if self.article_settings.is_some() {
+            self.draw_article_settings_window(&ctx);
         }
 
         if self.show_capture_debug {

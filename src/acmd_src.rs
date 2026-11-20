@@ -2655,6 +2655,15 @@ fn keyword_at(text: &str, at: usize, word: &str) -> bool {
         && bytes.get(at + word.len()).is_some_and(|b| !is_ident_byte(*b))
 }
 
+/// The span (declaration line start through closing brace) of the one function named `name` in
+/// `text`. `None` when there is none, or more than one, since which one a call reaches would then
+/// depend on module scoping this does not model.
+pub(crate) fn function_item(text: &str, name: &str) -> Option<Range<usize>> {
+    let mut found = scan_plain_functions(text).into_iter().filter(|f| f.name == name);
+    let first = found.next()?;
+    found.next().is_none().then_some(first.span)
+}
+
 /// Every `fn NAME(…) … { … }` in `text` with a body, nested ones included.
 fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
     let bytes = text.as_bytes();

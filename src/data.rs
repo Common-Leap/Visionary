@@ -5962,6 +5962,27 @@ impl AcmdScript {
         work_transition_term_stmt_mut: WorkTransitionTerm => WorkTransitionTermCall;
         work_module_set_stmt_mut: WorkModuleSet => WorkModuleSetCall;
         work_module_inc_int_stmt_mut: WorkModuleIncInt => WorkModuleIncIntCall;
+        article_stmt_mut: Article => ArticleCall;
+    }
+
+    /// How many [`ExcuteStmt::Article`] statements the source holds, each `for` body counted
+    /// once: the ordinals [`Self::article_stmt_mut`] takes. When this differs from the number of
+    /// script-read calls [`Self::to_article_calls`] gives, the two cannot be paired by position.
+    pub fn article_site_count(&self) -> usize {
+        fn count(stmts: &[AcmdStmt]) -> usize {
+            stmts
+                .iter()
+                .map(|stmt| match stmt {
+                    AcmdStmt::Excute(inner) => {
+                        inner.iter().filter(|s| matches!(s, ExcuteStmt::Article(_))).count()
+                    }
+                    AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::Article(_))),
+                    AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => count(body),
+                    _ => 0,
+                })
+                .sum()
+        }
+        count(&self.stmts)
     }
 
     /// The hurtbox statement a span's [`site`](HurtboxState::site) refers to.

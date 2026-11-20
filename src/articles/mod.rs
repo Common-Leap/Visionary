@@ -8,6 +8,7 @@ pub mod clone_compat;
 pub mod clones;
 pub mod params;
 pub mod settings;
+pub mod view;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -183,6 +184,52 @@ impl ArticleCatalog {
     pub fn get(&self, name: &str) -> Option<&Article> {
         self.articles.iter().find(|a| a.name == name || a.agent == name)
     }
+}
+
+/// The project's Rust files with their text, as the index read them.
+fn rust_sources(index: &SourceIndex) -> Vec<(std::path::PathBuf, String)> {
+    index
+        .files
+        .iter()
+        .filter(|file| file.extension().is_some_and(|e| e == "rs"))
+        .filter_map(|file| Some((file.clone(), std::fs::read_to_string(file).ok()?)))
+        .collect()
+}
+
+/// `fighter`'s objects as the linked moveset sees them: the dump's (from `fighter_dir`), the ones
+/// the source rewrites, and the clones it adds. `fighter_names` are every fighter folder name, to
+/// tell a clone's source owner from its kind.
+pub fn catalog_for(
+    fighter: &str,
+    index: &SourceIndex,
+    fighter_names: &[String],
+    fighter_dir: &Path,
+) -> ArticleCatalog {
+    let sources = rust_sources(index);
+    let (clones, unresolved) = clones::read_clones(&sources, &index.consts, fighter_names);
+    ArticleCatalog::build(fighter, Some(index), &clones, unresolved, fighter_dir)
+}
+
+/// The settings an article's status scripts write, following the project functions they call
+/// (looked up in the caller's file first, then anywhere in the project when only one has it).
+pub fn settings_for(index: &SourceIndex, agent: &str) -> Vec<settings::Setting> {
+    let bodies = index.status_bodies(agent);
+    if bodies.is_empty() {
+        return Vec::new();
+    }
+    let sources = rust_sources(index);
+    let helpers = |caller: &Path, name: &str| -> Option<(std::path::PathBuf, std::ops::Range<usize>, String)> {
+        let in_file = |(file, text): &(std::path::PathBuf, String)| {
+            crate::acmd_src::function_item(text, name).map(|span| (file.clone(), span.clone(), text[span].to_string()))
+        };
+        if let Some(found) = sources.iter().filter(|(file, _)| file == caller).find_map(in_file) {
+            return Some(found);
+        }
+        let mut all = sources.iter().filter_map(in_file);
+        let first = all.next()?;
+        all.next().is_none().then_some(first)
+    };
+    settings::read_settings(&bodies, &index.consts, &helpers)
 }
 
 #[cfg(test)]

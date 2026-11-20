@@ -2670,10 +2670,10 @@ fn command_matches_track(track: Track, command: &ExcuteStmt) -> bool {
     if matches!(command, ExcuteStmt::Effect(_)) {
         return track == Track::Effect;
     }
-    // A typed `ArticleModule` statement has no node of its own yet. It is kept as the
-    // preserved source line it was before it was typed, and saved as written.
+    // A typed `ArticleModule` statement is a game-script action: editable there, and saved as
+    // written until it is edited (`ArticleCall::emit`).
     if matches!(command, ExcuteStmt::Article(_)) {
-        return false;
+        return track == Track::Game;
     }
     if matches!(command, ExcuteStmt::NativeCall(_) | ExcuteStmt::WorkFlag(_)) {
         return true;
