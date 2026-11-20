@@ -37551,6 +37551,7 @@ fn rebuild_script_from_hitboxes(
                 | ExcuteStmt::StartCutIn
                 | ExcuteStmt::CaptureCutCommon
                 | ExcuteStmt::ArticleLifecycle(_)
+                | ExcuteStmt::Article(_)
                 | ExcuteStmt::GimmickEvent { .. }
                 | ExcuteStmt::GimmickChartEvent { .. }
                 | ExcuteStmt::GimmickChartEventValues { .. }

@@ -1943,22 +1943,45 @@ pub enum ArticleLifecycleCall {
     /// Native `shoot` with an exact symbolic target; emitted through `ArticleOperationTarget`.
     Shoot {
         symbol: String,
+        #[serde(deserialize_with = "closed_shoot_target")]
         target: ArticleTarget,
     },
     /// Distinct native `shoot_exist` call with the same reviewed target and fixed false tail.
     ShootExist {
         symbol: String,
+        #[serde(deserialize_with = "closed_shoot_target")]
         target: ArticleTarget,
     },
     /// One exact source tuple from the closed Eflame/Elight E-Sword partial-motion presets.
     AddMotionPartial { preset: ArticlePartialMotionPreset },
 }
 
-/// Exact article-instance selection tokens measured for source-only shooting calls.
+/// The timeline's shoot forms are measured with `All` and `Last` only. [`ArticleTarget`] also
+/// names the targets [`ArticleCall`] reads, so a saved shoot node naming another is refused
+/// here rather than widened.
+fn closed_shoot_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ArticleTarget, D::Error> {
+    match <ArticleTarget as serde::Deserialize>::deserialize(deserializer)? {
+        target @ (ArticleTarget::All | ArticleTarget::Last) => Ok(target),
+        other => Err(serde::de::Error::custom(format!(
+            "shoot target {other:?} is not one of the measured All or Last"
+        ))),
+    }
+}
+
+/// Which of an article's live instances an `ArticleModule` call acts on
+/// (`ARTICLE_OPE_TARGET_*`). The timeline's shoot nodes offer only `All` and `Last`; the rest
+/// come from [`ArticleCall`] reading what a script wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ArticleTarget {
     All,
     Last,
+    First,
+    Term,
+    None,
+    /// The call takes no target, or the one written is not a known `ARTICLE_OPE_TARGET_*`.
+    Unspecified,
 }
 
 /// Exact owner/symbol rows observed with `generate_article_enable(..., false, -1)`.
@@ -2006,11 +2029,315 @@ pub(crate) fn is_measured_enabled_article(fighter: &str, symbol: &str) -> bool {
 }
 
 impl ArticleTarget {
+    /// The symbolic spelling. `Unspecified` has none and gives an empty string.
     pub const fn source_token(self) -> &'static str {
         match self {
             Self::All => "*ARTICLE_OPE_TARGET_ALL",
             Self::Last => "*ARTICLE_OPE_TARGET_LAST",
+            Self::First => "*ARTICLE_OPE_TARGET_FIRST",
+            Self::Term => "*ARTICLE_OPE_TARGET_TERM",
+            Self::None => "*ARTICLE_OPE_TARGET_NONE",
+            Self::Unspecified => "",
         }
+    }
+
+    /// The lua_const value: ALL 0, FIRST 1, LAST 2, TERM 3, NONE 0xFFFFFFFF.
+    pub const fn number(self) -> Option<i64> {
+        match self {
+            Self::All => Some(0),
+            Self::First => Some(1),
+            Self::Last => Some(2),
+            Self::Term => Some(3),
+            Self::None => Some(0xFFFF_FFFF),
+            Self::Unspecified => Option::None,
+        }
+    }
+
+    /// Read a target argument as written: `ArticleOperationTarget(*ARTICLE_OPE_TARGET_X)` (with
+    /// or without a `smash::app::`/`app::` path), a bare `*ARTICLE_OPE_TARGET_X`, or a number.
+    /// Anything else is `Unspecified`.
+    pub fn read(text: &str) -> Self {
+        let inner = article_target_parts(text).1;
+        if let Some(name) = inner.strip_prefix("*ARTICLE_OPE_TARGET_") {
+            return match name {
+                "ALL" => Self::All,
+                "FIRST" => Self::First,
+                "LAST" => Self::Last,
+                "TERM" => Self::Term,
+                "NONE" => Self::None,
+                _ => Self::Unspecified,
+            };
+        }
+        let digits = inner.replace('_', "");
+        let number = match digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+        {
+            Some(hex) => i64::from_str_radix(hex, 16).ok(),
+            Option::None => digits.parse::<i64>().ok(),
+        };
+        match number {
+            Some(0) => Self::All,
+            Some(1) => Self::First,
+            Some(2) => Self::Last,
+            Some(3) => Self::Term,
+            Some(-1) | Some(0xFFFF_FFFF) => Self::None,
+            _ => Self::Unspecified,
+        }
+    }
+
+    /// Write this target in the spelling of `written`: the same `ArticleOperationTarget(..)`
+    /// wrapper (and path) if it had one, numeric if it was numeric, symbolic otherwise. An
+    /// unchanged target keeps `written` exactly.
+    pub fn respell(self, written: &str) -> String {
+        if self == Self::Unspecified || Self::read(written) == self {
+            return written.to_owned();
+        }
+        let (wrapper, inner) = article_target_parts(written);
+        let numeric = !inner.is_empty() && !inner.starts_with('*');
+        let value = match (numeric, self.number()) {
+            (true, Some(0xFFFF_FFFF)) if inner.starts_with('-') => "-1".to_owned(),
+            (true, Some(0xFFFF_FFFF)) => "0xFFFFFFFF".to_owned(),
+            (true, Some(n)) => n.to_string(),
+            _ => self.source_token().to_owned(),
+        };
+        match wrapper {
+            Some(path) => format!("{path}ArticleOperationTarget({value})"),
+            Option::None => value,
+        }
+    }
+}
+
+/// Split a target argument into its `ArticleOperationTarget(` wrapper path, if any, and the
+/// value inside it, both trimmed.
+fn article_target_parts(text: &str) -> (Option<&str>, &str) {
+    let text = text.trim();
+    if let Some(at) = text.find("ArticleOperationTarget(") {
+        let path = &text[..at];
+        if path.is_empty() || path == "smash::app::" || path == "app::" {
+            if let Some(inner) = text[at + "ArticleOperationTarget(".len()..].strip_suffix(')') {
+                return (Some(path), inner.trim());
+            }
+        }
+    }
+    (Option::None, text)
+}
+
+/// The `ArticleModule` function an [`ArticleCall`] makes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArticleOp {
+    Generate,
+    GenerateEnable,
+    Remove,
+    RemoveExist,
+    Shoot,
+    ShootExist,
+    ChangeMotion,
+    ChangeStatus,
+    ChangeStatusExist,
+    SetRate,
+    SetFrame,
+    AddMotionPartial,
+    SetVisibilityWhole,
+    SetVisibility,
+    SetPos,
+    SetFlag,
+    SetInt,
+    SetFloat,
+    /// Any other `ArticleModule` function, by name. Kept and written back as it was.
+    Other(String),
+}
+
+impl ArticleOp {
+    const NAMED: &'static [(&'static str, ArticleOp)] = &[
+        ("generate_article", ArticleOp::Generate),
+        ("generate_article_enable", ArticleOp::GenerateEnable),
+        ("remove", ArticleOp::Remove),
+        ("remove_exist", ArticleOp::RemoveExist),
+        ("shoot", ArticleOp::Shoot),
+        ("shoot_exist", ArticleOp::ShootExist),
+        ("change_motion", ArticleOp::ChangeMotion),
+        ("change_status", ArticleOp::ChangeStatus),
+        ("change_status_exist", ArticleOp::ChangeStatusExist),
+        ("set_rate", ArticleOp::SetRate),
+        ("set_frame", ArticleOp::SetFrame),
+        ("add_motion_partial", ArticleOp::AddMotionPartial),
+        ("set_visibility_whole", ArticleOp::SetVisibilityWhole),
+        ("set_visibility", ArticleOp::SetVisibility),
+        ("set_pos", ArticleOp::SetPos),
+        ("set_flag", ArticleOp::SetFlag),
+        ("set_int", ArticleOp::SetInt),
+        ("set_float", ArticleOp::SetFloat),
+    ];
+
+    pub fn from_name(name: &str) -> Self {
+        Self::NAMED
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map_or_else(|| Self::Other(name.to_owned()), |(_, op)| op.clone())
+    }
+
+    /// The function name as written after `ArticleModule::`.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Other(name) => name,
+            op => Self::NAMED
+                .iter()
+                .find(|(_, known)| known == op)
+                .map_or("", |(name, _)| name),
+        }
+    }
+
+    /// Where the `ArticleOperationTarget` sits in [`ArticleCall::args`], from the vanilla
+    /// `lua_bind` signatures. `None` for functions that take no target.
+    pub fn target_index(&self) -> Option<usize> {
+        match self {
+            Self::Shoot | Self::ShootExist | Self::Remove | Self::RemoveExist => Some(0),
+            Self::ChangeStatus | Self::SetVisibilityWhole => Some(1),
+            Self::SetVisibility => Some(2),
+            _ => Option::None,
+        }
+    }
+}
+
+/// One `ArticleModule::*` statement in a script, read from its source line.
+///
+/// `source` is the statement as written and is what gets saved back until `edited` is set, so
+/// an unedited script saves byte for byte. Once edited, the call is rebuilt from the fields in
+/// the spelling and with the receiver `source` used.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArticleCall {
+    pub op: ArticleOp,
+    /// The first argument after the module accessor, as written (e.g. `*FIGHTER_X_GENERATE_ARTICLE_Y`).
+    pub article: String,
+    /// The arguments after `article`, as written.
+    pub args: Vec<String>,
+    pub target: ArticleTarget,
+    /// The original statement.
+    pub source: String,
+    pub edited: bool,
+}
+
+/// The two path spellings of the module a call may be written with.
+const ARTICLE_MODULE_PATHS: [&str; 2] = ["smash::app::lua_bind::ArticleModule::", "ArticleModule::"];
+
+/// Split one complete `[path]ArticleModule::f(args);` statement into (path, fn, args).
+/// Anything else, such as a call inside an expression, a binding or a trailing comment, is
+/// not a statement this model owns and gives `None`.
+fn split_article_statement(line: &str) -> Option<(&'static str, &str, Vec<String>)> {
+    let line = line.trim();
+    let path = ARTICLE_MODULE_PATHS
+        .into_iter()
+        .find(|path| line.starts_with(path))?;
+    if line.contains("//") || line.contains("/*") {
+        return Option::None;
+    }
+    let rest = &line[path.len()..];
+    let open = rest.find('(')?;
+    let name = &rest[..open];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Option::None;
+    }
+    let body = rest[open..].strip_suffix(';')?.trim_end();
+    // The opening parenthesis must close exactly at the end of the statement.
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && index + 1 != body.len() {
+                    return Option::None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || in_string || !body.ends_with(')') {
+        return Option::None;
+    }
+    let args = crate::acmd::tokenize_args_balanced(&body[1..body.len() - 1]);
+    Some((path, name, args))
+}
+
+impl ArticleCall {
+    /// Read one `ArticleModule::f(accessor, article, ...);` statement, either module path.
+    pub fn parse(line: &str) -> Option<Self> {
+        let (_, name, mut args) = split_article_statement(line)?;
+        if args.len() < 2 {
+            return Option::None;
+        }
+        let op = ArticleOp::from_name(name);
+        args.remove(0);
+        let article = args.remove(0);
+        Some(Self::from_parts(op, article, args, line.trim().to_owned()))
+    }
+
+    fn from_parts(op: ArticleOp, article: String, args: Vec<String>, source: String) -> Self {
+        let target = op
+            .target_index()
+            .and_then(|index| args.get(index))
+            .map_or(ArticleTarget::Unspecified, |text| ArticleTarget::read(text));
+        Self {
+            op,
+            article,
+            args,
+            target,
+            source,
+            edited: false,
+        }
+    }
+
+    /// The same call when it is kept as a typed native call (`move_nodes::native_calls`).
+    pub fn from_native(call: &crate::move_nodes::native_calls::NativeCall) -> Option<Self> {
+        let name = call.callee.strip_prefix("ArticleModule::")?;
+        let mut args = call.arguments.clone();
+        if args.is_empty() {
+            return Option::None;
+        }
+        let article = args.remove(0);
+        Some(Self::from_parts(
+            ArticleOp::from_name(name),
+            article,
+            args,
+            call.source(),
+        ))
+    }
+
+    /// The article symbol without its `*`, as the preview looks objects up.
+    pub fn symbol(&self) -> &str {
+        self.article.trim_start_matches('*')
+    }
+
+    /// The statement to save: `source` unless edited, else rebuilt with the written module
+    /// path, receiver and target spelling.
+    pub fn emit(&self) -> String {
+        if !self.edited {
+            return self.source.clone();
+        }
+        let (path, receiver) = split_article_statement(&self.source)
+            .map(|(path, _, args)| (path, args.into_iter().next()))
+            .unwrap_or(("ArticleModule::", Option::None));
+        let receiver = receiver.unwrap_or_else(|| "agent.module_accessor".to_owned());
+        let mut args = self.args.clone();
+        if let Some(slot) = self.op.target_index().and_then(|index| args.get_mut(index)) {
+            *slot = self.target.respell(slot);
+        }
+        let mut all = vec![receiver, self.article.clone()];
+        all.extend(args);
+        format!("{path}{}({});", self.op.name(), all.join(", "))
     }
 }
 
@@ -4060,6 +4387,10 @@ pub enum ExcuteStmt {
     },
     /// One of the exact, registry-checked source-only ArticleModule lifecycle calls.
     ArticleLifecycle(ArticleLifecycleCall),
+    /// Any other `ArticleModule::*` statement, read into its parts and saved as written until
+    /// edited. Calls the timeline's closed forms ([`ArticleLifecycle`](Self::ArticleLifecycle))
+    /// or the typed native calls already own are not read into this.
+    Article(ArticleCall),
     /// Source-only handoff to a named live gimmick event receiver. Project expansion requires
     /// this name to be present in the fighter's compiled event bindings.
     GimmickEvent {
@@ -5237,7 +5568,13 @@ impl AcmdScript {
     /// Objects the move creates (true) or removes (false), as (script frame, article symbol,
     /// created), in running order.
     pub fn to_article_spawns(&self) -> Vec<(u32, String, bool)> {
-        self.walk().article_spawns
+        article_spawns(&self.walk().article_calls)
+    }
+
+    /// Every `ArticleModule` call the move makes, as (script frame, call), in running order.
+    /// The closed timeline forms and typed native calls are read into the same [`ArticleCall`].
+    pub fn to_article_calls(&self) -> Vec<(u32, ArticleCall)> {
+        self.walk().article_calls
     }
 
     /// The move's model visibility switches, as (script frame, set, group), in running order.
@@ -5247,17 +5584,17 @@ impl AcmdScript {
 
     /// Objects the move throws, as (script frame, article symbol), in running order.
     pub fn to_article_shots(&self) -> Vec<(u32, String)> {
-        self.walk().article_shots
+        article_shots(&self.walk().article_calls)
     }
 
     /// Motions the move gives its objects, as (script frame, article symbol, motion).
     pub fn to_article_motions(&self) -> Vec<(u32, String, String)> {
-        self.walk().article_motions
+        article_motions(&self.walk().article_calls)
     }
 
     /// Objects the move shows (true) or hides (false), as (script frame, article symbol, shown).
     pub fn to_article_visibility(&self) -> Vec<(u32, String, bool)> {
-        self.walk().article_visibility
+        article_visibility(&self.walk().article_calls)
     }
 
     /// Flatten the script into display hitboxes with computed frame ranges.
@@ -6614,17 +6951,11 @@ struct WalkAccum {
     work_flags: Vec<WorkFlagEvent>,
     work_transition_terms: Vec<WorkTransitionTermEvent>,
     work_module_inc_ints: Vec<WorkModuleIncIntEvent>,
-    /// Objects the move creates (true) or removes (false): (script frame, symbol, created).
-    article_spawns: Vec<(u32, String, bool)>,
-    /// Objects the move throws (`ArticleModule::shoot` / `shoot_exist`): (script frame, symbol).
-    article_shots: Vec<(u32, String)>,
+    /// Every `ArticleModule` call, whichever statement form it was read as: (script frame,
+    /// call). The preview's spawn, shot, motion and visibility lists are read from this.
+    pub article_calls: Vec<(u32, ArticleCall)>,
     /// Model visibility switches (`VisibilityModule::set_int64`): (script frame, set, group).
     visibility_changes: Vec<(u32, String, String)>,
-    /// Motions the move gives its objects (`ArticleModule::change_motion`):
-    /// (script frame, symbol, motion).
-    article_motions: Vec<(u32, String, String)>,
-    /// Objects shown or hidden (`ArticleModule::set_visibility_whole`): (script frame, symbol, shown).
-    article_visibility: Vec<(u32, String, bool)>,
     work_module_sets: Vec<WorkModuleSetEvent>,
     /// Next site per [`SiteFamily`], each family numbered independently.
     ///
@@ -6883,34 +7214,73 @@ fn record_raw_partial_frame(line: &str, frame: f32, hurt: &mut WalkAccum) {
     }
 }
 
-/// An `ArticleModule` call kept as a native call, for the preview's objects.
+/// An `ArticleModule` call kept as a native call, for the preview's objects. It is read into
+/// the same [`ArticleCall`] the raw spelling of the call would give.
 fn record_native_article_call(
     call: &crate::move_nodes::native_calls::NativeCall,
     at: u32,
     hurt: &mut WalkAccum,
 ) {
-    let Some(symbol) = call.arguments.first().and_then(|s| s.strip_prefix('*')) else {
-        return;
-    };
-    let symbol = symbol.to_owned();
-    let second = call.arguments.get(1).map(String::as_str);
-    match call.callee.trim_start_matches("ArticleModule::") {
-        "generate_article" => hurt.article_spawns.push((at, symbol, true)),
-        "change_motion" => {
-            if let Some(motion) = second
-                .and_then(|m| m.strip_prefix("Hash40::new(\""))
-                .and_then(|m| m.strip_suffix("\")"))
-            {
-                hurt.article_motions.push((at, symbol, motion.to_owned()));
-            }
-        }
-        "set_visibility_whole" => match second {
-            Some("true") => hurt.article_visibility.push((at, symbol, true)),
-            Some("false") => hurt.article_visibility.push((at, symbol, false)),
-            _ => {}
-        },
-        _ => {}
+    if let Some(call) = ArticleCall::from_native(call) {
+        hurt.article_calls.push((at, call));
     }
+}
+
+/// Objects created (true) or removed (false): (script frame, symbol, created).
+fn article_spawns(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
+    calls
+        .iter()
+        .filter_map(|(at, call)| {
+            let created = match call.op {
+                ArticleOp::Generate | ArticleOp::GenerateEnable => true,
+                ArticleOp::Remove | ArticleOp::RemoveExist => false,
+                _ => return Option::None,
+            };
+            Some((*at, call.symbol().to_owned(), created))
+        })
+        .collect()
+}
+
+/// Objects thrown (`shoot` / `shoot_exist`): (script frame, symbol).
+fn article_shots(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String)> {
+    calls
+        .iter()
+        .filter(|(_, call)| matches!(call.op, ArticleOp::Shoot | ArticleOp::ShootExist))
+        .map(|(at, call)| (*at, call.symbol().to_owned()))
+        .collect()
+}
+
+/// Motions given to objects by name (`change_motion(.., Hash40::new("m"), ..)`):
+/// (script frame, symbol, motion).
+fn article_motions(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, String)> {
+    calls
+        .iter()
+        .filter(|(_, call)| call.op == ArticleOp::ChangeMotion)
+        .filter_map(|(at, call)| {
+            let motion = call
+                .args
+                .first()?
+                .strip_prefix("Hash40::new(\"")?
+                .strip_suffix("\")")?;
+            Some((*at, call.symbol().to_owned(), motion.to_owned()))
+        })
+        .collect()
+}
+
+/// Objects shown (true) or hidden (false) whole: (script frame, symbol, shown).
+fn article_visibility(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
+    calls
+        .iter()
+        .filter(|(_, call)| call.op == ArticleOp::SetVisibilityWhole)
+        .filter_map(|(at, call)| {
+            let shown = match call.args.first()?.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Option::None,
+            };
+            Some((*at, call.symbol().to_owned(), shown))
+        })
+        .collect()
 }
 
 /// Run one statement from inside an `is_excute` block, or one written bare beside it.
@@ -7145,49 +7515,21 @@ fn eval_excute_stmt(s: &ExcuteStmt, frame: f32, hitboxes: &mut Vec<Hitbox>, hurt
         | ExcuteStmt::AttackModuleAddReactionFrame { .. }
         | ExcuteStmt::AttackModuleAddReactionFrameRevised { .. }
         | ExcuteStmt::GrabRebound { .. } => {}
-        ExcuteStmt::ArticleLifecycle(
-            ArticleLifecycleCall::Generate { symbol }
-            | ArticleLifecycleCall::GenerateEnabled { symbol },
-        ) => hurt.article_spawns.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-            true,
-        )),
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::RemoveAll { symbol }) => {
-            hurt.article_spawns.push((
-                script_frame(frame),
-                symbol.trim_start_matches('*').to_owned(),
-                false,
-            ))
+        // The closed timeline forms are read through their own emitted line, so they reach
+        // the preview as the same `ArticleCall` a raw or native spelling of the call gives.
+        ExcuteStmt::ArticleLifecycle(_) => {
+            for line in crate::acmd::emit_excute_stmts(std::slice::from_ref(s), "") {
+                if let Some(call) = ArticleCall::parse(&line) {
+                    hurt.article_calls.push((script_frame(frame), call));
+                }
+            }
         }
+        ExcuteStmt::Article(call) => hurt.article_calls.push((script_frame(frame), call.clone())),
         ExcuteStmt::VisibilitySetInt64 { group, status } => {
             hurt.visibility_changes
                 .push((script_frame(frame), group.clone(), status.clone()))
         }
-        ExcuteStmt::ArticleLifecycle(
-            ArticleLifecycleCall::Shoot { symbol, .. }
-            | ArticleLifecycleCall::ShootExist { symbol, .. },
-        ) => hurt.article_shots.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-        )),
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ChangeMotion { symbol, motion }) => {
-            hurt.article_motions.push((
-                script_frame(frame),
-                symbol.trim_start_matches('*').to_owned(),
-                motion.clone(),
-            ))
-        }
-        ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::SetVisibilityWhole {
-            symbol,
-            visible,
-        }) => hurt.article_visibility.push((
-            script_frame(frame),
-            symbol.trim_start_matches('*').to_owned(),
-            *visible,
-        )),
-        ExcuteStmt::ArticleLifecycle(_)
-        | ExcuteStmt::GimmickEvent { .. }
+        ExcuteStmt::GimmickEvent { .. }
         | ExcuteStmt::GimmickChartEvent { .. }
         | ExcuteStmt::GimmickChartEventValues { .. } => {}
         ExcuteStmt::AttackMod { kind, id, value } => {

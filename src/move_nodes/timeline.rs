@@ -2669,6 +2669,11 @@ fn command_matches_track(track: Track, command: &ExcuteStmt) -> bool {
     if matches!(command, ExcuteStmt::Effect(_)) {
         return track == Track::Effect;
     }
+    // A typed `ArticleModule` statement has no node of its own yet. It is kept as the
+    // preserved source line it was before it was typed, and saved as written.
+    if matches!(command, ExcuteStmt::Article(_)) {
+        return false;
+    }
     if matches!(command, ExcuteStmt::NativeCall(_) | ExcuteStmt::WorkFlag(_)) {
         return true;
     }
@@ -7912,10 +7917,14 @@ mod tests {
                 for stmt in stmts {
                     match stmt {
                         AcmdStmt::Excute(commands) => {
-                            *count += commands.iter().filter(|command| matches!(
-                                command,
-                                ExcuteStmt::Raw(raw) if raw.contains("ArticleModule::shoot(")
-                            )).count();
+                            *count += commands.iter().filter(|command| match command {
+                                ExcuteStmt::Raw(raw) => raw.contains("ArticleModule::shoot("),
+                                // Typed but kept as written, like the raw line it replaced.
+                                ExcuteStmt::Article(call) => {
+                                    !call.edited && call.source.contains("ArticleModule::shoot(")
+                                }
+                                _ => false,
+                            }).count();
                         }
                         AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
                             count_raw_shoot(body, count);

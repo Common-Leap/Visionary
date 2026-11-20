@@ -1012,6 +1012,10 @@ pub(super) fn article_target_label(target: crate::data::ArticleTarget) -> &'stat
     match target {
         crate::data::ArticleTarget::All => "All",
         crate::data::ArticleTarget::Last => "Last created",
+        crate::data::ArticleTarget::First => "First created",
+        crate::data::ArticleTarget::Term => "Term",
+        crate::data::ArticleTarget::None => "None",
+        crate::data::ArticleTarget::Unspecified => "Not set",
     }
 }
 

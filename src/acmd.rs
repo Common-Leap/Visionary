@@ -904,7 +904,7 @@ fn parse_stmts_with_fear_face_guard(
                 && plain_command_body(&lines[body_start..body_end])
                 && !excute_stmts
                     .iter()
-                    .any(|command| matches!(command, ExcuteStmt::Raw(_)))
+                    .any(|command| matches!(command, ExcuteStmt::Raw(_) | ExcuteStmt::Article(_)))
             {
                 stmts.push(AcmdStmt::RawBlock {
                     // As written: the function may call its agent something else.
@@ -1192,6 +1192,14 @@ fn parse_stmts_with_fear_face_guard(
         // hitbox means, which nothing has measured.
         if let Some(sound) = parse_sound_call(line) {
             stmts.push(AcmdStmt::Bare(Box::new(sound)));
+            pos += lines_consumed;
+            continue;
+        }
+
+        // An `ArticleModule` statement written outside `is_excute`: typed, and still written
+        // back exactly as it was unless edited.
+        if let Some(call) = crate::data::ArticleCall::parse(line) {
+            stmts.push(AcmdStmt::Bare(Box::new(ExcuteStmt::Article(call))));
             pos += lines_consumed;
             continue;
         }
@@ -2158,6 +2166,11 @@ fn parse_excute_block_with_fear_face_guard(
                 stmts.push(ExcuteStmt::NativeCall(call));
                 continue;
             }
+        }
+        // Any other `ArticleModule` statement: typed, saved as written unless edited.
+        if let Some(call) = crate::data::ArticleCall::parse(line) {
+            stmts.push(ExcuteStmt::Article(call));
+            continue;
         }
         stmts.push(ExcuteStmt::Raw(line.to_string()));
     }
@@ -7861,7 +7874,7 @@ fn emit_attack_abs(call: &crate::data::AttackAbsCall, indent: &str) -> String {
     )
 }
 
-fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<String> {
+pub(crate) fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<String> {
     stmts
         .iter()
         .map(|s| match s {
@@ -8331,6 +8344,8 @@ fn emit_excute_stmts(stmts: &[crate::data::ExcuteStmt], indent: &str) -> Vec<Str
                 num(call.slow_mul),
                 num(call.slow_time)
             ),
+            // As written unless edited, exactly like the raw line it used to be.
+            crate::data::ExcuteStmt::Article(call) => format!("{indent}{}", call.emit()),
             crate::data::ExcuteStmt::Raw(line) => format!("{indent}{line}"),
         })
         .collect()
@@ -10464,6 +10479,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::move_nodes::test_support::assert_json_eq;
 
+    /// The text of a statement kept exactly as written: a raw line, or an `ArticleModule`
+    /// call read into [`crate::data::ArticleCall`] and not edited. Both save verbatim.
+    pub(crate) fn verbatim(command: &crate::data::ExcuteStmt) -> Option<&str> {
+        match command {
+            crate::data::ExcuteStmt::Raw(line) => Some(line),
+            crate::data::ExcuteStmt::Article(call) if !call.edited => Some(&call.source),
+            _ => None,
+        }
+    }
+
     #[test]
     fn body_visibility_new_pairs_require_unattributed_root_execute_context() {
         fn typed(stmts: &[AcmdStmt]) -> usize {
@@ -11945,12 +11970,22 @@ pub(crate) mod tests {
             Some(ExcuteStmt::ArticleLifecycle(ArticleLifecycleCall::ShootExist { symbol, target: crate::data::ArticleTarget::Last }))
                 if symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
         ));
+        // Every unmeasured spelling stays exactly as written: as a typed `Article` when the line
+        // is one whole `ArticleModule` statement, or raw when it is not (a trailing statement,
+        // a wrapping call).
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| verbatim(command).is_some())
+                .count(),
+            15
+        );
         assert_eq!(
             commands
                 .iter()
                 .filter(|command| matches!(command, ExcuteStmt::Raw(_)))
                 .count(),
-            15
+            2
         );
         for (index, enabled, article_index, receiver) in [
             (8, "true", "-1", None),
@@ -12196,10 +12231,12 @@ pub(crate) mod tests {
         };
         let assert_preserved = |source: &str| {
             let parsed = parse_expression_script(source);
+            // Not the closed timeline form; an unmeasured spelling may still be read as a
+            // verbatim `ExcuteStmt::Article`.
             assert!(
                 !serde_json::to_string(&parsed)
                     .unwrap()
-                    .contains("ChangeMotion"),
+                    .contains("ArticleLifecycle"),
                 "{source}"
             );
             assert_json_eq!(
@@ -12919,7 +12956,7 @@ pub(crate) mod tests {
             assert!(
                 matches!(
                     parsed.stmts.as_slice(),
-                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [ExcuteStmt::Raw(raw)] if raw.trim() == mutation)
+                    [AcmdStmt::Excute(commands)] if matches!(commands.as_slice(), [command] if verbatim(command).is_some_and(|raw| raw.trim() == mutation))
                 ),
                 "mutated native position became editable: {mutation}"
             );
@@ -12975,8 +13012,10 @@ pub(crate) mod tests {
                                 ExcuteStmt::ArticleLifecycle(
                                     ArticleLifecycleCall::AddMotionPartial { .. },
                                 ) => *typed += 1,
-                                ExcuteStmt::Raw(source)
-                                    if source.contains("ArticleModule::add_motion_partial(") =>
+                                command
+                                    if verbatim(command).is_some_and(|source| {
+                                        source.contains("ArticleModule::add_motion_partial(")
+                                    }) =>
                                 {
                                     *raw += 1
                                 }
@@ -12986,6 +13025,13 @@ pub(crate) mod tests {
                     }
                     AcmdStmt::Raw(source)
                         if source.contains("ArticleModule::add_motion_partial(") =>
+                    {
+                        *raw += 1
+                    }
+                    AcmdStmt::Bare(command)
+                        if verbatim(command).is_some_and(|source| {
+                            source.contains("ArticleModule::add_motion_partial(")
+                        }) =>
                     {
                         *raw += 1
                     }
@@ -13064,12 +13110,12 @@ pub(crate) mod tests {
                             symbol: shot_symbol,
                             target: ArticleTarget::All,
                         }),
-                        ExcuteStmt::Raw(raw),
+                        raw,
                     ] if symbol == "FIGHTER_ROBOT_GENERATE_ARTICLE_GYRO"
                         && shot_symbol == "FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1"
-                        && raw.contains("ArticleModule::shoot("))
+                        && verbatim(raw).is_some_and(|raw| raw.contains("ArticleModule::shoot(")))
             ),
-            "Expression ArticleModule::shoot is not an eligible operation and must remain Raw"
+            "Expression ArticleModule::shoot is not an eligible operation and must stay verbatim source"
         );
         let emitted = preview_expression_fn(&parsed, "article");
         assert!(emitted.contains(
@@ -21696,5 +21742,245 @@ mod motion_script_alias_tests {
         for line in missed.iter().take(60) {
             eprintln!("missed {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod article_call_tests {
+    use super::{emit_stmts, parse_acmd_script};
+    use crate::data::{AcmdScript, AcmdStmt, ArticleCall, ArticleOp, ArticleTarget, ExcuteStmt};
+
+    fn game(body: &[&str]) -> String {
+        let mut lines = vec![
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {",
+            "    if macros::is_excute(agent) {",
+        ];
+        lines.extend(body.iter().copied());
+        lines.extend(["    }", "}", ""]);
+        lines.join("\n")
+    }
+
+    /// One line per `ArticleOp`, each as a real moveset writes it:
+    /// - Generate: -Moveset-Wii-Sports · src/mario/acmd/tilts.rs:30
+    /// - GenerateEnable: HDR-Standalone-Movesets · vendor/hdr/fighters/koopa/src/status/special_n.rs:58
+    /// - Remove: Potemkin-SL2 · src/moveset/kamui/acmd/normals/normals.rs:110
+    /// - RemoveExist: AnuGamer-Akaza-Moveset · code/src/captain/mod.rs:2154
+    /// - Shoot: -Moveset-Wii-Sports · src/mario/acmd/tilts.rs:31
+    /// - ShootExist: Chaos-Moveset · Chaos-rs/src/gekkouga/acmd/specials.rs:10
+    /// - ChangeMotion: Cuphead-Moveset · src/buddy/acmd/wins.rs:33
+    /// - ChangeStatus: AnuGamer-Akaza-Moveset · code/src/captain/mod.rs:3738
+    /// - ChangeStatusExist: Dark-Bowser-Moveset · src/koopad/koopa/acmd/special/special_n_spit.rs:38
+    /// - SetRate: HDR-Standalone-Movesets · ports/fighters/krool/src/acmd/specials/special_n.rs:14
+    /// - SetFrame: Potemkin-SL2 · src/moveset/kamui/acmd/normals/win.rs:100
+    /// - AddMotionPartial: HDR-Standalone-Movesets · vendor/hdr/fighters/eflame/src/acmd/tilts.rs:13
+    /// - SetVisibilityWhole: -Moveset-Wii-Sports · src/mario/acmd/misc.rs:34
+    /// - SetVisibility: HDR-Standalone-Movesets · ports/fighters/pickel/src/acmd/throws.rs:18
+    /// - SetPos: Iron-Man · src/stark/status/final_proton.rs:65
+    /// - SetFlag: HDR-Standalone-Movesets · ports/fighters/pickel/src/acmd/throws.rs:48
+    /// - SetInt: Sackboy-Moveset · src/shizue/status/catch.rs:29
+    /// - SetFloat: Sackboy-Moveset · src/shizue/status/catch.rs:32
+    const CORPUS: &[(&str, ArticleOp, &str, ArticleTarget)] = &[
+        ("ArticleModule::generate_article(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, false, -1);", ArticleOp::Generate, "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", ArticleTarget::Unspecified),
+        ("ArticleModule::generate_article_enable(fighter.module_accessor, *FIGHTER_KOOPA_GENERATE_ARTICLE_BREATH, false, -1);", ArticleOp::GenerateEnable, "*FIGHTER_KOOPA_GENERATE_ARTICLE_BREATH", ArticleTarget::Unspecified),
+        ("ArticleModule::remove(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::Remove, "FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON", ArticleTarget::All),
+        ("ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_CAPTAIN_GENERATE_ARTICLE_BLUEFALCON, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::RemoveExist, "*FIGHTER_CAPTAIN_GENERATE_ARTICLE_BLUEFALCON", ArticleTarget::All),
+        ("ArticleModule::shoot(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);", ArticleOp::Shoot, "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", ArticleTarget::All),
+        ("ArticleModule::shoot_exist(agent.module_accessor, FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);", ArticleOp::ShootExist, "FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL", ArticleTarget::All),
+        ("ArticleModule::change_motion(agent.module_accessor, *FIGHTER_BUDDY_GENERATE_ARTICLE_STRINGS, Hash40::new(\"win_3_wait\"), false, -1.0);", ArticleOp::ChangeMotion, "*FIGHTER_BUDDY_GENERATE_ARTICLE_STRINGS", ArticleTarget::Unspecified),
+        ("ArticleModule::change_status(agent.module_accessor, FIGHTER_CAPTAIN_GENERATE_ARTICLE_NEEDLE, WEAPON_CAPTAIN_NEEDLE_STATUS_KIND_SPAWN, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::ChangeStatus, "FIGHTER_CAPTAIN_GENERATE_ARTICLE_NEEDLE", ArticleTarget::All),
+        ("ArticleModule::change_status_exist(agent.module_accessor, FIGHTER_KOOPA_GENERATE_ARTICLE_CANNONBALLCLONED, 0x2);", ArticleOp::ChangeStatusExist, "FIGHTER_KOOPA_GENERATE_ARTICLE_CANNONBALLCLONED", ArticleTarget::Unspecified),
+        ("ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, 1.0);", ArticleOp::SetRate, "*FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS", ArticleTarget::Unspecified),
+        ("ArticleModule::set_frame(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, 143.0);", ArticleOp::SetFrame, "FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON", ArticleTarget::Unspecified),
+        ("ArticleModule::add_motion_partial(boma, *FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD, *WEAPON_EFLAME_ESWORD_MOTION_PART_SET_KIND_OPEM_CLOSE, Hash40::new(\"to_open\"), 5.0, 5.0, false, false, 0.0, false, true, false);", ArticleOp::AddMotionPartial, "*FIGHTER_EFLAME_GENERATE_ARTICLE_ESWORD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_visibility_whole(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_DOKAN, false, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::SetVisibilityWhole, "*FIGHTER_MARIO_GENERATE_ARTICLE_DOKAN", ArticleTarget::All),
+        ("ArticleModule::set_visibility(boma, *FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD, Hash40::new(\"rod\"), Hash40::new(\"rod_cast\"), smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));", ArticleOp::SetVisibility, "*FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::All),
+        ("ArticleModule::set_pos(fighter.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME, Vector3f {x: 0.0, y: 50.0, z: 0.0});", ArticleOp::SetPos, "*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", ArticleTarget::Unspecified),
+        ("ArticleModule::set_flag(boma, *FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD, true, *WEAPON_PICKEL_FISHINGROD_INSTANCE_WORK_ID_FLAG_ENABLE_REWIND);", ArticleOp::SetFlag, "*FIGHTER_PICKEL_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_int(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, capture_id, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_INT_TARGET_OBJECT_ID);", ArticleOp::SetInt, "*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+        ("ArticleModule::set_float(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, 1.0, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_FLOAT_FLOAT_SPEED_Y);", ArticleOp::SetFloat, "*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD", ArticleTarget::Unspecified),
+    ];
+
+    #[test]
+    fn parses_every_corpus_article_fn() {
+        for (line, op, article, target) in CORPUS {
+            let call = ArticleCall::parse(line).unwrap_or_else(|| panic!("not read: {line}"));
+            assert_eq!(&call.op, op, "{line}");
+            assert_eq!(call.article, *article, "{line}");
+            assert_eq!(call.target, *target, "{line}");
+            assert_eq!(call.emit(), *line);
+        }
+        // Inside a script every one reaches the walk's article calls, whichever statement
+        // form the parser keeps it as, and none is lost or doubled.
+        let body: Vec<String> = CORPUS.iter().map(|(line, ..)| format!("        {line}")).collect();
+        let source = game(&body.iter().map(String::as_str).collect::<Vec<_>>());
+        let walked = parse_acmd_script(&source).to_article_calls();
+        let ops: Vec<_> = walked.iter().map(|(_, call)| call.op.clone()).collect();
+        let expected: Vec<_> = CORPUS.iter().map(|(_, op, ..)| op.clone()).collect();
+        assert_eq!(ops, expected);
+        for ((_, call), (line, _, article, target)) in walked.iter().zip(CORPUS) {
+            assert_eq!(call.symbol(), article.trim_start_matches('*'), "{line}");
+            assert_eq!(call.target, *target, "{line}");
+        }
+    }
+
+    #[test]
+    fn article_lua_bind_path_is_read_inside_and_outside_execute() {
+        let line = "smash::app::lua_bind::ArticleModule::set_rate(agent.module_accessor, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, 0.5);";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::SetRate);
+        let source = format!(
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {{\n    {line}\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
+        );
+        let parsed = parse_acmd_script(&source);
+        assert!(
+            matches!(parsed.stmts.first(), Some(AcmdStmt::Bare(inner))
+                if matches!(inner.as_ref(), ExcuteStmt::Article(c) if c.op == ArticleOp::SetRate)),
+            "{:#?}",
+            parsed.stmts
+        );
+        assert!(
+            matches!(parsed.stmts.get(1), Some(AcmdStmt::Excute(inner))
+                if matches!(inner.as_slice(), [ExcuteStmt::Article(_)])),
+            "{:#?}",
+            parsed.stmts
+        );
+        assert_eq!(parsed.to_article_calls().len(), 2);
+    }
+
+    #[test]
+    fn numeric_target_reads_as_all() {
+        // Springtrap-Moveset · src/springtrap/acmd/other/win_3.rs:28
+        let line = "ArticleModule::remove_exist(boma, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(0));";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.target, ArticleTarget::All);
+        assert_eq!(call.emit(), line);
+        for (written, target) in [
+            ("ArticleOperationTarget(1)", ArticleTarget::First),
+            ("ArticleOperationTarget(2)", ArticleTarget::Last),
+            ("3", ArticleTarget::Term),
+            ("ArticleOperationTarget(-1)", ArticleTarget::None),
+            ("0xFFFFFFFF", ArticleTarget::None),
+            ("*ARTICLE_OPE_TARGET_LAST", ArticleTarget::Last),
+            ("app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_FIRST)", ArticleTarget::First),
+            ("ArticleOperationTarget(*ARTICLE_OPE_TARGET_OTHER)", ArticleTarget::Unspecified),
+        ] {
+            assert_eq!(ArticleTarget::read(written), target, "{written}");
+        }
+    }
+
+    #[test]
+    fn article_edit_keeps_receiver_path_and_target_spelling() {
+        let line = "smash::app::lua_bind::ArticleModule::shoot(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(0), false);";
+        let mut call = ArticleCall::parse(line).unwrap();
+        call.target = ArticleTarget::Last;
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "smash::app::lua_bind::ArticleModule::shoot(boma, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, ArticleOperationTarget(2), false);"
+        );
+        let mut call = ArticleCall::parse(
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_ALL, false);",
+        )
+        .unwrap();
+        call.target = ArticleTarget::First;
+        call.edited = true;
+        assert_eq!(
+            call.emit(),
+            "ArticleModule::shoot(agent.module_accessor, *FIGHTER_DIDDY_GENERATE_ARTICLE_ITEM_BANANA, *ARTICLE_OPE_TARGET_FIRST, false);"
+        );
+    }
+
+    #[test]
+    fn unknown_fn_is_other_verbatim() {
+        let line = "ArticleModule::set_weight(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, 1.5, false);";
+        let call = ArticleCall::parse(line).unwrap();
+        assert_eq!(call.op, ArticleOp::Other("set_weight".into()));
+        assert_eq!(call.emit(), line);
+        let parsed = parse_acmd_script(&game(&[&format!("        {line}")]));
+        let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
+            panic!("{:#?}", parsed.stmts);
+        };
+        assert!(
+            matches!(inner.as_slice(), [ExcuteStmt::Article(c)] if c.op == ArticleOp::Other("set_weight".into())),
+            "{inner:#?}"
+        );
+        let emitted = emit_stmts(&parsed.stmts, "    ").join("\n");
+        assert!(emitted.contains(&format!("        {line}\n")), "{emitted}");
+    }
+
+    #[test]
+    fn round_trip_byte_exact() {
+        let body = [
+            "    if macros::is_excute(agent) {",
+            "        ArticleModule::set_rate(boma, *FIGHTER_KROOL_GENERATE_ARTICLE_BLUNDERBUSS, (25.0 - 1.0)/13.0);",
+            "        ArticleModule::remove_exist(boma, *FIGHTER_GANON_GENERATE_ARTICLE_SWORD, ArticleOperationTarget(0));",
+            "        smash::app::lua_bind::ArticleModule::set_frame(agent.module_accessor, FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON, 143.0);",
+            "        ArticleModule::set_int(fighter.module_accessor,*FIGHTER_SHIZUE_GENERATE_ARTICLE_FISHINGROD, capture_id, *WEAPON_SHIZUE_FISHINGROD_INSTANCE_WORK_ID_INT_TARGET_OBJECT_ID);",
+            "        ArticleModule::set_weight(agent.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, 1.5, false);",
+            "    }",
+            "    ArticleModule::shoot(agent.module_accessor, FIGHTER_CHAOS_GENERATE_ARTICLE_WATERBALL, smash::app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL), false);",
+        ];
+        let source = format!(
+            "unsafe extern \"C\" fn game_article(agent: &mut L2CAgentBase) {{\r\n{}\r\n}}\r\n",
+            body.join("\r\n")
+        );
+        let parsed = parse_acmd_script(&source);
+        assert_eq!(parsed.to_article_calls().len(), 6, "{:#?}", parsed.stmts);
+        let typed = parsed
+            .stmts
+            .iter()
+            .flat_map(|stmt| match stmt {
+                AcmdStmt::Excute(inner) => inner.iter().collect::<Vec<_>>(),
+                AcmdStmt::Bare(inner) => vec![inner.as_ref()],
+                _ => Vec::new(),
+            })
+            .filter(|stmt| matches!(stmt, ExcuteStmt::Article(_)))
+            .count();
+        assert_eq!(typed, 6, "{:#?}", parsed.stmts);
+        assert_eq!(emit_stmts(&parsed.stmts, "    ").join("\r\n"), body.join("\r\n"));
+    }
+
+    #[test]
+    fn plain_static_symbol_spawns() {
+        let parsed = parse_acmd_script(&game(&[
+            "        ArticleModule::generate_article(agent.module_accessor, FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT, false, -1);",
+        ]));
+        assert_eq!(
+            parsed.to_article_spawns(),
+            vec![(1, "FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT".to_owned(), true)]
+        );
+    }
+
+    #[test]
+    fn native_and_typed_agree() {
+        let parsed = parse_acmd_script(&game(&[
+            "        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, true, -1);",
+            "        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_GUN, Hash40::new(\"catch\"), false, -1.0);",
+        ]));
+        let AcmdStmt::Excute(inner) = &parsed.stmts[0] else {
+            panic!("{:#?}", parsed.stmts);
+        };
+        assert!(
+            inner.iter().any(|stmt| matches!(stmt, ExcuteStmt::NativeCall(_))),
+            "{inner:#?}"
+        );
+        let typed = AcmdScript {
+            stmts: vec![AcmdStmt::Excute(
+                inner
+                    .iter()
+                    .map(|stmt| match stmt {
+                        ExcuteStmt::NativeCall(call) => {
+                            ExcuteStmt::Article(ArticleCall::parse(&call.source()).unwrap())
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            )],
+            ..parsed.clone()
+        };
+        assert!(!parsed.to_article_spawns().is_empty());
+        assert_eq!(parsed.to_article_spawns(), typed.to_article_spawns());
+        assert_eq!(parsed.to_article_motions(), typed.to_article_motions());
+        assert_eq!(parsed.to_article_calls(), typed.to_article_calls());
     }
 }
