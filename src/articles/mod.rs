@@ -215,16 +215,20 @@ pub fn catalog_for(
     ArticleCatalog::build(fighter, Some(index), &clones, unresolved, fighter_dir)
 }
 
-/// The moveset's `param_config` overrides of `fighter`'s own params (article blocks included).
-pub fn param_overrides_for(index: &SourceIndex, fighter: &str) -> Vec<params::ParamOverride> {
+/// The moveset's `param_config` overrides of params in `fighter`'s own file (its weapons'
+/// blocks included), and every call in the project that could not be attributed to a fighter.
+/// `fighter_dirs` are the fighter folder names, to name a weapon kind's owner.
+pub fn param_overrides_for(
+    index: &SourceIndex,
+    fighter: &str,
+    fighter_dirs: &[String],
+) -> (Vec<params::ParamOverride>, Vec<params::UnreadOverride>) {
     let sources: Vec<(std::path::PathBuf, String)> = rust_sources(index)
         .into_iter()
         .filter(|(_, text)| text.contains("param_config"))
         .collect();
-    params::param_config_overrides(&sources)
-        .into_iter()
-        .filter(|o| o.is_for_fighter(fighter))
-        .collect()
+    let (all, unread) = params::param_config_overrides(&sources, fighter_dirs);
+    (all.into_iter().filter(|o| o.is_for_fighter(fighter)).collect(), unread)
 }
 
 /// The settings an article's status scripts write, following the project functions they call

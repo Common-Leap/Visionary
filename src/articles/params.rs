@@ -541,14 +541,19 @@ fn whole_number(field: &str, kind: &str, value: f64) -> Result<i64> {
     Ok(rounded as i64)
 }
 
-/// One `param_config::update_{int,float}{,_2}(kind, slots, (hash40("block"), hash40("field"), v))`
-/// call in a moveset's source: a value the moveset sets in code over its param files.
-/// (`lib_paramconfig`: `update_int_2(kind: i32, slots: Vec<i32>, param: (u64, u64, i32))`; the
-/// float forms take an `f32`; a common param has `0` as its second hash.)
+/// One `param_config` call in a moveset's source that sets a param over its param files:
+/// `update_{int,float}_2(kind, slots, (hash40("block"), hash40("field") | 0, value))` or
+/// `update_{int,float}(kind, slots, (hash40("block"), hash40("field") | 0), value)`
+/// (lib_paramconfig: `update_int_2(kind: i32, slots: Vec<i32>, param: (u64, u64, i32))`,
+/// `update_float(kind, slots, index: (u64, u64), value: f32)`). A common param has `0` as its
+/// second hash. A weapon's params are set through its negated kind (`-*WEAPON_KIND_MURABITO_BULLET`)
+/// and live in its owner fighter's file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamOverride {
-    /// The kind argument as written, whitespace removed (`*FIGHTER_KIND_SAMUS`, `-(*WEAPON_…)`).
+    /// The kind argument as written, whitespace removed (`*FIGHTER_KIND_SAMUS`, `-*WEAPON_…`).
     pub kind: String,
+    /// The fighter whose param file holds the block: the fighter kind's, or a weapon kind's owner.
+    pub owner: String,
     /// The first hash's text (`param_cshot`, or `weight` for a common param).
     pub block: String,
     /// The second hash's text; `None` for a common param (`0`).
@@ -560,12 +565,19 @@ pub struct ParamOverride {
 }
 
 impl ParamOverride {
-    /// Whether this sets a fighter's own param (not a weapon's) for `fighter`.
+    /// Whether this sets a param in `fighter`'s own file (a weapon of its included).
     pub fn is_for_fighter(&self, fighter: &str) -> bool {
-        let kind = self.kind.trim_start_matches('*');
-        let kind = kind.rsplit("::").next().unwrap_or(kind).trim_start_matches('*');
-        kind == format!("FIGHTER_KIND_{}", fighter.to_uppercase())
+        self.owner.eq_ignore_ascii_case(fighter)
     }
+}
+
+/// A `param_config` call Visionary could not attribute, kept with its place and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadOverride {
+    pub file: PathBuf,
+    pub line: usize,
+    pub text: String,
+    pub reason: String,
 }
 
 /// The text inside `hash40("x")` / `smash::hash40("x")` / `Hash40::new("x").hash`, or `None` for
@@ -575,6 +587,12 @@ fn hash_arg(text: &str) -> Option<String> {
     let close = text.rfind('"')?;
     (close > open && (text.contains("hash40") || text.contains("Hash40")))
         .then(|| text[open + 1..close].to_string())
+}
+
+/// `0`, `0 as u64` or `0u64`: no second hash.
+fn is_zero_hash(text: &str) -> bool {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    matches!(compact.as_str(), "0" | "0u64" | "0asu64")
 }
 
 fn number_arg(expr: &syn::Expr) -> Option<f64> {
@@ -588,11 +606,46 @@ fn number_arg(expr: &syn::Expr) -> Option<f64> {
     }
 }
 
+/// The fighter whose file a kind's params live in: `*FIGHTER_KIND_SAMUS` gives `samus`;
+/// `-*WEAPON_KIND_MURABITO_BULLET` gives `murabito`, split by the longest fighter folder name
+/// that prefixes it (as the clone reader splits kinds). `Err` says why it can't be named.
+pub fn kind_owner(kind: &str, fighter_dirs: &[String]) -> Result<String, String> {
+    let compact: String = kind.chars().filter(|c| !c.is_whitespace()).collect();
+    let negated = compact.starts_with('-');
+    let mut name: String = compact.chars().filter(|c| !matches!(c, '-' | '*' | '&' | '(' | ')')).collect();
+    for suffix in ["asi32", "asu32", "asi64"] {
+        if let Some(rest) = name.strip_suffix(suffix) {
+            name = rest.to_string();
+        }
+    }
+    let name = name.rsplit("::").next().unwrap_or(&name).to_string();
+    if let Some(fighter) = name.strip_prefix("FIGHTER_KIND_") {
+        if negated {
+            return Err(format!("`{kind}` negates a fighter kind, which names no weapon"));
+        }
+        return Ok(fighter.to_lowercase());
+    }
+    if let Some(rest) = name.strip_prefix("WEAPON_KIND_") {
+        if !negated {
+            return Err(format!("`{kind}` is a weapon kind without the `-` lib_paramconfig expects"));
+        }
+        return fighter_dirs
+            .iter()
+            .filter(|dir| !dir.is_empty() && rest.starts_with(&format!("{}_", dir.to_uppercase())))
+            .max_by_key(|dir| dir.len())
+            .cloned()
+            .ok_or_else(|| format!("no fighter folder names the owner of `{name}`"));
+    }
+    Err(format!("the kind `{kind}` isn't a fighter or weapon kind Visionary can name"))
+}
+
 struct OverrideReader<'a> {
     file: &'a Path,
     text: &'a str,
     line_starts: Vec<usize>,
+    fighter_dirs: &'a [String],
     out: Vec<ParamOverride>,
+    unread: Vec<UnreadOverride>,
 }
 
 impl OverrideReader<'_> {
@@ -607,55 +660,134 @@ impl OverrideReader<'_> {
         let (a, b) = (self.offset(span.start()), self.offset(span.end()));
         self.text.get(a..b).unwrap_or_default().to_string()
     }
+
+    fn skip(&mut self, call: &syn::ExprCall, reason: impl Into<String>) {
+        let text = self.source(call);
+        self.unread.push(UnreadOverride {
+            file: self.file.to_path_buf(),
+            line: syn::spanned::Spanned::span(call).start().line,
+            text,
+            reason: reason.into(),
+        });
+    }
 }
 
 impl<'ast> syn::visit::Visit<'ast> for OverrideReader<'_> {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = call.func.as_ref() {
-            let name = path.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
-            let is_config = path.path.segments.iter().any(|s| s.ident == "param_config");
-            if is_config && matches!(name.as_str(), "update_int" | "update_int_2" | "update_float" | "update_float_2") {
-                if let (Some(kind), Some(syn::Expr::Tuple(tuple))) = (call.args.first(), call.args.last()) {
-                    let parts: Vec<&syn::Expr> = tuple.elems.iter().collect();
-                    if let [block, field, value] = parts.as_slice() {
-                        if let (Some(block), Some(value)) = (hash_arg(&self.source(*block)), number_arg(value)) {
-                            let kind: String = self.source(kind).chars().filter(|c| !c.is_whitespace()).collect();
-                            self.out.push(ParamOverride {
-                                kind,
-                                block,
-                                field: hash_arg(&self.source(*field)),
-                                value,
-                                file: self.file.to_path_buf(),
-                                line: syn::spanned::Spanned::span(call).start().line,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        self.read(call);
         syn::visit::visit_expr_call(self, call);
     }
 }
 
-/// Every `param_config` override in `sources`. A file that never names `param_config` is not
-/// parsed.
-pub fn param_config_overrides(sources: &[(PathBuf, String)]) -> Vec<ParamOverride> {
+impl OverrideReader<'_> {
+    fn read(&mut self, call: &syn::ExprCall) {
+        let syn::Expr::Path(path) = call.func.as_ref() else {
+            return;
+        };
+        if !path.path.segments.iter().any(|s| s.ident == "param_config") {
+            return;
+        }
+        let name = path.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        if !name.starts_with("update_") {
+            return;
+        }
+        if name.contains("_mul") {
+            self.skip(call, "it multiplies the value instead of setting it, which the card doesn't show");
+            return;
+        }
+        let paired = match name.as_str() {
+            "update_int_2" | "update_float_2" => false,
+            "update_int" | "update_float" => true,
+            _ => {
+                self.skip(call, format!("`param_config::{name}` is not a call Visionary reads"));
+                return;
+            }
+        };
+        let args: Vec<&syn::Expr> = call.args.iter().collect();
+        // (kind, slots, (h1, h2, value)) or (kind, slots, (h1, h2), value)
+        let (kind, index, value) = match (paired, args.as_slice()) {
+            (false, [kind, _, syn::Expr::Tuple(t)]) if t.elems.len() == 3 => {
+                let e: Vec<&syn::Expr> = t.elems.iter().collect();
+                (*kind, (e[0], e[1]), e[2])
+            }
+            (true, [kind, _, syn::Expr::Tuple(t), value]) if t.elems.len() == 2 => {
+                let e: Vec<&syn::Expr> = t.elems.iter().collect();
+                (*kind, (e[0], e[1]), *value)
+            }
+            _ => {
+                self.skip(call, "its param index is a variable or not a literal tuple, so Visionary can't tell which param it sets");
+                return;
+            }
+        };
+        let kind_text: String = self.source(kind).chars().filter(|c| !c.is_whitespace()).collect();
+        let owner = match kind_owner(&kind_text, self.fighter_dirs) {
+            Ok(owner) => owner,
+            Err(reason) => {
+                self.skip(call, reason);
+                return;
+            }
+        };
+        let block = hash_arg(&self.source(index.0));
+        let second = self.source(index.1);
+        let field = hash_arg(&second);
+        let (Some(block), Some(value)) = (block, number_arg(value)) else {
+            self.skip(call, "its param name or value is not a literal");
+            return;
+        };
+        if field.is_none() && !is_zero_hash(&second) {
+            self.skip(call, "its second hash is not a literal");
+            return;
+        }
+        self.out.push(ParamOverride {
+            kind: kind_text,
+            owner,
+            block,
+            field,
+            value,
+            file: self.file.to_path_buf(),
+            line: syn::spanned::Spanned::span(call).start().line,
+        });
+    }
+}
+
+/// Every `param_config` override in `sources`, and the calls that could not be attributed.
+/// `fighter_dirs` are the fighter folder names, to name a weapon kind's owner. A file that never
+/// names `param_config` is not parsed.
+pub fn param_config_overrides(
+    sources: &[(PathBuf, String)],
+    fighter_dirs: &[String],
+) -> (Vec<ParamOverride>, Vec<UnreadOverride>) {
     let mut out = Vec::new();
+    let mut unread = Vec::new();
     for (file, text) in sources {
         if !text.contains("param_config") {
             continue;
         }
         let Ok(ast) = syn::parse_file(text) else {
+            unread.push(UnreadOverride {
+                file: file.clone(),
+                line: 1,
+                text: String::new(),
+                reason: "the file doesn't parse as Rust, so its param_config calls weren't read".into(),
+            });
             continue;
         };
         let line_starts = std::iter::once(0)
             .chain(text.match_indices('\n').map(|(i, _)| i + 1))
             .collect();
-        let mut reader = OverrideReader { file, text, line_starts, out: Vec::new() };
+        let mut reader = OverrideReader {
+            file,
+            text,
+            line_starts,
+            fighter_dirs,
+            out: Vec::new(),
+            unread: Vec::new(),
+        };
         syn::visit::Visit::visit_file(&mut reader, &ast);
         out.extend(reader.out);
+        unread.extend(reader.unread);
     }
-    out
+    (out, unread)
 }
 
 /// The overrides for `fighter`'s `param_<name>` block, as [`param_block`] takes them.
@@ -964,26 +1096,53 @@ mod tests {
     /// Latios's shape: `update_int_2(*FIGHTER_KIND_SAMUS, slots, (hash40("param_cshot"), hash40("life"), 60))`.
     #[test]
     fn reads_param_config_overrides() {
-        let text = "fn f(marked_slots: Vec<i32>) {
-    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(),(smash::hash40(\"air_lasso_type\"), 0, 0));
-    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));
-    param_config::update_float_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"speed\"), -1.5));
-    param_config::update_int_2(-(*WEAPON_KIND_SAMUS_CSHOT), marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"angle\"), 0));
-}
-";
-        let found = param_config_overrides(&[(PathBuf::from("lib.rs"), text.to_string())]);
-        assert_eq!(found.len(), 4, "{found:#?}");
+        let dirs: Vec<String> = ["samus", "murabito", "pacman"].map(String::from).to_vec();
+        // Latios's shape: fighter kind, 3-tuple.
+        let latios = "fn f(marked_slots: Vec<i32>) {\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(),(smash::hash40(\"air_lasso_type\"), 0, 0));\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));\n    param_config::update_float_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"speed\"), -1.5));\n}\n";
+        let (found, unread) = param_config_overrides(&[(PathBuf::from("lib.rs"), latios.to_string())], &dirs);
+        assert!(unread.is_empty(), "{unread:#?}");
+        assert_eq!(found.len(), 3, "{found:#?}");
         assert_eq!(found[0].field, None);
-        assert_eq!(found[1].block, "param_cshot");
-        assert_eq!(found[1].field.as_deref(), Some("life"));
-        assert_eq!(found[1].value, 60.0);
-        assert_eq!(found[1].line, 3);
+        assert_eq!((found[1].block.as_str(), found[1].field.as_deref(), found[1].value, found[1].line), ("param_cshot", Some("life"), 60.0, 3));
         assert_eq!(found[2].value, -1.5);
-        assert!(found[1].is_for_fighter("samus"));
-        assert!(!found[3].is_for_fighter("samus"), "a weapon kind is not the fighter's");
+        assert!(found.iter().all(|o| o.is_for_fighter("samus")));
         assert_eq!(
             block_overrides(&found, "samus", "param_cshot"),
             [("param_cshot".to_string(), "life".to_string(), 60.0), ("param_cshot".to_string(), "speed".to_string(), -1.5)]
         );
+    }
+
+    /// Toad (plugin/src/toad/params.rs): a negated weapon kind sets that weapon's block in its
+    /// owner fighter's file.
+    #[test]
+    fn negated_weapon_kind_goes_to_its_owner() {
+        let dirs: Vec<String> = ["murabito", "mario"].map(String::from).to_vec();
+        let toad = "pub(crate) fn configure_params(slots: Vec<i32>) {\n    param_config::update_float_2(*FIGHTER_KIND_MURABITO, slots.clone(), (smash::hash40(\"weight\"), 0, 92.0));\n    param_config::update_int_2(-*WEAPON_KIND_MURABITO_BULLET, slots.clone(), (smash::hash40(\"param_bullet\"), smash::hash40(\"life\"), 21));\n    param_config::update_float_2(-*WEAPON_KIND_MURABITO_BULLET, slots.clone(), (smash::hash40(\"param_bullet\"), smash::hash40(\"gravity\"), -0.1));\n    param_config::update_int_2(-*WEAPON_KIND_MURABITO_BOWLING_BALL, slots.clone(), (smash::hash40(\"param_bowlingball\"), smash::hash40(\"is_penetration\"), 0));\n}\n";
+        let (found, unread) = param_config_overrides(&[(PathBuf::from("params.rs"), toad.to_string())], &dirs);
+        assert!(unread.is_empty(), "{unread:#?}");
+        assert!(found.iter().all(|o| o.owner == "murabito"), "{found:#?}");
+        assert_eq!(
+            block_overrides(&found, "murabito", "param_bullet"),
+            [("param_bullet".to_string(), "life".to_string(), 21.0), ("param_bullet".to_string(), "gravity".to_string(), -0.1)]
+        );
+        assert_eq!(kind_owner("-(*WEAPON_KIND_MURABITO_BULLET)", &dirs).unwrap(), "murabito");
+        assert!(kind_owner("*WEAPON_KIND_MURABITO_BULLET", &dirs).is_err());
+    }
+
+    /// The non-`_2` form (`update_int(kind, slots, (h1, h2), value)`, as Shy Guy's tether.rs
+    /// writes it) is read; a variable kind or index is reported with its line, not dropped.
+    #[test]
+    fn four_argument_form_and_unattributed_calls() {
+        let dirs: Vec<String> = ["pacman"].map(String::from).to_vec();
+        let text = "fn apply(kind: i32, slots: Vec<i32>, index: (u64, u64)) {\n    param_config::update_int(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"air_lasso_type\"), 0), 1);\n    param_config::update_float(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"air_lasso_data\"), hash40(\"lasso_speed\")), 2.5);\n    param_config::update_int(kind, slots.clone(), (hash40(\"air_lasso_type\"), 0), 1);\n    param_config::update_float(*FIGHTER_KIND_PACMAN, slots.clone(), index, 1.0);\n    param_config::update_int_mul_2(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"jump_y\"), 0, 1.5));\n}\n";
+        let (found, unread) = param_config_overrides(&[(PathBuf::from("tether.rs"), text.to_string())], &dirs);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        assert_eq!((found[0].block.as_str(), found[0].field.as_deref(), found[0].value), ("air_lasso_type", None, 1.0));
+        assert_eq!((found[1].block.as_str(), found[1].field.as_deref(), found[1].value), ("air_lasso_data", Some("lasso_speed"), 2.5));
+        let lines: Vec<usize> = unread.iter().map(|u| u.line).collect();
+        assert_eq!(lines, [4, 5, 6], "{unread:#?}");
+        assert!(unread[0].reason.contains("`kind`"), "{}", unread[0].reason);
+        assert!(unread[1].reason.contains("variable"), "{}", unread[1].reason);
+        assert!(unread[2].reason.contains("multiplies"), "{}", unread[2].reason);
     }
 }

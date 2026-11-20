@@ -336,6 +336,8 @@ pub struct SettingContext<'a> {
     pub block_name: Option<&'a str>,
     /// The other blocks the settings read, by full name.
     pub other_blocks: Option<&'a HashMap<String, ParamBlock>>,
+    /// The list entry each other block shows and edits (0 when absent).
+    pub other_variants: Option<&'a HashMap<String, usize>>,
     /// The moveset's `param_config` overrides for the owner fighter: a value they set shows with
     /// the call's place and is not edited here.
     pub overrides: &'a [ParamOverride],
@@ -493,7 +495,8 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
                             editable: false,
                         };
                     };
-                    let fields = params.variants.get(cx.variant).unwrap_or(&params.fields);
+                    let variant = setting_variant(setting, cx.block_name, cx.variant, cx.other_variants);
+                    let fields = params.variants.get(variant).unwrap_or(&params.fields);
                     if !params.present {
                         return SettingRow {
                             label,
@@ -532,6 +535,22 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
             }
         })
         .collect()
+}
+
+/// The list entry a setting is shown from and saved to: the card's own block's `own_variant`, or
+/// the variant chosen for the other block it reads (0 when none is chosen).
+pub fn setting_variant(
+    setting: &Setting,
+    own_block: Option<&str>,
+    own_variant: usize,
+    other_variants: Option<&HashMap<String, usize>>,
+) -> usize {
+    match &setting.value {
+        SettingValue::Param { block, .. } if own_block.is_some_and(|own| own != block) => {
+            other_variants.and_then(|m| m.get(block)).copied().unwrap_or(0)
+        }
+        _ => own_variant,
+    }
 }
 
 /// The fields of a param block nothing in the status code reads, so the card still shows them.
@@ -881,7 +900,7 @@ mod tests {
             }
         }
         // `lib.rs:158-161` set four `param_cshot` fields through `param_config`.
-        let overrides = crate::articles::param_overrides_for(&index, "samus");
+        let (overrides, _) = crate::articles::param_overrides_for(&index, "samus", &names);
         let cshot: Vec<(String, f64, usize)> = overrides
             .iter()
             .filter(|o| o.block == "param_cshot")
@@ -936,7 +955,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("src/lib.rs");
         let text = "fn f(s: Vec<i32>) {\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, s.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));\n}\n";
-        let overrides = param_config_overrides(&[(lib, text.to_string())]);
+        let (overrides, _) = param_config_overrides(&[(lib, text.to_string())], &["samus".to_string()]);
         let mut block = ParamBlock { present: true, ..Default::default() };
         // `param_block` gives an override an empty path.
         block.fields.insert("life".into(), (ParamValue::Int(60), PathBuf::new()));
@@ -970,5 +989,51 @@ mod tests {
         assert_eq!(rows[0].scripts, ["fly"]);
         assert_eq!(rows[0].game_scripts, ["fly_throw_b"]);
         assert!(rows[1].game_scripts.is_empty(), "a clone has no game scripts");
+    }
+
+    /// A setting that reads another list block is shown from, and saved to, that block's own
+    /// chosen entry, not the object block's.
+    #[test]
+    fn other_block_variant_is_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("fighter/samus/param/vl.prcxml");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let before = "<struct>\n<list hash=\"param_special_n\">\n<struct index=\"0\"><float hash=\"speed\">1</float></struct>\n<struct index=\"1\"><float hash=\"speed\">2</float></struct>\n<struct index=\"2\"><float hash=\"speed\">3</float></struct>\n</list>\n</struct>\n";
+        std::fs::write(&file, before).unwrap();
+        let s = setting(
+            SettingValue::Param { block: "param_special_n".into(), field: "speed".into() },
+            PathBuf::from("f.rs"),
+            0..1,
+        );
+        let chosen = HashMap::from([("param_special_n".to_string(), 2usize)]);
+        // The object's own block is on entry 1; the other block's choice (2) wins for this row.
+        let variant = setting_variant(&s, Some("param_lativolt"), 1, Some(&chosen));
+        assert_eq!(variant, 2);
+        let own_row = Setting { value: SettingValue::Param { block: "param_lativolt".into(), field: "x".into() }, ..s.clone() };
+        assert_eq!(setting_variant(&own_row, Some("param_lativolt"), 1, Some(&chosen)), 1);
+
+        let plan = crate::articles::settings::plan_setting_write(&s, 9.0, variant, std::slice::from_ref(&file)).unwrap();
+        let crate::articles::settings::SettingWrite::Param { file: to, block, field, variant: v } = plan else {
+            panic!("not a param write: {plan:?}");
+        };
+        assert_eq!(v, 2);
+        crate::articles::params::write_param_field(&to, &block, &field, v, 9.0, &HashMap::new()).unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(after, before.replace("<float hash=\"speed\">3</float>", "<float hash=\"speed\">9</float>"));
+
+        // And the row reads entry 2 of the other block.
+        let others = HashMap::from([(
+            "param_special_n".to_string(),
+            crate::articles::params::param_block(&[file], &[], "special_n", &HashMap::new()),
+        )]);
+        let cx = SettingContext {
+            block_name: Some("param_lativolt"),
+            variant: 1,
+            other_blocks: Some(&others),
+            other_variants: Some(&chosen),
+            ..Default::default()
+        };
+        let rows = setting_rows_in(&[s], &ParamBlock::default(), cx);
+        assert_eq!(rows[0].value, "9");
     }
 }

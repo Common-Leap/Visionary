@@ -664,6 +664,8 @@ struct ArticleSettingsCard {
     block: crate::articles::params::ParamBlock,
     /// Other blocks the settings read (`param_special_n`), by full name.
     other_blocks: HashMap<String, crate::articles::params::ParamBlock>,
+    /// The list entry each other block shows and saves to (0 unless picked).
+    other_variants: HashMap<String, usize>,
     /// The moveset's own param files for the object's owner: the only files a save may change.
     own: Vec<PathBuf>,
 }
@@ -681,6 +683,8 @@ struct ArticleCache {
     unresolved_statuses: Vec<crate::acmd_src::UnresolvedStatus>,
     /// The moveset's `param_config` overrides for this fighter.
     overrides: Vec<crate::articles::params::ParamOverride>,
+    /// `param_config` calls the reader could not attribute to a fighter, shown under "Not read".
+    unread_overrides: Vec<crate::articles::params::UnreadOverride>,
     /// The game's own script names (Pascal case) per object agent; filled in after the catalog,
     /// since listing them may need the network.
     dump_scripts: HashMap<String, Vec<String>>,
@@ -692,6 +696,59 @@ struct ArticleCache {
 enum ArticleJobResult {
     Cache(ArticleCache),
     Dump(HashMap<String, Vec<String>>, Option<String>),
+    /// The read stopped (it panicked); the reason is shown instead of retrying every frame.
+    Failed(String),
+}
+
+/// Where the user was going when an object script with unsynced changes was open.
+enum PendingLeave {
+    Script(Option<String>, MoveEntry),
+    Fighter(usize),
+}
+
+/// What the user chose in the unsynced-changes prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveChoice {
+    SyncNow,
+    Discard,
+    Stay,
+}
+
+/// Whether leaving the open move needs the unsynced-changes prompt: only an object's script with
+/// edits since it was loaded or last synced, since its edits are kept nowhere else (they are not
+/// in the edit log or the project).
+fn object_leave_needs_prompt(open_article: Option<&str>, edited_since_sync: bool) -> bool {
+    open_article.is_some() && edited_since_sync
+}
+
+/// Whether the navigation goes ahead after `choice`: a sync only when it wrote everything.
+fn object_leave_goes_ahead(choice: LeaveChoice, sync_clean: bool) -> bool {
+    match choice {
+        LeaveChoice::SyncNow => sync_clean,
+        LeaveChoice::Discard => true,
+        LeaveChoice::Stay => false,
+    }
+}
+
+#[cfg(test)]
+mod object_leave_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_edited_object_script_prompts() {
+        assert!(object_leave_needs_prompt(Some("samus_lativolt"), true));
+        assert!(!object_leave_needs_prompt(Some("samus_lativolt"), false));
+        // A fighter move's edits are already in the edit log, so leaving it never prompts.
+        assert!(!object_leave_needs_prompt(None, true));
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_the_user_on_the_script() {
+        assert!(object_leave_goes_ahead(LeaveChoice::SyncNow, true));
+        assert!(!object_leave_goes_ahead(LeaveChoice::SyncNow, false));
+        assert!(object_leave_goes_ahead(LeaveChoice::Discard, false));
+        assert!(!object_leave_goes_ahead(LeaveChoice::Stay, true));
+    }
 }
 
 /// The files and modification times an object catalog was read from (`None` index: none).
@@ -4241,6 +4298,19 @@ pub struct VisionaryApp {
     opened_object_agents: BTreeSet<String>,
     /// Object-call argument text being typed on the timeline, by (statement, argument).
     article_arg_edits: HashMap<(usize, usize), String>,
+    /// A background catalog read that stopped: (fighter, generation, reason). Not retried until
+    /// the fighter or the source changes.
+    article_catalog_failed: Option<(String, u64, String)>,
+    /// A fingerprint of the open object script's editable state when it loaded or was last synced.
+    object_baseline: Option<u64>,
+    /// The navigation waiting on the unsynced-changes prompt, and its last message.
+    pending_leave: Option<(PendingLeave, Option<String>)>,
+    /// Set for one navigation the prompt already approved.
+    leave_confirmed: bool,
+    /// Whether the last source sync ran and wrote everything it meant to.
+    last_sync_clean: bool,
+    /// Whether the open object script is defined in the linked source (so a sync saves it).
+    open_article_in_source: bool,
     /// The Settings card window for one object, when open.
     article_settings: Option<ArticleSettingsCard>,
     /// The fighters `acmd_src` installs only on chosen costume slots, refreshed with
@@ -4738,6 +4808,12 @@ impl VisionaryApp {
             open_article: None,
             opened_object_agents: BTreeSet::new(),
             article_arg_edits: HashMap::new(),
+            article_catalog_failed: None,
+            object_baseline: None,
+            pending_leave: None,
+            leave_confirmed: false,
+            last_sync_clean: false,
+            open_article_in_source: false,
             article_settings: None,
             acmd_src_costume_gated: BTreeSet::new(),
             edited_fighters: BTreeSet::new(),
@@ -5515,6 +5591,13 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
+        if !std::mem::take(&mut self.leave_confirmed)
+            && object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            self.pending_leave = Some((PendingLeave::Fighter(idx), None));
+            return;
+        }
+        self.object_baseline = None;
         // A click is an explicit navigation decision, so it supersedes a project-resume move
         // that may still be waiting for this fighter's background motion scan.
         self.pending_project_move_selection = None;
@@ -5849,6 +5932,13 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
+        if !std::mem::take(&mut self.leave_confirmed)
+            && object_leave_needs_prompt(self.open_article.as_deref(), self.object_script_dirty())
+        {
+            self.pending_leave = Some((PendingLeave::Script(article, move_entry), None));
+            return;
+        }
+        self.object_baseline = None;
         // Panel edits are keyed at the end of the frame, but a click can navigate before that
         // pass runs. Commit explicitly at the navigation boundary so leaving a move cannot lose
         // the last drag or source-point edit.
@@ -6033,6 +6123,7 @@ impl VisionaryApp {
             .acmd_src
             .as_ref()
             .and_then(|index| index.script_source(&fighter_name, &move_name));
+        self.open_article_in_source = self.open_article.is_some() && project.is_some();
         // A linked source that has nothing for this move is why vanilla shows; say so, or a
         // modded fighter reading as vanilla looks like the link silently failed.
         if project.is_none() {
@@ -6099,12 +6190,23 @@ impl VisionaryApp {
         std::thread::spawn(move || {
             let body = match &object {
                 Some((_, true)) => Ok(String::new()),
-                Some((owner, false)) => Ok(crate::acmd::fetch_object_script(
-                    owner,
-                    &fighter_name,
-                    &crate::acmd::move_name_to_pascal(&move_name),
-                )
-                .unwrap_or_default()),
+                Some((owner, false)) => {
+                    let script = crate::acmd::move_name_to_pascal(&move_name);
+                    match crate::acmd::fetch_object_script(owner, &fighter_name, &script) {
+                        Some(body) => Ok(body),
+                        // A missing script is cached as an empty file; no file means the fetch
+                        // itself failed.
+                        None if crate::scratch_dirs::app_storage_root()
+                            .join("script-cache")
+                            .join(&fighter_name)
+                            .join(format!("{script}.txt"))
+                            .exists() =>
+                        {
+                            Ok(String::new())
+                        }
+                        None => Err("Couldn't fetch the game's script (offline?)".to_string()),
+                    }
+                }
                 None => crate::acmd::fetch_script_body_cached(&fighter_name, &move_name)
                     .map_err(|e| e.to_string()),
             };
@@ -7121,6 +7223,10 @@ impl VisionaryApp {
     /// person editing Empoleon, who reads it as the sync having gone to vanilla Falco.
     fn sync_edits_to_source(&mut self) {
         self.sync_edits_to_source_for_row();
+        // An object script synced cleanly has nothing left to lose on leaving it.
+        if self.open_article.is_some() && self.last_sync_clean {
+            self.object_baseline = Some(self.object_edit_fingerprint());
+        }
         let row = self
             .state
             .selected_fighter
@@ -7135,6 +7241,7 @@ impl VisionaryApp {
     }
 
     fn sync_edits_to_source_for_row(&mut self) {
+        self.last_sync_clean = false;
         if self.acmd_src.is_none() {
             return;
         }
@@ -7564,6 +7671,7 @@ impl VisionaryApp {
             }
             self.refresh_source_buffer_after_sync(&fighter, &move_name, &mut notes);
         }
+        self.last_sync_clean = ran && notes.is_empty();
         self.state.status =
             source_sync_status(&fighter, &move_name, ran, changed, files.len(), &notes);
     }
@@ -7977,7 +8085,9 @@ impl VisionaryApp {
                     .selected_fighter
                     .and_then(|i| self.state.fighters.get(i))
                     .is_some_and(|f| f.is_modded());
-                self.acmd_error = Some(if modded {
+                self.acmd_error = Some(if self.open_article.is_some() {
+                    e.to_string()
+                } else if modded {
                     format!(
                         "'{fighter_name}' is a modded character — the online script archive \
                          only covers the vanilla roster. Use live capture (play the move in \
@@ -12706,7 +12816,13 @@ impl VisionaryApp {
             // Graphs, the edit log and the export are all keyed by fighter; an object's script
             // saved there would land on the fighter's move of the same name.
             ui.weak(format!(
-                "{agent} is an object's script. Move nodes don't edit object scripts yet — use the                  Classic editor and sync the change into the linked source."
+                "{agent} is an object's script, and Move nodes don't edit object scripts yet. {}",
+                if self.open_article_in_source {
+                    "Edit it in the Classic editor; syncing saves its changes into the linked source."
+                } else {
+                    "Changes to this script can't be saved yet: it's the game's own script and the \
+                     moveset doesn't define it."
+                }
             ));
             return;
         }
@@ -20028,9 +20144,21 @@ impl VisionaryApp {
                             cache.dump_note = note;
                         }
                     }
+                    Ok(ArticleJobResult::Failed(reason)) => {
+                        self.article_catalog_failed = Some((job_fighter.clone(), job_generation, reason));
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         keep = false;
+                        let delivered = self.article_catalog_generation == job_generation
+                            && self.article_catalog.as_ref().is_some_and(|c| c.fighter == job_fighter);
+                        if !delivered && self.article_catalog_failed.is_none() {
+                            self.article_catalog_failed = Some((
+                                job_fighter.clone(),
+                                job_generation,
+                                "the reader stopped before it finished".into(),
+                            ));
+                        }
                         break;
                     }
                 }
@@ -20042,6 +20170,13 @@ impl VisionaryApp {
         let generation = self.acmd_src_generation;
         let have = self.article_catalog.as_ref().is_some_and(|c| c.fighter == fighter);
         if have && self.article_catalog_generation == generation {
+            return;
+        }
+        if self
+            .article_catalog_failed
+            .as_ref()
+            .is_some_and(|(f, g, _)| *f == fighter && *g == generation)
+        {
             return;
         }
         if self
@@ -20072,9 +20207,10 @@ impl VisionaryApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = self.egui_ctx.clone();
         let job_fighter = fighter.clone();
+        self.article_catalog_failed = None;
         std::thread::spawn(move || {
             let fighter = job_fighter;
-            let (catalog, status_rows, unresolved_statuses, overrides) = match index.as_ref() {
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match index.as_ref() {
                 Some(index) => {
                     let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
                     let bodies = index.status_bodies(&fighter);
@@ -20088,15 +20224,30 @@ impl VisionaryApp {
                         .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
                         .cloned()
                         .collect();
-                    let overrides = crate::articles::param_overrides_for(index, &fighter);
-                    (catalog, rows, unresolved, overrides)
+                    let (overrides, unread_overrides) =
+                        crate::articles::param_overrides_for(index, &fighter, &names);
+                    (catalog, rows, unresolved, overrides, unread_overrides)
                 }
                 None => (
                     crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
+            }));
+            let (catalog, status_rows, unresolved_statuses, overrides, unread_overrides) = match read {
+                Ok(read) => read,
+                Err(panic) => {
+                    let reason = panic
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "the reader stopped unexpectedly".into());
+                    let _ = tx.send(ArticleJobResult::Failed(reason));
+                    ctx.request_repaint();
+                    return;
+                }
             };
             let agents: Vec<(String, String)> = catalog
                 .articles
@@ -20111,6 +20262,7 @@ impl VisionaryApp {
                 status_rows,
                 unresolved_statuses,
                 overrides,
+                unread_overrides,
                 dump_scripts: HashMap::new(),
                 dump_note: None,
             }));
@@ -20169,6 +20321,7 @@ impl VisionaryApp {
             settings: Vec::new(),
             block: Default::default(),
             other_blocks: HashMap::new(),
+            other_variants: HashMap::new(),
             own: Vec::new(),
         };
         self.reload_article_settings(&mut card);
@@ -20228,12 +20381,19 @@ impl VisionaryApp {
     }
 
     /// Save one Settings card value, through the setting writer: only the moveset's own files.
-    fn save_article_setting(&mut self, card: &mut ArticleSettingsCard, setting: &crate::articles::settings::Setting, text: &str) {
+    /// `variant` is the list entry of the block the setting reads (see `view::setting_variant`).
+    fn save_article_setting(
+        &mut self,
+        card: &mut ArticleSettingsCard,
+        setting: &crate::articles::settings::Setting,
+        text: &str,
+        variant: usize,
+    ) {
         let Ok(value) = text.trim().parse::<f64>() else {
             card.message = Some(format!("`{}` is not a number", text.trim()));
             return;
         };
-        let plan = crate::articles::settings::plan_setting_write(setting, value, card.variant, &card.own);
+        let plan = crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
         let result: anyhow::Result<String> = match plan {
             Err(error) => Err(error),
             Ok(crate::articles::settings::SettingWrite::Source { file, text }) => std::fs::write(&file, text)
@@ -20276,7 +20436,19 @@ impl VisionaryApp {
     fn draw_objects_list(&mut self, ui: &mut Ui, max_height: f32) {
         self.ensure_article_catalog();
         let Some(cache) = self.article_catalog.as_ref() else {
-            if self.article_catalog_job.is_some() {
+            let fighter = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone())
+                .unwrap_or_default();
+            if let Some((_, _, reason)) = self.article_catalog_failed.as_ref().filter(|(f, _, _)| *f == fighter) {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 170, 90),
+                    format!("Visionary couldn't read this fighter's objects: {reason}"),
+                );
+            } else if self.article_catalog_job.is_some() {
                 ui.separator();
                 ui.weak("Reading this fighter's objects…");
             }
@@ -20287,6 +20459,7 @@ impl VisionaryApp {
         let agents: Vec<String> = cache.catalog.articles.iter().map(|a| a.agent.clone()).collect();
         let unresolved_clones = cache.catalog.unresolved_clones.clone();
         let unresolved_statuses = cache.unresolved_statuses.clone();
+        let unread_overrides = cache.unread_overrides.clone();
         let root = self.acmd_src.as_ref().map(|index| index.root.clone());
         ui.separator();
         sidebar_section_heading(
@@ -20297,9 +20470,16 @@ impl VisionaryApp {
         if let Some(agent) = &self.open_article {
             ui.colored_label(
                 egui::Color32::from_rgb(235, 170, 90),
-                RichText::new(format!(
-                    "{agent} is open: its changes are saved by syncing them into the linked source.                      They are not kept in the project or exported yet."
-                ))
+                RichText::new(if self.open_article_in_source && self.acmd_src.is_some() {
+                    format!(
+                        "{agent} is open. Syncing saves its changes into the linked source; they \
+                         are not kept in the project or exported yet."
+                    )
+                } else {
+                    "Changes to this script can't be saved yet: it's the game's own script and the \
+                     moveset doesn't define it."
+                        .to_string()
+                })
                 .small(),
             );
         }
@@ -20368,10 +20548,10 @@ impl VisionaryApp {
                             }
                         });
                 }
-                if !unresolved_clones.is_empty() || !unresolved_statuses.is_empty() {
+                if !unresolved_clones.is_empty() || !unresolved_statuses.is_empty() || !unread_overrides.is_empty() {
                     egui::CollapsingHeader::new(format!(
                         "Not read ({})",
-                        unresolved_clones.len() + unresolved_statuses.len()
+                        unresolved_clones.len() + unresolved_statuses.len() + unread_overrides.len()
                     ))
                     .id_salt("objects_unread")
                     .default_open(true)
@@ -20389,6 +20569,19 @@ impl VisionaryApp {
                                 .small(),
                             )
                             .on_hover_text(&clone.text);
+                        }
+                        for call in &unread_overrides {
+                            ui.colored_label(
+                                warn,
+                                RichText::new(format!(
+                                    "A param_config call at {}:{} isn't read: {}",
+                                    short(&call.file),
+                                    call.line,
+                                    call.reason
+                                ))
+                                .small(),
+                            )
+                            .on_hover_text(&call.text);
                         }
                         for status in &unresolved_statuses {
                             ui.colored_label(
@@ -20427,8 +20620,24 @@ impl VisionaryApp {
             .and_then(|cache| cache.catalog.get(&card.agent))
             .cloned()
         else {
-            // Still being read (or re-read): keep the card for the next frame.
-            self.article_settings = Some(card);
+            let fighter_now = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .map(|f| f.name.clone());
+            let current = self.article_catalog_job.is_none()
+                && self.article_catalog_generation == self.acmd_src_generation
+                && self
+                    .article_catalog
+                    .as_ref()
+                    .is_some_and(|c| Some(&c.fighter) == fighter_now.as_ref());
+            if current {
+                // The source no longer has this object: the card has nothing left to show.
+                self.state.status = format!("{} is no longer one of this fighter's objects", card.agent);
+            } else {
+                // Still being read (or re-read): keep the card for the next frame.
+                self.article_settings = Some(card);
+            }
             return;
         };
         let overrides: Vec<crate::articles::params::ParamOverride> = self
@@ -20480,12 +20689,39 @@ impl VisionaryApp {
                 for (path, reason) in &card.block.skipped {
                     ui.label(RichText::new(format!("Not read: {path} — {reason}")).small().weak());
                 }
+                // Each other list block a setting reads has its own entry picker.
+                let mut others: Vec<(&String, usize)> = card
+                    .other_blocks
+                    .iter()
+                    .map(|(name, block)| (name, block.variants.len()))
+                    .filter(|(_, n)| *n > 1)
+                    .collect();
+                others.sort();
+                for (name, count) in others {
+                    let current = card.other_variants.get(name).copied().unwrap_or(0);
+                    let mut picked = current;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name.as_str()).small());
+                        egui::ComboBox::from_id_salt(("article_other_variant", card.agent.as_str(), name.as_str()))
+                            .selected_text(format!("variant {current} of {count}"))
+                            .show_ui(ui, |ui| {
+                                for v in 0..count {
+                                    ui.selectable_value(&mut picked, v, format!("variant {v}"));
+                                }
+                            });
+                    });
+                    if picked != current {
+                        card.other_variants.insert(name.clone(), picked);
+                        card.edits.clear();
+                    }
+                }
                 let cx = crate::articles::view::SettingContext {
                     variant: card.variant,
                     consts: consts.as_deref(),
                     root: root.as_deref(),
                     block_name: Some(&block_name),
                     other_blocks: Some(&card.other_blocks),
+                    other_variants: Some(&card.other_variants),
                     overrides: &overrides,
                 };
                 let rows = crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
@@ -20555,7 +20791,13 @@ impl VisionaryApp {
                 }
             });
         if let Some((setting, text)) = save {
-            self.save_article_setting(&mut card, &setting, &text);
+            let variant = crate::articles::view::setting_variant(
+                &setting,
+                Some(&block_name),
+                card.variant,
+                Some(&card.other_variants),
+            );
+            self.save_article_setting(&mut card, &setting, &text, variant);
         }
         if let Some(path) = reveal {
             if let Err(error) = crate::roster::reveal::reveal(&path) {
@@ -20701,6 +20943,111 @@ impl VisionaryApp {
                 self.state.status = format!("Could not open {}: {error:#}", path.display());
             }
         }
+    }
+
+    /// A fingerprint of everything an edit to the open script can change.
+    fn object_edit_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            self.state.hitboxes,
+            self.state.script,
+            self.state.sound_script,
+            self.state.sounds,
+            self.state.expression_script,
+            self.state.expressions,
+            self.state.effects,
+        )
+        .hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Whether the open object script changed since it loaded or was last synced.
+    fn object_script_dirty(&self) -> bool {
+        self.open_article.is_some()
+            && self
+                .object_baseline
+                .is_some_and(|baseline| baseline != self.object_edit_fingerprint())
+    }
+
+    /// Take the open object script's baseline once its load has finished.
+    fn settle_object_baseline(&mut self) {
+        if self.open_article.is_some()
+            && self.object_baseline.is_none()
+            && !self.fetching_acmd
+            && self.acmd_receiver.is_none()
+            && self.source_mismatch_prompt.is_none()
+            && self.state.selected_move.is_some()
+        {
+            self.object_baseline = Some(self.object_edit_fingerprint());
+        }
+    }
+
+    /// The prompt shown when leaving an object script with unsynced changes.
+    fn draw_object_leave_prompt(&mut self, ctx: &egui::Context) {
+        let Some((pending, message)) = self.pending_leave.take() else {
+            return;
+        };
+        let agent = self.open_article.clone().unwrap_or_default();
+        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let can_sync = self.open_article_in_source && self.acmd_src.is_some();
+        let mut choice: Option<LeaveChoice> = None;
+        egui::Window::new("Unsynced changes")
+            .id(egui::Id::unique("object_leave_prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{agent} · {move_name} has changes that aren't saved anywhere yet. An object's \
+                     script isn't kept in the project, so leaving it now loses them."
+                ));
+                if let Some(message) = &message {
+                    ui.colored_label(egui::Color32::from_rgb(235, 170, 90), message);
+                }
+                ui.horizontal(|ui| {
+                    let sync = ui.add_enabled(can_sync, egui::Button::new("Sync now"));
+                    let sync = if can_sync {
+                        sync.on_hover_text("Write the changes into the linked source, then go on")
+                    } else {
+                        sync.on_disabled_hover_text(
+                            "This script can't be synced: it's the game's own script and the moveset doesn't define it.",
+                        )
+                    };
+                    if sync.clicked() {
+                        choice = Some(LeaveChoice::SyncNow);
+                    }
+                    if ui.button("Discard").on_hover_text("Go on without the changes").clicked() {
+                        choice = Some(LeaveChoice::Discard);
+                    }
+                    if ui.button("Stay").clicked() {
+                        choice = Some(LeaveChoice::Stay);
+                    }
+                });
+            });
+        let Some(choice) = choice else {
+            self.pending_leave = Some((pending, message));
+            return;
+        };
+        let mut clean = false;
+        if choice == LeaveChoice::SyncNow {
+            self.sync_edits_to_source();
+            clean = self.last_sync_clean;
+        }
+        if !object_leave_goes_ahead(choice, clean) {
+            if choice == LeaveChoice::SyncNow {
+                let said = format!("Not everything was synced: {}", self.state.status);
+                self.pending_leave = Some((pending, Some(said)));
+            }
+            return;
+        }
+        self.leave_confirmed = true;
+        match pending {
+            PendingLeave::Script(article, entry) => self.select_script(article, entry),
+            PendingLeave::Fighter(index) => self.select_fighter(index),
+        }
+        self.leave_confirmed = false;
     }
 
     /// Whether the open object script is a clone's, which the game has no scripts for.
@@ -36668,6 +37015,10 @@ impl eframe::App for VisionaryApp {
 
         if self.article_settings.is_some() {
             self.draw_article_settings_window(&ctx);
+        }
+        self.settle_object_baseline();
+        if self.pending_leave.is_some() {
+            self.draw_object_leave_prompt(&ctx);
         }
 
         if self.show_capture_debug {
