@@ -11,6 +11,18 @@ use crate::ui::{act, chip, look, Look};
 /// The narrowest a card is laid out; wider windows fit more columns.
 const CARD_WIDTH: f32 = 560.0;
 
+/// Characters the game shows as one that are several fighters underneath. Each gets one card,
+/// with its fighters to switch between: every part button then acts on the one picked.
+const GROUPS: [(&str, &[(&str, &str)]); 3] = [
+    ("Pokémon Trainer", &[("pzenigame", "Squirtle"), ("pfushigisou", "Ivysaur"), ("plizardon", "Charizard"), ("ptrainer", "Trainer")]),
+    ("Pyra / Mythra", &[("eflame", "Pyra"), ("elight", "Mythra")]),
+    ("Ice Climbers", &[("popo", "Popo"), ("nana", "Nana")]),
+];
+
+fn group_of(fighter: &str) -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+    GROUPS.iter().find(|(_, members)| members.iter().any(|(member, _)| member.eq_ignore_ascii_case(fighter))).copied()
+}
+
 /// One card on the page.
 #[derive(Clone)]
 pub(super) struct Card {
@@ -24,6 +36,8 @@ pub(super) struct Card {
     roster_key: crate::roster::RosterKey,
     /// A character made in this project, on top of `fighter`.
     made_here: bool,
+    /// The fighters this card stands for, with their names, when it is more than one.
+    members: &'static [(&'static str, &'static str)],
 }
 
 /// Something a card asked for, done once the page is drawn.
@@ -41,6 +55,8 @@ enum PageAction {
     EditOtherEffect(String),
     OpenEffectFile,
     EditValues(String),
+    /// Show another fighter of a card that stands for several: (card name, fighter).
+    Member(String, String),
     /// Something a character made in this project asked for.
     Made(crate::roster::new_character::NewCharacterAction),
     EditGimmicks(String),
@@ -333,8 +349,20 @@ impl VisionaryApp {
         names.extend(self.roster.params.iter().filter(|(_, params)| !params.is_empty()).map(|(name, _)| name.clone()));
         names.extend(self.state.sound_script_edits.keys().filter_map(|key| key.split_once('/')).map(|(name, _)| name.to_owned()));
         names.extend(parts.links.iter().filter(|link| link.part != Part::Moves).map(|link| link.fighter.clone()));
-        let mut cards = Vec::new();
+        let mut cards: Vec<Card> = Vec::new();
         for name in names {
+            // One card for all the fighters of a character, showing the one picked on it.
+            let group = group_of(&name);
+            let name = match group {
+                Some((title, members)) => {
+                    if cards.iter().any(|card| card.name == title) {
+                        continue;
+                    }
+                    let picked = self.project_member.get(title).cloned();
+                    picked.filter(|picked| members.iter().any(|(member, _)| member == picked)).unwrap_or(name)
+                }
+                None => name,
+            };
             let Some(entry) = self.state.fighters.iter().find(|entry| entry.name.eq_ignore_ascii_case(&name)) else {
                 continue;
             };
@@ -344,10 +372,11 @@ impl VisionaryApp {
                 slots: entry.slots.clone(),
                 slot,
                 // "Ice Climbers · Popo" is the Ice Climbers on a card of their own.
-                name: entry.display_name.split(" · ").next().unwrap_or(&entry.display_name).to_owned(),
+                name: group.map_or_else(|| entry.display_name.split(" · ").next().unwrap_or(&entry.display_name).to_owned(), |(title, _)| title.to_owned()),
                 base: if entry.is_modded() { "Mod fighter".into() } else { "Base game".into() },
                 roster_key: crate::roster::RosterKey::fighter(&entry.name),
                 made_here: false,
+                members: group.map_or(&[], |(_, members)| members),
             });
         }
         for authored in &self.roster.project.authored {
@@ -361,6 +390,7 @@ impl VisionaryApp {
                 base: format!("Plays as {}", donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone())),
                 roster_key: authored.key.clone(),
                 made_here: true,
+                members: &[],
             });
         }
         cards.sort_by(|a, b| a.name.cmp(&b.name));
@@ -597,7 +627,21 @@ impl VisionaryApp {
                                 });
                         });
                     });
-                    ui.label(RichText::new(&card.base).size(15.0).color(look.dim));
+                    if card.members.is_empty() {
+                        ui.label(RichText::new(&card.base).size(15.0).color(look.dim));
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            for (member, label) in card.members {
+                                if self.fighter_index(member).is_none() {
+                                    continue;
+                                }
+                                let shown = member.eq_ignore_ascii_case(&card.fighter);
+                                if act(ui, look, label, shown.then_some(look.accent)).clicked() && !shown {
+                                    actions.push(PageAction::Member(card.name.clone(), (*member).to_owned()));
+                                }
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -938,9 +982,23 @@ impl VisionaryApp {
                 }
             }
             PageAction::Hide(fighter) => {
+                let members: Vec<&str> = group_of(&fighter).map_or(vec![fighter.as_str()], |(_, members)| members.iter().map(|(member, _)| *member).collect());
                 self.change_parts(|parts| {
-                    parts.characters.remove(&fighter);
+                    for member in &members {
+                        parts.characters.remove(*member);
+                    }
                 });
+            }
+            PageAction::Member(card, fighter) => {
+                if let Some((title, _)) = GROUPS.iter().find(|(title, _)| *title == card) {
+                    self.project_member.insert(title, fighter.clone());
+                }
+                // The card stays on the page whichever of its fighters is shown.
+                let slot = self.fighter_index(&fighter).map_or(0, |index| self.state.fighters[index].base_slot());
+                self.change_parts(|parts| {
+                    parts.characters.entry(fighter.clone()).or_insert(slot);
+                });
+                self.project_open_part = None;
             }
             PageAction::Add(fighter) => {
                 let slot = self.fighter_index(&fighter).map_or(0, |index| self.state.fighters[index].base_slot());

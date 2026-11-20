@@ -3574,6 +3574,9 @@ pub struct VisionaryApp {
     project_parts_cache: Option<(PathBuf, crate::project_parts::ProjectParts)>,
     /// The card and part open on the Project page.
     project_open_part: Option<(String, crate::project_parts::Part)>,
+    /// The fighter shown on a card that stands for several (Pokémon Trainer's Pokémon), by
+    /// the card's name.
+    project_member: std::collections::BTreeMap<&'static str, String>,
     workspace_asset_cache_root: Option<PathBuf>,
     workspace_asset_reclaimed: u64,
     /// Fresh generation for disk-staged model/motion carrier snapshots. Timestamp-seeded on send
@@ -4130,6 +4133,7 @@ impl VisionaryApp {
             playback_fps: 60.0,
             project_parts_cache: None,
             project_open_part: None,
+            project_member: Default::default(),
             skin_files_stamp: None,
             skin_files_checked: None,
             workspace_asset_cache_root: None,
