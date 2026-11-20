@@ -76,56 +76,64 @@ fn is_aegis_group(entry: &RosterEntry) -> bool {
     false
 }
 
-fn filtered_visible<'a>(entries: Vec<&'a RosterEntry>) -> Vec<&'a RosterEntry> {
+/// One entry per cell: Pyra and Mythra share a position, and the cell is theirs together.
+fn one_per_cell<'a>(entries: impl IntoIterator<Item = &'a RosterEntry>) -> Vec<&'a RosterEntry> {
     let mut out: Vec<&'a RosterEntry> = Vec::new();
     let mut seen_order: std::collections::HashMap<i8, usize> = std::collections::HashMap::new();
     for e in entries {
-        if let Some(n) = e.name_id.as_deref() {
-            if n.eq_ignore_ascii_case("miiall") {
-                continue;
-            }
-        }
         if let Some(order) = e.css_order {
             if let Some(&idx) = seen_order.get(&order) {
-                // Duplicate order (Aegis) - keep Aegis combined as representative
                 if is_aegis_combined(e) && !is_aegis_combined(out[idx]) {
                     out[idx] = e;
                 }
                 continue;
-            } else {
-                seen_order.insert(order, out.len());
             }
+            seen_order.insert(order, out.len());
         }
         out.push(e);
     }
     out
 }
 
-/// Grid cell target size and spacing. The grid lays itself out from these:
-/// columns are fitted to the window, then cells stretch to fill the row
-/// exactly, keeping this aspect. Nothing here is user-configurable — the
-/// roster fits the screen on its own instead of asking to be arranged.
-///
-/// Sized so portraits read at a glance (~100px): a dense-but-legible
-/// overview, not a wall of thumbnails.
-const CELL_W: f32 = 104.0;
-const CELL_H: f32 = 128.0;
-const GRID_SPACING: f32 = 6.0;
-const GRID_COLUMNS_MIN: usize = 3;
-const GRID_COLUMNS_MAX: usize = 16;
-/// Narrowest a cell gets before the grid scrolls sideways instead. Below
-/// this the portraits stop reading, so shrinking further buys nothing.
-const CELL_MIN_W: f32 = 56.0;
+/// The cells of the select screen with echoes separate, as the game ships: every character
+/// but the one Mii Fighter cell that stands in for the three when echoes are stacked.
+fn filtered_visible<'a>(entries: Vec<&'a RosterEntry>) -> Vec<&'a RosterEntry> {
+    one_per_cell(entries.into_iter().filter(|e| !e.name_id.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("miiall"))))
+}
 
-/// Columns and cell size that fill `avail_w` with no leftover gap. Measured
-/// outside the grid's own horizontal scroller, where `available_width` is the
-/// real window width — inside it, the width is unbounded and the answer is
-/// meaningless.
-fn grid_layout(avail_w: f32) -> (usize, f32) {
-    let cols = (((avail_w - 4.0) + GRID_SPACING) / (CELL_W + GRID_SPACING)).floor() as usize;
-    let cols = cols.clamp(GRID_COLUMNS_MIN, GRID_COLUMNS_MAX);
-    let cell_w = ((avail_w - 4.0) - (cols - 1) as f32 * GRID_SPACING) / cols as f32;
-    (cols, cell_w.max(CELL_MIN_W))
+/// The game lays the select screen out 13 cells across, each row centred, and this page does
+/// the same so it reads as the screen it edits. Cells are as wide as the page allows.
+const GAME_COLUMNS: usize = 13;
+/// A cell's height for its width: the game's cell art (`chara_7`) is 454 by 300.
+const CELL_ASPECT: f32 = 300.0 / 454.0;
+const GRID_SPACING: f32 = 4.0;
+/// Narrowest a cell gets before the grid scrolls sideways instead.
+const CELL_MIN_W: f32 = 52.0;
+const CELL_MAX_W: f32 = 150.0;
+
+/// The width of one cell when `GAME_COLUMNS` of them fill `avail_w`.
+fn cell_width(avail_w: f32) -> f32 {
+    (((avail_w - 4.0) - (GAME_COLUMNS - 1) as f32 * GRID_SPACING) / GAME_COLUMNS as f32).clamp(CELL_MIN_W, CELL_MAX_W)
+}
+
+/// The character an entry is a part of, for the entries the game folds into another's cell.
+fn part_of(name_id: &str) -> Option<&'static str> {
+    match name_id {
+        "pzenigame" | "pfushigisou" | "plizardon" => Some("part of Pokémon Trainer"),
+        "eflame_only" | "elight_only" | "element" => Some("part of Pyra / Mythra"),
+        "miiall" => Some("the one cell for all three Mii Fighters"),
+        _ => None,
+    }
+}
+
+/// The Random cell the game puts after the last character. Nothing here edits it.
+fn random_cell(ui: &mut Ui, look: crate::ui::Look, cell_w: f32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell_w, (cell_w * CELL_ASPECT).round()), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, look.sunk);
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, look.edge), egui::StrokeKind::Inside);
+    painter.text(rect.center(), egui::Align2::CENTER_CENTER, "RANDOM", egui::FontId::proportional((rect.height() * 0.2).clamp(8.0, 14.0)), look.dim);
+    response.on_hover_text("The game's Random cell, always last");
 }
 
 /// One dossier dot: bright when the slot has it, dim when missing, with
@@ -204,6 +212,8 @@ pub struct CssView {
     /// stays sound while filtered: positions are reused from the shown
     /// subset, so unshown entries keep theirs.
     grid_filter: String,
+    /// Preview the screen with the game's "Echo Fighters: Stacked" option on.
+    echo_stacked: bool,
     /// Narrows the off-roster list. Separate from the grid filter: finding
     /// someone to restore is a different hunt from arranging the screen.
     off_roster_filter: String,
@@ -304,6 +314,32 @@ impl CssView {
         }
     }
 
+    fn stacking(&self, entry: &RosterEntry) -> css::Stacking {
+        let row = entry.name_id.as_deref().and_then(|name_id| self.db.as_ref()?.row(name_id));
+        row.map_or(css::Stacking::Always, css::CharaRow::stacking)
+    }
+
+    /// The cells the game shows, in order, with echoes stacked or separate as picked here.
+    fn stage<'a>(&self, index: &'a RosterIndex) -> Vec<&'a RosterEntry> {
+        let stacked = self.echo_stacked;
+        one_per_cell(index.visible().into_iter().filter(|entry| match self.stacking(entry) {
+            css::Stacking::Always => true,
+            css::Stacking::SeparateOnly => !stacked,
+            css::Stacking::StackedOnly => stacked,
+        }))
+    }
+
+    /// The echo that shares `entry`'s cell when echoes are stacked.
+    fn echo_of<'a>(&self, entry: &RosterEntry, index: &'a RosterIndex) -> Option<&'a RosterEntry> {
+        let db = self.db.as_ref()?;
+        let row = db.row(entry.name_id.as_deref()?)?;
+        if row.alt_chara_id == 0 || row.stacking() != css::Stacking::Always {
+            return None;
+        }
+        let echo = db.entries().iter().find(|other| other.ui_chara_id == row.alt_chara_id && other.stacking() == css::Stacking::SeparateOnly)?;
+        index.visible().into_iter().find(|other| other.name_id.as_deref() == Some(echo.name_id.as_str()))
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut Ui,
@@ -329,11 +365,9 @@ impl CssView {
         }
         ui.add_space(4.0);
 
-        let raw_entries = index.visible();
-        let entries = filtered_visible(raw_entries);
-        // Layout for the grid, measured here — outside the horizontal
-        // scroller, where `available_width` is the real window width.
-        let (columns, cell_w) = grid_layout(ui.available_width());
+        let entries = self.stage(index);
+        // Measured here, outside the grid's sideways scroller, where the width is the page's.
+        let cell_w = cell_width(ui.available_width());
         if entries.is_empty() {
             egui::Frame::group(ui.style())
                 .inner_margin(egui::Margin::symmetric(14, 14))
@@ -372,74 +406,100 @@ impl CssView {
                     // drags and marquee own the pointer here.
                     egui::ScrollArea::horizontal()
                         .id_salt("roster_css_grid")
-                        .auto_shrink([false, false])
+                        .auto_shrink([false, true])
                         .scroll_source(super::GESTURE_AREA_SCROLL)
                         .show(ui, |ui| {
-                            self.draw_grid(ui, roots, &entries, project, columns, cell_w, index);
+                            self.draw_grid(ui, roots, &entries, project, cell_w, index);
                         });
                 });
         }
 
-        if !self.selected.is_empty() {
-            if let Some(key) = self
-                .last_selected
-                .clone()
-                .or_else(|| self.selected.iter().next().cloned())
-            {
-                if let Some(entry) = index.by_key(&key) {
-                    ui.add_space(6.0);
-                    egui::Frame::group(ui.style())
-                        .inner_margin(egui::Margin::symmetric(10, 10))
-                        .show(ui, |ui| {
-                            if self.focus_detail {
-                                self.focus_detail = false;
-                                ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
-                                    .scroll_to_me(Some(egui::Align::TOP));
-                            }
-                            if self.selected.len() > 1 {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{} selected", self.selected.len()))
-                                            .strong(),
-                                    );
-                                    if ui.small_button("Clear").clicked() {
-                                        self.selected.clear();
-                                        self.last_selected = None;
-                                    }
-                                });
-                                ui.add_space(4.0);
-                            }
-                            self.draw_selection(ui, entry, project, roots, index);
-                        });
-                }
+        // Under the grid: the picked cell's editor, with the characters that are not on the
+        // screen beside it. Stacked when the page is too narrow for both.
+        ui.add_space(8.0);
+        let look = crate::ui::look(ui);
+        let panel = move || egui::Frame::new().fill(look.sunk).stroke(egui::Stroke::new(1.0, look.edge)).corner_radius(10.0).inner_margin(egui::Margin::same(12));
+        let (width, side) = (ui.available_width(), 360.0);
+        let beside = width >= 900.0;
+        let editor = |view: &mut Self, ui: &mut Ui, project: &mut RosterMod| {
+            panel().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                view.draw_picked(ui, look, roots, index, project);
+            });
+            if view.show_bulk_names {
+                ui.add_space(8.0);
+                panel().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    view.draw_bulk_names(ui, index, project);
+                });
             }
-        }
-
-        if self.show_bulk_names {
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 10))
-                .show(ui, |ui| {
-                    self.draw_bulk_names(ui, index, project);
+        };
+        if beside {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(width - side - 10.0);
+                    editor(self, ui, project);
                 });
-        }
-
-        if self.show_off_roster {
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 10))
-                .show(ui, |ui| {
-                    self.draw_off_roster(ui, index, project);
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.set_width(side);
+                    panel().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.draw_off_roster(ui, index, project);
+                    });
                 });
+            });
+        } else {
+            editor(self, ui, project);
+            ui.add_space(8.0);
+            panel().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.draw_off_roster(ui, index, project);
+            });
         }
 
         if !self.status.is_empty() {
             ui.add_space(6.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.status).small().weak());
-            });
+            ui.label(RichText::new(&self.status).color(look.text));
         }
+    }
+
+    /// The editor for the picked cell, or what to do when none is.
+    fn draw_picked(&mut self, ui: &mut Ui, look: crate::ui::Look, roots: &[PathBuf], index: &RosterIndex, project: &mut RosterMod) {
+        let picked = self.last_selected.clone().or_else(|| self.selected.iter().next().cloned()).filter(|_| !self.selected.is_empty());
+        let Some(entry) = picked.as_ref().and_then(|key| index.by_key(key)) else {
+            ui.label(RichText::new("No cell picked").size(19.0).strong().color(look.dim));
+            return;
+        };
+        if self.focus_detail {
+            self.focus_detail = false;
+            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover()).scroll_to_me(Some(egui::Align::TOP));
+        }
+        if self.selected.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} picked", self.selected.len())).strong().color(look.text));
+                if crate::ui::act(ui, look, "Pick none", None).clicked() {
+                    self.selected.clear();
+                    self.last_selected = None;
+                }
+            });
+            ui.add_space(4.0);
+        }
+        // The echo stacked in this cell is edited from here too.
+        if self.echo_stacked {
+            if let Some(echo) = self.echo_of(entry, index) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("In this cell").strong().color(look.dim));
+                    ui.label(RichText::new(&entry.display_name).strong().color(look.text));
+                    if crate::ui::act(ui, look, &format!("Edit {}", echo.display_name), None).clicked() {
+                        self.selected = BTreeSet::from([echo.key.clone()]);
+                        self.last_selected = Some(echo.key.clone());
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        }
+        self.draw_selection(ui, entry, project, roots, index);
     }
 
     fn draw_missing_database(&mut self, ui: &mut Ui) {
@@ -481,9 +541,8 @@ impl CssView {
     }
 
     fn draw_toolbar(&mut self, ui: &mut Ui, index: &RosterIndex, project: &mut RosterMod) {
-        let visible = filtered_visible(index.visible());
+        let visible = self.stage(index);
         let visible_len = visible.len();
-        let off_len = index.off_roster().len();
         let filtering = !self.grid_filter.trim().is_empty();
         let shown_len = if filtering {
             visible
@@ -496,15 +555,16 @@ impl CssView {
         let look = crate::ui::look(ui);
         let toggle = |on: bool| on.then_some(look.accent);
         ui.horizontal_wrapped(|ui| {
-            if crate::ui::act(ui, look, &format!("Hidden characters ({off_len})"), toggle(self.show_off_roster))
-                .on_hover_text("Characters not on the select screen. Bring them back here.")
-                .clicked()
-            {
-                self.show_off_roster = !self.show_off_roster;
-                if self.show_off_roster {
-                    self.focus_off_roster = true;
+            ui.label(RichText::new("Echo fighters").strong().color(look.dim));
+            for (stacked, word, tip) in [
+                (false, "Separate", "Every echo fighter in a cell of its own, as the game starts out"),
+                (true, "Stacked", "Echo fighters share their original's cell and the three Mii Fighters share one, as with the game's Echo Fighters option set to Stacked"),
+            ] {
+                if crate::ui::act(ui, look, word, toggle(self.echo_stacked == stacked)).on_hover_text(tip).clicked() {
+                    self.echo_stacked = stacked;
                 }
             }
+            ui.add_space(10.0);
             if crate::ui::act(ui, look, "Edit names", toggle(self.show_bulk_names))
                 .on_hover_text("Every shown character's name in one table")
                 .clicked()
@@ -568,12 +628,10 @@ impl CssView {
         roots: &[PathBuf],
         entries: &[&RosterEntry],
         project: &mut RosterMod,
-        columns: usize,
         cell_w: f32,
         index: &RosterIndex,
     ) {
         let mut drop_on: Option<RosterKey> = None;
-        let columns = columns.clamp(GRID_COLUMNS_MIN, GRID_COLUMNS_MAX);
         let mut cell_rects: Vec<(RosterKey, Rect)> = Vec::new();
 
         // Narrow the grid to the filter query, if any. Reorder stays sound:
@@ -606,11 +664,23 @@ impl CssView {
         let pointer_pressed = ui.input(|i| i.pointer.primary_pressed());
         let pointer_released = ui.input(|i| i.pointer.any_released());
 
-        let grid_response = egui::Grid::new("roster_css_cells")
-            .spacing(egui::vec2(GRID_SPACING, GRID_SPACING))
-            .show(ui, |ui| {
-                for (position, entry) in shown.iter().enumerate() {
-                    let response = self.draw_cell(ui, roots, entry, project, cell_w);
+        // Rows of 13, each centred, with Random after the last character, as the game does.
+        let look = crate::ui::look(ui);
+        let cells = shown.len() + 1;
+        let grid_response = ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(GRID_SPACING, GRID_SPACING);
+            for row in 0..cells.div_ceil(GAME_COLUMNS) {
+                let range = row * GAME_COLUMNS..((row + 1) * GAME_COLUMNS).min(cells);
+                let missing = (GAME_COLUMNS - range.len()) as f32;
+                ui.horizontal(|ui| {
+                    ui.add_space(missing * (cell_w + GRID_SPACING) / 2.0);
+                    for position in range {
+                    let Some(entry) = shown.get(position) else {
+                        random_cell(ui, look, cell_w);
+                        continue;
+                    };
+                    let echo = if self.echo_stacked { self.echo_of(entry, index) } else { None };
+                    let response = self.draw_cell(ui, roots, entry, project, cell_w, echo);
                     cell_rects.push((entry.key.clone(), response.rect));
 
                     if response.drag_started() {
@@ -663,11 +733,10 @@ impl CssView {
                             self.focus_detail = true;
                         }
                     }
-                    if (position + 1) % columns == 0 {
-                        ui.end_row();
                     }
-                }
-            });
+                });
+            }
+        });
 
         // Marquee drag-select: start on background press, update while dragging
         let grid_rect = grid_response.response.rect;
@@ -766,26 +835,10 @@ impl CssView {
             }
         }
 
-        // Guidance only while idle: once a selection exists the editor
-        // below is the focus, not this line. (Cell hover covers drag/click.)
-        if self.selected.len() > 1 {
-            ui.label(
-                RichText::new(format!(
-                    "{} selected. Drag any to move as a group, Hide acts on all",
-                    self.selected.len()
-                ))
-                .small()
-                .weak(),
-            );
-        } else if self.selected.is_empty() {
-            ui.label(
-                RichText::new("Drag portraits to reorder · click / Ctrl / Shift / marquee to select · Delete hides")
-                    .small()
-                    .weak(),
-            );
-        }
     }
 
+    /// One cell, drawn as the game draws it: the character's cell art with its name across the
+    /// bottom. `echo` is the echo fighter stacked in this cell, if any.
     fn draw_cell(
         &mut self,
         ui: &mut Ui,
@@ -793,181 +846,97 @@ impl CssView {
         entry: &RosterEntry,
         project: &crate::mod_project::RosterMod,
         cell_w: f32,
+        echo: Option<&RosterEntry>,
     ) -> egui::Response {
-        // Cells stretch to fill the row; type scales with them so a wide
-        // window gets bigger portraits, not just more columns.
-        let zoom = cell_w / CELL_W;
-        let size = egui::vec2(cell_w, cell_w * CELL_H / CELL_W);
-        let label_h = 26.0 * zoom;
+        let look = crate::ui::look(ui);
+        let size = egui::vec2(cell_w, (cell_w * CELL_ASPECT).round());
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
-
-        let selected = self.selected.contains(&entry.key);
-        let dragging = self
-            .dragging
-            .as_ref()
-            .is_some_and(|set| set.contains(&entry.key));
-        let hovered = response.hovered();
-        let visuals = ui.visuals();
-        let base_stroke = origin_color(entry.origin);
-        let stroke_color = if selected {
-            visuals.selection.stroke.color
-        } else if dragging {
-            Color32::from_rgb(240, 200, 120)
-        } else if hovered {
-            visuals.widgets.hovered.bg_stroke.color
-        } else {
-            base_stroke
-        };
-        let bg = if dragging {
-            visuals.widgets.active.weak_bg_fill
-        } else if selected {
-            visuals.selection.bg_fill.gamma_multiply(0.45)
-        } else if hovered {
-            visuals.widgets.hovered.weak_bg_fill
-        } else {
-            visuals.extreme_bg_color
-        };
-
-        let painter = ui.painter_at(rect);
-        // Subtle shadow for depth
-        if !dragging {
-            painter.rect_filled(
-                rect.translate(egui::vec2(0.0, 1.0)),
-                4.0,
-                Color32::from_rgba_premultiplied(0, 0, 0, 40),
-            );
+        if !ui.is_rect_visible(rect) {
+            return response;
         }
-        painter.rect_filled(rect, 4.0, bg);
-        painter.rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(if selected || dragging { 2.0 } else { 1.0 }, stroke_color),
-            egui::StrokeKind::Inside,
-        );
+        let selected = self.selected.contains(&entry.key);
+        let dragging = self.dragging.as_ref().is_some_and(|set| set.contains(&entry.key));
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, look.sunk);
 
-        let image_rect = egui::Rect::from_min_size(
-            rect.min + egui::vec2(3.0, 3.0) * zoom,
-            egui::vec2(
-                rect.width() - 6.0 * zoom,
-                rect.height() - label_h - 3.0 * zoom,
-            ),
-        );
-        // The grid is the gamma-fixed display: portraits render corrected,
-        // like the game shows them. The per-image preview toggle in the
-        // Images editor is for judging a single PNG while editing it, not
-        // for this overview. Check for a per-entry PNG override so a custom
-        // portrait shows up — corrected, like everything else here.
-        let entry_slot = entry.backing.slot().unwrap_or(0);
         let png_override: Option<std::path::PathBuf> = project
             .ui_images
             .get(&entry.key)
             .and_then(|map| {
-                ["chara_1", "chara_2", "chara_0"]
-                    .into_iter()
-                    .filter_map(|kind| {
-                        crate::roster::ui_images::find_override(map, kind, entry_slot, entry_slot)
-                    })
-                    .next()
+                let own = entry.backing.slot().unwrap_or(0);
+                ["chara_7", "chara_1", "chara_2", "chara_0"].into_iter().find_map(|kind| crate::roster::ui_images::find_override(map, kind, own, own))
             })
-            .map(|ov| std::path::PathBuf::from(&ov.png_path));
-        let portrait = entry.name_id.as_deref().and_then(|name_id| {
-            self.portraits.get_with_gamma(
-                ui.ctx(),
-                roots,
-                name_id,
-                entry.backing.slot().unwrap_or(0),
-                true,
-                png_override.as_deref(),
-            )
+            .map(|picked| std::path::PathBuf::from(&picked.png_path));
+        // A character made here files its art under its own first colour.
+        let art = entry.name_id.as_deref().and_then(|name_id| {
+            self.portraits.get_image_with_gamma(ui.ctx(), roots, "chara_7", name_id, 0, true, png_override.as_deref())
         });
-        match portrait {
+        match art {
             Some(Ok(texture)) => {
-                painter.image(
-                    texture.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                // Fill the cell, cropping whichever way the picture overhangs.
+                let [w, h] = texture.size();
+                let (picture, cell) = (w as f32 / h.max(1) as f32, rect.width() / rect.height());
+                let (u, v) = if picture > cell { (cell / picture, 1.0) } else { (1.0, picture / cell) };
+                let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(u, v));
+                painter.image(texture.id(), rect, uv, Color32::WHITE);
             }
             _ => {
-                // No portrait, or still queued behind the decode budget. Either way the cell
-                // has to say who it is, so the initials stand in rather than nothing.
-                painter.text(
-                    image_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    initials(&entry.display_name),
-                    egui::FontId::proportional(20.0 * zoom),
-                    origin_color(entry.origin),
-                );
+                painter.text(rect.center() - egui::vec2(0.0, rect.height() * 0.12), egui::Align2::CENTER_CENTER, initials(&entry.display_name), egui::FontId::proportional(rect.height() * 0.34), look.dim);
             }
         }
 
-        // Origin dot — subtle, bottom-left of portrait
-        let dot_color = origin_color(entry.origin);
-        painter.circle_filled(
-            egui::pos2(image_rect.min.x + 5.0 * zoom, image_rect.max.y - 5.0 * zoom),
-            3.0 * zoom,
-            dot_color,
-        );
+        // The name, in capitals across the bottom, shrunk to fit like the game's.
+        let name = if is_aegis_group(entry) && entry.css_order == Some(80) { "PYRA / MYTHRA".to_owned() } else { entry.display_name.to_uppercase() };
+        let band = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.30), rect.max);
+        painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 170));
+        let mut font = (band.height() * 0.72).clamp(8.0, 15.0);
+        let mut galley = painter.layout_no_wrap(name.clone(), egui::FontId::proportional(font), Color32::WHITE);
+        while galley.size().x > band.width() - 6.0 && font > 7.0 {
+            font -= 0.5;
+            galley = painter.layout_no_wrap(name.clone(), egui::FontId::proportional(font), Color32::WHITE);
+        }
+        painter.galley(band.center() - galley.size() / 2.0, galley, Color32::WHITE);
 
-        let label = if is_aegis_group(entry) && entry.css_order == Some(80) {
-            "Pyra/Mythra".to_string()
-        } else {
-            elide(&entry.display_name, (11.0 * zoom).round() as usize)
-        };
-        painter.text(
-            egui::pos2(rect.center().x, rect.max.y - 14.0 * zoom),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(11.0 * zoom),
-            if selected {
-                Color32::WHITE
-            } else {
-                ui.visuals().text_color()
-            },
-        );
+        // Where it stands in the order, and whether this project moved it.
         if let Some(order) = entry.css_order {
-            // Order badge — small pill at top-left
-            let badge_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(4.0, 4.0) * zoom,
-                egui::vec2(16.0, 12.0) * zoom,
-            );
-            painter.rect_filled(
-                badge_rect,
-                6.0,
-                Color32::from_rgba_premultiplied(0, 0, 0, 120),
-            );
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                order.to_string(),
-                egui::FontId::monospace(8.0 * zoom),
-                Color32::from_rgb(210, 215, 225),
-            );
+            let moved = self.moved(entry);
+            let tag = egui::Rect::from_min_size(rect.min + egui::vec2(3.0, 3.0), egui::vec2(20.0, 13.0));
+            painter.rect_filled(tag, 3.0, if moved { Color32::from_rgb(240, 190, 70) } else { Color32::from_rgba_unmultiplied(0, 0, 0, 150) });
+            painter.text(tag.center(), egui::Align2::CENTER_CENTER, order.to_string(), egui::FontId::monospace(9.0), if moved { Color32::from_rgb(18, 18, 22) } else { Color32::WHITE });
         }
-        // Moved relative to the unedited roster — the diff overlay.
-        if self.moved(entry) {
-            painter.text(
-                egui::pos2(rect.max.x - 4.0 * zoom, rect.min.y + 4.0 * zoom),
-                egui::Align2::RIGHT_TOP,
-                "●",
-                egui::FontId::proportional(10.0 * zoom),
-                Color32::from_rgb(240, 200, 120),
-            );
+        if let Some(echo) = echo {
+            let words = painter.layout_no_wrap(format!("+ {}", echo.display_name), egui::FontId::proportional(9.5), Color32::from_rgb(18, 18, 22));
+            let tag = egui::Rect::from_min_size(egui::pos2(rect.right() - words.size().x - 9.0, rect.top() + 3.0), words.size() + egui::vec2(6.0, 2.0));
+            if tag.left() > rect.left() + 26.0 {
+                painter.rect_filled(tag, 3.0, Color32::from_rgb(255, 115, 160));
+                painter.galley(tag.min + egui::vec2(3.0, 1.0), words, Color32::BLACK);
+            } else {
+                painter.circle_filled(egui::pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, Color32::from_rgb(255, 115, 160));
+            }
         }
 
-        if selected {
-            // Selected checkmark overlay
-            painter.text(
-                egui::pos2(rect.max.x - 5.0 * zoom, rect.max.y - 5.0 * zoom),
-                egui::Align2::RIGHT_BOTTOM,
-                "●",
-                egui::FontId::proportional(9.0 * zoom),
-                Color32::WHITE,
-            );
-        }
+        let edge = if selected {
+            look.accent
+        } else if dragging {
+            Color32::from_rgb(240, 190, 70)
+        } else if response.hovered() {
+            look.text
+        } else {
+            match entry.origin {
+                EntryOrigin::Vanilla => look.edge,
+                other => origin_color(other),
+            }
+        };
+        let width = if selected || dragging { 3.0 } else if entry.origin == EntryOrigin::Vanilla { 1.0 } else { 2.0 };
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(width, edge), egui::StrokeKind::Inside);
 
-        response.on_hover_ui(|ui| self.hover_details(ui, entry))
+        let echo_name = echo.map(|echo| echo.display_name.clone());
+        response.on_hover_ui(|ui| {
+            self.hover_details(ui, entry);
+            if let Some(echo) = &echo_name {
+                ui.label(format!("{echo} shares this cell when echo fighters are stacked."));
+            }
+        })
     }
 
     fn hover_details(&self, ui: &mut Ui, entry: &RosterEntry) {
@@ -1025,7 +994,7 @@ impl CssView {
         }
         ui.separator();
         ui.label(
-            RichText::new("Drag onto another character to move here · Click to select")
+            RichText::new("Drag onto another character to move it there. Click to edit it.")
                 .small()
                 .weak(),
         );
@@ -1169,92 +1138,56 @@ impl CssView {
         roots: &[PathBuf],
         _index: &RosterIndex,
     ) {
-        // ── Header ──────────────────────────────────────────────────────────
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(&entry.display_name)
-                    .size(16.0)
-                    .strong()
-                    .color(origin_color(entry.origin)),
-            );
-            ui.label(
-                RichText::new(entry.origin.label())
-                    .small()
-                    .strong()
-                    .color(origin_color(entry.origin)),
-            );
-            if let Some(order) = entry.css_order {
-                ui.label(RichText::new(format!("pos {order}")).small().weak());
-            }
-            if let Some(nid) = &entry.name_id {
-                ui.label(RichText::new(nid.clone()).small().weak().monospace());
-            }
-            // A slot-backed entry is a costume, not a fighter — say which,
-            // up front, since every slot edit below is scoped to it.
-            if let (Some(fighter), Some(slot)) = (&entry.fighter, entry.backing.slot()) {
-                ui.label(
-                    RichText::new(format!("costume c{slot:02} of {fighter}"))
-                        .small()
-                        .weak(),
-                );
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(RichText::new("Hide").small())
-                    .on_hover_text("Hide this character from the select screen")
-                    .clicked()
-                {
+        let look = crate::ui::look(ui);
+        let changed_colour = Color32::from_rgb(240, 190, 70);
+        let has_edits = project.order.contains_key(&entry.key)
+            || project.names.contains_key(&entry.key)
+            || project.name_variants.contains_key(&entry.key)
+            || project.chara_overrides.contains_key(&entry.key)
+            || project.ui_images.contains_key(&entry.key);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(&entry.display_name).size(24.0).strong().color(look.text));
+                let mut line = match entry.origin {
+                    EntryOrigin::Vanilla => "Base game".to_owned(),
+                    EntryOrigin::Imported => "From a mod".to_owned(),
+                    EntryOrigin::Authored => "Made in this project".to_owned(),
+                };
+                if let (EntryOrigin::Authored, Some(fighter)) = (entry.origin, &entry.fighter) {
+                    line = format!("Made in this project, plays as {}", crate::data::fighter_display_name(fighter));
+                }
+                if let Some(order) = entry.css_order {
+                    line.push_str(&format!(", place {order}"));
+                }
+                if let Some(owner) = entry.name_id.as_deref().and_then(part_of) {
+                    line.push_str(&format!(", {owner}"));
+                }
+                ui.label(RichText::new(line).color(look.dim));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if crate::ui::act(ui, look, "Hide", None).on_hover_text("Take it off the select screen").clicked() {
                     self.pending_hide = true;
                 }
-                // Clearing one entry's edits (the old toolbar "Remove" did
-                // Hide plus this silently). Explicit here, per entry.
-                let has_edits = project.order.contains_key(&entry.key)
-                    || project.names.contains_key(&entry.key)
-                    || project.name_variants.contains_key(&entry.key)
-                    || project.chara_overrides.contains_key(&entry.key)
-                    || project.ui_images.contains_key(&entry.key);
-                if ui
-                    .add_enabled(
-                        has_edits,
-                        egui::Button::new(RichText::new("Reset entry").small()),
-                    )
-                    .on_hover_text("Clear this entry's name, position, row, and image edits")
-                    .clicked()
-                {
+                let undo = ui.add_enabled_ui(has_edits, |ui| crate::ui::act(ui, look, "Undo changes", None)).inner;
+                if undo.on_hover_text("Its name, place, skin count and pictures go back to the game's").clicked() {
                     project.order.remove(&entry.key);
                     project.names.remove(&entry.key);
                     project.name_variants.remove(&entry.key);
                     project.chara_overrides.remove(&entry.key);
                     project.ui_images.remove(&entry.key);
                     self.order_drafts.remove(&entry.key);
-                    self.status = format!("Cleared edits for {}.", entry.display_name);
+                    self.status = format!("{} is as the game has it again.", entry.display_name);
                 }
             });
         });
+        ui.add_space(8.0);
 
-        ui.add_space(6.0);
-
-        // ── Display name (the common case, always visible) ────────────────
-        // Field width flexes with the window instead of forcing overflow.
-        let name_w = (ui.available_width() - 190.0).clamp(100.0, 240.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Display name").small().weak());
-            let mut name = project
-                .names
-                .get(&entry.key)
-                .cloned()
-                .unwrap_or_else(|| entry.display_name.clone());
+            ui.label(RichText::new("Name").strong().color(look.dim));
+            let mut name = project.names.get(&entry.key).cloned().unwrap_or_else(|| entry.display_name.clone());
             let is_edited = project.names.contains_key(&entry.key);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut name)
-                    .desired_width(name_w)
-                    .hint_text("display name")
-                    .text_color(if is_edited {
-                        Color32::from_rgb(240, 200, 120)
-                    } else {
-                        ui.visuals().text_color()
-                    }),
-            );
+            let width = (ui.available_width() - 160.0).clamp(120.0, 320.0);
+            let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(width).text_color(if is_edited { changed_colour } else { look.text }));
             if response.changed() {
                 if name.trim().is_empty() || name == entry.display_name {
                     project.names.remove(&entry.key);
@@ -1262,97 +1195,33 @@ impl CssView {
                     project.names.insert(entry.key.clone(), name);
                 }
             }
-            if is_edited {
-                if ui
-                    .small_button("Reset")
-                    .on_hover_text("Use the game's name")
-                    .clicked()
-                {
-                    project.names.remove(&entry.key);
-                }
-                ui.colored_label(
-                    Color32::from_rgb(240, 200, 120),
-                    RichText::new("edited").small(),
-                );
+            if is_edited && crate::ui::act(ui, look, "Game's name", None).clicked() {
+                project.names.remove(&entry.key);
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
-        // ── Costume slots: the per-slot editing ─────────────────────────
-        // Open by default: this is the working surface, not an advanced
-        // corner. Every skin the game has on disk is listed with its name
-        // field — empty means "uses the display name above".
-        if let Some(fighter) = &entry.fighter {
-            let costume_count = project
-                .per_costume_names
-                .get(fighter)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let fighter = fighter.clone();
-            let suffix = if costume_count > 0 {
-                format!(" • {costume_count} named")
-            } else {
-                String::new()
-            };
-            egui::CollapsingHeader::new(RichText::new(format!("Costume slots{suffix}")).small())
-                .default_open(true)
-                .id_salt(format!("costume_names_{fighter}"))
-                .show(ui, |ui| {
-                    self.draw_per_costume_names(ui, entry, &fighter, project, roots);
-                });
+        // The rest in sections, most used first, each saying how much of it is changed.
+        let title = |words: &str, changed: usize| {
+            let text = if changed > 0 { format!("{words} ({changed} changed)") } else { words.to_owned() };
+            RichText::new(text).size(15.0).strong().color(if changed > 0 { changed_colour } else { look.text })
+        };
+        if let Some(fighter) = entry.fighter.clone() {
+            let named = project.per_costume_names.get(&fighter).map_or(0, |names| names.len());
+            egui::CollapsingHeader::new(title("Skins", named)).default_open(true).id_salt(format!("costume_names_{fighter}")).show(ui, |ui| {
+                self.draw_per_costume_names(ui, entry, &fighter, project, roots);
+            });
         }
-
-        // ── Images ────────────────────────────────────────────────────────
-        let image_count = project
-            .ui_images
-            .get(&entry.key)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        egui::CollapsingHeader::new(
-            RichText::new(format!(
-                "Images{}",
-                if image_count > 0 {
-                    format!(" • {image_count}")
-                } else {
-                    String::new()
-                }
-            ))
-            .small(),
-        )
-        .default_open(image_count > 0)
-        .id_salt(format!("images_{}", entry.key.as_str()))
-        .show(ui, |ui| {
+        let pictures = project.ui_images.get(&entry.key).map_or(0, |images| images.len());
+        egui::CollapsingHeader::new(title("Pictures", pictures)).default_open(pictures > 0).id_salt(format!("images_{}", entry.key.as_str())).show(ui, |ui| {
             self.draw_images(ui, entry, project, roots);
         });
-
-        // ── Roster row (position + ui_chara_db fields) ────────────────────
-        egui::CollapsingHeader::new(RichText::new("Roster row (position, slots)").small())
-            .id_salt(format!("roster_row_{}", entry.key.as_str()))
-            .show(ui, |ui| {
-                self.draw_roster_row(ui, entry, project);
-            });
-
-        // ── Advanced name variants (chr0/1/2) ─────────────────────────────
-        let variant_count = project
-            .name_variants
-            .get(&entry.key)
-            .map(|v| {
-                v.chr0.is_some() as usize + v.chr1.is_some() as usize + v.chr2.is_some() as usize
-            })
-            .unwrap_or(0);
-        egui::CollapsingHeader::new(
-            RichText::new(format!(
-                "Name variants (chr0/1/2){}",
-                if variant_count > 0 {
-                    format!(" • {variant_count}")
-                } else {
-                    String::new()
-                }
-            ))
-            .small(),
-        )
-        .id_salt(format!("name_variants_{}", entry.key.as_str()))
-        .show(ui, |ui| {
+        let placed = project.order.contains_key(&entry.key) as usize + project.chara_overrides.contains_key(&entry.key) as usize;
+        egui::CollapsingHeader::new(title("Place and skin count", placed)).id_salt(format!("roster_row_{}", entry.key.as_str())).show(ui, |ui| {
+            self.draw_roster_row(ui, entry, project);
+        });
+        let variants = project.name_variants.get(&entry.key).map_or(0, |v| v.chr0.is_some() as usize + v.chr1.is_some() as usize + v.chr2.is_some() as usize);
+        egui::CollapsingHeader::new(title("A different name per screen", variants)).id_salt(format!("name_variants_{}", entry.key.as_str())).show(ui, |ui| {
             self.draw_name_variants(ui, entry, project);
         });
 
@@ -1370,11 +1239,7 @@ impl CssView {
     }
 
     fn draw_name_variants(&mut self, ui: &mut Ui, entry: &RosterEntry, project: &mut RosterMod) {
-        ui.label(
-            RichText::new("Display writes chr0/chr1/chr2 together; these let them differ.")
-                .small()
-                .weak(),
-        );
+        
         ui.add_space(4.0);
         let variants = project
             .name_variants
@@ -1394,7 +1259,7 @@ impl CssView {
             .num_columns(3)
             .spacing([6.0, 4.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("chr0").small().monospace().weak());
+                ui.label(RichText::new("In menus").small().weak());
                 let r0 = ui.add(
                     egui::TextEdit::singleline(&mut chr0)
                         .desired_width(140.0)
@@ -1402,7 +1267,7 @@ impl CssView {
                 );
                 ui.label(RichText::new("CSS banner").small().weak());
                 ui.end_row();
-                ui.label(RichText::new("chr1").small().monospace().weak());
+                ui.label(RichText::new("Select screen").small().weak());
                 let r1 = ui.add(
                     egui::TextEdit::singleline(&mut chr1)
                         .desired_width(140.0)
@@ -1410,7 +1275,7 @@ impl CssView {
                 );
                 ui.label(RichText::new("Stock / results").small().weak());
                 ui.end_row();
-                ui.label(RichText::new("chr2").small().monospace().weak());
+                ui.label(RichText::new("In capitals").small().weak());
                 let r2 = ui.add(
                     egui::TextEdit::singleline(&mut chr2)
                         .desired_width(140.0)
@@ -1474,13 +1339,7 @@ impl CssView {
             .find(|a| a.key == entry.key)
             .and_then(|a| a.files_root.clone());
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(
-                    "M model · A anims · E effect · P portrait. Dim = missing, hover for counts",
-                )
-                .small()
-                .weak(),
-            );
+            
             if let Some(root) = files_root {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -2060,7 +1919,7 @@ impl CssView {
                         .iter()
                         .map(|s| format!("c{s:02}"))
                         .collect::<Vec<_>>()
-                        .join(" · ");
+                        .join(", ");
                     ui.colored_label(
                         Color32::from_rgb(130, 225, 150),
                         RichText::new(format!("set {list}")).small(),
@@ -2219,19 +2078,7 @@ impl CssView {
             });
         });
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("⌕").small().weak());
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.bulk_filter)
-                    .desired_width(130.0)
-                    .hint_text("Find a character"),
-            );
-            if !self.bulk_filter.is_empty() && ui.small_button(RichText::new("x").small()).clicked()
-            {
-                self.bulk_filter.clear();
-                resp.request_focus();
-            }
-        });
+        crate::ui::search_field(ui, "roster_names_search", &mut self.bulk_filter, "Find a character");
         ui.add_space(4.0);
 
         let query = self.bulk_filter.clone();
@@ -2298,201 +2145,81 @@ impl CssView {
             });
     }
 
+    /// Every character that is not on the screen: the ones this project hid, to bring back,
+    /// and the ones the game never shows (bosses, the parts of a character), to add.
     fn draw_off_roster(&mut self, ui: &mut Ui, index: &RosterIndex, project: &mut RosterMod) {
+        let look = crate::ui::look(ui);
         if self.focus_off_roster {
             self.focus_off_roster = false;
-            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover())
-                .scroll_to_me(Some(egui::Align::TOP));
+            ui.allocate_response(egui::Vec2::ZERO, egui::Sense::hover()).scroll_to_me(Some(egui::Align::TOP));
         }
         let mut entries = index.off_roster();
-        // Also expose the second half of a shared-order cell (Aegis) as addable
+        // The half of a shared cell that is not its face (Mythra) can be added on its own too.
         let raw = index.visible();
-        let filtered = filtered_visible(raw.clone());
+        let faces = filtered_visible(raw.clone());
         for e in raw {
-            if !filtered.iter().any(|f| f.key == e.key) && !entries.iter().any(|x| x.key == e.key) {
+            let mii_cell = e.name_id.as_deref() == Some("miiall");
+            if !mii_cell && !faces.iter().any(|f| f.key == e.key) && !entries.iter().any(|x| x.key == e.key) {
                 entries.push(e);
             }
         }
         entries.sort_by_key(|e| (e.css_order.is_none(), e.css_order.unwrap_or(0), e.id.0));
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(format!("Off-roster ({})", entries.len())).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("⌕").small().weak());
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.off_roster_filter)
-                        .desired_width(130.0)
-                        .hint_text("Find a character"),
-                );
-                if !self.off_roster_filter.is_empty()
-                    && ui.small_button(RichText::new("x").small()).clicked()
-                {
-                    self.off_roster_filter.clear();
-                    resp.request_focus();
-                }
-            });
-        });
+        ui.label(RichText::new("Not on the screen").size(19.0).strong().color(look.text));
+        crate::ui::search_field(ui, "roster_off_search", &mut self.off_roster_filter, "Find a character");
         ui.add_space(4.0);
-        if entries.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Full house").strong());
-                ui.label(
-                    RichText::new("Everyone is on the select screen. Hide someone above and they will wait for you here.")
-                        .small()
-                        .weak(),
-                );
-            });
-            return;
-        }
-
         let query = self.off_roster_filter.clone();
-        let shown: Vec<&&RosterEntry> = entries
-            .iter()
-            .filter(|e| matches_grid_filter(e, &query))
-            .collect();
-        if shown.is_empty() {
-            ui.label(
-                RichText::new(format!("No off-roster characters match “{}”", query.trim()))
-                    .small()
-                    .weak(),
-            );
+        let (hidden, never): (Vec<&RosterEntry>, Vec<&RosterEntry>) = entries.into_iter().filter(|e| matches_grid_filter(e, &query)).partition(|e| e.hidden);
+        if hidden.is_empty() && never.is_empty() {
+            ui.label(RichText::new("None found.").color(look.dim));
             return;
         }
-
-        // Two groups, dense one-line rows: what you hid (with Restore all)
-        // reads separately from what was never on the screen.
-        let (hidden, not_on_screen): (Vec<&&RosterEntry>, Vec<&&RosterEntry>) =
-            shown.into_iter().partition(|e| e.hidden);
-        egui::ScrollArea::vertical()
-            .id_salt("roster_css_off")
-            .max_height(230.0)
-            .show(ui, |ui| {
-                if !hidden.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(format!("Hidden by this project ({})", hidden.len()))
-                                .small()
-                                .strong(),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui
-                                    .small_button(RichText::new("Restore all").small())
-                                    .on_hover_text("Bring every hidden character back")
-                                    .clicked()
-                                {
-                                    for e in &hidden {
-                                        project.hidden.remove(&e.key);
-                                    }
-                                    self.status = format!(
-                                        "Restored {} hidden character{}.",
-                                        hidden.len(),
-                                        if hidden.len() == 1 { "" } else { "s" }
-                                    );
-                                }
-                            },
-                        );
-                    });
-                    for entry in &hidden {
-                        let key = entry.key.clone();
-                        let name = entry.display_name.clone();
-                        let detail = match entry.css_order {
-                            Some(o) => format!("was pos {o}"),
-                            None => "no position".to_string(),
-                        };
-                        let row = ui.horizontal(|ui| {
-                            ui.label(RichText::new(elide(&name, 24)).small().strong())
-                                .on_hover_text(format!("{key}. Double-click to restore"));
-                            ui.label(RichText::new(detail).small().weak());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new("Restore").small().strong(),
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        project.hidden.remove(&key);
-                                        self.status = format!("Restored {name}.");
-                                    }
-                                },
-                            );
-                        });
-                        if row.response.double_clicked() {
-                            project.hidden.remove(&key);
-                            self.status = format!("Restored {name}.");
+        let row = |ui: &mut Ui, name: &str, note: &str, button: &str, hover: &str| -> bool {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(elide(name, 22)).strong().color(look.text));
+                ui.label(RichText::new(note).color(look.dim));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::ui::act(ui, look, button, None).on_hover_text(hover).clicked()).inner
+            })
+            .inner
+        };
+        egui::ScrollArea::vertical().id_salt("roster_css_off").max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
+            if !hidden.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Hidden by this project ({})", hidden.len())).strong().color(look.dim));
+                    if crate::ui::act(ui, look, "Bring all back", None).clicked() {
+                        for e in &hidden {
+                            project.hidden.remove(&e.key);
                         }
+                        self.status = format!("Brought back {} hidden characters.", hidden.len());
                     }
-                    ui.add_space(4.0);
-                }
-
-                if !not_on_screen.is_empty() {
-                    ui.label(
-                        RichText::new(format!(
-                            "Not on the select screen ({})",
-                            not_on_screen.len()
-                        ))
-                        .small()
-                        .strong(),
-                    );
-                    for entry in &not_on_screen {
-                        let key = entry.key.clone();
-                        let name = entry.display_name.clone();
-                        let has_row = entry.name_id.is_some();
-                        let row = ui.horizontal(|ui| {
-                            ui.label(RichText::new(elide(&name, 24)).small().strong())
-                                .on_hover_text(if has_row {
-                                    format!("{key}. Double-click to add")
-                                } else {
-                                    key.as_str().to_string()
-                                });
-                            ui.label(
-                                RichText::new(entry.origin.label().to_ascii_lowercase())
-                                    .small()
-                                    .weak(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if has_row {
-                                        if ui
-                                            .add(egui::Button::new(RichText::new("Add").small()))
-                                            .on_hover_text("Put this character on the select screen")
-                                            .clicked()
-                                        {
-                                            let next = next_free_order(index);
-                                            project.order.insert(key.clone(), next);
-                                            project.hidden.remove(&key);
-                                            self.order_drafts.remove(&key);
-                                            self.status =
-                                                format!("Added {name} at position {next}.");
-                                        }
-                                    } else if ui
-                                        .small_button(RichText::new("New character →").small())
-                                        .on_hover_text(
-                                            "This fighter has no select-screen row. Create it as a new character",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.goto_new_character_tab = true;
-                                    }
-                                },
-                            );
-                        });
-                        if has_row && row.response.double_clicked() {
-                            let next = next_free_order(index);
-                            project.order.insert(key.clone(), next);
-                            project.hidden.remove(&key);
-                            self.order_drafts.remove(&key);
-                            self.status = format!("Added {name} at position {next}.");
-                        }
+                });
+                for entry in &hidden {
+                    let note = entry.css_order.map_or(String::new(), |order| format!("place {order}"));
+                    if row(ui, &entry.display_name, &note, "Bring back", "Put it back on the select screen") {
+                        project.hidden.remove(&entry.key);
+                        self.status = format!("Brought back {}.", entry.display_name);
                     }
                 }
-            });
+                ui.add_space(6.0);
+            }
+            if !never.is_empty() {
+                ui.label(RichText::new(format!("Never shown by the game ({})", never.len())).strong().color(look.dim));
+                for entry in &never {
+                    let note = entry.name_id.as_deref().and_then(part_of).unwrap_or("");
+                    if entry.name_id.is_none() {
+                        if row(ui, &entry.display_name, "no entry", "New character", "This fighter has no select screen entry. Make one on the New character page.") {
+                            self.goto_new_character_tab = true;
+                        }
+                    } else if row(ui, &entry.display_name, note, "Add", "Put it on the select screen, after the last character") {
+                        let next = next_free_order(index);
+                        project.order.insert(entry.key.clone(), next);
+                        project.hidden.remove(&entry.key);
+                        self.order_drafts.remove(&entry.key);
+                        self.status = format!("Added {} at place {next}.", entry.display_name);
+                    }
+                }
+            }
+        });
     }
 
     /// Hide the selected entries. Restoring happens in the off-roster
@@ -2768,33 +2495,18 @@ mod tests {
     /// fit with no leftover gap. A filler column or a sideways scrollbar
     /// would mean the math drifted from what the grid draws.
     #[test]
-    fn the_grid_fills_its_row_at_any_width() {
-        for width in [500.0, 860.0, 1180.0, 1600.0, 2400.0] {
-            let (cols, cell_w) = grid_layout(width);
-            assert!(
-                (GRID_COLUMNS_MIN..=GRID_COLUMNS_MAX).contains(&cols),
-                "width {width}: {cols} columns"
-            );
-            let used = cols as f32 * cell_w + (cols - 1) as f32 * GRID_SPACING;
-            assert!(
-                (used - (width - 4.0)).abs() < 1.0,
-                "width {width}: cells use {used}"
-            );
-            assert!(cell_w >= CELL_MIN_W, "width {width}: cell {cell_w}");
+    fn thirteen_cells_fill_the_row_until_they_would_be_too_small_to_read() {
+        for width in [800.0_f32, 1100.0, 1400.0, 1900.0] {
+            let cell = cell_width(width);
+            let row = GAME_COLUMNS as f32 * cell + (GAME_COLUMNS - 1) as f32 * GRID_SPACING;
+            assert!(row <= width - 3.9 && row > width - 4.1, "{width}: row of {row}");
         }
+        // Narrower than that the cells stop shrinking and the grid scrolls; wider, they stop
+        // growing and the page keeps its margins.
+        assert_eq!(cell_width(300.0), CELL_MIN_W);
+        assert_eq!(cell_width(4000.0), CELL_MAX_W);
     }
 
-    /// Absurdly narrow windows bottom out at readable cells rather than
-    /// shrinking to nothing; the scroller is the last resort, not the first.
-    #[test]
-    fn tiny_windows_keep_readable_cells() {
-        let (cols, cell_w) = grid_layout(150.0);
-        assert_eq!(cols, GRID_COLUMNS_MIN);
-        assert_eq!(cell_w, CELL_MIN_W);
-    }
-
-    /// The filter matches what a user would type: display name, key, or the
-    /// internal name_id — and an empty query shows everything.
     #[test]
     fn the_grid_filter_matches_names_keys_and_name_ids() {
         let mut jiggs = entry("purin", 5);

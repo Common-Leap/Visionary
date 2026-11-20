@@ -114,11 +114,9 @@ impl NewCharacterView {
             ui.vertical(|ui| {
                 let name = self.display_name.trim();
                 ui.label(RichText::new(if name.is_empty() { "New character" } else { name }).size(26.0).strong().color(look.text));
-                let line = match &base {
-                    Some(base) => format!("Plays as {base}"),
-                    None => "Pick the fighter it plays as".to_owned(),
-                };
-                ui.label(RichText::new(line).size(15.0).color(look.dim));
+                if let Some(base) = &base {
+                    ui.label(RichText::new(format!("Plays as {base}")).size(15.0).color(look.dim));
+                }
             });
         });
         ui.add_space(10.0);
@@ -145,9 +143,7 @@ impl NewCharacterView {
                         self.show_slot_map = !self.show_slot_map;
                     }
                 }
-                None => {
-                    ui.label(RichText::new("of the fighter you pick").color(look.dim));
-                }
+                None => {}
             }
         });
         if range.is_some() {
@@ -210,7 +206,10 @@ impl NewCharacterView {
         let mut action = NewCharacterAction::None;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(reason.is_none(), |ui| {
-                if act(ui, look, "Create character", Some(look.accent)).clicked() {
+                let create = act(ui, look, "Create character", Some(look.accent)).on_hover_text(
+                    "Copies the base fighter's model, animations, effects, sounds and portraits into the character's own folder. Its own place on the select screen needs the CSK Collection plugin in the game.",
+                );
+                if create.clicked() {
                     if let Some(home) = &home {
                         action = self.build_create_action(project, home.clone());
                     }
@@ -220,20 +219,6 @@ impl NewCharacterView {
                 ui.label(RichText::new(reason).color(look.dim));
             }
         });
-        ui.add_space(10.0);
-        if let Some(base) = &base {
-            ui.label(
-                RichText::new(format!(
-                    "It starts as a copy of {base}: model, animations, effects, sounds and portraits go into its own folder, and it gets its own place on the select screen."
-                ))
-                .color(look.dim),
-            );
-            ui.add_space(4.0);
-        }
-        ui.label(
-            RichText::new("Its own place on the select screen needs the CSK Collection plugin on the SD card. Without it the game shows the entry in the base fighter's costumes.")
-                .color(look.dim),
-        );
         if let Some(error) = &self.error {
             ui.add_space(8.0);
             ui.label(RichText::new(error).color(Color32::from_rgb(255, 120, 120)));
@@ -306,7 +291,6 @@ impl NewCharacterView {
                     }
                 });
             }
-            ui.label(RichText::new("Green is yours, white is free, grey is in use.").color(look.dim));
         });
     }
 

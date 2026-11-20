@@ -64,25 +64,7 @@ impl TraitsView {
         // Header with picker and global controls — same group styling as the main editor
         self.draw_traits_header(ui, index, params);
         let Some(key) = self.selected.clone() else {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Pick a character").size(13.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Choose a fighter above to change its weight, speed, jumps, shield and more.")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("Values are per fighter, not per costume. A new character that shares a donor shares all of them.")
-                                .small()
-                                .weak(),
-                        );
-                    });
-                });
+            ui.label(RichText::new("No fighter picked").size(19.0).strong().color(crate::ui::look(ui).dim));
             return;
         };
         let Some(entry) = index.by_key(&key) else {
@@ -392,11 +374,6 @@ impl TraitsView {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(format!("No fields match \"{}\"", self.filter)).weak());
-                ui.label(
-                    RichText::new("Try a shorter term or clear the filter.")
-                        .small()
-                        .weak(),
-                );
             });
         }
     }

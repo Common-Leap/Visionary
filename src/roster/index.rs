@@ -351,6 +351,8 @@ fn display_name_for(
     }
     match fighter {
         Some(fighter) => fighter.display_name.clone(),
+        // The one cell for the three Mii Fighters, shown when echo fighters are stacked.
+        None if row.name_id == "miiall" => "Mii Fighter".to_owned(),
         None => crate::data::fighter_display_name(&row.name_id),
     }
 }

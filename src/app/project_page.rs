@@ -221,13 +221,8 @@ fn effect_group(rel: &str) -> &'static str {
     }
 }
 
-fn section_title(ui: &mut Ui, look: Look, title: &str, note: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(21.0).strong().color(look.text));
-        if !note.is_empty() {
-            ui.label(RichText::new(note).color(look.dim));
-        }
-    });
+fn section_title(ui: &mut Ui, look: Look, title: &str) {
+    ui.label(RichText::new(title).size(21.0).strong().color(look.text));
 }
 
 #[derive(Clone, Copy)]
@@ -262,8 +257,13 @@ fn game_tile(ui: &mut Ui, look: Look, icon: Tile, title: &str, line: &str, chang
         }
     }
     let x = badge.right() + 12.0;
-    painter.text(egui::pos2(x, rect.top() + 12.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(18.0), look.text);
-    painter.text(egui::pos2(x, rect.top() + 36.0), egui::Align2::LEFT_TOP, line, egui::FontId::proportional(14.0), look.dim);
+    // The title sits alone until the project changes something here.
+    if line.is_empty() {
+        painter.text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(18.0), look.text);
+    } else {
+        painter.text(egui::pos2(x, rect.top() + 12.0), egui::Align2::LEFT_TOP, title, egui::FontId::proportional(18.0), look.text);
+        painter.text(egui::pos2(x, rect.top() + 36.0), egui::Align2::LEFT_TOP, line, egui::FontId::proportional(14.0), look.dim);
+    }
     response
 }
 
@@ -478,7 +478,7 @@ impl VisionaryApp {
         let columns = ((width / CARD_WIDTH) as usize).clamp(1, 3);
         let card_width = (width / columns as f32 - 10.0).min(CARD_WIDTH * 1.25);
 
-        section_title(ui, look, "Across the game", "Edits that belong to no single fighter");
+        section_title(ui, look, "Across the game");
         self.draw_game_tiles(ui, look, &parts, &mut actions);
         if self.project_open_part.as_ref().is_some_and(|(key, _)| key == OTHER_EFFECTS) {
             ui.add_space(8.0);
@@ -490,7 +490,7 @@ impl VisionaryApp {
         ui.add_space(18.0);
 
         ui.horizontal(|ui| {
-            section_title(ui, look, "Characters", "");
+            section_title(ui, look, "Characters");
             ui.add_space(12.0);
             let shown: BTreeSet<&str> = cards.iter().map(|card| card.fighter.as_str()).collect();
             egui::ComboBox::from_id_salt("project_add_character")
@@ -807,14 +807,14 @@ impl VisionaryApp {
                 }
             }
             match (groups.is_empty(), picked) {
-                (true, false) => "Shared, item and stage effects".to_owned(),
+                (true, false) => String::new(),
                 (true, true) => "From your folder".to_owned(),
                 (false, _) => groups.join(", "),
             }
         };
         let summary = self.roster.export_summary();
         let screen = match (summary.order, summary.hidden, summary.names) {
-            (0, 0, 0) => "As in the game".to_owned(),
+            (0, 0, 0) => String::new(),
             (order, hidden, names) => [(order, "moved"), (hidden, "hidden"), (names, "renamed")]
                 .iter()
                 .filter(|(n, _)| *n > 0)
@@ -823,12 +823,12 @@ impl VisionaryApp {
                 .join(", "),
         };
         let values = match summary.params {
-            0 => "As in the game".to_owned(),
+            0 => String::new(),
             1 => "1 value changed".to_owned(),
             n => format!("{n} values changed"),
         };
         let mods = match self.roster.enabled_roots().len() {
-            0 => "None turned on".to_owned(),
+            0 => String::new(),
             1 => "1 turned on".to_owned(),
             n => format!("{n} turned on"),
         };
@@ -866,7 +866,6 @@ impl VisionaryApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new("Effects of no fighter").size(19.0).strong().color(look.text));
-                ui.label(RichText::new("Hit sparks, dust and other shared effects, items and stages. Open one to edit it.").color(look.dim));
                 ui.add_space(6.0);
                 for group in EFFECT_GROUPS {
                     let files: Vec<&String> = edited.iter().filter(|(g, _)| *g == group).map(|(_, rel)| rel).collect();
@@ -884,9 +883,6 @@ impl VisionaryApp {
                         });
                     }
                     ui.add_space(4.0);
-                }
-                if edited.is_empty() {
-                    ui.label(RichText::new("None edited yet.").color(look.dim));
                 }
                 if let Some(dir) = &picked {
                     ui.horizontal_wrapped(|ui| {

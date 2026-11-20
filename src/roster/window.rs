@@ -841,15 +841,13 @@ impl RosterWindow {
         self.draw_notes(ui);
 
         if self.library.is_empty() {
-            ui.label(RichText::new("No mods added yet. Mods you add here show up in the fighter list with their skins and effects.").color(look.dim));
+            ui.label(RichText::new("No mods added").color(look.dim));
             self.draw_stale_overrides(ui);
             return;
         }
 
         self.draw_stale_overrides(ui);
         self.draw_conflicts(ui);
-        ui.add_space(6.0);
-        ui.label(RichText::new("Load order: when two mods change the same file, the one lower in the list wins.").color(look.dim));
         ui.add_space(6.0);
         self.draw_mod_rows(ui);
     }
@@ -991,13 +989,6 @@ impl RosterWindow {
         let by_fighter = self.library.conflicts_by_fighter();
         let total: usize = by_fighter.values().map(|list| list.len()).sum();
         if total == 0 {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("No file conflicts between enabled mods.")
-                        .small()
-                        .weak(),
-                );
-            });
             return;
         }
         egui::Frame::group(ui.style())

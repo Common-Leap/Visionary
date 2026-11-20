@@ -83,9 +83,34 @@ pub struct CharaRow {
     pub can_select: bool,
     /// Number of costume slots the select screen offers for this character.
     pub color_num: u8,
+    /// How the entry takes part in echo stacking; see [`Stacking`].
+    pub fighter_type: u64,
+    /// The entry this one is paired with: an echo's base, a base's echo.
+    pub alt_chara_id: u64,
+}
+
+/// An entry's part in the game's "Echo Fighters: Stacked / Separate" option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stacking {
+    /// Always shown.
+    Always,
+    /// Only with echoes separate: an echo, and each of the three Mii Fighters.
+    SeparateOnly,
+    /// Only with echoes stacked: the one Mii Fighter cell.
+    StackedOnly,
 }
 
 impl CharaRow {
+    pub fn stacking(&self) -> Stacking {
+        if self.fighter_type == hash40::hash40("fighter_type_opened").0 {
+            Stacking::SeparateOnly
+        } else if self.fighter_type == hash40::hash40("fighter_type_closed").0 {
+            Stacking::StackedOnly
+        } else {
+            Stacking::Always
+        }
+    }
+
     /// True when this entry occupies a cell on the select screen.
     pub fn on_roster(&self) -> bool {
         self.disp_order != OFF_ROSTER && self.disp_order != RANDOM_SLOT_ORDER && self.can_select
@@ -121,6 +146,7 @@ impl CharaDb {
         Ok(db)
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -308,6 +334,8 @@ impl CharaDb {
                 save_no: i8_field(entry, "save_no").unwrap_or(OFF_ROSTER),
                 can_select: bool_field(entry, "can_select").unwrap_or(false),
                 color_num: u8_field(entry, "color_num").unwrap_or(0),
+                fighter_type: hash_field(entry, "fighter_type").unwrap_or(0),
+                alt_chara_id: hash_field(entry, "alt_chara_id").unwrap_or(0),
             });
         }
     }

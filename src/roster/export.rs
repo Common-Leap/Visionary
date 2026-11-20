@@ -386,7 +386,7 @@ pub fn export_roster(
                 labels.insert(hash40::hash40(css::COLOR_START_FIELD).0, css::COLOR_START_FIELD.to_owned());
                 let labels = &labels;
                 let patch_path = |file: &str| Path::new(file).with_extension(css::PATCH_EXTENSION).to_string_lossy().replace('\\', "/");
-                let mut write_patch = |file: &str, xml: String, report: &mut RosterExport| -> Result<()> {
+                let write_patch = |file: &str, xml: String, report: &mut RosterExport| -> Result<()> {
                     let relative = patch_path(file);
                     let destination = mod_root.join(&relative);
                     if let Some(parent) = destination.parent() {
