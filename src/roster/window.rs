@@ -202,8 +202,9 @@ pub struct RosterWindow {
     was_open: bool,
     /// A page asked for a tab this frame; coming back keeps that one.
     tab_requested: bool,
-    /// See [`RosterWindow::take_settled_status`].
-    settled_status: Option<String>,
+    /// See [`RosterWindow::take_settled_status`]: what to say, and whether the change that
+    /// rebuilds the fighter list has been seen yet.
+    settled_status: Option<(String, bool)>,
     /// hash40 → parameter field name, supplied by `app.rs` from the label download. The
     /// parameter files store hashes, and the full-field view has nothing to show without them.
     labels: std::collections::HashMap<u64, String>,
@@ -515,10 +516,12 @@ impl RosterWindow {
     /// What to tell the author once the fighter list has been rebuilt, for a change that
     /// rebuilds it (the rebuild says what it found, over anything said before it).
     pub fn take_settled_status(&mut self) -> Option<String> {
-        if self.library_dirty {
-            return None;
+        match &self.settled_status {
+            Some((_, true)) if !self.library_dirty => {
+                self.settled_status.take().map(|(said, _)| said)
+            }
+            _ => None,
         }
-        self.settled_status.take()
     }
 
     /// The name a character shows on the select screen: a rename, else its own name.
@@ -773,6 +776,9 @@ impl RosterWindow {
         }
         self.project_roots = roots;
         self.library_dirty = true;
+        if let Some((_, seen)) = &mut self.settled_status {
+            *seen = true;
+        }
     }
 
     /// The Characters page, drawn in the main window.
@@ -1012,7 +1018,7 @@ impl RosterWindow {
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
                 let said = format!("Removed {name}. Its files are still in its folder.");
-                self.settled_status = Some(said.clone());
+                self.settled_status = Some((said.clone(), false));
                 Some(said)
             }
         }
@@ -1816,9 +1822,20 @@ mod project_root_tests {
         assert!(window.enabled_roots().is_empty());
         assert!(window.made_folders().is_empty());
         // The fighter list is rebuilt first, and that says what it found; the removal is said
-        // after it, or it is never seen.
+        // after it, or it is never seen. Before the change reaches the roots it is not said...
+        let mut fresh = RosterWindow::default();
+        fresh
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        fresh.set_project_dir(Some(dir.path().to_path_buf()));
+        fresh.library_dirty = false;
+        fresh.handle_new_character(NewCharacterAction::Remove(key.clone()));
+        assert_eq!(fresh.take_settled_status(), None);
+        // ...nor while the list is being rebuilt...
         assert!(window.library_dirty);
         assert_eq!(window.take_settled_status(), None);
+        // ...only once it has been.
         window.library_dirty = false;
         assert_eq!(
             window.take_settled_status().as_deref(),
