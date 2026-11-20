@@ -1521,6 +1521,23 @@ impl CssView {
             &crate::data::discover_costume_slots(roots, fighter),
             project.per_costume_names.get(fighter),
         );
+        // A character made on this fighter owns its costumes: they are listed on its own
+        // entry, and only there.
+        let owned = |slot: &u8| {
+            project
+                .authored
+                .iter()
+                .any(|made| made.donor == fighter && made.all_slots().contains(slot))
+        };
+        let slots: Vec<u8> = if entry.backing.shares_engine_fighter() {
+            let own = entry.backing.all_slots();
+            slots
+                .into_iter()
+                .filter(|slot| own.contains(slot))
+                .collect()
+        } else {
+            slots.into_iter().filter(|slot| !owned(slot)).collect()
+        };
         if slots.is_empty() {
             ui.label(
                 RichText::new(format!(

@@ -37,6 +37,8 @@ pub struct TraitsView {
     status: String,
     /// Inside width of a value card, set so a row of cards spans the page.
     card_width: f32,
+    /// Another page picked the fighter: bring it into view in the list once.
+    reveal_selected: bool,
 }
 
 impl TraitsView {
@@ -44,6 +46,7 @@ impl TraitsView {
     /// Show `key`'s values next.
     pub fn select(&mut self, key: RosterKey) {
         self.selected = Some(key);
+        self.reveal_selected = true;
     }
 
     pub fn invalidate(&mut self) {
@@ -175,6 +178,9 @@ impl TraitsView {
                             egui::FontId::proportional(14.0),
                             look.accent,
                         );
+                    }
+                    if picked && std::mem::take(&mut self.reveal_selected) {
+                        response.scroll_to_me(Some(egui::Align::Center));
                     }
                     if response.clicked() {
                         self.selected = Some(entry.key.clone());

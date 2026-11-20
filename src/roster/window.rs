@@ -66,7 +66,7 @@ impl RosterTab {
             Self::CharacterSelect => {
                 let n = window.project.order.len()
                     + window.project.hidden.len()
-                    + window.project.names.len()
+                    + window.renamed_count()
                     + window.project.name_variants.len()
                     + window
                         .project
@@ -202,6 +202,8 @@ pub struct RosterWindow {
     was_open: bool,
     /// A page asked for a tab this frame; coming back keeps that one.
     tab_requested: bool,
+    /// See [`RosterWindow::take_settled_status`].
+    settled_status: Option<String>,
     /// hash40 → parameter field name, supplied by `app.rs` from the label download. The
     /// parameter files store hashes, and the full-field view has nothing to show without them.
     labels: std::collections::HashMap<u64, String>,
@@ -239,6 +241,7 @@ impl Default for RosterWindow {
             project_roots: Vec::new(),
             was_open: false,
             tab_requested: false,
+            settled_status: None,
             labels: Default::default(),
         }
     }
@@ -493,10 +496,29 @@ impl RosterWindow {
             .map(|entry| entry.key.clone())
     }
 
-    /// Make move edits go to `key`'s costumes alone, or (with `None`) to every costume.
-    /// Set by the Project page when it opens a character in an editor.
-    pub fn set_edit_target(&mut self, key: Option<RosterKey>) {
-        self.edit_target = key;
+    /// Select screen names the project changes. A made character's own name is recorded as a
+    /// name too, so the game reads it, but it is not a rename.
+    fn renamed_count(&self) -> usize {
+        self.project
+            .names
+            .iter()
+            .filter(|(key, name)| {
+                !self
+                    .project
+                    .authored
+                    .iter()
+                    .any(|made| &made.key == *key && made.display_name == **name)
+            })
+            .count()
+    }
+
+    /// What to tell the author once the fighter list has been rebuilt, for a change that
+    /// rebuilds it (the rebuild says what it found, over anything said before it).
+    pub fn take_settled_status(&mut self) -> Option<String> {
+        if self.library_dirty {
+            return None;
+        }
+        self.settled_status.take()
     }
 
     /// The name a character shows on the select screen: a rename, else its own name.
@@ -653,7 +675,7 @@ impl RosterWindow {
     pub fn export_summary(&self) -> RosterExportSummary {
         let order = self.project.order.len();
         let hidden = self.project.hidden.len();
-        let names = self.project.names.len()
+        let names = self.renamed_count()
             + self.project.name_variants.len()
             + self
                 .project
@@ -989,9 +1011,9 @@ impl RosterWindow {
                 self.project.hidden.remove(&key);
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
-                Some(format!(
-                    "Removed {name}. Its files are still in its folder."
-                ))
+                let said = format!("Removed {name}. Its files are still in its folder.");
+                self.settled_status = Some(said.clone());
+                Some(said)
             }
         }
     }
@@ -1793,6 +1815,39 @@ mod project_root_tests {
         window.set_project_dir(Some(dir.path().to_path_buf()));
         assert!(window.enabled_roots().is_empty());
         assert!(window.made_folders().is_empty());
+        // The fighter list is rebuilt first, and that says what it found; the removal is said
+        // after it, or it is never seen.
+        assert!(window.library_dirty);
+        assert_eq!(window.take_settled_status(), None);
+        window.library_dirty = false;
+        assert_eq!(
+            window.take_settled_status().as_deref(),
+            Some("Removed Vision X. Its files are still in its folder.")
+        );
+        assert_eq!(window.take_settled_status(), None);
+    }
+
+    /// A made character's own name is written as a name so the game shows it; the Select
+    /// screen tile and tab must not call that a rename.
+    #[test]
+    fn a_made_characters_own_name_is_not_a_rename() {
+        let mut window = RosterWindow::default();
+        window
+            .project
+            .authored
+            .push(vision(PathBuf::from("characters/vision")));
+        let key = RosterKey::slot("mario", 8);
+        window.project.names.insert(key.clone(), "Vision".into());
+        assert_eq!(window.export_summary().names, 0);
+        assert_eq!(RosterTab::CharacterSelect.badge_count(&window), None);
+        window.project.names.insert(key, "Nova".into());
+        assert_eq!(window.export_summary().names, 1);
+        window
+            .project
+            .names
+            .insert(RosterKey::fighter("luigi"), "Weegee".into());
+        assert_eq!(window.export_summary().names, 2);
+        assert_eq!(RosterTab::CharacterSelect.badge_count(&window), Some(2));
     }
 
     /// The Fighter values badge, the card's count and the tile all count one way: values of the

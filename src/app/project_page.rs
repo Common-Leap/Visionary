@@ -128,12 +128,16 @@ pub(super) struct CardCounts {
     /// Effects whose look is changed, and effects borrowed from another file.
     pub effects_changed: usize,
     pub effects_borrowed: usize,
+    /// Effect textures replaced, added or removed.
+    pub textures: usize,
     /// Moves whose effects (which effects play, where) are changed.
     pub effect_moves: usize,
     /// Moves whose sounds are changed.
     pub sound_moves: usize,
     /// Fighter values changed, as the Fighter values page counts them.
     pub values: usize,
+    /// Values of the fighter's gimmick files changed.
+    pub gimmick_values: usize,
 }
 
 impl CardCounts {
@@ -308,7 +312,12 @@ fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
                 counted(counts.gimmicks, "gimmick"),
             );
             add(&mut chips, counts.meters, counted(counts.meters, "meter"));
-            counts.gimmicks + counts.meters > 0
+            add(
+                &mut chips,
+                counts.gimmick_values,
+                counted(counts.gimmick_values, "value"),
+            );
+            counts.gimmicks + counts.meters + counts.gimmick_values > 0
         }
         Part::Effects => {
             add(
@@ -323,6 +332,11 @@ fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
             );
             add(
                 &mut chips,
+                counts.textures,
+                counted(counts.textures, "texture"),
+            );
+            add(
+                &mut chips,
                 counts.effect_moves,
                 counted(counts.effect_moves, "move"),
             );
@@ -331,7 +345,8 @@ fn part_summary(part: Part, facts: &CardFacts) -> PartSummary {
             } else if facts.effect_file {
                 chips.push("Own file".into());
             }
-            counts.effects_changed + counts.effects_borrowed + counts.effect_moves > 0
+            counts.effects_changed + counts.effects_borrowed + counts.textures + counts.effect_moves
+                > 0
                 || facts.effect_file
                 || facts.effect_folder
         }
@@ -808,6 +823,9 @@ impl VisionaryApp {
             }
             self.project_parts_cache = workspace.map(|at| (at, parts));
         }
+        if let Some(status) = self.roster.take_settled_status() {
+            self.state.status = status;
+        }
         let made = self.roster.made_folders();
         if let Some((workspace, parts)) = &mut self.project_parts_cache {
             if parts.set_made(made) {
@@ -1149,6 +1167,29 @@ impl VisionaryApp {
         let expressions = moves_of(&mut self.state.expression_script_edits.keys());
         let mut moves: BTreeSet<String> = moves.into_iter().map(str::to_owned).collect();
         moves.extend(expressions);
+        // Moves the game is changed in live: a rule exists only for a changed move.
+        for (key, empty) in self
+            .hitbox_rules_store
+            .iter()
+            .map(|(key, rules)| (key, rules.is_empty()))
+            .chain(
+                self.effect_rules_store
+                    .iter()
+                    .map(|(key, rules)| (key, rules.is_empty())),
+            )
+            .chain(
+                self.effect_control_rules_store
+                    .iter()
+                    .map(|(key, rules)| (key, rules.is_empty())),
+            )
+        {
+            if empty || fighter_of_move_key(key).as_deref() != Some(fighter.as_str()) {
+                continue;
+            }
+            if let Some((_, name)) = key.split_once('/') {
+                moves.insert(name.to_owned());
+            }
+        }
         let mut effect_moves = moves_of(
             &mut self
                 .state
@@ -1167,11 +1208,21 @@ impl VisionaryApp {
                     charts.values().filter(|chart| acts(&chart.graph)).count()
                 }),
             meters: roster.meters.get(&fighter).map_or(0, Vec::len),
-            effects_changed: eff.map_or(0, |eff| eff.authored.len()),
+            effects_changed: eff.map_or(0, |eff| {
+                eff.authored.len() + eff.rosters.len() + eff.entry_edits.len()
+            }),
             effects_borrowed: eff.map_or(0, |eff| eff.transplants.len()),
+            textures: eff.map_or(0, |eff| {
+                eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len()
+            }),
             effect_moves: effect_moves.len(),
             sound_moves: moves_of(&mut self.state.sound_script_edits.keys()).len(),
             values: roster.fighter_value_count(&fighter),
+            gimmick_values: roster.params.get(&fighter).map_or(0, |params| {
+                params
+                    .field_count()
+                    .saturating_sub(roster.fighter_value_count(&fighter))
+            }),
         }
     }
 
@@ -1918,8 +1969,13 @@ impl VisionaryApp {
                 if matches!(part, Part::Model | Part::Animations) {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        if act(ui, look, "Show in game", None)
+                        let online = self.game_link.status()
+                            == crate::game_link::LinkStatus::Connected;
+                        if ui
+                            .add_enabled_ui(online, |ui| act(ui, look, "Show in game", None))
+                            .inner
                             .on_hover_text("The fighter must not hold an item while it loads")
+                            .on_disabled_hover_text("Start the game with the plugin first")
                             .clicked()
                         {
                             actions.push(files(FileAction::Send));
@@ -2232,10 +2288,10 @@ impl VisionaryApp {
             }
             _ => {}
         }
-        // The character opened is the one edited: a made character's own costumes, or the
-        // whole fighter.
-        self.roster
-            .set_edit_target(made.as_ref().map(|entry| entry.key.clone()));
+        // Seam: making the opened character the one edited (a made character's own edits, kept
+        // apart from its base fighter's) is `open_character`'s job. The old edit target is not
+        // set here: saving re-scopes whatever move is open to it, which moved the base
+        // fighter's existing edits onto the made character.
         self.focus_card(&fighter, costume);
         self.roster.open = false;
         self.eff_editor.open = false;
@@ -2504,6 +2560,7 @@ impl VisionaryApp {
         let result: anyhow::Result<Vec<PathBuf>> = match what {
             FileAction::CopyBase(part) => {
                 self.state.status = match self.copy_base_costume(&workspace, &parts, card, part) {
+                    Ok((0, kept)) => format!("{shown} already has all {kept} files."),
                     Ok((copied, 0)) => format!("Copied {} to {shown}.", counted(copied, "file")),
                     Ok((copied, kept)) => format!(
                         "Copied {} to {shown}. Kept {kept} already there.",
@@ -2867,6 +2924,23 @@ mod tests {
         let effects = part_summary(Part::Effects, &made);
         assert!(effects.changed);
         assert_eq!(effects.chips, vec!["Own file"]);
+    }
+
+    /// A card that exists because of an edit lights the part the edit is in: effect textures
+    /// and a gimmick's own values gave a card with every button dark.
+    #[test]
+    fn textures_and_gimmick_values_light_their_part() {
+        let mut base = facts();
+        base.counts.textures = 2;
+        let effects = part_summary(Part::Effects, &base);
+        assert!(effects.changed);
+        assert_eq!(effects.chips, vec!["2 textures"]);
+        base.counts.gimmick_values = 3;
+        let gimmicks = part_summary(Part::Gimmicks, &base);
+        assert!(gimmicks.changed);
+        assert_eq!(gimmicks.chips, vec!["3 values"]);
+        // The fighter values file is counted on its own button, not here.
+        assert!(!part_summary(Part::Values, &base).changed);
     }
 
     #[test]
