@@ -522,6 +522,23 @@ pub struct ScriptSite {
     pub delegate: Option<Delegate>,
 }
 
+/// One smashline status registration in the user's source: `.status(Main, KIND, f)` or
+/// `.on_start(f)`. Articles (fighter objects, projectiles) are agents like any other, so this
+/// is how an article's size, speed and life are found: they live in its status code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusSite {
+    /// The status kind exactly as written (`*WEAPON_X_STATUS_KIND_SHOOT`, `0`); empty for `on_start`.
+    pub kind_expr: String,
+    /// The last path segment of the phase (`Pre`, `Main`, `End`, `Init`, `Exec`, ...), or `Start`
+    /// for `on_start`.
+    pub phase: String,
+    /// The Rust function registered.
+    pub function: String,
+    pub file: PathBuf,
+    /// The function item, from its line start through its closing brace.
+    pub span: Range<usize>,
+}
+
 /// The shared implementation a forwarding script calls, as this caller sees it.
 ///
 /// The wrapper itself has no body worth showing, so reads use the callee's body with this
@@ -687,6 +704,10 @@ pub struct SourceIndex {
     /// way, so its scripts are that slot character's, and vanilla Falco's own slots keep the
     /// game's. See [`scan_agent_gating`].
     pub costume_gated: HashSet<String>,
+    /// Agent (`dedede_fireball`, `pacman`) -> the status scripts the project registers on it.
+    /// Registrations made on a parameter agent (`fn install(agent: &mut Agent)`) are not here:
+    /// only the caller knows which agent that is.
+    pub statuses: HashMap<String, Vec<StatusSite>>,
 }
 
 /// Project-wide facts the per-file indexing pass needs.
@@ -904,6 +925,7 @@ impl SourceIndex {
             );
         }
         index.resolve_delegates(&sources);
+        index.index_statuses(&sources);
         index.hash_macros =
             crate::hash_macros::HashMacros::scan(sources.iter().map(|(_, text)| text.as_str()));
         crate::hash_macros::set_current(index.hash_macros.clone());
@@ -1492,6 +1514,60 @@ impl SourceIndex {
                 );
             }
         }
+    }
+
+    /// Record every `.status(..)` / `.on_start(..)` registration made on a known agent. The
+    /// registered function is looked up in its own file first, then project-wide when its name
+    /// is defined exactly once.
+    fn index_statuses(&mut self, sources: &[(PathBuf, String)]) {
+        let mut defined: HashMap<String, Vec<(usize, Range<usize>)>> = HashMap::new();
+        for (n, (_, text)) in sources.iter().enumerate() {
+            for function in scan_plain_functions(text) {
+                defined.entry(function.name).or_default().push((n, function.span));
+            }
+        }
+        for (n, (_, text)) in sources.iter().enumerate() {
+            for registration in scan_status_registrations(text) {
+                let Some(agent) = registration.agent else {
+                    continue;
+                };
+                let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
+                let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
+                let found = match (own.as_slice(), candidates) {
+                    ([one], _) => Some((*one).clone()),
+                    ([], [one]) => Some(one.clone()),
+                    _ => None,
+                };
+                let Some((at, span)) = found else {
+                    continue;
+                };
+                let site = StatusSite {
+                    kind_expr: registration.kind_expr,
+                    phase: registration.phase,
+                    function: registration.function,
+                    file: sources[at].0.clone(),
+                    span,
+                };
+                let sites = self.statuses.entry(agent).or_default();
+                if !sites.contains(&site) {
+                    sites.push(site);
+                }
+            }
+        }
+    }
+
+    /// The status scripts registered on `agent`, each with its function's source text.
+    pub fn status_bodies(&self, agent: &str) -> Vec<(&StatusSite, String)> {
+        let Some(sites) = self.statuses.get(&normalize_fighter(agent)) else {
+            return Vec::new();
+        };
+        sites
+            .iter()
+            .filter_map(|site| {
+                let text = std::fs::read_to_string(&site.file).ok()?;
+                Some((site, text.get(site.span.clone())?.to_string()))
+            })
+            .collect()
     }
 
     fn record_script(&mut self, fighter: &str, script: String, site: ScriptSite) {
@@ -2305,6 +2381,72 @@ fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
     out.into_iter()
         .map(|(_, script, function, agent)| Registration { script, function, agent })
         .collect()
+}
+
+/// One `.status(Phase, KIND, f)` or `.on_start(f)` call.
+struct StatusRegistration {
+    agent: Option<String>,
+    phase: String,
+    kind_expr: String,
+    /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment.
+    function: String,
+}
+
+/// Every `.status(..)` / `.on_start(..)` registration in `text`, in document order, with the
+/// agent each is made on (as [`scan_registrations`] decides it).
+fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
+    let mut out: Vec<(usize, StatusRegistration)> = Vec::new();
+    let boundaries = statement_boundaries(text);
+    let bindings = agent_bindings(text, &boundaries);
+    for marker in [".status(", ".on_start("] {
+        let mut search = 0;
+        while search < text.len() {
+            if !text.is_char_boundary(search) {
+                search += 1;
+                continue;
+            }
+            if let Some(next) = skip_trivia(text, search) {
+                search = next;
+                continue;
+            }
+            if !text[search..].starts_with(marker) {
+                search += 1;
+                continue;
+            }
+            let dot = search;
+            let open = search + marker.len() - 1;
+            search = open + 1;
+            let Some((args, _)) = split_call_args(text, open + 1, text.len()) else {
+                continue;
+            };
+            let (phase, kind_expr, function) = match (marker, args.len()) {
+                (".status(", 3..) => (
+                    text[args[0].clone()].trim(),
+                    text[args[1].clone()].trim(),
+                    text[args[2].clone()].trim(),
+                ),
+                (".on_start(", 1) => ("Start", "", text[args[0].clone()].trim()),
+                _ => continue,
+            };
+            let phase = phase.rsplit("::").next().unwrap_or(phase).trim();
+            let function = function.rsplit("::").next().unwrap_or(function).trim();
+            if !is_identifier(phase) || !is_identifier(function) {
+                continue;
+            }
+            let receiver = &text[statement_start(&boundaries, dot)..dot];
+            out.push((
+                open,
+                StatusRegistration {
+                    agent: receiver_agent(receiver, &bindings),
+                    phase: phase.to_string(),
+                    kind_expr: kind_expr.to_string(),
+                    function: function.to_string(),
+                },
+            ));
+        }
+    }
+    out.sort_by_key(|(at, _)| *at);
+    out.into_iter().map(|(_, registration)| registration).collect()
 }
 
 /// Offsets of every `;`, `{` and `}` outside strings and comments, ascending.
@@ -17237,6 +17379,102 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(after, text);
         assert!(report.skipped.iter().any(|note| note.contains("retimed")));
         assert_eq!(motion_module_set_helper_calculation_sites(text).len(), 1);
+    }
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// King Boo's fireball registers its status scripts on a chained `Agent::new` and keeps the
+    /// speed in the status body: that body is where an article's motion is read from.
+    /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:35,103 (tier 1)
+    #[test]
+    fn indexes_weapon_status_on_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn shoot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 1.5, 0.0);
+    0.into()
+}
+pub fn install() {
+    Agent::new("dedede_fireball").status(Main, *WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT, shoot_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let bodies = index.status_bodies("dedede_fireball");
+        assert_eq!(bodies.len(), 1, "{:?}", index.statuses);
+        let (site, body) = &bodies[0];
+        assert_eq!(site.phase, "Main");
+        assert_eq!(site.kind_expr, "*WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT");
+        assert_eq!(site.function, "shoot_main");
+        assert!(body.contains("sv_kinetic_energy!"), "{body}");
+    }
+
+    /// A bound agent, a function in another file reached by path, the long phase spelling and
+    /// `on_start`.
+    /// Shy-Guy-Moveset · plugin/src/shyguy/articles/trampoline/status/mod.rs:16 and mod.rs:46 (tier 1)
+    #[test]
+    fn indexes_bound_agent_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "jackbox.rs",
+            "pub unsafe extern \"C\" fn jackbox_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+",
+        );
+        put(
+            root,
+            "install.rs",
+            r#"unsafe extern "C" fn trampoline_start(weapon: &mut L2CWeaponCommon) {}
+unsafe extern "C" fn trampoline_init(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    let agent = &mut Agent::new("pacman_trampoline");
+    agent.status(Init, 0, trampoline_init);
+    agent.status(smashline::Main, *WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_JACKBOX, jackbox::jackbox_main);
+    agent.on_start(trampoline_start);
+    agent.install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let sites = &index.statuses["pacman_trampoline"];
+        assert_eq!(sites.len(), 3, "{sites:?}");
+        assert!(sites.iter().any(|s| s.phase == "Init" && s.kind_expr == "0" && s.function == "trampoline_init"));
+        assert!(sites.iter().any(|s| s.phase == "Main" && s.function == "jackbox_main"));
+        assert!(sites.iter().any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
+        assert_eq!(index.status_bodies("pacman_trampoline").len(), 3);
+    }
+
+    /// The fighter's own status registrations never leak onto its article, or the reverse.
+    #[test]
+    fn indexes_fighter_status_not_on_article() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "status.rs",
+            r#"unsafe extern "C" fn fighter_main(fighter: &mut L2CFighterCommon) -> L2CValue { 0.into() }
+unsafe extern "C" fn article_main(weapon: &mut L2CWeaponCommon) -> L2CValue { 0.into() }
+pub fn install() {
+    Agent::new("pacman").status(Main, *FIGHTER_STATUS_KIND_ATTACK, fighter_main).install();
+    Agent::new("pacman_trampoline").status(Main, 0, article_main).install();
+}
+"#,
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let article = &index.statuses["pacman_trampoline"];
+        assert_eq!(article.len(), 1);
+        assert_eq!(article[0].function, "article_main");
+        let fighter = &index.statuses["pacman"];
+        assert_eq!(fighter.len(), 1);
+        assert_eq!(fighter[0].function, "fighter_main");
     }
 }
 
