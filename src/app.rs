@@ -8658,8 +8658,22 @@ impl VisionaryApp {
             {
                 kind = self.object_in_motion(&fighter, &name, kind, motion);
             }
+            // The hand the move's effect is on as the object appears: the flame in Sephiroth's
+            // hand as his flare leaves it.
+            let hand = self
+                .state
+                .effects
+                .iter()
+                .filter(|effect| {
+                    crate::article_preview::HANDS.contains(&effect.bone_name.as_str())
+                        && effect.active_start <= spawned
+                        && (effect.follows_bone || effect.active_end >= spawned)
+                })
+                .max_by_key(|effect| effect.active_start)
+                .map(|effect| effect.bone_name.clone());
             spawns.push(crate::article_preview::Spawn {
                 kind,
+                hand,
                 shown: shown
                     .iter()
                     .filter(|(at, other, _)| other == symbol && alive(*at))
@@ -8824,6 +8838,7 @@ impl VisionaryApp {
                         spawned: 0,
                         removed: None,
                         shot: None,
+                        hand: None,
                         age: 0.0,
                         placement: *at * have.inverse(),
                     });
@@ -8853,6 +8868,7 @@ impl VisionaryApp {
                     spawned: 0,
                     removed: None,
                     shot: None,
+                    hand: None,
                     age: 0.0,
                     placement: *hand * grip.inverse(),
                 });
@@ -8886,6 +8902,7 @@ impl VisionaryApp {
                     spawned: 0,
                     removed: None,
                     shot: None,
+                    hand: None,
                     age: animation_frame,
                     placement,
                 });
@@ -9488,6 +9505,7 @@ impl VisionaryApp {
                         removed: object.removed,
                         shot: object.shot,
                         shown: Vec::new(),
+                        hand: object.hand.clone(),
                     }],
                     at as f32,
                     &|f| (*bones_at(f.max(1.0) as u32)).clone(),
