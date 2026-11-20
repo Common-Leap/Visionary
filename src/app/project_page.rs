@@ -311,8 +311,10 @@ enum Tile {
 }
 
 /// A wide tile: icon, title and one line on what the project changes there.
+#[allow(clippy::too_many_arguments)]
 fn game_tile(
     ui: &mut Ui,
+    width: f32,
     look: Look,
     icon: Tile,
     title: &str,
@@ -324,7 +326,7 @@ fn game_tile(
         Tile::Part(part) => part_colour(part),
         Tile::Mods => Color32::from_rgb(190, 150, 255),
     };
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(300.0, 64.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 64.0), egui::Sense::click());
     let painter = ui.painter();
     painter.rect_filled(rect, 12.0, look.card);
     let edge = if open {
@@ -406,6 +408,8 @@ fn source_chip(from: &str) -> (String, Color32) {
         (format!("Code: {name}"), Color32::from_rgb(90, 175, 255))
     } else if let Some(name) = from.strip_prefix("the mod ") {
         (format!("Mod: {name}"), Color32::from_rgb(190, 150, 255))
+    } else if from == "the base fighter" {
+        ("Base fighter".into(), Color32::from_rgb(150, 154, 164))
     } else {
         ("Game".into(), Color32::from_rgb(150, 154, 164))
     }
@@ -598,6 +602,44 @@ impl VisionaryApp {
         part: Part,
     ) -> (bool, String, String) {
         let fighter = card.fighter.to_ascii_lowercase();
+        // A character made here plays as its base fighter: its moves are the ones edited for its
+        // own costumes; sounds, effects and gimmicks are the fighter's, shown on that card.
+        if card.made_here {
+            return match part {
+                Part::Moves => {
+                    let own = self
+                        .roster
+                        .authored_moves
+                        .get(&card.roster_key)
+                        .map_or(0, |moves| moves.len());
+                    let from = if own > 0 {
+                        "this project"
+                    } else {
+                        "the base fighter"
+                    };
+                    (
+                        own > 0,
+                        from.into(),
+                        format!("{} edited for this character", counted(own, "move")),
+                    )
+                }
+                Part::Model | Part::Animations | Part::SelectScreen => {
+                    self.fighter_part_summary(parts, card, part, &fighter)
+                }
+                _ => (false, "the base fighter".into(), String::new()),
+            };
+        }
+        self.fighter_part_summary(parts, card, part, &fighter)
+    }
+
+    fn fighter_part_summary(
+        &self,
+        parts: &ProjectParts,
+        card: &Card,
+        part: Part,
+        fighter: &str,
+    ) -> (bool, String, String) {
+        let fighter = fighter.to_owned();
         let picked = parts.link(&fighter, part, card.slot);
         let from_folder = |default: &str| {
             picked.map_or(default.to_owned(), |folder| {
@@ -606,12 +648,23 @@ impl VisionaryApp {
         };
         match part {
             Part::Moves => {
-                let moves = self
-                    .state
-                    .edit_log
-                    .entries
-                    .get(&fighter)
-                    .map_or(0, HashMap::len);
+                // An edit scoped only to a made character's costumes is that character's.
+                let made: Vec<u8> = self
+                    .roster
+                    .project
+                    .authored
+                    .iter()
+                    .filter(|authored| authored.donor == fighter)
+                    .flat_map(|authored| authored.all_slots())
+                    .collect();
+                let moves = self.state.edit_log.entries.get(&fighter).map_or(0, |log| {
+                    log.values()
+                        .filter(|record| {
+                            let scopes = record.effective_scopes();
+                            scopes.is_empty() || !scopes.iter().all(|slot| made.contains(slot))
+                        })
+                        .count()
+                });
                 let graphs = self.move_graphs.get(&fighter).map_or(0, BTreeMap::len);
                 let code = self.acmd_src.as_ref().map(|index| index.root.clone());
                 let from = match &code {
@@ -622,7 +675,7 @@ impl VisionaryApp {
                 (
                     moves + graphs > 0,
                     from,
-                    format!("{moves} moves edited, {graphs} with nodes"),
+                    format!("{} edited, {graphs} with nodes", counted(moves, "move")),
                 )
             }
             Part::Effects => {
@@ -630,8 +683,8 @@ impl VisionaryApp {
                 let file = self.project_effect_file(&fighter);
                 let detail = edits.map_or(String::new(), |eff| {
                     format!(
-                        "{} effects edited, {} borrowed",
-                        eff.authored.len(),
+                        "{} edited, {} borrowed",
+                        counted(eff.authored.len(), "effect"),
                         eff.transplants.len()
                     )
                 });
@@ -664,7 +717,11 @@ impl VisionaryApp {
                 (
                     scripts + files > 0,
                     from,
-                    format!("{scripts} moves edited, {files} files"),
+                    format!(
+                        "{} edited, {}",
+                        counted(scripts, "move"),
+                        counted(files, "file")
+                    ),
                 )
             }
             Part::Model | Part::Animations => {
@@ -695,7 +752,11 @@ impl VisionaryApp {
                 let gimmicks = main + charts;
                 let changed = gimmicks + meters > 0;
                 let detail = if changed {
-                    format!("{gimmicks} gimmicks, {meters} meters")
+                    format!(
+                        "{}, {}",
+                        counted(gimmicks, "gimmick"),
+                        counted(meters, "meter")
+                    )
                 } else {
                     String::new()
                 };
@@ -722,7 +783,7 @@ impl VisionaryApp {
                     } else {
                         "the game".into()
                     },
-                    format!("{values} values changed"),
+                    format!("{} changed", counted(values, "value")),
                 )
             }
             Part::SelectScreen => {
@@ -794,7 +855,8 @@ impl VisionaryApp {
         let parts = self.project_parts();
         let width = ui.available_width();
         let columns = ((width / CARD_WIDTH) as usize).clamp(1, 3);
-        let card_width = (width / columns as f32 - 10.0).min(CARD_WIDTH * 1.25);
+        // The cards share the whole row, however many fit.
+        let card_width = (width - 10.0 * (columns as f32 - 1.0)) / columns as f32 - 1.0;
 
         section_title(ui, look, "Across the game");
         self.draw_game_tiles(ui, look, &parts, &mut actions);
@@ -1212,8 +1274,7 @@ impl VisionaryApp {
         };
         let values = match summary.params {
             0 => String::new(),
-            1 => "1 value changed".to_owned(),
-            n => format!("{n} values changed"),
+            n => format!("{} changed", counted(n, "value")),
         };
         let mods = match self.roster.enabled_roots().len() {
             0 => String::new(),
@@ -1247,8 +1308,28 @@ impl VisionaryApp {
                 ),
                 (Tile::Mods, "Installed mods", &mods, false),
             ];
+            // Four to a row when they fit at a readable width, else two, else one; together they
+            // always fill the row.
+            let gap = 10.0;
+            let full = ui.available_width();
+            let per_row = [4.0f32, 2.0, 1.0]
+                .into_iter()
+                .find(|n| (full - gap * (n - 1.0)) / n >= 230.0)
+                .unwrap_or(1.0);
+            let width = ((full - gap * (per_row - 1.0)) / per_row).floor() - 1.0;
             for (index, (icon, title, line, changed)) in tiles.into_iter().enumerate() {
-                if game_tile(ui, look, icon, title, line, changed, index == 0 && open).clicked() {
+                if game_tile(
+                    ui,
+                    width,
+                    look,
+                    icon,
+                    title,
+                    line,
+                    changed,
+                    index == 0 && open,
+                )
+                .clicked()
+                {
                     match index {
                         0 => actions.push(PageAction::Open(OTHER_EFFECTS.into(), Part::Effects)),
                         1 => self.roster.focus_character_select(),
@@ -1483,7 +1564,27 @@ impl VisionaryApp {
                 }
             }
             PageAction::EditValues(fighter) => self.roster.focus_traits_for(&fighter),
-            PageAction::Made(action) => self.roster.handle_new_character(action),
+            PageAction::Made(action) => {
+                // Move edits made for only this character go with it.
+                if let crate::roster::new_character::NewCharacterAction::Remove(key) = &action {
+                    if let Some(made) = self
+                        .roster
+                        .project
+                        .authored
+                        .iter()
+                        .find(|made| &made.key == key)
+                    {
+                        let slots = made.all_slots();
+                        if let Some(log) = self.state.edit_log.entries.get_mut(&made.donor) {
+                            log.retain(|_, record| {
+                                let scopes = record.effective_scopes();
+                                scopes.is_empty() || !scopes.iter().all(|slot| slots.contains(slot))
+                            });
+                        }
+                    }
+                }
+                self.roster.handle_new_character(action);
+            }
             PageAction::EditGimmicks(fighter) => {
                 self.focus_card(&fighter, None);
                 self.roster.open = false;
@@ -1632,7 +1733,10 @@ impl VisionaryApp {
             }
         };
         self.state.status = match result {
-            Ok(files) => format!("Added {} files to {fighter} c{slot:02}.", files.len()),
+            Ok(files) => format!(
+                "Added {} to {fighter} c{slot:02}.",
+                counted(files.len(), "file")
+            ),
             Err(error) => format!("Could not add the files: {error:#}"),
         };
     }
@@ -1727,4 +1831,12 @@ fn copy_part_file(dir: &Path, picked: bool, part: Part, source: &Path) -> anyhow
     let out = dir.join(name);
     std::fs::copy(source, &out)?;
     Ok(out)
+}
+
+fn counted(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }

@@ -504,6 +504,26 @@ impl RosterWindow {
             .cloned()
     }
 
+    /// Every fighter's first portrait, by fighter name.
+    fn faces(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> std::collections::HashMap<String, egui::TextureHandle> {
+        let fighters: Vec<String> = self
+            .index
+            .entries
+            .iter()
+            .filter_map(|entry| entry.fighter.clone())
+            .collect();
+        fighters
+            .into_iter()
+            .filter_map(|fighter| {
+                let face = self.portrait(ctx, &RosterKey::fighter(&fighter), &fighter, 0)?;
+                Some((fighter, face))
+            })
+            .collect()
+    }
+
     /// Show the character select tab next time the window draws.
     pub fn focus_character_select(&mut self) {
         self.tab = RosterTab::CharacterSelect;
@@ -700,8 +720,15 @@ impl RosterWindow {
                             RosterTab::Traits => {
                                 let roots = self.roots.clone();
                                 let labels = std::mem::take(&mut self.labels);
-                                self.traits
-                                    .ui(ui, &roots, &labels, &self.index, &mut self.params);
+                                let faces = self.faces(ui.ctx());
+                                self.traits.ui(
+                                    ui,
+                                    &roots,
+                                    &labels,
+                                    &self.index,
+                                    &mut self.params,
+                                    &faces,
+                                );
                                 self.labels = labels;
                             }
                         }
@@ -826,6 +853,23 @@ impl RosterWindow {
                 if self.edit_target.as_ref() == Some(&key) {
                     self.edit_target = None;
                 }
+                // Its folder was added to the installed mods when it was made; it goes too, or
+                // the character's files would still load and ship.
+                let folder = self
+                    .project
+                    .authored
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .and_then(|entry| entry.files_root.clone());
+                if let Some(folder) = folder {
+                    let before = self.library.mods.len();
+                    self.library.mods.retain(
+                        |entry| !matches!(&entry.source, ModSource::Folder(dir) if *dir == folder),
+                    );
+                    if self.library.mods.len() != before {
+                        self.commit_library_change();
+                    }
+                }
                 self.project.authored.retain(|entry| entry.key != key);
                 self.project.names.remove(&key);
                 self.project.name_variants.remove(&key);
@@ -834,8 +878,7 @@ impl RosterWindow {
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
                 self.status =
-                    "Removed the character from the project. Its files are still in its folder."
-                        .to_string();
+                    "Removed the character. Its files are still in its folder.".to_string();
             }
         }
     }
