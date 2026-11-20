@@ -141,6 +141,8 @@ struct Emitter {
     data: effect_library::emitter::EmitterData,
     raw: ptcl::Emitter,
     fixed: Vec<u8>,
+    /// Child emitters, which emit from this emitter's particles and draw after it.
+    children: Vec<Emitter>,
 }
 
 /// A loaded file. Textures and pipelines fill in from the warm thread; the rest is fixed.
@@ -525,18 +527,21 @@ impl VfxPreview {
                 if draw.solo.is_some_and(|solo| solo != index) {
                     continue;
                 }
-                // A mesh primitive is looked up in this file, then in the shared one.
-                let mesh_id = mesh_id(emitter);
-                let mesh = (mesh_id != u64::MAX)
-                    .then(|| {
-                        file.meshes
-                            .get(&mesh_id)
-                            .or_else(|| shared.as_ref()?.meshes.get(&mesh_id))
-                    })
-                    .flatten();
-                if mesh_id != u64::MAX && mesh.is_none() {
+                // A mesh primitive is looked up in this file, then in the shared one; an emitter
+                // whose mesh is in neither draws nothing.
+                let find_mesh = |emitter: &Emitter| {
+                    let id = mesh_id(emitter);
+                    if id == u64::MAX {
+                        return Some(None);
+                    }
+                    file.meshes
+                        .get(&id)
+                        .or_else(|| shared.as_ref()?.meshes.get(&id))
+                        .map(Some)
+                };
+                let Some(mesh) = find_mesh(emitter) else {
                     continue;
-                }
+                };
                 let missing: Vec<Job> = file
                     .jobs(emitter)
                     .into_iter()
@@ -549,6 +554,9 @@ impl VfxPreview {
                 }
                 let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
                 s.set_particle_colour(draw.particle_colour);
+                for child in &emitter.children {
+                    s.add_child(&child.data, &child.fixed);
+                }
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
                 let first = placements.len().saturating_sub(601);
@@ -558,81 +566,114 @@ impl VfxPreview {
                     }
                     s.step_at(set);
                 }
-                if s.count() == 0 {
-                    continue;
-                }
                 let srt = s.emitter_srt(&placement);
-                let streams = s.streams();
-                if std::env::var_os("VFX_DUMP").is_some() {
-                    let name = emitter.data.name.clone().unwrap_or_default();
-                    let first = |stream: &str| {
-                        streams
-                            .get(stream)
-                            .map(|v| {
-                                v.iter()
-                                    .take(3)
-                                    .flatten()
-                                    .map(|x| format!("{x:.3}"))
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            })
-                            .unwrap_or_default()
-                    };
-                    eprintln!(
-                        "[vfx particles] {} {} age {} count={} pos {} vec {} scale {}",
-                        draw.name,
-                        name,
-                        draw.placements.len(),
-                        s.count(),
-                        first("sysLocalPosAttr"),
-                        first("sysLocalVecAttr"),
-                        first("sysScaleAttr")
-                    );
-                    let r = srt.transpose().to_cols_array();
-                    eprintln!(
-                        "[vfx dump] {} age {} n {} srt ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3})",
-                        draw.name, draw.placements.len(), s.count(),
-                        r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
-                    );
-                }
-                let dynamic = s.dynamic_block(&srt, &s.emitter_rt(&rt), draw.colour);
-                let statics = static_block::static_block(&emitter.fixed);
-                let custom0 = static_block::custom_block(&emitter.raw);
-                // Ink spawns: the game hands the ink shaders the ink colour in this block, row 0
-                // multiplying the effect's colour and row 1 added (zero).
-                let user_block: Option<Vec<u8>> = draw.ink.map(|[r, g, b]| {
-                    [r, g, b, 1.0, 0.0, 0.0, 0.0, 0.0]
+                let rt = s.emitter_rt(&rt);
+                let parts = std::iter::once((emitter, &s, mesh)).chain(
+                    emitter
+                        .children
                         .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect()
-                });
-                let samplers = samplers(emitter);
-                let textures = file.textures.lock().unwrap_or_else(|e| e.into_inner());
-                let views: [Option<Arc<render::GpuTexture>>; 3] = std::array::from_fn(|i| {
-                    let index = file.texture_index(samplers[i]?)?;
-                    textures.get(&index)?.clone()
-                });
-                drop(textures);
-                let draw_info = render::EmitterDraw {
-                    program: program(emitter),
-                    state: render_state(emitter),
-                    static_block: &statics,
-                    dynamic_block: &dynamic,
-                    custom0_block: custom0.as_deref(),
-                    user_block: user_block.as_deref(),
-                    custom2_block: Some(&custom2),
-                    streams: &streams,
-                    count: s.count() as u32,
-                    textures: std::array::from_fn(|i| views[i].as_deref()),
-                    samplers: std::array::from_fn(|i| {
-                        file.samplers.get(&sampler_key(samplers[i]?))
-                    }),
-                    mesh,
-                };
-                if let Some(prepared) = file.renderer.prepare(queue, &draw_info) {
-                    self.prepared.push((file.clone(), prepared));
+                        .zip(s.children())
+                        .filter_map(|(child, sim)| Some((child, sim, find_mesh(child)?))),
+                );
+                for (emitter, s, mesh) in parts {
+                    if s.count() > 0 {
+                        self.prepare_emitter(
+                            queue,
+                            &file,
+                            emitter,
+                            s,
+                            mesh,
+                            (&srt, &rt),
+                            draw,
+                            &custom2,
+                        );
+                    }
                 }
             }
+        }
+    }
+
+    /// Simulated particles of one emitter (or child) to a draw. `matrices` are the emitter's
+    /// with scale and without.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_emitter(
+        &mut self,
+        queue: &wgpu::Queue,
+        file: &Arc<EffectFile>,
+        emitter: &Emitter,
+        s: &sim::EmitterSim,
+        mesh: Option<&eff_wgpu::mesh::Mesh>,
+        (srt, rt): (&Mat4, &Mat4),
+        draw: &EffectDraw,
+        custom2: &[u8],
+    ) {
+        let streams = s.streams();
+        if std::env::var_os("VFX_DUMP").is_some() {
+            let name = emitter.data.name.clone().unwrap_or_default();
+            let first = |stream: &str| {
+                streams
+                    .get(stream)
+                    .map(|v| {
+                        v.iter()
+                            .take(3)
+                            .flatten()
+                            .map(|x| format!("{x:.3}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default()
+            };
+            eprintln!(
+                "[vfx particles] {} {} age {} count={} pos {} vec {} scale {}",
+                draw.name,
+                name,
+                draw.placements.len(),
+                s.count(),
+                first("sysLocalPosAttr"),
+                first("sysLocalVecAttr"),
+                first("sysScaleAttr")
+            );
+            let r = srt.transpose().to_cols_array();
+            eprintln!(
+                "[vfx dump] {} age {} n {} srt ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3},{:.3})",
+                draw.name, draw.placements.len(), s.count(),
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]
+            );
+        }
+        let dynamic = s.dynamic_block(srt, rt, draw.colour);
+        let statics = static_block::static_block(&emitter.fixed);
+        let custom0 = static_block::custom_block(&emitter.raw);
+        // Ink spawns: the game hands the ink shaders the ink colour in this block, row 0
+        // multiplying the effect's colour and row 1 added (zero).
+        let user_block: Option<Vec<u8>> = draw.ink.map(|[r, g, b]| {
+            [r, g, b, 1.0, 0.0, 0.0, 0.0, 0.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect()
+        });
+        let samplers = samplers(emitter);
+        let textures = file.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let views: [Option<Arc<render::GpuTexture>>; 3] = std::array::from_fn(|i| {
+            let index = file.texture_index(samplers[i]?)?;
+            textures.get(&index)?.clone()
+        });
+        drop(textures);
+        let draw_info = render::EmitterDraw {
+            program: program(emitter),
+            state: render_state(emitter),
+            static_block: &statics,
+            dynamic_block: &dynamic,
+            custom0_block: custom0.as_deref(),
+            user_block: user_block.as_deref(),
+            custom2_block: Some(custom2),
+            streams: &streams,
+            count: s.count() as u32,
+            textures: std::array::from_fn(|i| views[i].as_deref()),
+            samplers: std::array::from_fn(|i| file.samplers.get(&sampler_key(samplers[i]?))),
+            mesh,
+        };
+        if let Some(prepared) = file.renderer.prepare(queue, &draw_info) {
+            self.prepared.push((file.clone(), prepared));
         }
     }
 
@@ -686,6 +727,9 @@ impl EffectFile {
         ))];
         for sampler in samplers(emitter).into_iter().flatten() {
             jobs.extend(self.texture_index(sampler).map(Job::Texture));
+        }
+        for child in &emitter.children {
+            jobs.extend(self.jobs(child));
         }
         jobs
     }
@@ -780,7 +824,18 @@ fn load_file(
         .unwrap_or_default();
     // Samplers are cheap and few; make every one the file uses now.
     let mut sampler_map = HashMap::new();
-    for sampler in emitters.iter().flatten().flat_map(samplers).flatten() {
+    fn with_children(e: &Emitter) -> Vec<&Emitter> {
+        std::iter::once(e)
+            .chain(e.children.iter().flat_map(with_children))
+            .collect()
+    }
+    for sampler in emitters
+        .iter()
+        .flatten()
+        .flat_map(with_children)
+        .flat_map(samplers)
+        .flatten()
+    {
         let key = sampler_key(sampler);
         sampler_map
             .entry(key)
@@ -819,15 +874,26 @@ fn set_emitters(ptcl_file: &effect_library::ptcl_file::PtclFile) -> Vec<Vec<Emit
             set.emitters
                 .iter()
                 .zip(raws)
-                .map(|(parsed, raw)| Emitter {
-                    fixed: static_block::fixed_emitter_data(&raw, &|_| None, None),
-                    data: parsed.data.clone(),
-                    raw,
-                })
+                .map(|(parsed, raw)| emitter(parsed, raw))
                 .collect::<Vec<_>>(),
         );
     }
     emitters
+}
+
+/// An emitter and its children, parsed and raw.
+fn emitter(parsed: &effect_library::structs::Emitter, raw: ptcl::Emitter) -> Emitter {
+    Emitter {
+        fixed: static_block::fixed_emitter_data(&raw, &|_| None, None),
+        data: parsed.data.clone(),
+        children: parsed
+            .children
+            .iter()
+            .zip(raw.children.iter().cloned())
+            .map(|(parsed, raw)| emitter(parsed, raw))
+            .collect(),
+        raw,
+    }
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -928,5 +994,45 @@ mod tests {
         let rays = named("light2");
         assert!(alive(rays, 60) > 0, "{plan:?}");
         assert_eq!(alive(rays, period), 0, "{plan:?}");
+    }
+
+    /// Sephiroth's charge sparks (edge_fire2_hold sparks4) trail red and gold dots from two
+    /// child emitters. The preview loaded only the top emitters, so the sparks drew bare. The
+    /// children must load with their parent and run from its particles.
+    #[test]
+    fn child_emitters_load_and_run_with_their_parent() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeFire2Hold")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[set];
+        let sparks = emitters
+            .iter()
+            .find(|e| e.data.name.as_deref() == Some("sparks4"))
+            .unwrap();
+        let names: Vec<_> = sparks
+            .children
+            .iter()
+            .map(|c| c.data.name.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["Emitter1", "Emitter2"]);
+        let mut s = sim::EmitterSim::new(&sparks.data, &sparks.fixed);
+        for child in &sparks.children {
+            s.add_child(&child.data, &child.fixed);
+        }
+        for _ in 0..30 {
+            s.step();
+        }
+        assert!(s.children().iter().all(|c| c.count() > 0));
     }
 }
