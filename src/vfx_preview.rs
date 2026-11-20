@@ -60,25 +60,77 @@ fn draw_order(emitters: &[Emitter]) -> Vec<usize> {
         .collect()
 }
 
-/// Frames an effect has particles for, played on its own: until every emitter is empty after
-/// emitting at least once, up to 240.
-fn effect_length(emitters: &[Emitter]) -> usize {
+/// How an effect plays on its own, over and over: `length` frames, the last `kill` of them
+/// after it is killed, then a short gap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Loop {
+    length: usize,
+    /// The step that kills the effect, when it has emitters that never stop by themselves.
+    kill: Option<usize>,
+}
+
+/// The loop for an effect played on its own. An emitter that emits for a set time stops by
+/// itself; one that keeps emitting runs until whatever spawned it kills it. The game kills
+/// such an effect when its move or state ends, which is when the timed emitters are done
+/// (Sephiroth's charge, edge_fire2_hold: its rays and lightning keep coming until its swirl,
+/// 73 frames of particles, is gone, and the next charge level replaces it). So the effect is
+/// killed when the last timed emitter stops emitting, and no earlier than one particle life
+/// after the last running emitter starts, so every emitter shows; the loop ends when the last
+/// particle is gone. With no timed emitter at all it plays for 240 frames and restarts.
+fn effect_loop(emitters: &[Emitter]) -> Loop {
     const CAP: usize = 240;
-    let mut last = 1;
-    for emitter in emitters {
+    let runs_on = |e: &Emitter| !e.data.emission.is_one_time;
+    let mut timed_end = None::<usize>;
+    let mut particles_end = 0;
+    for emitter in emitters.iter().filter(|e| !runs_on(e)) {
+        let emission = &emitter.data.emission;
+        let stops = emission.start.max(0) as usize + emission.duration.max(1) as usize;
+        timed_end = Some(timed_end.unwrap_or(0).max(stops));
         let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
-        let mut seen = false;
         for step in 1..=CAP {
             s.step();
             if s.count() > 0 {
-                seen = true;
-                last = last.max(step);
-            } else if seen && step > last + 30 {
-                break;
+                particles_end = particles_end.max(step + 1);
             }
         }
     }
-    last
+    let Some(timed_end) = timed_end else {
+        return Loop {
+            length: CAP,
+            kill: None,
+        };
+    };
+    if !emitters.iter().any(runs_on) {
+        return Loop {
+            length: particles_end.max(1),
+            kill: None,
+        };
+    }
+    let shown = emitters
+        .iter()
+        .filter(|e| runs_on(e))
+        .map(|e| e.data.emission.start.max(0) as usize + e.data.particle_data.life.max(1) as usize)
+        .max()
+        .unwrap_or(0);
+    let kill = timed_end.max(shown).min(CAP);
+    // After the kill the running emitters stop and their particles live out their lives.
+    let mut length = kill.max(particles_end);
+    for emitter in emitters.iter().filter(|e| runs_on(e)) {
+        let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+        for step in 1..=CAP + kill {
+            if step > kill {
+                s.kill();
+            }
+            s.step();
+            if s.count() > 0 {
+                length = length.max(step + 1);
+            }
+        }
+    }
+    Loop {
+        length: length.min(kill + CAP),
+        kill: Some(kill),
+    }
 }
 
 /// The shared effect file. Its meshes serve every other file, and it is far too big to warm
@@ -162,8 +214,8 @@ pub struct VfxPreview {
     /// file, so an older load finishing late is dropped.
     overrides: HashMap<PathBuf, Arc<Vec<u8>>>,
     latest: HashMap<PathBuf, u64>,
-    /// Each effect's length for looping play, by file version (its address) and set.
-    lengths: HashMap<(usize, usize), usize>,
+    /// Each effect's loop for looping play, by file version (its address) and set.
+    lengths: HashMap<(usize, usize), Loop>,
     /// Files with a newer version loading while the old one draws: the view keeps painting
     /// until it lands, so an edit shows without waiting for the mouse to move.
     reloading: HashSet<PathBuf>,
@@ -446,14 +498,16 @@ impl VfxPreview {
             };
             // A looping draw replays the effect from the start every length plus a short gap.
             let looped: Vec<Mat4>;
+            let mut kill_at = draw.kill_at;
             let placements: &[Mat4] = match (draw.looping, draw.placements.last()) {
                 (Some(clock), Some(at)) => {
                     let key = (Arc::as_ptr(&file) as usize, set);
-                    let length = *self
+                    let plan = *self
                         .lengths
                         .entry(key)
-                        .or_insert_with(|| effect_length(&file.emitters[set]));
-                    looped = vec![*at; clock % (length + 15) + 1];
+                        .or_insert_with(|| effect_loop(&file.emitters[set]));
+                    looped = vec![*at; clock % (plan.length + 15) + 1];
+                    kill_at = plan.kill;
                     &looped
                 }
                 _ => &draw.placements,
@@ -499,7 +553,7 @@ impl VfxPreview {
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
                 let first = placements.len().saturating_sub(601);
                 for (index, set) in placements.iter().enumerate().skip(first) {
-                    if draw.kill_at.is_some_and(|kill| index >= kill) {
+                    if kill_at.is_some_and(|kill| index >= kill) {
                         s.kill();
                     }
                     s.step_at(set);
@@ -714,25 +768,7 @@ fn load_file(
             .with_sample_count(samples),
         ),
     };
-    let raw_sets = ptcl::emitter_sets(&ptcl_file.base_bytes);
-    let mut emitters = Vec::new();
-    for (index, set) in ptcl_file.emitter_list.emitter_sets.iter().enumerate() {
-        let raws = raw_sets
-            .get(index)
-            .map(|s| s.emitters.clone())
-            .unwrap_or_default();
-        emitters.push(
-            set.emitters
-                .iter()
-                .zip(raws)
-                .map(|(parsed, raw)| Emitter {
-                    fixed: static_block::fixed_emitter_data(&raw, &|_| None, None),
-                    data: parsed.data.clone(),
-                    raw,
-                })
-                .collect::<Vec<_>>(),
-        );
-    }
+    let emitters = set_emitters(ptcl_file);
     let sets = crate::effects::entry_set_handles(&file)
         .into_iter()
         .filter_map(|(name, set)| Some((name.to_lowercase(), usize::try_from(set).ok()?)))
@@ -768,6 +804,30 @@ fn load_file(
         meshes: eff_wgpu::mesh::meshes(ptcl_file),
         ptcl: ptcl_file.clone(),
     })
+}
+
+/// Every set's emitters: parsed, raw and with the runtime's load-time fixes.
+fn set_emitters(ptcl_file: &effect_library::ptcl_file::PtclFile) -> Vec<Vec<Emitter>> {
+    let raw_sets = ptcl::emitter_sets(&ptcl_file.base_bytes);
+    let mut emitters = Vec::new();
+    for (index, set) in ptcl_file.emitter_list.emitter_sets.iter().enumerate() {
+        let raws = raw_sets
+            .get(index)
+            .map(|s| s.emitters.clone())
+            .unwrap_or_default();
+        emitters.push(
+            set.emitters
+                .iter()
+                .zip(raws)
+                .map(|(parsed, raw)| Emitter {
+                    fixed: static_block::fixed_emitter_data(&raw, &|_| None, None),
+                    data: parsed.data.clone(),
+                    raw,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    emitters
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -811,4 +871,62 @@ fn sampler_key(s: &effect_library::emitter::TextureSampler) -> (u8, u8, u8, u32)
         s.filter,
         s.max_lod.to_bits(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sephiroth's blue charge (edge_fire2_hold) played on its own. Its swirl, ball and haze
+    /// are timed (one emission, 73 to 76 frames of life); its rays, sparks and lightning keep
+    /// emitting until the effect is killed. The loop ran to the 240 frame cap, so for two thirds
+    /// of it the swirl was gone and only the rays and lightning played; in game the charge is
+    /// replaced as the swirl ends. The swirl must fill most of the loop, and the rays must stop.
+    #[test]
+    fn a_charge_loop_ends_with_its_timed_emitters() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeFire2Hold")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[set];
+        let plan = effect_loop(emitters);
+        let period = plan.length + 15;
+        let named = |name: &str| {
+            emitters
+                .iter()
+                .find(|e| e.data.name.as_deref() == Some(name))
+                .unwrap()
+        };
+        let alive = |emitter: &Emitter, steps: usize| {
+            let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+            for index in 0..steps {
+                if plan.kill.is_some_and(|kill| index >= kill) {
+                    s.kill();
+                }
+                s.step();
+            }
+            s.count()
+        };
+        let swirl = named("sphere1");
+        let shown = (1..=period)
+            .filter(|&steps| alive(swirl, steps) > 0)
+            .count();
+        assert!(
+            shown * 10 >= period * 6,
+            "swirl shows {shown} of {period} frames ({plan:?})"
+        );
+        let rays = named("light2");
+        assert!(alive(rays, 60) > 0, "{plan:?}");
+        assert_eq!(alive(rays, period), 0, "{plan:?}");
+    }
 }
