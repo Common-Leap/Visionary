@@ -337,7 +337,7 @@ impl RosterWindow {
         self.refresh(fighters, data_root);
         let ui_root = self.ui_root();
         let mut report =
-            super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster)?;
+            super::export::export_roster(mod_root, ui_root.as_deref(), &self.index, roster, &self.labels)?;
         super::export::export_params(
             mod_root,
             self.param_root().as_deref(),

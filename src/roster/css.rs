@@ -24,6 +24,12 @@ use prc::ParamKind;
 /// Where the roster database lives inside a dumped arc root.
 pub const CHARA_DB_PATH: &str = "ui/param/database/ui_chara_db.prc";
 
+/// A patch for a database file: the same path with this in place of `.prc`. ARCropolis merges
+/// it into the game's file, so two mods can each change their own entries, and plugins that
+/// rebuild the database themselves (the CSK Collection) still see the change, which a whole
+/// replaced file does not get them.
+pub const PATCH_EXTENSION: &str = "prcxml";
+
 /// The layout database beside it: where each character's portraits sit in their frames.
 pub const LAYOUT_DB_PATH: &str = "ui/param/database/ui_layout_db.prc";
 
@@ -122,6 +128,11 @@ impl CharaDb {
         prc::save(path, &self.root)
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The whole parsed file, to compare against another for a patch.
+    pub fn tree(&self) -> &prc::ParamStruct {
+        &self.root
     }
 
     pub fn entries(&self) -> &[CharaRow] {
@@ -303,24 +314,23 @@ impl CharaDb {
 }
 
 /// Give each added character the portrait layout of the fighter it plays as: `ui_layout_db`
-/// read from `source`, with a copy of that fighter's rows per `(its ui_chara_id, name_id)`, written to
-/// `destination`. Returns how many rows were added.
-pub fn add_layouts(source: &Path, destination: &Path, added: &[(u64, String)]) -> Result<usize> {
+/// read from `source`, with a copy of that fighter's rows per `(its ui_chara_id, name_id)`.
+/// Returns the file as it was and as it is with them.
+pub fn add_layouts(source: &Path, added: &[(u64, String)]) -> Result<(prc::ParamStruct, prc::ParamStruct)> {
     use prc::hash40::Hash40;
-    let mut root = prc::open(source)
+    let base = prc::open(source)
         .map_err(|error| anyhow::anyhow!("{error:?}"))
         .with_context(|| format!("reading {}", source.display()))?;
+    let mut root = base.clone();
     let Some(ParamKind::List(list)) = db_root_mut(&mut root) else {
         anyhow::bail!("{} has no db_root", source.display());
     };
-    let mut count = 0;
     for (own, name_id) in added {
-        let own = *own;
         let rows: Vec<prc::ParamStruct> = list
             .0
             .iter()
             .filter_map(|row| match row {
-                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(own) => Some(row.clone()),
+                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(*own) => Some(row.clone()),
                 _ => None,
             })
             .collect();
@@ -334,18 +344,143 @@ pub fn add_layouts(source: &Path, destination: &Path, added: &[(u64, String)]) -
                 }
             }
             list.0.push(ParamKind::Struct(row));
-            count += 1;
         }
     }
-    if count > 0 {
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
+    Ok((base, root))
+}
+
+/// What `edited` changes in the `db_root` of `base`, as a `.prcxml` patch: each changed entry
+/// by its index with only the fields that differ, and each added entry in full. `None` when
+/// nothing differs. `labels` names the fields; one it does not know is written as its hash.
+pub fn patch_xml(base: &prc::ParamStruct, edited: &prc::ParamStruct, labels: &std::collections::HashMap<u64, String>) -> Option<String> {
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) = (db_root(base), db_root(edited)) else {
+        return None;
+    };
+    let name = |hash: u64| labels.get(&hash).cloned().unwrap_or_else(|| format!("0x{hash:010x}"));
+    let escape = |text: &str| text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let field = |hash: u64, value: &ParamKind| -> Option<String> {
+        let (tag, text) = match value {
+            ParamKind::Bool(value) => ("bool", if *value { "True".to_owned() } else { "False".to_owned() }),
+            ParamKind::I8(value) => ("sbyte", value.to_string()),
+            ParamKind::U8(value) => ("byte", value.to_string()),
+            ParamKind::I16(value) => ("short", value.to_string()),
+            ParamKind::U16(value) => ("ushort", value.to_string()),
+            ParamKind::I32(value) => ("int", value.to_string()),
+            ParamKind::U32(value) => ("uint", value.to_string()),
+            ParamKind::Float(value) => ("float", value.to_string()),
+            ParamKind::Hash(value) => ("hash40", name(value.0)),
+            ParamKind::Str(value) => ("string", escape(value)),
+            // No entry of these databases nests another.
+            ParamKind::List(_) | ParamKind::Struct(_) => return None,
+        };
+        Some(format!("      <{tag} hash=\"{}\">{text}</{tag}>", name(hash)))
+    };
+    let mut rows = Vec::new();
+    for (index, row) in edited.0.iter().enumerate() {
+        let ParamKind::Struct(row) = row else { continue };
+        let before = match base.0.get(index) {
+            Some(ParamKind::Struct(before)) => Some(before),
+            _ => None,
+        };
+        let fields: Vec<String> = row
+            .0
+            .iter()
+            .filter(|(hash, value)| before.is_none_or(|before| before.0.iter().find(|(known, _)| known == hash).map(|(_, old)| old) != Some(value)))
+            .filter_map(|(hash, value)| field(hash.0, value))
+            .collect();
+        if !fields.is_empty() {
+            rows.push(format!("    <struct index=\"{index}\">\n{}\n    </struct>", fields.join("\n")));
         }
-        prc::save(destination, &root)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .with_context(|| format!("writing {}", destination.display()))?;
     }
-    Ok(count)
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<struct>\n  <list hash=\"db_root\">\n{}\n  </list>\n</struct>\n",
+        rows.join("\n")
+    ))
+}
+
+/// What `edited` changes in the `db_root` of `base`, as entries for the CSK Collection's own
+/// database files (`database/*.json` in a mod). That plugin rebuilds these databases from the
+/// game's files and its own entries, so it is the one place a change reaches it. A changed
+/// entry carries its id and the fields that differ; an added one names the entry it is closest
+/// to as the one to copy, and the fields that differ from that. `id_field` is the entries' id
+/// (`ui_chara_id`, `ui_layout_id`).
+pub fn csk_entries(
+    base: &prc::ParamStruct,
+    edited: &prc::ParamStruct,
+    labels: &std::collections::HashMap<u64, String>,
+    id_field: &str,
+) -> Vec<serde_json::Value> {
+    use serde_json::{json, Map, Value};
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) = (db_root(base), db_root(edited)) else {
+        return Vec::new();
+    };
+    let id_hash = hash40::hash40(id_field).0;
+    let name = |hash: u64| match hash {
+        0 => String::new(),
+        hash => labels.get(&hash).cloned().unwrap_or_else(|| format!("0x{hash:010x}")),
+    };
+    // Per-colour tables (`c00_index`, `characall_label_c00`, ...) are maps in the plugin's
+    // format, which `color_start_index` fills; they are not written field by field.
+    let per_colour = |field: &str| {
+        field.starts_with("characall_label")
+            || (field.len() > 4 && matches!(field.as_bytes()[0], b'c' | b'n') && field[1..3].bytes().all(|b| b.is_ascii_digit()) && field.as_bytes()[3] == b'_')
+    };
+    let value = |value: &ParamKind| -> Option<Value> {
+        Some(match value {
+            ParamKind::Bool(value) => json!(value),
+            ParamKind::I8(value) => json!(value),
+            ParamKind::U8(value) => json!(value),
+            ParamKind::I16(value) => json!(value),
+            ParamKind::U16(value) => json!(value),
+            ParamKind::I32(value) => json!(value),
+            ParamKind::U32(value) => json!(value),
+            ParamKind::Float(value) => json!(value),
+            ParamKind::Hash(value) => json!(name(value.0)),
+            ParamKind::Str(value) => json!(value),
+            ParamKind::List(_) | ParamKind::Struct(_) => return None,
+        })
+    };
+    let differing = |row: &prc::ParamStruct, from: &prc::ParamStruct| -> Vec<(String, Value)> {
+        row.0
+            .iter()
+            .filter(|(hash, _)| hash.0 != id_hash)
+            .filter(|(hash, new)| from.0.iter().find(|(known, _)| known == hash).map(|(_, old)| old) != Some(new))
+            .filter_map(|(hash, new)| Some((name(hash.0), value(new)?)))
+            .filter(|(field, _)| !per_colour(field))
+            // The plugin keeps the first costume in its map of per-colour numbers (seen in
+            // game: as a field of the entry it is ignored and the base costumes load).
+            .map(|(field, value)| if field == COLOR_START_FIELD { ("extra_index_maps".to_owned(), json!({ COLOR_START_FIELD: value })) } else { (field, value) })
+            .collect()
+    };
+    let rows = |list: &prc::ParamList| -> Vec<prc::ParamStruct> {
+        list.0.iter().filter_map(|row| if let ParamKind::Struct(row) = row { Some(row.clone()) } else { None }).collect()
+    };
+    let (base, edited) = (rows(base), rows(edited));
+    let mut entries = Vec::new();
+    for (index, row) in edited.iter().enumerate() {
+        let Some(id) = hash_field(row, id_field) else { continue };
+        let mut entry = Map::new();
+        entry.insert(id_field.to_owned(), json!(name(id)));
+        let fields = match base.get(index) {
+            Some(before) => differing(row, before),
+            None => {
+                let Some((like, fields)) = base.iter().map(|like| (like, differing(row, like))).min_by_key(|(_, fields)| fields.len()) else {
+                    continue;
+                };
+                entry.insert(format!("clone_from_{id_field}"), json!(name(hash_field(like, id_field).unwrap_or(0))));
+                fields
+            }
+        };
+        if fields.is_empty() && entry.len() == 1 {
+            continue;
+        }
+        entry.extend(fields);
+        entries.push(Value::Object(entry));
+    }
+    entries
 }
 
 fn db_root(root: &prc::ParamStruct) -> Option<&ParamKind> {

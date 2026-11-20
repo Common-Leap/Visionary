@@ -346,6 +346,7 @@ pub fn export_roster(
     ui_root: Option<&Path>,
     index: &RosterIndex,
     project: &RosterMod,
+    labels: &std::collections::HashMap<u64, String>,
 ) -> Result<RosterExport> {
     let mut report = RosterExport::default();
 
@@ -374,9 +375,31 @@ pub fn export_roster(
                 let source = root.join(css::CHARA_DB_PATH);
                 let mut db = CharaDb::open(&source)
                     .with_context(|| "reading the base character select database")?;
+                let untouched = db.tree().clone();
+                // The new characters' own ids, so the patch names them instead of their hashes.
+                let mut labels = labels.clone();
+                for entry in &added {
+                    for name in std::iter::once(format!("ui_chara_{}", entry.name_id)).chain((0..8).map(|colour| format!("ui_chara_{}_{colour:02}", entry.name_id))) {
+                        labels.insert(hash40::hash40(&name).0, name);
+                    }
+                }
+                labels.insert(hash40::hash40(css::COLOR_START_FIELD).0, css::COLOR_START_FIELD.to_owned());
+                let labels = &labels;
+                let patch_path = |file: &str| Path::new(file).with_extension(css::PATCH_EXTENSION).to_string_lossy().replace('\\', "/");
+                let mut write_patch = |file: &str, xml: String, report: &mut RosterExport| -> Result<()> {
+                    let relative = patch_path(file);
+                    let destination = mod_root.join(&relative);
+                    if let Some(parent) = destination.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&destination, xml)?;
+                    report.files.push(relative);
+                    Ok(())
+                };
                 // Each new character gets an entry of its own, after the last one until the
                 // project places it.
                 let mut layouts = Vec::new();
+                let mut layout_entries = Vec::new();
                 let mut place = db.last_position();
                 for entry in &added {
                     if db.row(&entry.name_id).is_some() {
@@ -396,9 +419,11 @@ pub fn export_roster(
                 if !layouts.is_empty() {
                     let layout = root.join(css::LAYOUT_DB_PATH);
                     if layout.is_file() {
-                        if css::add_layouts(&layout, &mod_root.join(css::LAYOUT_DB_PATH), &layouts)? > 0 {
-                            report.files.push(css::LAYOUT_DB_PATH.to_string());
+                        let (before, after) = css::add_layouts(&layout, &layouts)?;
+                        if let Some(xml) = css::patch_xml(&before, &after, labels) {
+                            write_patch(css::LAYOUT_DB_PATH, xml, &mut report)?;
                         }
+                        layout_entries = css::csk_entries(&before, &after, labels, "ui_layout_id");
                     }
                 }
                 if !order.is_empty() {
@@ -419,9 +444,23 @@ pub fn export_roster(
                         ));
                     }
                 }
-                let destination = mod_root.join(css::CHARA_DB_PATH);
-                db.save(&destination)?;
-                report.files.push(css::CHARA_DB_PATH.to_string());
+                if let Some(xml) = css::patch_xml(&untouched, db.tree(), labels) {
+                    write_patch(css::CHARA_DB_PATH, xml, &mut report)?;
+                }
+                // The same changes for the CSK Collection, which builds the select screen
+                // from its own database files and not from patches to the game's.
+                let entries = css::csk_entries(&untouched, db.tree(), labels, "ui_chara_id");
+                if !entries.is_empty() {
+                    let name = mod_root.file_name().map_or("visionary".into(), |name| name.to_string_lossy().into_owned());
+                    let relative = format!("database/{name}.json");
+                    let file = serde_json::json!({
+                        "character_database_entries": entries,
+                        "layout_database_entries": layout_entries,
+                    });
+                    std::fs::create_dir_all(mod_root.join("database"))?;
+                    std::fs::write(mod_root.join(&relative), serde_json::to_vec_pretty(&file)?)?;
+                    report.files.push(relative);
+                }
             }
             None => report.warnings.push(format!(
                 "{} position/visibility/ui_chara_db change(s) were not written: no character select \
@@ -756,7 +795,7 @@ mod tests {
     /// underneath it change. A stored copy would pin whatever base file was installed when the
     /// edit was made.
     #[test]
-    fn the_written_database_is_the_base_file_with_only_the_overrides_applied() {
+    fn the_database_patch_holds_only_what_the_project_changes_and_adds() {
         let dir = tempfile::tempdir().unwrap();
         let ui_root = dir.path().join("ui_root");
         let mod_root = dir.path().join("mod");
@@ -768,14 +807,52 @@ mod tests {
         let mut project = RosterMod::default();
         project.order.insert(RosterKey::fighter("mario"), 5);
 
-        let report = export_roster(&mod_root, Some(&ui_root), &index, &project).unwrap();
-        assert_eq!(report.files, vec![css::CHARA_DB_PATH]);
-        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // A new character on Link, too: it is added whole, after the last entry.
+        project.authored.push(AuthoredEntry {
+            key: RosterKey::slot("link", 8),
+            donor: "link".into(),
+            slot: 8,
+            slots: vec![9],
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let index = RosterIndex::build(&[fighter("mario"), fighter("link")], &ModLibrary::default(), &project, Some(&db));
+        let labels: std::collections::HashMap<u64, String> =
+["disp_order", "can_select", "name_id", "color_num", "ui_chara_id", "ui_chara_mario", "ui_chara_link", css::COLOR_START_FIELD].iter().map(|name| (hash40::hash40(name).0, (*name).to_owned())).collect();
 
-        let written = CharaDb::open(&mod_root.join(css::CHARA_DB_PATH)).unwrap();
-        assert_eq!(written.row("mario").unwrap().disp_order, 5);
-        // Untouched entries keep exactly what the base file had.
-        assert_eq!(written.row("link").unwrap().disp_order, 2);
+        let report = export_roster(&mod_root, Some(&ui_root), &index, &project, &labels).unwrap();
+        assert!(report.files.contains(&"ui/param/database/ui_chara_db.prcxml".to_owned()), "{:?}", report.files);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        // A patch, not the whole file: the game's own file is left for other mods to patch too.
+        assert!(!mod_root.join(css::CHARA_DB_PATH).exists());
+
+        let xml = std::fs::read_to_string(mod_root.join("ui/param/database/ui_chara_db.prcxml")).unwrap();
+        // Mario's entry carries only what changed; Link's, untouched, is not in the patch.
+        let mario = db.row("mario").unwrap().index;
+        assert!(xml.contains(&format!("<struct index=\"{mario}\">\n      <sbyte hash=\"disp_order\">5</sbyte>\n    </struct>")), "{xml}");
+        assert!(!xml.contains(&format!("<struct index=\"{}\">", db.row("link").unwrap().index)));
+        // The new character is a whole entry past the end, in costumes c08 and c09.
+        let added = db.entries().len();
+        assert!(xml.contains(&format!("<struct index=\"{added}\">")), "{xml}");
+        assert!(xml.contains("<string hash=\"name_id\">vision</string>"));
+        assert!(xml.contains("<byte hash=\"color_num\">2</byte>"));
+        assert!(xml.contains("<byte hash=\"color_start_index\">8</byte>"));
+
+        // And the same for the CSK Collection: the moved entry by its id, the new one as a
+        // copy of Link's with what differs.
+        let file: serde_json::Value = serde_json::from_slice(&std::fs::read(mod_root.join("database/mod.json")).unwrap()).unwrap();
+        let entries = file["character_database_entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0], serde_json::json!({"ui_chara_id": "ui_chara_mario", "disp_order": 5}));
+        assert_eq!(entries[1]["ui_chara_id"], "ui_chara_vision");
+        assert_eq!(entries[1]["clone_from_ui_chara_id"], "ui_chara_link");
+        assert_eq!(entries[1]["name_id"], "vision");
+        assert_eq!(entries[1]["extra_index_maps"]["color_start_index"], 8);
+        assert!(entries[1].get("color_start_index").is_none());
+        assert_eq!(entries[1]["color_num"], 2);
+        assert!(entries[1].get("c00_index").is_none(), "per-colour fields are left to color_start_index");
     }
 
     /// Without a `ui/` dump there is no file to apply positions to. Treating that as "nothing
@@ -787,7 +864,7 @@ mod tests {
         let mut project = RosterMod::default();
         project.order.insert(RosterKey::fighter("mario"), 5);
 
-        let report = export_roster(dir.path(), None, &index, &project).unwrap();
+        let report = export_roster(dir.path(), None, &index, &project, &Default::default()).unwrap();
         assert!(report.files.is_empty());
         assert_eq!(report.warnings.len(), 1);
         assert!(report.warnings[0].contains("no character select database"));
@@ -797,7 +874,7 @@ mod tests {
     fn a_project_with_no_roster_edits_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (index, _) = setup();
-        let report = export_roster(dir.path(), None, &index, &RosterMod::default()).unwrap();
+        let report = export_roster(dir.path(), None, &index, &RosterMod::default(), &Default::default()).unwrap();
         assert!(report.files.is_empty());
         assert!(report.warnings.is_empty());
     }
