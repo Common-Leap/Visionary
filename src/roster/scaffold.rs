@@ -1,15 +1,14 @@
 //! Creating a new character as a costume of a donor fighter.
 //!
 //! What this produces is a costume slot with its own model, animations, effects, name, and
-//! **moveset**. What it does not produce is a separate cell on the character select grid —
-//! that needs a runtime costume pin, which a known engine limit blocks. The wizard says so before anything is created.
+//! **moveset**, and an entry of its own on the character select screen (`css::add_character`).
 //!
-//! ## Why the scaffold does not copy the donor's files
+//! ## The base fighter's files are copied in
 //!
-//! Copying would produce a working character that is identical to the donor, and "working"
-//! and "my model was picked up" would then look exactly the same. Creating the directories
-//! empty makes the readiness report meaningful: a slot with no model is visibly a slot with
-//! no model.
+//! A character made here starts as a full copy of the fighter it plays as: every model part,
+//! animation, effect, sound bank and portrait of the matching base costume, under the new
+//! character's own costume numbers and name. It works in the game at once, and every file that
+//! makes it up is in its folder to be replaced.
 //!
 //! ## The slot guard, and the trap inside it
 //!
@@ -81,17 +80,6 @@ pub fn create_many(mod_root: &Path, donor: &str, slots: &[u8]) -> Result<Scaffol
                 created.push(relative);
             }
         }
-        let guide = mod_root
-            .join(format!(
-                "fighter/{}/model/body/c{slot:02}",
-                donor.to_ascii_lowercase()
-            ))
-            .join("PUT_YOUR_MODEL_HERE.txt");
-        std::fs::write(&guide, placement_guide(donor, *slot))?;
-        created.push(format!(
-            "fighter/{}/model/body/c{slot:02}/PUT_YOUR_MODEL_HERE.txt",
-            donor.to_ascii_lowercase()
-        ));
     }
     Ok(Scaffold {
         donor: donor.to_ascii_lowercase(),
@@ -120,29 +108,83 @@ pub fn effect_files(donor: &str, slots: &[u8]) -> Vec<String> {
     slots.iter().map(|slot| effect_file(donor, *slot)).collect()
 }
 
-/// The note left in the model directory, naming the files the game expects.
-fn placement_guide(donor: &str, slot: u8) -> String {
+/// What [`copy_base`] brought over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Copied {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Copy the base fighter's files into a new character's folders under `mod_root`.
+///
+/// Colour `k` of the new character (costume `slots[k]`) starts as base costume `k`: each part
+/// under `fighter/<donor>/model` and `/motion`, the fighter's effect file as the costume's own,
+/// its sound banks, and its portraits renamed to `name_id` and colour `k`. `ui_name` is the
+/// name the base fighter's portraits are filed under. Later `roots` win, as in the game.
+pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str, name_id: &str, slots: &[u8]) -> Result<Copied> {
     let donor = donor.to_ascii_lowercase();
-    format!(
-        "This is costume slot c{slot:02} of {donor}, created by Visionary.\n\
-         \n\
-         Put your model here:\n\
-         \x20 model.numdlb, model.numshb, model.numatb, model.nusktb, model.numshexb,\n\
-         \x20 your .nutexb textures, and model.numatb's materials.\n\
-         \n\
-         Put your animations in:\n\
-         \x20 fighter/{donor}/motion/body/c{slot:02}/\n\
-         \x20 as .nuanmb files, plus a motion_list.bin naming them.\n\
-         \n\
-         Effects for this slot go in:\n\
-         \x20 effect/fighter/{donor}/ef_{donor}_c{slot:02}.eff\n\
-         \n\
-         Visionary does not copy {donor}'s own files in here. That is deliberate: an empty\n\
-         slot is visibly empty, whereas a copied one would look identical whether or not your\n\
-         files were picked up.\n\
-         \n\
-         Delete this file once your model is in place.\n"
-    )
+    let mut copied = Copied::default();
+    let mut copy = |from: &Path, to: &Path| -> Result<()> {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copied.bytes += std::fs::copy(from, to)?;
+        copied.files += 1;
+        Ok(())
+    };
+    fn files(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|entry| entry.path()).collect();
+        found.sort();
+        found
+    }
+    fn tree(from: &Path, to: &Path, copy: &mut dyn FnMut(&Path, &Path) -> Result<()>) -> Result<()> {
+        for path in files(from) {
+            let Some(name) = path.file_name() else { continue };
+            if path.is_dir() {
+                tree(&path, &to.join(name), copy)?;
+            } else {
+                copy(&path, &to.join(name))?;
+            }
+        }
+        Ok(())
+    }
+    for (colour, slot) in slots.iter().enumerate() {
+        let (base, own) = (format!("c{:02}", colour % 8), format!("c{slot:02}"));
+        for root in roots {
+            for kind in ["model", "motion"] {
+                let kind_dir = root.join("fighter").join(&donor).join(kind);
+                for part in files(&kind_dir) {
+                    let Some(name) = part.file_name() else { continue };
+                    let to = mod_root.join("fighter").join(&donor).join(kind).join(name).join(&own);
+                    tree(&part.join(&base), &to, &mut copy)?;
+                }
+            }
+            let effect = root.join(format!("effect/fighter/{donor}/ef_{donor}.eff"));
+            if effect.is_file() {
+                copy(&effect, &mod_root.join(effect_file(&donor, *slot)))?;
+            }
+            for bank in ["fighter", "fighter_voice"] {
+                let dir = root.join("sound/bank").join(bank);
+                for path in files(&dir) {
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+                    let marker = format!("_{donor}_{base}.");
+                    if let Some((stem, ext)) = name.split_once(&marker) {
+                        copy(&path, &mod_root.join("sound/bank").join(bank).join(format!("{stem}_{donor}_{own}.{ext}")))?;
+                    }
+                }
+            }
+            for area in ["ui/replace/chara", "ui/replace_patch/chara"] {
+                for set in files(&root.join(area)) {
+                    let Some(kind) = set.file_name().and_then(|name| name.to_str()) else { continue };
+                    let from = set.join(format!("{kind}_{ui_name}_{:02}.bntx", colour % 8));
+                    if from.is_file() {
+                        copy(&from, &mod_root.join(area).join(kind).join(format!("{kind}_{name_id}_{colour:02}.bntx")))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(copied)
 }
 
 /// Which parts of an authored character are present.
@@ -579,35 +621,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_scaffold_creates_the_slots_own_directories_and_leaves_a_guide() {
+    fn the_scaffold_creates_the_slots_own_directories() {
         let dir = tempfile::tempdir().unwrap();
         let scaffold = create_many(dir.path(), "Mario", &[8]).unwrap();
         assert_eq!(scaffold.donor, "mario");
         assert!(dir.path().join("fighter/mario/model/body/c08").is_dir());
         assert!(dir.path().join("fighter/mario/motion/body/c08").is_dir());
         assert!(dir.path().join("effect/fighter/mario").is_dir());
-        let guide = dir
-            .path()
-            .join("fighter/mario/model/body/c08/PUT_YOUR_MODEL_HERE.txt");
-        assert!(guide.is_file());
-        let text = std::fs::read_to_string(guide).unwrap();
-        assert!(text.contains("motion/body/c08"));
-        assert!(text.contains("ef_mario_c08.eff"));
     }
 
-    /// Copying the donor's files would make "working" and "my model was picked up"
-    /// indistinguishable.
+    /// A new character starts as the base fighter: each colour gets the matching base costume
+    /// under its own costume number, and its portraits under its own name.
     #[test]
-    fn the_scaffold_copies_nothing_from_the_donor() {
-        let dir = tempfile::tempdir().unwrap();
-        create_many(dir.path(), "mario", &[8]).unwrap();
-        let model = dir.path().join("fighter/mario/model/body/c08");
-        let files: Vec<String> = std::fs::read_dir(&model)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(files, vec!["PUT_YOUR_MODEL_HERE.txt"]);
+    fn the_base_fighter_s_files_are_copied_under_the_new_character_s_names() {
+        let (game, made) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let put = |path: &str, bytes: &[u8]| {
+            let path = game.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        put("fighter/mario/model/body/c00/model.numdlb", b"zero");
+        put("fighter/mario/model/body/c01/model.numdlb", b"one");
+        put("fighter/mario/model/fireball/c00/model.numdlb", b"ball");
+        put("fighter/mario/motion/body/c00/motion_list.bin", b"list");
+        put("fighter/mario/motion/body/c00/deep/a.nuanmb", b"anim");
+        put("effect/fighter/mario/ef_mario.eff", b"eff");
+        put("sound/bank/fighter/se_mario_c01.nus3audio", b"se");
+        put("ui/replace/chara/chara_1/chara_1_mario_01.bntx", b"face");
+        put("ui/replace/chara/chara_1/chara_1_luigi_01.bntx", b"other");
+        let copied = copy_base(made.path(), &[game.path().to_path_buf()], "Mario", "mario", "vision", &[8, 9]).unwrap();
+        let read = |path: &str| std::fs::read(made.path().join(path)).ok();
+        assert_eq!(read("fighter/mario/model/body/c08/model.numdlb").as_deref(), Some(&b"zero"[..]));
+        assert_eq!(read("fighter/mario/model/body/c09/model.numdlb").as_deref(), Some(&b"one"[..]));
+        assert_eq!(read("fighter/mario/model/fireball/c08/model.numdlb").as_deref(), Some(&b"ball"[..]));
+        assert_eq!(read("fighter/mario/motion/body/c08/deep/a.nuanmb").as_deref(), Some(&b"anim"[..]));
+        assert_eq!(read("effect/fighter/mario/ef_mario_c09.eff").as_deref(), Some(&b"eff"[..]));
+        assert_eq!(read("sound/bank/fighter/se_mario_c09.nus3audio").as_deref(), Some(&b"se"[..]));
+        assert_eq!(read("ui/replace/chara/chara_1/chara_1_vision_01.bntx").as_deref(), Some(&b"face"[..]));
+        assert!(read("ui/replace/chara/chara_1/chara_1_vision_00.bntx").is_none(), "the base has no such portrait");
+        assert_eq!(copied.files, 9);
+        assert_eq!(copied.bytes, 4 + 3 + 4 + 4 + 4 + 3 + 3 + 2 + 4);
     }
 
     #[test]
@@ -615,10 +668,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         create_many(dir.path(), "mario", &[8]).unwrap();
         let readiness = measure(&[dir.path().to_path_buf()], "mario", 8, false);
-        assert_eq!(
-            readiness.model_files, 0,
-            "the guide file was counted as content"
-        );
+        assert_eq!(readiness.model_files, 0);
         assert_eq!(readiness.motion_files, 0);
         assert!(!readiness.is_ready());
         assert!(readiness
@@ -660,7 +710,6 @@ mod tests {
         std::fs::create_dir_all(&motion).unwrap();
         std::fs::write(model.join("model.numdlb"), b"mesh").unwrap();
         std::fs::write(model.join("face.nutexb"), b"tex").unwrap();
-        std::fs::write(model.join("PUT_YOUR_MODEL_HERE.txt"), b"guide").unwrap();
         std::fs::write(motion.join("attack.nuanmb"), b"anim").unwrap();
         std::fs::write(motion.join("motion_list.bin"), b"list").unwrap();
         let inv = inventory(&[dir.path().to_path_buf()], "mario", 8, None);

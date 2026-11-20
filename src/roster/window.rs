@@ -723,15 +723,25 @@ impl RosterWindow {
                 name_id,
                 destination,
             } => {
+                // The new character starts as a full copy of the fighter it plays as.
+                let root = destination.join(crate::mod_export::slugify(&display_name));
+                let ui_name = self
+                    .index
+                    .by_key(&RosterKey::fighter(&donor))
+                    .and_then(|entry| entry.name_id.clone())
+                    .unwrap_or_else(|| donor.to_ascii_lowercase());
                 let create_res = new_character::create_and_import_range(
                     &mut self.library,
                     &destination,
+                    &self.roots,
                     &donor,
+                    &ui_name,
                     &slots,
                     &display_name,
+                    &name_id,
                 );
                 match create_res {
-                    Ok(scaffolded) => {
+                    Ok((scaffolded, copied)) => {
                         let mut entry = new_character::authored_entry_multi(
                             &donor,
                             &slots,
@@ -741,8 +751,7 @@ impl RosterWindow {
                         // Remember where the files went: the panels reveal
                         // this folder and report on its contents. Computed the
                         // same way `create_and_import` computes it.
-                        entry.files_root =
-                            Some(destination.join(crate::mod_export::slugify(&display_name)));
+                        entry.files_root = Some(root);
                         // The name is recorded as a roster edit as well as on the entry, so it
                         // reaches the .xmsbt the export writes. The entry's own field is what
                         // the panel shows; the override is what the game reads.
@@ -753,7 +762,7 @@ impl RosterWindow {
                             .authored
                             .retain(|existing| existing.key != entry.key);
                         self.project.authored.push(entry);
-                        self.new_character.note_created(&display_name, &scaffolded);
+                        self.new_character.note_created(&display_name, &scaffolded, copied);
                         self.commit_library_change();
                     }
                     Err(error) => self.new_character.note_error(format!("{error:#}")),

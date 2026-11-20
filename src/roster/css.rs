@@ -24,6 +24,14 @@ use prc::ParamKind;
 /// Where the roster database lives inside a dumped arc root.
 pub const CHARA_DB_PATH: &str = "ui/param/database/ui_chara_db.prc";
 
+/// The layout database beside it: where each character's portraits sit in their frames.
+pub const LAYOUT_DB_PATH: &str = "ui/param/database/ui_layout_db.prc";
+
+/// The field the CSK Collection plugin reads on an added character: the fighter costume its
+/// first colour is. The game has no such field; without the plugin an added character plays
+/// in the base fighter's own costumes.
+pub const COLOR_START_FIELD: &str = "color_start_index";
+
 /// `disp_order` for an entry that is not on the select screen.
 pub const OFF_ROSTER: i8 = -1;
 
@@ -187,6 +195,63 @@ impl CharaDb {
         missing
     }
 
+    /// The highest position any character on the select screen holds.
+    pub fn last_position(&self) -> i8 {
+        self.entries.iter().filter(|row| row.on_roster()).map(|row| row.disp_order).max().unwrap_or(0)
+    }
+
+    /// Add a character of its own that plays as `fighter` in the costumes `slots`: a copy of
+    /// that fighter's entry under `name_id`, at `order` on the select screen. Colour `k` of the
+    /// new character is costume `slots[k]`, which the CSK Collection plugin acts on.
+    pub fn add_character(&mut self, fighter: &str, name_id: &str, slots: &[u8], order: i8) -> Result<()> {
+        use prc::hash40::Hash40;
+        if self.row(name_id).is_some() {
+            anyhow::bail!("the select screen already has a character called {name_id}");
+        }
+        let (Some(first), true) = (slots.first().copied(), slots.len() <= 8) else {
+            anyhow::bail!("a character needs one to eight costumes");
+        };
+        let kind = fighter_kind_hash(fighter);
+        let base = self
+            .entries
+            .iter()
+            .find(|row| row.fighter_kind == kind)
+            .map(|row| row.index)
+            .with_context(|| format!("the select screen has no entry for the fighter {fighter}"))?;
+        let Some(ParamKind::List(list)) = db_root_mut(&mut self.root) else {
+            anyhow::bail!("db_root is missing");
+        };
+        let Some(ParamKind::Struct(mut entry)) = list.0.get(base).cloned() else {
+            anyhow::bail!("db_root entry {base} is not a struct");
+        };
+        let hash = |name: &str| Hash40(hash40::hash40(name).0);
+        let mut set = |name: &str, value: ParamKind| {
+            let wanted = hash(name);
+            match entry.0.iter_mut().find(|(field, _)| *field == wanted) {
+                Some((_, slot)) => *slot = value,
+                None => entry.0.push((wanted, value)),
+            }
+        };
+        set("ui_chara_id", ParamKind::Hash(hash(&format!("ui_chara_{name_id}"))));
+        set("name_id", ParamKind::Str(name_id.to_owned()));
+        // Not an echo of anyone, whatever the base fighter is.
+        set("alt_chara_id", ParamKind::Hash(Hash40(0)));
+        set("fighter_type", ParamKind::Hash(hash("fighter_type_normal")));
+        set("disp_order", ParamKind::I8(order));
+        set("can_select", ParamKind::Bool(order != OFF_ROSTER));
+        set("color_num", ParamKind::U8(slots.len() as u8));
+        for colour in 0..8usize {
+            let slot = slots.get(colour).copied().unwrap_or(first);
+            set(&format!("c{colour:02}_index"), ParamKind::U8(slot));
+            set(&format!("n{colour:02}_index"), ParamKind::U8(0));
+            set(&format!("c{colour:02}_group"), ParamKind::U8(0));
+        }
+        set(COLOR_START_FIELD, ParamKind::U8(first));
+        list.0.push(ParamKind::Struct(entry));
+        self.refresh();
+        Ok(())
+    }
+
     fn set_field(&mut self, name_id: &str, field: &str, value: ParamKind) -> Result<()> {
         let index = self
             .entries
@@ -235,6 +300,52 @@ impl CharaDb {
             });
         }
     }
+}
+
+/// Give each added character the portrait layout of the fighter it plays as: `ui_layout_db`
+/// read from `source`, with a copy of that fighter's rows per `(its ui_chara_id, name_id)`, written to
+/// `destination`. Returns how many rows were added.
+pub fn add_layouts(source: &Path, destination: &Path, added: &[(u64, String)]) -> Result<usize> {
+    use prc::hash40::Hash40;
+    let mut root = prc::open(source)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("reading {}", source.display()))?;
+    let Some(ParamKind::List(list)) = db_root_mut(&mut root) else {
+        anyhow::bail!("{} has no db_root", source.display());
+    };
+    let mut count = 0;
+    for (own, name_id) in added {
+        let own = *own;
+        let rows: Vec<prc::ParamStruct> = list
+            .0
+            .iter()
+            .filter_map(|row| match row {
+                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(own) => Some(row.clone()),
+                _ => None,
+            })
+            .collect();
+        for mut row in rows {
+            let colour = u8_field(&row, "chara_color").unwrap_or(0);
+            for (field, value) in row.0.iter_mut() {
+                if field.0 == hash40::hash40("ui_chara_id").0 {
+                    *value = ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}")).0));
+                } else if field.0 == hash40::hash40("ui_layout_id").0 {
+                    *value = ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}_{colour:02}")).0));
+                }
+            }
+            list.0.push(ParamKind::Struct(row));
+            count += 1;
+        }
+    }
+    if count > 0 {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        prc::save(destination, &root)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .with_context(|| format!("writing {}", destination.display()))?;
+    }
+    Ok(count)
 }
 
 fn db_root(root: &prc::ParamStruct) -> Option<&ParamKind> {
@@ -471,6 +582,24 @@ mod tests {
         assert_eq!(row.disp_order, 3);
         assert!(row.can_select);
         assert!(row.on_roster());
+    }
+
+    #[test]
+    fn an_added_character_is_a_copy_of_its_fighter_in_its_own_costumes() {
+        let mut db = test_db(&[("mario", 0, fighter_kind_hash("mario"), true), ("lucina", 23, fighter_kind_hash("lucina"), true)]);
+        db.add_character("lucina", "shade", &[8, 9, 10], 24).unwrap();
+        let row = db.row("shade").unwrap().clone();
+        assert_eq!(row.fighter_kind, fighter_kind_hash("lucina"));
+        assert_eq!(row.ui_chara_id, hash40::hash40("ui_chara_shade").0);
+        assert_eq!((row.disp_order, row.can_select, row.color_num), (24, true, 3));
+        let Some(ParamKind::List(list)) = db_root(&db.root) else { panic!() };
+        let Some(ParamKind::Struct(entry)) = list.0.last() else { panic!() };
+        assert_eq!(u8_field(entry, COLOR_START_FIELD), Some(8));
+        assert_eq!(u8_field(entry, "c02_index"), Some(10));
+        // The base fighter's own entry is untouched, and a second one of the same name refused.
+        assert_eq!(db.row("lucina").unwrap().disp_order, 23);
+        assert!(db.add_character("lucina", "shade", &[8], 25).is_err());
+        assert!(db.add_character("nobody", "x", &[8], 25).is_err());
     }
 
     #[test]

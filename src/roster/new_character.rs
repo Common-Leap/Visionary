@@ -1090,24 +1090,21 @@ impl NewCharacterView {
         scaffold::bind_animations(&list, &slot_dir, labels).ok()
     }
 
-    pub fn note_created(&mut self, display_name: &str, scaffolded: &scaffold::Scaffold) {
+    pub fn note_created(&mut self, display_name: &str, scaffolded: &scaffold::Scaffold, copied: scaffold::Copied) {
         self.error = None;
         self.display_name.clear();
         self.donor = None;
         self.slot_range = None;
-        let first = scaffolded.slots.first().copied().unwrap_or(scaffolded.slot);
-        let last = scaffolded.slots.last().copied().unwrap_or(scaffolded.slot);
-        let span = if first == last {
-            format!("c{first:02}")
+        self.status = if copied.files == 0 {
+            format!("Created {display_name}. None of the base fighter's files were found to copy, so its folders are empty.")
         } else {
-            format!("c{first:02} to c{last:02} ({} skins)", scaffolded.slots.len())
+            format!(
+                "Created {display_name} with {} skins: {} files ({} MB) copied from the base fighter into its own folders.",
+                scaffolded.slots.len(),
+                copied.files,
+                copied.bytes / 1_000_000
+            )
         };
-        self.status = format!(
-            "Created {display_name} as costume {span} of {}: {} folder(s). Put your model and \
-             animations in the folders it made.",
-            scaffolded.donor,
-            scaffolded.created.len()
-        );
     }
 
     pub fn note_error(&mut self, error: String) {
@@ -1439,29 +1436,53 @@ pub fn authored_entry_multi(
     }
 }
 
-/// Create the files for every slot in `slots` and register the result as a
-/// mod. The mod's manifest declares every slot, so each skin is immediately
-/// editable. The folder layout is one mod root holding all of them — that
-/// matches how slot-pack mods are organised.
+/// Make a new character's folder, fill it with the base fighter's files (`roots` are the game
+/// files and the mods on top; `ui_name` is the name its portraits are filed under) and add the
+/// folder as a mod, so every skin can be edited at once. One mod folder holds all the skins.
+#[allow(clippy::too_many_arguments)]
 pub fn create_and_import_range(
     library: &mut ModLibrary,
     destination: &std::path::Path,
+    roots: &[std::path::PathBuf],
     donor: &str,
+    ui_name: &str,
     slots: &[u8],
     display_name: &str,
-) -> anyhow::Result<scaffold::Scaffold> {
+    name_id: &str,
+) -> anyhow::Result<(scaffold::Scaffold, scaffold::Copied)> {
     if slots.is_empty() {
         anyhow::bail!("a new character needs at least one costume slot");
     }
     let root = destination.join(crate::mod_export::slugify(display_name));
     let scaffolded = scaffold::create_many(&root, donor, slots)?;
+    let copied = scaffold::copy_base(&root, roots, donor, ui_name, name_id, &scaffolded.slots)?;
+    if copied.files == 0 {
+        anyhow::bail!("none of {donor}'s game files were found, so there is nothing to make the character from");
+    }
     library.import_directory(ModSource::Folder(root), Some(display_name.to_string()))?;
-    Ok(scaffolded)
+    Ok((scaffolded, copied))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for the game's files: Mario with eight costumes.
+    fn game() -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
+        let dir = tempfile::tempdir().unwrap();
+        for costume in 0..8 {
+            let model = dir.path().join(format!("fighter/mario/model/body/c{costume:02}"));
+            std::fs::create_dir_all(&model).unwrap();
+            std::fs::write(model.join("model.numdlb"), b"model").unwrap();
+        }
+        let roots = vec![dir.path().to_path_buf()];
+        (dir, roots)
+    }
+
+    fn create(library: &mut ModLibrary, destination: &std::path::Path, slots: &[u8], name: &str) -> scaffold::Scaffold {
+        let (_game, roots) = game();
+        create_and_import_range(library, destination, &roots, "mario", "mario", slots, name, &name_id_for(name)).unwrap().0
+    }
 
     #[test]
     fn a_display_name_becomes_a_safe_stable_id() {
@@ -1513,14 +1534,7 @@ mod tests {
     fn a_multi_skin_range_creates_every_skin_directory() {
         let dir = tempfile::tempdir().unwrap();
         let mut library = ModLibrary::default();
-        let scaffolded = create_and_import_range(
-            &mut library,
-            dir.path(),
-            "mario",
-            &[8, 9, 10, 11, 12, 13, 14, 15],
-            "Vision",
-        )
-        .unwrap();
+        let scaffolded = create(&mut library, dir.path(), &[8, 9, 10, 11, 12, 13, 14, 15], "Vision");
 
         assert_eq!(scaffolded.slots, vec![8, 9, 10, 11, 12, 13, 14, 15]);
         assert_eq!(scaffolded.slot, 8);
@@ -1697,7 +1711,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut library = ModLibrary::default();
         let scaffolded =
-            create_and_import_range(&mut library, dir.path(), "mario", &[8], "Vision").unwrap();
+            create(&mut library, dir.path(), &[8], "Vision");
 
         assert_eq!(scaffolded.slot, 8);
         assert_eq!(library.mods.len(), 1);
@@ -1716,16 +1730,8 @@ mod tests {
         let mut library = ModLibrary::default();
         let dir = tempfile::tempdir().unwrap();
         let a =
-            create_and_import_range(&mut library, &dir.path().join("a"), "mario", &[8], "Vision")
-                .unwrap();
-        let b = create_and_import_range(
-            &mut library,
-            &dir.path().join("b"),
-            "mario",
-            &[9],
-            "Vision2",
-        )
-        .unwrap();
+            create(&mut library, &dir.path().join("a"), &[8], "Vision");
+        let b = create(&mut library, &dir.path().join("b"), &[9], "Vision2");
         assert_eq!(a.slot, 8);
         assert_eq!(b.slot, 9);
         assert_ne!(
@@ -1754,6 +1760,7 @@ mod tests {
         let mut library = ModLibrary::default();
         let root = dir.path().join("authored").join("vision");
         let s = crate::roster::scaffold::create_many(&root, "mario", &[12]).unwrap();
+        std::fs::write(root.join("fighter/mario/model/body/c12/model.numdlb"), b"model").unwrap();
         library
             .import_directory(ModSource::Folder(root), Some("Vision".into()))
             .unwrap();

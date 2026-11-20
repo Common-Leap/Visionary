@@ -77,12 +77,7 @@ pub fn resolve_names(index: &RosterIndex, project: &RosterMod) -> (Vec<NameOverr
         match index.by_key(key) {
             Some(entry) => match &entry.name_id {
                 Some(name_id) => {
-                    let slots = entry.backing.all_slots();
-                    let slots = if slots.is_empty() {
-                        vec![entry.backing.slot().unwrap_or(0)]
-                    } else {
-                        slots
-                    };
+                    let slots = name_colours(entry);
                     for slot in slots {
                         overrides.push(NameOverride {
                             name_id: name_id.clone(),
@@ -100,6 +95,16 @@ pub fn resolve_names(index: &RosterIndex, project: &RosterMod) -> (Vec<NameOverr
     unwritable.sort();
     unwritable.dedup();
     (overrides, unwritable)
+}
+
+/// The colour numbers an entry's name is written for: a whole fighter's first, and every
+/// colour of a character of its own (which counts them from 0).
+fn name_colours(entry: &crate::roster::RosterEntry) -> Vec<u8> {
+    let slots = entry.backing.all_slots();
+    if slots.is_empty() {
+        return vec![0];
+    }
+    slots.iter().map(|slot| entry.backing.colour_of(*slot)).collect()
 }
 
 /// Resolve per-label name variants (`chr0`/`chr1`/`chr2` independently) into detailed overrides.
@@ -122,12 +127,7 @@ pub fn resolve_detailed_names(
                         .get(key)
                         .cloned()
                         .or_else(|| Some(entry.display_name.clone()));
-                    let slots = entry.backing.all_slots();
-                    let slots = if slots.is_empty() {
-                        vec![entry.backing.slot().unwrap_or(0)]
-                    } else {
-                        slots
-                    };
+                    let slots = name_colours(entry);
                     for slot in slots {
                         overrides.push(DetailedNameOverride {
                             name_id: name_id.clone(),
@@ -198,7 +198,19 @@ pub fn resolve_all_names(
     index: &RosterIndex,
     project: &RosterMod,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let (simple, mut unwritable) = resolve_names(index, project);
+    let (mut simple, mut unwritable) = resolve_names(index, project);
+    // A character of its own has no name in the game to fall back on.
+    for entry in &index.entries {
+        let (crate::roster::EntryOrigin::Authored, Some(name_id)) = (entry.origin, &entry.name_id) else {
+            continue;
+        };
+        if project.names.contains_key(&entry.key) {
+            continue;
+        }
+        for slot in name_colours(entry) {
+            simple.push(NameOverride { name_id: name_id.clone(), slot, display: entry.display_name.clone() });
+        }
+    }
     let (detailed, unw2) = resolve_detailed_names(index, project);
     unwritable.extend(unw2);
     let (per_costume, unw3) = resolve_per_costume_names(index, project);
@@ -352,7 +364,9 @@ pub fn export_roster(
         ));
     }
 
-    let needs_db = !order.is_empty() || !chara_patches.is_empty();
+    let added: Vec<&crate::mod_project::AuthoredEntry> =
+        project.authored.iter().filter(|entry| !entry.name_id.is_empty()).collect();
+    let needs_db = !order.is_empty() || !chara_patches.is_empty() || !added.is_empty();
 
     if needs_db {
         match ui_root {
@@ -360,6 +374,33 @@ pub fn export_roster(
                 let source = root.join(css::CHARA_DB_PATH);
                 let mut db = CharaDb::open(&source)
                     .with_context(|| "reading the base character select database")?;
+                // Each new character gets an entry of its own, after the last one until the
+                // project places it.
+                let mut layouts = Vec::new();
+                let mut place = db.last_position();
+                for entry in &added {
+                    if db.row(&entry.name_id).is_some() {
+                        continue;
+                    }
+                    let kind = css::fighter_kind_hash(&entry.donor);
+                    let base = db.entries().iter().find(|row| row.fighter_kind == kind).map(|row| row.ui_chara_id);
+                    place += 1;
+                    if place == css::RANDOM_SLOT_ORDER {
+                        place += 1;
+                    }
+                    match db.add_character(&entry.donor, &entry.name_id, &entry.all_slots(), place) {
+                        Ok(()) => layouts.extend(base.map(|base| (base, entry.name_id.clone()))),
+                        Err(error) => report.warnings.push(format!("{}: {error:#}", entry.display_name)),
+                    }
+                }
+                if !layouts.is_empty() {
+                    let layout = root.join(css::LAYOUT_DB_PATH);
+                    if layout.is_file() {
+                        if css::add_layouts(&layout, &mod_root.join(css::LAYOUT_DB_PATH), &layouts)? > 0 {
+                            report.files.push(css::LAYOUT_DB_PATH.to_string());
+                        }
+                    }
+                }
                 if !order.is_empty() {
                     let missing = db.apply_order(&order);
                     for name_id in missing {
@@ -430,6 +471,11 @@ pub fn export_authored_files(
         // nothing) under a moveset gated to slots that do not exist.
         let all = entry.all_slots();
         let mut copied = 0;
+        // Everything in the character's own folder is the character: the other model parts,
+        // sounds and portraits copied in when it was made, as well as what is listed below.
+        if let Some(own) = entry.files_root.as_deref().filter(|own| own.is_dir()) {
+            copied += copy_tree(own, mod_root)?;
+        }
         for relative in super::scaffold::directories_for_slots(&entry.donor, &all) {
             for root in roots {
                 copied += copy_tree(&root.join(&relative), &mod_root.join(&relative))?;
@@ -634,7 +680,7 @@ mod tests {
     /// A slot-backed character's name is written against its own slot, or it would rename the
     /// donor's default costume instead of itself.
     #[test]
-    fn a_slot_backed_entrys_name_is_written_against_its_slot() {
+    fn a_new_character_s_name_is_written_against_its_own_colours() {
         let db = test_db(&[
             ("mario", 0, fighter_kind_hash("mario"), true),
             ("vision", 87, fighter_kind_hash("mario"), true),
@@ -663,7 +709,8 @@ mod tests {
         assert!(unwritable.is_empty());
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0].name_id, "vision");
-        assert_eq!(overrides[0].slot, 8);
+        // Its own first colour, though that is Mario's ninth costume.
+        assert_eq!(overrides[0].slot, 0);
     }
 
     /// Rebuilding from base + overrides is what keeps a project correct when the mods
