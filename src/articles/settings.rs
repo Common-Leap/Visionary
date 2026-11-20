@@ -109,7 +109,7 @@ pub fn read_settings(
     let mut out = Vec::new();
     for (site, body) in statuses {
         let status = Status { kind: &site.kind_expr, phase: &site.phase };
-        let called = scan(body, &site.file, site.span.start, consts, status, &mut out);
+        let called = scan(body, &site.function, &site.file, site.span.start, consts, status, &mut out);
         let mut followed: Vec<&str> = Vec::new();
         for name in &called {
             if name == &site.function || followed.contains(&name.as_str()) {
@@ -118,7 +118,7 @@ pub fn read_settings(
             followed.push(name);
             if let Some((file, span, text)) = helpers(&site.file, name) {
                 // One level only: what the helper calls is not followed.
-                scan(&text, &file, span.start, consts, status, &mut out);
+                scan(&text, name, &file, span.start, consts, status, &mut out);
             }
         }
     }
@@ -131,17 +131,18 @@ struct Status<'a> {
     phase: &'a str,
 }
 
-/// Records the settings `text` (one function, at byte `base` of `file`) writes, and returns the
-/// names it references that may be project functions.
+/// Records the settings `text` (the function `name`, at byte `base` of `file`) writes, and returns
+/// the names it references that may be project functions.
 fn scan(
     text: &str,
+    name: &str,
     file: &Path,
     base: usize,
     consts: &ProjectConsts,
     status: Status,
     out: &mut Vec<Setting>,
 ) -> Vec<String> {
-    let Some((start, functions)) = parse_functions(text) else {
+    let Some((start, functions)) = parse_functions(text, name) else {
         out.push(Setting {
             field: SettingField::OtherMovement,
             value: SettingValue::Computed("Visionary could not read this status function".into()),
@@ -176,8 +177,9 @@ fn scan(
 
 /// The functions in `text`, with the byte offset the parsed text starts at. A span can start
 /// before the item (`} unsafe extern "C" fn x(..)`), so when the whole text is not a file holding
-/// a function, parsing is retried from each keyword a function item can start with.
-fn parse_functions(text: &str) -> Option<(usize, Vec<syn::ItemFn>)> {
+/// a function, parsing is retried from each keyword a function item can start with. A retry is
+/// accepted only for the function `name`: a function nested in a broken one is not it.
+fn parse_functions(text: &str, name: &str) -> Option<(usize, Vec<syn::ItemFn>)> {
     if let Ok(file) = syn::parse_file(text) {
         let functions: Vec<syn::ItemFn> = file
             .items
@@ -207,7 +209,7 @@ fn parse_functions(text: &str) -> Option<(usize, Vec<syn::ItemFn>)> {
     candidates.into_iter().take(16).find_map(|at| {
         use syn::parse::Parser;
         let function = one_function.parse_str(&text[at..]).ok()?;
-        Some((at, vec![function]))
+        (function.sig.ident == name).then(|| (at, vec![function]))
     })
 }
 
@@ -1143,7 +1145,8 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         );
     }
 
-    /// Potemkin-SL2 · src/moveset/articles/ryusensya/specialn.rs:109-112 — `lua_args!` fills the
+    /// Potemkin-SL2 · src/moveset/articles/ryusensya/specialn.rs:109-112 (tier 1, smashline2),
+    /// adapted: those four lines, verbatim, inside a trimmed `fly_main`. `lua_args!` fills the
     /// lua stack the way `push_lua_stack` does.
     #[test]
     fn lua_args_speed_potemkin() {
@@ -1166,5 +1169,28 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         assert_eq!(y.value, SettingValue::Literal(0.0));
         let y_at = text.find("0.0);").unwrap();
         assert_eq!(y.span, y_at..y_at + 3);
+    }
+
+    /// A broken status holding a well-formed nested function is reported as unreadable; the nested
+    /// function is not read in its place.
+    #[test]
+    fn nested_function_in_broken_body_is_not_read_as_the_status() {
+        let text = "unsafe extern \"C\" fn status_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    fn inner() { ModelModule::set_scale(acc, 2.0); }\n    let = ;\n    0.into()\n}\n";
+        let site = StatusSite {
+            kind_expr: "*KIND_MAIN".into(),
+            phase: "Main".into(),
+            function: "status_main".into(),
+            file: PathBuf::from("f.rs"),
+            span: 0..text.len(),
+        };
+        let s = read_settings(&[(&site, text.to_string())], &ProjectConsts::default(), &|_, _| None);
+        assert_eq!(s.len(), 1, "{s:#?}");
+        assert_eq!(s[0].field, SettingField::OtherMovement);
+        assert_eq!(
+            s[0].value,
+            SettingValue::Computed("Visionary could not read this status function".into())
+        );
+        assert_eq!(s[0].span, 0..text.len());
+        assert!(s.iter().all(|s| s.field != SettingField::Scale));
     }
 }
