@@ -32845,7 +32845,7 @@ impl eframe::App for VisionaryApp {
                 root.join("fighter").is_dir().then_some(root)
             });
         self.roster.set_export_root(roster_export_root);
-        self.roster.set_project_saved(self.project_path.is_some());
+        self.roster.set_project_dir(self.workspace());
         self.roster.prepare(
             &ctx,
             &self.state.fighters,

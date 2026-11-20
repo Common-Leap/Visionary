@@ -22,6 +22,8 @@ pub(super) struct Card {
     base: String,
     /// The select screen entry, when the card is a character you added.
     roster_key: crate::roster::RosterKey,
+    /// A character made in this project, on top of `fighter`.
+    made_here: bool,
 }
 
 /// Something a card asked for, done once the page is drawn.
@@ -39,6 +41,8 @@ enum PageAction {
     EditOtherEffect(String),
     OpenEffectFile,
     EditValues(String),
+    /// Something a character made in this project asked for.
+    Made(crate::roster::new_character::NewCharacterAction),
     EditGimmicks(String),
     EditSelectScreen(crate::roster::RosterKey),
     Files(String, u8, FileAction),
@@ -283,7 +287,7 @@ fn folder_name(path: &Path) -> String {
 }
 
 impl VisionaryApp {
-    fn workspace(&self) -> Option<PathBuf> {
+    pub(super) fn workspace(&self) -> Option<PathBuf> {
         self.project_path.as_ref().and_then(|path| path.parent()).map(Path::to_path_buf)
     }
 
@@ -343,6 +347,7 @@ impl VisionaryApp {
                 name: entry.display_name.split(" · ").next().unwrap_or(&entry.display_name).to_owned(),
                 base: if entry.is_modded() { "Mod fighter".into() } else { "Base game".into() },
                 roster_key: crate::roster::RosterKey::fighter(&entry.name),
+                made_here: false,
             });
         }
         for authored in &self.roster.project.authored {
@@ -353,8 +358,9 @@ impl VisionaryApp {
                 slot: slots.first().copied().unwrap_or(authored.slot),
                 slots,
                 name: authored.display_name.clone(),
-                base: donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone()),
+                base: format!("Plays as {}", donor.map_or(authored.donor.clone(), |entry| entry.display_name.clone())),
                 roster_key: authored.key.clone(),
+                made_here: true,
             });
         }
         cards.sort_by(|a, b| a.name.cmp(&b.name));
@@ -572,7 +578,11 @@ impl VisionaryApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&card.name).size(28.0).strong().color(look.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if act(ui, look, "Hide", None).clicked() {
+                            if card.made_here {
+                                if act(ui, look, "Remove", None).on_hover_text("Take this character out of the project. Its files stay in its folder.").clicked() {
+                                    actions.push(PageAction::Made(crate::roster::new_character::NewCharacterAction::Remove(card.roster_key.clone())));
+                                }
+                            } else if act(ui, look, "Hide", None).clicked() {
                                 actions.push(PageAction::Hide(card.fighter.clone()));
                             }
                             egui::ComboBox::from_id_salt(("card_slot", &card.fighter, &card.name))
@@ -680,6 +690,19 @@ impl VisionaryApp {
                 }
                 if act(ui, look, "Edit with nodes", None).clicked() {
                     actions.push(PageAction::EditMoves(fighter.clone(), true));
+                }
+                if card.made_here {
+                    let alone = self.roster.edit_target() == Some(&card.roster_key);
+                    let base = crate::data::fighter_display_name(fighter);
+                    let (words, tip) = if alone {
+                        ("Edits change only this character", format!("Click to make move edits change every {base} again."))
+                    } else {
+                        ("Edits change every costume", format!("Move edits change every {base}. Click to make them change only this character."))
+                    };
+                    if act(ui, look, words, alone.then_some(colour)).on_hover_text(tip).clicked() {
+                        let target = (!alone).then(|| card.roster_key.clone());
+                        actions.push(PageAction::Made(crate::roster::new_character::NewCharacterAction::SetEditTarget(target)));
+                    }
                 }
             }
             Part::Effects => {
@@ -987,6 +1010,7 @@ impl VisionaryApp {
                 }
             }
             PageAction::EditValues(fighter) => self.roster.focus_traits_for(&fighter),
+            PageAction::Made(action) => self.roster.handle_new_character(action),
             PageAction::EditGimmicks(fighter) => {
                 self.focus_card(&fighter, None);
                 self.roster.open = false;

@@ -45,48 +45,30 @@ pub fn effect_file(donor: &str, slot: u8) -> String {
     format!("effect/fighter/{donor}/ef_{donor}_c{slot:02}.eff")
 }
 
-/// What a scaffold created.
+/// The folders made for a new character.
 #[derive(Debug, Clone)]
 pub struct Scaffold {
-    pub donor: String,
-    pub slot: u8,
-    /// Every slot scaffolded, ascending (single-slot scaffolds hold one).
+    /// Every costume it takes, ascending.
     pub slots: Vec<u8>,
-    pub created: Vec<String>,
 }
 
-/// Create the directory trees and placement guides for every slot in `slots`.
-///
-/// One mod root holds the whole range (c08–c15 lives in one folder), so this
-/// loops the single-slot layout rather than inventing a second one. `slots`
-/// must be non-empty; entries are de-duplicated and the scaffold reports them
-/// ascending with the lowest as [`Scaffold::slot`].
+/// Make the folders for every costume in `slots` under one mod folder.
 pub fn create_many(mod_root: &Path, donor: &str, slots: &[u8]) -> Result<Scaffold> {
     if donor.trim().is_empty() {
-        bail!("a new character needs a donor fighter to be a costume of");
+        bail!("a new character needs a fighter to play as");
     }
     if slots.is_empty() {
-        bail!("a new character needs at least one costume slot");
+        bail!("a new character needs at least one costume");
     }
     let mut sorted: Vec<u8> = slots.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let mut created = Vec::new();
     for slot in &sorted {
         for relative in directories(donor, *slot) {
-            let path = mod_root.join(&relative);
-            std::fs::create_dir_all(&path)?;
-            if !created.contains(&relative) {
-                created.push(relative);
-            }
+            std::fs::create_dir_all(mod_root.join(&relative))?;
         }
     }
-    Ok(Scaffold {
-        donor: donor.to_ascii_lowercase(),
-        slot: sorted[0],
-        slots: sorted,
-        created,
-    })
+    Ok(Scaffold { slots: sorted })
 }
 
 /// Directories for every slot in `slots`, de-duplicated (the shared
@@ -187,75 +169,6 @@ pub fn copy_base(mod_root: &Path, roots: &[PathBuf], donor: &str, ui_name: &str,
     Ok(copied)
 }
 
-/// Which parts of an authored character are present.
-///
-/// Reports what is *installed*, and — for the moveset — what is *registered*. Those are
-/// different questions: a generated script with no `agent.acmd` line compiles, installs
-/// nothing, and plays vanilla, so counting files would report a working moveset that does not
-/// exist.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Readiness {
-    pub model_files: usize,
-    pub motion_files: usize,
-    pub has_motion_list: bool,
-    pub has_effect: bool,
-    pub has_name: bool,
-    /// Moves the project has authored for this slot.
-    pub authored_moves: usize,
-    /// Of those, how many the generated plugin will actually install.
-    pub registered_moves: usize,
-}
-
-impl Readiness {
-    /// Human-readable outstanding items, most important first. Empty when nothing is missing.
-    pub fn outstanding(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        if self.model_files == 0 {
-            out.push("no model files in the slot's model folder".to_string());
-        }
-        if self.motion_files == 0 {
-            out.push("no animations in the slot's motion folder".to_string());
-        } else if !self.has_motion_list {
-            out.push(
-                "animations are present but there is no motion_list.bin naming them, so the \
-                 game will not find them"
-                    .to_string(),
-            );
-        }
-        if self.authored_moves > 0 && self.registered_moves < self.authored_moves {
-            out.push(format!(
-                "{} of {} authored move(s) are not registered, so they will compile and then \
-                 play the donor's move instead",
-                self.authored_moves - self.registered_moves,
-                self.authored_moves
-            ));
-        }
-        if !self.has_name {
-            out.push("no display name set for this slot".to_string());
-        }
-        out
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.outstanding().is_empty()
-    }
-
-    /// The starting-moveset moves this character has not replaced yet.
-    ///
-    /// Everything not in this list still plays the donor's version, which is the correct
-    /// default and not a fault — so this is a checklist, not a set of warnings.
-    pub fn remaining_starting_moves<'a>(
-        &self,
-        authored: &'a std::collections::BTreeSet<String>,
-    ) -> Vec<&'a str> {
-        MOVESET_TEMPLATE
-            .iter()
-            .filter(|name| !authored.contains(**name))
-            .copied()
-            .collect()
-    }
-}
-
 /// What one costume slot holds, per file kind, plus where to open it.
 ///
 /// `measure` answers "how ready is this authored slot"; this answers "what
@@ -347,173 +260,6 @@ pub fn inventory(roots: &[PathBuf], donor: &str, slot: u8, name_id: Option<&str>
         .unwrap_or(false);
     out
 }
-
-/// Scan the filesystem for what an authored slot has.
-pub fn measure(roots: &[PathBuf], donor: &str, slot: u8, has_name: bool) -> Readiness {
-    let donor = donor.to_ascii_lowercase();
-    let count = |relative: String| -> (usize, bool) {
-        let mut files = 0;
-        let mut motion_list = false;
-        for root in roots {
-            let Ok(entries) = std::fs::read_dir(root.join(&relative)) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if !entry.path().is_file() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-                // The placement guide is Visionary's own note, not the user's content.
-                if name == "put_your_model_here.txt" {
-                    continue;
-                }
-                if name == "motion_list.bin" {
-                    motion_list = true;
-                }
-                files += 1;
-            }
-        }
-        (files, motion_list)
-    };
-
-    let (model_files, _) = count(format!("fighter/{donor}/model/body/c{slot:02}"));
-    let (motion_files, has_motion_list) = count(format!("fighter/{donor}/motion/body/c{slot:02}"));
-    let effect = effect_file(&donor, slot);
-    Readiness {
-        model_files,
-        motion_files,
-        has_motion_list,
-        has_effect: roots.iter().any(|root| root.join(&effect).is_file()),
-        has_name,
-        authored_moves: 0,
-        registered_moves: 0,
-    }
-}
-
-/// How a slot's animations line up with the motion list that names them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct AnimationBinding {
-    /// Animations the motion list names that this slot provides.
-    pub resolved: Vec<String>,
-    /// Animations the motion list names that this slot does not provide.
-    ///
-    /// Not an error: the game falls back to the donor's base costume for these, which is
-    /// usually what an author wants while only some animations are replaced. It is reported so
-    /// "my animation is not playing" has an answer.
-    pub falls_back_to_donor: Vec<String>,
-    /// Files in the slot's motion folder that no motion list entry names.
-    ///
-    /// These will never play, whatever they are called. This is the failure mode worth
-    /// surfacing: the file is present, so nothing looks wrong.
-    pub unreferenced_files: Vec<String>,
-}
-
-impl AnimationBinding {
-    pub fn summary(&self) -> String {
-        format!(
-            "{} animation(s) come from this costume, {} fall back to the base costume",
-            self.resolved.len(),
-            self.falls_back_to_donor.len()
-        )
-    }
-}
-
-/// Compare a slot's animation files against the motion list that names them.
-///
-/// Matching is by hash40, not by text. A motion list stores hashes, and `Hash40`'s text form
-/// is the raw hex unless a global label table happens to be loaded — comparing those against
-/// filenames matches nothing, silently, and reports every animation as missing.
-///
-/// `motion_list` is the donor's list — the one the game reads for this fighter — and
-/// `slot_dir` is the costume's own motion folder. `labels` is used only to name the
-/// animations that fall back, since their names exist nowhere else.
-pub fn bind_animations(
-    motion_list: &Path,
-    slot_dir: &Path,
-    labels: &std::collections::HashMap<u64, String>,
-) -> Result<AnimationBinding> {
-    let list = motion_lib::open(motion_list)
-        .map_err(|error| anyhow::anyhow!("reading {}: {error:?}", motion_list.display()))?;
-
-    let mut named: std::collections::BTreeSet<u64> = Default::default();
-    for motion in list.list.values() {
-        for animation in &motion.animations {
-            named.insert(animation.name.0);
-        }
-    }
-
-    // hash40 of the filename stem → the stem, which is the name to show for a file that is
-    // present. A slot may legitimately hold two files whose stems differ only in case.
-    let mut present: std::collections::BTreeMap<u64, String> = Default::default();
-    if let Ok(entries) = std::fs::read_dir(slot_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if let Some(stem) = name.strip_suffix(".nuanmb") {
-                present.insert(hash40::hash40(stem).0, stem.to_string());
-            }
-        }
-    }
-
-    let describe = |hash: u64| {
-        labels
-            .get(&hash)
-            .cloned()
-            .unwrap_or_else(|| format!("{hash:#018x}"))
-    };
-
-    let mut binding = AnimationBinding::default();
-    for (hash, stem) in &present {
-        if named.contains(hash) {
-            binding.resolved.push(stem.clone());
-        } else {
-            binding.unreferenced_files.push(stem.clone());
-        }
-    }
-    for hash in &named {
-        if !present.contains_key(hash) {
-            binding.falls_back_to_donor.push(describe(*hash));
-        }
-    }
-    binding.resolved.sort();
-    binding.falls_back_to_donor.sort();
-    binding.unreferenced_files.sort();
-    Ok(binding)
-}
-
-/// The moves worth replacing first, as ACMD script names.
-///
-/// Not generated code. A costume-backed character is already playable the moment its model is
-/// in place, because it runs the donor's moveset until a move is replaced — so scaffolding
-/// copies of the donor's scripts would add nothing but 24 functions that do exactly what the
-/// absence of them does. What is useful is knowing which moves make a character feel like its
-/// own, which is what this list is: the ground and air normals, the smashes, the throws, and
-/// the four specials.
-pub const MOVESET_TEMPLATE: &[&str] = &[
-    "attack_11",
-    "attack_12",
-    "attack_13",
-    "attack_dash",
-    "attack_s3_s",
-    "attack_hi3",
-    "attack_lw3",
-    "attack_s4_s",
-    "attack_hi4",
-    "attack_lw4",
-    "attack_air_n",
-    "attack_air_f",
-    "attack_air_b",
-    "attack_air_hi",
-    "attack_air_lw",
-    "catch",
-    "throw_f",
-    "throw_b",
-    "throw_hi",
-    "throw_lw",
-    "special_n",
-    "special_s",
-    "special_hi",
-    "special_lw",
-];
 
 /// Emit an authored function, the fighter's own function, and a dispatcher between them.
 ///
@@ -624,7 +370,7 @@ mod tests {
     fn the_scaffold_creates_the_slots_own_directories() {
         let dir = tempfile::tempdir().unwrap();
         let scaffold = create_many(dir.path(), "Mario", &[8]).unwrap();
-        assert_eq!(scaffold.donor, "mario");
+        assert_eq!(scaffold.slots, vec![8]);
         assert!(dir.path().join("fighter/mario/model/body/c08").is_dir());
         assert!(dir.path().join("fighter/mario/motion/body/c08").is_dir());
         assert!(dir.path().join("effect/fighter/mario").is_dir());
@@ -661,41 +407,6 @@ mod tests {
         assert!(read("ui/replace/chara/chara_1/chara_1_vision_00.bntx").is_none(), "the base has no such portrait");
         assert_eq!(copied.files, 9);
         assert_eq!(copied.bytes, 4 + 3 + 4 + 4 + 4 + 3 + 3 + 2 + 4);
-    }
-
-    #[test]
-    fn readiness_reports_an_empty_slot_as_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        create_many(dir.path(), "mario", &[8]).unwrap();
-        let readiness = measure(&[dir.path().to_path_buf()], "mario", 8, false);
-        assert_eq!(readiness.model_files, 0);
-        assert_eq!(readiness.motion_files, 0);
-        assert!(!readiness.is_ready());
-        assert!(readiness
-            .outstanding()
-            .iter()
-            .any(|note| note.contains("no model")));
-    }
-
-    /// Animations with no motion_list.bin are invisible to the game, which looks like the
-    /// animations not being picked up at all.
-    #[test]
-    fn animations_without_a_motion_list_are_called_out() {
-        let dir = tempfile::tempdir().unwrap();
-        create_many(dir.path(), "mario", &[8]).unwrap();
-        std::fs::write(
-            dir.path()
-                .join("fighter/mario/motion/body/c08/attack.nuanmb"),
-            b"",
-        )
-        .unwrap();
-        let readiness = measure(&[dir.path().to_path_buf()], "mario", 8, false);
-        assert_eq!(readiness.motion_files, 1);
-        assert!(!readiness.has_motion_list);
-        assert!(readiness
-            .outstanding()
-            .iter()
-            .any(|note| note.contains("motion_list.bin")));
     }
 
     /// The dossier splits the model folder into meshes vs textures so a slot
@@ -745,24 +456,9 @@ mod tests {
         );
     }
 
-    /// A created function with no registration compiles, installs nothing, and plays vanilla.
-    /// Counting files rather than registrations would report a moveset that does not exist.
-    #[test]
-    fn unregistered_moves_are_reported_as_not_installed() {
-        let readiness = Readiness {
-            authored_moves: 5,
-            registered_moves: 3,
-            ..Default::default()
-        };
-        assert!(readiness
-            .outstanding()
-            .iter()
-            .any(|note| note.contains("2 of 5 authored move(s) are not registered")));
-    }
-
     const AUTHORED: &str = "unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 4.0);\n}\n";
     /// The archive spells the fighter's own script after the move, which is not always the
-    /// name the exporter picked — hence renaming whatever is declared rather than a known name.
+    /// name the exporter picked, hence renaming whatever is declared rather than a known name.
     const ORIGINAL: &str = "unsafe extern \"C\" fn game_attack_11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n}\n";
 
     #[test]
@@ -793,73 +489,5 @@ mod tests {
         if let Err(error) = syn::parse_file(&source) {
             panic!("costume-gated source does not parse: {error}\n\n{generated}");
         }
-    }
-
-    /// A file that no motion list names will never play, and nothing about the folder looks
-    /// wrong. That is the case worth reporting; a missing one merely falls back.
-    #[test]
-    fn animation_binding_separates_fallbacks_from_files_nothing_names() {
-        use motion_lib::mlist::{Animation, MList, Motion};
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut list = MList::default();
-        for name in ["attack_11", "attack_12"] {
-            list.list.insert(
-                hash40::hash40(name),
-                Motion {
-                    animations: vec![Animation {
-                        name: hash40::hash40(name),
-                        unk: 0,
-                    }],
-                    ..Default::default()
-                },
-            );
-        }
-        let list_path = dir.path().join("motion_list.bin");
-        motion_lib::save(&list_path, &list).unwrap();
-
-        let slot = dir.path().join("c08");
-        std::fs::create_dir_all(&slot).unwrap();
-        std::fs::write(slot.join("attack_11.nuanmb"), b"").unwrap();
-        std::fs::write(slot.join("typo_attack13.nuanmb"), b"").unwrap();
-
-        let labels: std::collections::HashMap<u64, String> = ["attack_11", "attack_12"]
-            .iter()
-            .map(|name| (hash40::hash40(name).0, (*name).to_string()))
-            .collect();
-        let binding = bind_animations(&list_path, &slot, &labels).unwrap();
-        assert_eq!(binding.resolved, vec!["attack_11"]);
-        assert_eq!(binding.falls_back_to_donor, vec!["attack_12"]);
-        assert_eq!(binding.unreferenced_files, vec!["typo_attack13"]);
-    }
-
-    #[test]
-    fn the_starting_moveset_covers_recovery_and_has_no_duplicates() {
-        assert!(MOVESET_TEMPLATE.contains(&"special_hi"));
-        let unique: std::collections::BTreeSet<&&str> = MOVESET_TEMPLATE.iter().collect();
-        assert_eq!(
-            unique.len(),
-            MOVESET_TEMPLATE.len(),
-            "duplicate script name"
-        );
-    }
-
-    /// A move not in the checklist is not a fault — it plays the donor's version, which is the
-    /// correct default. The list shrinks as moves are replaced.
-    #[test]
-    fn the_starting_move_checklist_shrinks_as_moves_are_replaced() {
-        let readiness = Readiness::default();
-        let none = std::collections::BTreeSet::new();
-        assert_eq!(
-            readiness.remaining_starting_moves(&none).len(),
-            MOVESET_TEMPLATE.len()
-        );
-        let some: std::collections::BTreeSet<String> = ["attack_11", "special_hi"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let remaining = readiness.remaining_starting_moves(&some);
-        assert_eq!(remaining.len(), MOVESET_TEMPLATE.len() - 2);
-        assert!(!remaining.contains(&"special_hi"));
     }
 }

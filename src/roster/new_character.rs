@@ -1,51 +1,25 @@
-//! The new-character tab: create a costume-backed character and see what it still needs.
+//! The New character page: pick the fighter it plays as, name it, create it.
 //!
-//! The first thing this panel says is what it is not. A slot-backed character gets its own
-//! model, animations, effects, name, and moveset, and it is selected as a **costume of the
-//! donor** — not as its own cell on the character select grid.
+//! A new character is a set of costumes of a base fighter with its own model, animations,
+//! effects, sounds, name, moves and entry on the select screen. Once made it is a card on the
+//! Project page like any other character; this page only makes them.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use egui::{Color32, RichText, Ui};
 
 use crate::mod_project::{AuthoredEntry, RosterMod};
+use crate::ui::{act, look, Look};
 
 use super::index::RosterIndex;
 use super::library::{ModLibrary, ModSource};
 use super::{scaffold, RosterKey};
 
-/// What the per-character rows asked for.
-enum ExistingAction {
-    None,
-    Remove(RosterKey),
-    Target(Option<RosterKey>),
-    /// Jump to Character Select with this character's editor open.
-    GotoCss(RosterKey),
-}
+/// The select screen gives one character at most eight colours.
+const MAX_SKINS: u8 = 8;
 
-/// Which creation button was pressed. The folder picker (Create) and the
-/// no-dialog path (Quick) funnel into the same `NewCharacterAction::Create.
-enum CreatorAsk {
-    None,
-    PickFolder,
-    Quick,
-}
-
-/// Minimum number of skins a new character needs. Slot-pack mods ship in
-/// multiples of the vanilla count, and a character below this number reads as
-/// "the same donor with one skin" — which is what they would be in-game.
-const MIN_SKINS: u8 = 8;
-
-/// Largest block the Skins stepper offers. Past this a character is really a
-/// slot pack, and the stepper becomes fiddly; the slot map still allows any
-/// start so odd sizes stay reachable via a smaller block plus manual growth.
-const MAX_SKINS: u8 = 32;
-
-/// Inclusive `[start, end]` slot range. A range of `(8, 15)` means 8 skins on
-/// c08..=c15. The form keeps both endpoints and rebuilds the inclusive vec
-/// when it needs to scaffold or report conflicts; storing a vec would let
-/// them drift, and a hole-bearing set would need the same validation.
+/// Inclusive `[start, end]` costume range: `(8, 15)` is eight skins on c08 to c15.
 type SlotRange = (u8, u8);
 
 fn range_slots(range: SlotRange) -> Vec<u8> {
@@ -58,43 +32,29 @@ fn range_count(range: SlotRange) -> u8 {
 
 #[derive(Default)]
 pub struct NewCharacterView {
-    /// The project has a folder on disk. A new character lives in the project, so one made
-    /// in an unsaved session would be lost while its files stayed behind.
-    pub project_saved: bool,
+    /// The project's folder. A new character's files go inside it, so there has to be one.
+    pub project_dir: Option<PathBuf>,
     donor: Option<String>,
-    /// Inclusive `[start, end]` slot range. `None` until the donor is picked,
-    /// at which point it is initialised to the lowest free run of [`MIN_SKINS`]
-    /// slots so a new donor never opens with a range that is already taken.
+    /// The costumes it takes: the lowest free run once a fighter is picked.
     slot_range: Option<SlotRange>,
-    /// Whether the slot map (the full chip grid) is expanded. Collapsed by
-    /// default so the form reads as one line plus one status line; the map
-    /// is there when the auto-picked block is not where the user wants it.
     show_slot_map: bool,
     display_name: String,
+    search: String,
+    /// A folder picked for its files in place of the project's.
+    folder: Option<PathBuf>,
     status: String,
     error: Option<String>,
-    /// Jump to Character Select with this character selected. Read and
-    /// cleared by the window each frame (this tab cannot switch tabs).
-    goto_css: Option<RosterKey>,
 }
 
-impl NewCharacterView {
-    /// Take the pending Character Select jump, if any.
-    pub fn take_goto_character_select(&mut self) -> Option<RosterKey> {
-        self.goto_css.take()
-    }
-}
-
-/// What the panel wants done after it draws. Returned rather than performed inline so the
-/// window owns every mutation of the library and project.
+/// What the page wants done after it draws. The window owns every change to the library and
+/// the project.
 pub enum NewCharacterAction {
     None,
-    /// Send moveset edits to this character's costume, or (with `None`) back to the fighter
-    /// as a whole.
+    /// Send move edits to this character's costumes, or (with `None`) back to the whole fighter.
     SetEditTarget(Option<RosterKey>),
     Create {
         donor: String,
-        /// Every costume slot this character owns, ascending and deduplicated.
+        /// Every costume this character takes, ascending.
         slots: Vec<u8>,
         display_name: String,
         name_id: String,
@@ -104,380 +64,255 @@ pub enum NewCharacterAction {
 }
 
 impl NewCharacterView {
-    // Traversal bundle (ui, roots, index, project, target, labels, moves) —
-    // same shape as every roster draw_*, allowed like `draw_stages` below.
-    #[allow(clippy::too_many_arguments)]
+    /// `faces` are the fighters' portraits by fighter name.
     pub fn ui(
         &mut self,
         ui: &mut Ui,
         roots: &[PathBuf],
         index: &RosterIndex,
         project: &RosterMod,
-        edit_target: Option<&RosterKey>,
-        labels: &std::collections::HashMap<u64, String>,
-        authored_moves: &BTreeMap<RosterKey, std::collections::BTreeSet<String>>,
+        faces: &HashMap<String, egui::TextureHandle>,
     ) -> NewCharacterAction {
+        let look = look(ui);
         let mut action = NewCharacterAction::None;
-
-        let creator = self.draw_creator(ui, roots, index);
-        match creator {
-            CreatorAsk::None => {}
-            CreatorAsk::PickFolder => action = self.build_create_action(),
-            CreatorAsk::Quick => action = self.build_quick_create_action(project),
-        }
-        ui.add_space(8.0);
-        match self.draw_existing(
-            ui,
-            roots,
-            index,
-            project,
-            edit_target,
-            labels,
-            authored_moves,
-        ) {
-            ExistingAction::None => {}
-            ExistingAction::Remove(key) => action = NewCharacterAction::Remove(key),
-            ExistingAction::Target(key) => action = NewCharacterAction::SetEditTarget(key),
-            ExistingAction::GotoCss(key) => self.goto_css = Some(key),
-        }
-
-        if let Some(error) = &self.error.clone() {
-            ui.add_space(6.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(Color32::from_rgb(240, 120, 120), "✘");
-                        ui.label(RichText::new(error).small().weak());
-                    });
+        // Side by side when there is room, stacked when there is not.
+        if ui.available_width() >= 860.0 {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(380.0);
+                    action = self.draw_form(ui, look, roots, index, project, faces);
                 });
-        } else if !self.status.is_empty() {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&self.status).small().weak());
+                ui.add_space(18.0);
+                ui.vertical(|ui| self.draw_fighters(ui, look, roots, index, faces));
             });
+        } else {
+            action = self.draw_form(ui, look, roots, index, project, faces);
+            ui.add_space(14.0);
+            self.draw_fighters(ui, look, roots, index, faces);
         }
         action
     }
 
-    fn draw_creator(&mut self, ui: &mut Ui, roots: &[PathBuf], index: &RosterIndex) -> CreatorAsk {
-        let mut pending = CreatorAsk::None;
-        let donors: Vec<&super::RosterEntry> = index
+    fn draw_form(
+        &mut self,
+        ui: &mut Ui,
+        look: Look,
+        roots: &[PathBuf],
+        index: &RosterIndex,
+        project: &RosterMod,
+        faces: &HashMap<String, egui::TextureHandle>,
+    ) -> NewCharacterAction {
+        let base = self.donor.as_deref().map(crate::data::fighter_display_name);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 96.0), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 10.0, look.sunk);
+            if let Some(face) = self.donor.as_ref().and_then(|donor| faces.get(donor)) {
+                egui::Image::new(face).corner_radius(10.0).paint_at(ui, rect);
+            }
+            ui.painter().rect_stroke(rect, 10.0, egui::Stroke::new(1.5, look.edge), egui::StrokeKind::Inside);
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                let name = self.display_name.trim();
+                ui.label(RichText::new(if name.is_empty() { "New character" } else { name }).size(26.0).strong().color(look.text));
+                let line = match &base {
+                    Some(base) => format!("Plays as {base}"),
+                    None => "Pick the fighter it plays as".to_owned(),
+                };
+                ui.label(RichText::new(line).size(15.0).color(look.dim));
+            });
+        });
+        ui.add_space(10.0);
+
+        let field = |ui: &mut Ui, label: &str| {
+            ui.label(RichText::new(label).strong().color(look.dim));
+        };
+        field(ui, "Name");
+        ui.add(egui::TextEdit::singleline(&mut self.display_name).desired_width(f32::INFINITY).hint_text("As the game shows it"));
+        ui.add_space(8.0);
+
+        field(ui, "Skins");
+        let mut range = self.slot_range.map(clamp_range);
+        ui.horizontal(|ui| {
+            let mut count = range.map_or(MAX_SKINS, range_count).clamp(1, MAX_SKINS);
+            let changed = ui.add(egui::DragValue::new(&mut count).range(1..=MAX_SKINS).speed(0.05)).changed();
+            match &mut range {
+                Some(range) => {
+                    if changed {
+                        range.1 = range.0.saturating_add(count - 1);
+                    }
+                    ui.label(RichText::new(format!("costumes c{:02} to c{:02}", range.0, range.1)).color(look.text));
+                    if act(ui, look, if self.show_slot_map { "Done" } else { "Change" }, None).clicked() {
+                        self.show_slot_map = !self.show_slot_map;
+                    }
+                }
+                None => {
+                    ui.label(RichText::new("of the fighter you pick").color(look.dim));
+                }
+            }
+        });
+        if range.is_some() {
+            self.slot_range = range;
+        }
+        let mut blocked = None;
+        if let (Some(donor), Some(range)) = (self.donor.clone(), self.slot_range) {
+            let statuses = slot_statuses(roots, index, &donor);
+            let taken = conflicts_in_range(&statuses, range);
+            if !taken.is_empty() {
+                let line = format!("Already in use: {}", summarize_taken(&taken));
+                ui.label(RichText::new(&line).color(Color32::from_rgb(240, 190, 90)));
+                blocked = Some("Pick costumes that are free.");
+                if let Some(next) = next_free_run_after(&statuses, range_count(range), range.0) {
+                    if act(ui, look, "Use the next free ones", None).clicked() {
+                        self.slot_range = Some(next);
+                    }
+                }
+            }
+            if self.show_slot_map {
+                self.draw_slot_map(ui, look, &statuses, range);
+            }
+        }
+        ui.add_space(8.0);
+
+        field(ui, "Files");
+        let home = self.folder.clone().or_else(|| self.project_dir.as_ref().map(|dir| dir.join("characters")));
+        ui.horizontal_wrapped(|ui| {
+            match &home {
+                Some(home) => {
+                    let name = crate::mod_export::slugify(self.display_name.trim());
+                    ui.label(RichText::new(home.join(name).display().to_string()).monospace().color(look.text));
+                }
+                None => {
+                    ui.label(RichText::new("Save the project first (File, Save as).").color(look.dim));
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            if act(ui, look, "Choose folder", None).clicked() {
+                if let Some(picked) = rfd::FileDialog::new().set_title("Folder for this character's files").pick_folder() {
+                    self.folder = Some(picked);
+                }
+            }
+            if self.folder.is_some() && act(ui, look, "Use project folder", None).clicked() {
+                self.folder = None;
+            }
+        });
+        ui.add_space(12.0);
+
+        let reason = if home.is_none() {
+            Some("Save the project first.")
+        } else if self.donor.is_none() {
+            Some("Pick a fighter.")
+        } else if self.display_name.trim().is_empty() {
+            Some("Give it a name.")
+        } else {
+            blocked
+        };
+        let mut action = NewCharacterAction::None;
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(reason.is_none(), |ui| {
+                if act(ui, look, "Create character", Some(look.accent)).clicked() {
+                    if let Some(home) = &home {
+                        action = self.build_create_action(project, home.clone());
+                    }
+                }
+            });
+            if let Some(reason) = reason {
+                ui.label(RichText::new(reason).color(look.dim));
+            }
+        });
+        ui.add_space(10.0);
+        if let Some(base) = &base {
+            ui.label(
+                RichText::new(format!(
+                    "It starts as a copy of {base}: model, animations, effects, sounds and portraits go into its own folder, and it gets its own place on the select screen."
+                ))
+                .color(look.dim),
+            );
+            ui.add_space(4.0);
+        }
+        ui.label(
+            RichText::new("Its own place on the select screen needs the CSK Collection plugin on the SD card. Without it the game shows the entry in the base fighter's costumes.")
+                .color(look.dim),
+        );
+        if let Some(error) = &self.error {
+            ui.add_space(8.0);
+            ui.label(RichText::new(error).color(Color32::from_rgb(255, 120, 120)));
+        } else if !self.status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new(&self.status).color(look.text));
+        }
+        action
+    }
+
+    /// Every fighter as a portrait tile, as many to a row as fit.
+    fn draw_fighters(&mut self, ui: &mut Ui, look: Look, roots: &[PathBuf], index: &RosterIndex, faces: &HashMap<String, egui::TextureHandle>) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Plays as").size(21.0).strong().color(look.text));
+            ui.add_space(8.0);
+            ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0).hint_text("Find a fighter"));
+        });
+        ui.add_space(6.0);
+        let wanted = self.search.trim().to_lowercase();
+        let fighters: Vec<(&str, &str)> = index
             .sorted()
             .into_iter()
-            .filter(|entry| entry.fighter.is_some() && !entry.backing.shares_engine_fighter())
+            .filter(|entry| !entry.backing.shares_engine_fighter())
+            .filter_map(|entry| Some((entry.fighter.as_deref()?, entry.display_name.as_str())))
+            .filter(|(fighter, name)| wanted.is_empty() || name.to_lowercase().contains(&wanted) || fighter.contains(&wanted))
             .collect();
-
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Based on")
-                        .on_hover_text("Shares this fighter's gameplay and traits, with its own costume, moves, and name.");
-                    ui.add_space(8.0);
-                    // Flex with the window instead of forcing a 220px box.
-                    let combo_w = (ui.available_width() - 110.0).clamp(140.0, 220.0);
-                    let previous_donor = self.donor.clone();
-                    let donor_list: Vec<_> =
-                        donors.iter().filter(|entry| entry.fighter.is_some()).collect();
-                    let picks: Vec<crate::ui::Pick> = donor_list
-                        .iter()
-                        .map(|entry| crate::ui::Pick {
-                            label: entry.display_name.clone(),
-                            hover: entry.fighter.clone().unwrap_or_default(),
-                            group: None,
-                        })
-                        .collect();
-                    let selected = donor_list
-                        .iter()
-                        .position(|entry| entry.fighter == self.donor);
-                    let current = self
-                        .donor
-                        .as_deref()
-                        .and_then(|donor| {
-                            donor_list
-                                .iter()
-                                .find(|entry| entry.fighter.as_deref() == Some(donor))
-                                .map(|entry| entry.display_name.clone())
-                        })
-                        .unwrap_or_else(|| "Pick a fighter".to_string());
-                    if let Some(index) =
-                        crate::ui::picker(ui, "newchar_donor", combo_w, &current, &picks, selected)
-                    {
-                        self.donor = donor_list[index].fighter.clone();
-                    }
-                    if self.donor != previous_donor {
-                        // Donor changed — pick a fresh range so the form never
-                        // opens with a range that crosses a taken slot. Falls
-                        // back to the conventional c08–c15 pack (which then
-                        // shows its conflicts) when no clear run exists.
-                        self.slot_range = self.donor.as_deref().map(|d| {
-                            lowest_free_run(roots, index, d, MIN_SKINS).unwrap_or((8, 15))
-                        });
-                        self.show_slot_map = false;
-                    }
-                });
-                ui.add_space(6.0);
-
-                self.draw_slot_range(ui, roots, index);
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Display name").small().strong());
-                    ui.add_space(8.0);
-                    let name_w = (ui.available_width() - 140.0).clamp(100.0, 200.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.display_name)
-                            .desired_width(name_w)
-                            .hint_text("shown in game"),
-                    );
-                    if !self.display_name.trim().is_empty() {
-                        ui.label(
-                            RichText::new(format!("id: {}", name_id_for(&self.display_name)))
-                                .small()
-                                .weak(),
-                        );
-                    }
-                });
-
-                ui.add_space(10.0);
-                let ready = self.donor.is_some() && !self.display_name.trim().is_empty();
-                let range_ok = self.slot_range.map(range_count).unwrap_or(0) >= MIN_SKINS;
-                let slot_taken = ready && self.slot_range_conflict(roots, index).is_some();
-                let can_create = ready && range_ok && !slot_taken && self.project_saved;
-                ui.horizontal_wrapped(|ui| {
-                    // One primary action: most users want the character made,
-                    // not a destination decision. Quick create imports
-                    // immediately; the folder picker is the rare override.
-                    if ui
-                        .add_enabled(
-                            can_create,
-                            egui::Button::new(RichText::new("Create character").strong()),
-                        )
-                        .on_hover_text(
-                            "Files go to Visionary's authored folder and the character imports immediately",
-                        )
-                        .clicked()
-                    {
-                        pending = CreatorAsk::Quick;
-                    }
-                    if ui
-                        .add_enabled(
-                            can_create,
-                            egui::Button::new(RichText::new("Custom folder").small()),
-                        )
-                        .on_hover_text("Pick where this character's files go")
-                        .clicked()
-                    {
-                        pending = CreatorAsk::PickFolder;
-                    }
-                    // The slot row above already details range problems; here
-                    // is only the one-line reason the button is grey.
-                    if !self.project_saved {
-                        ui.label(
-                            RichText::new("Save the project first (File > Save as): new characters are kept in it.")
-                                .small()
-                                .weak(),
-                        );
-                    } else if !ready {
-                        ui.label(RichText::new("Pick a donor and a name.").small().weak());
-                    } else if !range_ok || slot_taken {
-                        ui.colored_label(
-                            Color32::from_rgb(240, 200, 120),
-                            RichText::new("Fix the slots above.").small(),
-                        );
-                    }
-                });
-            });
-
-        pending
-    }
-
-    /// The slot picker, deliberately quiet: one control row (first slot +
-    /// skin count), one status line, and a "next free block" escape hatch.
-    /// The full slot map lives behind a collapsed toggle so a donor with a
-    /// busy slot table does not push the name field and the create buttons
-    /// off-screen. There is a single mental model — a block starting at
-    /// `First` holding `Skins` costumes — so an inverted range is
-    /// unrepresentable and the 8-skin minimum is just the stepper's floor.
-    fn draw_slot_range(&mut self, ui: &mut Ui, roots: &[PathBuf], index: &RosterIndex) {
-        let Some(donor) = self.donor.clone() else {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Costume slots").small().strong());
-                ui.label(
-                    RichText::new("Pick a fighter first. Slots appear after.")
-                        .small()
-                        .weak(),
-                );
-            });
-            return;
-        };
-        // One filesystem scan per frame; the conflict list below reuses it
-        // rather than rescanning.
-        let statuses = slot_statuses(roots, index, &donor);
-        let mut range = clamp_range(self.slot_range.unwrap_or((8, 15)));
-
-        // ── Row 1: the only controls ──────────────────────────────
+        let tile = egui::vec2(104.0, 128.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Costume slots").small().strong());
-            ui.add_space(8.0);
-            let mut start = range.0;
-            let mut count = range_count(range).max(MIN_SKINS);
-            let start_resp = ui
-                .add(
-                    egui::DragValue::new(&mut start)
-                        .range(0..=255)
-                        .prefix("c")
-                        .speed(1),
-                )
-                .on_hover_text("First costume slot. C00–c07 are the donor's own");
-            ui.label(RichText::new("×").small().weak());
-            let count_resp = ui
-                .add(
-                    egui::DragValue::new(&mut count)
-                        .range(MIN_SKINS..=MAX_SKINS)
-                        .suffix(" skins")
-                        .speed(1),
-                )
-                .on_hover_text(format!("How many costumes. At least {MIN_SKINS}"));
-            if start_resp.changed() || count_resp.changed() {
-                // saturating_add caps at 255 by type; end >= start always.
-                let end = start.saturating_add(count.saturating_sub(1));
-                range = (start, end.max(start));
-            }
-            self.slot_range = Some(range);
-        });
-
-        // ── Row 2: the single status line ─────────────────────────
-        // One line covers the three states (too small / taken / free) so the
-        // eye has one place to check instead of three badges to reconcile.
-        let taken = conflicts_in_range(&statuses, range);
-        let actual = range_count(range);
-        if actual < MIN_SKINS {
-            ui.colored_label(
-                Color32::from_rgb(240, 200, 120),
-                RichText::new(format!(
-                    "No room for {MIN_SKINS} skins from c{:02}. Pick a lower first slot.",
-                    range.0
-                ))
-                .small(),
-            );
-        } else if !taken.is_empty() {
-            ui.colored_label(
-                Color32::from_rgb(240, 200, 120),
-                RichText::new(format!("Taken: {}", summarize_taken(&taken))).small(),
-            );
-        } else {
-            ui.colored_label(
-                Color32::from_rgb(130, 225, 150),
-                RichText::new(format!("c{:02} to c{:02} all free", range.0, range.1)).small(),
-            );
-        }
-
-        // ── Row 3: escape hatches ─────────────────────────────────
-        ui.horizontal_wrapped(|ui| {
-            let next = next_free_run_after(&statuses, actual.max(MIN_SKINS), range.0);
-            let next_btn = ui
-                .add_enabled(
-                    next.is_some(),
-                    egui::Button::new(RichText::new("Next free block").small()),
-                )
-                .on_hover_text(if next.is_some() {
-                    "Jump to the next clear block of this size"
-                } else {
-                    "No clear block of this size anywhere"
-                });
-            if next_btn.clicked() {
-                if let Some(found) = next {
-                    self.slot_range = Some(found);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for (fighter, name) in fighters {
+                let picked = self.donor.as_deref() == Some(fighter);
+                let (rect, response) = ui.allocate_exact_size(tile, egui::Sense::click());
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                let painter = ui.painter();
+                painter.rect_filled(rect, 10.0, look.sunk);
+                let face = egui::Rect::from_min_size(rect.min, egui::vec2(tile.x, tile.x));
+                if let Some(texture) = faces.get(fighter) {
+                    egui::Image::new(texture).corner_radius(10.0).paint_at(ui, face);
+                }
+                let edge = if picked { look.accent } else if response.hovered() { look.text } else { look.edge };
+                painter.rect_stroke(rect, 10.0, egui::Stroke::new(if picked { 3.0 } else { 1.5 }, edge), egui::StrokeKind::Inside);
+                let label = egui::Rect::from_min_max(egui::pos2(rect.left() + 4.0, face.bottom()), rect.max - egui::vec2(4.0, 0.0));
+                let galley = painter.layout_no_wrap(name.to_owned(), egui::FontId::proportional(13.0), look.text);
+                let at = egui::pos2(label.center().x - galley.size().x.min(label.width()) / 2.0, label.center().y - galley.size().y / 2.0);
+                painter.with_clip_rect(label).galley(at, galley, look.text);
+                if response.on_hover_text(name).clicked() && !picked {
+                    self.donor = Some(fighter.to_owned());
+                    let width = self.slot_range.map_or(MAX_SKINS, range_count).clamp(1, MAX_SKINS);
+                    self.slot_range = Some(lowest_free_run(roots, index, fighter, width).unwrap_or((8, 7 + width)));
+                    self.show_slot_map = false;
+                    self.error = None;
                 }
             }
-            let map_open = self.show_slot_map;
-            ui.toggle_value(
-                &mut self.show_slot_map,
-                RichText::new(if map_open {
-                    "Slot map ▾"
-                } else {
-                    "Slot map ▸"
-                })
-                .small(),
-            )
-            .on_hover_text("Show every slot. Grey means taken");
         });
-
-        // ── The map, only on request ──────────────────────────────
-        if self.show_slot_map {
-            ui.add_space(4.0);
-            self.draw_slot_map(ui, &statuses, range);
-        }
     }
 
-    /// The full slot grid, shown only while the map toggle is open. Rows of
-    /// 8 so packs read as packs; two visual states only (white = free, grey
-    /// = taken) with the reason on hover, so there is no legend to learn.
-    /// Clicking a white slot moves the whole block there, keeping the skin
-    /// count — one click, no modifier keys.
-    fn draw_slot_map(&mut self, ui: &mut Ui, statuses: &[SlotStatus], range: SlotRange) {
-        let count = range_count(range).max(MIN_SKINS);
-        // Cover the block plus one pack of headroom, capped so a pathological
-        // slot table cannot turn the form into an endless scroll.
+    /// Every costume of the fighter, eight to a row. Clicking a free one moves the block there.
+    fn draw_slot_map(&mut self, ui: &mut Ui, look: Look, statuses: &[SlotStatus], range: SlotRange) {
+        let count = range_count(range);
         let map_end = range.1.saturating_add(8).clamp(31, 63) as usize;
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 4.0);
-                for row in statuses
-                    .iter()
-                    .take(map_end + 1)
-                    .enumerate()
-                    .collect::<Vec<_>>()
-                    .chunks(8)
-                {
-                    ui.horizontal(|ui| {
-                        for (i, status) in row {
-                            let slot = *i as u8;
-                            let in_range = slot >= range.0 && slot <= range.1;
-                            slot_chip(ui, slot, status, in_range, count, &mut self.slot_range);
-                        }
-                    });
-                }
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new("Click a white slot to move your block there.")
-                        .small()
-                        .weak(),
-                );
-            });
+        egui::Frame::new().fill(look.sunk).corner_radius(8.0).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 4.0);
+            for row in statuses.iter().take(map_end + 1).enumerate().collect::<Vec<_>>().chunks(8) {
+                ui.horizontal(|ui| {
+                    for (i, status) in row {
+                        let slot = *i as u8;
+                        slot_chip(ui, slot, status, slot >= range.0 && slot <= range.1, count, &mut self.slot_range);
+                    }
+                });
+            }
+            ui.label(RichText::new("Green is yours, white is free, grey is in use.").color(look.dim));
+        });
     }
 
-    /// Turn the form into a real action, asking for the destination folder.
-    fn build_create_action(&mut self) -> NewCharacterAction {
-        let (Some(donor), Some(range)) = (self.donor.clone(), self.slot_range) else {
-            return NewCharacterAction::None;
-        };
-        let display_name = self.display_name.trim().to_string();
-        if self.display_name.trim().is_empty() {
-            return NewCharacterAction::None;
-        }
-        let slots = range_slots(range);
-        let Some(destination) = rfd::FileDialog::new()
-            .set_title("Where should this character's files go?")
-            .pick_folder()
-        else {
-            return NewCharacterAction::None;
-        };
-        NewCharacterAction::Create {
-            name_id: name_id_for(&display_name),
-            donor,
-            slots,
-            display_name,
-            destination,
-        }
-    }
-
-    /// Turn the form into a real action without a folder picker: files go to
-    /// Visionary's authored folder. Re-creating a character already in the
-    /// project would import the same files twice, so that is refused up front.
-    fn build_quick_create_action(&mut self, project: &RosterMod) -> NewCharacterAction {
+    /// Turn the form into the create action. A range that overlaps a character already in the
+    /// project is refused: it would put the same files in the project twice.
+    fn build_create_action(&mut self, project: &RosterMod, destination: PathBuf) -> NewCharacterAction {
         let (Some(donor), Some(range)) = (self.donor.clone(), self.slot_range) else {
             return NewCharacterAction::None;
         };
@@ -485,609 +320,22 @@ impl NewCharacterView {
         if display_name.is_empty() {
             return NewCharacterAction::None;
         }
-        let slots = range_slots(range);
         let donor_lc = donor.to_ascii_lowercase();
-        if project.authored.iter().any(|entry| {
-            entry.donor == donor_lc
-                && (entry.slot == range.0
-                    || entry.slot == range.1
-                    || entry.slots.iter().any(|s| *s >= range.0 && *s <= range.1))
-        }) {
-            self.error = Some(format!(
-                "{display_name} overlaps a character already in the project on {donor}. Pick a free range."
-            ));
-            return NewCharacterAction::None;
-        }
-        let base = crate::scratch_dirs::app_storage_root().join("authored");
-        if let Err(error) = std::fs::create_dir_all(&base) {
-            self.error = Some(format!("Could not make the authored folder: {error:#}"));
+        let overlaps = project
+            .authored
+            .iter()
+            .any(|entry| entry.donor == donor_lc && entry.all_slots().iter().any(|slot| *slot >= range.0 && *slot <= range.1));
+        if overlaps {
+            self.error = Some(format!("{display_name} would take costumes another character of this project already has."));
             return NewCharacterAction::None;
         }
         NewCharacterAction::Create {
             name_id: name_id_for(&display_name),
             donor,
-            slots,
-            display_name: display_name.clone(),
-            destination: base.join(crate::mod_export::slugify(&display_name)),
+            slots: range_slots(range),
+            display_name,
+            destination,
         }
-    }
-
-    /// Every slot in the form's range that is already taken, with the name of
-    /// what owns it. The status line shows the summary; the create buttons
-    /// stay disabled until this is empty.
-    fn slot_range_conflict(
-        &self,
-        roots: &[PathBuf],
-        index: &RosterIndex,
-    ) -> Option<Vec<(u8, String)>> {
-        let donor = self.donor.as_ref()?;
-        let range = self.slot_range?;
-        let statuses = slot_statuses(roots, index, donor);
-        let out = conflicts_in_range(&statuses, range);
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
-    }
-
-    // Same traversal bundle as `ui` above.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_existing(
-        &mut self,
-        ui: &mut Ui,
-        roots: &[PathBuf],
-        index: &RosterIndex,
-        project: &RosterMod,
-        edit_target: Option<&RosterKey>,
-        labels: &std::collections::HashMap<u64, String>,
-        authored_moves: &BTreeMap<RosterKey, std::collections::BTreeSet<String>>,
-    ) -> ExistingAction {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Your characters").strong());
-            ui.label(
-                RichText::new(format!("({})", project.authored.len()))
-                    .small()
-                    .weak(),
-            );
-        });
-        ui.add_space(6.0);
-        if project.authored.is_empty() {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("No characters yet").strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Characters you create show here and on the Project page.")
-                                .small()
-                                .weak(),
-                        );
-                    });
-                });
-            return ExistingAction::None;
-        }
-
-        let mut result = ExistingAction::None;
-        for authored in &project.authored {
-            let has_name = project.names.contains_key(&authored.key);
-            let replaced = authored_moves
-                .get(&authored.key)
-                .cloned()
-                .unwrap_or_default();
-            let mut readiness = scaffold::measure(roots, &authored.donor, authored.slot, has_name);
-            readiness.authored_moves = replaced.len();
-            readiness.registered_moves = replaced.len();
-
-            // Theme-following card — no hard-coded dark fills, so light and
-            // high-contrast themes read it the same way.
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(authored.display_name.as_str()).strong());
-                        ui.label(
-                            RichText::new(format!(
-                                "c{:02} of {} · {}",
-                                authored.slot, authored.donor, authored.name_id
-                            ))
-                            .small()
-                            .weak(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .small_button(RichText::new(" ✕ Remove ").small())
-                                .on_hover_text("Remove this character from the project. Its files are left on disk.")
-                                .clicked()
-                            {
-                                result = ExistingAction::Remove(authored.key.clone());
-                            }
-                            if readiness.is_ready() {
-                                ui.colored_label(Color32::from_rgb(130, 225, 150), RichText::new("Ready").small().strong());
-                            } else {
-                                ui.colored_label(Color32::from_rgb(240, 200, 120), RichText::new("Needs work").small().strong());
-                            }
-                        });
-                    });
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    // ── Stage strip: where this character stands ─────────
-                    // Files → Moveset → Look → Ship. The strip answers "what
-                    // next" at a glance; each unfinished stage points at the
-                    // place that finishes it.
-                    let inv = scaffold::inventory(
-                        roots,
-                        &authored.donor,
-                        authored.slot,
-                        Some(authored.name_id.as_str()),
-                    );
-                    let files_done =
-                        inv.meshes > 0 && inv.has_motion_list && has_name;
-                    let remaining_starting =
-                        readiness.remaining_starting_moves(&replaced);
-                    let moves_done_count = scaffold::MOVESET_TEMPLATE.len()
-                        - remaining_starting.len();
-                    let moves_done = remaining_starting.is_empty();
-                    let has_portrait = project
-                        .ui_images
-                        .get(&authored.key)
-                        .is_some_and(|m| !m.is_empty());
-                    let look_done = has_name && has_portrait;
-                    self.draw_stages(
-                        ui,
-                        files_done,
-                        moves_done_count,
-                        moves_done,
-                        look_done,
-                        readiness.is_ready(),
-                        &mut result,
-                        authored,
-                    );
-
-                    ui.add_space(6.0);
-
-                    // One row: tick to scope move edits to this costume, untick
-                    // for fighter-wide. The trailing note names the scope so no
-                    // second explanation line is needed.
-                    let targeted = edit_target == Some(&authored.key);
-                    ui.horizontal_wrapped(|ui| {
-                        let mut on = targeted;
-                        if ui
-                            .checkbox(&mut on, RichText::new("Move edits only change this character").small().strong())
-                            .on_hover_text(format!(
-                                "On: moves you edit now change only this character (costume c{:02}). Off: they change every {}.",
-                                authored.slot, crate::data::fighter_display_name(&authored.donor),
-                            ))
-                            .changed()
-                        {
-                            result = ExistingAction::Target(on.then(|| authored.key.clone()));
-                        }
-                        if targeted {
-                            ui.colored_label(
-                                Color32::from_rgb(130, 225, 150),
-                                RichText::new(format!("c{:02} only", authored.slot)).small().strong(),
-                            );
-                        } else {
-                            ui.label(
-                                RichText::new(format!(
-                                    "edits change every {}",
-                                    crate::data::fighter_display_name(&authored.donor)
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        }
-                    });
-
-                    ui.add_space(6.0);
-
-                    // ── Files: everything this character is made of ──────
-                    egui::CollapsingHeader::new(RichText::new("Files").small())
-                        .default_open(!files_done)
-                        .id_salt(format!("files_{}", authored.key.as_str()))
-                        .show(ui, |ui| {
-                            self.draw_files(ui, roots, authored, project, &inv);
-                        });
-
-                    ui.add_space(6.0);
-
-                    // ── Details: the diagnostics behind the strip ──────
-                    // The stage strip above already answers "what next" and the
-                    // Files checklist covers the folders; everything below is
-                    // the fine print, collapsed so a finished character reads
-                    // as one short card instead of a wall of checklists.
-                    egui::CollapsingHeader::new(RichText::new("Details").small())
-                        .default_open(false)
-                        .id_salt(format!("details_{}", authored.key.as_str()))
-                        .show(ui, |ui| {
-                            self.draw_details(ui, roots, index, authored, labels, &readiness, &replaced);
-                        });
-                });
-            ui.add_space(8.0);
-        }
-        result
-    }
-
-    /// The stage strip: Files → Moves → Look → Ship, plus the single next
-    /// action. Answers "what do I do now" without reading the whole card.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_stages(
-        &mut self,
-        ui: &mut Ui,
-        files_done: bool,
-        moves_done_count: usize,
-        moves_done: bool,
-        look_done: bool,
-        ready: bool,
-        result: &mut ExistingAction,
-        authored: &crate::mod_project::AuthoredEntry,
-    ) {
-        fn chip(ui: &mut Ui, label: String, done: bool) {
-            ui.label(RichText::new(label).small().strong().color(if done {
-                Color32::from_rgb(130, 225, 150)
-            } else {
-                ui.visuals().weak_text_color()
-            }));
-        }
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    chip(
-                        ui,
-                        "Files".to_owned(),
-                        files_done,
-                    );
-                    chip(
-                        ui,
-                        format!("Moves {moves_done_count}/{}", scaffold::MOVESET_TEMPLATE.len()),
-                        moves_done,
-                    );
-                    chip(ui, "Look".to_owned(), look_done);
-                    chip(ui, "Ship".to_owned(), ready);
-                });
-                ui.add_space(2.0);
-                if !files_done {
-                    ui.label(
-                        RichText::new("Next: drop the model and animations into Files below.")
-                            .small()
-                            .weak(),
-                    );
-                } else if !look_done {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new("Next: name and portrait live in Character Select.")
-                                .small()
-                                .weak(),
-                        );
-                        if ui
-                            .small_button(RichText::new("Finish look").small())
-                            .clicked()
-                        {
-                            *result = ExistingAction::GotoCss(authored.key.clone());
-                        }
-                    });
-                } else if !moves_done {
-                    ui.label(
-                        RichText::new(
-                            "Next: tick “Edit this character's moves”, then replace moves in the main editor.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                } else if ready {
-                    ui.label(
-                        RichText::new("Ready to export. Export mod.")
-                            .small()
-                            .strong()
-                            .color(Color32::from_rgb(130, 225, 150)),
-                    );
-                }
-            });
-    }
-
-    /// The files this character is made of: what is there, what is missing,
-    /// and a button to open each one. Folders come from the scaffold root
-    /// this project recorded, falling back to wherever the files were found.
-    fn draw_files(
-        &mut self,
-        ui: &mut Ui,
-        roots: &[PathBuf],
-        authored: &crate::mod_project::AuthoredEntry,
-        project: &RosterMod,
-        inv: &scaffold::SlotInventory,
-    ) {
-        let model_target = authored
-            .files_root
-            .as_ref()
-            .map(|root| {
-                root.join(format!(
-                    "fighter/{}/model/body/c{:02}",
-                    authored.donor, authored.slot
-                ))
-            })
-            .or_else(|| inv.model_dir.clone());
-        let motion_target = authored
-            .files_root
-            .as_ref()
-            .map(|root| {
-                root.join(format!(
-                    "fighter/{}/motion/body/c{:02}",
-                    authored.donor, authored.slot
-                ))
-            })
-            .or_else(|| inv.motion_dir.clone());
-        let effect_target = authored
-            .files_root
-            .as_ref()
-            .map(|root| root.join(scaffold::effect_file(&authored.donor, authored.slot)));
-        let portrait_png = project
-            .ui_images
-            .get(&authored.key)
-            .and_then(|map| map.values().next())
-            .map(|ov| PathBuf::from(&ov.png_path));
-
-        let mut reveal_ask: Option<PathBuf> = None;
-        let model_state = if inv.meshes > 0 {
-            format!("{} mesh, {} texture(s)", inv.meshes, inv.textures)
-        } else {
-            "empty. Needs .numdlb + .nutexb".to_string()
-        };
-        if let Some(path) = file_row(
-            ui,
-            "Model",
-            &model_state,
-            inv.meshes > 0,
-            model_target.clone(),
-        ) {
-            reveal_ask = Some(path);
-        }
-        let motion_dest = authored
-            .files_root
-            .as_ref()
-            .map(|root| {
-                root.join(format!(
-                    "fighter/{}/motion/body/c{:02}",
-                    authored.donor, authored.slot
-                ))
-            })
-            .or_else(|| inv.motion_dir.clone());
-        // A new character can start as a copy of the fighter it is based on, so it works in
-        // game straight away and the user changes it from there.
-        let empty_model = inv.meshes == 0;
-        let empty_motion = inv.anims == 0;
-        if empty_model || empty_motion {
-            let donor_name = crate::data::fighter_display_name(&authored.donor);
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(18.0);
-                for (kind, empty, dest) in [
-                    ("model", empty_model, model_target.clone()),
-                    ("motion", empty_motion, motion_dest.clone()),
-                ] {
-                    let Some(dest) = dest.filter(|_| empty) else {
-                        continue;
-                    };
-                    let label = if kind == "model" {
-                        format!("Start from {donor_name}'s model")
-                    } else {
-                        format!("Start from {donor_name}'s animations")
-                    };
-                    if ui.small_button(label).clicked() {
-                        self.status = match copy_donor_costume(roots, &authored.donor, kind, &dest)
-                        {
-                            Ok(count) => format!(
-                                "Copied {count} file(s) from {donor_name} into {}",
-                                dest.display()
-                            ),
-                            Err(error) => error,
-                        };
-                    }
-                }
-            });
-        }
-        let anim_state = if inv.anims > 0 {
-            format!(
-                "{} animation(s){}",
-                inv.anims,
-                if inv.has_motion_list {
-                    ""
-                } else {
-                    ". NO motion_list.bin"
-                }
-            )
-        } else {
-            "empty. Needs .nuanmb + motion_list.bin".to_string()
-        };
-        if let Some(path) = file_row(
-            ui,
-            "Animations",
-            &anim_state,
-            inv.anims > 0 && inv.has_motion_list,
-            motion_target,
-        ) {
-            reveal_ask = Some(path);
-        }
-        if let Some(path) = file_row(
-            ui,
-            "Effect",
-            if inv.has_effect {
-                "own slot effect present"
-            } else {
-                "optional. Plays the donor's without one"
-            },
-            inv.has_effect,
-            effect_target,
-        ) {
-            reveal_ask = Some(path);
-        }
-        if let Some(path) = file_row(
-            ui,
-            "Portrait",
-            if portrait_png.is_some() {
-                "picked. See Select screen > Images"
-            } else {
-                "optional. Pick one in Select screen > Images"
-            },
-            portrait_png.is_some() || inv.has_portrait,
-            portrait_png,
-        ) {
-            reveal_ask = Some(path);
-        }
-        if let Some(path) = reveal_ask {
-            match super::reveal::reveal(&path) {
-                Ok(()) => self.status = format!("Opened {}.", path.display()),
-                Err(error) => self.status = format!("Could not open files: {error:#}"),
-            }
-        }
-    }
-
-    /// The fine print behind one character's stage strip: readiness notes,
-    /// moveset progress, animation binding, and file counts. Collapsed by
-    /// default — nothing here gates creating or editing, it only diagnoses.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_details(
-        &self,
-        ui: &mut Ui,
-        roots: &[PathBuf],
-        index: &RosterIndex,
-        authored: &crate::mod_project::AuthoredEntry,
-        labels: &std::collections::HashMap<u64, String>,
-        readiness: &scaffold::Readiness,
-        replaced: &std::collections::BTreeSet<String>,
-    ) {
-        let outstanding = readiness.outstanding();
-        if readiness.is_ready() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("●")
-                        .small()
-                        .color(Color32::from_rgb(130, 225, 150)),
-                );
-                ui.label(
-                    RichText::new("Ready. Model, animations, and name are all in place.")
-                        .small()
-                        .color(Color32::from_rgb(170, 210, 180)),
-                );
-            });
-        } else {
-            for note in outstanding {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("•")
-                            .small()
-                            .color(Color32::from_rgb(240, 200, 120)),
-                    );
-                    ui.label(
-                        RichText::new(note)
-                            .small()
-                            .color(Color32::from_rgb(220, 190, 150)),
-                    );
-                });
-            }
-        }
-        ui.add_space(4.0);
-        let remaining = readiness.remaining_starting_moves(replaced);
-        let done = scaffold::MOVESET_TEMPLATE.len() - remaining.len();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{done}/{} starting moves replaced",
-                    scaffold::MOVESET_TEMPLATE.len()
-                ))
-                .small()
-                .strong(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
-                    egui::ProgressBar::new(done as f32 / scaffold::MOVESET_TEMPLATE.len() as f32)
-                        .desired_width(80.0),
-                );
-            });
-        });
-        ui.label(
-            RichText::new(format!(
-                "The rest still play {}'s version. Normal until you change them.",
-                authored.donor
-            ))
-            .small()
-            .weak(),
-        );
-        if !remaining.is_empty() {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(format!("Still donor's: {}", remaining.join(", ")))
-                    .small()
-                    .weak(),
-            );
-        }
-
-        if let Some(binding) = Self::animation_binding(roots, authored, labels) {
-            ui.add_space(4.0);
-            ui.label(RichText::new(binding.summary()).small().weak());
-            if !binding.unreferenced_files.is_empty() {
-                ui.label(
-                    RichText::new(format!(
-                        "{} animation file(s) that no motion list names, so they will \
-                         never play: {}",
-                        binding.unreferenced_files.len(),
-                        binding.unreferenced_files.join(", ")
-                    ))
-                    .small()
-                    .weak(),
-                );
-            }
-        }
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new(format!(
-                "{} model file(s)  ·  {} animation(s){}",
-                readiness.model_files,
-                readiness.motion_files,
-                if readiness.has_effect {
-                    "  ·  own effects"
-                } else {
-                    ""
-                }
-            ))
-            .small()
-            .weak(),
-        );
-        if index.by_key(&authored.key).is_none() {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(240, 140, 140), "⚠");
-                ui.label(
-                    RichText::new(
-                        "Its donor fighter is not in the current data root, so it cannot be \
-                         edited right now.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-        }
-    }
-
-    /// How this character's animation files line up with the donor's motion list.
-    fn animation_binding(
-        roots: &[PathBuf],
-        authored: &crate::mod_project::AuthoredEntry,
-        labels: &std::collections::HashMap<u64, String>,
-    ) -> Option<scaffold::AnimationBinding> {
-        let relative = format!("fighter/{}/motion/body", authored.donor);
-        let list = roots
-            .iter()
-            .map(|root| root.join(&relative).join("motion_list.bin"))
-            .find(|path| path.is_file())?;
-        let slot_dir = roots
-            .iter()
-            .map(|root| root.join(format!("{relative}/c{:02}", authored.slot)))
-            .find(|path| path.is_dir())?;
-        scaffold::bind_animations(&list, &slot_dir, labels).ok()
     }
 
     pub fn note_created(&mut self, display_name: &str, scaffolded: &scaffold::Scaffold, copied: scaffold::Copied) {
@@ -1095,16 +343,12 @@ impl NewCharacterView {
         self.display_name.clear();
         self.donor = None;
         self.slot_range = None;
-        self.status = if copied.files == 0 {
-            format!("Created {display_name}. None of the base fighter's files were found to copy, so its folders are empty.")
-        } else {
-            format!(
-                "Created {display_name} with {} skins: {} files ({} MB) copied from the base fighter into its own folders.",
-                scaffolded.slots.len(),
-                copied.files,
-                copied.bytes / 1_000_000
-            )
-        };
+        self.status = format!(
+            "Created {display_name} with {} skins: {} files ({} MB) copied from the base fighter. It is on the Project page.",
+            scaffolded.slots.len(),
+            copied.files,
+            copied.bytes / 1_000_000
+        );
     }
 
     pub fn note_error(&mut self, error: String) {
@@ -1327,68 +571,6 @@ fn slot_chip(
     }
 }
 
-/// One row of the Files checklist: check or hollow dot, what it is, its
-/// state, and an Open button for its folder. Returns the path to reveal
-/// when Open is pressed, so the caller owns the status message.
-fn file_row(
-    ui: &mut Ui,
-    name: &str,
-    detail: &str,
-    done: bool,
-    target: Option<PathBuf>,
-) -> Option<PathBuf> {
-    let mut ask = None;
-    ui.horizontal(|ui| {
-        let colour = if done { Color32::from_rgb(130, 225, 150) } else { ui.visuals().strong_text_color() };
-        ui.label(RichText::new(name).small().strong().color(colour));
-        ui.label(RichText::new(detail).small().weak());
-        if let Some(path) = target {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(RichText::new("Open").small())
-                    .on_hover_text(format!("Show {} in the file manager", path.display()))
-                    .clicked()
-                {
-                    ask = Some(path);
-                }
-            });
-        }
-    });
-    ask
-}
-
-/// Copy the donor's first costume's `model` or `motion` body files into `dest`, skipping files
-/// already there. Returns how many were copied.
-fn copy_donor_costume(
-    roots: &[PathBuf],
-    donor: &str,
-    kind: &str,
-    dest: &std::path::Path,
-) -> Result<usize, String> {
-    let source = roots
-        .iter()
-        .map(|root| root.join(format!("fighter/{donor}/{kind}/body/c00")))
-        .find(|dir| dir.is_dir())
-        .ok_or_else(|| format!("No {kind} folder for {donor} in the game files"))?;
-    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let mut count = 0;
-    for entry in std::fs::read_dir(&source)
-        .map_err(|e| e.to_string())?
-        .flatten()
-    {
-        let path = entry.path();
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let target = dest.join(name);
-        if path.is_file() && !target.exists() {
-            std::fs::copy(&path, &target).map_err(|e| e.to_string())?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// The internal id a character gets, derived from its display name.
 pub fn name_id_for(display_name: &str) -> String {
     let mut out = String::new();
@@ -1503,31 +685,22 @@ mod tests {
         assert!(!entry.moveset_scaffolded);
     }
 
-    /// Quick-creating a range that overlaps a character already in the project
-    /// would import the same files as a second mod, so the form refuses it
-    /// before anything is written.
+    /// A range that overlaps a character already in the project would put the same files in
+    /// it twice, so the form refuses before anything is written.
     #[test]
-    fn quick_create_refuses_a_range_overlapping_an_authored_character() {
+    fn create_refuses_a_range_overlapping_a_character_of_the_project() {
         let mut view = NewCharacterView {
             donor: Some("mario".into()),
-            slot_range: Some((8, 15)),
+            slot_range: Some((12, 19)),
             display_name: "Vision".into(),
             ..Default::default()
         };
         let mut project = RosterMod::default();
-        project.authored.push(authored_entry_multi(
-            "mario",
-            &[8, 9, 10, 11, 12, 13, 14, 15],
-            "Vision",
-            "vision",
-        ));
-        // The guard returns before the authored folder is touched, so this
-        // test writes nothing outside tempdirs.
-        assert!(matches!(
-            view.build_quick_create_action(&project),
-            NewCharacterAction::None
-        ));
+        project.authored.push(authored_entry_multi("mario", &[8, 9, 10, 11, 12, 13, 14, 15], "Vision", "vision"));
+        assert!(matches!(view.build_create_action(&project, PathBuf::from("nowhere")), NewCharacterAction::None));
         assert!(view.error.is_some());
+        view.slot_range = Some((16, 23));
+        assert!(matches!(view.build_create_action(&project, PathBuf::from("nowhere")), NewCharacterAction::Create { .. }));
     }
 
     #[test]
@@ -1537,7 +710,7 @@ mod tests {
         let scaffolded = create(&mut library, dir.path(), &[8, 9, 10, 11, 12, 13, 14, 15], "Vision");
 
         assert_eq!(scaffolded.slots, vec![8, 9, 10, 11, 12, 13, 14, 15]);
-        assert_eq!(scaffolded.slot, 8);
+        assert_eq!(scaffolded.slots[0], 8);
         assert_eq!(library.mods.len(), 1);
         let mod_root = dir.path().join(crate::mod_export::slugify("Vision"));
         for slot in 8..=15 {
@@ -1616,40 +789,17 @@ mod tests {
     }
 
     #[test]
-    fn range_conflict_names_every_taken_slot_in_the_range() {
-        let view = NewCharacterView {
-            donor: Some("mario".into()),
-            slot_range: Some((8, 15)),
-            ..Default::default()
-        };
+    fn costumes_a_mod_already_fills_are_named_as_taken() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // c08 and c10 are occupied by a mod.
         for slot in [8, 10] {
-            std::fs::create_dir_all(root.join(format!("fighter/mario/model/body/c{slot:02}")))
-                .unwrap();
+            std::fs::create_dir_all(root.join(format!("fighter/mario/model/body/c{slot:02}"))).unwrap();
         }
         let index = RosterIndex::default();
-        let taken = view
-            .slot_range_conflict(&[root.to_path_buf()], &index)
-            .expect("conflict expected");
-        let slots: Vec<u8> = taken.iter().map(|(s, _)| *s).collect();
-        assert_eq!(slots, vec![8, 10]);
-    }
-
-    #[test]
-    fn range_conflict_returns_none_when_the_range_is_fully_free() {
-        let view = NewCharacterView {
-            donor: Some("mario".into()),
-            slot_range: Some((8, 15)),
-            ..Default::default()
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let index = RosterIndex::default();
-        assert!(view
-            .slot_range_conflict(&[root.to_path_buf()], &index)
-            .is_none());
+        let statuses = slot_statuses(&[root.to_path_buf()], &index, "mario");
+        let taken: Vec<u8> = conflicts_in_range(&statuses, (8, 15)).iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(taken, vec![8, 10]);
+        assert!(conflicts_in_range(&statuses, (11, 15)).is_empty());
     }
 
     fn free_statuses(taken: &[u8]) -> Vec<SlotStatus> {
@@ -1713,7 +863,7 @@ mod tests {
         let scaffolded =
             create(&mut library, dir.path(), &[8], "Vision");
 
-        assert_eq!(scaffolded.slot, 8);
+        assert_eq!(scaffolded.slots[0], 8);
         assert_eq!(library.mods.len(), 1);
         let imported = &library.mods[0];
         assert_eq!(imported.name, "Vision");
@@ -1732,8 +882,8 @@ mod tests {
         let a =
             create(&mut library, &dir.path().join("a"), &[8], "Vision");
         let b = create(&mut library, &dir.path().join("b"), &[9], "Vision2");
-        assert_eq!(a.slot, 8);
-        assert_eq!(b.slot, 9);
+        assert_eq!(a.slots, vec![8]);
+        assert_eq!(b.slots, vec![9]);
         assert_ne!(
             RosterKey::slot("mario", 8),
             RosterKey::slot("mario", 9),
@@ -1764,8 +914,7 @@ mod tests {
         library
             .import_directory(ModSource::Folder(root), Some("Vision".into()))
             .unwrap();
-        assert_eq!(s.slot, 12);
-        assert_eq!(s.donor, "mario");
+        assert_eq!(s.slots, vec![12]);
         assert!(library.mods[0].manifest.fighters["mario"]
             .slots
             .contains(&12));

@@ -511,6 +511,45 @@ pub fn export_authored_files(
     Ok(())
 }
 
+/// Write the `config.json` that makes the game load each new character's costumes (see
+/// [`costume_config`](super::costume_config)), keeping whatever the mod's config already says.
+pub fn export_costume_config(mod_root: &Path, authored: &[crate::mod_project::AuthoredEntry], report: &mut RosterExport) -> Result<()> {
+    if authored.is_empty() {
+        return Ok(());
+    }
+    fn walk(dir: &Path, root: &Path, found: &mut std::collections::BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, found);
+            } else if let Ok(relative) = path.strip_prefix(root) {
+                found.insert(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut provided = std::collections::BTreeSet::new();
+    walk(mod_root, mod_root, &mut provided);
+    let path = mod_root.join("config.json");
+    let mut config = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    for entry in authored {
+        if !super::costume_config::known(&entry.donor) {
+            report.warnings.push(format!(
+                "{}: the game has no costume table for {}, so its costumes were not described to the game and will not load.",
+                entry.display_name, entry.donor
+            ));
+            continue;
+        }
+        let costumes: Vec<(u8, u8)> = entry.all_slots().iter().enumerate().map(|(colour, slot)| (*slot, (colour % 8) as u8)).collect();
+        super::costume_config::add(&mut config, &entry.donor, &costumes, &provided);
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    report.files.push("config.json".to_string());
+    Ok(())
+}
+
 /// `c08` for one slot, `c08…c15` for a range — for messages about a
 /// character's whole costume block.
 fn slot_span(slots: &[u8]) -> String {

@@ -354,6 +354,7 @@ impl RosterWindow {
             &mut report,
         )?;
         super::export::export_authored_files(mod_root, &self.roots, &roster.authored, &mut report)?;
+        super::export::export_costume_config(mod_root, &roster.authored, &mut report)?;
         Ok(report)
     }
 
@@ -476,9 +477,16 @@ impl RosterWindow {
             .get(key)
             .and_then(|images| super::ui_images::find_override(images, "chara_1", slot, slot))
             .map(|picked| PathBuf::from(&picked.png_path));
+        // A character made here files its portraits under its own colour numbers.
+        let colour = self
+            .project
+            .authored
+            .iter()
+            .find(|entry| &entry.key == key)
+            .map_or(slot, |entry| entry.all_slots().iter().position(|own| *own == slot).unwrap_or(0) as u8);
         let roots = self.roots.clone();
         self.card_portraits
-            .get_with_gamma(ctx, &roots, &name_id, slot, true, picked.as_deref())?
+            .get_with_gamma(ctx, &roots, &name_id, colour, true, picked.as_deref())?
             .ok()
             .cloned()
     }
@@ -571,8 +579,13 @@ impl RosterWindow {
     }
 
     /// Whether the project has a folder on disk; new characters need one.
-    pub fn set_project_saved(&mut self, saved: bool) {
-        self.new_character.project_saved = saved;
+    /// The character move edits go to alone, when one is picked.
+    pub fn edit_target(&self) -> Option<&RosterKey> {
+        self.edit_target.as_ref()
+    }
+
+    pub fn set_project_dir(&mut self, dir: Option<PathBuf>) {
+        self.new_character.project_dir = dir;
     }
 
     /// The Characters page, drawn in the main window.
@@ -646,24 +659,17 @@ impl RosterWindow {
                             }
                             RosterTab::NewCharacter => {
                                 let roots = self.roots.clone();
-                                let action = {
-                                    let mut view = std::mem::take(&mut self.new_character);
-                                    let action = view.ui(
-                                        ui,
-                                        &roots,
-                                        &self.index,
-                                        &self.project,
-                                        self.edit_target.as_ref(),
-                                        &self.labels,
-                                        &self.authored_moves,
-                                    );
-                                    let goto_css = view.take_goto_character_select();
-                                    self.new_character = view;
-                                    if let Some(key) = goto_css {
-                                        self.select_css(key);
-                                    }
-                                    action
-                                };
+                                let fighters: Vec<String> = self.index.entries.iter().filter_map(|entry| entry.fighter.clone()).collect();
+                                let faces: std::collections::HashMap<String, egui::TextureHandle> = fighters
+                                    .into_iter()
+                                    .filter_map(|fighter| {
+                                        let face = self.portrait(ui.ctx(), &RosterKey::fighter(&fighter), &fighter, 0)?;
+                                        Some((fighter, face))
+                                    })
+                                    .collect();
+                                let mut view = std::mem::take(&mut self.new_character);
+                                let action = view.ui(ui, &roots, &self.index, &self.project, &faces);
+                                self.new_character = view;
                                 self.handle_new_character(action);
                             }
                             RosterTab::Traits => {
@@ -713,7 +719,7 @@ impl RosterWindow {
     /// the project goes through one place — the library has to be saved and the fighter index
     /// invalidated on any change, and a second path that forgot either would leave the new
     /// character invisible until the next restart.
-    fn handle_new_character(&mut self, action: NewCharacterAction) {
+    pub fn handle_new_character(&mut self, action: NewCharacterAction) {
         match action {
             NewCharacterAction::None => {}
             NewCharacterAction::Create {
@@ -770,11 +776,11 @@ impl RosterWindow {
             }
             NewCharacterAction::SetEditTarget(target) => {
                 self.status = match &target {
-                    Some(key) => format!(
-                        "Moves you edit now belong to {key}. The donor's other costumes keep \
-                         their own version of anything you change."
-                    ),
-                    None => "Moves you edit now apply to every costume again.".to_string(),
+                    Some(key) => {
+                        let name = self.project.authored.iter().find(|entry| &entry.key == key).map_or(key.to_string(), |entry| entry.display_name.clone());
+                        format!("Moves you edit now change only {name}.")
+                    }
+                    None => "Moves you edit now change every costume of the fighter again.".to_string(),
                 };
                 self.edit_target = target;
             }
@@ -789,8 +795,7 @@ impl RosterWindow {
                 self.project.hidden.remove(&key);
                 self.project.ui_images.remove(&key);
                 self.project.chara_overrides.remove(&key);
-                self.status =
-                    format!("Removed {key} from the project. Its files are still on disk.");
+                self.status = "Removed the character from the project. Its files are still in its folder.".to_string();
             }
         }
     }

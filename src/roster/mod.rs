@@ -17,6 +17,7 @@
 //!    editing the CSS or trait editors.
 
 pub mod archive;
+pub mod costume_config;
 pub mod css;
 pub mod css_view;
 pub mod export;
