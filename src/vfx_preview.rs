@@ -111,6 +111,24 @@ pub fn alone_placement(bones: &[&str]) -> Mat4 {
     }
 }
 
+/// The game's world from the preview's: the preview turns the game a quarter about Y so the
+/// fighter faces +Z (model = Ry(-90) * game), and the game's +X, the way a fighter facing right
+/// faces and screen right, is the preview's +Z. Effects run in the game's world: an emitter's
+/// world gravity (5,076 of them) and world-oriented velocity (749) are the game's axes, and in
+/// the preview's they pointed a quarter turn off.
+const GAME_FROM_PREVIEW: Mat4 = Mat4::from_cols(
+    glam::Vec4::new(0.0, 0.0, -1.0, 0.0),
+    glam::Vec4::Y,
+    glam::Vec4::new(1.0, 0.0, 0.0, 0.0),
+    glam::Vec4::W,
+);
+
+/// The preview's view matrix for points in the game's world (see [`GAME_FROM_PREVIEW`]): the
+/// same camera, so the picture is unchanged.
+fn game_view(view: Mat4) -> Mat4 {
+    view * GAME_FROM_PREVIEW.inverse()
+}
+
 /// The draw path the game gives its soft glows (3,389 fighter emitters, nearly all named flare,
 /// light or smoke).
 const GLOW_PATH: u8 = 21;
@@ -543,7 +561,19 @@ impl VfxPreview {
         self.collect_loaded();
         self.waiting = !self.reloading.is_empty();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
-        let camera = view_block::view_block(&rows(view), &rows(projection), eye, near, far, 1.0);
+        // The emitters run in the game's world, where world gravity and world-oriented
+        // velocities point; the camera looks at it from the preview's side.
+        let eye = GAME_FROM_PREVIEW
+            .transform_point3(glam::Vec3::from(eye))
+            .to_array();
+        let camera = view_block::view_block(
+            &rows(game_view(view)),
+            &rows(projection),
+            eye,
+            near,
+            far,
+            1.0,
+        );
         // Effects draw into the scene before bloom and colour grading, so they take the game's
         // half scale, which the post pass doubles back.
         let custom2 = render::game_custom2();
@@ -565,11 +595,16 @@ impl VfxPreview {
             else {
                 continue;
             };
+            let in_game: Vec<Mat4> = draw
+                .placements
+                .iter()
+                .map(|p| GAME_FROM_PREVIEW * *p)
+                .collect();
             // A looping draw replays the effect from the start every length plus a short gap.
             let looped: Vec<Mat4>;
             let mut kill_at = draw.kill_at;
             let mut spawn = draw.spawn;
-            let placements: &[Mat4] = match (draw.looping, draw.placements.last()) {
+            let placements: &[Mat4] = match (draw.looping, in_game.last()) {
                 (Some(clock), Some(at)) => {
                     let key = (Arc::as_ptr(&file) as usize, set);
                     let plan = *self
@@ -582,7 +617,7 @@ impl VfxPreview {
                     spawn = looped_spawn(draw.spawn, clock, period);
                     &looped
                 }
-                _ => &draw.placements,
+                _ => &in_game,
             };
             let seeds = set_seeds(&file.emitters[set], spawn);
             let rated;
@@ -1008,7 +1043,10 @@ fn render_state(emitter: &Emitter) -> render::RenderState {
         depth_test: rs.is_depth_test,
         depth_write: rs.is_depth_mask,
         depth_func: rs.depth_func,
-        display_side: 0,
+        // 1 draws only front faces, 2 only back faces, as the game culls the other side (4,117
+        // corpus emitters, nearly all meshes: an arc's inside and outside are often two
+        // emitters, each drawn on its own side).
+        display_side: rs.display_side,
     }
 }
 
@@ -1268,6 +1306,58 @@ mod tests {
             }
         }
         assert!(differ >= 5, "{differ}");
+    }
+
+    /// The emitters run in the game's world and the camera still sees the preview's picture:
+    /// the fighter's forward (the preview's +Z, screen right) is the game's +X, the way world
+    /// gravity and world-oriented velocities name screen right, and up stays up.
+    #[test]
+    fn effects_run_in_the_games_world_under_the_same_camera() {
+        let forward = GAME_FROM_PREVIEW.transform_vector3(glam::Vec3::Z);
+        assert!((forward - glam::Vec3::X).length() < 1e-6, "{forward}");
+        let up = GAME_FROM_PREVIEW.transform_vector3(glam::Vec3::Y);
+        assert!((up - glam::Vec3::Y).length() < 1e-6, "{up}");
+        let view = glam::camera::rh::view::look_at_mat4(
+            glam::Vec3::new(-60.0, 8.0, 3.0),
+            glam::Vec3::new(0.0, 8.0, 0.0),
+            glam::Vec3::Y,
+        );
+        let point = glam::Vec3::new(1.5, 12.0, -4.0);
+        let seen = view.transform_point3(point);
+        let in_game = game_view(view).transform_point3(GAME_FROM_PREVIEW.transform_point3(point));
+        assert!((seen - in_game).length() < 1e-4, "{seen} against {in_game}");
+    }
+
+    /// The game draws only one side of an emitter whose display side says so (4,117 corpus
+    /// emitters): Sephiroth's up special arcs (EDGE_OCTASLASH_ARC) draw arc1 on its front
+    /// faces only. The preview drew every emitter on both sides.
+    #[test]
+    fn an_emitter_draws_only_the_side_it_names() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeOctaslashArc")
+            .unwrap();
+        let sides: Vec<(String, u8)> = set_emitters(ptcl_file)[set]
+            .iter()
+            .map(|e| {
+                (
+                    e.data.name.clone().unwrap_or_default(),
+                    render_state(e).display_side,
+                )
+            })
+            .collect();
+        assert!(sides.contains(&("arc1".to_owned(), 1)), "{sides:?}");
+        assert!(sides.contains(&("arc2".to_owned(), 0)), "{sides:?}");
     }
 
     /// An effect the script plays at another rate (`LAST_EFFECT_SET_RATE`, 282 vanilla calls)
