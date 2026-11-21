@@ -166,6 +166,44 @@ pub fn notify_acmd_capture_end(end: &crate::slight::hitbox_viewer::CaptureEnd) {
     );
 }
 
+/// Stream one captured article ACMD line (strictly separate from fighter `AcmdCapture`).
+pub fn notify_article_acmd_capture(line: &crate::slight::hitbox_viewer::ArticleCaptureLine) {
+    if !emit_wanted() {
+        return;
+    }
+    emit(
+        "ArticleAcmdCapture",
+        &serde_json::json!({ "ArticleAcmdCapture": line }),
+    );
+}
+
+/// Tell the editor a captured article motion finished playing.
+pub fn notify_article_acmd_capture_end(end: &crate::slight::hitbox_viewer::ArticleCaptureEnd) {
+    if !emit_wanted() {
+        return;
+    }
+    emit(
+        "ArticleAcmdCaptureEnd",
+        &serde_json::json!({ "ArticleAcmdCaptureEnd": end }),
+    );
+}
+
+/// Report whether live edits for an article agent are supported (`supported` vs `unsupported`).
+pub fn notify_article_live_status(agent: &str, supported: bool) {
+    if !emit_wanted() {
+        return;
+    }
+    emit(
+        "ArticleLiveStatus",
+        &serde_json::json!({
+            "ArticleLiveStatus": {
+                "agent": agent,
+                "status": if supported { "supported" } else { "unsupported" },
+            }
+        }),
+    );
+}
+
 /// Send one aggregate capture-outcome row. Hook workers only update atomics; JSON allocation and
 /// socket work stay on the existing throttled facade path.
 pub fn notify_acmd_capture_debug(snapshot: &crate::slight::hitbox_viewer::CaptureDebugSnapshot) {
@@ -550,6 +588,90 @@ fn parse_tcp_payload(raw: &str) -> Option<ParsedEdit> {
         ) {
             Ok(rules) => crate::slight::hitbox_viewer::set_rules(rules),
             Err(e) => crate::slight::diag::note(format!("hitbox_rules parse error: {e}")),
+        }
+        return None;
+    }
+
+    // Currently selected fighter (and optional costume slot scope) for article capture/injection.
+    if let Some(sel_v) = v.get("selected_fighter") {
+        #[derive(serde::Deserialize)]
+        struct SelectedWire {
+            #[serde(default)]
+            fighter_kind: Option<i32>,
+            #[serde(default)]
+            costumes: Vec<i32>,
+        }
+        match serde_json::from_value::<SelectedWire>(sel_v.clone()) {
+            Ok(sel) => {
+                crate::slight::systems::article_notifier::set_selected_fighter(
+                    sel.fighter_kind,
+                    sel.costumes,
+                );
+            }
+            Err(e) => crate::slight::diag::note(format!("selected_fighter parse error: {e}")),
+        }
+        return None;
+    }
+
+    // Query whether a specific article agent (e.g. a clone) has a readable runtime weapon kind.
+    if let Some(probe_v) = v.get("article_probe") {
+        if let Some(agent) = probe_v.get("agent").and_then(|a| a.as_str()) {
+            let supported =
+                crate::slight::systems::article_notifier::resolve_article_agent(agent).is_some();
+            notify_article_live_status(agent, supported);
+        }
+        return None;
+    }
+
+    // Article hitbox rules: separate from fighter `hitbox_rules`, keyed by `agent`.
+    if let Some(rules_v) = v.get("article_hitbox_rules") {
+        match serde_json::from_value::<Vec<crate::slight::hitbox_viewer::ArticleHitboxRule>>(
+            rules_v.clone(),
+        ) {
+            Ok(rules) => {
+                for (agent, supported) in crate::slight::hitbox_viewer::set_article_rules(rules) {
+                    notify_article_live_status(&agent, supported);
+                }
+            }
+            Err(e) => crate::slight::diag::note(format!("article_hitbox_rules parse error: {e}")),
+        }
+        return None;
+    }
+
+    // Article effect spawn rules: separate from fighter `spawn_rules`, keyed by `agent`.
+    if let Some(rules_v) = v.get("article_spawn_rules") {
+        match serde_json::from_value::<
+            Vec<crate::slight::effect_viewer::spawn_rules::ArticleSpawnRule>,
+        >(rules_v.clone())
+        {
+            Ok(rules) => {
+                for (agent, supported) in
+                    crate::slight::effect_viewer::spawn_rules::set_article_rules(rules)
+                {
+                    notify_article_live_status(&agent, supported);
+                }
+            }
+            Err(e) => crate::slight::diag::note(format!("article_spawn_rules parse error: {e}")),
+        }
+        return None;
+    }
+
+    // Article effect control rules: separate from fighter `effect_control_rules`.
+    if let Some(rules_v) = v.get("article_effect_control_rules") {
+        match serde_json::from_value::<
+            Vec<crate::slight::effect_viewer::control_rules::ArticleControlRule>,
+        >(rules_v.clone())
+        {
+            Ok(rules) => {
+                for (agent, supported) in
+                    crate::slight::effect_viewer::control_rules::set_article_rules(rules)
+                {
+                    notify_article_live_status(&agent, supported);
+                }
+            }
+            Err(e) => {
+                crate::slight::diag::note(format!("article_effect_control_rules parse error: {e}"))
+            }
         }
         return None;
     }

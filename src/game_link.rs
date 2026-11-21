@@ -289,6 +289,52 @@ impl<T> ForFighter<T> {
     }
 }
 
+/// A live rule tagged with its article agent (`<owner>_<article>`, e.g. `samus_lativolt`).
+/// Sent on a separate wire family so fighter messages remain byte-identical.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ForArticle<T> {
+    pub agent: String,
+    #[serde(flatten)]
+    pub rule: T,
+}
+
+/// Whether the running plugin supports live edits for a given article agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArticleLiveSupport {
+    Supported,
+    Unsupported,
+}
+
+/// One captured ACMD call from an article owned by the selected fighter (`ArticleAcmdCapture`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ArticleCaptureLine {
+    pub agent: String,
+    pub owner_kind: i32,
+    pub article_kind: i32,
+    pub motion: u64,
+    pub frame: f32,
+    pub func: String,
+    pub args: Vec<LuaArgWire>,
+    #[serde(default)]
+    pub run: u32,
+    #[serde(default)]
+    pub common: bool,
+}
+
+impl ArticleCaptureLine {
+    pub fn to_capture_line(&self) -> CaptureLine {
+        CaptureLine {
+            kind: self.article_kind,
+            motion: self.motion,
+            frame: self.frame,
+            func: self.func.clone(),
+            args: self.args.clone(),
+            run: self.run,
+            common: self.common,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SpawnRuleWire {
     pub eff_hash: u64,
@@ -848,7 +894,8 @@ pub fn attack_mod_category(kind: crate::data::AttackModKind) -> u8 {
 }
 
 /// Sparse ATTACK-arg overrides (plugin `HbOverrides`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HbOverridesWire {
     /// Complete AREA_WIND argument vector when a wind payload changes. Wind calls do not share
     /// ATTACK's slot layout, so the plugin swaps this exact typed vector into the original hook.
@@ -1058,20 +1105,20 @@ pub struct HbOverridesWire {
     pub expression_args: Option<Vec<LuaArgWire>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InjectRuleWire {
     pub frame: f32,
     pub args: Vec<LuaArgWire>,
     /// Exact AREA_WIND family function for wind injection. Attack/grab injections omit it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// Condition from an If block, checked in the match when this call is due.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<LiveGuard>,
 }
 
 /// An If block's condition as the plugin evaluates it. **Must match the plugin's `LiveGuard`.**
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveGuard {
     Grounded,
@@ -1140,23 +1187,24 @@ fn is_zero_u8(v: &u8) -> bool {
 
 /// `frame_start`/`frame_end` scope suppress/override to ONE hit so multi-hit moves (which
 /// reuse the same id across frames) stay independent.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HitboxRuleWire {
     pub motion: u64,
     /// Rule family: 0 attack, 1 grab, 2 wind, and 11 `REVERSE_LR`. Omitted when 0 so old
     /// plugins default to the attack family.
-    #[serde(skip_serializing_if = "is_zero_u8")]
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub category: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hitbox_id: Option<u64>,
+    #[serde(default)]
     pub suppress: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_start: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_end: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<HbOverridesWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<InjectRuleWire>,
     /// The exact ACMD call this rule is for, when the category alone does not identify it.
     ///
@@ -1169,7 +1217,7 @@ pub struct HitboxRuleWire {
     ///
     /// A plugin predating this field ignores it and matches on the category alone — too broad
     /// rather than silently dead, which is the right way round for a preview.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub func: Option<String>,
 }
 
@@ -1798,6 +1846,13 @@ struct Shared {
     /// Fighter kinds forgotten by the desktop roster. Their capture stream is ignored until the
     /// user restores the fighter, so a later playback cannot silently repopulate its memory.
     ignored_capture_kinds: BTreeSet<i32>,
+    /// Separate live-ACMD capture store for the selected fighter's articles, keyed by `(agent, motion)`.
+    article_captures: BTreeMap<(String, u64), Vec<ArticleCaptureLine>>,
+    article_capture_claimed_runs: BTreeMap<(String, u64), u32>,
+    article_capture_completed_runs: BTreeSet<(String, u64, u32)>,
+    /// Per-agent live support reported by the plugin (`Unsupported` for clones whose runtime kind
+    /// smashline does not expose).
+    article_live_status: BTreeMap<String, ArticleLiveSupport>,
     outbox: Vec<String>,
     /// Gimmick operations temporarily removed from `outbox` for the current socket
     /// flush. Counting them prevents a concurrent UI action burst from overfilling the
@@ -1819,6 +1874,10 @@ const FULL_REPLACE_MARKERS: &[&str] = &[
     "\"spawn_rules\":",
     "\"hitbox_rules\":",
     "\"effect_control_rules\":",
+    "\"selected_fighter\":",
+    "\"article_hitbox_rules\":",
+    "\"article_spawn_rules\":",
+    "\"article_effect_control_rules\":",
     "\"effect_aliases\":",
     "\"donor_effs\":",
     "\"donor_bytes\":",
@@ -1981,6 +2040,10 @@ impl Default for Shared {
             capture_ends: BTreeMap::new(),
             capture_completed_runs: BTreeSet::new(),
             ignored_capture_kinds: BTreeSet::new(),
+            article_captures: BTreeMap::new(),
+            article_capture_claimed_runs: BTreeMap::new(),
+            article_capture_completed_runs: BTreeSet::new(),
+            article_live_status: BTreeMap::new(),
             outbox: Vec::new(),
             gimmick_operations_in_flight: 0,
             last_error: None,
@@ -2916,6 +2979,119 @@ impl GameLink {
         }
     }
 
+    /// Tell the plugin which fighter (and optional costume slot scope for slot characters such
+    /// as Shy Guy) is currently selected, so article capture/injection scopes strictly to that
+    /// fighter's own articles.
+    pub fn send_selected_fighter(&self, fighter_kind: Option<i32>, costumes: &[u8]) {
+        let costumes: Vec<i32> = costumes.iter().map(|&c| c as i32).collect();
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "selected_fighter": {
+                "fighter_kind": fighter_kind,
+                "costumes": costumes,
+            }
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Ask the plugin whether live edits for `agent` (e.g. `samus_lativolt`) are supported.
+    pub fn send_article_probe(&self, agent: &str) {
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "article_probe": { "agent": agent }
+        })) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            push_outbox_capped(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article hitbox-rule list. Fighter `hitbox_rules` stays untouched.
+    pub fn send_article_hitbox_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) =
+            serde_json::to_string(&serde_json::json!({ "article_hitbox_rules": rules }))
+        else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article effect spawn-rule list.
+    pub fn send_article_spawn_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) =
+            serde_json::to_string(&serde_json::json!({ "article_spawn_rules": rules }))
+        else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Replace the plugin's separate article effect control-rule list.
+    pub fn send_article_effect_control_rules<T: Serialize>(&self, rules: &[ForArticle<T>]) {
+        if self.sends_suppressed() {
+            return;
+        }
+        let Ok(payload) = serde_json::to_string(
+            &serde_json::json!({ "article_effect_control_rules": rules }),
+        ) else {
+            return;
+        };
+        let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
+        if let Ok(mut s) = self.shared.lock() {
+            queue_latest_full_replace(&mut s.outbox, frame);
+            s.edits_tx += 1;
+        }
+    }
+
+    /// Captured ACMD lines for one article `(agent, motion)` from its latest run, separate
+    /// from the fighter capture store.
+    pub fn latest_article_run_for(&self, agent: &str, motion: u64) -> Vec<CaptureLine> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| {
+                let lines = s.article_captures.get(&(agent.to_string(), motion))?;
+                let latest = lines.iter().map(|l| l.run).max()?;
+                Some(
+                    lines
+                        .iter()
+                        .filter(|l| l.run == latest)
+                        .map(ArticleCaptureLine::to_capture_line)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Live support reported by the plugin for an article agent, if known.
+    pub fn article_live_status(&self, agent: &str) -> Option<ArticleLiveSupport> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.article_live_status.get(agent).copied())
+    }
+
     /// Queue a sparse kind-modifier edit. Color/speed controls must not upload the live
     /// form's position/rotation: those values are ACMD script offsets, while a carrier-owned
     /// transplant is physically world-space, so accidentally pinning them moves it to the
@@ -3342,7 +3518,69 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
             s.capture_debug.clear();
             s.capture_ends.clear();
             s.capture_completed_runs.clear();
+            s.article_captures.clear();
+            s.article_capture_claimed_runs.clear();
+            s.article_capture_completed_runs.clear();
             s.captures_seq += 1;
+        }
+        "ArticleAcmdCapture" => {
+            let Some(c) = body.get("ArticleAcmdCapture") else {
+                return;
+            };
+            let Ok(line) = serde_json::from_value::<ArticleCaptureLine>(c.clone()) else {
+                return;
+            };
+            let key = (line.agent.clone(), line.motion);
+            let claim = s
+                .article_capture_claimed_runs
+                .entry(key.clone())
+                .or_insert(line.run);
+            if *claim != line.run {
+                return;
+            }
+            let bucket = s.article_captures.entry(key).or_default();
+            let candidate = line.to_capture_line();
+            if !bucket
+                .iter()
+                .any(|existing| same_capture(&existing.to_capture_line(), &candidate))
+            {
+                bucket.push(line);
+                s.captures_seq += 1;
+            }
+        }
+        "ArticleAcmdCaptureEnd" => {
+            let Some(e) = body.get("ArticleAcmdCaptureEnd") else {
+                return;
+            };
+            let (Some(agent), Some(motion)) = (
+                e.get("agent").and_then(|a| a.as_str()),
+                e.get("motion").and_then(|m| m.as_u64()),
+            ) else {
+                return;
+            };
+            let run = e.get("run").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+            let key = (agent.to_string(), motion);
+            if s.article_capture_claimed_runs.get(&key).copied() != Some(run) {
+                return;
+            }
+            s.article_capture_completed_runs
+                .insert((agent.to_string(), motion, run));
+        }
+        "ArticleLiveStatus" => {
+            let Some(st) = body.get("ArticleLiveStatus") else {
+                return;
+            };
+            let (Some(agent), Some(status)) = (
+                st.get("agent").and_then(|a| a.as_str()),
+                st.get("status").and_then(|s| s.as_str()),
+            ) else {
+                return;
+            };
+            let support = match status {
+                "supported" => ArticleLiveSupport::Supported,
+                _ => ArticleLiveSupport::Unsupported,
+            };
+            s.article_live_status.insert(agent.to_string(), support);
         }
         "CarrierStatus" => {
             // How far along the game is in taking the carrier we pushed. 0 = none staged,
@@ -9327,5 +9565,89 @@ mod tests {
         );
         deliver(&link, "GimmickLiveState", controller_state(1, too_many));
         assert!(link.gimmick_controller_snapshot().is_none());
+    }
+
+    #[test]
+    fn wire_round_trip() {
+        // Article rule message encodes and decodes with its `agent` field intact.
+        let rule = HitboxRuleWire {
+            motion: 0x0765_4321,
+            category: 0,
+            hitbox_id: Some(0),
+            suppress: false,
+            frame_start: Some(1.0),
+            frame_end: Some(5.0),
+            overrides: None,
+            inject: None,
+            func: None,
+        };
+        let article_msg = ForArticle {
+            agent: "samus_lativolt".to_string(),
+            rule: rule.clone(),
+        };
+        let json = serde_json::to_string(&article_msg).expect("serialize ForArticle");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse ForArticle");
+        assert_eq!(parsed["agent"], "samus_lativolt");
+        assert_eq!(parsed["motion"], 0x0765_4321u64);
+        assert!(
+            parsed.get("fighter_kind").is_none(),
+            "article message must carry agent, not fighter_kind"
+        );
+        let decoded: ForArticle<HitboxRuleWire> =
+            serde_json::from_str(&json).expect("deserialize ForArticle");
+        assert_eq!(decoded.agent, "samus_lativolt");
+        assert_eq!(decoded.rule.motion, 0x0765_4321);
+
+        // Fighter message stays unchanged (no `agent` field).
+        let fighter_msg = ForFighter::from_key("mario/attack_air_n", rule);
+        let fighter_json: serde_json::Value =
+            serde_json::to_value(&fighter_msg).expect("serialize ForFighter");
+        assert!(fighter_json.get("agent").is_none());
+        assert_eq!(
+            fighter_json["fighter_kind"],
+            crate::gimmicks::registry::fighter_kind_value("mario").unwrap()
+        );
+
+        // Inbound ArticleAcmdCapture and ArticleLiveStatus route separately from fighter captures.
+        let link = connected_test_link();
+        deliver(
+            &link,
+            "ArticleAcmdCapture",
+            serde_json::json!({
+                "ArticleAcmdCapture": {
+                    "agent": "mario_fireball",
+                    "owner_kind": 0,
+                    "article_kind": 0,
+                    "motion": 0x1111_u64,
+                    "frame": 1.0,
+                    "func": "ATTACK",
+                    "args": [],
+                    "run": 1,
+                    "common": false
+                }
+            }),
+        );
+        assert!(
+            link.latest_run_for(0x1111, Some(0)).is_empty(),
+            "article capture with article_kind == fighter_kind must never enter fighter captures"
+        );
+        let art = link.latest_article_run_for("mario_fireball", 0x1111);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0].func, "ATTACK");
+
+        deliver(
+            &link,
+            "ArticleLiveStatus",
+            serde_json::json!({
+                "ArticleLiveStatus": {
+                    "agent": "samus_lativolt",
+                    "status": "unsupported"
+                }
+            }),
+        );
+        assert_eq!(
+            link.article_live_status("samus_lativolt"),
+            Some(ArticleLiveSupport::Unsupported)
+        );
     }
 }

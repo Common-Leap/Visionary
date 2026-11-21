@@ -5697,12 +5697,7 @@ impl VisionaryApp {
         // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
         // every other fighter's rules remain live. The alias/carrier publication is coalesced
         // and flushed later in the normal update loop.
-        let spawn: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&spawn);
-        let controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_effect_control_rules(&controls);
-        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&hitboxes);
+        self.publish_live_rule_union();
         self.push_effect_aliases();
 
         self.forgotten_fighters.insert(fighter.to_ascii_lowercase());
@@ -5767,6 +5762,7 @@ impl VisionaryApp {
         self.hitbox_dirty_at = None;
         self.acmd_error = None;
         self.acmd_src_buffer = None;
+        self.send_selected_fighter_to_game();
     }
 
     fn select_fighter(&mut self, idx: usize) {
@@ -5789,6 +5785,7 @@ impl VisionaryApp {
         self.state.selected_move = None;
         self.open_article = None;
         self.article_settings = None;
+        self.send_selected_fighter_to_game();
         // A fighter switch is also a move-state boundary.  Clearing only the editable hitboxes
         // left the previous fighter's ACMD script alive, so a stale WHOLE_HIT/HIT_NODE OFF event
         // could hide every newly loaded parameter volume until the next move was opened.
@@ -6107,6 +6104,7 @@ impl VisionaryApp {
             cancel_frame: 0,
         };
         self.opened_object_agents.insert(agent.clone());
+        self.game_link.send_article_probe(&agent);
         self.select_script(Some(agent), move_entry);
     }
 
@@ -9838,8 +9836,7 @@ impl VisionaryApp {
                 self.hitbox_watch = Some((key.clone(), self.state.hitboxes.clone()));
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<_> = self.live_hitbox_rule_union();
-            self.game_link.send_hitbox_rules(&all);
+            self.publish_hitbox_rules();
             self.state.status = format!("Restored {f}/{m} hitboxes to the source data.");
         }
         if let Some(f) = remove_fighter {
@@ -9858,8 +9855,7 @@ impl VisionaryApp {
                 }
                 self.hitbox_dirty_at = None;
             }
-            let all: Vec<_> = self.live_hitbox_rule_union();
-            self.game_link.send_hitbox_rules(&all);
+            self.publish_hitbox_rules();
             self.state.status = format!("Restored all {f} hitboxes to their source data.");
         }
         if let Some(key) = remove_call_key {
@@ -14798,8 +14794,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if structural {
             self.state.status = if structural_live_supported {
                 "Move updated.".into()
@@ -15462,8 +15457,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(frame_key, frame_rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 || partial_unrepresentable > 0 || frame_unrepresentable > 0 {
             if unrepresentable > 0 {
                 self.note_live_replay_capture_limit("expression");
@@ -20671,6 +20665,14 @@ impl VisionaryApp {
                 })
                 .small(),
             );
+            if self.game_link.article_live_status(agent)
+                == Some(crate::game_link::ArticleLiveSupport::Unsupported)
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 170, 90),
+                    RichText::new("Live edits for this clone aren't supported").small(),
+                );
+            }
         }
         let selected_move = self.state.selected_move.as_ref().map(|m| m.name.clone());
         let mut to_open: Option<(String, String)> = None;
@@ -21781,8 +21783,7 @@ impl VisionaryApp {
                 self.hitbox_rules_store.remove(&store_key);
             }
         }
-        self.game_link
-            .send_hitbox_rules(&self.live_hitbox_rule_union());
+        self.publish_hitbox_rules();
     }
 
     fn note_live_replay_capture_limit(&mut self, category: &str) {
@@ -21929,6 +21930,30 @@ impl VisionaryApp {
             .to_motion_module_set_rate_partial_events();
     }
 
+    /// Tell the plugin which fighter (and slot scope, for slot-scoped characters like Shy Guy)
+    /// is selected so article capture/injection scopes strictly to that fighter's own articles.
+    fn send_selected_fighter_to_game(&self) {
+        let selected = self
+            .state
+            .selected_fighter
+            .and_then(|idx| self.state.fighters.get(idx));
+        let kind = selected.and_then(|f| fighter_kind_id(&f.name));
+        let costumes: &[u8] = selected
+            .filter(|f| f.custom_name.is_some())
+            .map(|f| f.slots.as_slice())
+            .unwrap_or(&[]);
+        self.game_link.send_selected_fighter(kind, costumes);
+    }
+
+    fn article_agent_from_rule_key(key: &str) -> Option<String> {
+        let agent = key.split(['/', '#']).next().unwrap_or_default();
+        if !agent.is_empty() && crate::gimmicks::registry::fighter_kind_value(agent).is_none() {
+            Some(agent.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Withhold source-only node tracks at the final publication boundary, including watcher
     /// and reconnect sends. Retain keyed rules so reverting a recipe can restore flat preview.
     fn live_hitbox_rule_union(
@@ -21937,7 +21962,11 @@ impl VisionaryApp {
         self.hitbox_rules_store
             .iter()
             .filter(|(key, _)| {
-                crate::move_nodes::live_support::allows_flat_live_rules(&self.move_graphs, key)
+                Self::article_agent_from_rule_key(key).is_none()
+                    && crate::move_nodes::live_support::allows_flat_live_rules(
+                        &self.move_graphs,
+                        key,
+                    )
             })
             .flat_map(|(key, rules)| {
                 // A call added inside an If only fires when the If passes.
@@ -21970,6 +21999,24 @@ impl VisionaryApp {
             .collect()
     }
 
+    fn live_article_hitbox_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::HitboxRuleWire>> {
+        self.hitbox_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
+                })
+            })
+            .collect()
+    }
+
     fn allows_flat_effect_rules(&self, key: &str) -> bool {
         crate::move_nodes::live_support::allows_flat_effect_rules(&self.move_graphs, key)
     }
@@ -21979,7 +22026,10 @@ impl VisionaryApp {
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::SpawnRuleWire>> {
         self.effect_rules_store
             .iter()
-            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, _)| {
+                Self::article_agent_from_rule_key(key).is_none()
+                    && self.allows_flat_effect_rules(key)
+            })
             .flat_map(|(key, rules)| {
                 // An effect added inside an If only fires when the If passes.
                 let guards = key
@@ -22004,12 +22054,33 @@ impl VisionaryApp {
             .collect()
     }
 
+    fn live_article_effect_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::SpawnRuleWire>> {
+        self.effect_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
+                })
+            })
+            .collect()
+    }
+
     fn live_effect_control_rule_union(
         &self,
     ) -> Vec<crate::game_link::ForFighter<crate::game_link::EffectControlRuleWire>> {
         self.effect_control_rules_store
             .iter()
-            .filter(|(key, _)| self.allows_flat_effect_rules(key))
+            .filter(|(key, _)| {
+                Self::article_agent_from_rule_key(key).is_none()
+                    && self.allows_flat_effect_rules(key)
+            })
             .flat_map(|(key, rules)| {
                 rules
                     .iter()
@@ -22019,16 +22090,53 @@ impl VisionaryApp {
             .collect()
     }
 
+    fn live_article_effect_control_rule_union(
+        &self,
+    ) -> Vec<crate::game_link::ForArticle<crate::game_link::EffectControlRuleWire>> {
+        self.effect_control_rules_store
+            .iter()
+            .filter_map(|(key, rules)| {
+                let agent = Self::article_agent_from_rule_key(key)?;
+                Some((agent, rules))
+            })
+            .flat_map(|(agent, rules)| {
+                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
+                    agent: agent.clone(),
+                    rule,
+                })
+            })
+            .collect()
+    }
+
+    fn publish_hitbox_rules(&self) {
+        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
+        self.game_link.send_hitbox_rules(&hitboxes);
+        let article_hitboxes: Vec<_> = self.live_article_hitbox_rule_union();
+        self.game_link.send_article_hitbox_rules(&article_hitboxes);
+    }
+
+    fn publish_effect_rules(&self) {
+        let effects: Vec<_> = self.live_effect_rule_union();
+        self.game_link.send_spawn_rules(&effects);
+        let article_effects: Vec<_> = self.live_article_effect_rule_union();
+        self.game_link.send_article_spawn_rules(&article_effects);
+    }
+
+    fn publish_effect_control_rules(&self) {
+        let controls: Vec<_> = self.live_effect_control_rule_union();
+        self.game_link.send_effect_control_rules(&controls);
+        let article_controls: Vec<_> = self.live_article_effect_control_rule_union();
+        self.game_link
+            .send_article_effect_control_rules(&article_controls);
+    }
+
     /// Publish the complete safe ACMD live-rule union currently staged in the keyed stores.
     /// Project loading calls this only after its all-family send barrier is lifted; ordinary
     /// rebuilds use it after their narrower rule batch ends.
     fn publish_live_rule_union(&self) {
-        let hitboxes: Vec<_> = self.live_hitbox_rule_union();
-        let effects: Vec<_> = self.live_effect_rule_union();
-        let controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_hitbox_rules(&hitboxes);
-        self.game_link.send_spawn_rules(&effects);
-        self.game_link.send_effect_control_rules(&controls);
+        self.publish_hitbox_rules();
+        self.publish_effect_rules();
+        self.publish_effect_control_rules();
     }
 
     /// Rehydrate every move represented by a loaded project through the same source parser and
@@ -26067,6 +26175,12 @@ impl VisionaryApp {
             .send_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
         self.game_link
             .send_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
+        self.game_link
+            .send_article_spawn_rules::<crate::game_link::SpawnRuleWire>(&[]);
+        self.game_link
+            .send_article_effect_control_rules::<crate::game_link::EffectControlRuleWire>(&[]);
+        self.game_link
+            .send_article_hitbox_rules::<crate::game_link::HitboxRuleWire>(&[]);
         self.game_link.send_effect_aliases(&[]);
         // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
         // on project replacement too, otherwise a later genuine fighter load could read files
@@ -26338,10 +26452,12 @@ impl VisionaryApp {
     ///
     /// (Frame-space helpers live just below — see [`Self::motion_to_script_frame`].)
     fn current_motion_hash(&self) -> Option<u64> {
-        // An object's script is not one of the fighter's motions: no live rule or capture is
-        // keyed to it (sending one live is a later step), so it has no motion here.
         if self.open_article.is_some() {
-            return None;
+            return self
+                .state
+                .selected_move
+                .as_ref()
+                .map(|m| Self::motion_hash_from_name(&m.name));
         }
         self.state
             .selected_move
@@ -26365,8 +26481,11 @@ impl VisionaryApp {
     ///     performing a move grounded and then aerial left the union of both branches and the
     ///     editor showed spawns that never occur together.
     fn captures_for_move(&self, fighter: &str, motion: u64) -> Vec<crate::game_link::CaptureLine> {
-        self.game_link
-            .latest_run_for(motion, fighter_kind_id(fighter))
+        if let Some(kind) = fighter_kind_id(fighter) {
+            self.game_link.latest_run_for(motion, Some(kind))
+        } else {
+            self.game_link.latest_article_run_for(fighter, motion)
+        }
     }
 
     /// Forget the persisted donor for the current move as well as the plugin's in-memory
@@ -26420,8 +26539,12 @@ impl VisionaryApp {
                     && self.replay_live_fallback_key.as_deref() != Some(key.as_str())
             });
         select_donor_captures(stored_is_authoritative, snapshot_captures, || {
-            self.game_link
-                .latest_run_for(motion, self.current_fighter_kind())
+            if let Some(agent) = &self.open_article {
+                self.game_link.latest_article_run_for(agent, motion)
+            } else {
+                self.game_link
+                    .latest_run_for(motion, self.current_fighter_kind())
+            }
         })
     }
 
@@ -26534,6 +26657,9 @@ impl VisionaryApp {
     /// Register newly-arrived capture lines for the open move, arming (or extending) the
     /// settle window. Cheap — only does work when the link's capture counter actually moved.
     fn note_new_captures(&mut self) {
+        if self.open_article.is_some() {
+            return;
+        }
         let seq = self.game_link.captures_seq();
         if seq == self.captures_seen_seq {
             return;
@@ -28754,8 +28880,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(mv_key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if missing_donor {
             self.state.status =
                 "This hitbox could not be sent live: perform the move in game once, then try again."
@@ -29157,8 +29282,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
     }
 
     /// Send this move's `FT_MOTION_RATE` values to the running game.
@@ -29221,8 +29345,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
@@ -29321,8 +29444,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if let Some((category, label, need)) =
             limits.filter(|_| unrepresentable > 0 && !sent_as_steps)
         {
@@ -30033,8 +30155,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_frame_partial");
             self.state.status = format!(
@@ -30076,8 +30197,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial frame");
             self.state.status = format!(
@@ -30387,8 +30507,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("MotionModule::set_rate_partial");
             self.state.status = format!(
@@ -30430,8 +30549,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         if unrepresentable > 0 {
             self.note_live_replay_capture_limit("expression partial rate");
             self.state.status = format!(
@@ -31379,8 +31497,7 @@ impl VisionaryApp {
         } else {
             self.hitbox_rules_store.insert(key, rules);
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
     }
 
     /// Rebuild live hitbox rules for every move in a loaded project, not just the move currently
@@ -31572,8 +31689,7 @@ impl VisionaryApp {
                 self.hitbox_rules_store.insert(key, rules);
             }
         }
-        let all: Vec<_> = self.live_hitbox_rule_union();
-        self.game_link.send_hitbox_rules(&all);
+        self.publish_hitbox_rules();
         incomplete
     }
 
@@ -33048,10 +33164,8 @@ impl VisionaryApp {
             self.apply_effect_call_edits_to_current();
             self.push_effect_rules();
         } else if !affected_moves.is_empty() {
-            let all: Vec<_> = self.live_effect_rule_union();
-            self.game_link.send_spawn_rules(&all);
-            let all_controls: Vec<_> = self.live_effect_control_rule_union();
-            self.game_link.send_effect_control_rules(&all_controls);
+            self.publish_effect_rules();
+            self.publish_effect_control_rules();
         }
     }
 
@@ -35044,8 +35158,7 @@ impl VisionaryApp {
             }
         }
         // Flush the union of all moves' rules so cross-move redirects apply live at once.
-        let all: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&all);
+        self.publish_effect_rules();
         // Live parity: the copy doesn't exist in the running game yet, but the plugin
         // aliases its hash to the donor's, so redirected spawns show in-game NOW and
         // match the export (a fresh copy is content-identical to its donor).
@@ -35661,10 +35774,8 @@ impl VisionaryApp {
             self.effect_control_rules_store
                 .insert(mv_key, control_rules);
         }
-        let all: Vec<_> = self.live_effect_rule_union();
-        self.game_link.send_spawn_rules(&all);
-        let all_controls: Vec<_> = self.live_effect_control_rule_union();
-        self.game_link.send_effect_control_rules(&all_controls);
+        self.publish_effect_rules();
+        self.publish_effect_control_rules();
         if unsupported_flip_axis {
             self.state.status =
                 "This flip-axis/control token is preserved for source/export, but live preview \
@@ -38202,12 +38313,11 @@ Click to see the code, or link your own project"),
             if client.is_some() {
                 // Re-push the authoritative live state after every fresh plugin connection.
                 // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<_> = self.live_effect_rule_union();
-                self.game_link.send_spawn_rules(&spawn);
-                let controls: Vec<_> = self.live_effect_control_rule_union();
-                self.game_link.send_effect_control_rules(&controls);
-                let hit: Vec<_> = self.live_hitbox_rule_union();
-                self.game_link.send_hitbox_rules(&hit);
+                self.send_selected_fighter_to_game();
+                if let Some(agent) = &self.open_article {
+                    self.game_link.send_article_probe(agent);
+                }
+                self.publish_live_rule_union();
                 self.push_effect_aliases();
                 self.live_overrides.resend_tweaks(&self.game_link);
             }

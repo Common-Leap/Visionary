@@ -1475,10 +1475,106 @@ macro_rules! effect_hook {
                 set_pending_scale_w(None);
                 // Eff-editor spawn rules: suppression + PER-SPAWN transform, both scoped to
                 // (motion, frame window) so editing one spawn doesn't affect the others.
+                // Weapons owned by the selected fighter read ONLY from the separate article rule
+                // table; fighters read ONLY from fighter spawn_rules.
                 let mut scoped_transform = false;
-                if crate::slight::effect_viewer::spawn_rules::any_for(args.eff_hash) {
-                    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
-                        as *mut smash::app::BattleObjectModuleAccessor;
+                let rule_boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+                    as *mut smash::app::BattleObjectModuleAccessor;
+                let is_weapon = !rule_boma.is_null()
+                    && smash::app::utility::get_category(&mut *rule_boma)
+                        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON;
+                if is_weapon && crate::slight::effect_viewer::spawn_rules::any_article_rules() {
+                    if let Some(article_key) =
+                        crate::slight::systems::article_notifier::selected_owner_article(
+                            (*rule_boma).battle_object_id,
+                        )
+                    {
+                        let frame = smash::app::lua_bind::MotionModule::frame(rule_boma);
+                        let motion = smash::app::lua_bind::MotionModule::motion_kind(rule_boma);
+                        if !crate::slight::hitbox_viewer::is_injecting()
+                            && crate::slight::effect_viewer::spawn_rules::suppressed_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                        {
+                            return;
+                        }
+                        if let Some((pos, rot, scale)) =
+                            crate::slight::effect_viewer::spawn_rules::transform_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                        {
+                            let pins = crate::slight::effect_viewer::kinds::Pinned {
+                                pos: pos.map(|p| super::effect_data::Point3D {
+                                    x: p[0],
+                                    y: p[1],
+                                    z: p[2],
+                                }),
+                                rot: rot.map(|r| super::effect_data::Point3D {
+                                    x: r[0],
+                                    y: r[1],
+                                    z: r[2],
+                                }),
+                                scale,
+                                ..Default::default()
+                            };
+                            rewrite_args(lua_state, &pins, $flip);
+                            if let Some(scoped_args) = parse_args(lua_state, $flip) {
+                                carrier_base_args = scoped_args;
+                            }
+                            scoped_transform = true;
+                        }
+                        set_pending_rate(
+                            crate::slight::effect_viewer::spawn_rules::rate_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        set_pending_camera_offset(
+                            crate::slight::effect_viewer::spawn_rules::camera_offset_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        let (tint, alpha) =
+                            crate::slight::effect_viewer::spawn_rules::tint_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            )
+                            .unwrap_or((None, None));
+                        set_pending_tint(tint, alpha);
+                        set_pending_particle_tint(
+                            crate::slight::effect_viewer::spawn_rules::particle_tint_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                        set_pending_scale_w(
+                            crate::slight::effect_viewer::spawn_rules::scale_w_for_article(
+                                &article_key.agent,
+                                args.eff_hash,
+                                motion,
+                                frame,
+                            ),
+                        );
+                    }
+                } else if !is_weapon
+                    && crate::slight::effect_viewer::spawn_rules::any_for(args.eff_hash)
+                {
+                    let boma = rule_boma;
                     let (motion, frame) = if boma.is_null() {
                         (0u64, -1.0f32)
                     } else {
@@ -2902,6 +2998,9 @@ pub fn reset_effect_injection_latches() {
     if let Some(mut noted) = LATE_FALLBACK_NOTED.try_lock() {
         noted.clear();
     }
+    if let Some(mut latches) = ARTICLE_EFF_FIRED.try_lock() {
+        latches.clear();
+    }
 }
 
 pub fn reset_control_injection_latches() {
@@ -3565,6 +3664,115 @@ pub unsafe fn inject_tick(lua_state: u64) {
     for target in targets {
         inject_control(&mut agent, boma, motion, CoroutineBoundary::Tick, target, frame);
         inject_effect(&mut agent, boma, motion, CoroutineBoundary::Tick, target, frame);
+    }
+}
+
+/// Separate per-frame effect/control injection latch for articles so article injections never
+/// share latch state with fighters.
+static ARTICLE_EFF_FIRED: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(u32, usize), InjectionLatch>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+static ARTICLE_TICK_LAST_FRAME: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u32, (u64, f32)>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Per-weapon effect/control injection tick for the selected fighter's own articles only.
+/// Reads strictly from the separate article rule tables keyed by `(agent, motion)`.
+pub unsafe fn inject_tick_article(lua_state: u64) {
+    use crate::slight::effect_viewer::{control_rules, spawn_rules};
+    if lua_state == 0 || crate::slight::hitbox_viewer::is_injecting() {
+        return;
+    }
+    if !spawn_rules::any_inject_article() && !control_rules::any_inject_article() {
+        return;
+    }
+    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
+        as *mut smash::app::BattleObjectModuleAccessor;
+    if boma.is_null() {
+        return;
+    }
+    if smash::app::utility::get_category(&mut *boma)
+        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
+    {
+        return;
+    }
+    let boid = (*boma).battle_object_id;
+    let Some(article_key) =
+        crate::slight::systems::article_notifier::selected_owner_article(boid)
+    else {
+        return;
+    };
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    if !frame.is_finite() {
+        return;
+    }
+    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
+    let previous = ARTICLE_TICK_LAST_FRAME.lock().insert(boid, (motion, frame));
+    let since = match previous {
+        Some((last_motion, last_frame)) if last_motion == motion && last_frame <= frame => last_frame,
+        _ => -1.0,
+    };
+
+    let eff_injections = spawn_rules::injections_for_article(&article_key.agent, motion);
+    if eff_injections.is_empty() {
+        return;
+    }
+    let mut agent = smash::lua2cpp::L2CAgentBase {
+        agent: smash::lib::L2CAgent::new(lua_state),
+        unk48: [0; 0x10],
+    };
+    for (idx, inj, rule_fingerprint) in eff_injections {
+        if !(inj.frame.is_finite() && since < inj.frame && inj.frame <= frame) {
+            continue;
+        }
+        let key = (boid, idx);
+        let latch = {
+            let mut fired = ARTICLE_EFF_FIRED.lock();
+            observed_latch(&mut fired, key, motion, inj.frame, rule_fingerprint, frame)
+        };
+        if !latch_can_attempt(
+            latch.as_ref(),
+            motion,
+            inj.frame,
+            idx,
+            rule_fingerprint,
+            frame,
+        ) {
+            continue;
+        }
+        if inj
+            .guard
+            .as_ref()
+            .is_some_and(|guard| !crate::slight::hitbox_viewer::guard_passes(boma, guard))
+        {
+            if let Some(mut latch) = latch {
+                latch.confirmed = true;
+                ARTICLE_EFF_FIRED.lock().insert(key, latch);
+            }
+            continue;
+        }
+        load_args(&mut agent, &inj.args);
+        let confirmed = {
+            let _attempt = InjectionAttemptGuard::new(key, motion, inj.frame, rule_fingerprint);
+            let _guard = crate::slight::hitbox_viewer::InjectGuard::new();
+            let confirmation = dispatch_effect(&inj.func, agent.agent.lua_state_agent);
+            if confirmation == DispatchConfirmation::NativeReturn {
+                note_injected_success();
+            }
+            InjectionAttemptGuard::confirmed()
+        };
+        agent.agent.clear_lua_stack();
+        store_latch(
+            &mut ARTICLE_EFF_FIRED.lock(),
+            key,
+            motion,
+            inj.frame,
+            idx,
+            rule_fingerprint,
+            frame,
+            confirmed,
+            false,
+        );
     }
 }
 
