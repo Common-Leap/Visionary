@@ -1588,9 +1588,26 @@ impl SourceIndex {
                 }
                 let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
                 let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
-                let found = match (own.as_slice(), candidates) {
-                    ([one], _) => Some((*one).clone()),
-                    ([], [one]) => Some(one.clone()),
+                // `fly::bullet_seed_end` names the function in the `fly` module beside the
+                // registering file, however many other modules define the same name.
+                let in_module = registration.module.as_deref().map(|module| {
+                    let dir = file.parent().unwrap_or(Path::new(""));
+                    let stem_dir = file.with_extension("");
+                    candidates
+                        .iter()
+                        .filter(|(at, _)| {
+                            let path = &sources[*at].0;
+                            [dir, stem_dir.as_path()].iter().any(|base| {
+                                *path == base.join(format!("{module}.rs")) || *path == base.join(module).join("mod.rs")
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let found = match (in_module.as_deref(), own.as_slice(), candidates) {
+                    (Some([one]), _, _) => Some((*one).clone()),
+                    (Some(_), _, _) => None,
+                    (None, [one], _) => Some((*one).clone()),
+                    (None, [], [one]) => Some(one.clone()),
                     _ => None,
                 };
                 let Some((at, span)) = found else {
@@ -2462,8 +2479,22 @@ struct StatusRegistration {
     /// The function's own name: a path (`jackbox::jackbox_main`) keeps its last segment. Anything
     /// that is not a name (a closure) is kept as written.
     function: String,
+    /// The module a path names the function in (`fly` for `fly::bullet_seed_end`), when it has one.
+    module: Option<String>,
     /// A phase registered with `noop_status!`: there is no function to follow.
     noop: bool,
+}
+
+/// The module segment before a function's name in a path (`fly` in `fly::bullet_seed_end`), when
+/// it is a plain module name rather than `self`, `super` or `crate`.
+fn function_module(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (module, _) = text.rsplit_once("::")?;
+    let last = module.rsplit("::").next()?.trim();
+    (!last.is_empty()
+        && !matches!(last, "self" | "super" | "crate")
+        && last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then(|| last.to_string())
 }
 
 /// A path's last segment, unless the text is not a plain path (a closure), which stays as written.
@@ -2516,6 +2547,7 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                     phase: function_name(&text[args[0].clone()]),
                     kind_expr: text[args[1].clone()].trim().to_string(),
                     function: function_name(&text[args[2].clone()]),
+                    module: function_module(&text[args[2].clone()]),
                     noop: false,
                 }),
                 (".on_start(", 1) => out.push(StatusRegistration {
@@ -2524,6 +2556,7 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                     phase: "Start".to_string(),
                     kind_expr: String::new(),
                     function: function_name(&text[args[0].clone()]),
+                    module: function_module(&text[args[0].clone()]),
                     noop: false,
                 }),
                 ("noop_status!(", 3..) => {
@@ -2537,6 +2570,7 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                             phase: function_name(phase),
                             kind_expr: kind_expr.clone(),
                             function: String::new(),
+                            module: None,
                             noop: true,
                         });
                     }
@@ -18442,6 +18476,37 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(dedede.len(), 1, "{:?}", index.statuses);
         assert_eq!(dedede[0].0.function, "kingteresa_attack_air_status_pre");
         assert_eq!(index.status_bodies("fighter")[0].0.function, "catched_pre");
+    }
+
+    /// Sceptile-Moveset · plugin/src/sceptile/articles/bullet_seed/status/mod.rs:19 registers
+    /// `.status(End, *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)`, and
+    /// `bullet_seed_end` is defined both in `status/fly.rs:248` and in `bullet_seed/mod.rs:24`
+    /// (tier 1, smashline2). The path names the one in `fly`.
+    #[test]
+    fn a_module_path_picks_the_function_in_that_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "bullet_seed/mod.rs",
+            "mod status;\nunsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) {}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/mod.rs",
+            "mod fly;\npub fn install() {\n    Agent::new(\"mario_bulletseed\")\n        .status(End,  *WEAPON_SIMON_AXE_STATUS_KIND_FLY, fly::bullet_seed_end)\n        .install();\n}\n",
+        );
+        put(
+            root,
+            "bullet_seed/status/fly.rs",
+            "pub(super) unsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let bodies = index.status_bodies("mario_bulletseed");
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].0.file.ends_with("fly.rs"), "{:?}", bodies[0].0.file);
+        assert!(bodies[0].1.contains("-> L2CValue"));
     }
 
     /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
