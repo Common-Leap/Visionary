@@ -808,6 +808,41 @@ fn shift_subtree_depth(emitters: &mut [EmitterDef], i: usize, delta: i16) -> boo
     true
 }
 
+/// Whether copying row `i` (and what is made from it) keeps the set inside what the game loads:
+/// at most [`MAX_CHILDREN`] parts made from one part.
+///
+/// [`MAX_CHILDREN`]: crate::eff_validate::MAX_CHILDREN
+fn room_to_copy(depths: &[u8], i: usize) -> bool {
+    match depths.get(i) {
+        None => false,
+        Some(0) => true,
+        Some(_) => {
+            let parent = (0..i).rev().find(|&k| depths[k] == 0).unwrap_or(0);
+            children_of(depths, parent) < crate::eff_validate::MAX_CHILDREN
+        }
+    }
+}
+
+/// Whether row `i` can be made from the part above it. The game plays one level of parts made
+/// from parts, so only a part on its own with nothing made from it qualifies, and the part it
+/// would be made from must have room for another.
+fn room_to_nest(depths: &[u8], i: usize) -> bool {
+    if i == 0 || depths.get(i) != Some(&0) || depths.get(i + 1).is_some_and(|d| *d > 0) {
+        return false;
+    }
+    let parent = (0..i).rev().find(|&k| depths[k] == 0).unwrap_or(0);
+    children_of(depths, parent) < crate::eff_validate::MAX_CHILDREN
+}
+
+/// How many parts are made directly from row `parent`.
+fn children_of(depths: &[u8], parent: usize) -> usize {
+    depths[parent + 1..]
+        .iter()
+        .take_while(|d| **d > 0)
+        .filter(|d| **d == 1)
+        .count()
+}
+
 /// A name for a duplicated emitter that no sibling already has.
 ///
 /// Emitters are addressed by name by every path that ships an edit — the exporter resolves an
@@ -868,7 +903,11 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
         }
         AttrKind::Int => {
             let mut v = value.as_i64();
-            let changed = ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed();
+            let mut drag = egui::DragValue::new(&mut v).speed(1.0);
+            if crate::eff_attrs::is_key_count(attr.id) {
+                drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as i64);
+            }
+            let changed = ui.add(drag).changed();
             if changed {
                 *value = AttrValue::Int(v);
             }
@@ -876,7 +915,11 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
         }
         AttrKind::UInt => {
             let mut v = value.as_u64();
-            let changed = ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed();
+            let mut drag = egui::DragValue::new(&mut v).speed(1.0);
+            if crate::eff_attrs::is_key_count(attr.id) {
+                drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as u64);
+            }
+            let changed = ui.add(drag).changed();
             if changed {
                 *value = AttrValue::UInt(v);
             }
@@ -3499,6 +3542,9 @@ impl EffEditor {
                 ui.label("");
                 ui.end_row();
                 let count = set.emitters.len();
+                let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
+                let copy_room: Vec<bool> = (0..count).map(|i| room_to_copy(&depths, i)).collect();
+                let nest_room: Vec<bool> = (0..count).map(|i| room_to_nest(&depths, i)).collect();
                 for (i, em) in set.emitters.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_space(em.depth as f32 * 12.0);
@@ -3535,8 +3581,12 @@ impl EffEditor {
                     }
                     ui.menu_button("⋯", |ui| {
                         if ui
-                            .button("Copy")
+                            .add_enabled(copy_room[i], egui::Button::new("Copy"))
                             .on_hover_text("Add another part just like this one")
+                            .on_disabled_hover_text(format!(
+                                "The game holds at most {} parts made from one part",
+                                crate::eff_validate::MAX_CHILDREN
+                            ))
                             .clicked()
                         {
                             duplicate = Some(i);
@@ -3567,9 +3617,16 @@ impl EffEditor {
                         }
                         ui.separator();
                         if ui
-                            .add_enabled(i > 0, egui::Button::new("Make from the part above"))
+                            .add_enabled(
+                                nest_room[i],
+                                egui::Button::new("Make from the part above"),
+                            )
                             .on_hover_text(
                                 "Its particles come out of the particles of the part above",
+                            )
+                            .on_disabled_hover_text(
+                                "Only a part on its own, with nothing made from it, can be made \
+                                 from another, and one part makes at most 16",
                             )
                             .clicked()
                         {
@@ -3653,7 +3710,7 @@ impl EffEditor {
             } else {
                 set.emitters
                     .get(i - 1)
-                    .map(|p| p.depth.saturating_add(1))
+                    .map(|p| p.depth.saturating_add(1).min(1))
                     .unwrap_or(0)
             };
             if let Some(root) = set.emitters.get(i) {
@@ -5282,6 +5339,41 @@ mod tests {
         assert_eq!(subtree(&list, 3), 3..4);
         assert_eq!(subtree(&list, 4), 4..5, "the last emitter runs to the end");
         assert_eq!(subtree(&list, 9), 9..9, "an index past the end is empty");
+    }
+
+    /// The part list stops at what the game loads: 16 parts made from one part, and one level of
+    /// parts made from parts. Parts on their own have no limit (24 load and play in game).
+    #[test]
+    fn copying_and_nesting_stop_at_what_the_game_loads() {
+        assert!(
+            room_to_copy(&[0u8; 24], 3),
+            "parts on their own are not capped"
+        );
+
+        // A part made from part 0, which already has 15 others made from it.
+        let mut family = vec![0u8];
+        family.extend(std::iter::repeat_n(1u8, 15));
+        family.push(0);
+        assert!(room_to_copy(&family, 1), "the 16th child has room");
+        assert!(
+            room_to_nest(&family, 16),
+            "and so does nesting the part below"
+        );
+        family.insert(1, 1);
+        assert!(!room_to_copy(&family, 1), "a 17th child does not");
+        assert!(!room_to_nest(&family, 17));
+
+        // Only a top-level part with nothing made from it can be nested.
+        assert!(room_to_nest(&[0, 0], 1));
+        assert!(
+            !room_to_nest(&[0, 0, 1], 1),
+            "its child would become a grandchild"
+        );
+        assert!(!room_to_nest(&[0, 1, 1], 2), "a child is already nested");
+        assert!(
+            !room_to_nest(&[0], 0),
+            "the first part has nothing above it"
+        );
     }
 
     #[test]

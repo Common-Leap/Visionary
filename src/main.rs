@@ -17,6 +17,7 @@ mod eff_attrs;
 mod eff_editor;
 mod eff_export;
 mod eff_subsections;
+mod eff_validate;
 mod effect_colour;
 mod effect_pool;
 mod effect_uses;

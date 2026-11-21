@@ -364,9 +364,8 @@ pub fn rebuild_runtime_carrier_eff_bytes_with_edits(
     // Removals last: the swaps that moved emitters off these textures have now been applied.
     apply_texture_removals(&mut carrier, removed_textures, warnings)?;
 
-    carrier
-        .save()
-        .context("effect_library failed to encode the runtime carrier .eff")
+    let bytes = save_keeping_source(carrier_bytes, &mut carrier)?;
+    refuse_invalid(bytes, "live carrier")
 }
 
 /// Every texture GUID some surviving emitter samples.
@@ -630,8 +629,8 @@ pub fn strip_donor_eff_bytes(src: &[u8], keep_entries: &[&str]) -> Result<Vec<u8
     clear_empty_emitter_set_references(&mut file);
     prune_unreferenced_resources(&mut file, &[])?;
     compact_shader_containers(&mut file)?;
-    file.save()
-        .context("effect_library failed to encode the stripped donor .eff")
+    let bytes = save_keeping_source(src, &mut file)?;
+    refuse_invalid(bytes, "stripped donor")
 }
 
 /// Empty every emitter set the transplants did not create, leaving the carrier's own effects as
@@ -1373,9 +1372,24 @@ fn rebuild_eff_bytes_filtered(
     for warning in &warnings {
         eprintln!("[EFF-EXPORT] warning: {warning}");
     }
-    namco
-        .save()
-        .context("effect_library failed to re-encode the .eff")
+    let bytes = save_keeping_source(src_bytes, &mut namco)?;
+    refuse_invalid(bytes, "eff export")
+}
+
+/// Refuse to hand the game a file that breaks an invariant every game file keeps.
+///
+/// Like `verify_shader_indices_resolve`, this is the last line before bytes reach the game, and a
+/// hard failure on purpose: the characteristic failure of a malformed `.eff` is a crash or a hang
+/// while the match loads, with nothing on screen to say which edit caused it.
+fn refuse_invalid(bytes: Vec<u8>, subject: &str) -> Result<Vec<u8>> {
+    let found = crate::eff_validate::problems(&bytes);
+    if found.is_empty() {
+        return Ok(bytes);
+    }
+    anyhow::bail!(
+        "{subject}: the written file breaks a rule every game file keeps: {}",
+        found.join("; ")
+    )
 }
 
 /// Duplicate a donor entry's emitter set(s) within the same eff under a new entry name —
@@ -1449,7 +1463,7 @@ fn apply_transplant_same_file(
             .ok_or_else(|| anyhow!("donor variant range out of bounds"))?
             .to_vec();
         let new_start = namco.effect_variants.len() as u16 + 1; // raw 1-based
-        for v in donor_variants {
+        for (offset, v) in donor_variants.into_iter().enumerate() {
             let new_set_id = clone_set(v.emitter_set_id as u32, sets)?;
             namco
                 .effect_variants
@@ -1457,6 +1471,15 @@ fn apply_transplant_same_file(
                     start_frame: v.start_frame,
                     emitter_set_id: new_set_id as u16,
                 });
+            // The bone table runs parallel to the part table, one name per part. Without the
+            // copy's names the header counts more parts than names, so the game reads the
+            // missing ones out of whatever follows the table.
+            let bone = namco
+                .external_bone_names
+                .get(start + offset)
+                .cloned()
+                .unwrap_or_default();
+            namco.external_bone_names.push(bone);
         }
         new_entry.variant_start_idx = new_start;
     }
@@ -2534,7 +2557,9 @@ fn nest_by_depth(
     // Path of indices from the root down to the emitter last placed at each depth.
     let mut path: Vec<usize> = Vec::new();
     for (emitter, &depth) in emitters.into_iter().zip(depths) {
-        let depth = (depth as usize).min(path.len());
+        // The game plays one level of children (its loader never walks a child's own child
+        // list), so a deeper slot is made a child of the top-level emitter it sits under.
+        let depth = (depth as usize).min(path.len()).min(1);
         path.truncate(depth);
         let mut level = &mut roots;
         for &step in &path {
@@ -2544,6 +2569,266 @@ fn nest_by_depth(
         path.push(level.len() - 1);
     }
     roots
+}
+
+/// Encode `file`, keeping byte for byte every top-level part of `source` it did not change.
+///
+/// `effect_library` re-encodes the whole PTCL on every save: the texture, model and shader pools
+/// go through its own BNTX, BFRES and BNSH writers, the texture table is re-sorted, and child
+/// emitters are re-aligned. None of the 328 game files survives that unchanged, so recolouring
+/// one emitter shipped three rewritten pools the edit never touched — including the model pools
+/// of Link, Byleth and one stage, whose relocation tables that writer is known not to reproduce.
+/// Here only what the edit changed is taken from the writer; the rest is the game's own bytes,
+/// and a file with no edits comes back identical to its source.
+///
+/// Each part is placed at an offset congruent to where it was laid out, modulo the 4096-byte
+/// alignment of the pools, so its internal padding stays valid. The sections are chained by
+/// relative offsets, so the extra padding this can need between them is skipped by the loader.
+fn save_keeping_source(
+    source: &[u8],
+    file: &mut effect_library::NamcoEffectFile,
+) -> Result<Vec<u8>> {
+    let written = finish_header(
+        file.save()
+            .context("effect_library failed to encode the .eff")?,
+        file.ptcl_file.is_some(),
+    );
+    let Ok(original) = effect_library::NamcoEffectFile::load(source) else {
+        return Ok(written);
+    };
+    let (Some(old), Some(new)) = (original.ptcl_file.as_ref(), file.ptcl_file.as_ref()) else {
+        return Ok(written);
+    };
+
+    let textures_same = match (&old.texture_info, &new.texture_info) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            let key = |info: &effect_library::ptcl_file::TextureInfo| {
+                let mut list: Vec<(u64, String)> = info
+                    .descriptors
+                    .iter()
+                    .map(|d| (d.id, d.name.clone()))
+                    .collect();
+                list.sort();
+                list
+            };
+            a.binary_data == b.binary_data
+                && a.desc_table_magic == b.desc_table_magic
+                && key(a) == key(b)
+        }
+        _ => false,
+    };
+    let models_same = match (&old.primitive_info, &new.primitive_info) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            let key = |info: &effect_library::ptcl_file::PrimitiveInfo| {
+                info.descriptors
+                    .iter()
+                    .map(|d| {
+                        (
+                            d.id,
+                            [
+                                d.position_index,
+                                d.normal_index,
+                                d.tangent_index,
+                                d.color_index,
+                                d.tex_coord0_index,
+                                d.tex_coord1_index,
+                            ],
+                            d.padding,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            a.binary_data == b.binary_data
+                && a.desc_table_magic == b.desc_table_magic
+                && key(a) == key(b)
+        }
+        _ => false,
+    };
+    let shaders_same = match (&old.shader_info, &new.shader_info) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.binary_data == b.binary_data && a.compute_binary == b.compute_binary
+        }
+        _ => false,
+    };
+    // The emitter list has no equality of its own; encode the source's through the same writer,
+    // pools left out so it costs nothing, and compare the bytes. Both lists start at the PTCL's
+    // first block, so equal content means equal bytes.
+    let emitters_same = {
+        let mut light =
+            effect_library::NamcoEffectFile::load(source).context("re-reading the source .eff")?;
+        if let Some(ptcl) = light.ptcl_file.as_mut() {
+            if let Some(info) = ptcl.texture_info.as_mut() {
+                info.binary_data = None;
+            }
+            if let Some(info) = ptcl.primitive_info.as_mut() {
+                info.binary_data = None;
+            }
+            if let Some(info) = ptcl.shader_info.as_mut() {
+                info.binary_data = None;
+                info.compute_binary = None;
+            }
+        }
+        let light = light.save().context("encoding the source's emitters")?;
+        let region = |bytes: &[u8]| {
+            let at = ptcl_offset(bytes)?;
+            let ptcl = &bytes[at..];
+            let sections = ptcl_sections(ptcl)?;
+            let (_, start, end) = sections.iter().find(|(magic, ..)| magic == b"ESTA")?;
+            Some(ptcl[*start..*end].to_vec())
+        };
+        match (region(&light), region(&written)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    };
+
+    let keep = |magic: &[u8; 4]| match magic {
+        b"ESTA" => emitters_same,
+        b"GRTF" => textures_same,
+        b"G3PR" => models_same,
+        b"GRSN" => shaders_same,
+        // The primitive list has no setter; nothing an export does can change it.
+        b"PRMA" => true,
+        _ => false,
+    };
+    Ok(splice_sections(source, &written, keep).unwrap_or(written))
+}
+
+/// Header fix-ups `effect_library`'s writer gets wrong.
+///
+/// The EFFN header names the PTCL's offset in 4 KiB pages. The writer records page 2 for any
+/// table of 0x1000 bytes or more, and pads with a mask that is only right for powers of two: a
+/// table of 0x23ec bytes put the particle data at 0x5000 under a header saying 0x2000, so the
+/// game, and `effect_library` itself, read zeros where the particle data should be. And a
+/// header-only file (no particle data at all) is marked 0xFFFF by the game, but the writer marks
+/// it page 1 and pads it, naming particle data that does not exist.
+fn finish_header(mut bytes: Vec<u8>, has_ptcl: bool) -> Vec<u8> {
+    if bytes.len() < 16 {
+        return bytes;
+    }
+    if !has_ptcl {
+        if let Some(end) = effn_tables_end(&bytes) {
+            bytes.truncate(end);
+            bytes[14..16].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        }
+        return bytes;
+    }
+    let Some(end) = effn_tables_end(&bytes) else {
+        return bytes;
+    };
+    let Some(at) = (end.div_ceil(0x1000)..=bytes.len() / 0x1000)
+        .map(|page| page * 0x1000)
+        .find(|at| bytes.get(*at..*at + 8) == Some(b"VFXB    "))
+    else {
+        return bytes;
+    };
+    // The game's own files put the particle data on the first page after the tables, with at
+    // least one byte of padding: 0xc35 bytes of tables -> 0x1000, 0x1a8c -> 0x2000.
+    let page = (end + 0x1000) & !0xFFF;
+    let Ok(pages) = u16::try_from(page / 0x1000) else {
+        return bytes;
+    };
+    if at != page {
+        let ptcl = bytes.split_off(at);
+        bytes.truncate(end);
+        bytes.resize(page, 0);
+        bytes.extend_from_slice(&ptcl);
+    }
+    bytes[14..16].copy_from_slice(&pages.to_le_bytes());
+    bytes
+}
+
+/// Where the EFFN header's tables (entries, parts, model flags and the three name lists) end.
+fn effn_tables_end(bytes: &[u8]) -> Option<usize> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+    let (entries, models, parts) = (
+        u16_at(8)? as usize,
+        u16_at(10)? as usize,
+        u16_at(12)? as usize,
+    );
+    let mut at = 16 + entries * 16 + parts * 4 + models;
+    for _ in 0..entries + models + parts {
+        at += bytes.get(at..)?.iter().position(|b| *b == 0)? + 1;
+    }
+    Some(at)
+}
+
+/// The PTCL's offset in an `.eff`, from the EFFN header's page count.
+fn ptcl_offset(bytes: &[u8]) -> Option<usize> {
+    let pages = u16::from_le_bytes(bytes.get(14..16)?.try_into().ok()?);
+    let at = pages as usize * 0x1000;
+    (pages != 0xFFFF && bytes.get(at..at + 8) == Some(b"VFXB    ")).then_some(at)
+}
+
+/// The PTCL's top-level sections as (magic, start, end), where `end` is where the next one
+/// starts, or the end of the data for the last.
+fn ptcl_sections(ptcl: &[u8]) -> Option<Vec<([u8; 4], usize, usize)>> {
+    let u32_at = |at: usize| Some(u32::from_le_bytes(ptcl.get(at..at + 4)?.try_into().ok()?));
+    let mut at = u16::from_le_bytes(ptcl.get(22..24)?.try_into().ok()?) as usize;
+    let mut out = Vec::new();
+    for _ in 0..64 {
+        let magic: [u8; 4] = ptcl.get(at..at + 4)?.try_into().ok()?;
+        let next = u32_at(at + 12)?;
+        let end = if next == u32::MAX {
+            ptcl.len()
+        } else {
+            at + next as usize
+        };
+        if end > ptcl.len() || end <= at {
+            return None;
+        }
+        out.push((magic, at, end));
+        if next == u32::MAX {
+            return Some(out);
+        }
+        at = end;
+    }
+    None
+}
+
+/// Lay out `written`'s PTCL again, taking each section `keep` names from `source` instead.
+/// None when the two files do not have the same sections in the same order.
+fn splice_sections(
+    source: &[u8],
+    written: &[u8],
+    keep: impl Fn(&[u8; 4]) -> bool,
+) -> Option<Vec<u8>> {
+    const NONE: u32 = u32::MAX;
+    let (src_at, out_at) = (ptcl_offset(source)?, ptcl_offset(written)?);
+    let (src, new) = (&source[src_at..], &written[out_at..]);
+    let (from_src, from_new) = (ptcl_sections(src)?, ptcl_sections(new)?);
+    if from_src.len() != from_new.len() || from_src.iter().zip(&from_new).any(|(a, b)| a.0 != b.0) {
+        return None;
+    }
+    let block = from_new.first()?.1;
+    let mut out = written[..out_at + block].to_vec();
+    let mut previous: Option<usize> = None;
+    for (index, (a, b)) in from_src.iter().zip(&from_new).enumerate() {
+        let (bytes, laid_at) = if keep(&a.0) {
+            (&src[a.1..a.2], a.1)
+        } else {
+            (&new[b.1..b.2], b.1)
+        };
+        // Same position modulo a page as where this section was encoded.
+        let cursor = out.len() - out_at;
+        let at = cursor + (laid_at + 4096 - cursor % 4096) % 4096;
+        out.resize(out_at + at, 0);
+        if let Some(prev) = previous {
+            let next = u32::try_from(at - prev).ok()?;
+            out[out_at + prev + 12..out_at + prev + 16].copy_from_slice(&next.to_le_bytes());
+        }
+        out.extend_from_slice(bytes);
+        if index + 1 == from_src.len() {
+            out[out_at + at + 12..out_at + at + 16].copy_from_slice(&NONE.to_le_bytes());
+        }
+        previous = Some(at);
+    }
+    let size = u32::try_from(out.len() - out_at).ok()?;
+    out[out_at + 28..out_at + 32].copy_from_slice(&size.to_le_bytes());
+    Some(out)
 }
 
 #[cfg(test)]
@@ -4245,8 +4530,9 @@ mod tests {
             .enumerate()
             .filter_map(|(i, w)| (w == b"ESET").then_some(i))
         {
+            // +16 is the attribute offset; the binary (name) offset is +20.
             let binary_offset =
-                u32::from_le_bytes(rebuilt[start + 16..start + 20].try_into().unwrap()) as usize;
+                u32::from_le_bytes(rebuilt[start + 20..start + 24].try_into().unwrap()) as usize;
             let name_start = start + binary_offset + 16;
             let name_end = name_start + set_name.len();
             if rebuilt.get(name_start..name_end) == Some(set_name.as_bytes()) {
@@ -4632,14 +4918,10 @@ mod tests {
         };
         //  A
         //    A1
-        //      A1a
         //    A2
         //  B
-        let flat: Vec<_> = ["A", "A1", "A1a", "A2", "B"]
-            .iter()
-            .map(|n| named(n))
-            .collect();
-        let tree = super::nest_by_depth(flat, &[0, 1, 2, 1, 0]);
+        let flat: Vec<_> = ["A", "A1", "A2", "B"].iter().map(|n| named(n)).collect();
+        let tree = super::nest_by_depth(flat, &[0, 1, 1, 0]);
 
         assert_eq!(tree.len(), 2, "two roots");
         assert_eq!(tree[0].data.display_name(), "A");
@@ -4647,8 +4929,18 @@ mod tests {
         assert_eq!(tree[0].children.len(), 2);
         assert_eq!(tree[0].children[0].data.display_name(), "A1");
         assert_eq!(tree[0].children[1].data.display_name(), "A2");
-        assert_eq!(tree[0].children[0].children.len(), 1);
-        assert_eq!(tree[0].children[0].children[0].data.display_name(), "A1a");
+
+        // The game plays one level of children, so a child of a child is hung off the top-level
+        // emitter above it instead of being written where the game never walks.
+        let flat: Vec<_> = ["A", "A1", "A1a", "A2"].iter().map(|n| named(n)).collect();
+        let tree = super::nest_by_depth(flat, &[0, 1, 2, 1]);
+        let names: Vec<String> = tree[0]
+            .children
+            .iter()
+            .map(|c| c.data.display_name())
+            .collect();
+        assert_eq!(names, ["A1", "A1a", "A2"]);
+        assert!(tree[0].children.iter().all(|c| c.children.is_empty()));
 
         // A depth that skips a level has no emitter to hang off, so it becomes a child of the
         // row above rather than being dropped or panicking on a missing parent.
@@ -4793,12 +5085,13 @@ mod tests {
                 .iter()
                 .position(|name| name.eq_ignore_ascii_case("bomberman_bomb"))
                 .expect("carrier keeps its own entry names");
+            // Silenced sets are emptied and the entry is pointed at no set (id 0, which 222
+            // game entries use): an entry naming an empty set makes the loader walk into the
+            // next one (`clear_empty_emitter_set_references`).
             let native_set = carrier.entries[native].emitter_set_id as usize;
-            assert!(
-                ptcl.emitter_list.emitter_sets[native_set - 1]
-                    .emitters
-                    .is_empty(),
-                "{label}: the carrier's own effect still has emitters"
+            assert_eq!(
+                native_set, 0,
+                "{label}: the silenced entry still names a set"
             );
 
             // Every surviving reference must resolve, and every retained resource must be

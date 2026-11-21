@@ -2902,6 +2902,13 @@ pub fn read_all(data: &EmitterData) -> Vec<Option<AttrValue>> {
 /// Write one attribute by id. Unknown ids are reported rather than ignored: an id that no longer
 /// resolves means a project is carrying an edit that will silently not ship.
 pub fn write(data: &mut EmitterData, id: &str, value: AttrValue) -> bool {
+    // A key count names how many slots of an eight-slot table are live; more than eight makes
+    // the game read the fields after the table as keyframes.
+    let value = if is_key_count(id) {
+        AttrValue::Int(value.as_i64().clamp(0, KEY_SLOTS as i64))
+    } else {
+        value
+    };
     match index_of(id) {
         Some(i) => {
             (table()[i].set)(data, value);
@@ -2909,6 +2916,14 @@ pub fn write(data: &mut EmitterData, id: &str, value: AttrValue) -> bool {
         }
         None => false,
     }
+}
+
+/// Slots in each of an emitter's keyframe tables (colour, alpha, scale, shader coefficients).
+pub const KEY_SLOTS: u32 = 8;
+
+/// Whether `id` is the live-key count of one of those tables.
+pub fn is_key_count(id: &str) -> bool {
+    id.starts_with("emitter_static.num_") && id.ends_with("_keys")
 }
 
 /// The vfx version Smash's own `.eff` files carry. Every version-gated field in the format is
