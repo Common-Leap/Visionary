@@ -275,6 +275,61 @@ fn resolve_setting_number(
     num.is_finite().then_some(num)
 }
 
+/// Filter a multi-use carrier's status `settings` down to those belonging to `motion` (or its
+/// ACMD handler function name, e.g. `motion = "carrot"` matching
+/// `WEAPON_PACMAN_BIGPACMAN_STATUS_KIND_CARROT`, or `motion = "fly"` with
+/// `handler_fn = Some("game_fireball_fly")` matching `WEAPON_PACMAN_TRAMPOLINE_STATUS_KIND_FIREBALL`).
+/// Returns an empty vec when no status specifically matches so callers can fall back to the
+/// article's default flight.
+pub fn settings_for_motion(
+    settings: &[crate::articles::settings::Setting],
+    motion: &str,
+    handler_fn: Option<&str>,
+) -> Vec<crate::articles::settings::Setting> {
+    let mut tokens: Vec<String> = Vec::new();
+    let add_tokens = |raw: &str, out: &mut Vec<String>| {
+        let lower = raw.to_ascii_lowercase();
+        let compact = lower.replace('_', "");
+        if compact.len() >= 3 && !out.contains(&compact) {
+            out.push(compact);
+        }
+        for part in lower.split('_') {
+            if part.len() >= 4
+                && !matches!(
+                    part,
+                    "game" | "effect" | "sound" | "expression" | "special" | "attack" | "main"
+                )
+                && !out.iter().any(|t| t == part)
+            {
+                out.push(part.to_owned());
+            }
+        }
+    };
+    add_tokens(motion, &mut tokens);
+    if let Some(handler) = handler_fn {
+        add_tokens(handler, &mut tokens);
+    }
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    settings
+        .iter()
+        .filter(|s| {
+            let status_lower = s.status.to_ascii_lowercase();
+            let status_compact = status_lower.replace('_', "");
+            // Match against the status suffix after `_STATUS_KIND_` when present.
+            let suffix = status_lower
+                .split_once("_status_kind_")
+                .map(|(_, tail)| tail.replace('_', ""))
+                .unwrap_or(status_compact);
+            tokens
+                .iter()
+                .any(|tok| suffix == *tok || suffix.contains(tok) || tok.contains(&suffix))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Uniform scale resolved from an article's status settings (`ModelModule::set_scale` /
 /// `PostureModule::set_scale`). `Computed` and non-positive values fall back to `1.0`.
 pub fn scale_from_settings(
@@ -2719,6 +2774,40 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                     .any(|(s, p)| crate::articles::view::status_matches_move(s, "special_n")
                         && p.name == "trampoline"),
                 "shyguy special_n status should spawn trampoline fireball: {status_spawns:?}"
+            );
+            // Check Shy Guy down tilt spawns carrot (bigpacman) with its real parabolic arc
+            // (LAUNCH_VX = 0.5, LAUNCH_VY = 3.1, ARC_GRAVITY = 0.12, LIFETIME_FRAMES = 250).
+            let dtilt = index.script_source("pacman", "attack_lw3").expect("shyguy attack_lw3");
+            let dtilt_plans = plan_wrapper_spawns_from_script(
+                &crate::acmd::parse_acmd_script(&dtilt.body),
+                &catalog,
+                Some(&index),
+            );
+            assert!(
+                dtilt_plans
+                    .iter()
+                    .any(|p| p.name == "bigpacman" && p.motion.as_deref() == Some("carrot")),
+                "shyguy attack_lw3 should spawn bigpacman@carrot: {dtilt_plans:?}"
+            );
+            let bigpac_settings = crate::articles::settings_for(&index, "pacman_bigpacman");
+            let carrot_settings = settings_for_motion(&bigpac_settings, "carrot", Some("game_carrot"));
+            assert!(!carrot_settings.is_empty(), "carrot status settings must be found");
+            let carrot_flight = Flight::default().with_settings(&carrot_settings, &ParamBlock::default());
+            assert!(
+                (carrot_flight.gravity - 0.12).abs() < 1e-4,
+                "carrot gravity should be 0.12, got {:?}",
+                carrot_flight
+            );
+            assert!(
+                carrot_flight.angle > 75.0 && carrot_flight.speed > 3.0,
+                "carrot should launch upward in a steep arc, got {:?}",
+                carrot_flight
+            );
+            let (_, y_mid) = carrot_flight.offset(25.0, 6.0);
+            let (_, y_late) = carrot_flight.offset(50.0, 6.0);
+            assert!(
+                y_mid > 30.0 && y_late < y_mid,
+                "carrot should arc upward then fall back down: y(25)={y_mid}, y(50)={y_late}"
             );
         }
     }

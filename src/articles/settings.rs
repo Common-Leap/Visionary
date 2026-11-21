@@ -107,9 +107,30 @@ pub fn read_settings(
     helpers: &dyn Fn(&Path, &str) -> Option<(PathBuf, Range<usize>, String)>,
 ) -> Vec<Setting> {
     let mut out = Vec::new();
+    let mut file_consts_cache: std::collections::HashMap<PathBuf, Option<ProjectConsts>> =
+        std::collections::HashMap::new();
+    let mut local_consts_for = |path: &Path| -> Option<ProjectConsts> {
+        file_consts_cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let text = std::fs::read_to_string(path).ok()?;
+                Some(ProjectConsts::scan(&[(path.to_path_buf(), text)]))
+            })
+            .clone()
+    };
     for (site, body) in statuses {
         let status = Status { kind: &site.kind_expr, phase: &site.phase };
-        let called = scan(body, &site.function, &site.file, site.span.start, consts, status, &mut out);
+        let file_consts = local_consts_for(&site.file);
+        let called = scan(
+            body,
+            &site.function,
+            &site.file,
+            site.span.start,
+            consts,
+            file_consts.as_ref(),
+            status,
+            &mut out,
+        );
         let mut followed: Vec<&str> = Vec::new();
         for name in &called {
             if name == &site.function || followed.contains(&name.as_str()) {
@@ -117,8 +138,18 @@ pub fn read_settings(
             }
             followed.push(name);
             if let Some((file, span, text)) = helpers(&site.file, name) {
+                let helper_consts = local_consts_for(&file);
                 // One level only: what the helper calls is not followed.
-                scan(&text, name, &file, span.start, consts, status, &mut out);
+                scan(
+                    &text,
+                    name,
+                    &file,
+                    span.start,
+                    consts,
+                    helper_consts.as_ref(),
+                    status,
+                    &mut out,
+                );
             }
         }
     }
@@ -139,6 +170,7 @@ fn scan(
     file: &Path,
     base: usize,
     consts: &ProjectConsts,
+    file_consts: Option<&ProjectConsts>,
     status: Status,
     out: &mut Vec<Setting>,
 ) -> Vec<String> {
@@ -162,7 +194,7 @@ fn scan(
         let mut lets = LetCollector { lines: &lines, lets: Vec::new() };
         syn::visit::Visit::visit_item_fn(&mut lets, function);
         let mut scanner = Scanner {
-            ctx: Ctx { text, lines: &lines, lets: &lets.lets, consts },
+            ctx: Ctx { text, lines: &lines, lets: &lets.lets, consts, file_consts },
             file,
             base,
             status,
@@ -268,6 +300,9 @@ struct Ctx<'a> {
     lines: &'a LineIndex<'a>,
     lets: &'a [(String, usize, syn::Expr)],
     consts: &'a ProjectConsts,
+    /// Consts defined in the scanned status/helper's own file, so private consts whose names
+    /// repeat in other modules (e.g. `LAUNCH_VY`, `LIFETIME_FRAMES`) still resolve unambiguously.
+    file_consts: Option<&'a ProjectConsts>,
 }
 
 struct Classified {
@@ -326,7 +361,11 @@ impl Ctx<'_> {
         let value = if let Some(number) = number(expr) {
             SettingValue::Literal(number)
         } else if let Some(name) = const_name(expr) {
-            let value = self.consts.get(&name).and_then(|def| def.number());
+            let value = self
+                .file_consts
+                .and_then(|fc| fc.get(&name))
+                .or_else(|| self.consts.get(&name))
+                .and_then(|def| def.number());
             SettingValue::Const { name, value }
         } else if let Some((block, field)) =
             param_call(expr).or_else(|| self.local(expr).and_then(|init| param_call(strip(init))))
@@ -336,6 +375,66 @@ impl Ctx<'_> {
             SettingValue::Computed(computed_text(self.source(expr), &referenced_params))
         };
         Classified { value, span, facing_factor, referenced_params }
+    }
+
+    /// True when `expr` reads the current vertical velocity (`KineticModule::get_sum_speed_y`,
+    /// `KineticModule::get_speed_y`, or a local `let` bound to one or to a `*_VY` work float).
+    fn is_current_vy(&self, expr: &syn::Expr) -> bool {
+        let expr = strip(expr);
+        if let syn::Expr::Call(call) = expr {
+            if let Some(path) = call_path(call) {
+                match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                    ["KineticModule", "get_sum_speed_y" | "get_speed_y"] => return true,
+                    ["WorkModule", "get_float"] if call.args.len() == 2 => {
+                        if let Some(name) = const_name(&call.args[1]) {
+                            if name.ends_with("_VY") || name.ends_with("_SPEED_Y") {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(init) = self.local(expr) {
+            return self.is_current_vy(init);
+        }
+        false
+    }
+
+    /// Extract the gravity decrement `G` from a per-frame `set_speed` Y argument such as
+    /// `current_vy - ARC_GRAVITY` or `if reflected { BOUNCE } else { current_vy - ARC_GRAVITY }`
+    /// (directly or through a local `let new_vy = ...;`).
+    fn per_frame_gravity<'a>(&'a self, expr: &'a syn::Expr) -> Option<&'a syn::Expr> {
+        let expr = strip(expr);
+        if let Some(init) = self.local(expr) {
+            return self.per_frame_gravity(init);
+        }
+        match expr {
+            syn::Expr::Binary(bin)
+                if matches!(bin.op, syn::BinOp::Sub(_)) && self.is_current_vy(&bin.left) =>
+            {
+                Some(strip(&bin.right))
+            }
+            syn::Expr::If(if_expr) => {
+                // Check `else` branch first because `if reflected { bounce } else { vy - g }`
+                // keeps normal flight in `else`.
+                let else_match = if_expr
+                    .else_branch
+                    .as_ref()
+                    .and_then(|(_, branch)| self.per_frame_gravity(branch));
+                else_match.or_else(|| self.block_tail_gravity(&if_expr.then_branch))
+            }
+            syn::Expr::Block(block) => self.block_tail_gravity(&block.block),
+            _ => None,
+        }
+    }
+
+    fn block_tail_gravity<'a>(&'a self, block: &'a syn::Block) -> Option<&'a syn::Expr> {
+        match block.stmts.last()? {
+            syn::Stmt::Expr(expr, _) => self.per_frame_gravity(expr),
+            _ => None,
+        }
     }
 
     /// Every `get_param_*` `expr` reads, following local names to the `let`s that bind them.
@@ -565,6 +664,19 @@ impl Scanner<'_, '_> {
                 // A negated y acceleration pulls the article down: gravity, by its magnitude.
                 syn::Expr::Unary(unary) if field == SettingField::AccelY && matches!(unary.op, syn::UnOp::Neg(_)) => {
                     self.value(SettingField::Gravity, &unary.expr)
+                }
+                // A per-frame status loop integrating gravity manually:
+                // `let new_vy = if ... { ... } else { current_vy - ARC_GRAVITY };`
+                // `sv_kinetic_energy!(set_speed, weapon, RESERVE, vx, new_vy);`
+                _ if field == SettingField::SpeedY && op == "set_speed" => {
+                    if let Some(classified) = self
+                        .ctx
+                        .per_frame_gravity(expr)
+                        .map(|grav_expr| self.ctx.classify(grav_expr))
+                    {
+                        self.record(SettingField::Gravity, classified);
+                    }
+                    self.value(field, expr);
                 }
                 _ => self.value(field, expr),
             }
@@ -1551,6 +1663,79 @@ pub mod write {
             let SettingWrite::Param { file, block, field, variant } = planned else { unreachable!() };
             crate::articles::params::write_param_field(&file, &block, &field, variant, 55.0, &HashMap::new()).unwrap();
             assert_eq!(std::fs::read_to_string(&romfs).unwrap(), before.replace(">40<", ">55<"));
+        }
+
+        #[test]
+        fn per_frame_vy_sub_is_gravity_and_file_local_consts_resolve() {
+            use crate::articles::settings::{read_settings, StatusSite};
+            use crate::project_consts::ProjectConsts;
+            let dir = tempfile::tempdir().unwrap();
+            let carrot_file = dir.path().join("carrot.rs");
+            let other_file = dir.path().join("special_hi.rs");
+            let carrot_src = r#"
+const LAUNCH_VX: f32 = 0.5;
+const LAUNCH_VY: f32 = 3.1;
+const REFLECT_BOUNCE_VY: f32 = 1.8;
+const ARC_GRAVITY: f32 = 0.12;
+const LIFETIME_FRAMES: i32 = 250;
+
+pub(super) unsafe extern "C" fn carrot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    let owner_facing = PostureModule::lr(owner_boma);
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, LAUNCH_VX * owner_facing, LAUNCH_VY);
+    weapon.set_life(LIFETIME_FRAMES);
+    weapon.fast_shift_status(carrot_main_loop)
+}
+
+unsafe extern "C" fn carrot_main_loop(weapon: &mut L2CWeaponCommon) -> L2CValue {
+    let current_vy = KineticModule::get_sum_speed_y(weapon.module_accessor, *KINETIC_ENERGY_RESERVE_ATTRIBUTE_MAIN);
+    let facing = PostureModule::lr(weapon.module_accessor);
+    let new_vy = if reflected_facing.is_some() { REFLECT_BOUNCE_VY } else { current_vy - ARC_GRAVITY };
+    sv_kinetic_energy!(set_speed, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, LAUNCH_VX * facing, new_vy);
+    0.into()
+}
+"#;
+            let other_src = "const LAUNCH_VY: f32 = 2.5;\n";
+            std::fs::write(&carrot_file, carrot_src).unwrap();
+            std::fs::write(&other_file, other_src).unwrap();
+            let consts = ProjectConsts::scan(&[
+                (carrot_file.clone(), carrot_src.to_string()),
+                (other_file.clone(), other_src.to_string()),
+            ]);
+            assert!(consts.get("LAUNCH_VY").is_none(), "project-wide LAUNCH_VY should be ambiguous");
+
+            let main_span = crate::acmd_src::function_item(carrot_src, "carrot_main").unwrap();
+            let loop_span = crate::acmd_src::function_item(carrot_src, "carrot_main_loop").unwrap();
+            let site = StatusSite {
+                kind_expr: "WEAPON_PACMAN_BIGPACMAN_STATUS_KIND_CARROT".into(),
+                phase: "Main".into(),
+                function: "carrot_main".into(),
+                file: carrot_file.clone(),
+                span: main_span.clone(),
+            };
+            let settings = read_settings(
+                &[(&site, carrot_src[main_span].to_string())],
+                &consts,
+                &|_caller, name| {
+                    (name == "carrot_main_loop").then(|| {
+                        (carrot_file.clone(), loop_span.clone(), carrot_src[loop_span.clone()].to_string())
+                    })
+                },
+            );
+            let speed_y = settings
+                .iter()
+                .find(|s| s.field == SettingField::SpeedY && matches!(s.value, SettingValue::Const { .. }))
+                .expect("carrot LAUNCH_VY should resolve from carrot.rs");
+            assert_eq!(speed_y.value, SettingValue::Const { name: "LAUNCH_VY".into(), value: Some(3.1) });
+            let gravity = settings
+                .iter()
+                .find(|s| s.field == SettingField::Gravity)
+                .expect("carrot_main_loop `current_vy - ARC_GRAVITY` should extract Gravity");
+            assert_eq!(gravity.value, SettingValue::Const { name: "ARC_GRAVITY".into(), value: Some(0.12) });
+            let life = settings
+                .iter()
+                .find(|s| s.field == SettingField::Life)
+                .expect("carrot LIFETIME_FRAMES should resolve from carrot.rs");
+            assert_eq!(life.value, SettingValue::Const { name: "LIFETIME_FRAMES".into(), value: Some(250.0) });
         }
     }
 }

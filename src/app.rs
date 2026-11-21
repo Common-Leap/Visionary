@@ -11476,7 +11476,22 @@ impl VisionaryApp {
             .and_then(|index| index.script_source(&agent, motion))
             .map(|p| p.body)
             .filter(|b| !b.trim().is_empty());
-        if anim.is_none() && motion_body.is_none() {
+        let handler_fn = self.acmd_src.as_ref().and_then(|index| {
+            let fs = index.fighters.get(&agent)?;
+            fs.scripts
+                .get(&format!("game_{motion}"))
+                .or_else(|| fs.scripts.get(&format!("effect_{motion}")))
+                .map(|site| site.function.clone())
+        });
+        let motion_settings = self
+            .acmd_src
+            .as_ref()
+            .map(|index| {
+                let all = crate::articles::settings_for(index, &agent);
+                crate::article_preview::settings_for_motion(&all, motion, handler_fn.as_deref())
+            })
+            .unwrap_or_default();
+        if anim.is_none() && motion_body.is_none() && motion_settings.is_empty() {
             return kind;
         }
         let (hitboxes, effects) = match motion_body {
@@ -11490,6 +11505,78 @@ impl VisionaryApp {
             }
             None => (kind.hitboxes.clone(), kind.effects.clone()),
         };
+        // For multi-use carriers (e.g. Shy Guy's `bigpacman` hosting carrot, fryguy,
+        // carpet_camera, and autobomb_blast), recompute flight and scale from ONLY the
+        // matching status's settings so sibling statuses cannot flatten or overwrite the arc.
+        let (flight, scale) = if !motion_settings.is_empty() {
+            let (param_layers, _) = self.article_param_layers(&fighter.name);
+            let param_overrides: Vec<crate::articles::params::ParamOverride> = self
+                .article_catalog
+                .as_ref()
+                .filter(|cache| cache.fighter == fighter.name)
+                .map(|cache| cache.overrides.clone())
+                .unwrap_or_default();
+            let block_of = |block_short: &str| {
+                let full = format!("param_{block_short}");
+                let set = crate::articles::params::block_overrides(
+                    &param_overrides,
+                    &fighter.name,
+                    &full,
+                );
+                crate::articles::params::param_block(
+                    &param_layers,
+                    &set,
+                    block_short,
+                    &self.state.labels,
+                )
+            };
+            let params = block_of(name);
+            let base_flight = if params.present {
+                crate::article_preview::flight_from_param_block(&params)
+            } else {
+                crate::article_preview::flight_from_params(
+                    &fighter.param_path,
+                    name,
+                    &self.state.labels,
+                )
+            };
+            let own_block = format!("param_{name}");
+            let other_blocks: HashMap<String, crate::articles::params::ParamBlock> =
+                motion_settings
+                    .iter()
+                    .filter_map(|s| match &s.value {
+                        crate::articles::settings::SettingValue::Param { block, .. }
+                            if *block != own_block =>
+                        {
+                            Some(block.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<BTreeSet<String>>()
+                    .into_iter()
+                    .filter_map(|full| {
+                        let short = full.strip_prefix("param_")?.to_owned();
+                        Some((full, block_of(&short)))
+                    })
+                    .collect();
+            let flight = if other_blocks.is_empty() {
+                base_flight.with_settings(&motion_settings, &params)
+            } else {
+                base_flight.with_settings_and_blocks(&motion_settings, &params, &other_blocks)
+            };
+            let scale = if other_blocks.is_empty() {
+                crate::article_preview::scale_from_settings(&motion_settings, &params)
+            } else {
+                crate::article_preview::scale_from_settings_and_blocks(
+                    &motion_settings,
+                    &params,
+                    &other_blocks,
+                )
+            };
+            (flight, scale)
+        } else {
+            (kind.flight, kind.scale)
+        };
         let synced = anim.as_deref().is_some_and(|a| {
             kind.skel
                 .as_deref()
@@ -11499,6 +11586,8 @@ impl VisionaryApp {
             anim: anim.or_else(|| kind.anim.clone()),
             hitboxes,
             effects,
+            flight,
+            scale,
             synced,
             ..(*kind).clone()
         });
