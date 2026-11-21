@@ -8398,6 +8398,11 @@ pub fn article_calls_in_source_order(
             pristine.len()
         ));
     }
+    // The file holds exactly the calls the editor loaded, in their order: call `i` is the `i`th,
+    // even where several are the same call (Cuphead's four identical bullets in one frame).
+    if source.iter().zip(pristine).all(|(held, loaded)| article_call_unchanged(held, loaded)) {
+        return Ok(edited.to_vec());
+    }
     let was: Vec<Vec<String>> = pristine.iter().map(article_call_fields).collect();
     let then: Vec<Vec<String>> = edited.iter().map(article_call_fields).collect();
     // `None`: this source call cannot be editor call `index`. Otherwise how many fields agree,
@@ -19200,6 +19205,29 @@ mod rewrite_article_tests {
         let second = sync_each(&first, &pristine, &edited);
         assert_eq!(second, first.replace("CSHOT, false, -1", "CSHOT, false, 3"), "{second}");
         assert!(second.contains("CSHOT, true, 7"), "the other call is untouched: {second}");
+    }
+
+    /// Cuphead-Moveset · src/buddy/acmd/specials.rs:78-96 (`game_specialn2`, tier 1, smashline2)
+    /// spawns `*FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET` four times at frame 14 with the same
+    /// arguments. While the file still holds the calls as loaded, an edit to one of them writes
+    /// that one, and putting it back restores every byte.
+    #[test]
+    fn identical_calls_as_loaded_pair_by_position() {
+        let line = "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_BUDDY_GENERATE_ARTICLE_BULLET, false, -1);";
+        let text = format!(
+            "unsafe extern \"C\" fn game_specialn2(agent: &mut L2CAgentBase) {{\r\n    frame(agent.lua_state_agent, 14.0);\r\n    if macros::is_excute(agent) {{\r\n            {line}\r\n            {line}\r\n    }}\r\n}}\r\n"
+        );
+        let pristine = calls(&text);
+        assert_eq!(pristine.len(), 2);
+        let mut edited = pristine.clone();
+        edited[1].1.args[1] = "0".into();
+        let (out, report) = rewrite_editor_article_calls(&text, "buddy/specialn2", &pristine, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let second = text.rfind("false, -1").unwrap();
+        assert_eq!(out, format!("{}false, 0{}", &text[..second], &text[second + "false, -1".len()..]));
+        let (back, report) = rewrite_editor_article_calls(&out, "buddy/specialn2", &edited, &pristine).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert_eq!(back, text);
     }
 
     /// Calls the mapping cannot tell apart are refused with the reason, and nothing is written.
