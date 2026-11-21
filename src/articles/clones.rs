@@ -79,12 +79,15 @@ pub fn read_clones(
         named: &named,
         fighter_dirs,
         env: Vec::new(),
+        helpers: Vec::new(),
+        inlining: Vec::new(),
         decls: Vec::new(),
         unresolved: Vec::new(),
     };
     for (file, text, ast) in parsed {
         out.file = file.clone();
         out.lines = text.lines().collect();
+        out.helpers = ast.as_ref().map(clone_helpers).unwrap_or_default();
         match ast {
             Some(ast) => syn::visit::Visit::visit_file(&mut out, &ast),
             None => out.text_scan(text),
@@ -218,9 +221,101 @@ struct Reader<'a> {
     named: &'a NamedConsts,
     fighter_dirs: &'a [String],
     /// Loop variables in scope, innermost last, each bound to one element of a literal table.
+    /// While a helper is read for one of its calls, its parameters are bound to that call's
+    /// arguments here too.
     env: Vec<(String, syn::Expr)>,
+    /// This file's helper functions that wrap `clone_weapon` (see [`CloneHelper`]).
+    helpers: Vec<CloneHelper>,
+    /// The helpers being read for a call, innermost last, with that call's line: a declaration
+    /// made inside one is placed at the call, and a helper never inlines itself.
+    inlining: Vec<(String, usize)>,
     decls: Vec<CloneDecl>,
     unresolved: Vec<UnresolvedClone>,
+}
+
+/// A function that calls `clone_weapon` with its own parameters, such as Sceptile's
+/// `unsafe fn clone(name: &str, source: i32, generate_id: *mut i32, ..)`. Each call of it with
+/// literal arguments is one clone, read as if the body were written at the call.
+#[derive(Clone)]
+struct CloneHelper {
+    name: String,
+    params: Vec<String>,
+    body: syn::Block,
+}
+
+/// The helpers in `file`: functions, at any depth, with a `clone_weapon` call that reads one of
+/// their parameters.
+fn clone_helpers(file: &syn::File) -> Vec<CloneHelper> {
+    #[derive(Default)]
+    struct Finder(Vec<CloneHelper>);
+    impl<'ast> syn::visit::Visit<'ast> for Finder {
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            let params: Vec<String> = item
+                .sig
+                .inputs
+                .iter()
+                .filter_map(|input| match input {
+                    syn::FnArg::Typed(t) => match t.pat.as_ref() {
+                        syn::Pat::Ident(p) => Some(p.ident.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if !params.is_empty() && clone_reads_any(&item.block, &params) {
+                self.0.push(CloneHelper { name: item.sig.ident.to_string(), params, body: (*item.block).clone() });
+            }
+            syn::visit::visit_item_fn(self, item);
+        }
+    }
+    let mut finder = Finder::default();
+    syn::visit::Visit::visit_file(&mut finder, file);
+    finder.0
+}
+
+/// Whether a `clone_weapon` call in `block` names one of `params` among its arguments.
+fn clone_reads_any(block: &syn::Block, params: &[String]) -> bool {
+    struct Probe<'p> {
+        params: &'p [String],
+        in_clone: bool,
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Probe<'_> {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            let was = self.in_clone;
+            self.in_clone |= is_clone_call(call);
+            syn::visit::visit_expr_call(self, call);
+            self.in_clone = was;
+        }
+        fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+            if self.in_clone && p.path.segments.len() == 1 {
+                let name = p.path.segments[0].ident.to_string();
+                self.found |= self.params.contains(&name);
+            }
+        }
+    }
+    let mut probe = Probe { params, in_clone: false, found: false };
+    syn::visit::Visit::visit_block(&mut probe, block);
+    probe.found
+}
+
+/// The static a pointer argument points at: `std::ptr::addr_of_mut!(X)`, `addr_of!(X)`,
+/// `&mut X` or `&raw mut X`.
+fn pointee(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Paren(p) => pointee(&p.expr),
+        syn::Expr::Group(g) => pointee(&g.expr),
+        syn::Expr::Reference(r) => target_name(&r.expr),
+        syn::Expr::RawAddr(r) => target_name(&r.expr),
+        syn::Expr::Macro(m) => {
+            let last = m.mac.path.segments.last()?.ident.to_string();
+            if last != "addr_of_mut" && last != "addr_of" {
+                return None;
+            }
+            target_name(&m.mac.parse_body::<syn::Expr>().ok()?)
+        }
+        _ => None,
+    }
 }
 
 const UNBOUND_ID: &str = "the generate id is stored somewhere this reader does not follow (a destructured `let`, a pointer or an unnamed target), so no name is known for it";
@@ -288,6 +383,14 @@ impl Reader<'_> {
             reason: reason.into(),
         };
         self.unresolved.push(unresolved);
+    }
+
+    /// An argument with a loop variable or an outer helper's parameter replaced by its value.
+    fn resolved_arg(&self, arg: &syn::Expr) -> syn::Expr {
+        match path_name(arg).and_then(|name| self.lookup_env(&name)) {
+            Some(bound) if matches!(strip(arg), syn::Expr::Path(p) if p.path.segments.len() == 1) => bound.clone(),
+            _ => arg.clone(),
+        }
     }
 
     fn lookup_env(&self, name: &str) -> Option<&syn::Expr> {
@@ -360,7 +463,7 @@ impl Reader<'_> {
         match built {
             Ok(mut decl) => {
                 decl.file = self.file.clone();
-                decl.line = Self::line_of(call.span());
+                decl.line = self.inlining.last().map_or_else(|| Self::line_of(call.span()), |(_, line)| *line);
                 self.decls.push(decl);
                 Some(self.decls.len() - 1)
             }
@@ -461,7 +564,8 @@ impl Reader<'_> {
         if let Some(var) = var {
             // The old signature returns the id itself, so the variable is the id.
             let direct = call.args.len() == 5;
-            let mut finder = BindingFinder { var, direct, aliases: Vec::new(), ids: Vec::new(), kinds: Vec::new() };
+            let pointers = self.env.iter().filter_map(|(name, arg)| Some((name.clone(), pointee(arg)?))).collect();
+            let mut finder = BindingFinder { var, direct, aliases: Vec::new(), pointers, ids: Vec::new(), kinds: Vec::new() };
             for stmt in rest {
                 syn::visit::Visit::visit_stmt(&mut finder, stmt);
             }
@@ -519,11 +623,47 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        use syn::spanned::Spanned;
         if is_clone_call(call) {
             self.resolve(call, false);
             return;
         }
+        let callee = match call.func.as_ref() {
+            syn::Expr::Path(p) if p.path.segments.len() == 1 => Some(p.path.segments[0].ident.to_string()),
+            _ => None,
+        };
+        let helper = callee.and_then(|name| {
+            self.helpers
+                .iter()
+                .find(|h| h.name == name && h.params.len() == call.args.len())
+                .filter(|h| !self.inlining.iter().any(|(n, _)| *n == h.name))
+                .cloned()
+        });
+        if let Some(helper) = helper {
+            let mark = self.env.len();
+            // Arguments are read in the caller's scope, before the parameters shadow anything.
+            let bound: Vec<(String, syn::Expr)> = helper
+                .params
+                .iter()
+                .zip(&call.args)
+                .map(|(param, arg)| (param.clone(), self.resolved_arg(arg)))
+                .collect();
+            self.env.extend(bound);
+            self.inlining.push((helper.name.clone(), Self::line_of(call.span())));
+            self.visit_block(&helper.body);
+            self.inlining.pop();
+            self.env.truncate(mark);
+            return;
+        }
         syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        // A helper's own body is read at each of its calls, where its arguments are known.
+        if self.helpers.iter().any(|h| item.sig.ident == h.name) && self.inlining.is_empty() {
+            return;
+        }
+        syn::visit::visit_item_fn(self, item);
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
@@ -577,6 +717,9 @@ struct BindingFinder {
     direct: bool,
     /// Names bound to a field read (`let id = v.generate_id;`), with which field.
     aliases: Vec<(String, &'static str)>,
+    /// A helper's pointer parameters and the static each call points them at, so
+    /// `*generate_id = v.generate_id` stores into that static.
+    pointers: Vec<(String, String)>,
     ids: Vec<String>,
     kinds: Vec<String>,
 }
@@ -622,7 +765,14 @@ impl BindingFinder {
     }
 
     fn store(&mut self, target: &syn::Expr, value: &syn::Expr) {
-        let (Some(name), Some(field)) = (target_name(target), self.field_of(value)) else { return };
+        let through_pointer = match target {
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => path_name(&u.expr)
+                .and_then(|param| self.pointers.iter().find(|(p, _)| *p == param).map(|(_, to)| to.clone())),
+            _ => None,
+        };
+        let (Some(name), Some(field)) = (through_pointer.or_else(|| target_name(target)), self.field_of(value)) else {
+            return;
+        };
         let list = if field == "id" { &mut self.ids } else { &mut self.kinds };
         if !list.contains(&name) {
             list.push(name);
@@ -986,6 +1136,54 @@ fn f() {
         let (d, _) = run(r#"fn f() { clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false); }"#);
         assert!(d[0].id_bindings.is_empty());
         assert_eq!(d[0].id_note, None);
+    }
+
+    /// Sceptile-Moveset · plugin/src/sceptile/articles/registration.rs:144-173 (tier 1, smashline2):
+    /// a nested `unsafe fn clone(name, source, generate_id: *mut i32, weapon_kind: *mut i32)`
+    /// wraps `clone_weapon("mario", name, source, false)` and is called once per article with
+    /// `std::ptr::addr_of_mut!(FIGHTER_MARIO_GENERATE_ARTICLE_..)`.
+    #[test]
+    fn helper_calls_are_one_clone_each() {
+        let (d, u) = run(r#"
+pub static mut FIGHTER_MARIO_GENERATE_ARTICLE_LEAF_STORM: i32 = -1;
+pub static mut WEAPON_KIND_MARIO_LEAF_STORM: i32 = -1;
+pub static mut FIGHTER_MARIO_GENERATE_ARTICLE_STICK: i32 = -1;
+pub static mut WEAPON_KIND_MARIO_STICK: i32 = -1;
+pub(in crate::sceptile) fn register_clones() {
+    unsafe fn clone(name: &str, source: i32, generate_id: *mut i32, weapon_kind: *mut i32) {
+        let clone = smashline::clone_weapon("mario", name, source, false);
+        *generate_id = clone.generate_id;
+        *weapon_kind = clone.weapon_id;
+    }
+
+    unsafe {
+        clone("leafstorm", *WEAPON_KIND_RIDLEY_BREATH,
+            std::ptr::addr_of_mut!(FIGHTER_MARIO_GENERATE_ARTICLE_LEAF_STORM), std::ptr::addr_of_mut!(WEAPON_KIND_MARIO_LEAF_STORM));
+        clone("stick", *WEAPON_KIND_KROOL_IRONBALL,
+            std::ptr::addr_of_mut!(FIGHTER_MARIO_GENERATE_ARTICLE_STICK), std::ptr::addr_of_mut!(WEAPON_KIND_MARIO_STICK));
+    }
+}
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 2, "{d:#?}");
+        assert_eq!((d[0].new_owner.as_str(), d[0].new_name.as_str()), ("mario", "leafstorm"));
+        assert_eq!(d[0].src_kind, "WEAPON_KIND_RIDLEY_BREATH");
+        assert_eq!(d[0].id_bindings, ["FIGHTER_MARIO_GENERATE_ARTICLE_LEAF_STORM"]);
+        assert_eq!(d[0].kind_bindings, ["WEAPON_KIND_MARIO_LEAF_STORM"]);
+        assert_eq!(d[0].id_note, None);
+        assert_eq!(d[0].line, 14, "placed at the call");
+        assert_eq!(d[1].new_name, "stick");
+        assert_eq!(d[1].id_bindings, ["FIGHTER_MARIO_GENERATE_ARTICLE_STICK"]);
+        assert_eq!(d[1].line, 16);
+        // A helper called with arguments it can't read reports at its call.
+        let (d, u) = run(r#"
+fn reg(n: &str) {
+    fn clone(name: &str) { smashline::clone_weapon("mario", name, *WEAPON_KIND_MARIO_FIREBALL, false); }
+    clone(n);
+}
+"#);
+        assert!(d.is_empty());
+        assert_eq!(u.len(), 1, "{u:?}");
     }
 
     #[test]
