@@ -6,6 +6,8 @@
 
 pub mod clone_compat;
 pub mod clones;
+#[cfg(test)]
+mod corpus_sweep;
 pub mod params;
 pub mod settings;
 pub mod view;
