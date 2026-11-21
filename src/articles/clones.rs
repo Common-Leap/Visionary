@@ -63,9 +63,12 @@ pub fn read_clones(
         .iter()
         .map(|(file, text)| (file, text.as_str(), syn::parse_file(text).ok()))
         .collect();
+    // Every const and static by name, whatever its value, for the conventional id below.
+    let mut defined = DefinedItems::default();
     for (_, _, ast) in &parsed {
         if let Some(ast) = ast {
             syn::visit::Visit::visit_file(&mut named, ast);
+            syn::visit::Visit::visit_file(&mut defined, ast);
         }
     }
     let _ = consts; // numeric consts never name an owner, a kind or an article
@@ -87,7 +90,39 @@ pub fn read_clones(
             None => out.text_scan(text),
         }
     }
-    (out.decls, out.unresolved)
+    let mut decls = out.decls;
+    bind_conventional_ids(&mut decls, &defined.0);
+    (decls, out.unresolved)
+}
+
+/// Every `const` and `static` the project defines, by name, whatever its value.
+#[derive(Default)]
+struct DefinedItems(std::collections::HashSet<String>);
+
+impl<'ast> syn::visit::Visit<'ast> for DefinedItems {
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        self.0.insert(item.ident.to_string());
+    }
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.0.insert(item.ident.to_string());
+    }
+}
+
+/// A clone whose call keeps no id is still bound when the project defines a const or static under the
+/// conventional name, `FIGHTER_<OWNER>_GENERATE_ARTICLE_<NAME>`: that const is the name its
+/// scripts spawn it by (Master Chief writes the number out, `= 0x9`, beside a bare call).
+fn bind_conventional_ids(decls: &mut [CloneDecl], defined: &std::collections::HashSet<String>) {
+    for decl in decls.iter_mut().filter(|d| d.id_bindings.is_empty()) {
+        let conventional = format!(
+            "FIGHTER_{}_GENERATE_ARTICLE_{}",
+            decl.new_owner.to_uppercase(),
+            decl.new_name.to_uppercase()
+        );
+        if defined.contains(&conventional) {
+            decl.id_bindings.push(conventional);
+            decl.id_note = None;
+        }
+    }
 }
 
 /// `const NAME: &str = "…";` and `const NAME: T = path::WEAPON_KIND_X;` across the project. A
@@ -928,6 +963,29 @@ fn f() {
         let (d, u) = run(r#"fn f() { clone_weapon("a", "b"); }"#);
         assert!(d.is_empty());
         assert_eq!(u.len(), 1);
+    }
+
+    /// Master-Chief-Moveset · Master Chief-rs/src/chief/master/weapons/mod.rs:7 (bare old-API call)
+    /// and src/chief/consts.rs:38 (`pub const FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT:i32 = 0x9;`),
+    /// tier 1, smashline2. The scripts spawn it by that const.
+    #[test]
+    fn bare_call_binds_the_conventional_const() {
+        let (d, u) = run_many(&[
+            ("weapons.rs", r#"pub fn install() {
+    clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false);
+}"#),
+            ("consts.rs", "pub mod weapon_kind_ex {
+    pub const FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT:i32 = 0x9;
+}
+"),
+        ]);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d[0].id_bindings, ["FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT"]);
+        assert_eq!(d[0].id_note, None);
+        // Without the const, a bare call still has no id and no note (its id is discarded).
+        let (d, _) = run(r#"fn f() { clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false); }"#);
+        assert!(d[0].id_bindings.is_empty());
+        assert_eq!(d[0].id_note, None);
     }
 
     #[test]
