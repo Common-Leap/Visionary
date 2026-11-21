@@ -79,18 +79,42 @@ pub fn read_clones(
         named: &named,
         fighter_dirs,
         env: Vec::new(),
-        helpers: Vec::new(),
+        // Helpers from every file: a moveset's `util.rs` often holds the one its fighters call.
+        helpers: parsed
+            .iter()
+            .filter_map(|(file, _, ast)| Some(clone_helpers(ast.as_ref()?, file)))
+            .flatten()
+            .collect(),
         inlining: Vec::new(),
+        inlined: std::collections::HashSet::new(),
         decls: Vec::new(),
         unresolved: Vec::new(),
     };
-    for (file, text, ast) in parsed {
-        out.file = file.clone();
+    for (file, text, ast) in &parsed {
+        out.file = (*file).clone();
         out.lines = text.lines().collect();
-        out.helpers = ast.as_ref().map(clone_helpers).unwrap_or_default();
         match ast {
-            Some(ast) => syn::visit::Visit::visit_file(&mut out, &ast),
+            Some(ast) => syn::visit::Visit::visit_file(&mut out, ast),
             None => out.text_scan(text),
+        }
+    }
+    // A helper no call was followed into still makes clones: each is listed, never dropped.
+    for helper in &out.helpers {
+        if out.inlined.contains(&(helper.file.clone(), helper.line)) {
+            continue;
+        }
+        let lines: Vec<&str> = parsed
+            .iter()
+            .find(|(file, _, _)| **file == helper.file)
+            .map(|(_, text, _)| text.lines().collect())
+            .unwrap_or_default();
+        for line in clone_call_lines(&helper.body) {
+            out.unresolved.push(UnresolvedClone {
+                file: helper.file.clone(),
+                line,
+                text: lines.get(line - 1).map(|l| l.trim().to_string()).unwrap_or_default(),
+                reason: format!("made inside helper `{}`, whose callers Visionary couldn't follow", helper.name),
+            });
         }
     }
     let mut decls = out.decls;
@@ -222,13 +246,17 @@ struct Reader<'a> {
     fighter_dirs: &'a [String],
     /// Loop variables in scope, innermost last, each bound to one element of a literal table.
     /// While a helper is read for one of its calls, its parameters are bound to that call's
-    /// arguments here too.
+    /// arguments here too. A binding's value names only bindings before it (see
+    /// [`Reader::lookup_env`]), so no chain of them can loop.
     env: Vec<(String, syn::Expr)>,
-    /// This file's helper functions that wrap `clone_weapon` (see [`CloneHelper`]).
+    /// The project's helper functions that wrap `clone_weapon` (see [`CloneHelper`]).
     helpers: Vec<CloneHelper>,
-    /// The helpers being read for a call, innermost last, with that call's line: a declaration
-    /// made inside one is placed at the call, and a helper never inlines itself.
-    inlining: Vec<(String, usize)>,
+    /// The helpers being read for a call, innermost last (by file and line), with that call's
+    /// line and text: a declaration made inside one is placed at the call, and a helper never
+    /// inlines itself.
+    inlining: Vec<((PathBuf, usize), usize, String)>,
+    /// Helpers some call was followed into.
+    inlined: std::collections::HashSet<(PathBuf, usize)>,
     decls: Vec<CloneDecl>,
     unresolved: Vec<UnresolvedClone>,
 }
@@ -241,14 +269,34 @@ struct CloneHelper {
     name: String,
     params: Vec<String>,
     body: syn::Block,
+    file: PathBuf,
+    /// The line of its `fn`, which tells it from other functions of the same name.
+    line: usize,
+}
+
+/// The `clone_weapon` calls in `block`, by line.
+fn clone_call_lines(block: &syn::Block) -> Vec<usize> {
+    #[derive(Default)]
+    struct Lines(Vec<usize>);
+    impl<'ast> syn::visit::Visit<'ast> for Lines {
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            use syn::spanned::Spanned;
+            if is_clone_call(call) {
+                self.0.push(call.span().start().line);
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut lines = Lines::default();
+    syn::visit::Visit::visit_block(&mut lines, block);
+    lines.0
 }
 
 /// The helpers in `file`: functions, at any depth, with a `clone_weapon` call that reads one of
 /// their parameters.
-fn clone_helpers(file: &syn::File) -> Vec<CloneHelper> {
-    #[derive(Default)]
-    struct Finder(Vec<CloneHelper>);
-    impl<'ast> syn::visit::Visit<'ast> for Finder {
+fn clone_helpers(file: &syn::File, path: &PathBuf) -> Vec<CloneHelper> {
+    struct Finder<'p>(Vec<CloneHelper>, &'p PathBuf);
+    impl<'ast> syn::visit::Visit<'ast> for Finder<'_> {
         fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
             let params: Vec<String> = item
                 .sig
@@ -263,15 +311,26 @@ fn clone_helpers(file: &syn::File) -> Vec<CloneHelper> {
                 })
                 .collect();
             if !params.is_empty() && clone_reads_any(&item.block, &params) {
-                self.0.push(CloneHelper { name: item.sig.ident.to_string(), params, body: (*item.block).clone() });
+                use syn::spanned::Spanned;
+                self.0.push(CloneHelper {
+                    name: item.sig.ident.to_string(),
+                    params,
+                    body: (*item.block).clone(),
+                    file: self.1.clone(),
+                    line: item.sig.fn_token.span().start().line,
+                });
             }
             syn::visit::visit_item_fn(self, item);
         }
     }
-    let mut finder = Finder::default();
+    let mut finder = Finder(Vec::new(), path);
     syn::visit::Visit::visit_file(&mut finder, file);
     finder.0
 }
+
+/// How deep a chain of bindings is followed: a backstop, since [`Reader::lookup_env`] only ever
+/// looks backwards.
+const MAX_BINDING_DEPTH: usize = 32;
 
 /// Whether a `clone_weapon` call in `block` names one of `params` among its arguments.
 fn clone_reads_any(block: &syn::Block, params: &[String]) -> bool {
@@ -363,6 +422,30 @@ impl Reader<'_> {
         span.start().line
     }
 
+    /// The helper a call runs: `clone(..)`, `self::clone(..)`, `util::clone_article(..)`, by its
+    /// last segment and argument count. One in the calling file wins; otherwise it must be the
+    /// only one in the project. A path through a type (`Arc::clone(..)`) is never a helper.
+    fn helper_for(&self, call: &syn::ExprCall) -> Option<CloneHelper> {
+        let syn::Expr::Path(p) = call.func.as_ref() else { return None };
+        let segments: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
+        let (name, modules) = segments.split_last()?;
+        if modules.iter().any(|m| m.starts_with(|c: char| c.is_ascii_uppercase())) {
+            return None;
+        }
+        let fits: Vec<&CloneHelper> = self
+            .helpers
+            .iter()
+            .filter(|h| h.name == *name && h.params.len() == call.args.len())
+            .filter(|h| !self.inlining.iter().any(|((file, line), _, _)| *file == h.file && *line == h.line))
+            .collect();
+        let local: Vec<&&CloneHelper> = fits.iter().filter(|h| h.file == self.file).collect();
+        match (local.as_slice(), fits.as_slice()) {
+            ([one], _) => Some((**one).clone()),
+            ([], [one]) => Some((*one).clone()),
+            _ => None,
+        }
+    }
+
     /// The source lines a call covers, trimmed, for the report.
     fn text_of(&self, span: proc_macro2::Span) -> String {
         let (first, last) = (span.start().line, span.end().line.max(span.start().line));
@@ -376,35 +459,62 @@ impl Reader<'_> {
     fn report(&mut self, call: &syn::ExprCall, reason: impl Into<String>) {
         use syn::spanned::Spanned;
         let span = call.span();
+        let reason = reason.into();
+        // Inside a helper: at the call that was followed, with the helper named.
+        let (line, text, reason) = match self.inlining.first() {
+            Some((_, line, text)) => {
+                let helper = self.inlining.last().and_then(|((file, at), _, _)| {
+                    self.helpers.iter().find(|h| h.file == *file && h.line == *at).map(|h| h.name.clone())
+                });
+                (*line, text.clone(), format!("{reason} (made inside helper `{}`)", helper.unwrap_or_default()))
+            }
+            None => (Self::line_of(span), self.text_of(span), reason),
+        };
         let unresolved = UnresolvedClone {
             file: self.file.clone(),
-            line: Self::line_of(span),
-            text: self.text_of(span),
-            reason: reason.into(),
+            line,
+            text,
+            reason,
         };
         self.unresolved.push(unresolved);
     }
 
     /// An argument with a loop variable or an outer helper's parameter replaced by its value.
     fn resolved_arg(&self, arg: &syn::Expr) -> syn::Expr {
-        match path_name(arg).and_then(|name| self.lookup_env(&name)) {
-            Some(bound) if matches!(strip(arg), syn::Expr::Path(p) if p.path.segments.len() == 1) => bound.clone(),
+        let bare = matches!(strip(arg), syn::Expr::Path(p) if p.path.segments.len() == 1);
+        match path_name(arg).and_then(|name| self.lookup_env(&name, self.env.len())) {
+            Some((_, bound)) if bare => bound.clone(),
             _ => arg.clone(),
         }
     }
 
-    fn lookup_env(&self, name: &str) -> Option<&syn::Expr> {
-        self.env.iter().rev().find(|(n, _)| n == name).map(|(_, e)| e)
+    /// The innermost binding of `name` among the first `scope` bindings, with its index. A
+    /// binding's value is looked up among the bindings before it, which is the scope it was
+    /// written in, so `name → name` or `a → b → a` can never be followed round.
+    fn lookup_env(&self, name: &str, scope: usize) -> Option<(usize, &syn::Expr)> {
+        self.env[..scope.min(self.env.len())]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (n, _))| n == name)
+            .map(|(at, (_, e))| (at, e))
     }
 
     /// A string argument: a literal, a loop variable bound to one, or a `const &str`.
     fn string_arg(&self, expr: &syn::Expr, what: &str) -> Result<String, String> {
+        self.string_arg_in(expr, what, self.env.len(), 0)
+    }
+
+    fn string_arg_in(&self, expr: &syn::Expr, what: &str, scope: usize, depth: usize) -> Result<String, String> {
+        if depth > MAX_BINDING_DEPTH {
+            return Err(format!("the {what} goes through more bindings than Visionary follows"));
+        }
         match strip(expr) {
             syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Ok(s.value()),
             syn::Expr::Path(p) if p.path.segments.len() == 1 => {
                 let name = p.path.segments[0].ident.to_string();
-                if let Some(bound) = self.lookup_env(&name) {
-                    return self.string_arg(bound, what);
+                if let Some((at, bound)) = self.lookup_env(&name, scope) {
+                    return self.string_arg_in(bound, what, at, depth + 1);
                 }
                 self.named.string(&name).map(str::to_string).ok_or_else(|| {
                     format!("the {what} is `{name}`, which is not a string literal or a `const &str` in the project")
@@ -416,11 +526,18 @@ impl Reader<'_> {
 
     /// A weapon kind argument, reduced to its bare `WEAPON_KIND_…` name.
     fn kind_arg(&self, expr: &syn::Expr) -> Result<String, String> {
+        self.kind_arg_in(expr, self.env.len(), 0)
+    }
+
+    fn kind_arg_in(&self, expr: &syn::Expr, scope: usize, depth: usize) -> Result<String, String> {
+        if depth > MAX_BINDING_DEPTH {
+            return Err("the source weapon kind goes through more bindings than Visionary follows".into());
+        }
         let Some(name) = path_name(expr) else {
             return Err("the source weapon kind is computed, not a `WEAPON_KIND_…` constant".into());
         };
-        if let Some(bound) = self.lookup_env(&name) {
-            return self.kind_arg(bound);
+        if let Some((at, bound)) = self.lookup_env(&name, scope) {
+            return self.kind_arg_in(bound, at, depth + 1);
         }
         if name.starts_with("WEAPON_KIND_") {
             return Ok(name);
@@ -463,7 +580,7 @@ impl Reader<'_> {
         match built {
             Ok(mut decl) => {
                 decl.file = self.file.clone();
-                decl.line = self.inlining.last().map_or_else(|| Self::line_of(call.span()), |(_, line)| *line);
+                decl.line = self.inlining.first().map_or_else(|| Self::line_of(call.span()), |(_, line, _)| *line);
                 self.decls.push(decl);
                 Some(self.decls.len() - 1)
             }
@@ -628,28 +745,26 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
             self.resolve(call, false);
             return;
         }
-        let callee = match call.func.as_ref() {
-            syn::Expr::Path(p) if p.path.segments.len() == 1 => Some(p.path.segments[0].ident.to_string()),
-            _ => None,
-        };
-        let helper = callee.and_then(|name| {
-            self.helpers
-                .iter()
-                .find(|h| h.name == name && h.params.len() == call.args.len())
-                .filter(|h| !self.inlining.iter().any(|(n, _)| *n == h.name))
-                .cloned()
-        });
-        if let Some(helper) = helper {
+        if let Some(helper) = self.helper_for(call) {
             let mark = self.env.len();
-            // Arguments are read in the caller's scope, before the parameters shadow anything.
+            // Arguments are read in the caller's scope, before the parameters shadow anything. A
+            // parameter whose argument is an unknown name of its own (`clone(name)` inside
+            // `fn reg(name: &str)`) is left unbound: it is unknown, not itself.
             let bound: Vec<(String, syn::Expr)> = helper
                 .params
                 .iter()
                 .zip(&call.args)
                 .map(|(param, arg)| (param.clone(), self.resolved_arg(arg)))
+                .filter(|(param, value)| path_name(value).as_deref() != Some(param.as_str()))
                 .collect();
             self.env.extend(bound);
-            self.inlining.push((helper.name.clone(), Self::line_of(call.span())));
+            let key = (helper.file.clone(), helper.line);
+            self.inlined.insert(key.clone());
+            let (line, text) = match self.inlining.first() {
+                Some((_, line, text)) => (*line, text.clone()),
+                None => (Self::line_of(call.span()), self.text_of(call.span())),
+            };
+            self.inlining.push((key, line, text));
             self.visit_block(&helper.body);
             self.inlining.pop();
             self.env.truncate(mark);
@@ -659,8 +774,11 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        // A helper's own body is read at each of its calls, where its arguments are known.
-        if self.helpers.iter().any(|h| item.sig.ident == h.name) && self.inlining.is_empty() {
+        use syn::spanned::Spanned;
+        // A helper's own body is read at each of its calls, where its arguments are known. Only
+        // that function: another of the same name is read as usual.
+        let line = item.sig.fn_token.span().start().line;
+        if self.helpers.iter().any(|h| h.file == self.file && h.line == line) {
             return;
         }
         syn::visit::visit_item_fn(self, item);
@@ -1184,6 +1302,84 @@ fn reg(n: &str) {
 "#);
         assert!(d.is_empty());
         assert_eq!(u.len(), 1, "{u:?}");
+    }
+
+    /// C-1: a helper parameter whose argument is an unknown name of its own must not loop.
+    /// Shapes: `fn reg(name: &str) { clone(name, ..) }`, a `CLONES.iter()` loop whose names match
+    /// the helper's parameters, and a two-helper chain `a → b → a`.
+    #[test]
+    fn self_named_helper_arguments_are_unknown_not_a_loop() {
+        let (d, u) = run(r#"
+fn clone(name: &str, kind: i32) { smashline::clone_weapon("mario", name, kind, false); }
+fn reg(name: &str) { clone(name, *WEAPON_KIND_MARIO_FIREBALL); }
+"#);
+        assert!(d.is_empty(), "{d:#?}");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(u[0].reason.contains("name") && u[0].reason.contains("helper `clone`"), "{}", u[0].reason);
+        assert_eq!(u[0].line, 3, "reported at the call");
+
+        let (d, u) = run(r#"
+fn clone(name: &str, kind: i32) { smashline::clone_weapon("mario", name, kind, false); }
+fn reg() { for (name, kind) in CLONES.iter() { clone(name, *kind); } }
+"#);
+        assert!(d.is_empty(), "{d:#?}");
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(!u[0].reason.is_empty());
+
+        let (d, u) = run(r#"
+fn a(x: &str) { b(x); }
+fn b(y: &str) { for x in [y] { smashline::clone_weapon("mario", x, *WEAPON_KIND_MARIO_FIREBALL, false); } a(y); }
+fn reg(y: &str) { a(y); }
+"#);
+        assert!(d.is_empty(), "{d:#?}");
+        assert!(!u.is_empty() && u.iter().all(|u| !u.reason.is_empty()), "{u:?}");
+    }
+
+    /// I-2: a helper in `util.rs` called from a fighter's module, by a path, and a `self::` call.
+    #[test]
+    fn helpers_are_found_across_files_and_paths() {
+        let util = r#"pub fn clone_article(name: &str, kind: i32, id: *mut i32) {
+    let c = smashline::clone_weapon("mario", name, kind, false);
+    unsafe { *id = c.generate_id; }
+}"#;
+        let fighter = r#"pub static mut FIGHTER_MARIO_GENERATE_ARTICLE_LEAF: i32 = -1;
+pub fn install() {
+    crate::util::clone_article("leaf", *WEAPON_KIND_RIDLEY_BREATH, std::ptr::addr_of_mut!(FIGHTER_MARIO_GENERATE_ARTICLE_LEAF));
+}"#;
+        let (d, u) = run_many(&[("util.rs", util), ("mario/mod.rs", fighter)]);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].new_name, "leaf");
+        assert_eq!(d[0].file, PathBuf::from("mario/mod.rs"));
+        assert_eq!(d[0].line, 3);
+        assert_eq!(d[0].id_bindings, ["FIGHTER_MARIO_GENERATE_ARTICLE_LEAF"]);
+
+        let (d, u) = run(r#"
+fn clone(name: &str) { smashline::clone_weapon("mario", name, *WEAPON_KIND_MARIO_FIREBALL, false); }
+fn reg() { self::clone("ball"); }
+"#);
+        assert!(u.is_empty(), "{u:?}");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].new_name, "ball");
+
+        // Never called where Visionary can follow it: listed, not dropped.
+        let (d, u) = run_many(&[("util.rs", util)]);
+        assert!(d.is_empty());
+        assert_eq!(u.len(), 1, "{u:?}");
+        assert!(u[0].reason.contains("made inside helper `clone_article`, whose callers Visionary couldn't follow"), "{u:?}");
+        assert_eq!((u[0].file.clone(), u[0].line), (PathBuf::from("util.rs"), 2));
+
+        // A function sharing the helper's name in another file is still read.
+        let other = r#"fn clone_article() { let _ = smashline::clone_weapon("mario", "orb", *WEAPON_KIND_MARIO_FIREBALL, false); }"#;
+        let (d, _) = run_many(&[("util.rs", util), ("other.rs", other)]);
+        assert!(d.iter().any(|d| d.new_name == "orb"), "{d:#?}");
+        // `Arc::clone(&x)` is never a helper call.
+        let (d, u) = run(r#"
+fn clone(name: &str) { smashline::clone_weapon("mario", name, *WEAPON_KIND_MARIO_FIREBALL, false); }
+fn reg(x: &Arc<i32>) { let _ = Arc::clone(x); clone("ball"); }
+"#);
+        assert_eq!(d.len(), 1, "{d:#?} {u:?}");
+        assert!(u.is_empty(), "{u:?}");
     }
 
     #[test]
