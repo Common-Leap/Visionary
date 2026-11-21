@@ -2588,11 +2588,12 @@ fn save_keeping_source(
     source: &[u8],
     file: &mut effect_library::NamcoEffectFile,
 ) -> Result<Vec<u8>> {
-    let written = finish_header(
+    let mut written = finish_header(
         file.save()
             .context("effect_library failed to encode the .eff")?,
         file.ptcl_file.is_some(),
     );
+    tag_empty_tables(&mut written);
     let Ok(original) = effect_library::NamcoEffectFile::load(source) else {
         return Ok(written);
     };
@@ -2739,6 +2740,43 @@ fn finish_header(mut bytes: Vec<u8>, has_ptcl: bool) -> Vec<u8> {
     }
     bytes[14..16].copy_from_slice(&pages.to_le_bytes());
     bytes
+}
+
+/// Put the `GTNT`/`G3NT` tag back on an empty texture or model table.
+///
+/// `effect_library` writes an EMPTY descriptor table with an all-zero tag. The game does not
+/// accept that: The Sand Bird, a GameBanana stage, ships a model table with no models and its
+/// tag, and with only those four bytes zeroed its stage hangs on the loading screen (bisected in
+/// game). Every export of that stage did this, whatever the edit, because every save re-wrote
+/// the table; and pruning a carrier or donor down to no models writes the same shape.
+fn tag_empty_tables(bytes: &mut [u8]) {
+    let Some(at) = ptcl_offset(bytes) else {
+        return;
+    };
+    let Some(sections) = ptcl_sections(&bytes[at..]) else {
+        return;
+    };
+    for (magic, start, _) in sections {
+        let tag: &[u8; 4] = match &magic {
+            b"GRTF" => b"GTNT",
+            b"G3PR" => b"G3NT",
+            _ => continue,
+        };
+        let section = at + start;
+        let Some(child) = bytes
+            .get(section + 8..section + 12)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        else {
+            continue;
+        };
+        if child == u32::MAX {
+            continue;
+        }
+        let table = section + child as usize;
+        if bytes.get(table..table + 4) == Some(&[0u8; 4]) {
+            bytes[table..table + 4].copy_from_slice(tag);
+        }
+    }
 }
 
 /// Where the EFFN header's tables (entries, parts, model flags and the three name lists) end.

@@ -66,6 +66,10 @@ struct Section {
     children: u16,
 }
 
+const UNTAGGED_TEXTURES: &str = "the texture table has no GTNT tag";
+const UNTAGGED_MODELS: &str =
+    "the model table has no G3NT tag, which hangs the game while it loads";
+
 /// Everything wrong with `bytes` as a game `.eff`, in plain sentences. Empty means it passes.
 pub fn problems(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
@@ -264,7 +268,7 @@ fn check_ptcl(ptcl: &[u8], out: &mut Vec<String>) -> Sets {
                 }
             }
             b"G3PR" => {
-                sets.primitives = Some(primitive_table(&data, at, &section));
+                sets.primitives = Some(primitive_table(&data, at, &section, out));
                 if section.binary != NONE {
                     let start = at + section.binary as usize;
                     if !start.is_multiple_of(4096) {
@@ -515,6 +519,9 @@ fn texture_table(
     let Some(table) = data.section(table_at) else {
         return list;
     };
+    if &table.magic != b"GTNT" {
+        out.push(UNTAGGED_TEXTURES.into());
+    }
     if table.binary == NONE {
         return list;
     }
@@ -540,7 +547,7 @@ fn texture_table(
     list
 }
 
-fn primitive_table(data: &Bytes, at: usize, g3pr: &Section) -> Vec<u64> {
+fn primitive_table(data: &Bytes, at: usize, g3pr: &Section, out: &mut Vec<String>) -> Vec<u64> {
     let mut list = Vec::new();
     if g3pr.child == NONE {
         return list;
@@ -549,6 +556,10 @@ fn primitive_table(data: &Bytes, at: usize, g3pr: &Section) -> Vec<u64> {
     let Some(table) = data.section(table_at) else {
         return list;
     };
+    // An untagged model table hangs the stage load (The Sand Bird, bisected in game).
+    if &table.magic != b"G3NT" {
+        out.push(UNTAGGED_MODELS.into());
+    }
     if table.binary == NONE {
         return list;
     }
@@ -1589,6 +1600,153 @@ mod tests {
         flags(damaged(ptcl_at + 28, &0u32.to_le_bytes()), "bytes, ");
         // An effect playing a set that does not exist.
         flags(damaged(16 + 4, &9999u32.to_le_bytes()), "plays set 9999");
+    }
+
+    /// Where the model table of a written file starts, and its four-byte tag.
+    fn model_table_tag(bytes: &[u8]) -> [u8; 4] {
+        let pages = u16::from_le_bytes(bytes[14..16].try_into().unwrap()) as usize;
+        let ptcl = &bytes[pages * 0x1000..];
+        let mut at = u16::from_le_bytes(ptcl[22..24].try_into().unwrap()) as usize;
+        loop {
+            let next = u32::from_le_bytes(ptcl[at + 12..at + 16].try_into().unwrap());
+            if &ptcl[at..at + 4] == b"G3PR" {
+                let child = u32::from_le_bytes(ptcl[at + 8..at + 12].try_into().unwrap()) as usize;
+                return ptcl[at + child..at + child + 4].try_into().unwrap();
+            }
+            assert_ne!(next, u32::MAX, "no model section");
+            at += next as usize;
+        }
+    }
+
+    /// An effect in `file` none of whose emitters uses a model.
+    fn entry_with_no_models(file: &effect_library::NamcoEffectFile) -> Option<String> {
+        let sets = &file.ptcl_file.as_ref()?.emitter_list.emitter_sets;
+        let uses_no_model = |set: &effect_library::structs::EmitterSet| {
+            let mut stack: Vec<&effect_library::structs::Emitter> = set.emitters.iter().collect();
+            let mut none = !stack.is_empty();
+            while let Some(e) = stack.pop() {
+                stack.extend(e.children.iter());
+                let d = &e.data;
+                for id in [
+                    d.particle_data.primitive_id,
+                    d.particle_data.primitive_ex_id,
+                    d.shape_info.primitive_index,
+                ] {
+                    none &= id == 0 || id == u64::MAX;
+                }
+            }
+            none
+        };
+        file.entries
+            .iter()
+            .enumerate()
+            .find(|(_, e)| {
+                e.variant_count == 0
+                    && sets
+                        .get((e.emitter_set_id as usize).wrapping_sub(1))
+                        .is_some_and(uses_no_model)
+            })
+            .map(|(i, _)| file.entry_names[i].clone())
+    }
+
+    /// Mario's file cut down to one effect that uses no model: the shape The Sand Bird (a
+    /// GameBanana stage over Delfino Plaza) ships, an empty model table that keeps its G3NT tag.
+    fn with_no_models(root: &Path) -> Vec<u8> {
+        let bytes = game(root, NO_MODELS);
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let entry = entry_with_no_models(&file).expect("an effect with no models");
+        crate::eff_export::strip_donor_eff_bytes(&bytes, &[entry.as_str()]).unwrap()
+    }
+
+    const NO_MODELS: &str = "effect/fighter/mario/ef_mario.eff";
+
+    /// The Sand Bird's stage hung on the loading screen after any Visionary edit: every export
+    /// re-wrote its empty model table without the G3NT tag (bisected in game to those four
+    /// bytes). An edited export of a file shaped like it keeps the tag, and the checker flags a
+    /// table that lost it.
+    #[test]
+    fn an_empty_model_table_keeps_its_tag() {
+        let Some(root) = dump_root() else {
+            return;
+        };
+        let source = with_no_models(&root);
+        assert_eq!(&model_table_tag(&source), b"G3NT");
+        assert!(problems(&source).is_empty(), "{:?}", problems(&source));
+
+        // What the old export wrote for any edit: the library's own save.
+        let raw = effect_library::NamcoEffectFile::load(&source)
+            .unwrap()
+            .save()
+            .unwrap();
+        assert_eq!(&model_table_tag(&raw), &[0u8; 4]);
+        assert!(
+            problems(&raw).iter().any(|p| p.contains("no G3NT tag")),
+            "{:?}",
+            problems(&raw)
+        );
+
+        // A colour edit through the exporter, and one that rewrites the model section too.
+        let file = effect_library::NamcoEffectFile::load(&source).unwrap();
+        let sets = &file.ptcl_file.as_ref().unwrap().emitter_list.emitter_sets;
+        let set_idx = sets.iter().position(|s| !s.emitters.is_empty()).unwrap();
+        let set = &sets[set_idx];
+        let colour = EffMod {
+            source_rel: NO_MODELS.into(),
+            authored: vec![AuthoredEdit {
+                set_name: set.name.clone(),
+                entry_name: String::new(),
+                set_idx,
+                emitter_name: names_of(set)[0].0.clone(),
+                emitter_idx: 0,
+                fields: EmitterFieldEdits {
+                    color0: Some(vec![[0.9, 0.7, 0.2, 0.0]]),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let out = crate::eff_export::rebuild_eff_bytes(&source, &colour, Some(&root)).unwrap();
+        assert_eq!(&model_table_tag(&out), b"G3NT");
+        assert!(problems(&out).is_empty(), "{:?}", problems(&out));
+        let borrowed = EffMod {
+            transplants: vec![TransplantOp {
+                new_entry_name: "pickel_tnt".into(),
+                src_file_rel: "effect/fighter/pickel/ef_pickel.eff".into(),
+                src_set_name: "pickel_tnt".into(),
+                src_set_idx: 0,
+                one_slot_slots: Vec::new(),
+                replace_entry: None,
+            }],
+            ..colour
+        };
+        let out = crate::eff_export::rebuild_eff_bytes(&source, &borrowed, Some(&root)).unwrap();
+        assert_eq!(&model_table_tag(&out), b"G3NT");
+        assert!(problems(&out).is_empty(), "{:?}", problems(&out));
+    }
+
+    /// Pruning a file down to effects that use no models empties its model table through the
+    /// library's writer, which drops the tag; the export puts it back.
+    #[test]
+    fn a_table_pruned_to_nothing_keeps_its_tag() {
+        let Some(root) = dump_root() else {
+            return;
+        };
+        const MARIO: &str = "effect/fighter/mario/ef_mario.eff";
+        let bytes = game(&root, MARIO);
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let entry = entry_with_no_models(&file).expect("an effect with no models");
+        let stripped = crate::eff_export::strip_donor_eff_bytes(&bytes, &[entry.as_str()]).unwrap();
+        let kept = effect_library::NamcoEffectFile::load(&stripped).unwrap();
+        let models = kept
+            .ptcl_file
+            .as_ref()
+            .unwrap()
+            .primitive_info
+            .as_ref()
+            .unwrap();
+        assert!(models.descriptors.is_empty(), "every model was pruned");
+        assert_eq!(&model_table_tag(&stripped), b"G3NT");
+        assert!(problems(&stripped).is_empty(), "{:?}", problems(&stripped));
     }
 
     /// A keyframe table has eight slots. A count past that is clamped on the way in, and a file
