@@ -15,7 +15,7 @@ pub(super) type Owners = Vec<Arc<ControllerCoordinator>>;
 
 /// The costume a fighter object is wearing, or -1 when the game does not say. Read at dispatch,
 /// where the object's identity has just been checked; no allocation and no I/O.
-pub(super) fn costume_of(boid: u32) -> i32 {
+pub(crate) fn costume_of(boid: u32) -> i32 {
     unsafe {
         if smash::app::sv_battle_object::is_null(boid)
             || !smash::app::sv_battle_object::is_active(boid)

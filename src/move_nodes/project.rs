@@ -339,16 +339,14 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
         }
     }
     for (key, data) in &project.characters {
-        // A made character's store carries its moves, its own effect file and its own gimmick.
-        // Fighter values and meters stay with the engine fighter (the game keeps one set per
-        // fighter); anything here would be saved and never exported, so it is refused rather
-        // than dropped.
-        if !data.params.is_empty() || !data.meters.is_empty() {
+        // A made character's store carries its moves, its own effect file, its own gimmick and
+        // its own meters. Fighter values stay with the engine fighter (the game keeps one set per
+        // fighter); any here would be saved and never exported, so they are refused rather than
+        // dropped.
+        if !data.params.is_empty() {
             errors.push(NodeError {
                 subject: format!("character {key}"),
-                reason:
-                    "fighter values and meters belong to the base fighter, not to a made character"
-                        .into(),
+                reason: "fighter values belong to the base fighter, not to a made character".into(),
             });
         }
         if let Err(reason) =
@@ -1445,16 +1443,28 @@ mod tests {
     use crate::move_nodes::test_support as fixture;
     use crate::move_nodes::test_support::assert_json_eq;
 
-    /// A made character has its own gimmick: export keeps it. Fighter values stay the fighter's
-    /// (the game keeps one set per fighter), so a made character's are refused, not dropped.
+    /// A made character has its own gimmick and meters: export keeps them. Fighter values stay
+    /// the fighter's (the game keeps one set per fighter), so a made character's are refused,
+    /// not dropped.
     #[test]
     fn a_made_characters_own_gimmick_is_exported_and_its_values_refused() {
         let key = crate::roster::RosterKey::slot("mario", 8);
         let mut project = ModProjectFile::default();
         let graph = crate::gimmicks::templates::Preset::Timer.graph();
         project.characters.entry(key.clone()).or_default().behavior = graph.clone();
+        let meter = crate::gimmicks::meter::MeterBinding {
+            fighter: "mario".into(),
+            enabled: true,
+            style: crate::gimmicks::meter::MeterStyle::Pips,
+            value: crate::gimmicks::meter::MeterValue::Pips {
+                symbol: "WEAPON_MARIO_FIREBALL_INSTANCE_WORK_ID_INT_BOUND_COUNT".into(),
+                count: 3,
+            },
+        };
+        project.characters.get_mut(&key).unwrap().meters = vec![meter.clone()];
         let expanded = expand(&project).unwrap_or_else(|errors| panic!("{errors:?}"));
         assert_eq!(expanded.characters[&key].behavior, graph);
+        assert_eq!(expanded.characters[&key].meters, [meter]);
 
         project
             .characters

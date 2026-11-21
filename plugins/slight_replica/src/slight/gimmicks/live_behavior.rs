@@ -14,6 +14,8 @@ use super::{dispatcher, live_model as model, registry};
 
 #[path = "live_behavior/controllers.rs"]
 mod controllers;
+/// The costume a fighter object wears; meters show by it as gimmicks run by it.
+pub(crate) use controllers::costume_of;
 #[cfg(test)]
 pub use controllers::{controller_wire_rows, ControllerStateRow};
 pub use controllers::{

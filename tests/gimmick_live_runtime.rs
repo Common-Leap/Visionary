@@ -16,6 +16,9 @@ mod article_lifetime_tests;
 #[path = "slight/damage_expression_tests.rs"]
 mod damage_expression_tests;
 
+#[path = "slight/meter_costume_tests.rs"]
+mod meter_costume_tests;
+
 use std::sync::LazyLock;
 
 static TEST_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
@@ -226,6 +229,9 @@ pub mod app {
 }
 
 mod slight {
+    #[path = "../../plugins/slight_replica/src/slight/costume_scope.rs"]
+    pub mod costume_scope;
+
     pub mod agents {
         pub fn newest_registered(_objects: &[u32]) -> Option<u32> {
             None
@@ -1115,6 +1121,46 @@ mod slight {
             ) -> Result<(), String> {
                 preflight_write(boid, fighter, expected, action)
             }
+            #[derive(Debug, Clone, Copy)]
+            pub(crate) struct WorkSource<'a> {
+                pub symbol: &'a str,
+                pub kind: super::registry::IdentifierKind,
+            }
+
+            #[derive(Debug, Clone, Copy, PartialEq)]
+            pub(crate) enum WorkValue {
+                Float(f32),
+                Int(i32),
+                Flag(bool),
+            }
+
+            /// The test sample for each source, after the same identity check the plugin makes.
+            pub(crate) fn sample_work_values(
+                boid: u32,
+                fighter: &str,
+                expected: Identity,
+                sources: &[WorkSource<'_>],
+            ) -> Result<Vec<WorkValue>, String> {
+                if Identity::from_live_fighter(boid, fighter) != Some(expected) {
+                    return Err("stale work identity".into());
+                }
+                if FAIL_SAMPLE.load(Ordering::SeqCst) {
+                    return Err("simulated work sample failure".into());
+                }
+                Ok(sources
+                    .iter()
+                    .map(|source| match source.kind {
+                        super::registry::IdentifierKind::WorkFloat => {
+                            WorkValue::Float(f32::from_bits(SAMPLE_BITS.load(Ordering::SeqCst)))
+                        }
+                        super::registry::IdentifierKind::WorkInt => {
+                            WorkValue::Int(SAMPLE_INT.load(Ordering::SeqCst))
+                        }
+                        _ => WorkValue::Flag(SAMPLE_FLAG.load(Ordering::SeqCst)),
+                    })
+                    .collect())
+            }
+
             pub(crate) const MAX_WORK_SAMPLES: usize = 64;
             static SAMPLE_BITS: AtomicU32 = AtomicU32::new(75.0f32.to_bits());
             static SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1319,10 +1365,9 @@ mod slight {
         #[path = "../../../plugins/slight_replica/src/slight/gimmicks/behavior.rs"]
         pub mod behavior;
 
-        pub mod meter_snapshot {
-            // The emitted fixture has zero bindings; no HUD getter is mocked.
-            pub struct MeterBinding;
-        }
+        // The plugin's own meter pass, run against the mocked object table.
+        #[path = "../../../plugins/slight_replica/src/slight/gimmicks/meter_snapshot.rs"]
+        pub mod meter_snapshot;
 
         pub fn on_reset_fighter(boid: u32) {
             live_behavior::clear_boid(boid);

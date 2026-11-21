@@ -2803,8 +2803,9 @@ fn claim_saved_gimmicks(roster: &mut crate::roster::window::RosterWindow) {
 }
 
 /// Swap the gimmick kept under character `key` with the one kept under its engine `fighter`, in
-/// every store a character's gimmick is kept in. Calling it twice puts both back. Nothing moves
-/// for a base fighter, whose key is the fighter. Meters and values are the fighter's and stay.
+/// every store a character's gimmick is kept in, meters included. Calling it twice puts both
+/// back. Nothing moves for a base fighter, whose key is the fighter. Values are the fighter's
+/// (the game keeps one set per fighter) and stay.
 fn lend_gimmick(roster: &mut crate::roster::window::RosterWindow, key: &str, fighter: &str) {
     fn swap<T>(store: &mut BTreeMap<String, T>, a: &str, b: &str) {
         let first = store.remove(a);
@@ -2822,6 +2823,7 @@ fn lend_gimmick(roster: &mut crate::roster::window::RosterWindow, key: &str, fig
     swap(&mut roster.behaviors, key, fighter);
     swap(&mut roster.behavior_layouts, key, fighter);
     swap(&mut roster.controller_charts, key, fighter);
+    swap(&mut roster.meters, key, fighter);
 }
 
 /// The character a gimmick limited to `costumes` of `fighter` belongs to: the made character
@@ -4149,6 +4151,12 @@ impl VisionaryApp {
         // `mod_roots` file means an upgrading user keeps the setup they had.
         let mut roster = crate::roster::window::RosterWindow::default();
         roster.ensure_initialized(&saved_mod_roots);
+        // An older build saved made characters' folders (and folders since deleted) among the
+        // roots; the file keeps installed mods only.
+        let installed_roots = roster.library.enabled_roots();
+        if saved_mod_root_lines() != installed_roots {
+            save_mod_roots(&installed_roots);
+        }
         if std::env::var_os("VISIONARY_ROSTER_OPEN").is_some() {
             roster.open = true;
         }
@@ -17817,7 +17825,7 @@ impl VisionaryApp {
             counts.textures =
                 eff.textures.len() + eff.textures_added.len() + eff.textures_removed.len();
         }
-        // Each character's gimmick is its own; meters, like values, are the fighter's.
+        // Each character's gimmick and meters are its own; values are the fighter's.
         counts.gimmicks = usize::from(
             self.roster
                 .behaviors
@@ -17828,11 +17836,9 @@ impl VisionaryApp {
             .controller_charts
             .get(key.as_str())
             .map_or(0, BTreeMap::len);
-        if !key.is_made() {
-            counts.meters = self.roster.meters.get(key.as_str()).map_or(0, |meters| {
-                meters.iter().filter(|meter| meter.enabled).count()
-            });
-        }
+        counts.meters = self.roster.meters.get(key.as_str()).map_or(0, |meters| {
+            meters.iter().filter(|meter| meter.enabled).count()
+        });
         counts
     }
 
@@ -18017,6 +18023,7 @@ impl VisionaryApp {
             self.roster.behaviors.remove(key.as_str());
             self.roster.behavior_layouts.remove(key.as_str());
             self.roster.controller_charts.remove(key.as_str());
+            self.roster.meters.remove(key.as_str());
         }
         self.node_editor.invalidate();
         self.node_live_cache = None;
@@ -18090,6 +18097,12 @@ impl VisionaryApp {
                 self.roster
                     .controller_charts
                     .insert(key.as_str().to_owned(), charts);
+            }
+        }
+        // The donor's meters, shown on the character's own costumes from now on.
+        if !self.roster.meters.contains_key(key.as_str()) {
+            if let Some(meters) = self.roster.meters.get(&donor).cloned() {
+                self.roster.meters.insert(key.as_str().to_owned(), meters);
             }
         }
         // The donor's effect edits, onto the character's own effect file. Effects borrowed for
@@ -19731,9 +19744,11 @@ impl VisionaryApp {
                 }
             }
         }
-        for (fighter, meters) in &self.roster.meters {
+        for (owner, meters) in &self.roster.meters {
             if !meters.is_empty() {
-                project.fighters.entry(fighter.clone()).or_default().meters = meters.clone();
+                if let Some(fm) = project_owner_mod(&mut project, &roster, owner) {
+                    fm.meters = meters.clone();
+                }
             }
         }
         for (fighter, graphs) in &self.move_graphs {
@@ -21665,11 +21680,9 @@ impl VisionaryApp {
             .map(|(owner, data)| (owner, data.controller_charts.clone()))
             .collect();
         claim_saved_gimmicks(&mut self.roster);
-        self.roster.meters = project
-            .fighters
-            .iter()
+        self.roster.meters = crate::mod_export::gimmick_owners(&project)
             .filter(|(_, fm)| !fm.meters.is_empty())
-            .map(|(fighter, fm)| (fighter.clone(), fm.meters.clone()))
+            .map(|(owner, fm)| (owner, fm.meters.clone()))
             .collect();
         self.move_graphs = stored_move_graphs;
         self.node_editor.invalidate();
@@ -31401,48 +31414,7 @@ impl VisionaryApp {
                 unsupported_flip_axis = true;
                 continue;
             }
-            // A follow emitter has no automatic relationship to the editor's end frame.
-            // Schedule the same EFFECT_OFF_KIND that exported ACMD emits. This dispatches
-            // through the plugin's normal kill-kind hook, which redirects transplanted kinds
-            // from the fighter to their hidden carrier owner.
-            let end_changed = pristine
-                .map(|p| p.active_end != ec.active_end)
-                .unwrap_or(true);
-            if ec.follows_bone && ec.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME {
-                rules.push(crate::game_link::SpawnRuleWire {
-                    eff_hash: hash,
-                    suppress: false,
-                    stop_func: None,
-                    motion,
-                    frame_start: None,
-                    frame_end: None,
-                    pos: None,
-                    rot: None,
-                    scale: None,
-                    rate: None,
-                    camera_offset: None,
-                    tint: None,
-                    particle_tint: None,
-                    alpha: None,
-                    scale_w: None,
-                    color: None,
-                    transition: None,
-                    inject: Some(Self::build_effect_stop_inject(ec)),
-                    color_inject: None,
-                });
-            }
-            // If the finite pristine stop no longer represents the edited follow, suppress it
-            // before the replacement stop is injected. A stop rule is separate from a spawn rule
-            // even when both use the same effect hash.
-            if end_changed
-                && pristine.is_some_and(|p| {
-                    p.follows_bone && p.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
-                })
-            {
-                if let Some(old) = pristine {
-                    rules.push(Self::build_effect_stop_suppression(old, motion));
-                }
-            }
+            rules.extend(follow_stop_rules(pristine, ec, motion));
             // Swap, retime, or re-attach: the effect NAME, FRAME, or BONE changed →
             // suppress the original spawn and inject the new effect at the new frame (bone
             // and transform baked in). The injected call reuses the original spawn's
@@ -32217,6 +32189,10 @@ impl VisionaryApp {
     /// end. Start suppression is keyed by the graphic hash, but a stop is a different semantic
     /// event: `EFFECT_OFF_KIND` names the effect while `AFTER_IMAGE_OFF` has no texture argument
     /// at all. The optional wire command keeps those rules isolated from same-hash spawn rules.
+    /// A follow emitter has no automatic relationship to the editor's end frame: its stop is
+    /// the same EFFECT_OFF_KIND that exported ACMD emits. This dispatches through the plugin's
+    /// normal kill-kind hook, which redirects transplanted kinds from the fighter to their hidden
+    /// carrier owner.
     fn build_effect_stop_suppression(
         pristine: &crate::data::EffectCall,
         motion: Option<u64>,
@@ -33873,7 +33849,9 @@ impl eframe::App for VisionaryApp {
         // keeps the roster module from reaching into the fighter index.
         if std::mem::take(&mut self.roster.library_dirty) {
             self.extra_roots = self.roster.enabled_roots();
-            save_mod_roots(&self.extra_roots);
+            // Only installed mods are saved: a made character's folder is its project's root,
+            // added while that project is open, never one every project loads.
+            save_mod_roots(&self.roster.library.enabled_roots());
             self.reindex_fighters();
         }
         self.perf.end("eff_editor", t);
@@ -37680,6 +37658,55 @@ fn load_window_geometry() -> std::collections::BTreeMap<String, WindowGeometry> 
         .collect()
 }
 
+/// The live rules that stop the follow effect `ec` (the game's own call is `pristine`) at its
+/// end. When the game's own stop already ends this effect at this frame the same way, nothing is
+/// sent: a move opened and left as the game has it sends no rule. Otherwise the edited stop is
+/// injected; when the end frame moved, the game's own stop is suppressed so it cannot end the
+/// edited effect early. A stop rule is separate from a spawn rule even when both use the same
+/// effect hash.
+fn follow_stop_rules(
+    pristine: Option<&crate::data::EffectCall>,
+    ec: &crate::data::EffectCall,
+    motion: Option<u64>,
+) -> Vec<crate::game_link::SpawnRuleWire> {
+    let open = crate::data::OPEN_ENDED_EFFECT_FRAME;
+    let game_stop = pristine.filter(|p| p.follows_bone && p.active_end != open);
+    let game_stops_it = game_stop.is_some_and(|p| {
+        p.active_end == ec.active_end
+            && effect_name_hash(&p.effect_name) == effect_name_hash(&ec.effect_name)
+            && p.off_fade == ec.off_fade
+            && p.off_detach == ec.off_detach
+    });
+    let mut rules = Vec::new();
+    if ec.follows_bone && ec.active_end != open && !game_stops_it {
+        rules.push(crate::game_link::SpawnRuleWire {
+            eff_hash: effect_name_hash(&ec.effect_name),
+            suppress: false,
+            stop_func: None,
+            motion,
+            frame_start: None,
+            frame_end: None,
+            pos: None,
+            rot: None,
+            scale: None,
+            rate: None,
+            camera_offset: None,
+            tint: None,
+            particle_tint: None,
+            alpha: None,
+            scale_w: None,
+            color: None,
+            transition: None,
+            inject: Some(VisionaryApp::build_effect_stop_inject(ec)),
+            color_inject: None,
+        });
+    }
+    if let Some(old) = game_stop.filter(|p| p.active_end != ec.active_end) {
+        rules.push(VisionaryApp::build_effect_stop_suppression(old, motion));
+    }
+    rules
+}
+
 /// Mod roots persist as one absolute path per line (same config dir as the single-path keys;
 /// a list needs its own format because `save_config_path` stores exactly one path).
 fn save_mod_roots(roots: &[std::path::PathBuf]) {
@@ -37699,6 +37726,14 @@ fn save_mod_roots(roots: &[std::path::PathBuf]) {
 /// Saved mod roots, dropping any that no longer exist (an unplugged SD card should not
 /// leave a permanently broken entry in the list).
 fn load_mod_roots() -> Vec<std::path::PathBuf> {
+    saved_mod_root_lines()
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Every root the `mod_roots` file names, as written.
+fn saved_mod_root_lines() -> Vec<std::path::PathBuf> {
     let Some(dest) = config_path("mod_roots") else {
         return Vec::new();
     };
@@ -37709,7 +37744,6 @@ fn load_mod_roots() -> Vec<std::path::PathBuf> {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
         .collect()
 }
 
@@ -47969,6 +48003,28 @@ mod character_store_tests {
         assert_eq!(window.behaviors["mario"], mario);
     }
 
+    /// Vision's meters are its own: the Gimmicks page edits them in Mario's place and puts both
+    /// back, so a meter added for Vision never reaches Mario's.
+    #[test]
+    fn lending_a_made_characters_gimmick_lends_its_meters() {
+        let mut window = roster_window();
+        let meter = |symbol: &str| crate::gimmicks::meter::MeterBinding {
+            fighter: "mario".into(),
+            enabled: true,
+            style: crate::gimmicks::meter::MeterStyle::Icon,
+            value: crate::gimmicks::meter::MeterValue::Flag {
+                symbol: symbol.into(),
+            },
+        };
+        window.meters.insert("mario".into(), vec![meter("A")]);
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert!(!window.meters.contains_key("mario"));
+        window.meters.insert("mario".into(), vec![meter("B")]);
+        lend_gimmick(&mut window, "mario#c08", "mario");
+        assert_eq!(window.meters["mario"], [meter("A")]);
+        assert_eq!(window.meters["mario#c08"], [meter("B")]);
+    }
+
     /// A gimmick saved under Mario but limited to exactly Vision's costumes was Vision's; it
     /// moves to Vision unchanged. Mario's own, with no limit, stays Mario's, its saved costumes
     /// untouched (made costumes are left out when it is sent, not in the file).
@@ -48069,5 +48125,112 @@ mod character_store_tests {
                 .collect::<Vec<_>>(),
             ["mario#c08"]
         );
+    }
+}
+
+#[cfg(test)]
+mod follow_stop_tests {
+    use super::{effect_name_hash, follow_stop_rules, VisionaryApp};
+    use crate::game_link::LuaArgWire;
+
+    /// Mario's forward smash effect script, lifted from the script cache
+    /// (`script-cache/mario/AttackS4.txt`) and from the e2e project's saved source of the move:
+    /// `mario_fb_shoot` follows the left hand from frame 14 and the script's own
+    /// `EFFECT_OFF_KIND(false, true)` ends it on frame 22.
+    const MARIO_ATTACK_S4: &str = r#"unsafe extern "C" fn effect_attacks4(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_smash_flash"), Hash40::new("handl"), 2.0, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, 14.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLIP(agent, Hash40::new("sys_attack_line"), Hash40::new("sys_attack_line"), Hash40::new("top"), 1, 7, -1, 0, -2, 0, 0.8, 0, 0, 0, 0, 0, 0, true, *EF_FLIP_YZ);
+        macros::EFFECT_FOLLOW(agent, Hash40::new("mario_fb_shoot"), Hash40::new("havel"), 0, 0, 0, 0, -45, 0, 1, true);
+    }
+    frame(agent.lua_state_agent, 15.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_flame"), Hash40::new("top"), 0, 8, 12, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 360, true);
+    }
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        macros::LANDING_EFFECT(agent, Hash40::new("sys_atk_smoke"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+    }
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_OFF_KIND(agent, Hash40::new("mario_fb_shoot"), false, true);
+    }
+}
+"#;
+
+    fn calls() -> Vec<crate::data::EffectCall> {
+        crate::acmd::parse_effect_script(MARIO_ATTACK_S4)
+            .to_effect_calls()
+            .into_iter()
+            .map(crate::data::EffectCall::normalized_timing)
+            .collect()
+    }
+
+    fn follow(calls: &[crate::data::EffectCall]) -> crate::data::EffectCall {
+        let follow = calls
+            .iter()
+            .find(|call| call.effect_name == "mario_fb_shoot")
+            .cloned()
+            .expect("the fixture spawns mario_fb_shoot");
+        // The case the rule is about: a follow effect the game's own script ends.
+        assert!(follow.follows_bone);
+        assert_ne!(follow.active_end, crate::data::OPEN_ENDED_EFFECT_FRAME);
+        follow
+    }
+
+    /// Opening Mario's forward smash and changing nothing sends no rule for any of its effects:
+    /// the game's own stop already ends the follow. Resuming the e2e project used to send an
+    /// extra EFFECT_OFF_KIND for it, and the card then counted the move as edited.
+    #[test]
+    fn an_unchanged_follow_effect_sends_no_stop() {
+        let calls = calls();
+        follow(&calls);
+        for call in &calls {
+            assert!(
+                follow_stop_rules(Some(call), call, Some(1)).is_empty(),
+                "{} sent a stop it did not change",
+                call.effect_name
+            );
+        }
+    }
+
+    /// Moving the follow's end sends the same stop call at the new frame and keeps the game's
+    /// own from ending it early.
+    #[test]
+    fn a_moved_follow_end_sends_its_stop_and_holds_back_the_games() {
+        let calls = calls();
+        let game = follow(&calls);
+        let mut edited = game.clone();
+        edited.active_end += 4;
+        let rules = follow_stop_rules(Some(&game), &edited, Some(1));
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        let inject = rules[0].inject.as_ref().expect("the new stop is injected");
+        assert_eq!(inject.func, "EFFECT_OFF_KIND");
+        assert_eq!(
+            inject.frame,
+            VisionaryApp::script_to_motion_frame(edited.active_end)
+        );
+        assert!(matches!(
+            inject.args.as_slice(),
+            [LuaArgWire::Hash(hash), LuaArgWire::Bool(false), LuaArgWire::Bool(true)]
+                if *hash == effect_name_hash("mario_fb_shoot")
+        ));
+        assert!(rules[1].suppress);
+        assert_eq!(rules[1].stop_func.as_deref(), Some("EFFECT_OFF_KIND"));
+
+        // A follow swapped for another effect still needs its own stop: the game's ends the old
+        // effect only. The game's stop stays, at a frame that no longer matters.
+        let mut swapped = game.clone();
+        swapped.effect_name = "mario_fb_bound".into();
+        let rules = follow_stop_rules(Some(&game), &swapped, Some(1));
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].eff_hash, effect_name_hash("mario_fb_bound"));
+
+        // A follow the user added has no stop of the game's.
+        assert_eq!(follow_stop_rules(None, &game, Some(1)).len(), 1);
     }
 }

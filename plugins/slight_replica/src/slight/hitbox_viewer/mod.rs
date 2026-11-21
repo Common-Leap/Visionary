@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
-pub mod costume_scope;
+pub use super::costume_scope;
 pub use costume_scope::{costume_is, prefer_specific_costumes, CostumeScoped};
 mod drop_hooks;
 mod node_steps;

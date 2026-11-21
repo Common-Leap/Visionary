@@ -186,6 +186,8 @@ impl MeterDraft {
 
 pub struct MeterView {
     fighter: String,
+    /// The character whose meters are shown: its fighter's name, or a made character's key.
+    owner: String,
     style: MeterStyle,
     draft: MeterDraft,
     preview_boundary: PreviewBoundary,
@@ -196,6 +198,7 @@ impl Default for MeterView {
     fn default() -> Self {
         Self {
             fighter: String::new(),
+            owner: String::new(),
             style: MeterStyle::Bar,
             draft: MeterDraft {
                 first: "0".to_string(),
@@ -209,18 +212,21 @@ impl Default for MeterView {
 }
 
 impl MeterView {
+    /// `meters` holds `owner`'s meters in `fighter`'s place (see the Gimmicks page).
     pub fn ui(
         &mut self,
         ui: &mut Ui,
         fighter: &str,
+        owner: &str,
         meters: &mut BTreeMap<String, Vec<MeterBinding>>,
         link: &GameLink,
     ) {
         if fighter.is_empty() {
             return;
         }
-        if self.fighter != fighter {
+        if self.fighter != fighter || self.owner != owner {
             self.reset_for_fighter(fighter);
+            self.owner = owner.to_owned();
         }
         link.ensure_started();
         ui.add_space(8.0);
@@ -291,7 +297,7 @@ impl MeterView {
                         });
                 });
                 self.draw_value_fields(ui);
-                self.draw_live_value(ui, fighter, link);
+                self.draw_live_value(ui, link);
                 let verdict = self.draft.binding(fighter, self.style);
                 let existing = meters.get(fighter).and_then(|saved| {
                     saved
@@ -393,11 +399,12 @@ impl MeterView {
         });
     }
 
-    fn draw_live_value(&self, ui: &mut Ui, fighter: &str, link: &GameLink) {
+    fn draw_live_value(&self, ui: &mut Ui, link: &GameLink) {
         if self.draft.symbol.is_empty() {
             return;
         }
-        let values = link.gimmick_meter_values(fighter, &self.draft.symbol);
+        // Only players in this character's costumes show its meters.
+        let values = link.gimmick_meter_values(&self.owner, &self.draft.symbol);
         if values.is_empty() {
             if link.status() == LinkStatus::Connected {
                 ui.label(

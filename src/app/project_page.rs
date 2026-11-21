@@ -233,7 +233,6 @@ struct EditFamilies {
     gimmicks: Vec<String>,
     controllers: Vec<String>,
     meters: Vec<String>,
-    live_rules: Vec<String>,
     folders: Vec<String>,
 }
 
@@ -262,7 +261,6 @@ fn fighters_with_edits(families: &EditFamilies) -> BTreeSet<String> {
         gimmicks,
         controllers,
         meters,
-        live_rules,
         folders,
     } = families;
     [
@@ -277,7 +275,6 @@ fn fighters_with_edits(families: &EditFamilies) -> BTreeSet<String> {
         gimmicks,
         controllers,
         meters,
-        live_rules,
         folders,
     ]
     .into_iter()
@@ -916,7 +913,7 @@ impl VisionaryApp {
                 .iter()
                 .any(|step| !step.actions.is_empty())
         };
-        // Gimmicks are kept per character; meters, like values, per fighter.
+        // Gimmicks and meters are kept per character; values per fighter.
         let gimmick_of = |key: &String| Some(key.clone());
         let roster = &self.roster;
         EditFamilies {
@@ -975,25 +972,6 @@ impl VisionaryApp {
                 .filter(|(_, meters)| !meters.is_empty())
                 .filter_map(|(fighter, _)| gimmick_of(fighter))
                 .collect(),
-            live_rules: of_keys(
-                &mut self
-                    .hitbox_rules_store
-                    .iter()
-                    .filter(|(_, rules)| !rules.is_empty())
-                    .map(|(key, _)| key)
-                    .chain(
-                        self.effect_rules_store
-                            .iter()
-                            .filter(|(_, rules)| !rules.is_empty())
-                            .map(|(key, _)| key),
-                    )
-                    .chain(
-                        self.effect_control_rules_store
-                            .iter()
-                            .filter(|(_, rules)| !rules.is_empty())
-                            .map(|(key, _)| key),
-                    ),
-            ),
             // Folders are picked per fighter and costume: one picked for a made character's
             // costume is that character's.
             folders: parts
@@ -1149,9 +1127,9 @@ impl VisionaryApp {
     }
 
     /// The moves `owner` has edited in any way the Moves part shows: hitboxes and other game
-    /// script calls, node graphs, expressions, and moves the game is changed in live.
+    /// script calls, node graphs and expressions. A live rule is sent for one of these edits and
+    /// is never an edit of its own: a move opened and left as the game has it counts nothing.
     fn character_edited_moves(&self, owner: &crate::character::CharacterKey) -> BTreeSet<String> {
-        let mine = |key: &&String| owner_of_move_key(key).as_deref() == Some(owner.as_str());
         // Scripts the export leaves out as the game's own are no edit.
         let mut moves = self.character_game_moves(owner);
         moves.extend(
@@ -1160,32 +1138,9 @@ impl VisionaryApp {
                 .into_iter()
                 .flat_map(|graphs| graphs.keys().cloned()),
         );
-        let named = |key: &String| {
-            crate::character::split_move_key(key)
-                .map(|(_, name)| name.split('#').next().unwrap_or(name).to_owned())
-        };
         moves.extend(
             self.character_script_moves(owner, crate::move_nodes::model::Track::Expression),
         );
-        // A live rule exists only for a changed move.
-        let live = self
-            .hitbox_rules_store
-            .iter()
-            .filter(|(_, rules)| !rules.is_empty())
-            .map(|(key, _)| key)
-            .chain(
-                self.effect_rules_store
-                    .iter()
-                    .filter(|(_, rules)| !rules.is_empty())
-                    .map(|(key, _)| key),
-            )
-            .chain(
-                self.effect_control_rules_store
-                    .iter()
-                    .filter(|(_, rules)| !rules.is_empty())
-                    .map(|(key, _)| key),
-            );
-        moves.extend(live.filter(mine).filter_map(named));
         moves
     }
 
@@ -2813,17 +2768,16 @@ mod tests {
             gimmicks: one("samus"),
             controllers: one("kirby"),
             meters: one("fox"),
-            live_rules: one("ness"),
             folders: one("pickel"),
         };
         let named = fighters_with_edits(&families);
         for fighter in [
             "mario", "luigi", "peach", "daisy", "bowser", "yoshi", "dk", "link", "samus", "kirby",
-            "fox", "ness", "pickel",
+            "fox", "pickel",
         ] {
             assert!(named.contains(fighter), "{fighter} got no card");
         }
-        assert_eq!(named.len(), 13);
+        assert_eq!(named.len(), 12);
         assert!(fighters_with_edits(&EditFamilies::default()).is_empty());
     }
 

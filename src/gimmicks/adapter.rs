@@ -100,8 +100,8 @@ pub fn render_with_meters(
 /// Render static behavior, meters, and complete independent controller charts.
 /// Owners with additional charts are installed as one bounded V5 bundle and
 /// deliberately omit their legacy V4 program registration. `graphs` and `controllers` are keyed
-/// by character (a fighter's name or a made character's key); `roster` says which costumes each
-/// runs on. Meters stay keyed by fighter.
+/// by character (a fighter's name or a made character's key), and so are `meters`; `roster`
+/// says which costumes each runs on.
 pub(crate) fn render_with_controllers(
     graphs: &BTreeMap<String, BehaviorGraph>,
     controllers: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
@@ -139,7 +139,14 @@ fn render_with_controllers_internal(
         }
     }
     let mut rendered_meters = Vec::new();
-    for (fighter, bindings) in meters {
+    for (key, bindings) in meters {
+        // A character's meters show on its own costumes, like its gimmick: a fighter's never on
+        // a costume one of its made characters owns. A character no longer in the project has
+        // no costume, and its meters show nowhere.
+        let Some(owner) = crate::character::gimmick_owner(key, &[], roster) else {
+            continue;
+        };
+        let fighter = &owner.fighter;
         let mut enabled_sources = BTreeSet::new();
         for (index, binding) in bindings.iter().enumerate() {
             if !binding.enabled {
@@ -168,8 +175,10 @@ fn render_with_controllers_internal(
             let validation = meter::validate(binding);
             if validation.is_empty() {
                 rendered_meters.push(RenderedMeter {
-                    id: format!("meter.{fighter}.{index}"),
+                    id: meter::binding_id(key, index),
                     fighter: fighter.clone(),
+                    costumes: owner.scope.costumes.clone(),
+                    except_costumes: owner.scope.except_costumes.clone(),
                     symbol: symbol.to_string(),
                     kind: meter_kind(&binding.value),
                     presentation: meter_presentation(binding),
@@ -252,8 +261,14 @@ fn render_with_controllers_internal(
     ));
     for binding in &rendered_meters {
         source.push_str(&format!(
-            "    super::meter_snapshot::MeterBinding {{ id: {:?}, fighter: {:?}, source: super::meter_snapshot::MeterSource::Work {{ symbol: {:?}, kind: super::registry::IdentifierKind::{} }}, presentation: {} }},\n",
-            binding.id, binding.fighter, binding.symbol, binding.kind, binding.presentation
+            "    super::meter_snapshot::MeterBinding {{ id: {:?}, fighter: {:?}, costumes: &{:?}, except_costumes: &{:?}, source: super::meter_snapshot::MeterSource::Work {{ symbol: {:?}, kind: super::registry::IdentifierKind::{} }}, presentation: {} }},\n",
+            binding.id,
+            binding.fighter,
+            binding.costumes,
+            binding.except_costumes,
+            binding.symbol,
+            binding.kind,
+            binding.presentation
         ));
     }
     source.push_str(
@@ -304,6 +319,8 @@ fn render_with_controllers_internal(
 struct RenderedMeter {
     id: String,
     fighter: String,
+    costumes: Vec<u8>,
+    except_costumes: Vec<u8>,
     symbol: String,
     kind: &'static str,
     presentation: String,
@@ -1638,6 +1655,129 @@ mod tests {
             style,
             value,
         }
+    }
+
+    fn limit_bar() -> meter::MeterBinding {
+        cloud_meter(
+            meter::MeterValue::Float {
+                symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE".into(),
+                min: 0.0,
+                max: 100.0,
+            },
+            meter::MeterStyle::Bar,
+        )
+    }
+
+    fn roster_with_cloud_character() -> crate::mod_project::RosterMod {
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("cloud", 8),
+            donor: "cloud".into(),
+            slot: 8,
+            slots: (9..=15).collect(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        roster
+    }
+
+    /// A character made on Cloud (c08-c15) has its own meter beside Cloud's. Each is declared
+    /// for its own costumes, so the game shows Cloud's on c00-c07 and the made character's on
+    /// c08-c15.
+    #[test]
+    fn each_characters_meter_is_declared_for_its_own_costumes() {
+        let meters = BTreeMap::from([
+            ("cloud".to_string(), vec![limit_bar()]),
+            ("cloud#c08".to_string(), vec![limit_bar()]),
+        ]);
+        let artifact = render_with_controllers(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &meters,
+            &roster_with_cloud_character(),
+        )
+        .unwrap();
+        assert!(artifact.source.contains(
+            "id: \"meter.cloud.0\", fighter: \"cloud\", costumes: &[], except_costumes: &[8, 9, 10, 11, 12, 13, 14, 15]"
+        ), "{}", artifact.source);
+        assert!(artifact.source.contains(
+            "id: \"meter.cloud#c08.0\", fighter: \"cloud\", costumes: &[8, 9, 10, 11, 12, 13, 14, 15], except_costumes: &[]"
+        ), "{}", artifact.source);
+        assert_eq!(artifact.fighters, ["cloud"]);
+        syn::parse_file(&artifact.source).unwrap();
+
+        // With no made character in the project, Cloud's meter shows on every costume, and a
+        // meter kept for a character that is gone shows nowhere.
+        let artifact = render_with_controllers(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &meters,
+            &crate::mod_project::RosterMod::default(),
+        )
+        .unwrap();
+        assert!(artifact.source.contains(
+            "id: \"meter.cloud.0\", fighter: \"cloud\", costumes: &[], except_costumes: &[]"
+        ));
+        assert!(!artifact.source.contains("meter.cloud#c08"));
+    }
+
+    /// The meter declarations the export writes name exactly the fields of the plugin's
+    /// `MeterBinding`, so the plugin built from an export compiles. The plugin's own tests never
+    /// run, so this reads its source.
+    #[test]
+    fn rendered_meters_fill_every_field_of_the_plugins_meter_binding() {
+        let meters = BTreeMap::from([("cloud".to_string(), vec![limit_bar()])]);
+        let artifact = render_with_meters(&BTreeMap::new(), &meters).unwrap();
+        let rendered = syn::parse_file(&artifact.source).unwrap();
+        let mut written: Vec<String> = Vec::new();
+        for item in &rendered.items {
+            let syn::Item::Static(item) = item else {
+                continue;
+            };
+            if item.ident != "METER_BINDINGS" {
+                continue;
+            }
+            let syn::Expr::Array(array) = &*item.expr else {
+                panic!("METER_BINDINGS is not an array");
+            };
+            for element in &array.elems {
+                let syn::Expr::Struct(binding) = element else {
+                    panic!("a meter is not a struct literal");
+                };
+                written = binding
+                    .fields
+                    .iter()
+                    .map(|field| match &field.member {
+                        syn::Member::Named(name) => name.to_string(),
+                        syn::Member::Unnamed(_) => panic!("unnamed meter field"),
+                    })
+                    .collect();
+            }
+        }
+        assert!(!written.is_empty(), "no meter was rendered");
+        let plugin = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/plugins/slight_replica/src/slight/gimmicks/meter_snapshot.rs"
+        ))
+        .unwrap();
+        let plugin = syn::parse_file(&plugin).unwrap();
+        let declared: Vec<String> = plugin
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Struct(item) if item.ident == "MeterBinding" => Some(
+                    item.fields
+                        .iter()
+                        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("the plugin declares MeterBinding");
+        assert_eq!(written, declared);
+        assert!(declared.iter().any(|field| field == "costumes"));
     }
 
     #[test]

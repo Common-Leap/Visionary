@@ -33,6 +33,8 @@ pub mod effect_viewer {
         crate::slight::systems::main_module::on_init_fighter(boid);
     }
 }
+/// Which costumes a live rule or a meter runs on; plain std, used by every build.
+pub mod costume_scope;
 pub mod extras;
 pub mod frame_context;
 pub mod gimmicks;

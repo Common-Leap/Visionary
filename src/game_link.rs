@@ -2488,15 +2488,19 @@ impl GameLink {
             .and_then(|shared| shared.gimmick_agents_error.clone())
     }
 
-    /// Current-session live values for one generated symbolic meter source.
-    pub fn gimmick_meter_values(&self, fighter: &str, symbol: &str) -> Vec<LiveGimmickMeter> {
+    /// Current-session live values for one generated symbolic meter source of character
+    /// `owner` (a fighter's name, or a made character's key): the players in its costumes.
+    pub fn gimmick_meter_values(&self, owner: &str, symbol: &str) -> Vec<LiveGimmickMeter> {
         self.shared
             .lock()
             .map(|shared| {
                 shared
                     .gimmick_meters
                     .iter()
-                    .filter(|meter| meter.fighter == fighter && meter.symbol == symbol)
+                    .filter(|meter| {
+                        crate::gimmicks::meter::binding_owner(&meter.binding_id) == Some(owner)
+                            && meter.symbol == symbol
+                    })
                     .cloned()
                     .collect()
             })
@@ -3743,7 +3747,7 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
 
 /// The plugin's costume matching, run here: tests in the plugin crate never run.
 #[cfg(test)]
-#[path = "../plugins/slight_replica/src/slight/hitbox_viewer/costume_scope.rs"]
+#[path = "../plugins/slight_replica/src/slight/costume_scope.rs"]
 mod plugin_costume_scope;
 
 #[cfg(test)]
@@ -8301,13 +8305,21 @@ mod tests {
                     "version": 1,
                     "seq": 2,
                     "values": [{
-                        "binding_id": "fixture.cloud.limit_work",
+                        "binding_id": "meter.cloud.0",
                         "fighter": "cloud",
                         "entry_id": 0,
                         "boid": 0,
                         "symbol": "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE",
                         "kind": "work_float",
                         "value": { "float": 47.5 }
+                    }, {
+                        "binding_id": "meter.cloud#c08.0",
+                        "fighter": "cloud",
+                        "entry_id": 1,
+                        "boid": 1,
+                        "symbol": "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE",
+                        "kind": "work_float",
+                        "value": { "float": 12.0 }
                     }]
                 }
             }),
@@ -8317,6 +8329,14 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].boid, 0);
         assert_eq!(values[0].value, LiveGimmickMeterValue::Float(47.5));
+        // A character made on Cloud shows its own meter's players only, and Cloud never shows
+        // theirs.
+        let made = link.gimmick_meter_values(
+            "cloud#c08",
+            "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE",
+        );
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].value, LiveGimmickMeterValue::Float(12.0));
 
         // Replayed and type-mismatched frames preserve the last good value.
         deliver(

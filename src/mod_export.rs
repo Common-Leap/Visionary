@@ -229,8 +229,8 @@ pub fn plan_normal_export(
         .unwrap_or_default();
     let has_acmd_source = ordinary_source.is_some();
 
-    // Gimmicks are kept per character: a made character's runs on its own costumes beside its
-    // fighter's, which never runs on the made character's costumes.
+    // Gimmicks and meters are kept per character: a made character's run on its own costumes
+    // beside its fighter's, which never run on the made character's costumes.
     let graphs = gimmick_owners(project)
         .map(|(key, edits)| (key, edits.behavior.clone()))
         .collect();
@@ -239,11 +239,9 @@ pub fn plan_normal_export(
             (!edits.controller_charts.is_empty()).then_some((key, edits.controller_charts.clone()))
         })
         .collect();
-    let meters = project
-        .fighters
-        .iter()
-        .filter_map(|(fighter, edits)| {
-            (!edits.meters.is_empty()).then_some((fighter.clone(), edits.meters.clone()))
+    let meters = gimmick_owners(project)
+        .filter_map(|(key, edits)| {
+            (!edits.meters.is_empty()).then_some((key, edits.meters.clone()))
         })
         .collect();
     let artifact = crate::gimmicks::adapter::render_with_controllers(

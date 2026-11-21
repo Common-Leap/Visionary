@@ -1,4 +1,4 @@
-//! Which costumes of its fighter a live rule runs on.
+//! Which costumes of its fighter a live rule or a meter runs on.
 //!
 //! A character made in the editor shares its donor's fighter kind and owns some of its costumes,
 //! so a rule names costumes as well as a fighter. Plain std only: the editor's tests include

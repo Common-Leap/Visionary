@@ -294,10 +294,13 @@ impl RosterWindow {
             return;
         }
         self.initialized = true;
-        self.library = library::load();
+        let (loaded, tidied) = library::load();
+        self.library = loaded;
         let adopted = library::adopt_legacy_roots(&mut self.library, legacy_roots);
         if !adopted.is_empty() {
             self.status = format!("Adopted {} existing mod root(s).", adopted.len());
+        }
+        if tidied || !adopted.is_empty() {
             self.library_dirty = true;
             library::save(&self.library);
         }
@@ -929,10 +932,11 @@ impl RosterWindow {
             NewCharacterAction::Remove(key) => {
                 let name = self.shown_name(&key).unwrap_or_else(|| key.to_string());
                 // Older versions installed its folder as a mod; that goes too, or the
-                // character's files would still load and ship. Its place among this project's
-                // roots goes on the next frame (see `set_project_dir`).
+                // character's files would still load and ship, and so does the library's note
+                // that the folder is the project's. Its place among this project's roots goes
+                // on the next frame (see `set_project_dir`).
                 if let Some(folder) = self.made_root(&key) {
-                    if self.library.release_project_folders(&[folder]) {
+                    if self.library.forget_project_folder(&folder) {
                         self.commit_library_change();
                     }
                 }

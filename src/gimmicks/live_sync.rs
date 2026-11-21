@@ -692,6 +692,7 @@ mod tests {
         let start = source
             .find(&format!("\nfn {name}("))
             .or_else(|| source.find(&format!("\npub(super) fn {name}(")))
+            .or_else(|| source.find(&format!("\npub(crate) fn {name}(")))
             .unwrap_or_else(|| panic!("plugin has no fn {name}"));
         let rest = &source[start + 1..];
         let end = rest.find("\n}\n").map_or(rest.len(), |end| end + 3);

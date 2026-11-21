@@ -532,7 +532,10 @@ impl GimmicksEditor {
                             self.operations.ui(ui, &context.fighter, data.link);
                         }
                     }
-                    Section::Meters => self.meter.ui(ui, &context.fighter, data.meters, data.link),
+                    Section::Meters => {
+                        self.meter
+                            .ui(ui, &context.fighter, key, data.meters, data.link)
+                    }
                 }
                 if let Err(error) = saved.validate_change(&context.fighter, &mut data) {
                     self.status = error;
