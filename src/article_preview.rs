@@ -740,6 +740,7 @@ pub struct ResolvedArticleInputs<'a> {
 
 /// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
 /// one of the object's game scripts by name ("Regular"), or nothing.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_kind(
     fighter_dir: &Path,
     param_path: &Path,

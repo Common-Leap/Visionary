@@ -5634,6 +5634,7 @@ impl AcmdScript {
 
     /// Objects the move creates (true) or removes (false), as (script frame, article symbol,
     /// created), in running order.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_spawns(&self) -> Vec<(u32, String, bool)> {
         article_spawns(&self.walk().article_calls)
     }
@@ -5650,16 +5651,19 @@ impl AcmdScript {
     }
 
     /// Objects the move throws, as (script frame, article symbol), in running order.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_shots(&self) -> Vec<(u32, String)> {
         article_shots(&self.walk().article_calls)
     }
 
     /// Motions the move gives its objects, as (script frame, article symbol, motion).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_motions(&self) -> Vec<(u32, String, String)> {
         article_motions(&self.walk().article_calls)
     }
 
     /// Objects the move shows (true) or hides (false), as (script frame, article symbol, shown).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn to_article_visibility(&self) -> Vec<(u32, String, bool)> {
         article_visibility(&self.walk().article_calls)
     }
@@ -7315,6 +7319,7 @@ fn record_native_article_call(
 }
 
 /// Objects created (true) or removed (false): (script frame, symbol, created).
+#[cfg_attr(not(test), allow(dead_code))]
 fn article_spawns(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
     calls
         .iter()
@@ -7330,6 +7335,7 @@ fn article_spawns(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
 }
 
 /// Objects thrown (`shoot` / `shoot_exist`): (script frame, symbol).
+#[cfg_attr(not(test), allow(dead_code))]
 fn article_shots(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String)> {
     calls
         .iter()
@@ -7340,6 +7346,7 @@ fn article_shots(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String)> {
 
 /// Motions given to objects by name (`change_motion(.., Hash40::new("m"), ..)`):
 /// (script frame, symbol, motion).
+#[cfg_attr(not(test), allow(dead_code))]
 fn article_motions(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, String)> {
     calls
         .iter()
@@ -7356,6 +7363,7 @@ fn article_motions(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, String)> {
 }
 
 /// Objects shown (true) or hidden (false) whole: (script frame, symbol, shown).
+#[cfg_attr(not(test), allow(dead_code))]
 fn article_visibility(calls: &[(u32, ArticleCall)]) -> Vec<(u32, String, bool)> {
     calls
         .iter()
