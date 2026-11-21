@@ -130,6 +130,7 @@ pub fn object_rows(catalog: &ArticleCatalog) -> Vec<ObjectRow> {
             if let Some(note) = &article.id_note {
                 warnings.push(format!("Visionary can't follow this object's id: {note}"));
             }
+            warnings.extend(article.clone_conflicts.iter().cloned());
             if let ArticleOrigin::Clone(decl) = &article.origin {
                 if let Some(entry) = clone_compat::lookup(&decl.src_kind) {
                     if entry.can_clone == Some(false) {
@@ -176,6 +177,7 @@ pub fn clone_notes(article: &Article) -> Vec<String> {
         decl.line,
         if decl.use_original_code { ", running the original's code" } else { "" }
     )];
+    out.extend(article.clone_conflicts.iter().cloned());
     for (file, line) in &article.also_declared {
         out.push(format!("Also declared at {}:{line}, by another `clone_weapon` call for the same object", file.display()));
     }
@@ -713,6 +715,7 @@ mod tests {
             conflicts: vec![],
             id_note: None,
             also_declared: vec![],
+            clone_conflicts: vec![],
         }
     }
 
@@ -735,6 +738,7 @@ mod tests {
             conflicts: vec![],
             id_note: None,
             also_declared: vec![],
+            clone_conflicts: vec![],
         }
     }
 

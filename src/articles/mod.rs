@@ -47,6 +47,9 @@ pub struct Article {
     /// For a clone: the other `clone_weapon` calls (file, line) that declare this same article,
     /// such as a vendored copy of the crate. The first call is the one in `origin`.
     pub also_declared: Vec<(std::path::PathBuf, usize)>,
+    /// For a clone declared more than once from different sources: one sentence per other
+    /// declaration, naming both sources and where each is. The first declaration is `origin`.
+    pub clone_conflicts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,19 +134,56 @@ impl ArticleCatalog {
                 conflicts,
                 id_note: None,
                 also_declared: Vec::new(),
+                clone_conflicts: Vec::new(),
             });
         }
         for decl in clones {
             let name = decl.new_name.to_lowercase();
             let agent = format!("{fighter}_{name}");
             // The same article declared again (HDR's vendored crate beside its port) is one
-            // article; the other calls are kept on it.
+            // article; the other calls are kept on it. Declared again from a different source,
+            // it is still one object in game, but which source wins is not known: say so.
             if let Some(first) = articles.iter_mut().find(|a| a.agent == agent) {
                 first.also_declared.push((decl.file.clone(), decl.line));
+                let ArticleOrigin::Clone(kept) = &mut first.origin else { continue };
+                let source = |d: &CloneDecl| {
+                    format!(
+                        "{}/{}{}",
+                        d.src_owner.as_deref().unwrap_or("?"),
+                        d.src_kind,
+                        if d.use_original_code { " with its original code" } else { "" }
+                    )
+                };
+                if (&kept.src_owner, &kept.src_kind, kept.use_original_code)
+                    != (&decl.src_owner, &decl.src_kind, decl.use_original_code)
+                {
+                    first.clone_conflicts.push(format!(
+                        "Declared as a clone of {} at {}:{} and of {} at {}:{}; Visionary shows the first",
+                        source(kept),
+                        kept.file.display(),
+                        kept.line,
+                        source(decl),
+                        decl.file.display(),
+                        decl.line
+                    ));
+                    continue;
+                }
                 for binding in &decl.id_bindings {
                     if !first.id_symbols.contains(binding) {
                         first.id_symbols.push(binding.clone());
                     }
+                    if !kept.id_bindings.contains(binding) {
+                        kept.id_bindings.push(binding.clone());
+                    }
+                }
+                for binding in &decl.kind_bindings {
+                    if !kept.kind_bindings.contains(binding) {
+                        kept.kind_bindings.push(binding.clone());
+                    }
+                }
+                if !first.id_symbols.is_empty() {
+                    first.id_note = None;
+                    kept.id_note = None;
                 }
                 continue;
             }
@@ -158,6 +198,7 @@ impl ArticleCatalog {
                 conflicts,
                 id_note: decl.id_note.clone(),
                 also_declared: Vec::new(),
+                clone_conflicts: Vec::new(),
             });
         }
         Self { articles, unresolved_clones: unresolved }
@@ -478,6 +519,47 @@ pub fn install() {
     /// `mario/model/hugeflame`; Toad-Moveset · plugin/src/toad/acmd/ground.rs:231 spawns
     /// `*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET` (0x0) for `murabito/model/bullet`
     /// (both tier 1, smashline2).
+    /// R20: two declarations of one clone from different sources are a conflict, kept with both;
+    /// from the same source, their bindings merge.
+    #[test]
+    fn a_clone_declared_from_two_sources_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = decl("packun", "firebreath", &[], Some("unbound"));
+        let b = CloneDecl {
+            src_kind: "WEAPON_KIND_KOOPA_BREATH".into(),
+            src_owner: Some("koopa".into()),
+            file: PathBuf::from("vendor/lib.rs"),
+            line: 101,
+            ..a.clone()
+        };
+        let c = ArticleCatalog::build("packun", None, &[a.clone(), b], vec![], tmp.path());
+        assert_eq!(c.articles.len(), 1);
+        let article = &c.articles[0];
+        assert_eq!(article.origin, ArticleOrigin::Clone(a.clone()));
+        assert_eq!(article.clone_conflicts.len(), 1);
+        let note = &article.clone_conflicts[0];
+        assert!(note.contains("mario/WEAPON_KIND_MARIO_FIREBALL") && note.contains("koopa/WEAPON_KIND_KOOPA_BREATH"), "{note}");
+        assert!(note.contains("lib.rs:1") && note.contains("vendor/lib.rs:101"), "{note}");
+        assert!(crate::articles::view::clone_notes(article).iter().any(|n| n == note));
+
+        let same = CloneDecl {
+            id_bindings: vec!["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH".into()],
+            kind_bindings: vec!["WEAPON_KIND_PACKUN_FIREBREATH".into()],
+            id_note: None,
+            file: PathBuf::from("vendor/lib.rs"),
+            line: 101,
+            ..a.clone()
+        };
+        let c = ArticleCatalog::build("packun", None, &[a, same], vec![], tmp.path());
+        let article = &c.articles[0];
+        assert!(article.clone_conflicts.is_empty());
+        assert_eq!(article.id_symbols, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
+        assert_eq!(article.id_note, None);
+        let ArticleOrigin::Clone(kept) = &article.origin else { panic!() };
+        assert_eq!(kept.kind_bindings, ["WEAPON_KIND_PACKUN_FIREBREATH"]);
+        assert_eq!(kept.id_bindings, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
+    }
+
     #[test]
     fn resolves_the_games_own_spellings() {
         let c = named("mario", "hugeflame");
