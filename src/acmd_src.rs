@@ -1697,12 +1697,17 @@ fn fighter_for_file(
             // fighter's own scripts, and one declaring only articles doesn't own its other
             // files at all: keep walking to the module that names the fighter. A folder
             // named for the mod (`emperte/`) rather than the fighter is then still Falco's.
-            let fighters: Vec<&String> = names.iter().filter(|name| !name.contains('_')).collect();
+            // `Agent::new("fighter")` / `("weapon")` is smashline's agent for every fighter or
+            // weapon: its registrations name it as their receiver, and it owns no module (King
+            // Boo's `status/` holds one beside the statuses it installs on `dedede`).
+            let generic = |name: &str| matches!(name, "fighter" | "weapon");
+            let fighters: Vec<&String> =
+                names.iter().filter(|name| !name.contains('_') && !generic(name)).collect();
             match fighters.as_slice() {
                 [] => {}
-                [fighter] if names
-                    .iter()
-                    .all(|name| *name == **fighter || name.starts_with(&format!("{fighter}_"))) =>
+                [fighter] if names.iter().all(|name| {
+                    *name == **fighter || name.starts_with(&format!("{fighter}_")) || generic(name)
+                }) =>
                 {
                     return Some((*fighter).clone());
                 }
@@ -2499,6 +2504,11 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                 continue;
             };
             let receiver = &text[statement_start(&boundaries, at)..at];
+            // `$agent.status($phase, $kind, …)` is the body of a `macro_rules!`: its invocations
+            // are the registrations (`noop_status!` ones are read below), not the template.
+            if args.iter().take(2).any(|arg| text[arg.clone()].trim_start().starts_with('$')) {
+                continue;
+            }
             match (marker, args.len()) {
                 (".status(", 3..) => out.push(StatusRegistration {
                     at,
@@ -18396,6 +18406,60 @@ pub fn install(agent: &mut smashline::Agent) {
         assert!(bodies.iter().any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
         assert!(bodies.iter().any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
         assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+    }
+
+    /// King-Boo-Moveset · src/kingteresa/mod.rs:47-52 hands `Agent::new("dedede")` to
+    /// `status::install(agent)`, and src/kingteresa/status/status_catched_portrait.rs:75 in that
+    /// module builds `Agent::new("fighter")` for a status every fighter gets (tier 1, smashline2).
+    /// The module's parameter registrations are still dedede's; the generic agent keeps its own.
+    #[test]
+    fn a_generic_fighter_agent_does_not_claim_the_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "kingteresa/mod.rs",
+            "mod status;\npub fn do_install() {\n    let agent = &mut smashline::Agent::new(\"dedede\");\n    status::install(agent);\n    agent.install();\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/mod.rs",
+            "mod status_attack_air;\nmod status_catched_portrait;\npub fn install(agent: &mut smashline::Agent) {\n    status_attack_air::install(agent);\n    status_catched_portrait::install(agent);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_attack_air.rs",
+            "unsafe extern \"C\" fn kingteresa_attack_air_status_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(agent: &mut smashline::Agent) {\n    agent.status(Pre, *FIGHTER_STATUS_KIND_ATTACK_AIR, kingteresa_attack_air_status_pre);\n}\n",
+        );
+        put(
+            root,
+            "kingteresa/status/status_catched_portrait.rs",
+            "unsafe extern \"C\" fn catched_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(_agent: &mut smashline::Agent) {\n    Agent::new(\"fighter\")\n        .status(Pre, FIGHTER_STATUS_KIND_CATCHED_KINGTERESA_PORTRAIT, catched_pre)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        let dedede = index.status_bodies("dedede");
+        assert_eq!(dedede.len(), 1, "{:?}", index.statuses);
+        assert_eq!(dedede[0].0.function, "kingteresa_attack_air_status_pre");
+        assert_eq!(index.status_bodies("fighter")[0].0.function, "catched_pre");
+    }
+
+    /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
+    /// `$( $agent.status($phase, $kind, $crate::empty_status_weapon); )+` (tier 1, smashline2).
+    /// The template is not a registration; each invocation is listed as a no-op.
+    #[test]
+    fn a_macro_rules_body_is_not_a_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(
+            root,
+            "util.rs",
+            "#[macro_export]\nmacro_rules! noop_status {\n    ($agent:expr, $kind:expr, [$($phase:expr),+ $(,)?]) => {\n        $( $agent.status($phase, $kind, $crate::empty_status_weapon); )+\n    };\n}\npub fn install() {\n    let agent = &mut Agent::new(\"mario_bulletseed\");\n    noop_status!(agent, *WEAPON_SIMON_AXE_STATUS_KIND_HAVED, [Pre, Main]);\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        let unresolved = &index.unresolved_statuses;
+        assert_eq!(unresolved.len(), 2, "{unresolved:?}");
+        assert!(unresolved.iter().all(|u| u.reason.contains("noop_status!") && u.kind_expr.starts_with('*')));
     }
 
     /// Closures, `noop_status!` (Shy Guy has eight) and a parameter nobody installs are not
