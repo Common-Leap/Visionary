@@ -679,6 +679,8 @@ struct ArticleCache {
     catalog: crate::articles::ArticleCatalog,
     /// Article calls in the fighter's own status code, read-only.
     status_rows: Vec<crate::articles::view::StatusCallRow>,
+    /// Preview spawn plans parsed from the fighter's status bodies, paired with their status kind.
+    status_spawns: Vec<(String, crate::article_preview::SpawnPlan)>,
     /// Status registrations the index could not place, for the fighter or its objects.
     unresolved_statuses: Vec<crate::acmd_src::UnresolvedStatus>,
     /// The moveset's `param_config` overrides for this fighter.
@@ -10775,6 +10777,7 @@ impl VisionaryApp {
         &mut self,
         frame: &eframe::Frame,
     ) -> Vec<crate::article_preview::PlacedObject> {
+        self.ensure_article_catalog();
         self.object_loads.retain(|rx| match rx.try_recv() {
             Ok((key, kind)) => {
                 self.object_pending.remove(&key);
@@ -10792,6 +10795,64 @@ impl VisionaryApp {
         else {
             return Vec::new();
         };
+        // When an article's own script is open from the Objects panel, display that article
+        // directly at the origin playing its open script's motion so its 3D model, skeleton,
+        // live editable hitboxes, and effects all appear in the viewport.
+        if let Some(open_name) = self.open_article_name(&fighter) {
+            let Some(mut kind) = self.object_kind(&fighter, &open_name) else {
+                return Vec::new();
+            };
+            if let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) {
+                kind = self.object_in_motion(&fighter, &open_name, kind, &move_name);
+            }
+            if self.state.total_frames == 0 {
+                let anim_frames = kind
+                    .anim
+                    .as_ref()
+                    .map(|a| a.final_frame_index.max(0.0).ceil() as u32 + 1)
+                    .unwrap_or(0);
+                let hitbox_end = self
+                    .state
+                    .hitboxes
+                    .iter()
+                    .map(|hb| hb.active_end)
+                    .filter(|&end| end < 9000)
+                    .max()
+                    .unwrap_or(0);
+                let effect_end = self
+                    .state
+                    .effects
+                    .iter()
+                    .map(|ec| ec.active_end)
+                    .filter(|&end| end < 9000)
+                    .max()
+                    .unwrap_or(0);
+                let life = if kind.flight.life.is_finite() && kind.flight.life > 0.0 {
+                    kind.flight.life.round() as u32
+                } else {
+                    0
+                };
+                self.state.total_frames = anim_frames
+                    .max(hitbox_end)
+                    .max(effect_end)
+                    .max(life)
+                    .max(60);
+            }
+            let scale = if kind.scale.is_finite() && kind.scale > 0.0 {
+                kind.scale
+            } else {
+                1.0
+            };
+            return vec![crate::article_preview::PlacedObject {
+                kind,
+                spawned: 1,
+                removed: None,
+                shot: None,
+                hand: None,
+                age: animation_frame_for_game_frame(self.state.current_frame),
+                placement: glam::Mat4::from_scale(glam::Vec3::splat(scale)),
+            }];
+        }
         let mut spawns: Vec<crate::article_preview::Spawn> = Vec::new();
         // Objects are spawned from any of the move's scripts; Fox draws his blaster in the
         // expression script. Use the typed ArticleCall stream so remove/shoot/visibility/motion
@@ -10805,7 +10866,7 @@ impl VisionaryApp {
             .map(|(f, call)| (*f, call))
             .collect();
         let empty_locals: HashMap<String, String> = HashMap::new();
-        let plans = crate::article_preview::plan_spawns_from_calls(&call_refs, &|call| {
+        let mut plans = crate::article_preview::plan_spawns_from_calls(&call_refs, &|call| {
             self.article_catalog
                 .as_ref()
                 .filter(|cache| cache.fighter == fighter.name)
@@ -10813,6 +10874,47 @@ impl VisionaryApp {
                 .map(|article| article.name.clone())
                 .or_else(|| crate::article_preview::article_name(&call.article))
         });
+        // Also pick up project-defined wrapper spawn calls (e.g. Sceptile's
+        // `generate_sceptile_article(..., ArticleKind::LeafStorm)` and Shy Guy's
+        // `generate_stacked_article(..., ArticleKind::Pellet)`) and cached status-code spawns
+        // when the catalog is ready.
+        if let Some(cache) = self
+            .article_catalog
+            .as_ref()
+            .filter(|cache| cache.fighter == fighter.name)
+        {
+            for script in [
+                &self.state.script,
+                &self.state.expression_script,
+                &self.state.sound_script,
+            ] {
+                for plan in crate::article_preview::plan_wrapper_spawns_from_script(
+                    script,
+                    &cache.catalog,
+                    self.acmd_src.as_ref(),
+                ) {
+                    if !plans
+                        .iter()
+                        .any(|p| p.name == plan.name && p.spawned == plan.spawned)
+                    {
+                        plans.push(plan);
+                    }
+                }
+            }
+            if let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.as_str()) {
+                for (status, plan) in &cache.status_spawns {
+                    if !crate::articles::view::status_matches_move(status, move_name) {
+                        continue;
+                    }
+                    if !plans
+                        .iter()
+                        .any(|p| p.name == plan.name && p.motion == plan.motion)
+                    {
+                        plans.push(plan.clone());
+                    }
+                }
+            }
+        }
         for plan in plans {
             let Some(mut kind) = self.object_kind(&fighter, &plan.name) else {
                 continue;
@@ -11134,6 +11236,53 @@ impl VisionaryApp {
         out
     }
 
+    /// The moveset's own `romfs/` directories: `<index root>/romfs`, `<index root>/../romfs`
+    /// (for crates nested under `plugin/` such as Shy Guy and Sceptile), and the open project's
+    /// `romfs/`.
+    fn acmd_romfs_roots(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut push_unique = |dir: PathBuf| {
+            if dir.is_dir() && !out.contains(&dir) {
+                out.push(dir);
+            }
+        };
+        if let Some(index) = self.acmd_src.as_ref() {
+            push_unique(index.root.join("romfs"));
+            if let Some(parent) = index.root.parent() {
+                push_unique(parent.join("romfs"));
+            }
+        }
+        if let Some(romfs) = self.project_romfs() {
+            push_unique(romfs);
+        }
+        out
+    }
+
+    /// The costume slot currently viewed for `fighter` (for slot characters like Latios c32,
+    /// Shy Guy c40, Sceptile c40).
+    fn active_article_slot(&self, fighter: &crate::data::FighterEntry) -> u8 {
+        if fighter.slots.is_empty() || fighter.slots.contains(&self.workspace_asset_slot) {
+            self.workspace_asset_slot
+        } else {
+            fighter.base_slot()
+        }
+    }
+
+    /// Short article name (`"lativolt"`, `"bulletseed"`, `"trampoline"`) when an article script
+    /// is open from the Objects panel.
+    fn open_article_name(&self, fighter: &crate::data::FighterEntry) -> Option<String> {
+        let agent = self.open_article.as_deref()?;
+        if let Some(article) = self
+            .article_catalog
+            .as_ref()
+            .and_then(|cache| cache.catalog.get(agent))
+        {
+            return Some(article.name.clone());
+        }
+        let prefix = format!("{}_", fighter.name);
+        Some(agent.strip_prefix(&prefix).unwrap_or(agent).to_owned())
+    }
+
     /// A fighter object's kind if it is loaded; otherwise starts loading it on a thread and
     /// returns `None` (the viewport repaints until it arrives).
     fn object_kind(
@@ -11141,7 +11290,8 @@ impl VisionaryApp {
         fighter: &crate::data::FighterEntry,
         name: &str,
     ) -> Option<std::sync::Arc<crate::article_preview::ObjectKind>> {
-        let key = format!("{}/{name}", fighter.name);
+        let slot = self.active_article_slot(fighter);
+        let key = format!("{}/c{slot:02}/{name}", fighter.name);
         match self.object_kinds.get(&key) {
             Some(kind) => kind.clone(),
             None => {
@@ -11205,13 +11355,7 @@ impl VisionaryApp {
                         .map(|cache| cache.overrides.clone())
                         .unwrap_or_default();
                     let mut extra_fighter_dirs: Vec<PathBuf> = Vec::new();
-                    if let Some(index) = self.acmd_src.as_ref() {
-                        let dir = index.root.join("romfs").join("fighter").join(&owner);
-                        if dir.is_dir() {
-                            extra_fighter_dirs.push(dir);
-                        }
-                    }
-                    if let Some(romfs) = self.project_romfs() {
+                    for romfs in self.acmd_romfs_roots() {
                         let dir = romfs.join("fighter").join(&owner);
                         if dir.is_dir() && !extra_fighter_dirs.contains(&dir) {
                             extra_fighter_dirs.push(dir);
@@ -11275,7 +11419,7 @@ impl VisionaryApp {
                         let kind = crate::article_preview::load_kind_resolved(
                             &fighter.fighter_dir,
                             &fighter.param_path,
-                            fighter.base_slot(),
+                            slot,
                             &name,
                             &labels,
                             &inputs,
@@ -11305,7 +11449,8 @@ impl VisionaryApp {
     }
 
     /// `kind` playing `motion` (by name) when it has one, placed by that motion's own space;
-    /// `kind` unchanged otherwise.
+    /// also loads motion-specific hitboxes/effects from the moveset source when available (for
+    /// multi-use carriers like Shy Guy's trampoline). `kind` unchanged otherwise.
     fn object_in_motion(
         &mut self,
         fighter: &crate::data::FighterEntry,
@@ -11313,20 +11458,48 @@ impl VisionaryApp {
         kind: std::sync::Arc<crate::article_preview::ObjectKind>,
         motion: &str,
     ) -> std::sync::Arc<crate::article_preview::ObjectKind> {
-        let key = format!("{}/{name}@{motion}", fighter.name);
+        let slot = self.active_article_slot(fighter);
+        let key = format!("{}/c{slot:02}/{name}@{motion}", fighter.name);
         if let Some(Some(cached)) = self.object_kinds.get(&key) {
             return cached.clone();
         }
         let hash = hash40::hash40(motion).0;
-        let Some((_, anim)) = kind.motions.iter().find(|(m, _)| *m == hash) else {
+        let anim = kind
+            .motions
+            .iter()
+            .find(|(m, _)| *m == hash)
+            .map(|(_, a)| a.clone());
+        let agent = format!("{}_{name}", fighter.name);
+        let motion_body = self
+            .acmd_src
+            .as_ref()
+            .and_then(|index| index.script_source(&agent, motion))
+            .map(|p| p.body)
+            .filter(|b| !b.trim().is_empty());
+        if anim.is_none() && motion_body.is_none() {
             return kind;
+        }
+        let (hitboxes, effects) = match motion_body {
+            Some(body) => {
+                let hbs = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+                let effs = crate::article_preview::object_effects(&body);
+                (
+                    if hbs.is_empty() { kind.hitboxes.clone() } else { hbs },
+                    if effs.is_empty() { kind.effects.clone() } else { effs },
+                )
+            }
+            None => (kind.hitboxes.clone(), kind.effects.clone()),
         };
-        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
-            anim: Some(anim.clone()),
-            synced: kind
-                .skel
+        let synced = anim.as_deref().is_some_and(|a| {
+            kind.skel
                 .as_deref()
-                .is_some_and(|skel| crate::article_preview::plays_in_fighter_space(skel, anim)),
+                .is_some_and(|skel| crate::article_preview::plays_in_fighter_space(skel, a))
+        });
+        let playing = std::sync::Arc::new(crate::article_preview::ObjectKind {
+            anim: anim.or_else(|| kind.anim.clone()),
+            hitboxes,
+            effects,
+            synced,
             ..(*kind).clone()
         });
         self.object_kinds.insert(key, Some(playing.clone()));
@@ -11738,9 +11911,20 @@ impl VisionaryApp {
                 .borrow_mut()
                 .entry(game_frame)
                 .or_insert_with(|| {
-                    std::rc::Rc::new(
-                        rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
-                    )
+                    if self.open_article.is_some() {
+                        let map = if let Some(object) = objects.first() {
+                            let mut probe = object.clone();
+                            probe.age = animation_frame_for_game_frame(game_frame);
+                            crate::article_preview::object_bones(&probe)
+                        } else {
+                            HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
+                        };
+                        std::rc::Rc::new(map)
+                    } else {
+                        std::rc::Rc::new(
+                            rs.bone_world_matrices_at(animation_frame_for_game_frame(game_frame)),
+                        )
+                    }
                 })
                 .clone()
         };
@@ -11834,8 +12018,9 @@ impl VisionaryApp {
             }
         }
         // Objects' own effects, on the object's bones at each age. Many projectiles have no
-        // mesh and these are all the game shows of them.
-        for object in objects {
+        // mesh and these are all the game shows of them. Skip when an article's own script is
+        // open, because `self.state.effects` above already renders its live editable effects.
+        for object in objects.iter().filter(|_| self.open_article.is_none()) {
             let object_frame = object.age.floor() as u32 + 1;
             let object_at = |age_frame: u32| {
                 let at = object.spawned + age_frame.saturating_sub(1);
@@ -12107,6 +12292,7 @@ impl VisionaryApp {
                     // A camera animation places the camera in the world itself.
                     let animated = self.camera_anim_on && self.camera_anim.is_some();
                     rs.camera.follow = if animated
+                        || self.open_article.is_some()
                         || (self.eff_editor.open
                             && self.eff_editor.view == crate::eff_editor::EffectView::Alone
                             && self.eff_editor.selected_entry_name().is_some())
@@ -12232,6 +12418,7 @@ impl VisionaryApp {
                         self.preview_trails(frame)
                     },
                     hide_body: alone
+                        || self.open_article.is_some()
                         || objects
                             .iter()
                             .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
@@ -12273,7 +12460,16 @@ impl VisionaryApp {
                     // `last_frame` is one paint behind. Evaluate the requested frame
                     // directly to keep moving bones/root motion and grabboxes synchronized.
                     let t = self.perf.start();
-                    let bone_matrices = rs.bone_world_matrices_at(animation_frame);
+                    let bone_matrices = if self.open_article.is_some() {
+                        objects
+                            .first()
+                            .map(crate::article_preview::object_bones)
+                            .unwrap_or_else(|| {
+                                HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)])
+                            })
+                    } else {
+                        rs.bone_world_matrices_at(animation_frame)
+                    };
                     self.perf.end("bone_matrices", t);
                     // Keep a positions map for debug display
                     let bone_positions: std::collections::HashMap<String, glam::Vec3> =
@@ -12329,6 +12525,7 @@ impl VisionaryApp {
                     // Parameter-defined hurtboxes sit underneath editable collision geometry,
                     // so attacks, grabs, wind areas, and effect markers remain easy to select.
                     if self.show_hurtboxes
+                        && self.open_article.is_none()
                         && self.hurtbox_volumes.iter().any(|volume| {
                             matches!(volume.shape, crate::data::HurtboxShape::Capsule)
                         })
@@ -12420,10 +12617,18 @@ impl VisionaryApp {
                         }
                     }
 
-                    // Each object's own hitboxes, on the object's bones.
-                    for object in &objects {
+                    // Each object's own hitboxes, on the object's bones. When an article script
+                    // is open directly, `self.state.hitboxes` below draws its live editable
+                    // hitboxes on the article's bones instead.
+                    for object in objects.iter().filter(|_| self.open_article.is_none()) {
                         let bones = crate::article_preview::object_bones(object);
-                        let (_, facing, _) = object.placement.to_scale_rotation_translation();
+                        let (obj_scale, facing, _) =
+                            object.placement.to_scale_rotation_translation();
+                        let scale_factor = if obj_scale.x.is_finite() && obj_scale.x > 0.0 {
+                            obj_scale.x
+                        } else {
+                            1.0
+                        };
                         let object_frame = object.age.floor() as u32 + 1;
                         let mut label_at = None;
                         for hb in &object.kind.hitboxes {
@@ -12444,7 +12649,8 @@ impl VisionaryApp {
                             let bone = if is_system_bone(&hb.bone_name)
                                 || !bones.contains_key(&hb.bone_name)
                             {
-                                glam::Mat4::from_rotation_translation(
+                                glam::Mat4::from_scale_rotation_translation(
+                                    glam::Vec3::splat(scale_factor),
                                     facing,
                                     bone.col(3).truncate(),
                                 )
@@ -12468,7 +12674,7 @@ impl VisionaryApp {
                                 ProjectedCapsule {
                                     world_start: start,
                                     world_end: end,
-                                    world_radius: hb.size,
+                                    world_radius: hb.size * scale_factor,
                                     stroke,
                                     fill,
                                 },
@@ -12631,12 +12837,28 @@ impl VisionaryApp {
                             .copied()
                             .unwrap_or(glam::Mat4::IDENTITY);
 
+                        let (hitbox_model_scale, hitbox_collision_scale) =
+                            if self.open_article.is_some() {
+                                let s = objects
+                                    .first()
+                                    .map(|o| {
+                                        if o.kind.scale.is_finite() && o.kind.scale > 0.0 {
+                                            o.kind.scale
+                                        } else {
+                                            1.0
+                                        }
+                                    })
+                                    .unwrap_or(1.0);
+                                (s, s)
+                            } else {
+                                (rs.model_scale(), viewport_scales.collision(hb.category))
+                            };
                         let (world_pos, capsule_world_end, world_radius) =
                             collision_world_placement(
                                 bone_mat,
                                 hb,
-                                rs.model_scale(),
-                                viewport_scales.collision(hb.category),
+                                hitbox_model_scale,
+                                hitbox_collision_scale,
                             );
                         let launch_center = capsule_world_end
                             .map(|world_end| (world_pos + world_end) * 0.5)
@@ -20505,6 +20727,27 @@ impl VisionaryApp {
                     let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
                     let bodies = index.status_bodies(&fighter);
                     let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
+                    let mut status_spawns: Vec<(String, crate::article_preview::SpawnPlan)> =
+                        Vec::new();
+                    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+                    for (site, body) in &bodies {
+                        let file_text = file_cache
+                            .entry(site.file.clone())
+                            .or_insert_with(|| std::fs::read_to_string(&site.file).unwrap_or_default());
+                        for plan in crate::article_preview::plan_spawns_from_status_body(
+                            body,
+                            Some(file_text.as_str()),
+                            &catalog,
+                            Some(index),
+                        ) {
+                            if !status_spawns
+                                .iter()
+                                .any(|(s, p)| s == &site.kind_expr && p.name == plan.name && p.motion == plan.motion)
+                            {
+                                status_spawns.push((site.kind_expr.clone(), plan));
+                            }
+                        }
+                    }
                     let agents: Vec<&str> = std::iter::once(fighter.as_str())
                         .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
                         .collect();
@@ -20516,7 +20759,7 @@ impl VisionaryApp {
                         .collect();
                     let (overrides, unread_overrides) =
                         crate::articles::param_overrides_for(index, &fighter, &names);
-                    (catalog, rows, unresolved, overrides, unread_overrides)
+                    (catalog, rows, status_spawns, unresolved, overrides, unread_overrides)
                 }
                 None => (
                     crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
@@ -20524,9 +20767,17 @@ impl VisionaryApp {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
             }));
-            let (catalog, status_rows, unresolved_statuses, overrides, unread_overrides) = match read {
+            let (
+                catalog,
+                status_rows,
+                status_spawns,
+                unresolved_statuses,
+                overrides,
+                unread_overrides,
+            ) = match read {
                 Ok(read) => read,
                 Err(panic) => {
                     let reason = panic
@@ -20550,6 +20801,7 @@ impl VisionaryApp {
                 fingerprint,
                 catalog,
                 status_rows,
+                status_spawns,
                 unresolved_statuses,
                 overrides,
                 unread_overrides,
@@ -20589,13 +20841,7 @@ impl VisionaryApp {
                 layers.push(param_dir(&root).join(name));
             }
         }
-        let own_roots: Vec<PathBuf> = self
-            .acmd_src
-            .as_ref()
-            .map(|index| index.root.join("romfs"))
-            .into_iter()
-            .chain(self.project_romfs())
-            .collect();
+        let own_roots = self.acmd_romfs_roots();
         let own = own_param_files(owner, &own_roots, &self.shared_roots());
         layers.retain(|file| file.exists() && !own.contains(file));
         layers.extend(own.iter().cloned());
