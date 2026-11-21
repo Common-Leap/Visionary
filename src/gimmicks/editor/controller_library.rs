@@ -133,12 +133,11 @@ impl ControllerLibrary {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Name");
                     ui.add(egui::TextEdit::singleline(&mut self.target_id).desired_width(180.0).char_limit(48));
-                    if ui.button("Add gimmick").on_hover_text("Adds this as one more gimmick; the ones you have stay. It runs in the game right away.").clicked() {
+                    if ui.button("Add gimmick").on_hover_text("Adds this as one more gimmick; the ones you have stay. It runs in the game right away. It keeps its own values. Save the project after adding.").clicked() {
                         requested = Some((asset.clone(), self.target_id.clone()));
                     }
                     cancel = ui.small_button("Cancel").clicked();
                 });
-                ui.weak("It keeps its own values. Save the project after adding.");
             });
         }
         if cancel {

@@ -183,9 +183,12 @@ impl GimmicksEditor {
         if let Some(id) = self.pending_chart_delete.clone() {
             ui.group(|ui| {
                 ui.label(format!("Delete gimmick {id}?"));
-                ui.weak("Removes its rules. Other gimmicks stay as they are.");
                 ui.horizontal(|ui| {
-                    if ui.button("Delete gimmick").clicked() {
+                    if ui
+                        .button("Delete gimmick")
+                        .on_hover_text("Removes its rules. Other gimmicks stay as they are.")
+                        .clicked()
+                    {
                         command = Some(ChartCommand::Remove(id));
                     }
                     if ui.button("Cancel").clicked() {

@@ -2328,7 +2328,8 @@ impl EffEditor {
     /// The selected effect's emitters, with its texture and the game's live values below.
     pub fn page_right(&mut self, ui: &mut Ui, link: &GameLink) {
         if self.selected_entry.is_none() {
-            ui.weak("Pick an effect on the left to change how it looks.");
+            ui.weak("No effect selected")
+                .on_hover_text("Pick an effect on the left to change how it looks.");
             return;
         }
         // The texture of the part on the Look tab, and the game's view of the effect while one
@@ -2996,8 +2997,7 @@ impl EffEditor {
         // leaves the previous emitter's texture on screen, with working Replace buttons.
         self.selected_texture = None;
         let Some(entry_idx) = self.selected_entry else {
-            ui.colored_label(
-                egui::Color32::GRAY,
+            ui.colored_label(egui::Color32::GRAY, "No effect selected").on_hover_text(
                 "Pick an effect on the left to change how it looks. It plays in the view as you edit.",
             );
             return;
@@ -4338,12 +4338,11 @@ impl EffEditor {
 
         if users > 1 {
             ui.label(
-                egui::RichText::new(format!(
-                    "{users} parts share this texture — editing it changes all of them"
-                ))
-                .small()
-                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
-            );
+                egui::RichText::new(format!("{users} parts share this texture"))
+                    .small()
+                    .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
+            )
+            .on_hover_text("Editing it changes all of them.");
         }
     }
 
@@ -4683,12 +4682,9 @@ impl EffEditor {
             ui.label(
                 egui::RichText::new(format!("{} of {total} parts changed", edited.len())).small(),
             )
-            .on_hover_text(edited_names);
-            ui.label(
-                egui::RichText::new("Send edits, then trigger the move again.")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
+            .on_hover_text(format!(
+                "{edited_names}\nSend edits, then trigger the move again."
+            ));
         }
         // Texture replacements are file-wide, not per-entry, so they are listed here in full
         // rather than filtered to the selected effect — a replaced texture changes every
@@ -4731,12 +4727,11 @@ impl EffEditor {
         let Some(kind) = kind else {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(
-                    "Trigger the effect in game (training mode) to open its kind tab.",
-                )
-                .small()
-                .color(egui::Color32::DARK_GRAY),
-            );
+                egui::RichText::new("Not seen in the game yet")
+                    .small()
+                    .color(egui::Color32::DARK_GRAY),
+            )
+            .on_hover_text("Trigger the effect in game (training mode) to open its kind tab.");
             ui.separator();
             self.draw_transplant_section(ui, &entry_name);
             return;

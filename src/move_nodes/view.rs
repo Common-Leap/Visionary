@@ -458,15 +458,17 @@ impl NodeEditor {
         }
         node_edit_error(ui, &self.error);
         if !self.workspace {
-            ui.weak("Tracks replace move scripts.");
             if self.draft.tracks.is_empty() {
-                ui.label("Import a move to edit its timed nodes.");
+                ui.label("No tracks").on_hover_text(
+                    "Import a move to edit its timed nodes. Tracks replace move scripts.",
+                );
             } else {
                 self.track = self.track.min(self.draft.tracks.len() - 1);
                 let previous_track = self.track;
                 ui.horizontal_wrapped(|ui| {
                     for (index, track) in self.draft.tracks.iter().enumerate() {
-                        ui.selectable_value(&mut self.track, index, format!("{:?}", track.track));
+                        ui.selectable_value(&mut self.track, index, format!("{:?}", track.track))
+                            .on_hover_text("Tracks replace move scripts.");
                     }
                 });
                 if self.track != previous_track {
@@ -597,7 +599,9 @@ impl NodeEditor {
                     ui.weak("Opening field…");
                 }
                 if self.canvas.selected_node().is_none() {
-                    ui.weak("Drag blocks to arrange. Connect execution, event or matching Value ports. Select a block to edit.");
+                    ui.weak("No block selected").on_hover_text(
+                        "Drag blocks to arrange. Connect execution, event or matching Value ports. Select a block to edit.",
+                    );
                 }
             }
         }
@@ -641,8 +645,9 @@ impl NodeEditor {
                 } else if self.canvas.selected.is_none() {
                     self.story_ui(ui);
                     ui.separator();
-                    ui.weak("Click a block to edit it. Blocks run left to right, and wires show what runs next.");
-                    ui.weak("F  Fit · Space + drag  Pan\nShift + click / drag  Select group\nCtrl + D  Duplicate · Delete  Remove");
+                    ui.weak("No block selected").on_hover_text(
+                        "Click a block to edit it. Blocks run left to right, and wires show what runs next.\n\nF  Fit · Space + drag  Pan\nShift + click / drag  Select group\nCtrl + D  Duplicate · Delete  Remove",
+                    );
                 }
             }
             ui.separator();
@@ -753,7 +758,6 @@ impl NodeEditor {
         egui::CollapsingHeader::new("Code")
             .id_salt("block_code")
             .show(ui, |ui| {
-                ui.weak("The lines this block writes. Change them and press Use this code.");
                 if let Some((_, _, text)) = &mut self.code_edit {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -765,6 +769,12 @@ impl NodeEditor {
                     ui.horizontal(|ui| {
                         apply = ui
                             .add_enabled(changed, egui::Button::new("Use this code"))
+                            .on_hover_text(
+                                "The lines this block writes. Change them and press Use this code.",
+                            )
+                            .on_disabled_hover_text(
+                                "The lines this block writes. Change them and press Use this code.",
+                            )
                             .clicked();
                         if ui
                             .add_enabled(changed, egui::Button::new("Reset"))
@@ -821,7 +831,6 @@ impl NodeEditor {
             .collapsible(false)
             .default_width(420.0)
             .show(ui.ctx(), |ui| {
-                ui.label("Type a few lines of game code. Each line must be a call Visionary knows, so the block can update live.");
                 ui.add(
                     egui::TextEdit::multiline(text)
                         .code_editor()
@@ -836,7 +845,10 @@ impl NodeEditor {
                 if !self.code_error.is_empty() {
                     ui.colored_label(ui.visuals().warn_fg_color, &self.code_error);
                 }
-                add = ui.button("Add block").clicked();
+                add = ui
+                    .button("Add block")
+                    .on_hover_text("Type a few lines of game code. Each line must be a call Visionary knows, so the block can update live.")
+                    .clicked();
             });
         if !open {
             self.new_code = None;
@@ -908,7 +920,8 @@ impl NodeEditor {
                 );
             }
             if !self.workspace {
-                ui.weak("Press Apply nodes to use your edits");
+                ui.weak("Not applied yet")
+                    .on_hover_text("Press Apply nodes to use your edits.");
             }
         });
         if open {
@@ -1717,7 +1730,8 @@ pub(crate) fn native_source_ui(
         .response.on_hover_text(format!("Read from the game: {}\nChecked once each frame. If the game has no value, this step is skipped.", source.reference()));
     ui.weak(format!("Read-only · {type_label}"));
     if !source.valid_for(fighter) || source.kind() != Some(kind) {
-        ui.weak("Pick something to read first.");
+        ui.weak("Nothing picked")
+            .on_hover_text("Pick something to read first.");
     }
 }
 
@@ -1993,8 +2007,10 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
             });
         }
         ExcuteStmt::AttackAbs(call) => {
-            ui.weak("Sets the throw's damage. Apply throw is what hits the held opponent with it.")
-                .on_hover_text(&call.kind);
+            ui.weak("Throw damage").on_hover_text(format!(
+                "Sets the throw's damage. Apply throw is what hits the held opponent with it.\n{}",
+                call.kind
+            ));
             ui.horizontal_wrapped(|ui| {
                 ui.label("Number");
                 ui.add(egui::DragValue::new(&mut call.id).range(0..=255));

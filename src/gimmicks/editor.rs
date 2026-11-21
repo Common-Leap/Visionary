@@ -28,6 +28,9 @@ pub struct CharacterContext {
     /// The made character picked here, when it is one. The app makes it the character being
     /// edited, so every page agrees on who is open.
     pub character: Option<crate::roster::RosterKey>,
+    /// For a base fighter: the costumes characters made on it own, which its gimmick never
+    /// runs on.
+    pub made_costumes: Vec<u8>,
 }
 
 impl CharacterContext {
@@ -37,6 +40,7 @@ impl CharacterContext {
             name: name.to_string(),
             costume_slots,
             character: None,
+            made_costumes: Vec::new(),
         }
     }
 }
@@ -71,21 +75,22 @@ fn costume_scope_ui(
         .get(&context.fighter)
         .map(|graph| graph.costumes.clone())
         .unwrap_or_default();
-    // A fighter with characters made on it keeps to its own costumes (`costume_slots`): theirs
-    // are theirs. One without any can run on every costume, which is no limit at all.
-    let unlimited = context.costume_slots.clone();
-    let all = if unlimited.is_empty() {
-        crate::data::costume_slots_or_default(roots, &context.fighter)
+    // A fighter's gimmick never runs on the costumes of characters made on it: those are
+    // theirs. With no limit it runs on every costume of its own, which is stored as no limit.
+    let unlimited: Vec<u8> = Vec::new();
+    let all: Vec<u8> = crate::data::costume_slots_or_default(roots, &context.fighter)
+        .into_iter()
+        .filter(|slot| !context.made_costumes.contains(slot))
+        .collect();
+    let own: &[u8] = if context.made_costumes.is_empty() {
+        &[]
     } else {
-        unlimited.clone()
+        &all
     };
-    let label = match crate::character::slot_range(&current) {
-        None => "Runs on every costume".to_owned(),
-        Some(range) => format!("Runs on {range}"),
-    };
+    let label = costume_scope_label(&current, own);
     let mut chosen = None;
     ui.menu_button(label, |ui| {
-        let every = if unlimited.is_empty() {
+        let every = if context.made_costumes.is_empty() {
             "Every costume".to_owned()
         } else {
             format!("Every {} costume", context.name)
@@ -120,6 +125,17 @@ fn costume_scope_ui(
             .entry(context.fighter.clone())
             .or_default()
             .costumes = next;
+    }
+}
+
+/// The costumes a fighter's gimmick runs on, as its header shows them. With no limit it runs
+/// on every costume that is the fighter's own (`own`), which leaves out the costumes of
+/// characters made on it; with none made on it (`own` empty), on every costume.
+fn costume_scope_label(limit: &[u8], own: &[u8]) -> String {
+    let shown = if limit.is_empty() { own } else { limit };
+    match crate::character::slot_range(shown) {
+        None => "Runs on every costume".to_owned(),
+        Some(range) => format!("Runs on {range}"),
     }
 }
 
@@ -351,6 +367,15 @@ impl GimmicksEditor {
             .and_then(|key| authored.iter().find(|entry| &entry.key == key));
         CharacterContext {
             character: selected.map(|entry| entry.key.clone()),
+            made_costumes: if selected.is_some() {
+                Vec::new()
+            } else {
+                authored
+                    .iter()
+                    .filter(|entry| entry.donor == fighter)
+                    .flat_map(crate::mod_project::AuthoredEntry::all_slots)
+                    .collect()
+            },
             ..CharacterContext::new(
                 fighter,
                 selected.map_or(name, |entry| entry.display_name.as_str()),
@@ -455,9 +480,13 @@ impl GimmicksEditor {
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Load {name}?"));
-                ui.weak("Replaces this fighter's gimmicks, values and meters. Other edits stay.");
                 ui.horizontal(|ui| {
-                    apply = ui.button("Apply setup").clicked();
+                    apply = ui
+                        .button("Apply setup")
+                        .on_hover_text(
+                            "Replaces this fighter's gimmicks, values and meters. Other edits stay.",
+                        )
+                        .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -569,14 +598,14 @@ impl GimmicksEditor {
             egui::CollapsingHeader::new("Live parameter diagnostics").id_salt("parameter_getter_health").show(ui, |ui| {
                 match health.getter_backend {
                     Some(super::live_params::ParameterGetterBackend::NativeParamData) => { ui.weak("Values read from the game"); }
-                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("The game may change some of these in ways the preview doesn't show."); }
+                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("Values may change in the game").on_hover_text("The game may change some of these in ways the preview doesn't show."); }
                     None => { ui.weak("Getter backend not reported by this plugin."); }
                 }
-                ui.weak("Game-wide counters since the accepted parameter snapshot; field read counts remain fighter-specific.");
-                ui.weak(format!("Getter reads: {} float · {} integer; {} overrides returned", health.float_wrapper_calls, health.int_wrapper_calls, health.overrides_returned));
+                ui.weak(format!("Getter reads: {} float · {} integer; {} overrides returned", health.float_wrapper_calls, health.int_wrapper_calls, health.overrides_returned))
+                    .on_hover_text("Game-wide counters since the accepted parameter snapshot; field read counts remain fighter-specific.");
                 ui.weak(format!("Fighter identity: {} matches · {} misses; parameter keys: {} matches · {} misses", health.identity_matches, health.identity_misses, health.parameter_key_matches, health.parameter_key_misses));
                 ui.weak(format!("{} type mismatches · {} lock contentions · {} disabled-table reads", health.type_mismatches, health.identity_lock_busy.saturating_add(health.overlay_lock_busy), health.overlay_disabled));
-                if health.float_wrapper_calls == 0 && health.int_wrapper_calls == 0 { ui.weak("No reads reached the installed getters. An accepted table alone does not prove live application."); }
+                if health.float_wrapper_calls == 0 && health.int_wrapper_calls == 0 { ui.weak("No reads reached the installed getters").on_hover_text("An accepted table alone does not prove live application."); }
             });
         }
         ui.horizontal(|ui| {
@@ -767,9 +796,7 @@ impl GimmicksEditor {
         link: &GameLink,
         recipes: Option<&BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     ) {
-        if graphs.get(fighter).is_none_or(BehaviorGraph::is_empty) {
-            ui.weak("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Start from a ready-made one, or build the rules in Move nodes.");
-        } else if let Some(graph) = graphs.get(fighter) {
+        if let Some(graph) = graphs.get(fighter).filter(|graph| !graph.is_empty()) {
             let names: Vec<&str> = graph
                 .states
                 .iter()
@@ -842,20 +869,23 @@ impl GimmicksEditor {
             }
         })
         .response
-        .on_hover_text("Fill this gimmick from a ready-made one or another character. You confirm before anything is replaced.");
+        .on_hover_text("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Fill this one from a ready-made gimmick or another character, or build the rules in Move nodes. You confirm before anything is replaced.");
         if let Some((name, _)) = &self.pending {
             let mut apply = false;
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Use {name}?"));
-                if let Some(about) = preset_about(name) {
-                    ui.weak(about);
-                }
+                let mut about: Vec<String> = preset_about(name).into_iter().collect();
                 if graphs.get(fighter).is_some_and(|graph| !graph.is_empty()) {
-                    ui.weak("This replaces the rules this gimmick has now.");
+                    about.push("This replaces the rules this gimmick has now.".to_owned());
                 }
                 ui.horizontal(|ui| {
-                    apply = ui.button("Apply").clicked();
+                    let button = ui.button("Apply");
+                    apply = if about.is_empty() {
+                        button.clicked()
+                    } else {
+                        button.on_hover_text(about.join("\n")).clicked()
+                    };
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -909,12 +939,11 @@ impl GimmicksEditor {
         let mut add_variable = None;
         ui.scope(|ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Duration");
+                ui.label("Duration").on_hover_text("Counts down automatically. Each expiry increments elapsed_events and raises ready; stock loss resets its state.");
                 changed |= ui.add(egui::DragValue::new(&mut config.duration_frames).range(1..=super::live_model::MAX_TIMER_FRAMES as u32).suffix(" frames")).changed();
                 ui.weak(format!("{:.2} seconds at 60 fps", config.duration_frames as f32 / 60.0));
                 changed |= ui.checkbox(&mut config.repeats, "Repeat").changed();
             });
-            ui.weak("Counts down automatically. Each expiry increments elapsed_events and raises ready; stock loss resets its state.");
             egui::CollapsingHeader::new("When the timer expires").id_salt(("timer_expiry", fighter)).default_open(true).show(ui, |ui| {
                 let mut command = None;
                 let count = config.expiry_actions.len();
@@ -1157,11 +1186,12 @@ fn live_values_ui(
     let captures = values.keys().filter(|name| is_call_capture(name)).count();
     if captures > 0 {
         ui.collapsing(format!("Call storage ({captures})"), |ui| {
-            ui.weak("Private argument snapshots and results; not editable character state.");
             for (name, value) in values.iter().filter(|(name, _)| is_call_capture(name)) {
                 live_value_row(ui, name, value, None);
             }
-        });
+        })
+        .header_response
+        .on_hover_text("Private argument snapshots and results; not editable character state.");
     }
 }
 
@@ -1990,12 +2020,15 @@ pub(super) fn action_picker(
                     ui.label("y");
                     ui.push_id("object_speed_y", |ui| value_editor(ui, fighter, graph, y, VarType::Float, scope));
                 }
-                ui.weak("Acts on the newest live one, on its own next frame; run it every frame to steer.");
+                ui.weak("Acts on the newest live one")
+                    .on_hover_text("On its own next frame; run it every frame to steer.");
             }
             ControllerAction::ArticleMovement { symbol, op } => {
                 article_picker(ui, fighter, symbol);
                 movement_fields(ui, op);
-                ui.weak("Every live one moves by this much each time the rule runs; run it every frame to steer.");
+                ui.weak("Moves every live one").on_hover_text(
+                    "Every live one moves by this much each time the rule runs; run it every frame to steer.",
+                );
             }
             ControllerAction::GenerateArticle { symbol }
             | ControllerAction::RemoveArticle { symbol } => {
@@ -2094,7 +2127,9 @@ pub(super) fn action_picker(
                     ui.label("value").on_hover_text("Multipliers: 1 is normal (0..=10). Every jump's height is Jump height ÷ Gravity. Armor: hits up to this much damage cause no flinch.");
                     value_editor(ui, fighter, graph, value, VarType::Float, scope);
                 }
-                ui.weak("A later policy on the same channel replaces this one; the channel returns to normal when the scope ends.");
+                ui.weak("Lasts until the scope ends").on_hover_text(
+                    "A later policy on the same channel replaces this one; the channel returns to normal when the scope ends.",
+                );
             }
             ControllerAction::CancelIncomingHit => {}
             ControllerAction::Movement(op) => movement_fields(ui, op),
@@ -2476,6 +2511,17 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    /// Cloud's gimmick header says the costumes it really runs on: with Nova owning c08-c15 an
+    /// unlimited gimmick runs on c00-c07, not "every costume"; with nobody made on Cloud it does
+    /// run on every costume; a limit is shown as it is.
+    #[test]
+    fn a_fighters_gimmick_header_names_the_costumes_it_runs_on() {
+        let own: Vec<u8> = (0..8).collect();
+        assert_eq!(costume_scope_label(&[], &own), "Runs on c00\u{2013}c07");
+        assert_eq!(costume_scope_label(&[], &[]), "Runs on every costume");
+        assert_eq!(costume_scope_label(&[0, 1], &own), "Runs on c00\u{2013}c01");
+    }
 
     #[test]
     fn projectile_picker_defaults_are_typed_and_keep_the_projectile_action() {

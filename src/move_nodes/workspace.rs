@@ -789,7 +789,8 @@ impl NodeEditor {
             });
         }
         if !any {
-            ui.weak("Nothing yet. Pick a starter on the left, or add a block.");
+            ui.weak("Nothing yet")
+                .on_hover_text("Pick a starter on the left, or add a block.");
         }
         if let Some(id) = focus {
             self.canvas.focus_node(id);

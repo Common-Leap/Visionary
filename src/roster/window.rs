@@ -1174,11 +1174,12 @@ impl RosterWindow {
                     ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
                     ui.label(
                         RichText::new(format!(
-                            "{total} file(s) provided by more than one enabled mod. Later in load order wins."
+                            "{total} file(s) provided by more than one enabled mod"
                         ))
                         .small()
                         .strong(),
-                    );
+                    )
+                    .on_hover_text("Later in load order wins.");
                 });
                 ui.add_space(4.0);
                 for (fighter, conflicts) in by_fighter {
@@ -1218,10 +1219,13 @@ impl RosterWindow {
                                                 .collect::<Vec<_>>()
                                                 .join(" → ");
                                             ui.label(
-                                                RichText::new(format!("{}  [{}]", conflict.game_path, chain))
-                                                    .small()
-                                                    .monospace()
-                                                    .weak(),
+                                                RichText::new(format!(
+                                                    "{}  [{}]",
+                                                    conflict.game_path, chain
+                                                ))
+                                                .small()
+                                                .monospace()
+                                                .weak(),
                                             );
                                         }
                                     });

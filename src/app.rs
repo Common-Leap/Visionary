@@ -7398,12 +7398,11 @@ impl VisionaryApp {
                 ui.spacing_mut().item_spacing.y = 3.0;
                 if kinds.is_empty() {
                     ui.label(
-                        RichText::new(
-                            "No capture attempts received. Connect the game and perform a move.",
-                        )
-                        .small()
-                        .color(Color32::GRAY),
-                    );
+                        RichText::new("No capture attempts received")
+                            .small()
+                            .color(Color32::GRAY),
+                    )
+                    .on_hover_text("Connect the game and perform a move.");
                     return;
                 }
 
@@ -7969,7 +7968,6 @@ impl VisionaryApp {
                 return;
             }
 
-            ui.weak("Use ↶ to restore an original value in the project and game.");
 
             // ── Roster — every roster edit kind, each revertible ──
             {
@@ -8004,7 +8002,8 @@ impl VisionaryApp {
                         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 65, 85)))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("Roster").small().strong().color(Color32::from_rgb(160, 200, 240)));
+                                ui.label(RichText::new("Roster").small().strong().color(Color32::from_rgb(160, 200, 240)))
+                                    .on_hover_text("Saved with the project and included when you export a mod.");
                                 ui.label(
                                     RichText::new(format!(
                                         "{total} edit{}",
@@ -8089,15 +8088,6 @@ impl VisionaryApp {
                                     }
                                 });
                             }
-                            ui.horizontal(|ui| {
-                                ui.add_space(12.0);
-                                ui.label(
-                                    RichText::new("Saved with project · included when you export a mod")
-                                        .small()
-                                        .weak()
-                                        .color(Color32::from_rgb(130, 145, 165)),
-                                );
-                            });
                         });
                     ui.add_space(6.0);
                 }
@@ -8872,14 +8862,13 @@ impl VisionaryApp {
                             "Cached fighter data",
                             "Scripts, edits, and live-preview data Visionary has remembered for this fighter during editing.",
                         );
-                        ui.label(
-                            egui::RichText::new(concat!(
-                                "Clears cached scripts, edits, and live effect previews. ",
-                                "Source files stay on disk."
-                            ))
-                            .small(),
-                        );
-                        if ui.button("Forget fighter").clicked() {
+                        if ui
+                            .button("Forget fighter")
+                            .on_hover_text(
+                                "Clears cached scripts, edits, and live effect previews. Source files stay on disk.",
+                            )
+                            .clicked()
+                        {
                             forget_fighter = Some(fighter_name.clone());
                             ui.close();
                         }
@@ -11164,7 +11153,8 @@ impl VisionaryApp {
             return;
         };
         let Some(snapshot) = self.game_link.gimmick_live_snapshot() else {
-            ui.weak("Connect a compatible game plugin to see accepted trigger values.");
+            ui.weak("No live values from the game")
+                .on_hover_text("Connect a compatible game plugin to see accepted trigger values.");
             return;
         };
         // The open character's gimmick, and only the players whose costume runs it.
@@ -11231,11 +11221,14 @@ impl VisionaryApp {
             .and_then(|i| self.state.fighters.get(i))
             .cloned()
         else {
-            ui.weak("Choose a character in the bar above to edit its moves and controllers.");
+            ui.weak("No character open").on_hover_text(
+                "Choose a character in the bar above to edit its moves and controllers.",
+            );
             return;
         };
         let Some(move_entry) = self.state.selected_move.clone() else {
-            ui.weak("Select a move to author nodes.");
+            ui.weak("No move open")
+                .on_hover_text("Select a move to build it with nodes.");
             return;
         };
         if self.fetching_acmd {
@@ -11550,7 +11543,8 @@ impl VisionaryApp {
                 .and_then(|index| self.state.fighters.get(index))
                 .cloned()
             else {
-                ui.weak("Select a character to edit gimmicks");
+                ui.weak("No character open")
+                    .on_hover_text("Select a character to edit its gimmicks.");
                 return;
             };
             let active = self.active_key().filter(|key| key.is_made());
@@ -11867,7 +11861,8 @@ impl VisionaryApp {
                         if self.state.hitboxes.is_empty() && self.state.selected_move.is_some() {
                             let fetched = !self.state.acmd_source.is_empty();
                             if !fetched {
-                                ui.weak("Nothing loaded yet — use Move › Reload source.");
+                                ui.weak("Nothing loaded yet")
+                                    .on_hover_text("Use Move › Reload source.");
                             } else if self.move_has_no_script {
                                 // Measured in game: Steve's jab swings the forward tilt
                                 // animation on his upper body and never plays this one.
@@ -11878,15 +11873,22 @@ impl VisionaryApp {
                                     .selected_fighter
                                     .and_then(|i| self.state.fighters.get(i))
                                     .is_some_and(|f| f.name == "pickel");
-                                ui.weak(if steve_jab {
-                                    "Steve's jab plays Forward tilt in the game, not this \
-                                     animation. Edit Forward tilt to change his jab."
+                                if steve_jab {
+                                    ui.weak("Plays Forward tilt in the game").on_hover_text(
+                                        "Steve's jab plays Forward tilt in the game, not this \
+                                         animation. Edit Forward tilt to change his jab.",
+                                    );
                                 } else {
-                                    "The game gives this move no script; its actions come from \
-                                     the fighter's own code. Anything you add here gives it one."
-                                });
+                                    ui.weak("No script in the game").on_hover_text(
+                                        "The game gives this move no script; its actions come \
+                                         from the fighter's own code. Anything you add here gives \
+                                         it one.",
+                                    );
+                                }
                             } else {
-                                ui.weak("This move has no hitboxes.");
+                                ui.weak("This move has no hitboxes.").on_hover_text(
+                                    "Use Move nodes or the other tabs to edit the rest of the move.",
+                                );
                                 let plural = |n: usize, one: &str, many: &str| {
                                     format!("{n} {}", if n == 1 { one } else { many })
                                 };
@@ -11909,9 +11911,7 @@ impl VisionaryApp {
                                     .iter()
                                     .filter(|e| e.color.is_some())
                                     .count();
-                                if sounds == 0 && effects == 0 && flashes == 0 {
-                                    ui.weak("Use Move nodes or the other tabs to edit non-collision logic.");
-                                } else {
+                                if sounds + effects + flashes > 0 {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.weak("It has");
                                         let total = [sounds, effects, flashes]
@@ -12271,9 +12271,10 @@ impl VisionaryApp {
                                 // match the ordinary hit-property controls; every other FP slot remains
                                 // preserved from the source/capture.
                                 if hb.category == crate::data::CAT_ATTACK_FP {
-                                    ui.weak(
-                            "ATTACK_FP geometry is preserved but not shown as a bone-local volume.",
-                        );
+                                    ui.weak("Shape not drawn").on_hover_text(
+                                        "This kind of hitbox keeps its shape from the game; the \
+                                         preview does not draw it on the body.",
+                                    );
                                     wide_slider_f32(ui, &mut hb.damage, 0.0..=50.0, "Damage");
                                     angle_picker(ui, &mut hb.angle);
                                     wide_slider_i32(ui, &mut hb.kb_base, 0..=200, "Base knockback");
@@ -12887,7 +12888,8 @@ impl VisionaryApp {
             "sound_ script",
         );
         if candidates.is_empty() {
-            ui.weak("No sound labels loaded. Enter a sound name to add one.");
+            ui.weak("No sound labels loaded")
+                .on_hover_text("Enter a sound name to add one.");
         }
 
         enum StructuralAction {
@@ -13807,7 +13809,7 @@ impl VisionaryApp {
                 egui::Color32::from_rgb(170, 210, 220),
                 "MotionModule::set_frame_partial",
             );
-            ui.label(
+            ui.weak("Seek frame and sync flag").on_hover_text(
                 "Edit the seek frame and sync flag. Live replacement requires a unique native (part kind, pristine seek frame, script frame) capture identity; shared or unresolved identities stay source-only.",
             );
             for event in &partial_frame_events {
@@ -13854,7 +13856,7 @@ impl VisionaryApp {
                 egui::Color32::from_rgb(235, 185, 100),
                 "source-only",
             );
-            ui.label(
+            ui.weak("Not live-editable").on_hover_text(
                 "Preserved for export; not live-editable because the native boolean is unmeasured.",
             );
             for event in raw_partial_frames {
@@ -15489,7 +15491,8 @@ impl VisionaryApp {
             });
 
         let Some(index) = self.selected_hurtbox else {
-            ui.weak("Pick a hurtbox above or click one on the model.");
+            ui.weak("No hurtbox selected")
+                .on_hover_text("Pick a hurtbox above or click one on the model.");
             return;
         };
         let Some(volume) = self.hurtbox_volumes.get(index).cloned() else {
@@ -15682,7 +15685,8 @@ impl VisionaryApp {
         // feature discoverable in its tab and explains the one prerequisite instead of making
         // the heading appear to be missing.
         if self.state.selected_move.is_none() {
-            ui.weak("Select a move to inspect and edit its hurtbox states.");
+            ui.weak("No move open")
+                .on_hover_text("Select a move to inspect and edit its hurtbox states.");
             return;
         }
         let (states, pris) = self.state.script.to_hurtboxes();
@@ -15690,7 +15694,8 @@ impl VisionaryApp {
 
         if states.is_empty() && conditions.is_empty() && pris.is_empty() {
             if self.state.acmd_source.is_empty() {
-                ui.weak("No hurtbox commands loaded yet — use Move › Reload source.");
+                ui.weak("No hurtbox commands loaded yet")
+                    .on_hover_text("Use Move › Reload source.");
             } else {
                 ui.weak(
                     "This move has no HIT_NODE, HIT_NO, WHOLE_HIT, or damage-reaction commands.",
@@ -16002,12 +16007,8 @@ impl VisionaryApp {
             || !self.state.effects.is_empty();
 
         if !has_effect_data {
-            ui.colored_label(egui::Color32::GRAY, "This move hasn't loaded yet");
-            ui.label(
-                egui::RichText::new("Use Move > Retry source to load it.")
-                    .small()
-                    .color(egui::Color32::DARK_GRAY),
-            );
+            ui.colored_label(egui::Color32::GRAY, "This move hasn't loaded yet")
+                .on_hover_text("Use Move > Retry source to load it.");
         } else {
             let visible: Vec<usize> = self
                 .state
@@ -17531,12 +17532,11 @@ impl VisionaryApp {
                     "The fighter's .eff file holds what its effects look like. Without it the view cannot draw them.",
                 );
                 ui.colored_label(egui::Color32::GRAY, "Effect file: not found");
-                ui.label(
-                    egui::RichText::new("Extract effect/fighter/ from data.arc, or:")
-                        .small()
-                        .color(egui::Color32::DARK_GRAY),
-                );
-                if ui.button(format!("Browse for ef_{}.eff…", name)).clicked() {
+                if ui
+                    .button(format!("Browse for ef_{}.eff", name))
+                    .on_hover_text("Extract effect/fighter/ from data.arc, or pick the file.")
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("Effect file", &["eff"])
                         .set_title(format!("Open ef_{}.eff", name))
@@ -28335,7 +28335,8 @@ impl VisionaryApp {
                 // Draw inside a CentralPanel so the viewport gets the normal panel background.
                 egui::CentralPanel::default().show(ui, |ui| {
                 if fighter_names.is_empty() {
-                    ui.colored_label(egui::Color32::GRAY, "Load a game data root first.");
+                    ui.colored_label(egui::Color32::GRAY, "No game data root")
+                        .on_hover_text("Load a game data root first.");
                     return;
                 }
                 let pool = self.effect_pool.as_ref().unwrap();
@@ -28556,7 +28557,8 @@ impl VisionaryApp {
                     );
                 }
                 let Some(target) = &target else {
-                    ui.colored_label(egui::Color32::GRAY, "Pick a fighter to borrow into.");
+                    ui.colored_label(egui::Color32::GRAY, "No fighter picked")
+                        .on_hover_text("Pick a fighter to borrow into.");
                     return;
                 };
                 crate::ui::search_field(ui, "transplant_search", &mut self.transplant_search, "Search effects");
@@ -28949,7 +28951,8 @@ impl VisionaryApp {
                         do_transplant = Some((rel, donor, new_name));
                     }
                 } else {
-                    ui.colored_label(egui::Color32::GRAY, "Pick an effect above to borrow it.");
+                    ui.colored_label(egui::Color32::GRAY, "No effect picked")
+                        .on_hover_text("Pick an effect above to borrow it.");
                 }
                 });
                 // Closing the OS window unticks the Windows-menu toggle.
@@ -32946,9 +32949,8 @@ impl VisionaryApp {
             } else if effects_page {
                 ui.weak("This move spawns no effects from its script.");
             } else if self.timeline_rows(total).is_empty() {
-                ui.weak(
-                    "This move has nothing on its timeline. Drag along the frame bar to scrub.",
-                );
+                ui.weak("This move has nothing on its timeline")
+                    .on_hover_text("Drag along the frame bar to scrub.");
             } else {
                 ui.weak("The filters above hide this move's events.");
             }
@@ -33475,11 +33477,12 @@ impl eframe::App for VisionaryApp {
                     ui.label(
                         egui::RichText::new(match &self.project_path {
                             Some(path) => format!("Saved in {}", path.display()),
-                            None => "Not saved yet. Save as to keep your edits.".into(),
+                            None => "Not saved yet".into(),
                         })
                         .small()
                         .weak(),
-                    );
+                    )
+                    .on_hover_text("Save as to keep your edits.");
                     ui.separator();
                     if ui.button("New project").on_hover_text("Pick a folder for a new project; every edit saves there").clicked() {
                         self.project_hub.show = true;
@@ -33712,11 +33715,8 @@ impl eframe::App for VisionaryApp {
                                 .color(Color32::GRAY),
                         );
                     } else {
-                        ui.label(
-                            RichText::new("Not saved yet: File > Save as keeps your edits")
-                                .small()
-                                .color(Color32::GRAY),
-                        );
+                        ui.label(RichText::new("Not saved yet").small().color(Color32::GRAY))
+                            .on_hover_text("File > Save as keeps your edits.");
                     }
                 });
             });
@@ -35647,12 +35647,11 @@ fn draw_verification(ui: &mut egui::Ui, report: &crate::acmd_verify::Report, has
     }
     if report.is_clean() {
         ui.label(
-            egui::RichText::new(
-                "✔ Verified — this reads back as exactly the move on screen, and compiles.",
-            )
-            .small()
-            .color(egui::Color32::from_rgb(120, 200, 120)),
-        );
+            egui::RichText::new("✔ Verified")
+                .small()
+                .color(egui::Color32::from_rgb(120, 200, 120)),
+        )
+        .on_hover_text("This reads back as exactly the move on screen, and compiles.");
         return;
     }
     for finding in &report.findings {
@@ -35660,18 +35659,14 @@ fn draw_verification(ui: &mut egui::Ui, report: &crate::acmd_verify::Report, has
             Severity::Blocker => ("✖", egui::Color32::from_rgb(240, 110, 110)),
             Severity::Warning => ("⚠", egui::Color32::from_rgb(255, 170, 60)),
         };
-        ui.label(
+        let line = ui.label(
             egui::RichText::new(format!("{mark} {}", finding.message))
                 .small()
                 .color(color),
         );
-    }
-    if report.has_blockers() {
-        ui.label(
-            egui::RichText::new("An export will refuse to write this until it is resolved.")
-                .small()
-                .color(egui::Color32::GRAY),
-        );
+        if finding.severity == Severity::Blocker {
+            line.on_hover_text("An export will refuse to write this until it is resolved.");
+        }
     }
 }
 

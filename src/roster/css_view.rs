@@ -405,15 +405,10 @@ impl CssView {
                 .inner_margin(egui::Margin::symmetric(14, 14))
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("The stage is empty").size(13.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
+                        ui.label(RichText::new("The stage is empty").size(13.0).strong())
+                            .on_hover_text(
                                 "Every entry is either hidden by this project or marked off-roster by the database.",
-                            )
-                            .small()
-                            .weak(),
-                        );
+                            );
                         ui.add_space(6.0);
                         // Escape hatch in place: no need to hunt the list below.
                         if !project.hidden.is_empty()
@@ -587,9 +582,10 @@ impl CssView {
                     });
                     ui.add_space(6.0);
                 }
-                ui.label(
-                    RichText::new(format!("Place ui/ so {} exists.", css::CHARA_DB_PATH)).small(),
-                );
+                ui.label(RichText::new(format!("Missing {}", css::CHARA_DB_PATH)).small())
+                    .on_hover_text(
+                        "Place the game's ui/ folder in the data root so this file exists.",
+                    );
                 ui.add_space(10.0);
                 if ui
                     .add(egui::Button::new(RichText::new("Look again").strong()))
@@ -1409,14 +1405,24 @@ impl CssView {
             .id_salt(format!("images_{}", entry.key.as_str()))
             .show(ui, |ui| {
                 self.draw_images(ui, entry, project, roots);
-            });
+            })
+            .header_response
+            .on_hover_text(
+                "One portrait per skin: pick the costume, then its PNG. Change skins in the rows \
+                 below and the stage follows. Preview fix only changes this editor's preview. \
+                 Upload fix changes the exported bytes so the game shows what you saw here.",
+            );
         let placed = project.order.contains_key(&entry.key) as usize
             + project.chara_overrides.contains_key(&entry.key) as usize;
         egui::CollapsingHeader::new(title("Place and skin count", placed))
             .id_salt(format!("roster_row_{}", entry.key.as_str()))
             .show(ui, |ui| {
                 self.draw_roster_row(ui, entry, project);
-            });
+            })
+            .header_response
+            .on_hover_text(
+                "What the game reads for select screen placement. Dragging the grid edits position too.",
+            );
         let variants = project.name_variants.get(&entry.key).map_or(0, |v| {
             v.chr0.is_some() as usize + v.chr1.is_some() as usize + v.chr2.is_some() as usize
         });
@@ -1430,11 +1436,8 @@ impl CssView {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
-                ui.label(
-                    RichText::new("No roster row. Add from off-roster or the New Character tab.")
-                        .small()
-                        .weak(),
-                );
+                ui.label(RichText::new("No roster row").small().weak())
+                    .on_hover_text("Add it from off-roster or the New Character tab.");
             });
         }
     }
@@ -1540,12 +1543,11 @@ impl CssView {
         };
         if slots.is_empty() {
             ui.label(
-                RichText::new(format!(
-                    "No costume slots found on disk for {fighter}. Dump its fighter folder to work skins individually."
-                ))
-                .small()
-                .weak(),
-            );
+                RichText::new(format!("No costume slots found on disk for {fighter}"))
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text("Dump its fighter folder to work skins individually.");
             return;
         }
         // This entry's own files, when it is a character the project added —
@@ -1698,14 +1700,6 @@ impl CssView {
     }
 
     fn draw_roster_row(&mut self, ui: &mut Ui, entry: &RosterEntry, project: &mut RosterMod) {
-        ui.label(
-            RichText::new(
-                "What the game reads for CSS placement. Dragging the grid edits position too.",
-            )
-            .small()
-            .weak(),
-        );
-        ui.add_space(4.0);
         let db_row = entry
             .name_id
             .as_deref()
@@ -2016,24 +2010,22 @@ impl CssView {
                 let longest = px.x.max(px.y).max(1.0);
                 ui.image((id, px * (200.0 / longest)));
                 ui.label(
-                    RichText::new(format!(
-                        "game {kind} c{slot:02}. Pick a PNG below to replace"
-                    ))
-                    .small()
-                    .weak(),
-                );
+                    RichText::new(format!("game {kind} c{slot:02}"))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text("Pick a PNG below to replace it.");
             }
             (_, _, false) => {
                 // No override picked: whatever the game lookup said, the
                 // answer is "nothing to show yet" — a decode error here
                 // means the file is absent, not broken.
                 ui.label(
-                    RichText::new(format!(
-                        "No {kind} c{slot:02} anywhere yet. Pick a PNG below"
-                    ))
-                    .small()
-                    .weak(),
-                );
+                    RichText::new(format!("No {kind} c{slot:02} anywhere yet"))
+                        .small()
+                        .weak(),
+                )
+                .on_hover_text("Pick a PNG below.");
             }
             (StageTex::Queued, _, true) => {
                 // Override picked but still queued behind the decode budget:
@@ -2041,11 +2033,6 @@ impl CssView {
                 ui.spinner();
             }
         }
-        ui.label(
-            RichText::new("Change skins in the rows below. The stage follows.")
-                .small()
-                .weak(),
-        );
     }
 
     fn draw_images(
@@ -2055,12 +2042,6 @@ impl CssView {
         project: &mut RosterMod,
         roots: &[PathBuf],
     ) {
-        ui.label(
-            RichText::new("One portrait per skin: pick the costume, then its PNG. Preview fix only changes this editor's preview. Upload fix changes the exported bytes so the game shows what you saw here.")
-                .small()
-                .weak(),
-        );
-        ui.add_space(4.0);
         self.draw_image_stage(ui, entry, project, roots);
         ui.add_space(4.0);
         ui.separator();
@@ -2197,7 +2178,8 @@ impl CssView {
             // Which skin this row edits. Fixed for single-costume entries.
             if multi_slot {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Costume").small().weak());
+                    ui.label(RichText::new("Costume").small().weak())
+                        .on_hover_text("Each skin exports its own file.");
                     egui::ComboBox::from_id_salt(format!("img_slot_{}_{kind}", entry.key.as_str()))
                         .selected_text(format!("c{sel_slot:02}"))
                         .show_ui(ui, |ui| {
@@ -2214,11 +2196,6 @@ impl CssView {
                                 }
                             }
                         });
-                    ui.label(
-                        RichText::new("each skin exports its own file")
-                            .small()
-                            .weak(),
-                    );
                 });
             }
             if has {

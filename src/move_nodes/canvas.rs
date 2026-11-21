@@ -422,7 +422,8 @@ impl CanvasState {
                     }
                 }
                 None => {
-                    ui.weak("Right-click a script lane to clear it.");
+                    ui.weak("No lane here")
+                        .on_hover_text("Right-click a script lane to clear it.");
                 }
             });
         }
