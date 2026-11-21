@@ -417,20 +417,49 @@ fn inline_field(expr: &syn::Expr) -> Option<(&syn::ExprCall, &'static str)> {
 
 type Args<'a> = Vec<&'a syn::Expr>;
 
+enum HelperLookup {
+    None,
+    One(CloneHelper),
+    Ambiguous(Vec<CloneHelper>),
+}
+
+/// Module-name components of a Rust source file: directory segments plus the file stem, omitting
+/// `mod`, `lib`, and `main` (so `src/util/mod.rs` yields `["src", "util"]` and `other.rs` yields
+/// `["other"]`).
+fn file_module_trail(file: &std::path::Path) -> Vec<String> {
+    let mut parts: Vec<String> = file
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => os.to_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    if let Some(stem) = file.file_stem().and_then(|s| s.to_str()) {
+        if !matches!(stem, "mod" | "lib" | "main") {
+            parts.push(stem.to_owned());
+        }
+    }
+    parts
+}
+
 impl Reader<'_> {
     fn line_of(span: proc_macro2::Span) -> usize {
         span.start().line
     }
 
     /// The helper a call runs: `clone(..)`, `self::clone(..)`, `util::clone_article(..)`, by its
-    /// last segment and argument count. One in the calling file wins; otherwise it must be the
-    /// only one in the project. A path through a type (`Arc::clone(..)`) is never a helper.
-    fn helper_for(&self, call: &syn::ExprCall) -> Option<CloneHelper> {
-        let syn::Expr::Path(p) = call.func.as_ref() else { return None };
+    /// module path (when qualified), last segment, and argument count. A bare call prefers one in
+    /// the calling file; a module-qualified call (`other::clone(..)`) matches only helpers whose
+    /// file path ends with that module trail and never falls back to a local helper. A path
+    /// through a type (`Arc::clone(..)`) is never a helper.
+    fn helper_for(&self, call: &syn::ExprCall) -> HelperLookup {
+        let syn::Expr::Path(p) = call.func.as_ref() else { return HelperLookup::None };
         let segments: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
-        let (name, modules) = segments.split_last()?;
+        let Some((name, modules)) = segments.split_last() else { return HelperLookup::None };
         if modules.iter().any(|m| m.starts_with(|c: char| c.is_ascii_uppercase())) {
-            return None;
+            return HelperLookup::None;
         }
         let fits: Vec<&CloneHelper> = self
             .helpers
@@ -438,12 +467,45 @@ impl Reader<'_> {
             .filter(|h| h.name == *name && h.params.len() == call.args.len())
             .filter(|h| !self.inlining.iter().any(|((file, line), _, _)| *file == h.file && *line == h.line))
             .collect();
-        let local: Vec<&&CloneHelper> = fits.iter().filter(|h| h.file == self.file).collect();
-        match (local.as_slice(), fits.as_slice()) {
-            ([one], _) => Some((**one).clone()),
-            ([], [one]) => Some((*one).clone()),
-            _ => None,
+        if fits.is_empty() {
+            return HelperLookup::None;
         }
+        let pick = |list: Vec<&CloneHelper>| match list.as_slice() {
+            [] => HelperLookup::None,
+            [one] => HelperLookup::One((*one).clone()),
+            _ => HelperLookup::Ambiguous(list.into_iter().cloned().collect()),
+        };
+        let named_modules: Vec<&str> = modules
+            .iter()
+            .map(String::as_str)
+            .skip_while(|m| matches!(*m, "crate" | "super" | "self"))
+            .collect();
+        if !named_modules.is_empty() {
+            let matched: Vec<&CloneHelper> = fits
+                .into_iter()
+                .filter(|h| {
+                    let trail = file_module_trail(&h.file);
+                    trail.len() >= named_modules.len()
+                        && trail[trail.len() - named_modules.len()..]
+                            .iter()
+                            .map(String::as_str)
+                            .eq(named_modules.iter().copied())
+                })
+                .collect();
+            return pick(matched);
+        }
+        if modules.iter().any(|m| m == "super") {
+            let external: Vec<&CloneHelper> = fits.into_iter().filter(|h| h.file != self.file).collect();
+            return pick(external);
+        }
+        let local: Vec<&CloneHelper> = fits.iter().copied().filter(|h| h.file == self.file).collect();
+        if modules.iter().any(|m| m == "self") {
+            return pick(local);
+        }
+        if !local.is_empty() {
+            return pick(local);
+        }
+        pick(fits)
     }
 
     /// The source lines a call covers, trimmed, for the report.
@@ -745,30 +807,49 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
             self.resolve(call, false);
             return;
         }
-        if let Some(helper) = self.helper_for(call) {
-            let mark = self.env.len();
-            // Arguments are read in the caller's scope, before the parameters shadow anything. A
-            // parameter whose argument is an unknown name of its own (`clone(name)` inside
-            // `fn reg(name: &str)`) is left unbound: it is unknown, not itself.
-            let bound: Vec<(String, syn::Expr)> = helper
-                .params
-                .iter()
-                .zip(&call.args)
-                .map(|(param, arg)| (param.clone(), self.resolved_arg(arg)))
-                .filter(|(param, value)| path_name(value).as_deref() != Some(param.as_str()))
-                .collect();
-            self.env.extend(bound);
-            let key = (helper.file.clone(), helper.line);
-            self.inlined.insert(key.clone());
-            let (line, text) = match self.inlining.first() {
-                Some((_, line, text)) => (*line, text.clone()),
-                None => (Self::line_of(call.span()), self.text_of(call.span())),
-            };
-            self.inlining.push((key, line, text));
-            self.visit_block(&helper.body);
-            self.inlining.pop();
-            self.env.truncate(mark);
-            return;
+        match self.helper_for(call) {
+            HelperLookup::One(helper) => {
+                let mark = self.env.len();
+                // Arguments are read in the caller's scope, before the parameters shadow anything. A
+                // parameter whose argument is an unknown name of its own (`clone(name)` inside
+                // `fn reg(name: &str)`) is left unbound: it is unknown, not itself.
+                let bound: Vec<(String, syn::Expr)> = helper
+                    .params
+                    .iter()
+                    .zip(&call.args)
+                    .map(|(param, arg)| (param.clone(), self.resolved_arg(arg)))
+                    .filter(|(param, value)| path_name(value).as_deref() != Some(param.as_str()))
+                    .collect();
+                self.env.extend(bound);
+                let key = (helper.file.clone(), helper.line);
+                self.inlined.insert(key.clone());
+                let (line, text) = match self.inlining.first() {
+                    Some((_, line, text)) => (*line, text.clone()),
+                    None => (Self::line_of(call.span()), self.text_of(call.span())),
+                };
+                self.inlining.push((key, line, text));
+                self.visit_block(&helper.body);
+                self.inlining.pop();
+                self.env.truncate(mark);
+                return;
+            }
+            HelperLookup::Ambiguous(candidates) => {
+                let mut where_list: Vec<String> = candidates
+                    .iter()
+                    .map(|h| format!("{}:{}", h.file.display(), h.line))
+                    .collect();
+                where_list.sort();
+                let name = candidates.first().map(|h| h.name.as_str()).unwrap_or("helper");
+                self.report(
+                    call,
+                    format!(
+                        "ambiguous call to clone helper `{name}`; matches {}",
+                        where_list.join(", ")
+                    ),
+                );
+                return;
+            }
+            HelperLookup::None => {}
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -1380,6 +1461,58 @@ fn reg(x: &Arc<i32>) { let _ = Arc::clone(x); clone("ball"); }
 "#);
         assert_eq!(d.len(), 1, "{d:#?} {u:?}");
         assert!(u.is_empty(), "{u:?}");
+    }
+
+    #[test]
+    fn module_qualified_helper_call_does_not_inline_local_same_name() {
+        let local_file = r#"
+fn make(name: &str) {
+    smashline::clone_weapon("mario", name, *WEAPON_KIND_MARIO_FIREBALL, false);
+}
+pub fn install() {
+    other::make("ice");
+}
+"#;
+        let other_file = r#"
+pub fn make(name: &str) {
+    smashline::clone_weapon("luigi", name, *WEAPON_KIND_LUIGI_FIREBALL, false);
+}
+"#;
+        let (d, u) = run_many(&[("a.rs", local_file), ("other.rs", other_file)]);
+        assert_eq!(d.len(), 1, "{d:#?}");
+        assert_eq!(d[0].new_name, "ice");
+        assert_eq!(d[0].src_kind, "WEAPON_KIND_LUIGI_FIREBALL");
+        // Local `make` was never called, so it stays reported as an unfollowed helper rather than
+        // being silently inlined in place of `other::make`.
+        assert!(
+            u.iter().any(|x| x.file == PathBuf::from("a.rs")),
+            "uncalled local helper should be reported: {u:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_helper_call_reports_unresolved_even_when_helpers_were_inlined() {
+        let a = r#"
+pub fn make(name: &str) {
+    smashline::clone_weapon("mario", name, *WEAPON_KIND_MARIO_FIREBALL, false);
+}
+pub fn reg_a() { make("a_ball"); }
+"#;
+        let b = r#"
+pub fn make(name: &str) {
+    smashline::clone_weapon("luigi", name, *WEAPON_KIND_LUIGI_FIREBALL, false);
+}
+pub fn reg_b() { make("b_ball"); }
+"#;
+        let c = r#"
+pub fn reg_c() { make("ambig_ball"); }
+"#;
+        let (d, u) = run_many(&[("a.rs", a), ("b.rs", b), ("c.rs", c)]);
+        assert_eq!(d.len(), 2, "{d:#?}");
+        assert!(
+            u.iter().any(|x| x.file == PathBuf::from("c.rs") && x.reason.contains("ambiguous")),
+            "ambiguous call in c.rs must be reported even when both helpers were inlined elsewhere: {u:?}"
+        );
     }
 
     #[test]

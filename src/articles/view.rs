@@ -236,25 +236,53 @@ pub fn missing_block_note(article: &Article, block: &ParamBlock, settings: &[Set
     Some(note)
 }
 
+enum ResolvedArticleName {
+    Own(String),
+    Foreign { id_owner: String, name: String },
+}
+
 /// The article an id expression names: through the catalog, else the name a vanilla
-/// `FIGHTER_X_GENERATE_ARTICLE_Y` constant spells.
-fn article_name(expr: &str, catalog: &ArticleCatalog) -> Option<String> {
+/// `FIGHTER_X_GENERATE_ARTICLE_Y` constant spells (preserving when `X` belongs to another
+/// fighter rather than the catalog's owner).
+fn article_name(expr: &str, catalog: &ArticleCatalog) -> Option<ResolvedArticleName> {
     if let Some(article) = catalog.resolve_id(expr, &HashMap::new()) {
-        return Some(article.name.clone());
+        return Some(ResolvedArticleName::Own(article.name.clone()));
     }
     let ident = expr.trim().trim_start_matches(['*', '&']).trim();
     let ident = ident.rsplit("::").next().unwrap_or(ident);
     let (head, name) = ident.split_once("_GENERATE_ARTICLE_")?;
-    (head.starts_with("FIGHTER_")
-        && !name.is_empty()
-        && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    .then(|| name.to_lowercase())
+    let id_owner = head.strip_prefix("FIGHTER_")?;
+    if id_owner.is_empty()
+        || name.is_empty()
+        || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let lower_owner = id_owner.to_lowercase();
+    let lower_name = name.to_lowercase();
+    let catalog_owner = catalog.articles.first().map(|a| a.owner.as_str()).unwrap_or("");
+    if !catalog_owner.is_empty() && lower_owner != catalog_owner.to_lowercase() {
+        Some(ResolvedArticleName::Foreign {
+            id_owner: lower_owner,
+            name: lower_name,
+        })
+    } else {
+        Some(ResolvedArticleName::Own(lower_name))
+    }
 }
 
-/// "the fireball", "every fireball", or the unresolved form with the expression as written.
-fn phrase(det: &str, name: Option<&str>, expr: &str) -> String {
+/// "the fireball", "every fireball", "lucario's auraball id (on samus)", or the unresolved form
+/// with the expression as written.
+fn phrase(det: &str, name: Option<&ResolvedArticleName>, expr: &str, fighter: &str) -> String {
     match name {
-        Some(name) => format!("{det} {name}"),
+        Some(ResolvedArticleName::Own(name)) => format!("{det} {name}"),
+        Some(ResolvedArticleName::Foreign { id_owner, name }) => {
+            if det == "the" {
+                format!("{id_owner}'s {name} id (on {fighter})")
+            } else {
+                format!("{det} {id_owner}'s {name} id (on {fighter})")
+            }
+        }
         None if det == "the" => format!("an object Visionary can't name (`{}`)", expr.trim()),
         None => format!("{det} object Visionary can't name (`{}`)", expr.trim()),
     }
@@ -281,7 +309,8 @@ fn hash_text(arg: &str) -> String {
 /// One article call in plain words: "Creates the fireball", "Shoots the last fireball".
 pub fn timeline_label(call: &ArticleCall, catalog: &ArticleCatalog) -> String {
     let name = article_name(&call.article, catalog);
-    let the = |det: &str| phrase(det, name.as_deref(), &call.article);
+    let catalog_owner = catalog.articles.first().map(|a| a.owner.as_str()).unwrap_or("");
+    let the = |det: &str| phrase(det, name.as_ref(), &call.article, catalog_owner);
     let arg = |n: usize| call.args.get(n).map(|a| a.trim().to_string()).unwrap_or_default();
     match &call.op {
         ArticleOp::Generate => format!("Creates {}", the("the")),
@@ -824,6 +853,18 @@ mod tests {
         assert_eq!(
             label("ArticleModule::generate_article(agent.module_accessor, owner_article(x), false, -1);"),
             "Creates an object Visionary can't name (`owner_article(x)`)"
+        );
+        // Cross-fighter article ID constant on another fighter explicitly notes the foreign ID.
+        let samus = catalog(vec![vanilla("samus", "bomb")]);
+        assert_eq!(
+            timeline_label(
+                &ArticleCall::parse(
+                    "ArticleModule::generate_article(agent.module_accessor, *FIGHTER_LUCARIO_GENERATE_ARTICLE_AURABALL, false, -1);"
+                )
+                .unwrap(),
+                &samus
+            ),
+            "Creates lucario's auraball id (on samus)"
         );
     }
 

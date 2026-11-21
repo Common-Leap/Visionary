@@ -144,8 +144,10 @@ impl ArticleCatalog {
             // article; the other calls are kept on it. Declared again from a different source,
             // it is still one object in game, but which source wins is not known: say so.
             if let Some(first) = articles.iter_mut().find(|a| a.agent == agent) {
-                first.also_declared.push((decl.file.clone(), decl.line));
-                let ArticleOrigin::Clone(kept) = &mut first.origin else { continue };
+                let ArticleOrigin::Clone(kept) = &mut first.origin else {
+                    first.also_declared.push((decl.file.clone(), decl.line));
+                    continue;
+                };
                 let source = |d: &CloneDecl| {
                     format!(
                         "{}/{}{}",
@@ -168,6 +170,7 @@ impl ArticleCatalog {
                     ));
                     continue;
                 }
+                first.also_declared.push((decl.file.clone(), decl.line));
                 for binding in &decl.id_bindings {
                     if !first.id_symbols.contains(binding) {
                         first.id_symbols.push(binding.clone());
@@ -514,11 +517,6 @@ pub fn install() {
         assert_eq!(c.articles[0].also_declared, [(PathBuf::from("vendor/lib.rs"), 101)]);
     }
 
-    /// Iron-Man · src/stark/status/final_proton.rs:64 spawns
-    /// `*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME` (0x3 in the game's lua consts) for the dump's
-    /// `mario/model/hugeflame`; Toad-Moveset · plugin/src/toad/acmd/ground.rs:231 spawns
-    /// `*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET` (0x0) for `murabito/model/bullet`
-    /// (both tier 1, smashline2).
     /// R20: two declarations of one clone from different sources are a conflict, kept with both;
     /// from the same source, their bindings merge.
     #[test]
@@ -537,6 +535,7 @@ pub fn install() {
         let article = &c.articles[0];
         assert_eq!(article.origin, ArticleOrigin::Clone(a.clone()));
         assert_eq!(article.clone_conflicts.len(), 1);
+        assert!(article.also_declared.is_empty(), "conflict should not duplicate into also_declared");
         let note = &article.clone_conflicts[0];
         assert!(note.contains("mario/WEAPON_KIND_MARIO_FIREBALL") && note.contains("koopa/WEAPON_KIND_KOOPA_BREATH"), "{note}");
         assert!(note.contains("lib.rs:1") && note.contains("vendor/lib.rs:101"), "{note}");
@@ -553,6 +552,7 @@ pub fn install() {
         let c = ArticleCatalog::build("packun", None, &[a, same], vec![], tmp.path());
         let article = &c.articles[0];
         assert!(article.clone_conflicts.is_empty());
+        assert_eq!(article.also_declared, [(PathBuf::from("vendor/lib.rs"), 101)]);
         assert_eq!(article.id_symbols, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
         assert_eq!(article.id_note, None);
         let ArticleOrigin::Clone(kept) = &article.origin else { panic!() };
@@ -560,6 +560,11 @@ pub fn install() {
         assert_eq!(kept.id_bindings, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
     }
 
+    /// Iron-Man · src/stark/status/final_proton.rs:64 spawns
+    /// `*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME` (0x3 in the game's lua consts) for the dump's
+    /// `mario/model/hugeflame`; Toad-Moveset · plugin/src/toad/acmd/ground.rs:231 spawns
+    /// `*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET` (0x0) for `murabito/model/bullet`
+    /// (both tier 1, smashline2).
     #[test]
     fn resolves_the_games_own_spellings() {
         let c = named("mario", "hugeflame");

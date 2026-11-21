@@ -21,6 +21,7 @@ pub struct CompatEntry {
 }
 
 struct Sheet {
+    #[cfg_attr(not(test), allow(dead_code))]
     advice: &'static str,
     entries: Vec<CompatEntry>,
 }

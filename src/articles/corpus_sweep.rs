@@ -178,7 +178,6 @@ pub(super) fn script_scope_check(
     sources: &[(PathBuf, String)],
     names: &[String],
 ) -> Result<(), String> {
-    let quoted = format!("\"{agent}\"");
     let names_function = |text: &str| {
         text.match_indices(function).any(|(at, _)| {
             let before = text[..at].chars().next_back();
@@ -186,7 +185,10 @@ pub(super) fn script_scope_check(
             !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
         })
     };
-    if sources.iter().any(|(_, text)| text.contains(&quoted) && names_function(text)) {
+    if sources
+        .iter()
+        .any(|(_, text)| agent_literals(text).iter().any(|a| a == agent) && names_function(text))
+    {
         return Ok(());
     }
     let owned = |name: &String| split_agent(name, names).is_some_and(|(o, _)| o == owner);
