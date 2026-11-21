@@ -3374,6 +3374,137 @@ fn effect_call_display_name(call: &crate::data::EffectCall) -> String {
     }
 }
 
+/// World position of a trail edge: `offset` in `bone`'s space, with the same system-bone rule
+/// spawn markers use (translation only).
+fn trail_edge_point(
+    matrices: &std::collections::HashMap<String, glam::Mat4>,
+    bone: &str,
+    offset: [f32; 3],
+) -> Option<glam::Vec3> {
+    let mat = matrices
+        .get(bone)
+        .or_else(|| matrices.get(&bone.to_lowercase()))
+        .copied()?;
+    let mat = if is_system_bone(bone) {
+        glam::Mat4::from_translation(mat.col(3).truncate())
+    } else {
+        mat
+    };
+    Some(mat.transform_point3(glam::Vec3::from(offset)))
+}
+
+/// Paint one trail into the viewport: the swept ribbon between its two edges over the visible
+/// stretch of swing, fading toward the tail, plus the blade segment at the head. A selected
+/// trail outside its window still shows where its edges are now, as a dashed segment.
+///
+/// Returns the screen distance from `click_pos` to the head segment when the click is close
+/// enough to pick the trail.
+#[allow(clippy::too_many_arguments)]
+fn draw_trail_preview(
+    painter: &egui::Painter,
+    rs: &crate::renderer::HitboxRenderState,
+    rect: egui::Rect,
+    current_matrices: &std::collections::HashMap<String, glam::Mat4>,
+    ec: &crate::data::EffectCall,
+    geometry: &crate::trail_preview::TrailGeometry,
+    frame_num: u32,
+    selected: bool,
+    click_pos: Option<egui::Pos2>,
+) -> Option<f32> {
+    let color = if selected {
+        egui::Color32::from_rgb(255, 205, 120)
+    } else {
+        egui::Color32::from_rgb(240, 160, 60)
+    };
+    let edges_at = |matrices: &std::collections::HashMap<String, glam::Mat4>| {
+        let a = trail_edge_point(matrices, &geometry.bone1, geometry.offset1)?;
+        let b = trail_edge_point(matrices, &geometry.bone2, geometry.offset2)?;
+        Some((rs.world_to_screen(a, rect)?, rs.world_to_screen(b, rect)?))
+    };
+    let span = crate::trail_preview::visible_span(
+        ec.active_start,
+        ec.active_end,
+        geometry.frames,
+        frame_num as f32,
+    );
+    let head = match span {
+        Some((tail, head)) => {
+            let samples = crate::trail_preview::sample_frames(tail, head);
+            let edges: Vec<Option<(egui::Pos2, egui::Pos2)>> = samples
+                .iter()
+                .map(|&f| {
+                    // The current frame's matrices are already in hand; reuse them.
+                    if f == frame_num as f32 {
+                        edges_at(current_matrices)
+                    } else {
+                        edges_at(
+                            &rs.bone_world_matrices_at(crate::trail_preview::motion_frame(f)),
+                        )
+                    }
+                })
+                .collect();
+            let mut mesh = egui::Mesh::default();
+            let last = samples.len().saturating_sub(1).max(1) as f32;
+            let peak = if selected { 150.0 } else { 110.0 };
+            for (k, pair) in edges.windows(2).enumerate() {
+                let (Some((a0, b0)), Some((a1, b1))) = (pair[0], pair[1]) else {
+                    continue;
+                };
+                let tint = |at: usize| {
+                    let alpha = (peak * at as f32 / last) as u8;
+                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+                };
+                let base = mesh.vertices.len() as u32;
+                mesh.colored_vertex(a0, tint(k));
+                mesh.colored_vertex(b0, tint(k));
+                mesh.colored_vertex(a1, tint(k + 1));
+                mesh.colored_vertex(b1, tint(k + 1));
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base + 1, base + 3, base + 2);
+            }
+            if !mesh.is_empty() {
+                painter.add(egui::Shape::mesh(mesh));
+            }
+            let head = edges.last().copied().flatten();
+            if let Some((a, b)) = head {
+                let width = if selected { 2.5 } else { 1.5 };
+                painter.line_segment([a, b], egui::Stroke::new(width, color));
+            }
+            head
+        }
+        None if selected => {
+            let head = edges_at(current_matrices);
+            if let Some((a, b)) = head {
+                painter.extend(egui::Shape::dashed_line(
+                    &[a, b],
+                    egui::Stroke::new(1.5, color),
+                    5.0,
+                    4.0,
+                ));
+            }
+            head
+        }
+        None => None,
+    }?;
+    let (a, b) = head;
+    painter.text(
+        b + egui::vec2(4.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        &ec.effect_name,
+        egui::FontId::monospace(9.0),
+        color,
+    );
+    let cp = click_pos?;
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 {
+        ((cp - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let d = cp.distance(a + ab * t);
+    (d <= 10.0).then_some(d)
+}
+
 fn is_system_bone(name: &str) -> bool {
     matches!(
         name.to_lowercase().as_str(),
@@ -13131,6 +13262,30 @@ impl VisionaryApp {
                         }
                         if ec.disabled {
                             continue;
+                        }
+                        // A trail is a swept ribbon between two edges, not a point.
+                        if effect_call_is_trail(ec) {
+                            if let Some(geometry) = crate::trail_preview::trail_geometry(ec) {
+                                let t = self.perf.start();
+                                let picked = draw_trail_preview(
+                                    ui.painter(),
+                                    rs,
+                                    rect,
+                                    &bone_matrices,
+                                    ec,
+                                    &geometry,
+                                    frame_num,
+                                    self.state.selected_effect_call == Some(i),
+                                    click_pos,
+                                );
+                                self.perf.end("trail_preview", t);
+                                if let Some(d) = picked {
+                                    if best_pick.map(|(_, bd)| d < bd).unwrap_or(true) {
+                                        best_pick = Some((i, d));
+                                    }
+                                }
+                                continue;
+                            }
                         }
                         let active = frame_num >= ec.active_start && frame_num <= ec.active_end;
                         if !active && self.state.selected_effect_call != Some(i) {

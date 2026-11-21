@@ -65,6 +65,7 @@ mod source_style;
 mod source_timing;
 mod sources;
 mod texture_import;
+mod trail_preview;
 mod ui;
 mod vfx_preview;
 mod viewport_navigation;
