@@ -291,8 +291,7 @@ fn drop_unchanged_scripts(
     project: &mut ModProjectFile,
     vanilla: &dyn Fn(&str, &str) -> Option<String>,
 ) {
-    use crate::move_nodes::model::{MoveGraph, Track};
-    let same = |a: &dyn erased_json::Json, b: &dyn erased_json::Json| a.json() == b.json();
+    use crate::move_nodes::model::Track;
     // A made character's edit is compared with the game's version of its engine fighter's
     // move, like any other: matching it means its costumes run the game's version anyway.
     let owners = project
@@ -308,7 +307,6 @@ fn drop_unchanged_scripts(
             )
         }));
     for (fighter, edits) in owners {
-        let fighter = &fighter;
         let mut moves: Vec<String> = edits
             .acmd
             .keys()
@@ -320,61 +318,105 @@ fn drop_unchanged_scripts(
         moves.sort();
         moves.dedup();
         for move_name in moves {
-            let Some(body) = vanilla(fighter, &move_name).filter(|body| !body.is_empty()) else {
+            let Some(game) = game_scripts(&fighter, &move_name, vanilla) else {
                 continue;
             };
-            let game = crate::acmd::parse_acmd_script(&body);
-            let sound = crate::acmd::parse_sound_script(&body);
-            let expression = crate::acmd::parse_expression_script(&body);
-            let effect = crate::acmd::parse_effect_script(&body);
-            let mut graph = MoveGraph {
-                tracks: [Track::Game, Track::Sound, Track::Expression]
-                    .into_iter()
-                    .zip([&game, &sound, &expression])
-                    .map(|(track, script)| {
-                        crate::move_nodes::timeline::import_for_fighter(fighter, track, script)
-                    })
-                    .collect(),
-                ..MoveGraph::default()
-            };
-            graph
-                .tracks
-                .push(crate::move_nodes::effects::import_for_fighter(
-                    fighter, &effect,
-                ));
-            let mut alone = ModProjectFile::default();
-            alone
-                .fighters
-                .entry(fighter.clone())
-                .or_default()
-                .move_graphs
-                .insert(move_name.clone(), graph);
-            let Ok(compiled) = crate::move_nodes::project::expand(&alone) else {
-                continue;
-            };
-            let Some(theirs) = compiled.fighters.get(fighter) else {
-                continue;
-            };
-            if let (Some(ours), Some(game)) =
-                (edits.acmd.get(&move_name), theirs.acmd.get(&move_name))
+            if edits
+                .acmd
+                .get(&move_name)
+                .is_some_and(|ours| record_matches_game(&game, &move_name, ours))
             {
-                if same(&ours.script, &game.script) && ours.effective_scopes().is_empty() {
-                    edits.acmd.remove(&move_name);
-                }
+                edits.acmd.remove(&move_name);
             }
-            for (ours, game) in [
-                (&mut edits.sound_scripts, &theirs.sound_scripts),
-                (&mut edits.expression_scripts, &theirs.expression_scripts),
-                (&mut edits.effect_scripts, &theirs.effect_scripts),
+            for (track, ours) in [
+                (Track::Sound, &mut edits.sound_scripts),
+                (Track::Expression, &mut edits.expression_scripts),
+                (Track::Effect, &mut edits.effect_scripts),
             ] {
-                if let (Some(mine), Some(original)) = (ours.get(&move_name), game.get(&move_name)) {
-                    if same(mine, original) {
-                        ours.remove(&move_name);
-                    }
+                if ours
+                    .get(&move_name)
+                    .is_some_and(|mine| script_matches_game(&game, &move_name, track, mine))
+                {
+                    ours.remove(&move_name);
                 }
             }
         }
     }
+}
+
+/// The game's own scripts of `fighter`'s `move_name`, put through the same node import and
+/// compile as an edit, to compare edits with ([`script_matches_game`]). None when the move's
+/// dumped source is not known or does not compile.
+pub(crate) fn game_scripts(
+    fighter: &str,
+    move_name: &str,
+    vanilla: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<FighterMod> {
+    use crate::move_nodes::model::{MoveGraph, Track};
+    let body = vanilla(fighter, move_name).filter(|body| !body.is_empty())?;
+    let game = crate::acmd::parse_acmd_script(&body);
+    let sound = crate::acmd::parse_sound_script(&body);
+    let expression = crate::acmd::parse_expression_script(&body);
+    let effect = crate::acmd::parse_effect_script(&body);
+    let mut graph = MoveGraph {
+        tracks: [Track::Game, Track::Sound, Track::Expression]
+            .into_iter()
+            .zip([&game, &sound, &expression])
+            .map(|(track, script)| {
+                crate::move_nodes::timeline::import_for_fighter(fighter, track, script)
+            })
+            .collect(),
+        ..MoveGraph::default()
+    };
+    graph
+        .tracks
+        .push(crate::move_nodes::effects::import_for_fighter(
+            fighter, &effect,
+        ));
+    let mut alone = ModProjectFile::default();
+    alone
+        .fighters
+        .entry(fighter.to_owned())
+        .or_default()
+        .move_graphs
+        .insert(move_name.to_owned(), graph);
+    let mut compiled = crate::move_nodes::project::expand(&alone).ok()?;
+    compiled.fighters.remove(fighter)
+}
+
+/// `mine`, a script of `track` for `move_name`, is the game's own (`game`, from
+/// [`game_scripts`]): the export leaves it out and the game keeps running its version.
+pub(crate) fn script_matches_game(
+    game: &FighterMod,
+    move_name: &str,
+    track: crate::move_nodes::model::Track,
+    mine: &crate::data::AcmdScript,
+) -> bool {
+    use crate::move_nodes::model::Track;
+    use erased_json::Json;
+    let theirs = match track {
+        Track::Game => game.acmd.get(move_name).map(|record| &record.script),
+        Track::Sound => game.sound_scripts.get(move_name),
+        Track::Expression => game.expression_scripts.get(move_name),
+        Track::Effect => game.effect_scripts.get(move_name),
+    };
+    theirs.is_some_and(|theirs| mine.json() == theirs.json())
+}
+
+/// A move's game script edit is the game's own and gated onto no costumes, so the export
+/// leaves it out.
+pub(crate) fn record_matches_game(
+    game: &FighterMod,
+    move_name: &str,
+    record: &crate::data::EditRecord,
+) -> bool {
+    record.effective_scopes().is_empty()
+        && script_matches_game(
+            game,
+            move_name,
+            crate::move_nodes::model::Track::Game,
+            &record.script,
+        )
 }
 
 mod erased_json {
@@ -2658,9 +2700,11 @@ mod made_character_export_tests {
     //! A character made on Mario is its own character: its edits gate onto its costumes, Mario's
     //! edits never reach them, and a project with no made characters exports as it always did.
     use super::*;
+    use crate::data::AcmdScript;
     use crate::data::EditRecord;
     use crate::mod_project::{AuthoredEntry, FighterMod, MoveSourceSnapshot};
     use crate::roster::RosterKey;
+    use std::collections::BTreeMap;
 
     /// Mario's jab as the game ships it, lifted whole from the script cache
     /// (`script-cache/mario/Attack11.txt`): all four categories.
@@ -3119,5 +3163,123 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
                 .collect::<Vec<_>>()
         };
         assert_eq!(files(&rendered.project), files(&plain));
+    }
+
+    /// The scripts a node edit saves for every track of `body`'s move, compiled as the editor
+    /// applies a graph: the game's own scripts imported as nodes and compiled back.
+    fn applied_tracks(body: &str) -> Vec<(crate::move_nodes::model::Track, AcmdScript)> {
+        use crate::move_nodes::model::{MoveGraph, Track};
+        let graph = MoveGraph {
+            tracks: vec![
+                crate::move_nodes::timeline::import_for_fighter(
+                    "mario",
+                    Track::Game,
+                    &crate::acmd::parse_acmd_script(body),
+                ),
+                crate::move_nodes::timeline::import_for_fighter(
+                    "mario",
+                    Track::Sound,
+                    &crate::acmd::parse_sound_script(body),
+                ),
+                crate::move_nodes::timeline::import_for_fighter(
+                    "mario",
+                    Track::Expression,
+                    &crate::acmd::parse_expression_script(body),
+                ),
+                crate::move_nodes::effects::import_for_fighter(
+                    "mario",
+                    &crate::acmd::parse_effect_script(body),
+                ),
+            ],
+            ..MoveGraph::default()
+        };
+        let mut compiled = crate::move_nodes::project::compile_recipes_with_controllers(
+            "mario",
+            &Default::default(),
+            &Default::default(),
+            &BTreeMap::from([("attack11".to_owned(), graph)]),
+        )
+        .unwrap();
+        compiled.tracks.remove("attack11").unwrap()
+    }
+
+    fn track(
+        saved: &[(crate::move_nodes::model::Track, AcmdScript)],
+        track: crate::move_nodes::model::Track,
+    ) -> &AcmdScript {
+        &saved.iter().find(|(kind, _)| *kind == track).unwrap().1
+    }
+
+    fn game_jab() -> FighterMod {
+        game_scripts("mario", "attack11", &|fighter, name| {
+            (fighter == "mario" && name == "attack11").then(|| MARIO_ATTACK11.to_owned())
+        })
+        .unwrap()
+    }
+
+    /// A node edit saves every track of the move. The tracks it did not change are the game's
+    /// own and change nothing: a card must not count them as edits.
+    #[test]
+    fn the_untouched_tracks_saved_beside_a_node_edit_match_the_game() {
+        use crate::move_nodes::model::Track;
+        let edited = MARIO_ATTACK11.replacen("2.2, 361, 30", "9.0, 361, 30", 1);
+        assert_ne!(edited, MARIO_ATTACK11);
+        let saved = applied_tracks(&edited);
+        let game = game_jab();
+        for kind in [Track::Effect, Track::Sound, Track::Expression] {
+            assert!(
+                script_matches_game(&game, "attack11", kind, track(&saved, kind)),
+                "{kind:?}"
+            );
+        }
+        assert!(!script_matches_game(
+            &game,
+            "attack11",
+            Track::Game,
+            track(&saved, Track::Game)
+        ));
+    }
+
+    /// Paired with the above: an effect the user changed is no longer the game's own.
+    #[test]
+    fn a_changed_effect_track_does_not_match_the_game() {
+        use crate::move_nodes::model::Track;
+        let edited = MARIO_ATTACK11.replacen("sys_attack_impact", "sys_attack_arc", 1);
+        assert_ne!(edited, MARIO_ATTACK11);
+        let saved = applied_tracks(&edited);
+        let game = game_jab();
+        assert!(!script_matches_game(
+            &game,
+            "attack11",
+            Track::Effect,
+            track(&saved, Track::Effect)
+        ));
+        assert!(script_matches_game(
+            &game,
+            "attack11",
+            Track::Sound,
+            track(&saved, Track::Sound)
+        ));
+    }
+
+    /// A game script edit gated onto costumes is kept even when its script is the game's.
+    #[test]
+    fn a_costume_gated_record_of_the_games_script_is_still_an_edit() {
+        use crate::move_nodes::model::Track;
+        let saved = applied_tracks(MARIO_ATTACK11);
+        let game = game_jab();
+        let mut record = EditRecord {
+            fighter: "mario".into(),
+            fighter_display: "Mario".into(),
+            move_name: "attack11".into(),
+            script: track(&saved, Track::Game).clone(),
+            hitboxes_pristine: Vec::new(),
+            hitboxes: Vec::new(),
+            slot_scope: None,
+            slot_scopes: Vec::new(),
+        };
+        assert!(record_matches_game(&game, "attack11", &record));
+        record.slot_scopes = vec![8];
+        assert!(!record_matches_game(&game, "attack11", &record));
     }
 }

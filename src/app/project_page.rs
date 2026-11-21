@@ -44,6 +44,31 @@ fn group_of(fighter: &str) -> Option<(&'static str, &'static [(&'static str, &'s
         .copied()
 }
 
+/// What "Add character" offers, as (label, fighter to add), sorted by label: each fighter
+/// without a card, and a group the game shows as one character (Pokémon Trainer) once, by the
+/// game's name for it, never its members one by one.
+fn add_choices<'a>(
+    fighters: &[(&'a str, &'a str)],
+    shown: &BTreeSet<&str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut choices: Vec<(&str, &str)> = Vec::new();
+    for &(name, display) in fighters {
+        if shown.contains(name) {
+            continue;
+        }
+        match group_of(name) {
+            Some((group, _)) => {
+                if !choices.iter().any(|(label, _)| *label == group) {
+                    choices.push((group, name));
+                }
+            }
+            None => choices.push((display, name)),
+        }
+    }
+    choices.sort_by(|a, b| a.0.cmp(b.0));
+    choices
+}
+
 /// The page a card action opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CardPage {
@@ -212,6 +237,15 @@ struct EditFamilies {
     meters: Vec<String>,
     live_rules: Vec<String>,
     folders: Vec<String>,
+}
+
+/// The move a card's page opens on: the open one when the part changed it, else the first
+/// move the part changed, else none (the open move, if any, stays).
+fn move_to_open(open: Option<&str>, changed: &BTreeSet<String>) -> Option<String> {
+    if open.is_some_and(|open| changed.contains(open)) {
+        return None;
+    }
+    changed.iter().next().cloned()
 }
 
 /// Every fighter any kind of edit touches.
@@ -1128,14 +1162,8 @@ impl VisionaryApp {
     /// script calls, node graphs, expressions, and moves the game is changed in live.
     fn character_edited_moves(&self, owner: &crate::character::CharacterKey) -> BTreeSet<String> {
         let mine = |key: &&String| owner_of_move_key(key).as_deref() == Some(owner.as_str());
-        let mut moves: BTreeSet<String> = self
-            .state
-            .edit_log
-            .entries
-            .get(owner.as_str())
-            .into_iter()
-            .flat_map(|log| log.keys().cloned())
-            .collect();
+        // Scripts the export leaves out as the game's own are no edit.
+        let mut moves = self.character_game_moves(owner);
         moves.extend(
             self.move_graphs
                 .get(owner.as_str())
@@ -1147,11 +1175,7 @@ impl VisionaryApp {
                 .map(|(_, name)| name.split('#').next().unwrap_or(name).to_owned())
         };
         moves.extend(
-            self.state
-                .expression_script_edits
-                .keys()
-                .filter(mine)
-                .filter_map(named),
+            self.character_script_moves(owner, crate::move_nodes::model::Track::Expression),
         );
         // A live rule exists only for a changed move.
         let live = self
@@ -1452,16 +1476,15 @@ impl VisionaryApp {
                 .width(200.0)
                 .height(420.0)
                 .show_ui(ui, |ui| {
-                    let mut fighters: Vec<_> = self
+                    let fighters: Vec<(&str, &str)> = self
                         .state
                         .fighters
                         .iter()
-                        .filter(|entry| !shown.contains(entry.name.as_str()))
+                        .map(|entry| (entry.name.as_str(), entry.display_name.as_str()))
                         .collect();
-                    fighters.sort_by(|a, b| a.display_name.cmp(&b.display_name));
-                    for entry in fighters {
-                        if ui.selectable_label(false, &entry.display_name).clicked() {
-                            actions.push(PageAction::Add(entry.name.clone()));
+                    for (label, fighter) in add_choices(&fighters, &shown) {
+                        if ui.selectable_label(false, label).clicked() {
+                            actions.push(PageAction::Add(fighter.to_owned()));
                         }
                     }
                 });
@@ -1750,7 +1773,7 @@ impl VisionaryApp {
             .stroke(egui::Stroke::new(1.5, colour))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
+                let header = ui.horizontal_wrapped(|ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
                     paint_part_icon(ui.painter(), rect, part, colour);
@@ -1759,6 +1782,24 @@ impl VisionaryApp {
                         chip(ui, text, if summary.changed { colour } else { look.dim });
                     }
                 });
+                // The moves a count stands for, one per line.
+                let owner = Self::card_character(card);
+                let moves = match part {
+                    Part::Moves => self.character_edited_moves(&owner),
+                    Part::Effects => self.character_effect_moves(&owner),
+                    Part::Sounds => self
+                        .character_script_moves(&owner, crate::move_nodes::model::Track::Sound),
+                    _ => BTreeSet::new(),
+                };
+                if !moves.is_empty() {
+                    header.response.on_hover_text(
+                        moves
+                            .iter()
+                            .map(|name| format_move_name(name))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                }
                 // Where the part's files are, for the parts that have files.
                 if part.has_folder() && part != Part::Moves {
                     let workspace = self.workspace();
@@ -2228,7 +2269,27 @@ impl VisionaryApp {
             CardPage::Gimmicks => CharacterPage::Gimmicks,
             CardPage::Effects => CharacterPage::Effects,
         };
-        self.open_character(character, Some(costume), page);
+        let changed = match page {
+            CharacterPage::ClassicCollisions | CharacterPage::MoveNodes => {
+                self.character_edited_moves(&character)
+            }
+            CharacterPage::ClassicEffects => self.character_effect_moves(&character),
+            CharacterPage::ClassicAudio => {
+                self.character_script_moves(&character, crate::move_nodes::model::Track::Sound)
+            }
+            CharacterPage::Gimmicks | CharacterPage::Effects => BTreeSet::new(),
+        };
+        self.open_character(character.clone(), Some(costume), page);
+        // A page a card opens shows a move that part changed, not an empty editor.
+        let open = self
+            .state
+            .selected_move
+            .as_ref()
+            .filter(|_| self.active_key().as_ref() == Some(&character))
+            .map(|entry| entry.name.clone());
+        if let Some(name) = move_to_open(open.as_deref(), &changed) {
+            self.open_move_named(&name);
+        }
     }
 
     /// Take a made character out of the project, with every edit it owns.
@@ -2694,6 +2755,54 @@ fn counted(n: usize, noun: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pokémon Trainer is offered once by its own name, not as Squirtle, Ivysaur, Charizard and
+    /// Trainer; fighters of no group keep their own names.
+    #[test]
+    fn add_character_offers_a_group_once_by_its_name() {
+        let fighters = [
+            ("pzenigame", "Squirtle"),
+            ("pfushigisou", "Ivysaur"),
+            ("plizardon", "Charizard"),
+            ("ptrainer", "Trainer"),
+            ("mario", "Mario"),
+            ("eflame", "Pyra"),
+            ("elight", "Mythra"),
+        ];
+        let labels: Vec<&str> = add_choices(&fighters, &BTreeSet::new())
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Mario", "Pokémon Trainer", "Pyra / Mythra"]);
+    }
+
+    /// Paired with the above: a group already on the page is not offered again.
+    #[test]
+    fn add_character_leaves_out_a_group_already_shown() {
+        let fighters = [("popo", "Popo"), ("nana", "Nana"), ("mario", "Mario")];
+        let shown: BTreeSet<&str> = ["popo", "nana"].into();
+        assert_eq!(add_choices(&fighters, &shown), vec![("Mario", "mario")]);
+    }
+
+    /// A card's Edit opens on a move that part changed, not on an empty editor.
+    #[test]
+    fn a_card_page_opens_on_the_first_move_its_part_changed() {
+        let changed: BTreeSet<String> = ["special_n".to_owned(), "attack_11".to_owned()].into();
+        assert_eq!(move_to_open(None, &changed).as_deref(), Some("attack_11"));
+        assert_eq!(
+            move_to_open(Some("attack_s4"), &changed).as_deref(),
+            Some("attack_11")
+        );
+    }
+
+    /// Paired with the above: a move the part changed that is already open stays open, and
+    /// a part with no changed move leaves the editor as it is.
+    #[test]
+    fn a_card_page_keeps_an_open_changed_move_and_moves_nothing_without_one() {
+        let changed: BTreeSet<String> = ["special_n".to_owned(), "attack_11".to_owned()].into();
+        assert_eq!(move_to_open(Some("special_n"), &changed), None);
+        assert_eq!(move_to_open(Some("attack_s4"), &BTreeSet::new()), None);
+    }
 
     #[test]
     fn costumes_read_as_ranges() {

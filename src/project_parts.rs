@@ -249,7 +249,8 @@ pub fn sound_target(file_name: &str) -> &'static str {
 
 /// Copy a picked folder into an exported mod at `target` (a game folder). Sound files are
 /// sorted into their bank; every other part keeps its subfolders as they are. Files the
-/// export already wrote win, and are returned so the export can say so.
+/// export already wrote win, and are returned so the export can say so, unless they are the
+/// same file.
 pub fn ship_folder(
     folder: &Path,
     target: &Path,
@@ -276,7 +277,9 @@ pub fn ship_folder(
                 dest.join(target).join(relative)
             };
             if out.exists() {
-                kept.push(out.strip_prefix(dest).unwrap_or(&out).display().to_string());
+                if !crate::project_hub::same_file_contents(&path, &out) {
+                    kept.push(out.strip_prefix(dest).unwrap_or(&out).display().to_string());
+                }
                 continue;
             }
             if let Some(parent) = out.parent() {
@@ -287,6 +290,64 @@ pub fn ship_folder(
         }
     }
     Ok((copied, kept))
+}
+
+/// What shipping a project's own files into an exported mod did.
+#[derive(Debug, Default)]
+pub struct ShippedFiles {
+    pub report: Vec<String>,
+    /// Files of the project the mod does not use, because it already has a different file
+    /// there. The rest of the mod is unaffected, so these never stop the export.
+    pub warnings: Vec<String>,
+    /// Folders that could not be read or written.
+    pub errors: Vec<String>,
+}
+
+/// Ship the project's own files into `dest`, after the export wrote the files it makes: each
+/// folder picked for a part first, then the project's `romfs/` folder. A picked folder is
+/// where the editor shows that part's files from, so it wins over an older copy in `romfs/`.
+pub fn ship_project_files(workspace: &Path, dest: &Path) -> ShippedFiles {
+    let mut out = ShippedFiles::default();
+    for (folder, target) in ProjectParts::load(workspace).shipped_folders() {
+        match ship_folder(&folder, &target, dest) {
+            Ok((copied, kept)) => {
+                if copied > 0 {
+                    out.report.push(format!(
+                        "{copied} file(s) from {} to {}",
+                        folder.display(),
+                        target.display()
+                    ));
+                }
+                for path in kept {
+                    out.warnings.push(format!(
+                        "{path} from {} is not in the mod: the export made its own",
+                        folder.display()
+                    ));
+                }
+            }
+            Err(e) => out.errors.push(format!("{}: {e:#}", folder.display())),
+        }
+    }
+    let overlay = crate::project_hub::workspace_romfs(workspace);
+    if overlay.is_dir() {
+        match crate::project_hub::merge_romfs_overlay(&overlay, dest) {
+            Ok((copied, skipped)) => {
+                if copied > 0 {
+                    out.report.push(format!(
+                        "Workspace overlay — {copied} manual file{} (models/animations/…) from romfs/",
+                        if copied == 1 { "" } else { "s" }
+                    ));
+                }
+                for path in skipped {
+                    out.warnings.push(format!(
+                        "romfs/{path} is not in the mod: it already has a different {path}"
+                    ));
+                }
+            }
+            Err(e) => out.errors.push(format!("workspace overlay failed: {e:#}")),
+        }
+    }
+    out
 }
 
 /// The newest change time under `dir` (one level of subfolders deep), or `None` when empty.
@@ -461,5 +522,85 @@ mod tests {
         assert!(dest
             .join("effect/fighter/pickel/trail/tex.nutexb")
             .is_file());
+    }
+
+    /// A folder linked to Steve's c07 model while the project still has its earlier copy of
+    /// the same files in `romfs/`, as in the e2e project.
+    fn steve_with_linked_model(name: &str, romfs_model: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
+        let root = scratch(name);
+        let workspace = root.join("project");
+        let linked = root.join("cape/model");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join("model.numdlb"), b"mesh").unwrap();
+        std::fs::write(linked.join("cape.nutexb"), b"cape").unwrap();
+        let copy =
+            crate::project_hub::workspace_romfs(&workspace).join("fighter/pickel/model/body/c07");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join("model.numdlb"), romfs_model).unwrap();
+        std::fs::write(copy.join("cape.nutexb"), b"cape").unwrap();
+        let mut parts = ProjectParts::default();
+        parts.set_link("pickel", Part::Model, 7, Some(linked.clone()));
+        parts.save(&workspace).unwrap();
+        let dest = root.join("mod");
+        std::fs::create_dir_all(&dest).unwrap();
+        (workspace, linked, dest)
+    }
+
+    /// The same files in the linked folder and in `romfs/` are no conflict: nothing to warn
+    /// about and nothing that stops the export.
+    #[test]
+    fn the_same_file_in_a_linked_folder_and_romfs_ships_once_without_a_message() {
+        let (workspace, _, dest) = steve_with_linked_model("same", b"mesh");
+        let shipped = ship_project_files(&workspace, &dest);
+        assert!(shipped.warnings.is_empty(), "{:?}", shipped.warnings);
+        assert!(shipped.errors.is_empty(), "{:?}", shipped.errors);
+        assert_eq!(
+            std::fs::read(dest.join("fighter/pickel/model/body/c07/model.numdlb")).unwrap(),
+            b"mesh"
+        );
+    }
+
+    /// Paired with the above: a different older copy in `romfs/` is a warning, never an
+    /// error, and the linked folder (where the editor shows the part from) is what ships.
+    #[test]
+    fn a_different_romfs_copy_of_a_linked_part_is_a_warning_and_the_link_ships() {
+        let (workspace, _, dest) = steve_with_linked_model("differ", b"old mesh");
+        let shipped = ship_project_files(&workspace, &dest);
+        assert!(shipped.errors.is_empty(), "{:?}", shipped.errors);
+        assert_eq!(shipped.warnings.len(), 1, "{:?}", shipped.warnings);
+        assert!(shipped.warnings[0].contains("romfs/fighter/pickel/model/body/c07/model.numdlb"));
+        assert_eq!(
+            std::fs::read(dest.join("fighter/pickel/model/body/c07/model.numdlb")).unwrap(),
+            b"mesh"
+        );
+    }
+
+    /// A folder that cannot be read is still an error.
+    #[test]
+    fn a_missing_linked_folder_is_an_error() {
+        let (workspace, linked, dest) = steve_with_linked_model("missing", b"mesh");
+        std::fs::remove_dir_all(&linked).unwrap();
+        let shipped = ship_project_files(&workspace, &dest);
+        assert_eq!(shipped.errors.len(), 1, "{:?}", shipped.errors);
+    }
+
+    /// A file the export made itself wins over a different one in a linked folder, and an
+    /// identical one is not reported.
+    #[test]
+    fn a_linked_file_the_export_also_made_is_reported_only_when_it_differs() {
+        let root = scratch("ship_same");
+        let effects = root.join("fx");
+        std::fs::create_dir_all(&effects).unwrap();
+        std::fs::write(effects.join("ef_pickel.eff"), b"built").unwrap();
+        let dest = root.join("out");
+        std::fs::create_dir_all(dest.join("effect/fighter/pickel")).unwrap();
+        std::fs::write(dest.join("effect/fighter/pickel/ef_pickel.eff"), b"built").unwrap();
+        let target = Path::new("effect/fighter/pickel");
+        assert_eq!(ship_folder(&effects, target, &dest).unwrap(), (0, vec![]));
+        std::fs::write(effects.join("ef_pickel.eff"), b"mine").unwrap();
+        assert_eq!(
+            ship_folder(&effects, target, &dest).unwrap(),
+            (0, vec!["effect/fighter/pickel/ef_pickel.eff".to_owned()])
+        );
     }
 }

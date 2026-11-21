@@ -1507,6 +1507,15 @@ pub fn scaffold_workspace(workspace: &Path, name: &str) -> anyhow::Result<PathBu
     Ok(file)
 }
 
+/// `a` and `b` hold the same bytes.
+pub fn same_file_contents(a: &Path, b: &Path) -> bool {
+    let (Ok(meta_a), Ok(meta_b)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    meta_a.len() == meta_b.len()
+        && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Merge a workspace `romfs/` overlay into an exported mod folder.
 ///
 /// Copies every file under `overlay` into `dest` preserving arc-relative
@@ -1546,6 +1555,10 @@ pub fn merge_romfs_overlay(overlay: &Path, dest: &Path) -> anyhow::Result<(usize
             };
             let out = dest.join(rel);
             if out.exists() {
+                // The same file already there is no conflict: what ships is what was meant.
+                if same_file_contents(&path, &out) {
+                    continue;
+                }
                 skipped.push(
                     rel.components()
                         .map(|c| c.as_os_str().to_string_lossy())
@@ -1965,6 +1978,26 @@ mod tests {
         ] {
             assert!(destination.join(path).is_file(), "missing {path}");
         }
+    }
+
+    /// A file the mod already has with the same bytes is no conflict.
+    #[test]
+    fn romfs_overlay_does_not_report_a_file_the_mod_already_has_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("workspace/romfs");
+        let dest = dir.path().join("mod");
+        for root in [&overlay, &dest] {
+            std::fs::create_dir_all(root.join("fighter/pickel/model/body/c07")).unwrap();
+            std::fs::write(
+                root.join("fighter/pickel/model/body/c07/model.numdlb"),
+                b"mesh",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            merge_romfs_overlay(&overlay, &dest).unwrap(),
+            (0, Vec::new())
+        );
     }
 
     #[cfg(unix)]

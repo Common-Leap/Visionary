@@ -3662,6 +3662,10 @@ pub struct VisionaryApp {
     node_preview: bool,
     move_graphs: BTreeMap<String, BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     node_effect_scripts: HashMap<String, crate::data::AcmdScript>,
+    /// The game's own scripts of each "fighter/move" counted on a card, compiled once the way
+    /// the export compiles them, so the counts leave out what the export leaves out.
+    game_script_baselines:
+        std::cell::RefCell<HashMap<String, Option<std::rc::Rc<crate::mod_project::FighterMod>>>>,
     node_live_cache: Option<(
         String,
         BTreeMap<String, crate::gimmicks::behavior::BehaviorGraph>,
@@ -4157,6 +4161,7 @@ impl VisionaryApp {
             node_preview: true,
             move_graphs: Default::default(),
             node_effect_scripts: Default::default(),
+            game_script_baselines: Default::default(),
             node_live_cache: None,
             timeline_filters: load_timeline_filters(),
             selected_command: None,
@@ -5180,9 +5185,8 @@ impl VisionaryApp {
         self.hurtbox_condition_edit_end = FIRST_GAME_FRAME;
         self.state.selected_effect_call = None;
         self.selected_command = None;
-        if self.primary_tab != PrimaryEditorTab::Gimmicks {
-            self.primary_tab = PrimaryEditorTab::Collisions;
-        }
+        // The right-hand tab stays the one the user (or the card that opened the character)
+        // picked: a new move is shown on the same tab.
         self.show_add_hitbox = false;
         // The frame count is parsed here rather than when the list was built. Reading ~460
         // `.nuanmb` files up front is what the old six-substring family filter existed to avoid,
@@ -12793,71 +12797,20 @@ impl VisionaryApp {
         let mut structural: Option<StructuralAction> = None;
 
         for event in &self.state.sounds {
-            let active = event.frame == self.state.current_frame;
-            egui::ScrollArea::horizontal()
-                .id_salt(("sound_row", event.site))
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        // `STOP_SE` silences rather than plays, and reads colder for it — the
-                        // same distinction the timeline band draws.
-                        let color = if event.call.func.starts_with("STOP") {
-                            egui::Color32::from_rgb(120, 140, 160)
-                        } else if active {
-                            egui::Color32::from_rgb(150, 210, 150)
-                        } else {
-                            egui::Color32::from_rgb(100, 150, 100)
-                        };
-                        ui.colored_label(color, if active { "◆" } else { "◇" });
-                        ui.label(format!(
-                            "Frame {} · {}",
-                            event.frame,
-                            sound_func_words(&event.call.func).unwrap_or(&event.call.func)
-                        ))
-                        .on_hover_text(format!("{} on frame {}", event.call.func, event.frame));
-
-                        let mut call = event.call.clone();
-                        let mut changed = false;
-                        for (index, name) in call.sounds.iter_mut().enumerate() {
-                            changed |=
-                                sound_name_picker(ui, name, &candidates, (event.site, index));
-                        }
-                        // Shown, not editable: the suppression window is the one non-hash
-                        // argument in the family and nothing has measured what a sensible range
-                        // for it is.
-                        if let Some(tail) = &event.call.tail {
-                            ui.weak(format!("for {tail} frames"));
-                        }
-                        let flat = self.state.sound_script.sound_site_is_flat(event.site);
-                        if ui
-                            .add_enabled(
-                                flat && event.frame != self.state.current_frame,
-                                egui::Button::new("Move here"),
-                            )
-                            .on_hover_text(if flat {
-                                "Move this sound call to the current playhead frame."
-                            } else {
-                                "This call is inside a loop or branch; retiming it would change its control flow."
-                            })
-                            .clicked()
-                        {
-                            structural = Some(StructuralAction::Move {
-                                site: event.site,
-                                frame: self.state.current_frame.max(FIRST_GAME_FRAME),
-                            });
-                        }
-                        if ui
-                            .small_button("Remove")
-                            .on_hover_text("Remove this source sound call, including every loop iteration if it is looped.")
-                            .clicked()
-                        {
-                            structural = Some(StructuralAction::Remove { site: event.site });
-                        }
-                        if changed {
-                            edit = Some((event.site, ExcuteStmt::Sound(call)));
-                        }
-                    });
-                });
+            let flat = self.state.sound_script.sound_site_is_flat(event.site);
+            match sound_row(ui, event, self.state.current_frame, flat, &candidates) {
+                SoundRowAction::None => {}
+                SoundRowAction::Edit(call) => edit = Some((event.site, ExcuteStmt::Sound(call))),
+                SoundRowAction::MoveHere => {
+                    structural = Some(StructuralAction::Move {
+                        site: event.site,
+                        frame: self.state.current_frame.max(FIRST_GAME_FRAME),
+                    })
+                }
+                SoundRowAction::Remove => {
+                    structural = Some(StructuralAction::Remove { site: event.site })
+                }
+            }
         }
 
         ui.menu_button("+ Add sound", |ui| {
@@ -13970,94 +13923,7 @@ impl VisionaryApp {
                             }
                         }
                     });
-                    ui.horizontal_wrapped(|ui| match &mut call {
-                        ExpressionCall::RumbleHit { kind, unk } => {
-                            changed |= rumble_kind_picker(
-                                ui,
-                                "Preset",
-                                kind,
-                                (event.site, 0),
-                                &rumble_patterns,
-                                "The complete game-defined rumble preset. The name is the effect; there is no separate strength control.",
-                            );
-                            changed |= expression_integer_edit(
-                                ui,
-                                "Value",
-                                unk,
-                                (event.site, 1),
-                                "The second RUMBLE_HIT argument. The native binding exposes it only as a game-defined integer, so it is preserved and passed through unchanged in type.",
-                            );
-                        }
-                        ExpressionCall::Quake { kind } => {
-                            changed |= expression_selector(
-                                ui,
-                                "Shake",
-                                kind,
-                                (event.site, 0),
-                                EXPRESSION_QUAKE_KIND_OPTIONS,
-                                "Camera shake size. The numeric value is preserved for live replay.",
-                            );
-                        }
-                        ExpressionCall::FtAttackAbsCameraQuake {
-                            attack_abs_kind,
-                            quake_kind,
-                        } => {
-                            changed |= expression_selector(
-                                ui,
-                                "Attack",
-                                attack_abs_kind,
-                                (event.site, 0),
-                                EXPRESSION_ATTACK_ABS_KIND_OPTIONS,
-                                "Absolute attack kind used by the throw/catch camera shake.",
-                            );
-                            changed |= expression_selector(
-                                ui,
-                                "Shake",
-                                quake_kind,
-                                (event.site, 1),
-                                EXPRESSION_QUAKE_KIND_OPTIONS,
-                                "Camera shake size.",
-                            );
-                        }
-                        ExpressionCall::ControlModuleSetRumble {
-                            kind,
-                            duration,
-                            looped,
-                            target,
-                            ..
-                        } => {
-                            changed |= rumble_kind_picker(
-                                ui,
-                                "Preset",
-                                kind,
-                                (event.site, 0),
-                                &rumble_patterns,
-                                "The complete game-defined rumble preset. The name is the effect; there is no separate strength control.",
-                            );
-                            changed |= expression_integer_edit(
-                                ui,
-                                "Duration",
-                                duration,
-                                (event.site, 1),
-                                "The native duration argument. Zero is a valid value and uses the preset's native timing; it does not disable the rumble.",
-                            );
-                            changed |= expression_bool_edit(
-                                ui,
-                                "Repeat",
-                                looped,
-                                (event.site, 2),
-                                "Repeat the preset while the native duration is active.",
-                            );
-                            changed |= expression_selector(
-                                ui,
-                                "Target",
-                                target,
-                                (event.site, 3),
-                                EXPRESSION_TARGET_OPTIONS,
-                                "The battle object receiving the rumble. Default target is the normal authored value; custom source expressions stay editable.",
-                            );
-                        }
-                    });
+                    changed |= expression_fields(ui, &mut call, event.site, &rumble_patterns);
                 });
             });
             if changed {
@@ -15977,13 +15843,22 @@ impl VisionaryApp {
                 .current_move_key()
                 .is_some_and(|key| self.node_effect_scripts.contains_key(&key))
         {
+            // A state, not an explanation: why these effects need Move nodes is in the hover.
             ui.label(if native_work_source {
-                "Native effects use Move nodes."
+                "Effects only Move nodes can edit"
             } else {
-                "This move's effects use structured nodes."
+                "Effects made with Move nodes"
             });
-            ui.weak("Edit the Effect track to keep native slots, command order and branches intact. Apply saves the recipe; plugin export/reload runs it.");
-            if ui.button("Open effect nodes").clicked() {
+            if ui
+                .button("Edit in Move nodes")
+                .on_hover_text(if native_work_source {
+                    "These effects run inside branches or calls this tab cannot show, so they \
+                     are edited as blocks in Move nodes, which keeps them in order"
+                } else {
+                    "These effects were built as blocks, so they are edited where the blocks are"
+                })
+                .clicked()
+            {
                 self.primary_tab = PrimaryEditorTab::Nodes;
                 self.node_workspace = true;
             }
@@ -17882,46 +17757,16 @@ impl VisionaryApp {
         &self,
         key: &crate::character::CharacterKey,
     ) -> crate::character::CharacterEditCounts {
-        let owned = |store_key: &String| {
-            crate::character::split_move_key(store_key)
-                .is_some_and(|(owner, _)| owner == key.as_str())
-        };
-        let effect_moves: BTreeSet<&String> = self
-            .state
-            .effect_call_edits
-            .iter()
-            .filter(|(k, edits)| owned(k) && !edits.is_empty())
-            .map(|(k, _)| k)
-            .chain(
-                self.state
-                    .effect_call_full
-                    .iter()
-                    .filter(|(k, calls)| owned(k) && !calls.is_empty())
-                    .map(|(k, _)| k),
-            )
-            .chain(self.node_effect_scripts.keys().filter(|k| owned(k)))
-            .collect();
         let mut counts = crate::character::CharacterEditCounts {
-            game_moves: self
-                .state
-                .edit_log
-                .entries
-                .get(key.as_str())
-                .map_or(0, HashMap::len),
+            game_moves: self.character_game_moves(key).len(),
             node_graphs: self.move_graphs.get(key.as_str()).map_or(0, BTreeMap::len),
             sound_moves: self
-                .state
-                .sound_script_edits
-                .keys()
-                .filter(|k| owned(k))
-                .count(),
+                .character_script_moves(key, crate::move_nodes::model::Track::Sound)
+                .len(),
             expression_moves: self
-                .state
-                .expression_script_edits
-                .keys()
-                .filter(|k| owned(k))
-                .count(),
-            effect_call_moves: effect_moves.len(),
+                .character_script_moves(key, crate::move_nodes::model::Track::Expression)
+                .len(),
+            effect_call_moves: self.character_effect_moves(key).len(),
             ..Default::default()
         };
         // Each character's effect file edits are kept under its own key.
@@ -17949,6 +17794,148 @@ impl VisionaryApp {
             });
         }
         counts
+    }
+
+    /// The moves whose game script `key` changed, by name: edits the export would leave out as
+    /// the game's own are not counted.
+    pub(crate) fn character_game_moves(
+        &self,
+        key: &crate::character::CharacterKey,
+    ) -> BTreeSet<String> {
+        self.state
+            .edit_log
+            .entries
+            .get(key.as_str())
+            .into_iter()
+            .flat_map(|log| log.iter())
+            .filter(|(move_name, record)| !self.record_is_games_own(key, move_name, record))
+            .map(|(move_name, _)| move_name.clone())
+            .collect()
+    }
+
+    /// The moves whose `track` script (sound or expression) `key` changed, by name. A script
+    /// saved beside a node graph is kept for every track, changed or not: only the ones the
+    /// export keeps change the game.
+    pub(crate) fn character_script_moves(
+        &self,
+        key: &crate::character::CharacterKey,
+        track: crate::move_nodes::model::Track,
+    ) -> BTreeSet<String> {
+        use crate::move_nodes::model::Track;
+        let store = match track {
+            Track::Sound => &self.state.sound_script_edits,
+            Track::Expression => &self.state.expression_script_edits,
+            Track::Effect => &self.node_effect_scripts,
+            Track::Game => return self.character_game_moves(key),
+        };
+        store
+            .iter()
+            .filter_map(|(store_key, script)| {
+                let (owner, move_name) = crate::character::split_move_key(store_key)?;
+                (owner == key.as_str() && !self.script_is_games_own(store_key, track, script))
+                    .then(|| move_name.to_owned())
+            })
+            .collect()
+    }
+
+    /// The moves whose effect calls (which effects a move plays, and where) `key` changed.
+    pub(crate) fn character_effect_moves(
+        &self,
+        key: &crate::character::CharacterKey,
+    ) -> BTreeSet<String> {
+        let owned = |store_key: &String| {
+            crate::character::split_move_key(store_key)
+                .filter(|(owner, _)| *owner == key.as_str())
+                .map(|(_, move_name)| move_name.to_owned())
+        };
+        let mut moves: BTreeSet<String> = self
+            .state
+            .effect_call_edits
+            .iter()
+            .filter(|(_, edits)| !edits.is_empty())
+            .filter_map(|(k, _)| owned(k))
+            .chain(
+                self.state
+                    .effect_call_full
+                    .iter()
+                    .filter(|(_, calls)| !calls.is_empty())
+                    .filter_map(|(k, _)| owned(k)),
+            )
+            .collect();
+        moves.extend(self.character_script_moves(key, crate::move_nodes::model::Track::Effect));
+        moves
+    }
+
+    /// Open `move_name` of the fighter on screen, now when its move list is loaded, else as
+    /// soon as it is.
+    pub(crate) fn open_move_named(&mut self, move_name: &str) {
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|fighter| fighter.name.clone())
+        else {
+            return;
+        };
+        if let Some(entry) = self
+            .move_list
+            .iter()
+            .find(|entry| entry.name == move_name)
+            .cloned()
+        {
+            self.select_move(entry);
+        } else if self.move_list_receiver.is_some() {
+            self.pending_project_move_selection = Some((fighter, move_name.to_owned()));
+        }
+    }
+
+    /// The game's own scripts of `fighter`'s `move_name` as the export compiles them, read and
+    /// compiled once per session.
+    fn game_scripts_of(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Option<std::rc::Rc<crate::mod_project::FighterMod>> {
+        let key = format!("{fighter}/{move_name}");
+        if let Some(known) = self.game_script_baselines.borrow().get(&key) {
+            return known.clone();
+        }
+        let game =
+            crate::mod_export::game_scripts(fighter, move_name, &crate::acmd::cached_script_body)
+                .map(std::rc::Rc::new);
+        self.game_script_baselines
+            .borrow_mut()
+            .insert(key, game.clone());
+        game
+    }
+
+    /// `script`, the `track` script saved under the move key `store_key`, is the game's own:
+    /// the export leaves it out, so it changes nothing.
+    pub(crate) fn script_is_games_own(
+        &self,
+        store_key: &str,
+        track: crate::move_nodes::model::Track,
+        script: &crate::data::AcmdScript,
+    ) -> bool {
+        let Some((owner, move_name)) = crate::character::split_move_key(store_key) else {
+            return false;
+        };
+        let fighter = crate::character::CharacterKey::parse(owner);
+        self.game_scripts_of(fighter.engine_fighter(), move_name)
+            .is_some_and(|game| {
+                crate::mod_export::script_matches_game(&game, move_name, track, script)
+            })
+    }
+
+    /// `owner`'s game script edit of `move_name` is the game's own: the export leaves it out.
+    pub(crate) fn record_is_games_own(
+        &self,
+        owner: &crate::character::CharacterKey,
+        move_name: &str,
+        record: &crate::data::EditRecord,
+    ) -> bool {
+        self.game_scripts_of(owner.engine_fighter(), move_name)
+            .is_some_and(|game| crate::mod_export::record_matches_game(&game, move_name, record))
     }
 
     /// Who the gimmick kept for `fighter` belongs to: the made character whose costumes it is
@@ -18695,6 +18682,14 @@ impl VisionaryApp {
     }
 
     fn refresh_current_live_rules(&mut self) {
+        // Re-sending a move's rules as it opens is not an edit: keep the status line saying
+        // what it said, not "Move updated.".
+        let status = self.state.status.clone();
+        self.refresh_current_live_rules_quietly();
+        self.state.status = status;
+    }
+
+    fn refresh_current_live_rules_quietly(&mut self) {
         self.push_hitbox_rules();
         self.push_hurtbox_rules();
         self.push_attack_mod_rules();
@@ -21384,55 +21379,25 @@ impl VisionaryApp {
             Err(error) => errors.push(format!("roster export failed: {error:#}")),
         }
 
-        // 2b. Workspace manual overlay: models, animations, and anything the
-        // tool does not model ships verbatim from <workspace>/romfs/.
+        // 2b. The project's own files: folders picked for a part, then everything in
+        // <workspace>/romfs/ (models, animations, anything the tool does not model). A file the
+        // mod cannot use is a warning: it never stops the rest of the mod from building.
+        let mut warnings = warnings;
         if let Some(workspace) = self
             .project_path
             .as_ref()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         {
-            let overlay = crate::project_hub::workspace_romfs(&workspace);
-            if overlay.is_dir() {
-                match crate::project_hub::merge_romfs_overlay(&overlay, &dest) {
-                    Ok((copied, skipped)) => {
-                        if copied > 0 {
-                            report.push(format!(
-                                "Workspace overlay — {copied} manual file{} (models/animations/…) from romfs/",
-                                if copied == 1 { "" } else { "s" }
-                            ));
-                        }
-                        for conflict in skipped {
-                            errors.push(format!(
-                                "{conflict}: workspace romfs overlay skipped — generated file wins"
-                            ));
-                        }
-                    }
-                    Err(e) => errors.push(format!("workspace overlay failed: {e:#}")),
-                }
-            }
-            // Folders picked for a part ship at that part's place in the game.
-            for (folder, target) in
-                crate::project_parts::ProjectParts::load(&workspace).shipped_folders()
-            {
-                match crate::project_parts::ship_folder(&folder, &target, &dest) {
-                    Ok((copied, kept)) => {
-                        if copied > 0 {
-                            report.push(format!(
-                                "{copied} file(s) from {} to {}",
-                                folder.display(),
-                                target.display()
-                            ));
-                        }
-                        for path in kept {
-                            errors.push(format!(
-                                "{path}: kept the file the export built over the one in {}",
-                                folder.display()
-                            ));
-                        }
-                    }
-                    Err(e) => errors.push(format!("{}: {e:#}", folder.display())),
-                }
-            }
+            let shipped = crate::project_parts::ship_project_files(&workspace, &dest);
+            report.extend(shipped.report);
+            report.extend(
+                shipped
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("  ⚠ {warning}")),
+            );
+            warnings.extend(shipped.warnings);
+            errors.extend(shipped.errors);
         }
 
         // A binary-overlay-only export has neither generated EFF nor ACMD source, so
@@ -33441,6 +33406,15 @@ impl eframe::App for VisionaryApp {
                         }
                         ui.close();
                     }
+                    // The finished mod is the bar's Export mod; this is for building it yourself.
+                    if ui
+                        .button("Export source code")
+                        .on_hover_text("The source code and files the exported mod is made from, for building it yourself")
+                        .clicked()
+                    {
+                        self.export_developer_files();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("Game files folder").on_hover_text("The extracted game folder with fighter/, effect/ and ui/").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -33571,13 +33545,6 @@ impl eframe::App for VisionaryApp {
                     .clicked()
                 {
                     self.export_full_mod();
-                }
-                if ui
-                    .button("Export source code")
-                    .on_hover_text("The source code and files the exported mod is made from, for building it yourself")
-                    .clicked()
-                {
-                    self.export_developer_files();
                 }
                 ui.separator();
             });
@@ -36356,6 +36323,124 @@ fn expression_integer_edit(
 
 /// A boolean expression argument is a checkbox when the source is a normal bool, with the same
 /// source fallback used for unusual project expressions.
+/// The values of one rumble or camera shake call, as fields that wrap to the panel's width.
+/// Each field is a row of its own, which a wrapped row cannot break, so a new line starts
+/// before a field that would run past the panel.
+fn expression_fields(
+    ui: &mut Ui,
+    call: &mut crate::data::ExpressionCall,
+    site: usize,
+    rumble_patterns: &[String],
+) -> bool {
+    use crate::data::ExpressionCall;
+    // The room left on the line. A wrapped row's `available_width` does not shrink as the
+    // line fills, so it is measured from the cursor.
+    let next_field = |ui: &mut Ui, width: f32| {
+        if ui.max_rect().right() - ui.cursor().left() < width {
+            ui.end_row();
+        }
+    };
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| match call {
+        ExpressionCall::RumbleHit { kind, unk } => {
+            next_field(ui, 220.0);
+            changed |= rumble_kind_picker(
+                ui,
+                "Preset",
+                kind,
+                (site, 0),
+                rumble_patterns,
+                "The complete game-defined rumble preset. The name is the effect; there is no separate strength control.",
+            );
+            next_field(ui, 140.0);
+            changed |= expression_integer_edit(
+                ui,
+                "Value",
+                unk,
+                (site, 1),
+                "The second RUMBLE_HIT argument. The native binding exposes it only as a game-defined integer, so it is preserved and passed through unchanged in type.",
+            );
+        }
+        ExpressionCall::Quake { kind } => {
+            next_field(ui, 180.0);
+            changed |= expression_selector(
+                ui,
+                "Shake",
+                kind,
+                (site, 0),
+                EXPRESSION_QUAKE_KIND_OPTIONS,
+                "Camera shake size. The numeric value is preserved for live replay.",
+            );
+        }
+        ExpressionCall::FtAttackAbsCameraQuake {
+            attack_abs_kind,
+            quake_kind,
+        } => {
+            next_field(ui, 180.0);
+            changed |= expression_selector(
+                ui,
+                "Attack",
+                attack_abs_kind,
+                (site, 0),
+                EXPRESSION_ATTACK_ABS_KIND_OPTIONS,
+                "Absolute attack kind used by the throw/catch camera shake.",
+            );
+            next_field(ui, 180.0);
+            changed |= expression_selector(
+                ui,
+                "Shake",
+                quake_kind,
+                (site, 1),
+                EXPRESSION_QUAKE_KIND_OPTIONS,
+                "Camera shake size.",
+            );
+        }
+        ExpressionCall::ControlModuleSetRumble {
+            kind,
+            duration,
+            looped,
+            target,
+            ..
+        } => {
+            next_field(ui, 220.0);
+            changed |= rumble_kind_picker(
+                ui,
+                "Preset",
+                kind,
+                (site, 0),
+                rumble_patterns,
+                "The complete game-defined rumble preset. The name is the effect; there is no separate strength control.",
+            );
+            next_field(ui, 140.0);
+            changed |= expression_integer_edit(
+                ui,
+                "Duration",
+                duration,
+                (site, 1),
+                "The native duration argument. Zero is a valid value and uses the preset's native timing; it does not disable the rumble.",
+            );
+            next_field(ui, 90.0);
+            changed |= expression_bool_edit(
+                ui,
+                "Repeat",
+                looped,
+                (site, 2),
+                "Repeat the preset while the native duration is active.",
+            );
+            next_field(ui, 180.0);
+            changed |= expression_selector(
+                ui,
+                "Target",
+                target,
+                (site, 3),
+                EXPRESSION_TARGET_OPTIONS,
+                "The battle object receiving the rumble. Default target is the normal authored value; custom source expressions stay editable.",
+            );
+        }
+    });
+    changed
+}
+
 fn expression_bool_edit(
     ui: &mut Ui,
     field: &str,
@@ -36405,6 +36490,82 @@ fn expression_source_edit(
     .changed()
 }
 
+/// What the user did on one row of the move's sounds.
+#[derive(Debug, PartialEq)]
+enum SoundRowAction {
+    None,
+    Edit(crate::data::SoundCall),
+    MoveHere,
+    Remove,
+}
+
+/// One sound call of the move: its frame and kind, its sound names, and its buttons. `flat`
+/// says the call is outside every loop and branch, so it can be moved. Wrapped, not scrolled:
+/// a long sound name moves the buttons to the next line instead of out of the panel.
+fn sound_row(
+    ui: &mut Ui,
+    event: &crate::data::SoundEvent,
+    current_frame: u32,
+    flat: bool,
+    candidates: &[String],
+) -> SoundRowAction {
+    let active = event.frame == current_frame;
+    let mut action = SoundRowAction::None;
+    ui.horizontal_wrapped(|ui| {
+        // `STOP_SE` silences rather than plays, and reads colder for it — the same distinction
+        // the timeline band draws.
+        let color = if event.call.func.starts_with("STOP") {
+            egui::Color32::from_rgb(120, 140, 160)
+        } else if active {
+            egui::Color32::from_rgb(150, 210, 150)
+        } else {
+            egui::Color32::from_rgb(100, 150, 100)
+        };
+        ui.colored_label(color, if active { "◆" } else { "◇" });
+        ui.label(format!(
+            "Frame {} · {}",
+            event.frame,
+            sound_func_words(&event.call.func).unwrap_or(&event.call.func)
+        ))
+        .on_hover_text(format!("{} on frame {}", event.call.func, event.frame));
+
+        let mut call = event.call.clone();
+        let mut changed = false;
+        for (index, name) in call.sounds.iter_mut().enumerate() {
+            changed |= sound_name_picker(ui, name, candidates, (event.site, index));
+        }
+        // Shown, not editable: the suppression window is the one non-hash argument in the
+        // family and nothing has measured what a sensible range for it is.
+        if let Some(tail) = &event.call.tail {
+            ui.weak(format!("for {tail} frames"));
+        }
+        if ui
+            .add_enabled(flat && !active, egui::Button::new("Move here"))
+            .on_hover_text(if flat {
+                "Move this sound call to the current playhead frame."
+            } else {
+                "This call is inside a loop or branch; retiming it would change its control flow."
+            })
+            .clicked()
+        {
+            action = SoundRowAction::MoveHere;
+        }
+        if ui
+            .small_button("Remove")
+            .on_hover_text(
+                "Remove this source sound call, including every loop iteration if it is looped.",
+            )
+            .clicked()
+        {
+            action = SoundRowAction::Remove;
+        }
+        if changed {
+            action = SoundRowAction::Edit(call);
+        }
+    });
+    action
+}
+
 fn sound_name_picker(
     ui: &mut Ui,
     name: &mut String,
@@ -36412,7 +36573,8 @@ fn sound_name_picker(
     salt: (usize, usize),
 ) -> bool {
     let mut changed = false;
-    let desired_width = compact_source_field_width(ui, name);
+    let desired_width = compact_source_field_width(ui, name)
+        .min(ui.available_width().max(COMPACT_SOURCE_FIELD_MIN_WIDTH));
     changed |= ui
         .add(
             egui::TextEdit::singleline(name)
@@ -47522,6 +47684,158 @@ mod placement_offset_tests {
             super::placement_offset(&impact, impact.offset),
             [0.0, 10.0, 14.0]
         );
+    }
+}
+
+#[cfg(test)]
+mod sound_row_layout_tests {
+    use super::*;
+    use crate::ui::TestFrame;
+
+    /// How far past `width` the widgets `draw` lays out in a panel `width` wide run.
+    fn overflow(width: f32, mut draw: impl FnMut(&mut Ui)) -> f32 {
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut over = 0.0;
+        let _ = context.run_test_ui(input, |ui| {
+            ui.allocate_ui(egui::vec2(width, 900.0), |ui| {
+                ui.set_max_width(width);
+                let left = ui.max_rect().left();
+                draw(ui);
+                over = ui.min_rect().right() - (left + width);
+            });
+        });
+        over
+    }
+
+    /// Donkey Kong's forward smash stops `se_common_smash_start` on frame 16 (script cache,
+    /// `donkey/AttackS4.txt`): the row seen running out of the Sound & feedback panel.
+    fn smash_start_stop() -> crate::data::SoundEvent {
+        crate::data::SoundEvent {
+            frame: 16,
+            call: crate::data::SoundCall {
+                func: "STOP_SE".into(),
+                sounds: vec!["se_common_smash_start".into()],
+                tail: None,
+            },
+            site: 0,
+        }
+    }
+
+    /// At the panel's width in a 1000 and a 1400 wide window, and narrower, a sound row stays
+    /// inside the panel.
+    #[test]
+    fn a_sound_row_stays_inside_the_panel() {
+        let event = smash_start_stop();
+        let candidates = vec!["se_common_smash_start".to_owned()];
+        for width in [240.0, 300.0, 385.0] {
+            let over = overflow(width, |ui| {
+                sound_row(ui, &event, 1, true, &candidates);
+            });
+            assert!(over <= 0.5, "{over} px past a {width} px panel");
+        }
+    }
+
+    /// Donkey Kong's forward smash rumbles and shakes the camera on frame 22 (script cache,
+    /// `donkey/AttackS4.txt`): the timed rumble's fields ran out of the panel.
+    const SMASH_FEEDBACK: &str = r#"unsafe extern "C" fn expression_attacks4(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {
+        macros::RUMBLE_HIT(agent, Hash40::new("rbkind_attackll"), 0);
+        ControlModule::set_rumble(agent.module_accessor, Hash40::new("rbkind_nohit_attacks"), 0, false, *BATTLE_OBJECT_ID_INVALID as u32);
+        macros::QUAKE(agent, *CAMERA_QUAKE_KIND_S);
+    }
+}"#;
+
+    /// Every rumble and camera shake row's fields stay inside the panel at its width in a 1000
+    /// and a 1400 wide window.
+    #[test]
+    fn rumble_and_shake_fields_stay_inside_the_panel() {
+        let events = crate::acmd::parse_expression_script(SMASH_FEEDBACK).to_expression_events();
+        assert_eq!(events.len(), 3, "{events:?}");
+        let patterns = vec![
+            "rbkind_attackll".to_owned(),
+            "rbkind_nohit_attacks".to_owned(),
+        ];
+        for width in [300.0, 365.0] {
+            for event in &events {
+                let mut call = event.call.clone();
+                let over = overflow(width, |ui| {
+                    ui.group(|ui| {
+                        expression_fields(ui, &mut call, event.site, &patterns);
+                    });
+                });
+                assert!(over <= 0.5, "{over} px past a {width} px panel: {call:?}");
+            }
+        }
+    }
+
+    /// Paired with the above: the same widgets on one unwrapped line do run past it, so the
+    /// measure can see an overflow.
+    #[test]
+    fn the_same_widgets_on_one_line_run_past_the_panel() {
+        let over = overflow(300.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("◇ Frame 16 · Stop sound");
+                ui.add(
+                    egui::TextEdit::singleline(&mut "se_common_smash_start".to_owned())
+                        .desired_width(COMPACT_SOURCE_FIELD_MAX_WIDTH),
+                );
+                let _ = ui.button("Browse");
+                let _ = ui.button("Move here");
+                let _ = ui.small_button("Remove");
+            });
+        });
+        assert!(over > 0.5, "{over}");
+    }
+}
+
+#[cfg(test)]
+mod editor_tab_guard_tests {
+    /// The body of `fn name` in `source`: from its line to the next function at its indent.
+    fn body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source
+            .find(&format!("\n    fn {name}("))
+            .or_else(|| source.find(&format!("\n    pub(crate) fn {name}(")))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let rest = &source[start + 1..];
+        let end = rest[1..]
+            .find("\n    fn ")
+            .into_iter()
+            .chain(rest[1..].find("\n    pub(crate) fn "))
+            .chain(rest[1..].find("\n    pub fn "))
+            .min()
+            .map_or(rest.len(), |end| end + 1);
+        &rest[..end]
+    }
+
+    const ASSIGN: &str = concat!("self.primary_tab ", "= ");
+
+    /// Picking a move keeps the right-hand tab: a sounds editor stays on sounds from move to
+    /// move, and a card that opened a character on its Effects tab stays there once its move
+    /// loads.
+    #[test]
+    fn picking_a_move_keeps_the_right_hand_tab() {
+        let source = include_str!("app.rs");
+        for name in ["select_move", "activate_move"] {
+            assert!(
+                !body(source, name).contains(ASSIGN),
+                "fn {name} sets the tab"
+            );
+        }
+    }
+
+    /// The paired positive: the scan sees the assignment where a tab is chosen on purpose.
+    #[test]
+    fn the_scan_sees_a_tab_assignment() {
+        let source = include_str!("app.rs");
+        assert!(body(source, "open_character").contains(ASSIGN));
     }
 }
 
