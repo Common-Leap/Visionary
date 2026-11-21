@@ -3752,7 +3752,9 @@ mod plugin_costume_scope;
 
 #[cfg(test)]
 mod costume_scope_tests {
-    use super::plugin_costume_scope::{costume_is, prefer_specific_costumes, CostumeScoped};
+    use super::plugin_costume_scope::{
+        costume_is, prefer_specific_costumes, rule_color, CostumeScoped,
+    };
     use super::ForFighter;
     use crate::roster::RosterKey;
 
@@ -3816,6 +3818,40 @@ mod costume_scope_tests {
             .filter(|rule| costume_is(color, &rule.costumes, &rule.except_costumes))
             .map(|rule| rule.damage)
             .collect()
+    }
+
+    /// Review finding 11: a fireball has no costume of its own, so it used to pass every
+    /// costume test and both Mario's and Vision's versions of its move ran on it. It now takes
+    /// the costume of the fighter that threw it, for that fighter's rules.
+    #[test]
+    fn a_projectile_runs_only_its_throwers_version_of_a_move() {
+        const MARIO: i32 = 1;
+        let roster = roster_with_vision();
+        let rules = installed(&[
+            ForFighter::scoped("mario/attack_11", jab(5.0), &roster).unwrap(),
+            ForFighter::scoped("mario#c08/attack_11", jab(20.0), &roster).unwrap(),
+        ]);
+        let on_fireball = |founder: Option<(i32, i32)>| -> Vec<f32> {
+            rules
+                .iter()
+                .filter(|rule| {
+                    costume_is(
+                        rule_color(-1, Some(MARIO), founder),
+                        &rule.costumes,
+                        &rule.except_costumes,
+                    )
+                })
+                .map(|rule| rule.damage)
+                .collect()
+        };
+        assert_eq!(on_fireball(Some((MARIO, 2))), vec![5.0]);
+        assert_eq!(on_fireball(Some((MARIO, 9))), vec![20.0]);
+        // The paired control: with no fighter behind it (or another fighter's), it is unknown
+        // and passes, as every object did before; a fighter's own costume always decides.
+        assert_eq!(on_fireball(None).len(), 2);
+        assert_eq!(on_fireball(Some((MARIO + 1, 9))).len(), 2);
+        assert_eq!(rule_color(3, Some(MARIO), Some((MARIO, 9))), 3);
+        // That the plugin asks for the thrower's costume where it tests a rule's is in CHECKS.
     }
 
     #[test]
@@ -3969,11 +4005,26 @@ mod costume_scope_tests {
         (0, "staticACTING_COLOR:", "staticACTING_COLOR:"),
         (
             0,
-            "pubunsafefnnote_acting(",
+            "unsafefnkind_and_color(",
             "FIGHTER_INSTANCE_WORK_ID_INT_COLOR",
         ),
         (0, "pubunsafefnnote_acting(", "ACTING_COLOR.store(color"),
-        (0, "pubfnacting_is(", "&&costume_is(ACTING_COLOR.load("),
+        // A projectile takes the costume of the fighter that made it.
+        (
+            0,
+            "pubunsafefnnote_acting(",
+            "get_founder_id((*boma).battle_object_id)",
+        ),
+        (
+            0,
+            "pubunsafefnnote_acting(",
+            "FOUNDER_COLOR.store(founder_color",
+        ),
+        (
+            0,
+            "pubfnacting_is(",
+            "&&costume_is(rule_color(ACTING_COLOR.load(",
+        ),
         (0, "pubstructHitboxRule{", "pubcostumes:Vec<u8>"),
         (0, "pubstructHitboxRule{", "pubexcept_costumes:Vec<u8>"),
         (

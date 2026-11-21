@@ -34,7 +34,7 @@ use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
 pub use super::costume_scope;
-pub use costume_scope::{costume_is, prefer_specific_costumes, CostumeScoped};
+pub use costume_scope::{costume_is, prefer_specific_costumes, rule_color, CostumeScoped};
 mod drop_hooks;
 mod node_steps;
 pub use node_steps::{passes as guard_passes, LiveGuard};
@@ -1532,25 +1532,50 @@ pub struct HitboxRule {
 static ACTING_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 /// That fighter's costume (colour slot); -1 for anything that isn't a fighter.
 static ACTING_COLOR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// For a projectile or other object: the kind and costume of the fighter that made it; -1 when
+/// that is not a fighter, or the one acting is a fighter itself.
+static FOUNDER_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static FOUNDER_COLOR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// A fighter's kind and costume.
+unsafe fn kind_and_color(boma: *mut smash::app::BattleObjectModuleAccessor) -> (i32, i32) {
+    (
+        smash::app::utility::get_kind(&mut *boma),
+        smash::app::lua_bind::WorkModule::get_int(
+            boma,
+            *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+        ),
+    )
+}
 
 /// Every rule lookup follows a hook reading this boma's motion, so that read names the fighter
-/// and the costume it wears.
+/// and the costume it wears, or for anything else the fighter that made it.
 pub unsafe fn note_acting(boma: *mut smash::app::BattleObjectModuleAccessor) {
-    let (kind, color) = if smash::app::utility::get_category(&mut *boma)
-        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
-    {
-        (
-            smash::app::utility::get_kind(&mut *boma),
-            smash::app::lua_bind::WorkModule::get_int(
-                boma,
-                *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-            ),
-        )
+    let fighter = *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER;
+    let (kind, color) = if smash::app::utility::get_category(&mut *boma) == fighter {
+        kind_and_color(boma)
     } else {
         (-1, -1)
     };
+    let (founder_kind, founder_color) = if kind != -1 {
+        (-1, -1)
+    } else {
+        let founder = smash::app::sv_battle_object::get_founder_id((*boma).battle_object_id);
+        let owner = if founder >= 0 && smash::app::sv_battle_object::is_active(founder as u32) {
+            smash::app::sv_battle_object::module_accessor(founder as u32)
+        } else {
+            std::ptr::null_mut()
+        };
+        if !owner.is_null() && smash::app::utility::get_category(&mut *owner) == fighter {
+            kind_and_color(owner)
+        } else {
+            (-1, -1)
+        }
+    };
     ACTING_KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
     ACTING_COLOR.store(color, std::sync::atomic::Ordering::Relaxed);
+    FOUNDER_KIND.store(founder_kind, std::sync::atomic::Ordering::Relaxed);
+    FOUNDER_COLOR.store(founder_color, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
@@ -1573,9 +1598,20 @@ pub fn acting_is(fighter_kind: Option<i32>, costumes: &[u8], except_costumes: &[
             || (wanted == *smash::lib::lua_const::FIGHTER_KIND_POPO
                 && acting == *smash::lib::lua_const::FIGHTER_KIND_NANA)
     });
+    let founder_kind = FOUNDER_KIND.load(std::sync::atomic::Ordering::Relaxed);
+    let founder = (founder_kind != -1).then(|| {
+        (
+            founder_kind,
+            FOUNDER_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    });
     fighter
         && costume_is(
-            ACTING_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+            rule_color(
+                ACTING_COLOR.load(std::sync::atomic::Ordering::Relaxed),
+                fighter_kind,
+                founder,
+            ),
             costumes,
             except_costumes,
         )

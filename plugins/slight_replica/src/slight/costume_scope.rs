@@ -13,6 +13,20 @@ pub fn costume_is(color: i32, costumes: &[u8], except_costumes: &[u8]) -> bool {
     (costumes.is_empty() || costumes.contains(&color)) && !except_costumes.contains(&color)
 }
 
+/// The costume a rule is tested against. A fighter's own (`acting_color`); for a projectile or
+/// other object, the costume of the fighter that made it (`founder`: its kind and costume) when
+/// the rule is for that fighter, so Mario's version of a move and a made character's each drive
+/// only their own fireballs. Anything else stays unknown (-1) and passes, as before.
+pub fn rule_color(acting_color: i32, rule_kind: Option<i32>, founder: Option<(i32, i32)>) -> i32 {
+    if acting_color >= 0 {
+        return acting_color;
+    }
+    match (rule_kind, founder) {
+        (Some(kind), Some((founder_kind, color))) if kind == founder_kind => color,
+        _ => -1,
+    }
+}
+
 /// The fighter kind and motion a rule is for; rules with equal scopes are versions of one move.
 pub type MoveScope = (Option<i32>, Option<u64>);
 
