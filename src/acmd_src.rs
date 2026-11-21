@@ -1603,23 +1603,30 @@ impl SourceIndex {
                         })
                         .collect::<Vec<_>>()
                 });
+                // A path that names no module beside the file (`super::status::f`, a `pub use`
+                // re-export, an inline `mod fly {}`) says nothing: the name alone decides.
                 let found = match (in_module.as_deref(), own.as_slice(), candidates) {
                     (Some([one]), _, _) => Some((*one).clone()),
-                    (Some(_), _, _) => None,
-                    (None, [one], _) => Some((*one).clone()),
-                    (None, [], [one]) => Some(one.clone()),
+                    (Some([_, _, ..]), _, _) => None,
+                    (_, [one], _) => Some((*one).clone()),
+                    (_, [], [one]) => Some(one.clone()),
                     _ => None,
                 };
                 let Some((at, span)) = found else {
                     let reason = if candidates.is_empty() {
-                        "the registered function is not defined in the project source"
+                        "the registered function is not defined in the project source".to_string()
+                    } else if registration.module.is_some() {
+                        format!(
+                            "the registered function name is defined in {} places, and its path doesn't say which",
+                            candidates.len()
+                        )
                     } else {
-                        "the registered function name is defined more than once"
+                        format!(
+                            "the registered function name is defined in {} places, none of them in the registering file",
+                            candidates.len()
+                        )
                     };
-                    self.unresolved_statuses.push(UnresolvedStatus {
-                        reason: reason.to_string(),
-                        ..unresolved
-                    });
+                    self.unresolved_statuses.push(UnresolvedStatus { reason, ..unresolved });
                     continue;
                 };
                 let site = StatusSite {
@@ -18507,6 +18514,42 @@ pub fn install(agent: &mut smashline::Agent) {
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].0.file.ends_with("fly.rs"), "{:?}", bodies[0].0.file);
         assert!(bodies[0].1.contains("-> L2CValue"));
+    }
+
+    /// I-3: a path that names no module beside the registering file still finds a function
+    /// defined once: `super::status::f`, and a `pub use` re-export.
+    #[test]
+    fn a_path_naming_no_module_beside_the_file_keeps_the_unique_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "orb/mod.rs", "mod status;\nmod install;\n");
+        put(
+            root,
+            "orb/status.rs",
+            "pub unsafe extern \"C\" fn orb_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
+        );
+        put(
+            root,
+            "orb/install.rs",
+            "pub fn install() {\n    Agent::new(\"mario_orb\")\n        .status(Main, *WEAPON_KIND_X, super::status::orb_main)\n        .install();\n}\n",
+        );
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert_eq!(index.status_bodies("mario_orb").len(), 1);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "shot/mod.rs", "mod imp;\nmod fly { pub use super::imp::shot_main; }\npub fn install() {\n    Agent::new(\"mario_shot\").status(Main, 0, fly::shot_main).install();\n}\n");
+        put(root, "shot/imp.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(index.status_bodies("mario_shot")[0].1.contains("shot_main"));
+
+        // Defined twice and the path names neither: refused, with a reason that says so.
+        put(root, "shot/other.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    1.into()\n}\n");
+        let index = SourceIndex::build(root).unwrap();
+        let reason = &index.unresolved_statuses[0].reason;
+        assert!(reason.contains("defined in 2 places") && reason.contains("path doesn't say which"), "{reason}");
     }
 
     /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
