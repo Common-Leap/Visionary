@@ -106,6 +106,116 @@ pub(super) fn split_agent(agent: &str, names: &[String]) -> Option<(String, Opti
         .map(|n| (n.clone(), Some(agent[n.len() + 1..].to_string())))
 }
 
+/// Fighters whose scripts write another fighter's article ids on purpose, and whose: Kirby's copy
+/// abilities spawn the copied fighter's articles, and an echo or semi-clone shares its original's
+/// list. Such an id is residue to list, never a misattribution.
+const CROSS_FIGHTER: &[(&str, &str)] = &[
+    ("samusd", "samus"),
+    ("pichu", "pikachu"),
+    ("richter", "simon"),
+    ("falco", "fox"),
+    ("shizue", "murabito"),
+    ("daisy", "peach"),
+    ("lucina", "marth"),
+    ("chrom", "roy"),
+    ("ken", "ryu"),
+    ("pitb", "pit"),
+];
+
+pub(super) fn cross_fighter_ok(owner: &str, other: &str) -> bool {
+    owner == "kirby" || CROSS_FIGHTER.contains(&(owner, other))
+}
+
+/// The fighter an id symbol names when it is a fighter other than `owner`:
+/// `FIGHTER_<X>_GENERATE_ARTICLE_*`, or `WEAPON_<X>_<ARTICLE>_GENERATE_ARTICLE_*` for an article's
+/// own. A name that is no fighter (`FIGHTER_KINGTERESA_…`, a moveset's own) names nobody else.
+pub(super) fn foreign_id_owner(symbol: &str, owner: &str, names: &[String]) -> Option<String> {
+    let ident = symbol.trim().trim_start_matches(['*', '&']).trim();
+    let ident = ident.rsplit("::").next().unwrap_or(ident);
+    let (head, _) = ident.split_once("_GENERATE_ARTICLE_")?;
+    let named = if let Some(fighter) = head.strip_prefix("FIGHTER_") {
+        let fighter = fighter.to_lowercase();
+        names.contains(&fighter).then_some(fighter)
+    } else {
+        let rest = head.strip_prefix("WEAPON_")?.to_lowercase();
+        split_agent(&rest, names).map(|(fighter, _)| fighter)
+    }?;
+    (!named.eq_ignore_ascii_case(owner)).then_some(named)
+}
+
+/// Why a clone listed under `fighter` is not that fighter's, if it isn't.
+pub(super) fn clone_owner_mismatch(article: &super::Article, fighter: &str) -> Option<String> {
+    let ArticleOrigin::Clone(decl) = &article.origin else { return None };
+    (!decl.new_owner.eq_ignore_ascii_case(fighter)).then(|| {
+        format!("`{}` is listed under {fighter} but its clone_weapon names {} as its owner", article.agent, decl.new_owner)
+    })
+}
+
+/// The agent names a file's text declares: `Agent::new("…")` and `agent = "…"`.
+fn agent_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in ["Agent::new(\"", "agent = \"", "agent=\""] {
+        let mut rest = text;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            if let Some(end) = rest.find('"') {
+                out.push(rest[..end].to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// Whether a script the index puts on `agent` (`<owner>_<name>`) is written where that owner is
+/// named: a file that registers it by that agent explicitly, else the nearest file or folder that
+/// names any agent, which must name one of `owner`'s.
+pub(super) fn script_scope_check(
+    agent: &str,
+    owner: &str,
+    file: &Path,
+    function: &str,
+    root: &Path,
+    sources: &[(PathBuf, String)],
+    names: &[String],
+) -> Result<(), String> {
+    let quoted = format!("\"{agent}\"");
+    let names_function = |text: &str| {
+        text.match_indices(function).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + function.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    };
+    if sources.iter().any(|(_, text)| text.contains(&quoted) && names_function(text)) {
+        return Ok(());
+    }
+    let owned = |name: &String| split_agent(name, names).is_some_and(|(o, _)| o == owner);
+    let in_file: Vec<String> = sources.iter().filter(|(f, _)| f == file).flat_map(|(_, t)| agent_literals(t)).collect();
+    if !in_file.is_empty() {
+        return if in_file.iter().any(owned) { Ok(()) } else { Err(format!("its file names only {}", in_file.join(", "))) };
+    }
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        let here: Vec<String> = sources
+            .iter()
+            .filter(|(f, _)| f.parent() == Some(d))
+            .flat_map(|(_, t)| agent_literals(t))
+            .collect();
+        if !here.is_empty() {
+            return if here.iter().any(owned) {
+                Ok(())
+            } else {
+                Err(format!("the nearest folder naming agents, `{}`, names only {}", d.display(), here.join(", ")))
+            };
+        }
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+    Err(format!("no file around it names {owner} or `{agent}`"))
+}
+
 /// `let NAME = EXPR;` bindings in `body`, as `resolve_id` takes them.
 fn let_bindings(body: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -155,6 +265,8 @@ struct Moveset {
     rt_scripts: usize,
     rt_failed: Vec<String>,
     rt_refused: Vec<String>,
+    /// Ids naming another fighter that the fighter writes on purpose (Kirby, echoes).
+    cross_ids: Vec<String>,
     failures: Vec<String>,
 }
 
@@ -342,6 +454,7 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
     fighters.retain(|f| !matches!(f.as_str(), "common"));
     out.fighters = fighters.iter().cloned().collect();
 
+    let all_sources = super::rust_sources(&index);
     let mut owner_of_agent: HashMap<String, String> = HashMap::new();
     let mut listed_agents: BTreeSet<String> = BTreeSet::new();
     let no_locals = HashMap::new();
@@ -360,6 +473,28 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
             listed_agents.insert(a.agent.clone());
             if a.owner != *fighter {
                 out.failures.push(format!("{fighter}'s catalog lists `{}` owned by {}", a.agent, a.owner));
+            }
+            if let Some(why) = clone_owner_mismatch(a, fighter) {
+                out.failures.push(why);
+            }
+            // A clone's id names, and the ids the catalog answers to, name this fighter or none.
+            for symbol in &a.id_symbols {
+                if let Some(other) = foreign_id_owner(symbol, fighter, &names) {
+                    let line = format!("`{}` answers to `{symbol}`, {other}'s id", a.agent);
+                    if cross_fighter_ok(fighter, &other) {
+                        out.cross_ids.push(line);
+                    } else {
+                        out.failures.push(line);
+                    }
+                }
+            }
+            // Each of its scripts is written where its owner is named.
+            if let Some(scripts) = index.fighters.get(&a.agent) {
+                for site in scripts.scripts.values() {
+                    if let Err(why) = script_scope_check(&a.agent, fighter, &site.file, &site.function, root, &all_sources, &names) {
+                        out.failures.push(format!("`{}:{}` {} is attributed to `{}`, but {why}", short(&site.file), line_of(&std::fs::read_to_string(&site.file).unwrap_or_default(), site.span.start), site.function, a.agent));
+                    }
+                }
             }
         }
         let mut stats: Vec<ArticleStats> = catalog.articles.iter().map(|_| ArticleStats::default()).collect();
@@ -405,6 +540,10 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                         Some(a) => {
                             if a.owner != *fighter {
                                 out.failures.push(format!("{place} {agent}/{script}: `{}` resolves to {}'s {}", call.article, a.owner, a.name));
+                            }
+                            if let Some(other) = foreign_id_owner(&call.article, fighter, &names) {
+                                let line = format!("{place} {agent}/{script}: `{}` names {other} but resolves to {fighter}'s {}", call.article.trim(), a.name);
+                                if cross_fighter_ok(fighter, &other) { out.cross_ids.push(line) } else { out.failures.push(line) }
                             }
                             out.ids_resolved += 1;
                             let s = &mut stats[at(a)];
@@ -452,6 +591,10 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                         Some(a) => {
                             if a.owner != *fighter {
                                 out.failures.push(format!("{place} {agent} status: `{}` resolves to {}'s {}", call.article, a.owner, a.name));
+                            }
+                            if let Some(other) = foreign_id_owner(&call.article, fighter, &names) {
+                                let line = format!("{place} {agent} status: `{}` names {other} but resolves to {fighter}'s {}", call.article.trim(), a.name);
+                                if cross_fighter_ok(fighter, &other) { out.cross_ids.push(line) } else { out.failures.push(line) }
                             }
                             out.status_resolved += 1;
                             stats[at(a)].status_rows += 1;
@@ -649,7 +792,8 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
                 settings.replace('|', "\\|"),
             );
         }
-        let lists: [(&str, &Vec<String>); 11] = [
+        let lists: [(&str, &Vec<String>); 12] = [
+            ("Ids that name another fighter on purpose", &m.cross_ids),
             ("Failures", &m.failures),
             ("Unresolved ids (scripts)", &m.ids_unresolved),
             ("Unresolved ids (status code)", &m.status_unresolved),
@@ -757,6 +901,64 @@ mod tests {
         assert_eq!(split_agent("mario", &names), Some(("mario".into(), None)));
         assert_eq!(split_agent("pacman_", &names), None);
         assert_eq!(split_agent("toad", &names), None);
+    }
+
+    /// I-1: the misattribution checks catch a deliberate wrong attribution.
+    #[test]
+    fn wrong_attributions_fail_the_checks() {
+        let names: Vec<String> = ["mario", "samus", "kirby", "dedede", "murabito"].iter().map(|s| s.to_string()).collect();
+        // An id naming another fighter.
+        assert_eq!(foreign_id_owner("*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", "samus", &names).as_deref(), Some("mario"));
+        assert_eq!(foreign_id_owner("FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT", "Samus", &names), None);
+        assert_eq!(foreign_id_owner("WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", "mario", &names).as_deref(), Some("murabito"));
+        assert_eq!(foreign_id_owner("WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", "murabito", &names), None);
+        // A moveset's own name for a fighter (King Boo on dedede) names nobody else.
+        assert_eq!(foreign_id_owner("FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL", "dedede", &names), None);
+        assert!(cross_fighter_ok("kirby", "mario") && cross_fighter_ok("samusd", "samus"));
+        assert!(!cross_fighter_ok("samus", "lucario"));
+
+        // A clone listed under the wrong fighter.
+        let decl = super::super::clones::CloneDecl {
+            new_owner: "samus".into(),
+            new_name: "lativolt".into(),
+            src_owner: Some("mario".into()),
+            src_kind: "WEAPON_KIND_MARIO_FIREBALL".into(),
+            use_original_code: false,
+            id_bindings: vec![],
+            kind_bindings: vec![],
+            id_note: None,
+            file: PathBuf::from("lib.rs"),
+            line: 1,
+        };
+        let article = super::super::Article {
+            owner: "mario".into(),
+            name: "lativolt".into(),
+            agent: "mario_lativolt".into(),
+            origin: ArticleOrigin::Clone(decl),
+            id_symbols: vec![],
+            source_scripts: vec![],
+            conflicts: vec![],
+            id_note: None,
+            also_declared: vec![],
+            clone_conflicts: vec![],
+        };
+        assert!(clone_owner_mismatch(&article, "mario").is_some());
+        assert!(clone_owner_mismatch(&article, "Samus").is_none());
+
+        // A script put on `mario_fireball` from a folder that only names luigi.
+        let root = PathBuf::from("r");
+        let sources = vec![
+            (root.join("luigi/mod.rs"), "pub fn install() { let a = &mut Agent::new(\"luigi\"); acmd::install(a); }".to_string()),
+            (root.join("luigi/acmd.rs"), "unsafe extern \"C\" fn game_fly(agent: &mut L2CAgentBase) {}".to_string()),
+            (root.join("mario/mod.rs"), "pub fn install() { Agent::new(\"mario_fireball\").acmd(\"game_x\", fireball::game_x).install(); }".to_string()),
+            (root.join("mario/fireball.rs"), "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {}".to_string()),
+        ];
+        let names: Vec<String> = ["mario", "luigi"].iter().map(|s| s.to_string()).collect();
+        let wrong = script_scope_check("mario_fireball", "mario", &root.join("luigi/acmd.rs"), "game_fly", &root, &sources, &names);
+        assert!(wrong.unwrap_err().contains("luigi"));
+        // Registered by that agent explicitly, or under a folder naming the owner: fine.
+        assert!(script_scope_check("mario_fireball", "mario", &root.join("mario/fireball.rs"), "game_x", &root, &sources, &names).is_ok());
+        assert!(script_scope_check("luigi_fireball", "luigi", &root.join("luigi/acmd.rs"), "game_fly", &root, &sources, &names).is_ok());
     }
 
     #[test]

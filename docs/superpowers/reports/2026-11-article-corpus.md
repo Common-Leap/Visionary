@@ -48,10 +48,23 @@ statement, an edit not written, or a revert that does not restore the file is a 
 
 ### Misattribution checks
 
-An agent listed in two catalogs or twice in one, a catalog article whose owner is not the
-catalog's fighter, and an id in a fighter's (or its article's) script that resolves to another
-owner's article. Ids are resolved with `ArticleCatalog::resolve_id` and no locals, as the app's
-timeline labels do.
+Ids are resolved with `ArticleCatalog::resolve_id` and no locals, as the app's timeline labels
+do. A failure is any of:
+
+- an agent listed in two catalogs, or twice in one;
+- a clone listed under a fighter its `clone_weapon` does not name as the new owner;
+- an id the catalog answers to, or a resolved id in a script or status line, shaped
+  `FIGHTER_<X>_GENERATE_ARTICLE_*` (or `WEAPON_<X>_<ARTICLE>_GENERATE_ARTICLE_*`) where `X` is a
+  fighter other than the catalog's. A name that is no fighter (`FIGHTER_KINGTERESA_…`) is the
+  moveset's own and passes; Kirby and the echo/semi-clone pairs (samusd/samus, pichu/pikachu,
+  richter/simon, falco/fox, shizue/murabito, daisy/peach, lucina/marth, chrom/roy, ken/ryu,
+  pitb/pit) are listed under "Ids that name another fighter on purpose" instead;
+- an article script the index puts on `<owner>_<name>` that is neither registered by that agent
+  in a file naming its function, nor in a file or nearest agent-naming folder that names one of
+  the owner's agents.
+
+`corpus_sweep::tests::wrong_attributions_fail_the_checks` gives each check a deliberate wrong
+attribution and shows it fails. On the corpus all four pass: 0 failures.
 
 ### Fighter names
 
@@ -76,6 +89,24 @@ at all; using the full name list here lets the sweep still attribute their artic
 | 10 | Clones made through a helper, `unsafe fn clone(name, source, generate_id: *mut i32, ..)` called with `addr_of_mut!(FIGHTER_MARIO_GENERATE_ARTICLE_..)` (Sceptile `registration.rs:144-173`): 1 unresolved clone, 6 objects missing | Inline a helper at each call; a store through a pointer parameter binds the call's static | `articles::clones::tests::helper_calls_are_one_clone_each` | 4c09b5e |
 | 11 | `.status(End, KIND, fly::bullet_seed_end)` with `bullet_seed_end` defined in two modules (Sceptile `bullet_seed/status/mod.rs:19`, 4 statuses) | Follow the path's module to the function | `acmd_src::tests::a_module_path_picks_the_function_in_that_module` | b8a0fd2 |
 | 12 | `*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON` for the dump's `peach/motion/peachdaikon` (HDR `vendor/hdr/fighters/peach/src/acmd/specials.rs:379`; daisy the same) | A vanilla folder may carry its owner's name | `articles::tests::resolves_the_games_own_spellings` | cc6d0f6 |
+
+Review round 1 (no change to the counts above; the final sweep's detail is identical):
+
+- Clone helpers: a binding is looked up only among the bindings before it, with a depth guard,
+  so `clone(name)` inside `fn reg(name: &str)`, a `CLONES.iter()` loop with the same names, or a
+  two-helper cycle can't recurse; each is listed as unresolved at its call
+  (`clones::tests::self_named_helper_arguments_are_unknown_not_a_loop`). Helpers are found across
+  the project and through `self::`/`util::` paths, a same-named function elsewhere is still read,
+  and a helper no call reaches lists its clones as "made inside helper `<fn>`, whose callers
+  Visionary couldn't follow" (`clones::tests::helpers_are_found_across_files_and_paths`).
+- A clone declared again from another source is a conflict on the article naming both sources
+  and places, shown in its notes and warnings; an identical one merges its bindings
+  (`articles::tests::a_clone_declared_from_two_sources_is_a_conflict`).
+- A status function path naming no module beside the file (`super::status::f`, a `pub use`
+  re-export) falls back to the unique definition, and the ambiguity reason says how many places
+  and why (`acmd_src::tests::a_path_naming_no_module_beside_the_file_keeps_the_unique_match`).
+- The misattribution checks above replace the earlier ones, which `build` made true by
+  construction.
 
 Fix 7 changes `fighter_for_file`, which ACMD script attribution uses too: a folder holding a
 fighter's module and an `Agent::new("fighter")` now goes to the fighter instead of to nobody. No
