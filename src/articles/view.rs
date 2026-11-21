@@ -606,11 +606,11 @@ pub fn status_call_rows(
             continue;
         };
         for (offset, line) in body.lines().enumerate() {
-            if !line.contains("ArticleModule::") {
+            let Some(read) = status_line_call(line) else {
                 continue;
-            }
+            };
             let number = first + offset;
-            let label = match ArticleCall::parse(line) {
+            let label = match read {
                 Some(call) => timeline_label(&call, catalog),
                 None => format!(
                     "An object call Visionary doesn't read, kept as written: `{}`",
@@ -628,6 +628,42 @@ pub fn status_call_rows(
         }
     }
     out
+}
+
+/// The `ArticleModule` call one line of status code makes. `None` when the line makes none, or
+/// only names one in a comment (`//ArticleModule::remove_exist(..)`). `Some(None)` for a call
+/// Visionary can't read. A call inside a condition or an expression
+/// (`if ArticleModule::is_exist(acc, ID) {`) is read as the call alone: its object is still named.
+pub fn status_line_call(line: &str) -> Option<Option<ArticleCall>> {
+    let at = line.find("ArticleModule::")?;
+    if line.find("//").is_some_and(|comment| comment < at) || line.trim_start().starts_with(['*', '/']) {
+        return None;
+    }
+    if let Some(call) = ArticleCall::parse(line) {
+        return Some(Some(call));
+    }
+    let start = line[..at]
+        .strip_suffix("smash::app::lua_bind::")
+        .map_or(at, |before| before.len());
+    let open = at + line[at..].find('(')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut close = None;
+    for (i, c) in line[open..].char_indices() {
+        match c {
+            '"' => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(close.and_then(|close| ArticleCall::parse(&format!("{};", &line[start..=close]))))
 }
 
 /// Whether a status kind belongs to a move: `SPECIAL_N` statuses (`SPECIAL_N_C` too) go with
@@ -859,6 +895,30 @@ mod tests {
         assert_eq!(rows[0].label, "Creates the fireball");
         assert_eq!(rows[0].origin, "in status code, `status.rs:3`");
         assert_eq!(rows[0].line, 3);
+    }
+
+    /// Conker-Moveset-Dev and -Moveset-Wii-Sports check `if ArticleModule::is_exist(fighter.module_accessor,
+    /// *FIGHTER_MARIO_GENERATE_ARTICLE_PUMP) {` / `..._CAPPY){` in status code; Potemkin-SL2 ·
+    /// src/moveset/kamui status keeps `//    ArticleModule::remove_exist(module_accessor,FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON,ArticleOperationTarget(0));`
+    /// commented out (tier 1, smashline2). The check names its object; the comment is no call.
+    #[test]
+    fn status_lines_read_calls_inside_conditions_and_skip_comments() {
+        let call = status_line_call("    if ArticleModule::is_exist(fighter.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_PUMP) {")
+            .unwrap()
+            .unwrap();
+        assert_eq!(call.op, ArticleOp::Other("is_exist".into()));
+        assert_eq!(call.article, "*FIGHTER_MARIO_GENERATE_ARTICLE_PUMP");
+        let call = status_line_call("        && ArticleModule::motion_kind(agent.module_accessor, *FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1, ArticleOperationTarget(*ARTICLE_OPE_TARGET_LAST)) == hash40(\"start\")")
+            .unwrap()
+            .unwrap();
+        assert_eq!(call.article, "*FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1");
+        assert_eq!(status_line_call("    //    ArticleModule::remove_exist(module_accessor,FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON,ArticleOperationTarget(0));"), None);
+        assert_eq!(status_line_call("    let x = 1; // ArticleModule::shoot(..)"), None);
+        assert_eq!(status_line_call("    MotionModule::set_rate(boma, 1.0);"), None);
+        let line = "    ArticleModule::generate_article(fighter.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, false, -1);";
+        assert_eq!(status_line_call(line), Some(ArticleCall::parse(line)));
+        // A call split over lines is kept as unread, never dropped.
+        assert_eq!(status_line_call("    ArticleModule::generate_article("), Some(None));
     }
 
     #[test]
