@@ -9023,12 +9023,8 @@ impl VisionaryApp {
                     self.move_revealed = open_move;
                 }
 
-                if groups.iter().all(Vec::is_empty) {
-                    ui.weak(if self.state.selected_fighter.is_none() {
-                        "Select a fighter"
-                    } else {
-                        "No matching moves"
-                    });
+                if self.state.selected_fighter.is_some() && groups.iter().all(Vec::is_empty) {
+                    ui.weak("No matching moves");
                 }
                 let mut to_select: Option<MoveEntry> = None;
                 for (ci, group) in groups.iter().enumerate() {
@@ -10228,11 +10224,10 @@ impl VisionaryApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         let rect = ui.available_rect_before_wrap();
-        if self.current_model_dir.is_some() {
-            self.draw_stage_picker(ui, rect);
-        }
-
-        if self.current_model_dir.is_some() {
+        self.draw_stage_picker(ui, rect);
+        // With no character open the view still renders: the stage, and an effect on its own.
+        let no_fighter = self.current_model_dir.is_none();
+        {
             let w = rect.width();
             let h = rect.height();
 
@@ -10351,6 +10346,7 @@ impl VisionaryApp {
                         self.preview_trails(frame)
                     },
                     hide_body: alone
+                        || no_fighter
                         || objects
                             .iter()
                             .any(|object| crate::article_preview::replaces_fighter(&object.kind)),
@@ -11039,12 +11035,6 @@ impl VisionaryApp {
                     }
                 }
             }
-        } else {
-            ui.painter()
-                .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Open a data root directory to begin").color(Color32::GRAY));
-            });
         }
     }
 

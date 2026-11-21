@@ -2876,10 +2876,8 @@ impl EffEditor {
                                     .any(|m| m.label.to_lowercase().contains(&filter))
                             }))
                 };
-                if !self.entries.iter().any(&matches) {
-                    ui.weak(if self.entries.is_empty() {
-                        "Open an effect file above to see its effects"
-                    } else if only_move {
+                if !self.entries.is_empty() && !self.entries.iter().any(&matches) {
+                    ui.weak(if only_move {
                         "This move plays none of this file's effects"
                     } else {
                         "No matching effects"
