@@ -2874,6 +2874,13 @@ fn made_effect_lookup(
     Some(own.ok_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff")))
 }
 
+/// Whether `status` is the effect alias push's own success line, which says nothing the user
+/// acted on.
+fn alias_status_is_routine(status: &str) -> bool {
+    status.starts_with("Sent to the game:")
+        || status.starts_with("Goes to the game when it connects:")
+}
+
 /// Values worked out from every edit, kept until the edit revision they were worked out at
 /// changes.
 struct RevisionCache<K, V>(std::cell::RefCell<HashMap<K, (u64, V)>>);
@@ -3970,6 +3977,8 @@ pub struct VisionaryApp {
     /// is the entire transplant delay, and recreating the same assist kind while the previous
     /// object is still dying can hang the game's loader outright.
     carrier_push_callers: Vec<String>,
+    /// Whether a queued alias publication reports its success on the status bar.
+    carrier_push_reports: bool,
     project_name: String,
     /// The open project's `modproject.json` path. `None` means in-memory only
     /// ("Browse without project"). Persisted so the hub can Resume last.
@@ -4429,6 +4438,7 @@ impl VisionaryApp {
             effect_loop_started: std::time::Instant::now(),
             effect_loop_for: None,
             carrier_push_callers: Vec::new(),
+            carrier_push_reports: false,
             project_name: "unnamed_mod".into(),
             project_path: None,
             last_saved_snapshot: None,
@@ -18110,7 +18120,7 @@ impl VisionaryApp {
         self.node_live_cache = None;
         self.gimmicks_editor.invalidate();
         self.publish_live_rule_union();
-        self.push_effect_aliases();
+        self.push_effect_aliases_quietly();
     }
 
     /// Copy every move edit `donor` has into the new character `key`: a made character starts as
@@ -18245,7 +18255,15 @@ impl VisionaryApp {
         // Costumes changed hands either way: the donor's rules no longer run on a new
         // character's costumes and run again on a removed one's.
         self.publish_live_rule_union();
-        self.push_effect_aliases();
+        self.push_effect_aliases_quietly();
+    }
+
+    /// Re-send the effect aliases after costumes changed hands, keeping the status line of
+    /// whatever changed them: the aliases' own line only says they were sent. A problem with
+    /// them still shows.
+    #[track_caller]
+    fn push_effect_aliases_quietly(&mut self) {
+        self.queue_effect_aliases(false);
     }
 
     /// Every character the pickers offer: each fighter, then the characters made on it, indented
@@ -22361,6 +22379,7 @@ impl VisionaryApp {
         self.game_link.send_donor_bytes(&[]);
         self.game_link.send_donor_effs(&[]);
         self.carrier_push_callers.clear();
+        self.carrier_push_reports = false;
         // Stop serving merged eff files: wipe the SD-side manifest + files (the plugin's
         // registrations stay for this boot but resolve to nothing → vanilla files load).
         if let Some(dir) = crate::scratch_dirs::emulator_sd_root()
@@ -29335,11 +29354,19 @@ impl VisionaryApp {
     /// [`Self::flush_effect_aliases`], from the final project state.
     #[track_caller]
     fn push_effect_aliases(&mut self) {
+        self.queue_effect_aliases(true);
+    }
+
+    /// Queue a publication; `report` says whether its routine success line belongs on the
+    /// status bar.
+    #[track_caller]
+    fn queue_effect_aliases(&mut self, report: bool) {
         let caller = std::panic::Location::caller();
         let caller = format!("{}:{}", caller.file(), caller.line());
         if !self.carrier_push_callers.contains(&caller) {
             self.carrier_push_callers.push(caller);
         }
+        self.carrier_push_reports |= report;
     }
 
     /// Hand a payload to the plugin by DISK where possible, base64 otherwise.
@@ -29399,6 +29426,18 @@ impl VisionaryApp {
         if self.carrier_push_callers.is_empty() {
             return;
         }
+        // Only quiet requests this frame: their success line would replace the line of what
+        // asked for them ("Removed Vision."). A problem with the aliases still shows.
+        let report = std::mem::take(&mut self.carrier_push_reports);
+        let before = self.state.status.clone();
+        self.send_effect_aliases();
+        if !report && alias_status_is_routine(&self.state.status) {
+            self.state.status = before;
+        }
+    }
+
+    /// Build and send the snapshot [`Self::flush_effect_aliases`] was asked for.
+    fn send_effect_aliases(&mut self) {
         let caller = std::mem::take(&mut self.carrier_push_callers).join(",");
         let mut aliases: Vec<crate::game_link::EffectAliasWire> = Vec::new();
         // The carrier attaches to the fighter the user currently has selected — that is the
@@ -41687,7 +41726,45 @@ mod live_effect_capture_tests {
             .and_then(|rest| rest.split("\n    fn ").next())
             .expect("remove_character_edits");
         assert!(edits.contains("self.publish_live_rule_union();"));
-        assert!(edits.contains("self.push_effect_aliases();"));
+        assert!(edits.contains("self.push_effect_aliases_quietly();"));
+    }
+
+    /// The removal (or creation) keeps its own status line: the effect aliases' success line
+    /// replaced "Removed Vision." in the real UI. Their warnings still show.
+    #[test]
+    fn a_routine_alias_line_does_not_replace_a_characters_status() {
+        assert!(alias_status_is_routine(
+            "Goes to the game when it connects: 1 borrowed and 1 edited effect(s)"
+        ));
+        assert!(alias_status_is_routine(
+            "Sent to the game: 0 borrowed and 2 edited effect(s)"
+        ));
+        assert!(!alias_status_is_routine(
+            "NOT sent — the live carrier cannot take ef_mario. Export the eff to use these."
+        ));
+        assert!(!alias_status_is_routine(
+            "Removed Vision. Its files are still in its folder."
+        ));
+        // The lines it recognises are the ones the push writes.
+        let push = include_str!("app.rs")
+            .split("fn send_effect_aliases(&mut self)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("send_effect_aliases");
+        // And the flush keeps the earlier line only for quiet requests.
+        let flush = include_str!("app.rs")
+            .split("fn flush_effect_aliases(&mut self)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("flush_effect_aliases");
+        assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
+        for line in [
+            "\"Goes to the game when it connects\"",
+            "\"Sent to the game\"",
+            "\"{sent}: {} borrowed and {} edited effect(s)\"",
+        ] {
+            assert!(push.contains(line), "{line}");
+        }
     }
 
     #[test]

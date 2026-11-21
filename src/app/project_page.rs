@@ -2250,6 +2250,8 @@ impl VisionaryApp {
             crate::roster::new_character::NewCharacterAction::Remove(key.clone()),
         );
         self.remove_character_edits(&crate::character::CharacterKey::made(key.clone()));
+        // Its edits are gone already: the per-frame check must not remove them a second time.
+        self.known_made = None;
         let donor = made.donor.clone();
         self.change_parts(|parts| {
             parts.characters.remove(key.as_str());
