@@ -44,6 +44,36 @@ pub struct EffectDraw {
     pub looping: Option<usize>,
     /// Effect frames a game frame (`LAST_EFFECT_SET_RATE`); 1 unless the script sets one.
     pub rate: f32,
+    /// Which spawn of the effect this is. The game seeds every spawn anew (each emitter's seed
+    /// type says how), so an effect never plays the same particles twice; the same number here
+    /// plays the same ones. A looping draw takes a new one each time round.
+    pub spawn: u32,
+}
+
+/// The spawn number of a looping draw `clock` frames in, when each time round is `period`
+/// frames: the draw's own number for the first, a new one for each after.
+fn looped_spawn(spawn: u32, clock: usize, period: usize) -> u32 {
+    let round = (clock / period.max(1)) as u32;
+    spawn ^ round.wrapping_mul(0x9e37_79b9)
+}
+
+/// Each emitter's seed and its children's for one spawn of a set, as the game draws them
+/// (see `sim::SpawnSeeds`): in file order, each emitter and then its children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmitterSeeds {
+    own: u32,
+    children: Vec<u32>,
+}
+
+fn set_seeds(emitters: &[Emitter], spawn: u32) -> Vec<EmitterSeeds> {
+    let mut seeds = sim::SpawnSeeds::new(spawn);
+    emitters
+        .iter()
+        .map(|e| EmitterSeeds {
+            own: seeds.emitter(&e.fixed),
+            children: e.children.iter().map(|c| seeds.emitter(&c.fixed)).collect(),
+        })
+        .collect()
 }
 
 /// The placements an effect's emitters step through when it plays at `rate` effect frames a
@@ -538,6 +568,7 @@ impl VfxPreview {
             // A looping draw replays the effect from the start every length plus a short gap.
             let looped: Vec<Mat4>;
             let mut kill_at = draw.kill_at;
+            let mut spawn = draw.spawn;
             let placements: &[Mat4] = match (draw.looping, draw.placements.last()) {
                 (Some(clock), Some(at)) => {
                     let key = (Arc::as_ptr(&file) as usize, set);
@@ -545,12 +576,15 @@ impl VfxPreview {
                         .lengths
                         .entry(key)
                         .or_insert_with(|| effect_loop(&file.emitters[set]));
-                    looped = vec![*at; clock % (plan.length + 15) + 1];
+                    let period = plan.length + 15;
+                    looped = vec![*at; clock % period + 1];
                     kill_at = plan.kill;
+                    spawn = looped_spawn(draw.spawn, clock, period);
                     &looped
                 }
                 _ => &draw.placements,
             };
+            let seeds = set_seeds(&file.emitters[set], spawn);
             let rated;
             let placements: &[Mat4] = if (draw.rate - 1.0).abs() < 1e-6 {
                 placements
@@ -598,7 +632,7 @@ impl VfxPreview {
                     self.waiting = true;
                     continue;
                 }
-                let mut s = emitter_sim(emitter);
+                let mut s = emitter_sim(emitter, &seeds[index]);
                 s.set_particle_colour(draw.particle_colour);
                 // The game updates an emitter once before each draw, the spawn frame included
                 // (live capture: time 0 drawn after one Calculate): one step per placement.
@@ -904,13 +938,14 @@ fn load_file(
     })
 }
 
-/// An emitter as the preview runs it: with its child emitters, and with the field sections
-/// that move its particles (a convergence field pulls Sephiroth's charge sparks in).
-fn emitter_sim(emitter: &Emitter) -> sim::EmitterSim<'_> {
-    let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
+/// An emitter as the preview runs it: from this spawn's seeds, with its child emitters, and
+/// with the field sections that move its particles (a convergence field pulls Sephiroth's
+/// charge sparks in).
+fn emitter_sim<'a>(emitter: &'a Emitter, seeds: &EmitterSeeds) -> sim::EmitterSim<'a> {
+    let mut s = sim::EmitterSim::with_seed(&emitter.data, &emitter.fixed, seeds.own);
     s.set_fields(sim::Fields::of(&emitter.raw.attributes));
-    for child in &emitter.children {
-        s.add_child(&child.data, &child.fixed)
+    for (child, seed) in emitter.children.iter().zip(&seeds.children) {
+        s.add_child_with_seed(&child.data, &child.fixed, *seed)
             .set_fields(sim::Fields::of(&child.raw.attributes));
     }
     s
@@ -1081,7 +1116,12 @@ mod tests {
             .map(|c| c.data.name.clone().unwrap_or_default())
             .collect();
         assert_eq!(names, ["Emitter1", "Emitter2"]);
-        let mut s = emitter_sim(sparks);
+        let seeds = set_seeds(emitters, 0);
+        let at = emitters
+            .iter()
+            .position(|e| e.data.name.as_deref() == Some("sparks4"))
+            .unwrap();
+        let mut s = emitter_sim(sparks, &seeds[at]);
         for _ in 0..30 {
             s.step();
         }
@@ -1089,12 +1129,7 @@ mod tests {
         // The sparks' convergence field runs too: 0.11 of the way to the centre a frame on top
         // of their own speed, so the first ones (out at 6 to 30 on frame 18) are nearly in.
         // Without it the preview's sparks crept in at their own speed and drew short dashes.
-        let mut bare = sim::EmitterSim::new(&sparks.data, &sparks.fixed);
-        let mut pulled = emitter_sim(sparks);
-        for _ in 0..25 {
-            bare.step();
-            pulled.step();
-        }
+        // A spawn has only a few sparks out at frame 25, so eight spawns are measured.
         let radius = |s: &sim::EmitterSim| {
             let positions = &s.streams()["sysLocalPosAttr"];
             positions
@@ -1103,11 +1138,22 @@ mod tests {
                 .sum::<f32>()
                 / positions.len() as f32
         };
+        let (mut with, mut without) = (0.0, 0.0);
+        for spawn in 0..8 {
+            let seed = &set_seeds(emitters, spawn)[at];
+            let mut bare = sim::EmitterSim::with_seed(&sparks.data, &sparks.fixed, seed.own);
+            let mut pulled = emitter_sim(sparks, seed);
+            for _ in 0..25 {
+                bare.step();
+                pulled.step();
+            }
+            assert!(radius(&pulled) < radius(&bare) * 0.9, "spawn {spawn}");
+            with += radius(&pulled);
+            without += radius(&bare);
+        }
         assert!(
-            radius(&pulled) < radius(&bare) * 0.7,
-            "{} with the field, {} without",
-            radius(&pulled),
-            radius(&bare)
+            with < without * 0.8,
+            "{with} with the field, {without} without"
         );
     }
 
@@ -1158,6 +1204,70 @@ mod tests {
         }
         assert!(total > 20);
         assert!(across * 3 > total, "{across} of {total} rays go across");
+    }
+
+    /// Sephiroth's blue charge played on its own, round after round. The game seeds every spawn
+    /// anew, so each charge throws its rays, sparks and lightning differently; the preview
+    /// seeded every emitter the same way each time, so every loop was a copy of the first.
+    /// Within one time round the frames must agree (each paint runs the round from its start).
+    #[test]
+    fn each_time_round_an_effect_on_its_own_plays_new_particles() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeFire2Hold")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[set];
+        let period = effect_loop(emitters).length + 15;
+        let base = 0x5eed;
+        assert_eq!(
+            looped_spawn(base, 3, period),
+            looped_spawn(base, period - 1, period)
+        );
+        assert_eq!(looped_spawn(base, 0, period), base);
+        let rounds: Vec<u32> = (0..4)
+            .map(|r| looped_spawn(base, r * period + 5, period))
+            .collect();
+        for (i, a) in rounds.iter().enumerate() {
+            assert!(rounds[i + 1..].iter().all(|b| b != a), "{rounds:?}");
+        }
+        // What each emitter draws 20 frames into a round.
+        let play = |spawn: u32| -> Vec<Vec<[f32; 4]>> {
+            let seeds = set_seeds(emitters, spawn);
+            emitters
+                .iter()
+                .zip(&seeds)
+                .map(|(e, seed)| {
+                    let mut s = emitter_sim(e, seed);
+                    for _ in 0..20 {
+                        s.step();
+                    }
+                    let streams = s.streams();
+                    let mut drawn = streams.get("sysRandomAttr").cloned().unwrap_or_default();
+                    drawn.extend(streams.get("sysLocalPosAttr").cloned().unwrap_or_default());
+                    drawn
+                })
+                .collect()
+        };
+        assert_eq!(play(rounds[0]), play(rounds[0]));
+        let (first, second) = (play(rounds[0]), play(rounds[1]));
+        let mut differ = 0;
+        for (e, (a, b)) in emitters.iter().zip(first.iter().zip(&second)) {
+            if !a.is_empty() {
+                assert_ne!(a, b, "{:?} played the same particles", e.data.name);
+                differ += 1;
+            }
+        }
+        assert!(differ >= 5, "{differ}");
     }
 
     /// An effect the script plays at another rate (`LAST_EFFECT_SET_RATE`, 282 vanilla calls)

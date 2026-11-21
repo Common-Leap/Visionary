@@ -3968,6 +3968,10 @@ pub struct VisionaryApp {
     /// When the Effects page's looping play of the open effect started.
     effect_loop_started: std::time::Instant,
     effect_loop_for: Option<String>,
+    /// How many times playback has come round to the move's start. The game spawns a move's
+    /// effects anew each time it is played, each with its own random particles and offsets, so
+    /// each time round the preview plays them with new numbers too.
+    playthrough: u32,
     /// Call sites that asked to publish a donor/carrier snapshot this UI frame. Publication is
     /// coalesced to one per frame: several handlers can run in a single frame and the earlier
     /// ones observe half-updated project state. The editor's transplant drain, for instance,
@@ -4437,6 +4441,7 @@ impl VisionaryApp {
             effect_uses: EffectUseIndex::default(),
             effect_loop_started: std::time::Instant::now(),
             effect_loop_for: None,
+            playthrough: 0,
             carrier_push_callers: Vec::new(),
             carrier_push_reports: false,
             project_name: "unnamed_mod".into(),
@@ -9923,10 +9928,12 @@ impl VisionaryApp {
         let solo_for = |name: &str| {
             solo.filter(|_| solo_name.as_deref() == Some(name.to_ascii_lowercase().as_str()))
         };
+        let playthrough = self.playthrough;
         let mut push = |name: &str,
                         placements: Vec<glam::Mat4>,
                         kill_at: Option<usize>,
-                        call: Option<&crate::data::EffectCall>| {
+                        call: Option<&crate::data::EffectCall>,
+                        spawn: u32| {
             if placements.is_empty() {
                 return;
             }
@@ -9946,15 +9953,17 @@ impl VisionaryApp {
                     solo: solo_for(name),
                     looping: None,
                     rate,
+                    spawn,
                 });
             }
         };
         // The preview faces right, so the facing-left arm of a facing test never plays.
-        for ec in self
+        for (call_index, ec) in self
             .state
             .effects
             .iter()
-            .filter(|ec| crate::data::facing_arm_of(ec.guard.as_deref()) != Some(true))
+            .enumerate()
+            .filter(|(_, ec)| crate::data::facing_arm_of(ec.guard.as_deref()) != Some(true))
         {
             // An effect draws until its particles are gone, as in game; the preview simulates
             // at most 600 frames of it.
@@ -9970,7 +9979,9 @@ impl VisionaryApp {
             let kill_at = (ec.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME
                 && ec.active_end > ec.active_start)
                 .then(|| clock.ticks_between(ec.active_start, ec.active_end).round() as usize);
-            let (offset, euler) = spawn_with_random_ranges(ec);
+            let spawn =
+                effect_spawn_number(playthrough, &ec.effect_name, ec.active_start, call_index);
+            let (offset, euler) = spawn_with_random_ranges(ec, spawn);
             let offset = placement_offset(ec, offset);
             let rotation = effect_rotation(euler);
             let local = glam::Mat4::from_scale_rotation_translation(
@@ -10001,7 +10012,7 @@ impl VisionaryApp {
                 place(ec.active_start).map(|at| vec![at; ticks.len()])
             };
             if let Some(placements) = placements {
-                push(&ec.effect_name, placements, kill_at, Some(ec));
+                push(&ec.effect_name, placements, kill_at, Some(ec), spawn);
             }
         }
         // Objects' own effects, on the object's bones at each age. Many projectiles have no
@@ -10053,7 +10064,13 @@ impl VisionaryApp {
                         .map(|at| vec![at; (object_frame - effect.start + 1) as usize])
                 };
                 if let Some(placements) = placements {
-                    push(&effect.name, placements, None, None);
+                    let spawn = effect_spawn_number(
+                        playthrough,
+                        &effect.name,
+                        object.spawned + effect.start,
+                        usize::MAX,
+                    );
+                    push(&effect.name, placements, None, None, spawn);
                 }
             }
         }
@@ -10071,6 +10088,8 @@ impl VisionaryApp {
                 let placement = crate::vfx_preview::alone_placement(
                     &self.eff_editor.selected_spawn_bones().unwrap_or_default(),
                 );
+                // Each time round the loop is a new spawn (`vfx_preview::looped_spawn`).
+                let spawn = effect_spawn_number(0, &name, 0, 0);
                 out.push(crate::vfx_preview::EffectDraw {
                     file,
                     solo: solo_for(&name),
@@ -10082,6 +10101,7 @@ impl VisionaryApp {
                     ink: None,
                     looping: Some(clock),
                     rate: 1.0,
+                    spawn,
                 });
             }
         }
@@ -33322,12 +33342,12 @@ impl eframe::App for VisionaryApp {
                 elapsed -= spent;
                 self.last_frame_time += std::time::Duration::from_secs_f32(spent);
                 if self.state.total_frames > 0 {
-                    self.state.current_frame =
-                        if self.state.current_frame >= self.state.total_frames {
-                            FIRST_GAME_FRAME
-                        } else {
-                            self.state.current_frame + 1
-                        };
+                    let (next, round) =
+                        next_playback_frame(self.state.current_frame, self.state.total_frames);
+                    self.state.current_frame = next;
+                    if round {
+                        self.playthrough = self.playthrough.wrapping_add(1);
+                    }
                 } else {
                     // Keep the timeline moving even when only live capture data is loaded.
                     self.state.current_frame = (self.state.current_frame + 1).min(9999);
@@ -34656,7 +34676,30 @@ fn stowed_articles(model_root: &std::path::Path, body_bones: &[String]) -> Vec<S
 /// of the spread, centred on the authored value, so 360 covers one turn. The game's own random
 /// numbers cannot be reproduced; the preview draws its own from the call itself, so a spawn
 /// keeps one angle from frame to frame instead of jittering.
-fn spawn_with_random_ranges(ec: &crate::data::EffectCall) -> ([f32; 3], [f32; 3]) {
+/// Which spawn of a move's effect call this is (`vfx_preview::EffectDraw::spawn`): by the call
+/// (its effect, frame and place in the script) and how many times the move has been played.
+fn effect_spawn_number(playthrough: u32, name: &str, frame: u32, call: usize) -> u32 {
+    let hash = name.bytes().fold(
+        0xcbf2_9ce4_8422_2325u64 ^ u64::from(frame) ^ (call as u64).rotate_left(32),
+        |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3),
+    );
+    let hash = (hash ^ u64::from(playthrough).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_mul(0x0100_0000_01b3);
+    (hash ^ (hash >> 32)) as u32
+}
+
+/// The next frame of looping playback, and whether it came round to the start.
+fn next_playback_frame(current: u32, total: u32) -> (u32, bool) {
+    if current >= total {
+        (FIRST_GAME_FRAME, true)
+    } else {
+        (current + 1, false)
+    }
+}
+
+/// The offset and rotation an effect call spawns at, with the random ranges its script gives
+/// them drawn for this spawn (`spawn`, see [`effect_spawn_number`]).
+fn spawn_with_random_ranges(ec: &crate::data::EffectCall, spawn: u32) -> ([f32; 3], [f32; 3]) {
     let mut offset = ec.offset;
     let mut euler = script_rotation(ec);
     let Some(ranges) = ec.extra_args.as_ref().and_then(|args| {
@@ -34670,7 +34713,7 @@ fn spawn_with_random_ranges(ec: &crate::data::EffectCall) -> ([f32; 3], [f32; 3]
         return (offset, euler);
     };
     let mut seed = ec.effect_name.bytes().fold(
-        0x9e37_79b9_7f4a_7c15u64 ^ u64::from(ec.active_start),
+        0x9e37_79b9_7f4a_7c15u64 ^ u64::from(ec.active_start) ^ (u64::from(spawn) << 32),
         |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3),
     );
     let mut unit = || {
@@ -48144,17 +48187,17 @@ mod spawn_random_range_tests {
         // Mario's forward smash sys_atk_smoke: every range 0.
         let zero = call(Some(&["0", "0", "0", "0", "0", "0", "true"]));
         assert_eq!(
-            spawn_with_random_ranges(&zero),
+            spawn_with_random_ranges(&zero, 7),
             ([0.0, 8.0, 12.0], [0.0; 3])
         );
         // An EFFECT_FOLLOW tail is only the terminate flag.
         let follow = call(Some(&["true"]));
         assert_eq!(
-            spawn_with_random_ranges(&follow),
+            spawn_with_random_ranges(&follow, 7),
             ([0.0, 8.0, 12.0], [0.0; 3])
         );
         assert_eq!(
-            spawn_with_random_ranges(&call(None)),
+            spawn_with_random_ranges(&call(None), 7),
             ([0.0, 8.0, 12.0], [0.0; 3])
         );
     }
@@ -48163,12 +48206,48 @@ mod spawn_random_range_tests {
     fn a_full_turn_range_rolls_the_spawn_within_half_a_turn_each_way() {
         // Mario's forward smash sys_flame: 360 on Z, as in the game script.
         let flame = call(Some(&["0", "0", "0", "0", "0", "360", "true"]));
-        let (offset, euler) = spawn_with_random_ranges(&flame);
+        let (offset, euler) = spawn_with_random_ranges(&flame, 7);
         assert_eq!(offset, [0.0, 8.0, 12.0]);
         assert_eq!(euler[0], 0.0);
         assert!(euler[2] != 0.0 && euler[2].abs() <= 180.0, "{euler:?}");
-        // The same call keeps its angle from frame to frame.
-        assert_eq!(spawn_with_random_ranges(&flame), (offset, euler));
+        // The same spawn keeps its angle from frame to frame.
+        assert_eq!(spawn_with_random_ranges(&flame, 7), (offset, euler));
+    }
+
+    /// In game every spawn of Mario's forward smash flame rolls a new angle within its range.
+    /// The preview kept one angle per call for good, so each play of the move showed the same
+    /// flame. Played again (a new spawn number), the angle is drawn again.
+    #[test]
+    fn each_play_of_a_move_rolls_its_random_ranges_again() {
+        let flame = call(Some(&["0", "0", "0", "0", "0", "360", "true"]));
+        let number = |play| super::effect_spawn_number(play, "sys_flame", 15, 3);
+        assert_eq!(number(4), number(4));
+        let angles: Vec<f32> = (0..6)
+            .map(|play| spawn_with_random_ranges(&flame, number(play)).1[2])
+            .collect();
+        for (i, a) in angles.iter().enumerate() {
+            assert!(a.abs() <= 180.0);
+            assert!(angles[i + 1..].iter().all(|b| b != a), "{angles:?}");
+        }
+        // Two calls of one effect in one play are two spawns.
+        assert_ne!(
+            super::effect_spawn_number(0, "sys_flame", 15, 3),
+            super::effect_spawn_number(0, "sys_flame", 15, 4)
+        );
+        assert_ne!(
+            super::effect_spawn_number(0, "sys_flame", 15, 3),
+            super::effect_spawn_number(0, "sys_flame", 16, 3)
+        );
+    }
+
+    /// Playback comes round to the move's start after its last frame; that is a new play.
+    #[test]
+    fn playback_counts_each_time_round() {
+        assert_eq!(super::next_playback_frame(5, 30), (6, false));
+        assert_eq!(
+            super::next_playback_frame(30, 30),
+            (super::FIRST_GAME_FRAME, true)
+        );
     }
 }
 
@@ -48208,7 +48287,7 @@ mod effect_rotation_tests {
             .next()
             .unwrap();
         assert_eq!(super::script_rotation(&call), [-4.0, 80.0, 96.0]);
-        let (_, euler) = super::spawn_with_random_ranges(&call);
+        let (_, euler) = super::spawn_with_random_ranges(&call, 0);
         assert_eq!(euler, [-4.0, 80.0, 96.0]);
     }
 
