@@ -176,6 +176,9 @@ pub fn clone_notes(article: &Article) -> Vec<String> {
         decl.line,
         if decl.use_original_code { ", running the original's code" } else { "" }
     )];
+    for (file, line) in &article.also_declared {
+        out.push(format!("Also declared at {}:{line}, by another `clone_weapon` call for the same object", file.display()));
+    }
     match clone_compat::lookup(&decl.src_kind) {
         Some(entry) => {
             let said = |text: &str| {
@@ -673,6 +676,7 @@ mod tests {
             source_scripts: vec!["game_fly".into(), "effect_fly".into()],
             conflicts: vec![],
             id_note: None,
+            also_declared: vec![],
         }
     }
 
@@ -694,6 +698,7 @@ mod tests {
             source_scripts: vec![],
             conflicts: vec![],
             id_note: None,
+            also_declared: vec![],
         }
     }
 

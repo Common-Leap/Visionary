@@ -44,6 +44,9 @@ pub struct Article {
     pub conflicts: Vec<String>,
     /// For a clone: why its id is not bound to a name Visionary follows. `None` otherwise.
     pub id_note: Option<String>,
+    /// For a clone: the other `clone_weapon` calls (file, line) that declare this same article,
+    /// such as a vendored copy of the crate. The first call is the one in `origin`.
+    pub also_declared: Vec<(std::path::PathBuf, usize)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,10 +96,14 @@ impl ArticleCatalog {
             (scripts, conflicts)
         };
 
+        let clones: Vec<&CloneDecl> = clones.iter().filter(|d| d.new_owner.eq_ignore_ascii_case(&fighter)).collect();
+        // A folder a clone of this fighter adds is that clone's, not a vanilla article: the
+        // moveset ships the clone's model under its new owner (Latios's `samus/model/lativolt`).
+        let cloned: BTreeSet<String> = clones.iter().map(|d| d.new_name.to_lowercase()).collect();
         let mut names = BTreeSet::new();
         for sub in ["model", "motion"] {
             for name in subfolders(&fighter_dir.join(sub)) {
-                if name != "body" {
+                if name != "body" && !cloned.contains(&name) {
                     names.insert(name);
                 }
             }
@@ -123,11 +130,23 @@ impl ArticleCatalog {
                 source_scripts,
                 conflicts,
                 id_note: None,
+                also_declared: Vec::new(),
             });
         }
-        for decl in clones.iter().filter(|d| d.new_owner.eq_ignore_ascii_case(&fighter)) {
+        for decl in clones {
             let name = decl.new_name.to_lowercase();
             let agent = format!("{fighter}_{name}");
+            // The same article declared again (HDR's vendored crate beside its port) is one
+            // article; the other calls are kept on it.
+            if let Some(first) = articles.iter_mut().find(|a| a.agent == agent) {
+                first.also_declared.push((decl.file.clone(), decl.line));
+                for binding in &decl.id_bindings {
+                    if !first.id_symbols.contains(binding) {
+                        first.id_symbols.push(binding.clone());
+                    }
+                }
+                continue;
+            }
             let (source_scripts, conflicts) = scripts_of(&agent);
             articles.push(Article {
                 owner: fighter.clone(),
@@ -138,6 +157,7 @@ impl ArticleCatalog {
                 source_scripts,
                 conflicts,
                 id_note: decl.id_note.clone(),
+                also_declared: Vec::new(),
             });
         }
         Self { articles, unresolved_clones: unresolved }
@@ -179,8 +199,30 @@ impl ArticleCatalog {
         if let Some(found) = self.articles.iter().find(|a| a.id_symbols.iter().any(|s| s == ident)) {
             return Some(found);
         }
+        if let Some(found) = self.by_vanilla_spelling(ident) {
+            return Some(found);
+        }
         let init = locals.get(ident)?;
         self.resolve_depth(init, locals, depth + 1)
+    }
+
+    /// A vanilla id the game spells differently from the article's folder:
+    /// `FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME` for `mario/model/hugeflame`, and the id an
+    /// article uses for its owner's other articles, `WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET`
+    /// for `murabito/model/bullet`. Only the game's own articles (clones are bound by name), and
+    /// only when exactly one matches.
+    fn by_vanilla_spelling(&self, ident: &str) -> Option<&Article> {
+        let (head, name) = ident.split_once("_GENERATE_ARTICLE_")?;
+        let squash = |s: &str| s.replace('_', "").to_lowercase();
+        let name = squash(name);
+        let mut found = self.articles.iter().filter(|a| {
+            let owner = a.owner.to_uppercase();
+            let owned = head == format!("FIGHTER_{owner}")
+                || head.strip_prefix(&format!("WEAPON_{owner}_")).is_some_and(|rest| !rest.is_empty());
+            owned && !matches!(a.origin, ArticleOrigin::Clone(_)) && squash(&a.name) == name
+        });
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
     }
 
     pub fn get(&self, name: &str) -> Option<&Article> {
@@ -394,6 +436,53 @@ pub fn install() {
             "*FIGHTER_PACMAN_GENERATE_ARTICLE_TRAMPOLINE".to_string(),
         )]);
         assert_eq!(c.resolve_id("generate_id", &locals).unwrap().name, "trampoline");
+    }
+
+    /// Latios-Moveset · src/lib.rs:559 clones `lativolt` onto samus and ships its model as
+    /// `romfs/fighter/samus/model/lativolt` (tier 1, smashline2). The folder is the clone's,
+    /// so the object is listed once, as the clone.
+    #[test]
+    fn a_clones_own_folder_is_not_a_vanilla_article() {
+        let tmp = tempfile::tempdir().unwrap();
+        put(tmp.path(), "model/lativolt/c00/a.txt", "");
+        put(tmp.path(), "model/cshot/c00/a.txt", "");
+        let d = decl("samus", "lativolt", &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"], None);
+        let c = ArticleCatalog::build("samus", None, &[d.clone()], vec![], tmp.path());
+        let agents: Vec<&str> = c.articles.iter().map(|a| a.agent.as_str()).collect();
+        assert_eq!(agents, ["samus_cshot", "samus_lativolt"]);
+        assert_eq!(c.get("lativolt").unwrap().origin, ArticleOrigin::Clone(d));
+    }
+
+    /// HDR-Standalone-Movesets · ports/fighters/packun/src/lib.rs:102 and
+    /// vendor/hdr/fighters/packun/src/lib.rs:101 both call
+    /// `clone_weapon("mario", *WEAPON_KIND_MARIO_FIREBALL, "packun", "firebreath", false)`
+    /// (tier 1, smashline2). One object, with the second call kept on it.
+    #[test]
+    fn the_same_clone_declared_twice_is_one_article() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = decl("packun", "firebreath", &[], None);
+        let b = CloneDecl { file: PathBuf::from("vendor/lib.rs"), line: 101, ..a.clone() };
+        let c = ArticleCatalog::build("packun", None, &[a.clone(), b], vec![], tmp.path());
+        assert_eq!(c.articles.len(), 1);
+        assert_eq!(c.articles[0].origin, ArticleOrigin::Clone(a));
+        assert_eq!(c.articles[0].also_declared, [(PathBuf::from("vendor/lib.rs"), 101)]);
+    }
+
+    /// Iron-Man · src/stark/status/final_proton.rs:64 spawns
+    /// `*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME` (0x3 in the game's lua consts) for the dump's
+    /// `mario/model/hugeflame`; Toad-Moveset · plugin/src/toad/acmd/ground.rs:231 spawns
+    /// `*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET` (0x0) for `murabito/model/bullet`
+    /// (both tier 1, smashline2).
+    #[test]
+    fn resolves_the_games_own_spellings() {
+        let c = named("mario", "hugeflame");
+        let none = HashMap::new();
+        assert_eq!(c.resolve_id("*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", &none).unwrap().name, "hugeflame");
+        let c = named("murabito", "bullet");
+        assert_eq!(c.resolve_id("*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).unwrap().name, "bullet");
+        // Another fighter's id is not this fighter's article.
+        assert!(c.resolve_id("*FIGHTER_SHIZUE_GENERATE_ARTICLE_BULLET", &none).is_none());
+        assert!(c.resolve_id("*WEAPON_SHIZUE_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).is_none());
     }
 
     #[test]
