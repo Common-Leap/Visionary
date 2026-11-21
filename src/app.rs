@@ -9982,32 +9982,35 @@ impl VisionaryApp {
             let spawn =
                 effect_spawn_number(playthrough, &ec.effect_name, ec.active_start, call_index);
             let (offset, euler) = spawn_with_random_ranges(ec, spawn);
-            let offset = placement_offset(ec, offset);
-            let rotation = effect_rotation(euler);
-            let local = glam::Mat4::from_scale_rotation_translation(
-                glam::Vec3::splat(ec.scale.max(0.01)),
-                rotation,
-                glam::Vec3::from(offset),
-            );
             let place = |game_frame: u32| {
                 let bones = bones_at(game_frame);
                 let bone = bones
                     .get(&ec.bone_name)
                     .or_else(|| bones.get(&ec.bone_name.to_lowercase()))
                     .copied()?;
-                let bone = if is_system_bone(&ec.bone_name) {
-                    glam::Mat4::from_translation(bone.col(3).truncate())
-                } else {
-                    bone
-                };
-                Some(bone * local)
+                Some(effect_placement(ec, bone, offset, euler))
             };
             // A following effect rides its bone every frame; any other stays where it was
             // spawned, as the game places it once.
             // One placement per game tick since the spawn.
             let ticks = clock.frames_by_tick(ec.active_start, frame_num);
             let placements: Option<Vec<glam::Mat4>> = if ec.follows_bone {
-                ticks.into_iter().map(place).collect()
+                let followed: Option<Vec<glam::Mat4>> = ticks.into_iter().map(place).collect();
+                // EFFECT_FLW_POS follows its bone's position only: it keeps the turn it was
+                // spawned with.
+                match (follows_position_only(ec), place(ec.active_start)) {
+                    (true, Some(spawned)) => followed.map(|followed| {
+                        followed
+                            .into_iter()
+                            .map(|at| {
+                                let mut kept = spawned;
+                                kept.w_axis = at.w_axis;
+                                kept
+                            })
+                            .collect()
+                    }),
+                    _ => followed,
+                }
             } else {
                 place(ec.active_start).map(|at| vec![at; ticks.len()])
             };
@@ -10980,13 +10983,9 @@ impl VisionaryApp {
                         else {
                             continue;
                         };
-                        let bone_mat = if is_system_bone(&ec.bone_name) {
-                            glam::Mat4::from_translation(bone_mat.col(3).truncate())
-                        } else {
-                            bone_mat
-                        };
-                        let world_pos = bone_mat
-                            .transform_point3(glam::Vec3::from(placement_offset(ec, ec.offset)));
+                        let world_pos = effect_placement(ec, bone_mat, ec.offset, [0.0; 3])
+                            .w_axis
+                            .truncate();
                         let Some(screen_pos) = rs.world_to_screen(world_pos, rect) else {
                             continue;
                         };
@@ -34567,18 +34566,60 @@ impl Hitbox {
 /// is the same either way. A following call's flag means something else: 146 `false` ones
 /// carry it in Z against 8 in X (Yoshi's dash attack impact is 14 in front of him).
 fn placement_offset(ec: &crate::data::EffectCall, offset: [f32; 3]) -> [f32; 3] {
+    if offset_in_facing_space(ec) {
+        [-offset[2], offset[1], offset[0]]
+    } else {
+        offset
+    }
+}
+
+/// Whether an effect call's offset is in the fighter's facing axes rather than its bone's (see
+/// [`placement_offset`]).
+fn offset_in_facing_space(ec: &crate::data::EffectCall) -> bool {
     let follows = ec.spawn_func.contains("FOLLOW") || ec.spawn_func.contains("FLW");
-    let facing_space = !follows
+    !follows
         && is_system_bone(&ec.bone_name)
         && ec
             .extra_args
             .as_ref()
             .and_then(|args| args.iter().rev().find(|a| *a == "true" || *a == "false"))
-            .is_some_and(|flag| flag == "false");
-    if facing_space {
-        [-offset[2], offset[1], offset[0]]
+            .is_some_and(|flag| flag == "false")
+}
+
+/// Whether a following call follows its bone's position only (`EFFECT_FLW_POS` and its
+/// variants), keeping the turn it was spawned with.
+fn follows_position_only(ec: &crate::data::EffectCall) -> bool {
+    ec.spawn_func.contains("FLW_POS")
+}
+
+/// Where an effect call puts its effect on a bone whose matrix is `bone`, with its offset and
+/// rotation (script order, degrees) as drawn for this spawn.
+///
+/// The effect takes the bone's whole matrix, its turn included, on the root bones as on any
+/// other: the game places an effect by its joint. The preview took only the position of the
+/// root bones ("rot", "throw", "trans"), so an effect spawned while the body is turned stood
+/// as if it were not: Bowser's up special shell on "rot" (turned 150 degrees), Kirby's neutral
+/// air spin wind (128), Diddy Kong's side special flip (137) and the throws' flashes on
+/// "throw" (turned 180) came out flipped. On "top" the preview's bone has no turn, and the
+/// fighter's facing is the preview's own. An offset in the fighter's facing axes (see
+/// [`placement_offset`]) is not turned by the bone.
+fn effect_placement(
+    ec: &crate::data::EffectCall,
+    bone: glam::Mat4,
+    offset: [f32; 3],
+    euler: [f32; 3],
+) -> glam::Mat4 {
+    let turn = glam::Mat4::from_scale_rotation_translation(
+        glam::Vec3::splat(ec.scale.max(0.01)),
+        effect_rotation(euler),
+        glam::Vec3::ZERO,
+    );
+    let offset = glam::Vec3::from(placement_offset(ec, offset));
+    if offset_in_facing_space(ec) {
+        let (scale, rotation, at) = bone.to_scale_rotation_translation();
+        glam::Mat4::from_scale_rotation_translation(scale, rotation, at + offset) * turn
     } else {
-        offset
+        bone * glam::Mat4::from_translation(offset) * turn
     }
 }
 
@@ -34621,6 +34662,69 @@ fn animation_final_frame(path: &std::path::Path) -> Option<f32> {
     ssbh_data::anim_data::AnimData::from_file(path)
         .ok()
         .map(|anim| anim.final_frame_index)
+}
+
+#[cfg(test)]
+mod effect_placement_tests {
+    /// Bowser's up special in the air spawns his shell on "rot" six frames in, when the body
+    /// is turned 150 degrees about Y. The game places an effect by its joint, turn included;
+    /// the preview took only the position of the root bones, and the shell faced the other way.
+    /// Needs VISIONARY_DATA_ROOT (an extracted game); skipped otherwise.
+    #[test]
+    fn an_effect_on_a_turned_root_bone_turns_with_it() {
+        let Some(root) = std::env::var_os("VISIONARY_DATA_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_DATA_ROOT to an extracted game");
+            return;
+        };
+        let body = root.join("fighter/koopa/model/body/c00/model.nusktb");
+        let skel = ssbh_data::skel_data::SkelData::from_file(body).unwrap();
+        let motions = root.join("fighter/koopa/motion/body/c00");
+        let anim = std::fs::read_dir(&motions)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.len() > 3 && &n[3..] == "specialairhi.nuanmb")
+            })
+            .map(|path| ssbh_data::anim_data::AnimData::from_file(path).unwrap())
+            .unwrap();
+        // Verbatim from koopa/SpecialAirHi.
+        let source = "unsafe extern \"C\" fn effect_specialairhi(agent: &mut L2CAgentBase) {\n\
+            frame(agent.lua_state_agent, 6.0);\n\
+            if macros::is_excute(agent) {\n\
+            macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new(\"koopa_shell_a\"), Hash40::new(\"koopa_shell_b\"), Hash40::new(\"rot\"), 0, -3, 0, 0, 0, 0, 1.45, true, *EF_FLIP_NONE);\n\
+            }\n}\n";
+        let calls = crate::acmd::parse_effect_script(source).to_effect_calls();
+        let ec = &calls[0];
+        assert_eq!((ec.bone_name.as_str(), ec.active_start), ("rot", 6));
+        let bones = crate::renderer::compute_bone_world_matrices(
+            &skel,
+            Some(&anim),
+            &[],
+            super::animation_frame_for_game_frame(ec.active_start),
+        );
+        let rot = bones["rot"];
+        let forward = |m: glam::Mat4| m.transform_vector3(glam::Vec3::Z).normalize();
+        assert!(
+            forward(rot).z < -0.5,
+            "the body faces back at the spawn: {}",
+            forward(rot)
+        );
+        let placed = super::effect_placement(ec, rot, ec.offset, super::script_rotation(ec));
+        assert!(
+            forward(placed).dot(forward(rot)) > 0.999,
+            "the shell faces {} and the body {}",
+            forward(placed),
+            forward(rot)
+        );
+        // The offset rides the bone too: 3 down along the body's own Y.
+        let down = rot.transform_vector3(glam::Vec3::new(0.0, -3.0, 0.0));
+        let at = placed.w_axis.truncate() - rot.w_axis.truncate();
+        assert!((at - down).length() < 1e-3, "{at} against {down}");
+    }
 }
 
 #[cfg(test)]

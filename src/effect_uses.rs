@@ -81,8 +81,9 @@ fn object_agents(fighter: &str) -> Vec<String> {
     .collect()
 }
 
-/// The effects a script spawns, each with the bone it spawns it on: the first and second names
-/// of every effect macro that makes one, in every branch (a left-facing fighter's
+/// The effects a script spawns, each with the bone it spawns it on: the first name of every
+/// effect macro that makes one and the bone name after it (the third name of a flip macro,
+/// whose second is the effect for the other facing), in every branch (a left-facing fighter's
 /// `mario_fb_bullet_l` as well as the right's), sorted, once each.
 fn spawns(body: &str) -> Vec<(String, Option<String>)> {
     let mut found: Vec<(String, Option<String>)> = body
@@ -99,9 +100,12 @@ fn spawns(body: &str) -> Vec<(String, Option<String>)> {
             }
             let (_, rest) = args.split_once("Hash40::new(\"")?;
             let (name, rest) = rest.split_once('"')?;
+            // A flip macro names the effect for the other facing second and the bone third.
+            let names_before_bone = if macro_name.contains("FLIP") { 2 } else { 1 };
             let bone = rest
-                .split_once("Hash40::new(\"")
-                .and_then(|(_, rest)| rest.split_once('"'))
+                .split("Hash40::new(\"")
+                .nth(names_before_bone)
+                .and_then(|rest| rest.split_once('"'))
                 .map(|(bone, _)| bone.to_owned());
             Some((name.to_owned(), bone))
         })
@@ -307,6 +311,19 @@ mod tests {
                 ("mario_fb_bullet_l".to_owned(), Some("rot".to_owned())),
                 ("mario_fb_shoot".to_owned(), Some("havel".to_owned())),
             ]
+        );
+    }
+
+    /// A flip macro names the effect twice, the second time for the other facing, and the bone
+    /// third. Read as the second name, the bone of Diddy Kong's down tilt arc was the arc
+    /// itself, no root bone, and the arc played on its own in the world's axes, a quarter turn
+    /// off the way his move throws it. Verbatim from diddy/AttackLw3.
+    #[test]
+    fn a_flip_macro_spawns_on_its_third_name() {
+        let body = "macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new(\"diddy_attack_arc_c\"), Hash40::new(\"diddy_attack_arc_c\"), Hash40::new(\"top\"), -0.5, 5, 6, -9, 28, -158, 1, true, *EF_FLIP_YZ);";
+        assert_eq!(
+            spawns(body),
+            vec![("diddy_attack_arc_c".to_owned(), Some("top".to_owned()))]
         );
     }
 }
