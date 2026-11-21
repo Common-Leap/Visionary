@@ -1107,6 +1107,28 @@ fn matching_category_original(
         .filter(|name| candidates.iter().any(|candidate| candidate == name))
         .collect::<Vec<_>>();
     let subject = format!("{fighter}/{move_name} {category}");
+    // A saved source that holds another of the move's effect, sound and expression scripts but
+    // none of this kind is the game having none: the costumes that run the game's version run
+    // nothing here. A source with only its game script may have been saved before the others
+    // were kept, so a missing kind there is still refused.
+    let declares_another_kind = ["effect", "sound", "expression"]
+        .into_iter()
+        .filter(|other| *other != category)
+        .flat_map(|other| crate::acmd::acmd_script_candidates(other, move_name))
+        .any(|name| {
+            body.lines()
+                .filter_map(declared_source_function)
+                .any(|declared| declared == name)
+        });
+    if matches.is_empty() && declares_another_kind {
+        let name = candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{category}_{}", move_name.replace('_', "")));
+        return Ok(format!(
+            "unsafe extern \"C\" fn {name}(agent: &mut L2CAgentBase) {{\n    // The game has no {category} script for this move.\n    let _ = agent;\n}}\n"
+        ));
+    }
     if matches.len() != 1 {
         let tried = candidates.join(", ");
         let detail = if matches.is_empty() {
@@ -1223,9 +1245,22 @@ pub fn make_portable_project(
         bail!("asset directory must be relative");
     }
 
-    let mut fighters: Vec<_> = portable.fighters.iter_mut().collect();
-    fighters.sort_by(|a, b| a.0.cmp(b.0));
+    // Made characters' effect textures go under their own key, so Vision's never share a
+    // folder with Mario's.
+    let mut fighters: Vec<(String, &mut FighterMod)> = portable
+        .fighters
+        .iter_mut()
+        .map(|(fighter, edits)| (fighter.clone(), edits))
+        .chain(
+            portable
+                .characters
+                .iter_mut()
+                .map(|(key, edits)| (key.as_str().to_owned(), edits)),
+        )
+        .collect();
+    fighters.sort_by(|a, b| a.0.cmp(&b.0));
     for (fighter, edits) in fighters {
+        let fighter = fighter.as_str();
         let Some(eff) = &mut edits.eff else { continue };
         for (index, texture) in eff.textures.iter_mut().enumerate() {
             if texture.png_path.is_empty() {
@@ -1331,7 +1366,11 @@ pub fn write_portable_project(
 /// rebuild and live-send code, which expects readable filesystem paths.
 pub fn resolve_project_assets(project: &mut ModProjectFile, project_path: &Path) -> Result<()> {
     let parent = project_path.parent().unwrap_or_else(|| Path::new("."));
-    for edits in project.fighters.values_mut() {
+    for edits in project
+        .fighters
+        .values_mut()
+        .chain(project.characters.values_mut())
+    {
         let Some(eff) = &mut edits.eff else { continue };
         for path in eff
             .textures
@@ -1577,6 +1616,60 @@ mod tests {
         let resolved = &loaded.fighters["kirby"].eff.as_ref().unwrap().textures[0].png_path;
         assert!(Path::new(resolved).is_absolute(), "{resolved}");
         assert!(Path::new(resolved).is_file());
+    }
+
+    /// Review finding 6: a made character's effect textures are saved with the project and
+    /// found again on load, in a folder of their own beside its donor's.
+    #[test]
+    fn portable_project_keeps_made_characters_textures_apart_from_their_donors() {
+        let temp = tempfile::tempdir().unwrap();
+        let eff = |owner: &str, png: &Path| -> FighterMod {
+            std::fs::write(png, owner.as_bytes()).unwrap();
+            FighterMod {
+                eff: Some(EffMod {
+                    source_rel: "effect/fighter/mario/ef_mario.eff".into(),
+                    textures: vec![TextureImport {
+                        texture_name: "ef_mario_fire".into(),
+                        png_path: png.to_string_lossy().to_string(),
+                        raw: false,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        let mut project = ModProjectFile {
+            name: "portable".into(),
+            ..Default::default()
+        };
+        project
+            .fighters
+            .insert("mario".into(), eff("mario", &temp.path().join("mario.png")));
+        let vision = crate::roster::RosterKey::slot("mario", 8);
+        project.characters.insert(
+            vision.clone(),
+            eff("vision", &temp.path().join("vision.png")),
+        );
+        let project_path = temp.path().join("bundle/modproject.json");
+        write_portable_project(&project, &project_path, "assets").unwrap();
+        let mut loaded: ModProjectFile =
+            serde_json::from_str(&std::fs::read_to_string(&project_path).unwrap()).unwrap();
+        let png = |project: &ModProjectFile, owner: Option<&crate::roster::RosterKey>| {
+            let edits = match owner {
+                Some(key) => &project.characters[key],
+                None => &project.fighters["mario"],
+            };
+            edits.eff.as_ref().unwrap().textures[0].png_path.clone()
+        };
+        let (saved_mario, saved_vision) = (png(&loaded, None), png(&loaded, Some(&vision)));
+        assert!(Path::new(&saved_vision).is_relative(), "{saved_vision}");
+        assert_ne!(saved_mario, saved_vision);
+        resolve_project_assets(&mut loaded, &project_path).unwrap();
+        assert_eq!(
+            std::fs::read(png(&loaded, Some(&vision))).unwrap(),
+            b"vision"
+        );
+        assert_eq!(std::fs::read(png(&loaded, None)).unwrap(), b"mario");
     }
 
     #[test]
@@ -2569,6 +2662,51 @@ unsafe extern \"C\" fn expression_attack11(agent: &mut L2CAgentBase) {\n    // o
         assert!(error.contains("other costumes"), "{error}");
     }
 
+    /// Mario's air dodge as the game ships it (script cache mario/EscapeAir.txt): a game and a
+    /// sound script, and no expression script.
+    const MARIO_ESCAPE_AIR: &str = r#"unsafe extern "C" fn game_escapeair(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 19.0);
+    if macros::is_excute(agent) {
+        KineticModule::change_kinetic(agent.module_accessor, *FIGHTER_KINETIC_TYPE_FALL);
+    }
+}
+
+unsafe extern "C" fn sound_escapeair(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_mario_escapeair"));
+    }
+}"#;
+
+    /// Review finding 4: a made character that adds an expression script to a move the game
+    /// has none for exported nothing at all ("no matching original function"). The game's
+    /// version on the other costumes is to run no expression script.
+    #[test]
+    fn a_kind_of_script_the_game_does_not_have_runs_nothing_on_the_other_costumes() {
+        let original =
+            matching_category_original(MARIO_ESCAPE_AIR, "mario", "escape_air", "expression")
+                .unwrap();
+        assert!(original.starts_with(
+            "unsafe extern \"C\" fn expression_escapeair(agent: &mut L2CAgentBase) {"
+        ));
+        assert!(!original.contains("frame("), "{original}");
+        // Present kinds still come from the game.
+        let sound =
+            matching_category_original(MARIO_ESCAPE_AIR, "mario", "escape_air", "sound").unwrap();
+        assert!(sound.contains("se_mario_escapeair"), "{sound}");
+    }
+
+    /// The paired negative: a saved source with only the game script may be one saved before
+    /// every kind was kept, so a missing kind there is still refused.
+    #[test]
+    fn a_source_with_only_its_game_script_still_refuses_a_missing_kind() {
+        let game_only = MARIO_ESCAPE_AIR.split("\n\nunsafe extern").next().unwrap();
+        let error = matching_category_original(game_only, "mario", "escape_air", "expression")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no matching original function"), "{error}");
+    }
+
     #[test]
     fn ambiguous_move_alias_originals_are_refused() {
         let source = "unsafe extern \"C\" fn sound_attacks3s(agent: &mut L2CAgentBase) { }\n\
@@ -2964,6 +3102,131 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
         registered_once(&text, "game_attack11");
     }
 
+    /// Review finding 3: before made characters had their own stores, Mario's edits played on
+    /// Vision's costumes too. Loading such a project gives Vision its own copy, once, so its
+    /// costumes keep playing the edit instead of silently going back to the game's jab.
+    #[test]
+    fn an_older_project_keeps_the_donors_edits_on_its_made_characters_costumes() {
+        let mut project = project();
+        project.version = crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1;
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let findings = project.migrate().unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(project.version, crate::mod_project::PROJECT_VERSION);
+        let text = acmd(&export(&project));
+        assert!(function(&text, "game_attack11_c08_costume").contains("9.0, 361, 30"));
+        assert!(function(&text, "game_attack11_costume").contains("9.0, 361, 30"));
+        assert!(!text.contains("_original"), "{text}");
+
+        // Saved and opened again it is a current project: nothing more is copied.
+        let saved = serde_json::to_value(&project).unwrap();
+        let mut reopened: ModProjectFile = serde_json::from_value(saved.clone()).unwrap();
+        assert!(reopened.migrate().unwrap().is_empty());
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), saved);
+    }
+
+    /// The paired negative: a project already in the current format, or one written with a
+    /// `characters` map by a build from before the version was raised, is not copied into, so
+    /// Mario's edits made after Vision was created never reach it.
+    #[test]
+    fn a_current_project_never_copies_the_donors_edits_into_its_made_characters() {
+        for (version, own_edit) in [
+            (crate::mod_project::PROJECT_VERSION, false),
+            (crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1, true),
+        ] {
+            let mut project = project();
+            project.version = version;
+            project.roster.authored.push(made(8, 8..=15, "Vision"));
+            let own_sound = crate::acmd::parse_sound_script(&MARIO_ATTACK11.replace(
+                "se_common_punch_kick_swing_s",
+                "se_common_punch_kick_swing_l",
+            ));
+            if own_edit {
+                project.characters.insert(
+                    RosterKey::slot("mario", 8),
+                    with_source(FighterMod {
+                        sound_scripts: HashMap::from([(
+                            "attack_11".to_string(),
+                            own_sound.clone(),
+                        )]),
+                        ..Default::default()
+                    }),
+                );
+            }
+            project.fighters.insert("mario".into(), game_edit("9.0"));
+            assert!(project.migrate().unwrap().is_empty());
+            let vision = project.characters.get(&RosterKey::slot("mario", 8));
+            assert!(vision.is_none_or(|own| own.acmd.is_empty()));
+            assert_eq!(
+                vision.is_some_and(|own| own
+                    .sound_scripts
+                    .get("attack_11")
+                    .is_some_and(|sound| serde_json::to_value(sound).ok()
+                        == serde_json::to_value(&own_sound).ok())),
+                own_edit
+            );
+            let text = acmd(&export(&project));
+            assert!(function(&text, "game_attack11_original").contains("2.2, 361, 30"));
+        }
+    }
+
+    /// A project with no made characters is left exactly as it was by the version change.
+    #[test]
+    fn an_older_project_with_no_made_characters_only_gets_its_version_raised() {
+        let mut project = project();
+        project.version = crate::mod_project::OWN_CHARACTER_STORES_VERSION - 1;
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let before = serde_json::to_value(&project).unwrap();
+        assert!(project.migrate().unwrap().is_empty());
+        let mut after = serde_json::to_value(&project).unwrap();
+        after["version"] = before["version"].clone();
+        assert_eq!(after, before);
+    }
+
+    /// Review finding 7: exporting one of Mario's moves on its own ships one function for every
+    /// Mario costume, so it carries Vision's costumes too: Mario's edit stays off them, and
+    /// Vision's own version of the move comes along when it has one.
+    #[test]
+    fn one_move_of_a_donor_exports_with_its_made_characters_costumes() {
+        let one_jab = |project: &ModProjectFile| {
+            crate::mod_project::scope_acmd_project(
+                project,
+                crate::mod_project::AcmdProjectScope::Move {
+                    fighter: "mario",
+                    move_name: "attack_11",
+                },
+            )
+        };
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.fighters.insert("mario".into(), game_edit("9.0"));
+        let text = acmd(&export(&one_jab(&project)));
+        let dispatcher = function(&text, "game_attack11");
+        assert!(
+            dispatcher.contains("color == 15 {\n        game_attack11_original(agent);"),
+            "{dispatcher}"
+        );
+        assert!(function(&text, "game_attack11_costume").contains("9.0, 361, 30"));
+
+        project
+            .characters
+            .insert(RosterKey::slot("mario", 8), game_edit("14.0"));
+        let text = acmd(&export(&one_jab(&project)));
+        assert!(function(&text, "game_attack11_c08_costume").contains("14.0, 361, 30"));
+        assert!(function(&text, "game_attack11_costume").contains("9.0, 361, 30"));
+        registered_once(&text, "game_attack11");
+
+        // With no character made on Mario the single move is exported as it always was.
+        project.roster.authored.clear();
+        project.characters.clear();
+        let text = acmd(&export(&one_jab(&project)));
+        assert!(
+            !text.contains("FIGHTER_INSTANCE_WORK_ID_INT_COLOR"),
+            "{text}"
+        );
+    }
+
     /// The paired positive: with no character made on Mario, his edit ships plainly.
     #[test]
     fn a_base_edit_with_no_made_characters_ships_ungated() {
@@ -3001,6 +3264,56 @@ unsafe extern "C" fn expression_attack11(agent: &mut L2CAgentBase) {
             !text.contains("fn game_attack11"),
             "the game script is untouched:\n{text}"
         );
+    }
+
+    /// Review finding 4, through the whole export: Vision adds rumble to Mario's air dodge,
+    /// which has no expression script in the game (script cache mario/EscapeAir.txt). The
+    /// export gates it, and Mario's costumes run an empty one.
+    #[test]
+    fn a_made_characters_script_the_game_lacks_exports_with_an_empty_game_arm() {
+        const ESCAPE_AIR: &str = r#"unsafe extern "C" fn game_escapeair(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 19.0);
+    if macros::is_excute(agent) {
+        KineticModule::change_kinetic(agent.module_accessor, *FIGHTER_KINETIC_TYPE_FALL);
+    }
+}
+
+unsafe extern "C" fn sound_escapeair(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_SE(agent, Hash40::new("se_mario_escapeair"));
+    }
+}"#;
+        let expression = MARIO_ATTACK11
+            .split("unsafe extern \"C\" fn expression_attack11")
+            .nth(1)
+            .expect("the jab's expression script");
+        let rumble = crate::acmd::parse_expression_script(&format!(
+            "unsafe extern \"C\" fn expression_escapeair{expression}"
+        ));
+        let mut project = project();
+        project.roster.authored.push(made(8, 8..=15, "Vision"));
+        project.characters.insert(
+            RosterKey::slot("mario", 8),
+            FighterMod {
+                expression_scripts: HashMap::from([("escape_air".to_string(), rumble)]),
+                move_sources: HashMap::from([(
+                    "escape_air".to_string(),
+                    MoveSourceSnapshot {
+                        body: ESCAPE_AIR.into(),
+                        captures: Vec::new(),
+                    },
+                )]),
+                ..Default::default()
+            },
+        );
+        let text = acmd(&export(&project));
+        assert!(function(&text, "expression_escapeair_costume").contains("rbkind_attacks"));
+        let original = function(&text, "expression_escapeair_original");
+        assert!(!original.contains("frame("), "{original}");
+        assert!(function(&text, "expression_escapeair")
+            .contains("} else {\n        expression_escapeair_original(agent);"));
+        registered_once(&text, "expression_escapeair");
     }
 
     /// A move edited only as nodes on a made character is its edit, gated like any other.

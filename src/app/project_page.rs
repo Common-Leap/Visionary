@@ -2244,10 +2244,12 @@ impl VisionaryApp {
             return;
         };
         let slots = made.all_slots();
-        self.remove_character_edits(&crate::character::CharacterKey::made(key.clone()));
+        // The entry goes first: what is published next must already give its costumes back
+        // to the donor.
         let status = self.roster.handle_new_character(
             crate::roster::new_character::NewCharacterAction::Remove(key.clone()),
         );
+        self.remove_character_edits(&crate::character::CharacterKey::made(key.clone()));
         let donor = made.donor.clone();
         self.change_parts(|parts| {
             parts.characters.remove(key.as_str());

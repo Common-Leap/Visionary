@@ -1447,11 +1447,16 @@ pub fn workspace_romfs_has_files(workspace: &Path) -> bool {
     false
 }
 
-/// Carry the manual overlay when Save As or Export Project adopts a new workspace. Existing
-/// files in the destination win and are reported, matching normal mod export behavior.
-pub fn preserve_workspace_romfs(
+/// Carry the files a project keeps beside it when Save As adopts a new workspace: the manual
+/// `romfs/` overlay, the folder of every made character stored inside the old workspace
+/// (`made_roots` as the project stores them; absolute ones are outside it and stay put), and
+/// `parts.json`. Existing files in the destination win and are reported, matching normal mod
+/// export behavior. Page links to folders inside the old workspace that are not copied are
+/// rewritten to their absolute paths so they keep pointing at the same files.
+pub fn preserve_workspace_files(
     old_project_file: &Path,
     new_project_file: &Path,
+    made_roots: &[PathBuf],
 ) -> anyhow::Result<(usize, Vec<String>)> {
     let old_workspace = old_project_file.parent().unwrap_or_else(|| Path::new("."));
     let new_workspace = new_project_file.parent().unwrap_or_else(|| Path::new("."));
@@ -1461,10 +1466,43 @@ pub fn preserve_workspace_romfs(
     {
         return Ok((0, Vec::new()));
     }
-    merge_romfs_overlay(
+    let (mut copied, mut skipped) = merge_romfs_overlay(
         &workspace_romfs(old_workspace),
         &workspace_romfs(new_workspace),
-    )
+    )?;
+    let inside: Vec<&PathBuf> = made_roots
+        .iter()
+        .filter(|root| root.is_relative())
+        .collect();
+    for root in &inside {
+        let (made_copied, made_skipped) =
+            merge_romfs_overlay(&old_workspace.join(root), &new_workspace.join(root))?;
+        copied += made_copied;
+        let shown = root.to_string_lossy().replace('\\', "/");
+        skipped.extend(
+            made_skipped
+                .into_iter()
+                .map(|path| format!("{shown}/{path}")),
+        );
+    }
+    let parts_file = new_workspace.join(crate::project_parts::PARTS_FILE);
+    let mut parts = crate::project_parts::ProjectParts::load(old_workspace);
+    if parts != crate::project_parts::ProjectParts::default() {
+        if parts_file.exists() {
+            skipped.push(crate::project_parts::PARTS_FILE.to_owned());
+        } else {
+            for link in &mut parts.links {
+                let carried = link.folder.starts_with("romfs")
+                    || inside.iter().any(|root| link.folder.starts_with(root));
+                if link.folder.is_relative() && !carried {
+                    link.folder = old_workspace.join(&link.folder);
+                }
+            }
+            parts.save(new_workspace)?;
+            copied += 1;
+        }
+    }
+    Ok((copied, skipped))
 }
 
 const WORKSPACE_README: &str = "\
@@ -2926,7 +2964,7 @@ mod tests {
         std::fs::write(&new_conflict, b"new").unwrap();
 
         assert!(workspace_romfs_has_files(old_project.parent().unwrap()));
-        let (copied, skipped) = preserve_workspace_romfs(&old_project, &new_project).unwrap();
+        let (copied, skipped) = preserve_workspace_files(&old_project, &new_project, &[]).unwrap();
         assert_eq!(copied, 1);
         assert_eq!(skipped, vec!["fighter/kirby/motion/body/c00/swing.prc"]);
         assert!(dir
@@ -2934,5 +2972,93 @@ mod tests {
             .join("new/romfs/fighter/kirby/motion/body/c00/run.nuanmb")
             .is_file());
         assert_eq!(std::fs::read(new_conflict).unwrap(), b"new");
+    }
+
+    /// Review finding 2: a made character's folder sits inside the project and is stored
+    /// relative to it, so Save As to another folder must bring the folder and the page's
+    /// parts.json along, or the saved copy points at nothing.
+    #[test]
+    fn save_as_brings_made_characters_folders_and_the_page_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_project = dir.path().join("old/modproject.json");
+        let new_project = dir.path().join("new/modproject.json");
+        touch(&old_project);
+        touch(&new_project);
+        let model = "fighter/mario/model/body/c08/model.numdlb";
+        touch(&dir.path().join("old/characters/vision").join(model));
+        let outside = dir.path().join("elsewhere/vision");
+        touch(&outside.join(model));
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.characters.insert("mario#c08".into(), 8);
+        for folder in [
+            "romfs/effect/fighter/mario",
+            "characters/vision",
+            "my folder",
+        ] {
+            parts.links.push(crate::project_parts::PartLink {
+                fighter: "mario".into(),
+                part: crate::project_parts::Part::Effects,
+                slot: None,
+                folder: folder.into(),
+            });
+        }
+        parts.save(old_project.parent().unwrap()).unwrap();
+
+        let (copied, skipped) = preserve_workspace_files(
+            &old_project,
+            &new_project,
+            &["characters/vision".into(), outside.clone()],
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(copied, 2);
+        assert!(dir
+            .path()
+            .join("new/characters/vision")
+            .join(model)
+            .is_file());
+        let saved = crate::project_parts::ProjectParts::load(new_project.parent().unwrap());
+        assert_eq!(saved.characters, parts.characters);
+        let folders: Vec<PathBuf> = saved.links.iter().map(|link| link.folder.clone()).collect();
+        assert_eq!(
+            folders,
+            vec![
+                PathBuf::from("romfs/effect/fighter/mario"),
+                PathBuf::from("characters/vision"),
+                dir.path().join("old/my folder"),
+            ]
+        );
+    }
+
+    /// The paired negative: saving into the same folder copies nothing, and a page file already
+    /// at the destination is kept and reported rather than replaced.
+    #[test]
+    fn save_as_keeps_a_destination_page_file_and_skips_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_project = dir.path().join("old/modproject.json");
+        touch(&old_project);
+        touch(&dir.path().join("old/characters/vision/a.bin"));
+        let mut parts = crate::project_parts::ProjectParts::default();
+        parts.characters.insert("mario#c08".into(), 8);
+        parts.save(old_project.parent().unwrap()).unwrap();
+        let roots = [PathBuf::from("characters/vision")];
+        assert_eq!(
+            preserve_workspace_files(&old_project, &old_project, &roots).unwrap(),
+            (0, Vec::new())
+        );
+
+        let new_project = dir.path().join("new/modproject.json");
+        touch(&new_project);
+        let mut theirs = crate::project_parts::ProjectParts::default();
+        theirs.characters.insert("luigi".into(), 0);
+        theirs.save(new_project.parent().unwrap()).unwrap();
+        let (copied, skipped) =
+            preserve_workspace_files(&old_project, &new_project, &roots).unwrap();
+        assert_eq!(copied, 1);
+        assert_eq!(skipped, vec![crate::project_parts::PARTS_FILE.to_owned()]);
+        assert_eq!(
+            crate::project_parts::ProjectParts::load(new_project.parent().unwrap()),
+            theirs
+        );
     }
 }

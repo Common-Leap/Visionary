@@ -287,6 +287,45 @@ mod tests {
         );
     }
 
+    /// Review finding 13, the evidence for sending a gimmick limited to some costumes through
+    /// the bundle even when the project has no made characters: the legacy static program has
+    /// no costume field at all, so it renders the same program for a gimmick limited to c00 as
+    /// for one on every costume, and that export ran the gimmick on every costume. The bundle
+    /// carries the limit. A gimmick on every costume still exports as the same static program.
+    #[test]
+    fn a_costume_limited_gimmick_needs_the_bundle_because_a_static_program_cannot_limit_it() {
+        let every = Preset::KoTally.graph();
+        let mut first_only = every.clone();
+        first_only.costumes = vec![0];
+        let program = |graph: &BehaviorGraph| {
+            let mut names = super::super::Names::default();
+            let rendered = super::super::ProgramRenderer::new("mario", graph, &mut names)
+                .and_then(|renderer| renderer.render())
+                .unwrap_or_else(|_| panic!("renders"));
+            rendered.source
+        };
+        assert_eq!(program(&first_only), program(&every));
+
+        let roster = crate::mod_project::RosterMod::default();
+        let graphs = |graph: &BehaviorGraph| BTreeMap::from([("mario".to_string(), graph.clone())]);
+        assert!(!needs_bundle("mario", &every, &BTreeMap::new(), &roster));
+        assert!(compile_bundle(&graphs(&every), &BTreeMap::new(), &roster)
+            .unwrap()
+            .is_none());
+        assert!(needs_bundle(
+            "mario",
+            &first_only,
+            &BTreeMap::new(),
+            &roster
+        ));
+        let bundle = compile_bundle(&graphs(&first_only), &BTreeMap::new(), &roster)
+            .unwrap()
+            .expect("the limited gimmick goes in the bundle");
+        let request = controller_protocol::decode_request(&bundle.encoded).unwrap();
+        assert_eq!(request.charts.len(), 1);
+        assert_eq!(request.charts[0].program.costumes, [0]);
+    }
+
     fn chart_sets(pairs: &[(&str, &str)]) -> BTreeMap<String, BTreeMap<String, ControllerChart>> {
         pairs
             .iter()

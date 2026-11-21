@@ -3,7 +3,7 @@ use crate::move_kinds::plain_name as format_move_name;
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
@@ -2852,6 +2852,87 @@ enum NodesReturn {
 /// A live rule-store key without its family suffix: `"mario#c08/attack_11#hurt"` →
 /// `"mario#c08/attack_11"`. The character part may carry a `#` of its own, so the suffix is the
 /// one after the move.
+/// Where the effect file `rel` is read from when it is a made character's own costume file:
+/// `Ok` with the file in the character's folder, or, when it has none there, `Err` with the
+/// donor's own file to look up instead (what its costumes load without one). `None` for any
+/// other file.
+fn made_effect_lookup(
+    rel: &str,
+    roster: &crate::mod_project::RosterMod,
+    made_root: impl Fn(&crate::roster::RosterKey) -> Option<PathBuf>,
+) -> Option<Result<PathBuf, String>> {
+    let rel = rel.replace('\\', "/");
+    let owner =
+        crate::character::CharacterKey::parse(&crate::character::effect_owner(&rel, roster));
+    if !owner.is_made() {
+        return None;
+    }
+    let own = made_root(owner.roster_key())
+        .map(|root| root.join(&rel))
+        .filter(|path| path.is_file());
+    let fighter = owner.engine_fighter();
+    Some(own.ok_or_else(|| format!("effect/fighter/{fighter}/ef_{fighter}.eff")))
+}
+
+/// Values worked out from every edit, kept until the edit revision they were worked out at
+/// changes.
+struct RevisionCache<K, V>(std::cell::RefCell<HashMap<K, (u64, V)>>);
+
+impl<K, V> Default for RevisionCache<K, V> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> RevisionCache<K, V> {
+    /// The value for `key` at `revision`, from `find` only when none is kept for it.
+    fn get_or(&self, revision: u64, key: K, find: impl FnOnce() -> V) -> V {
+        if let Some((kept, value)) = self.0.borrow().get(&key) {
+            if *kept == revision {
+                return value.clone();
+            }
+        }
+        let value = find();
+        self.0.borrow_mut().insert(key, (revision, value.clone()));
+        value
+    }
+}
+
+/// A store keyed by move ("mario/attack_11", rule stores with a "#…" suffix after the move)
+/// that a new made character copies its donor's entries of.
+trait ForkStore {
+    /// Copy every entry `donor` has into `key`'s, except moves in `limited`; never replaces one
+    /// `key` already has.
+    fn fork(
+        &mut self,
+        donor: &str,
+        key: &crate::character::CharacterKey,
+        limited: &HashSet<String>,
+    );
+}
+
+impl<V: Clone> ForkStore for HashMap<String, V> {
+    fn fork(
+        &mut self,
+        donor: &str,
+        key: &crate::character::CharacterKey,
+        limited: &HashSet<String>,
+    ) {
+        let copies: Vec<(String, V)> = self
+            .iter()
+            .filter_map(|(store_key, value)| {
+                let (owner, rest) = crate::character::split_move_key(store_key)?;
+                let move_name = rest.split('#').next().unwrap_or(rest);
+                (owner == donor && !limited.contains(move_name))
+                    .then(|| (crate::character::move_key(key, rest), value.clone()))
+            })
+            .collect();
+        for (store_key, value) in copies {
+            self.entry(store_key).or_insert(value);
+        }
+    }
+}
+
 fn rule_move_key(key: &str) -> String {
     match crate::character::split_move_key(key) {
         Some((owner, rest)) => {
@@ -3714,6 +3795,13 @@ pub struct VisionaryApp {
     /// the export compiles them, so the counts leave out what the export leaves out.
     game_script_baselines:
         std::cell::RefCell<HashMap<String, Option<std::rc::Rc<crate::mod_project::FighterMod>>>>,
+    /// Bumped whenever the project's saved content changes (checked with the autosave, not per
+    /// frame). Anything derived from every edit is cached against it.
+    edit_revision: u64,
+    revision_snapshot: Option<serde_json::Value>,
+    /// Each character's changed moves per track, as of `edit_revision`: finding them compares
+    /// each saved script with the game's, which is too slow to repeat every frame.
+    changed_moves_cache: RevisionCache<(String, u8), BTreeSet<String>>,
     node_live_cache: Option<(
         String,
         BTreeMap<String, crate::gimmicks::behavior::BehaviorGraph>,
@@ -4216,6 +4304,9 @@ impl VisionaryApp {
             move_graphs: Default::default(),
             node_effect_scripts: Default::default(),
             game_script_baselines: Default::default(),
+            edit_revision: 0,
+            revision_snapshot: None,
+            changed_moves_cache: Default::default(),
             node_live_cache: None,
             timeline_filters: load_timeline_filters(),
             selected_command: None,
@@ -4425,33 +4516,51 @@ impl VisionaryApp {
     ///
     /// Falls back to the export-root path when nothing exists, preserving the previous
     /// behaviour (and the previous error message) for genuinely missing files.
+    /// The project's own copy of effect file `source_rel`, or one in a folder picked for the
+    /// effects.
+    fn project_eff_source(&self, source_rel: &str) -> Option<PathBuf> {
+        let (workspace, parts) = self.project_parts_cache.as_ref()?;
+        let rel = source_rel.replace('\\', "/");
+        let picked = match rel
+            .strip_prefix("effect/fighter/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            Some((fighter, rest)) => parts
+                .link(fighter, crate::project_parts::Part::Effects, 0)
+                .map(|dir| dir.join(rest)),
+            None => rel.strip_prefix("effect/").and_then(|rest| {
+                Some(
+                    parts
+                        .link(
+                            crate::project_parts::OTHER_EFFECTS,
+                            crate::project_parts::Part::Effects,
+                            0,
+                        )?
+                        .join(rest),
+                )
+            }),
+        };
+        let own = crate::project_hub::workspace_romfs(workspace).join(&rel);
+        picked.into_iter().chain([own]).find(|path| path.is_file())
+    }
+
     fn resolve_eff_source(&self, source_rel: &str) -> PathBuf {
-        // The project's own copy, or a folder picked for the effects, comes before the game.
-        if let Some((workspace, parts)) = &self.project_parts_cache {
-            let rel = source_rel.replace('\\', "/");
-            let picked = match rel
-                .strip_prefix("effect/fighter/")
-                .and_then(|rest| rest.split_once('/'))
-            {
-                Some((fighter, rest)) => parts
-                    .link(fighter, crate::project_parts::Part::Effects, 0)
-                    .map(|dir| dir.join(rest)),
-                None => rel.strip_prefix("effect/").and_then(|rest| {
-                    Some(
-                        parts
-                            .link(
-                                crate::project_parts::OTHER_EFFECTS,
-                                crate::project_parts::Part::Effects,
-                                0,
-                            )?
-                            .join(rest),
-                    )
-                }),
-            };
-            let own = crate::project_hub::workspace_romfs(workspace).join(&rel);
-            if let Some(found) = picked.into_iter().chain([own]).find(|path| path.is_file()) {
-                return found;
+        // A made character's own costume file comes from its own folder, else from the
+        // project's own files, never from a mod that happens to ship the same costume's file;
+        // with none, its costumes load the donor's file.
+        match made_effect_lookup(source_rel, &self.roster.project, |key| {
+            self.roster.made_root(key)
+        }) {
+            Some(Ok(own)) => return own,
+            Some(Err(donor_rel)) => {
+                return self
+                    .project_eff_source(source_rel)
+                    .unwrap_or_else(|| self.resolve_eff_source(&donor_rel));
             }
+            None => {}
+        }
+        if let Some(found) = self.project_eff_source(source_rel) {
+            return found;
         }
         let primary = self.eff_editor.export_root().join(source_rel);
         if primary.exists() {
@@ -5266,7 +5375,13 @@ impl VisionaryApp {
         self.acmd_error = None;
         // Path was resolved at move list build time — no disk scan needed
         self.current_anim_path = self.costume_anim_path(move_entry.anim_path.clone());
-        self.state.selected_move = Some(move_entry);
+        // The move belongs to the character it is opened for; saves follow it, not later
+        // changes of the active character.
+        let owner = self
+            .active_key()
+            .map(|owner| owner.as_str().to_owned())
+            .unwrap_or_default();
+        self.state.open_move(&owner, move_entry);
         if let (Some(key), Some(snapshot)) = (self.current_move_key(), snapshot.as_ref()) {
             // Store even an empty-body capture snapshot before choosing the body/capture load
             // branch below. Capture-only provenance can legitimately have no previewable ACMD
@@ -8604,65 +8719,8 @@ impl VisionaryApp {
         }
     }
 
-    /// Snapshot the current hitboxes/script into the edit log for the active fighter+move —
-    /// but only when they actually DIFFER from the pristine load (the log is an edit tree,
-    /// not a browsing history).
-    fn current_point_events_edited(state: &AppState) -> bool {
-        state.point_events_edited()
-    }
-
     fn commit_current_edits(&mut self) {
-        let fighter = match self
-            .state
-            .selected_fighter
-            .and_then(|i| self.state.fighters.get(i))
-        {
-            Some(f) => f.clone(),
-            None => return,
-        };
-        let Some(owner) = self.active_key() else {
-            return;
-        };
-        let move_name = match &self.state.selected_move {
-            Some(m) => m.name.clone(),
-            None => return,
-        };
-        if self.state.script.stmts.is_empty() && self.state.hitboxes.is_empty() {
-            return;
-        }
-        let already_logged = self
-            .state
-            .edit_log
-            .entries
-            .get(owner.as_str())
-            .map(|m| m.contains_key(&move_name))
-            .unwrap_or(false);
-        let hurtbox_states_edited = self.state.script.to_hurtboxes()
-            != self.state.hurtboxes_pristine
-            || self.state.script.to_hurtbox_conditions() != self.state.hurtbox_conditions_pristine;
-        let script_points_edited = Self::current_point_events_edited(&self.state);
-        if self.state.hitboxes == self.state.hitboxes_pristine
-            && !hurtbox_states_edited
-            && !script_points_edited
-            && !already_logged
-        {
-            return;
-        }
-        // Capture-sourced moves have no base script text — synthesize one from the hitboxes
-        // so the export path works the same as for GitHub-fetched scripts.
-        let script = game_script_for_edits(&self.state.script, &self.state.hitboxes);
-        // The edit belongs to the character being edited. A made character's edits live under
-        // its own key, so the export gives its costumes their own version of the move; saving
-        // never changes which costumes an existing record covers.
-        self.state.edit_log.save(
-            owner.as_str(),
-            &fighter.name,
-            &fighter.display_name,
-            &move_name,
-            script,
-            self.state.hitboxes_pristine.clone(),
-            self.state.hitboxes.clone(),
-        );
+        commit_open_move(&mut self.state);
     }
 
     /// When the user explicitly chooses a newer source body, keep the edited payload but make
@@ -11184,11 +11242,10 @@ impl VisionaryApp {
             ui.weak("Loading move scripts…");
             return;
         }
-        // Graphs, gimmick and controllers all belong to the character being edited.
-        let Some(owner) = self.active_key() else {
+        // Graphs, gimmick and controllers all belong to the character whose move is open.
+        let Some(owner) = self.state.open_move_owner().map(str::to_owned) else {
             return;
         };
-        let owner = owner.as_str().to_owned();
         let base = self
             .roster
             .behaviors
@@ -17608,11 +17665,12 @@ impl VisionaryApp {
         format!("{fighter}/{move_name}")
     }
 
-    /// The open move's key in every per-move store: the active character's, not the fighter's.
+    /// The open move's key in every per-move store: the character it was opened for, which is
+    /// not always the active one while navigation is switching characters.
     fn current_move_key(&self) -> Option<String> {
-        let character = self.active_key()?;
-        let mv = self.state.selected_move.as_ref()?.name.clone();
-        Some(crate::character::move_key(&character, &mv))
+        let owner = crate::character::CharacterKey::parse(self.state.open_move_owner()?);
+        let mv = &self.state.selected_move.as_ref()?.name;
+        Some(crate::character::move_key(&owner, mv))
     }
 
     /// The character being edited: the made character picked for the selected fighter, or the
@@ -17848,15 +17906,36 @@ impl VisionaryApp {
         &self,
         key: &crate::character::CharacterKey,
     ) -> BTreeSet<String> {
-        self.state
-            .edit_log
-            .entries
-            .get(key.as_str())
-            .into_iter()
-            .flat_map(|log| log.iter())
-            .filter(|(move_name, record)| !self.record_is_games_own(key, move_name, record))
-            .map(|(move_name, _)| move_name.clone())
-            .collect()
+        self.changed_moves(key, crate::move_nodes::model::Track::Game, || {
+            self.state
+                .edit_log
+                .entries
+                .get(key.as_str())
+                .into_iter()
+                .flat_map(|log| log.iter())
+                .filter(|(move_name, record)| !self.record_is_games_own(key, move_name, record))
+                .map(|(move_name, _)| move_name.clone())
+                .collect()
+        })
+    }
+
+    /// `find` (the moves of `key` whose `track` differs from the game's) as of the current edit
+    /// revision: worked out again only after the project changed, never once a frame.
+    fn changed_moves(
+        &self,
+        key: &crate::character::CharacterKey,
+        track: crate::move_nodes::model::Track,
+        find: impl FnOnce() -> BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        use crate::move_nodes::model::Track;
+        let slot = match track {
+            Track::Game => 0,
+            Track::Effect => 1,
+            Track::Sound => 2,
+            Track::Expression => 3,
+        };
+        self.changed_moves_cache
+            .get_or(self.edit_revision, (key.as_str().to_owned(), slot), find)
     }
 
     /// The moves whose `track` script (sound or expression) `key` changed, by name. A script
@@ -17874,14 +17953,16 @@ impl VisionaryApp {
             Track::Effect => &self.node_effect_scripts,
             Track::Game => return self.character_game_moves(key),
         };
-        store
-            .iter()
-            .filter_map(|(store_key, script)| {
-                let (owner, move_name) = crate::character::split_move_key(store_key)?;
-                (owner == key.as_str() && !self.script_is_games_own(store_key, track, script))
-                    .then(|| move_name.to_owned())
-            })
-            .collect()
+        self.changed_moves(key, track, || {
+            store
+                .iter()
+                .filter_map(|(store_key, script)| {
+                    let (owner, move_name) = crate::character::split_move_key(store_key)?;
+                    (owner == key.as_str() && !self.script_is_games_own(store_key, track, script))
+                        .then(|| move_name.to_owned())
+                })
+                .collect()
+        })
     }
 
     /// The moves whose effect calls (which effects a move plays, and where) `key` changed.
@@ -17993,7 +18074,7 @@ impl VisionaryApp {
             crate::character::split_move_key(store_key)
                 .is_some_and(|(owner, _)| owner == key.as_str())
         };
-        if self.active_key().as_ref() == Some(key) {
+        if self.state.open_move_owner() == Some(key.as_str()) {
             // Close the open move first so the next frame cannot save it back.
             self.state.selected_move = None;
             clear_move_state(&mut self.state);
@@ -18029,16 +18110,24 @@ impl VisionaryApp {
         self.node_live_cache = None;
         self.gimmicks_editor.invalidate();
         self.publish_live_rule_union();
+        self.push_effect_aliases();
     }
 
     /// Copy every move edit `donor` has into the new character `key`: a made character starts as
     /// a full copy of its donor and from then on owns its own edits.
     fn fork_donor_edits(&mut self, key: &crate::character::CharacterKey) {
         let donor = key.engine_fighter().to_owned();
-        let from_donor = |store_key: &str| -> Option<String> {
-            let (owner, move_name) = crate::character::split_move_key(store_key)?;
-            (owner == donor).then(|| crate::character::move_key(key, move_name))
-        };
+        // A move whose record is limited to some costumes is not part of the donor as a whole.
+        let limited: HashSet<String> = self
+            .state
+            .edit_log
+            .entries
+            .get(&donor)
+            .into_iter()
+            .flatten()
+            .filter(|(_, record)| !record.effective_scopes().is_empty())
+            .map(|(move_name, _)| move_name.clone())
+            .collect();
         if let Some(moves) = self.state.edit_log.entries.get(&donor).cloned() {
             let target = self
                 .state
@@ -18047,8 +18136,7 @@ impl VisionaryApp {
                 .entry(key.as_str().to_owned())
                 .or_default();
             for (move_name, mut record) in moves {
-                // A record scoped to other costumes is not part of the donor as a whole.
-                if !record.effective_scopes().is_empty() {
+                if limited.contains(&move_name) {
                     continue;
                 }
                 record.slot_scope = None;
@@ -18056,24 +18144,21 @@ impl VisionaryApp {
                 target.entry(move_name).or_insert(record);
             }
         }
-        fn fork<V: Clone>(store: &mut HashMap<String, V>, rename: &dyn Fn(&str) -> Option<String>) {
-            let copies: Vec<(String, V)> = store
-                .iter()
-                .filter_map(|(k, v)| rename(k).map(|new| (new, v.clone())))
-                .collect();
-            for (k, v) in copies {
-                store.entry(k).or_insert(v);
-            }
-        }
-        fork(&mut self.state.effect_call_edits, &from_donor);
-        fork(&mut self.state.effect_call_full, &from_donor);
-        fork(&mut self.state.effect_dropped_lines, &from_donor);
-        fork(&mut self.state.effect_frame_residue, &from_donor);
-        fork(&mut self.state.sound_script_edits, &from_donor);
-        fork(&mut self.state.expression_script_edits, &from_donor);
-        fork(&mut self.state.capture_branch_warnings, &from_donor);
-        fork(&mut self.move_source_cache, &from_donor);
-        fork(&mut self.node_effect_scripts, &from_donor);
+        let fork = |store: &mut dyn ForkStore| store.fork(&donor, key, &limited);
+        fork(&mut self.state.effect_call_edits);
+        fork(&mut self.state.effect_call_full);
+        fork(&mut self.state.effect_dropped_lines);
+        fork(&mut self.state.effect_frame_residue);
+        fork(&mut self.state.sound_script_edits);
+        fork(&mut self.state.expression_script_edits);
+        fork(&mut self.state.capture_branch_warnings);
+        fork(&mut self.move_source_cache);
+        fork(&mut self.node_effect_scripts);
+        // The donor's live rules too, so the game plays the copy from the moment the character
+        // exists, as the export does; the costumes they run on come from the key.
+        fork(&mut self.hitbox_rules_store);
+        fork(&mut self.effect_rules_store);
+        fork(&mut self.effect_control_rules_store);
         if let Some(graphs) = self.move_graphs.get(&donor).cloned() {
             let target = self.move_graphs.entry(key.as_str().to_owned()).or_default();
             for (move_name, graph) in graphs {
@@ -18157,6 +18242,10 @@ impl VisionaryApp {
             let key = crate::character::CharacterKey::made(removed.clone());
             self.remove_character_edits(&key);
         }
+        // Costumes changed hands either way: the donor's rules no longer run on a new
+        // character's costumes and run again on a removed one's.
+        self.publish_live_rule_union();
+        self.push_effect_aliases();
     }
 
     /// Every character the pickers offer: each fighter, then the characters made on it, indented
@@ -19134,13 +19223,16 @@ impl VisionaryApp {
                 .get_or_insert_with(|| (owner.as_str().to_string(), move_name.to_string()));
             self.state.selected_fighter = Some(fighter_index);
             self.active_character = Some(owner.clone());
-            self.state.selected_move = Some(MoveEntry {
-                name: move_name.to_string(),
-                hash: context.motion,
-                frame_count: 0,
-                anim_path: None,
-            });
             clear_move_state(&mut self.state);
+            self.state.open_move(
+                owner.as_str(),
+                MoveEntry {
+                    name: move_name.to_string(),
+                    hash: context.motion,
+                    frame_count: 0,
+                    anim_path: None,
+                },
+            );
             if context.source.body.is_empty() && context.captures.is_empty() {
                 report.missing_source.insert(key);
                 continue;
@@ -19939,11 +20031,24 @@ impl VisionaryApp {
     /// Canonical snapshot for the dirty check: the editable project
     /// with move-source provenance cleared. Browsing moves records provenance
     /// without editing anything, and must not read as dirty.
+    /// What decides whether the project changed: everything saved except the game sources a
+    /// browsed move records, for fighters and made characters alike. Opening a move is not an
+    /// edit, so an entry holding nothing else is left out.
     fn snapshot_for_dirty(project: &crate::mod_project::ModProjectFile) -> serde_json::Value {
         let mut without_sources = project.clone();
-        for fighter in without_sources.fighters.values_mut() {
+        for fighter in without_sources
+            .fighters
+            .values_mut()
+            .chain(without_sources.characters.values_mut())
+        {
             fighter.move_sources.clear();
         }
+        without_sources
+            .fighters
+            .retain(|_, edits| edits.has_edits());
+        without_sources
+            .characters
+            .retain(|_, edits| edits.has_edits());
         serde_json::to_value(&without_sources).unwrap_or(serde_json::Value::Null)
     }
 
@@ -20034,15 +20139,22 @@ impl VisionaryApp {
         let previous_project = self.project_path.clone();
         match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
             Ok(()) => {
-                let overlay_report = previous_project
-                    .as_deref()
-                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
+                let overlay_report = previous_project.as_deref().map(|current| {
+                    let made_roots: Vec<std::path::PathBuf> = self
+                        .roster
+                        .project
+                        .authored
+                        .iter()
+                        .filter_map(|entry| entry.files_root.clone())
+                        .collect();
+                    crate::project_hub::preserve_workspace_files(current, &path, &made_roots)
+                });
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Saved {}", path.display());
                 match overlay_report {
                     Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
                         self.state.status.push_str(&format!(
-                            " — copied {copied} workspace overlay file{}{}",
+                            " — copied {copied} project file{}{}",
                             if copied == 1 { "" } else { "s" },
                             if skipped.is_empty() {
                                 String::new()
@@ -20058,7 +20170,7 @@ impl VisionaryApp {
                     Some(Err(error)) => self
                         .state
                         .status
-                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
+                        .push_str(&format!(" — copying project files failed: {error:#}")),
                     _ => {}
                 }
             }
@@ -20097,12 +20209,6 @@ impl VisionaryApp {
         const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
 
-        let Some(path) = self.project_path.clone() else {
-            // Nowhere to write yet — Save As gives the project a home, after
-            // which every later edit autosaves.
-            self.project_autosave_pending_since = None;
-            return;
-        };
         if self.workspace_copy_rx.is_some() {
             return;
         }
@@ -20117,9 +20223,21 @@ impl VisionaryApp {
         self.project_autosave_last_check = std::time::Instant::now();
 
         let project = self.build_project();
+        let snapshot = Self::snapshot_for_dirty(&project);
+        if self.revision_snapshot.as_ref() != Some(&snapshot) {
+            self.edit_revision += 1;
+            self.revision_snapshot = Some(snapshot.clone());
+            ctx.request_repaint();
+        }
+        let Some(path) = self.project_path.clone() else {
+            // Nowhere to write yet — Save As gives the project a home, after
+            // which every later edit autosaves.
+            self.project_autosave_pending_since = None;
+            return;
+        };
         let dirty = match &self.last_saved_snapshot {
             None => !project.is_empty(),
-            Some(saved) => Some(&Self::snapshot_for_dirty(&project)) != Some(saved),
+            Some(saved) => Some(&snapshot) != Some(saved),
         };
         if !dirty {
             self.project_autosave_pending_since = None;
@@ -21578,13 +21696,15 @@ impl VisionaryApp {
         // Before anything reads the project: bring it to the current format, and refuse a file
         // written by a newer build. Loading one of those would present it as complete and then
         // re-save it with whatever this build cannot read silently removed.
-        if let Err(error) = project.migrate() {
-            self.state.status = format!("Project load failed: {error}");
-            return;
-        }
         // Edits saved for a made character before it had its own store move into it; any that
         // match no character stay limited to their costumes and are reported.
-        let migration_findings = project.migrate_scoped_records();
+        let migration_findings = match project.migrate() {
+            Ok(findings) => findings,
+            Err(error) => {
+                self.state.status = format!("Project load failed: {error}");
+                return;
+            }
+        };
         if let Err(error) = crate::mod_export::validate_project(&project)
             .and_then(|_| crate::mod_export::resolve_project_assets(&mut project, path))
         {
@@ -22208,6 +22328,8 @@ impl VisionaryApp {
     }
 
     fn clear_all_game_edits(&mut self) {
+        // Everything worked out from the old project's edits is stale.
+        self.edit_revision += 1;
         self.game_link.send_reset_pins();
         self.effect_rules_store.clear();
         self.effect_control_rules_store.clear();
@@ -35728,6 +35850,65 @@ fn refresh_acmd_index(index: &mut crate::acmd_src::SourceIndex, notes: &mut Vec<
     }
 }
 
+/// Snapshot the open move into the edit log when it differs from its pristine load (the log is
+/// an edit tree, not a browsing history). The record goes under the character the move was
+/// opened for, never under whoever is active now: navigation changes the active character
+/// before the old move is closed, and saving it under the new one would hand one character's
+/// move to another. A move opened for a different fighter than the selected one is refused.
+fn commit_open_move(state: &mut crate::data::AppState) {
+    let Some(fighter) = state
+        .selected_fighter
+        .and_then(|i| state.fighters.get(i))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(owner) = state
+        .open_move_owner()
+        .map(crate::character::CharacterKey::parse)
+    else {
+        return;
+    };
+    if !owner.engine_fighter().eq_ignore_ascii_case(&fighter.name) {
+        return;
+    }
+    let move_name = match &state.selected_move {
+        Some(m) => m.name.clone(),
+        None => return,
+    };
+    if state.script.stmts.is_empty() && state.hitboxes.is_empty() {
+        return;
+    }
+    let already_logged = state
+        .edit_log
+        .entries
+        .get(owner.as_str())
+        .map(|m| m.contains_key(&move_name))
+        .unwrap_or(false);
+    let hurtbox_states_edited = state.script.to_hurtboxes() != state.hurtboxes_pristine
+        || state.script.to_hurtbox_conditions() != state.hurtbox_conditions_pristine;
+    let script_points_edited = state.point_events_edited();
+    if state.hitboxes == state.hitboxes_pristine
+        && !hurtbox_states_edited
+        && !script_points_edited
+        && !already_logged
+    {
+        return;
+    }
+    // Capture-sourced moves have no base script text — synthesize one from the hitboxes
+    // so the export path works the same as for GitHub-fetched scripts.
+    let script = game_script_for_edits(&state.script, &state.hitboxes);
+    state.edit_log.save(
+        owner.as_str(),
+        &fighter.name,
+        &fighter.display_name,
+        &move_name,
+        script,
+        state.hitboxes_pristine.clone(),
+        state.hitboxes.clone(),
+    );
+}
+
 fn clear_move_state(state: &mut crate::data::AppState) {
     state.hitboxes.clear();
     state.hitboxes_pristine.clear();
@@ -41205,6 +41386,315 @@ mod live_effect_capture_tests {
             .is_empty());
     }
 
+    /// Mario's jab as the game ships it, lifted from the script cache (mario/Attack11.txt).
+    const MARIO_GAME_ATTACK11: &str = r#"unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 2.2, 361, 30, 0, 20, 1.2, 0.0, 6.3, 6.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+    wait(agent.lua_state_agent, 2.0);
+    if macros::is_excute(agent) {
+        AttackModule::clear_all(agent.module_accessor);
+        WorkModule::on_flag(agent.module_accessor, *FIGHTER_STATUS_ATTACK_FLAG_ENABLE_COMBO);
+    }
+}
+"#;
+
+    fn mario_and_luigi() -> AppState {
+        let fighter = |name: &str, display: &str| crate::data::FighterEntry {
+            name: name.into(),
+            display_name: display.into(),
+            param_path: PathBuf::new(),
+            motion_dir: PathBuf::new(),
+            model_dir: PathBuf::new(),
+            effect_dir: None,
+            slots: (0..16).collect(),
+            fighter_dir: PathBuf::new(),
+            source: crate::data::FighterSource::DataRoot,
+        };
+        AppState {
+            fighters: vec![fighter("mario", "Mario"), fighter("luigi", "Luigi")],
+            ..AppState::default()
+        }
+    }
+
+    /// Open Mario's jab for `owner` with the game's script, and set its first hitbox's damage.
+    fn open_jab(state: &mut AppState, owner: &str, damage: f32) {
+        state.selected_fighter = Some(0);
+        clear_move_state(state);
+        state.open_move(
+            owner,
+            MoveEntry {
+                name: "attack11".into(),
+                hash: hash40::hash40("attack11").0,
+                frame_count: 20,
+                anim_path: None,
+            },
+        );
+        let script = crate::acmd::parse_acmd_script(MARIO_GAME_ATTACK11);
+        state.hitboxes = script.to_hitboxes();
+        state.hitboxes_pristine = state.hitboxes.clone();
+        state.set_script(script);
+        state.hitboxes[0].damage = damage;
+    }
+
+    fn jab_damage(state: &AppState, owner: &str) -> Option<f32> {
+        Some(state.edit_log.entries.get(owner)?.get("attack11")?.hitboxes[0].damage)
+    }
+
+    /// Review finding 1: leaving a made character for another fighter ran a second save after the
+    /// active character had already become the donor, filing the made character's open move as
+    /// the donor's. Saves follow the move's owner, so repeating the save at every step of that
+    /// switch leaves Mario's own record alone.
+    #[test]
+    fn leaving_a_made_character_never_saves_its_move_as_the_donor() {
+        let mut state = mario_and_luigi();
+        open_jab(&mut state, "mario", 5.0);
+        commit_open_move(&mut state);
+        assert_eq!(jab_damage(&state, "mario"), Some(5.0));
+
+        open_jab(&mut state, "mario#c08", 14.0);
+        // select_character: save, switch the active character to Luigi (a base fighter, so the
+        // Mario slot is still selected and the active key reads as plain Mario), then
+        // select_fighter saves again before it clears the move.
+        commit_open_move(&mut state);
+        commit_open_move(&mut state);
+        state.selected_fighter = Some(1);
+        commit_open_move(&mut state);
+        clear_move_state(&mut state);
+
+        assert_eq!(jab_damage(&state, "mario#c08"), Some(14.0));
+        assert_eq!(jab_damage(&state, "mario"), Some(5.0));
+    }
+
+    /// The paired positive: Mario's own open move saves as Mario's, and a made character's as its
+    /// own, so the guard above is not passing because nothing saves at all.
+    #[test]
+    fn an_open_move_saves_under_the_character_it_was_opened_for() {
+        let mut state = mario_and_luigi();
+        open_jab(&mut state, "mario", 9.0);
+        commit_open_move(&mut state);
+        assert_eq!(jab_damage(&state, "mario"), Some(9.0));
+        assert_eq!(jab_damage(&state, "mario#c08"), None);
+
+        open_jab(&mut state, "mario#c08", 11.0);
+        commit_open_move(&mut state);
+        assert_eq!(jab_damage(&state, "mario#c08"), Some(11.0));
+        assert_eq!(jab_damage(&state, "mario"), Some(9.0));
+    }
+
+    /// A move opened for Mario is never saved while another fighter is selected.
+    #[test]
+    fn an_open_move_is_not_saved_while_another_fighter_is_selected() {
+        let mut state = mario_and_luigi();
+        open_jab(&mut state, "mario#c08", 14.0);
+        state.selected_fighter = Some(1);
+        commit_open_move(&mut state);
+        assert!(state.edit_log.entries.is_empty());
+    }
+
+    /// Every way a move is opened records its owner: the selection is only set through
+    /// `AppState::open_move`, and the save path reads that owner, never the active character.
+    #[test]
+    fn the_open_moves_owner_is_set_only_with_the_move_and_read_by_the_save() {
+        for (path, source) in [
+            ("src/app.rs", include_str!("app.rs")),
+            (
+                "src/app/project_page.rs",
+                include_str!("app/project_page.rs"),
+            ),
+            ("src/data.rs", include_str!("data.rs")),
+            ("src/mod_project.rs", include_str!("mod_project.rs")),
+        ] {
+            let assignments = source.matches(concat!("selected_move", " = Some(")).count()
+                + source.matches(concat!("move_owner", " = ")).count();
+            let expected = if path == "src/data.rs" { 2 } else { 0 };
+            assert_eq!(
+                assignments, expected,
+                "{path} opens a move without its owner"
+            );
+        }
+        let save = include_str!("app.rs")
+            .split("fn commit_open_move(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("commit_open_move");
+        assert!(save.contains("open_move_owner()"));
+        assert!(!save.contains("active_character") && !save.contains("active_key"));
+    }
+
+    /// Review finding 5: a new made character copies its donor's live rules as well as its
+    /// edits, so the game plays the copy at once, as the export does; rule keys carry a suffix
+    /// after the move, a move limited to some costumes stays with them, and nothing of another
+    /// fighter or of the character itself is touched.
+    #[test]
+    fn a_new_made_character_copies_its_donors_live_rules() {
+        let vision = crate::character::CharacterKey::parse("mario#c08");
+        let mut store: HashMap<String, Vec<u32>> = HashMap::from([
+            ("mario/attack_11#0".to_string(), vec![1]),
+            ("mario/attack_12".to_string(), vec![2]),
+            ("mario/attack_13#2".to_string(), vec![3]),
+            ("luigi/attack_11#0".to_string(), vec![4]),
+            ("mario#c08/attack_12".to_string(), vec![5]),
+        ]);
+        let limited = HashSet::from(["attack_13".to_string()]);
+        store.fork("mario", &vision, &limited);
+        assert_eq!(store.get("mario#c08/attack_11#0"), Some(&vec![1]));
+        assert_eq!(store.get("mario#c08/attack_12"), Some(&vec![5]));
+        assert_eq!(store.get("mario#c08/attack_13#2"), None);
+        assert_eq!(store.get("mario/attack_11#0"), Some(&vec![1]));
+        assert_eq!(store.len(), 6);
+        // Every live rule store is part of the copy.
+        let fork = include_str!("app.rs")
+            .split("fn fork_donor_edits(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("fork_donor_edits");
+        for rules in [
+            "fork(&mut self.hitbox_rules_store)",
+            "fork(&mut self.effect_rules_store)",
+            "fork(&mut self.effect_control_rules_store)",
+        ] {
+            assert!(fork.contains(rules), "{rules}");
+        }
+    }
+
+    /// Review finding 9: opening a made character's move records the game's source under it;
+    /// that is no edit, so the project is not marked changed. A real edit still is.
+    #[test]
+    fn browsing_a_made_characters_move_does_not_mark_the_project_changed() {
+        let vision = crate::roster::RosterKey::slot("mario", 8);
+        let saved = crate::mod_project::ModProjectFile::default();
+        let mut browsed = saved.clone();
+        for edits in [
+            browsed.fighters.entry("mario".into()).or_default(),
+            browsed.characters.entry(vision.clone()).or_default(),
+        ] {
+            edits.display = "Mario".into();
+            edits.move_sources.insert(
+                "attack_11".into(),
+                crate::mod_project::MoveSourceSnapshot {
+                    body: MARIO_GAME_ATTACK11.into(),
+                    captures: Vec::new(),
+                },
+            );
+        }
+        assert_eq!(
+            VisionaryApp::snapshot_for_dirty(&browsed),
+            VisionaryApp::snapshot_for_dirty(&saved)
+        );
+        let mut edited = browsed.clone();
+        edited
+            .characters
+            .get_mut(&vision)
+            .unwrap()
+            .sound_scripts
+            .insert("attack_11".into(), crate::data::AcmdScript::default());
+        assert_ne!(
+            VisionaryApp::snapshot_for_dirty(&edited),
+            VisionaryApp::snapshot_for_dirty(&saved)
+        );
+    }
+
+    /// Review finding 8: a card's counts compare every saved script with the game's, so they
+    /// are worked out once per edit revision rather than once per frame.
+    #[test]
+    fn counts_are_worked_out_again_only_after_an_edit() {
+        let cache: RevisionCache<&str, usize> = RevisionCache::default();
+        let mut runs = 0;
+        for _frame in 0..3 {
+            assert_eq!(
+                cache.get_or(1, "mario", || {
+                    runs += 1;
+                    4
+                }),
+                4
+            );
+        }
+        assert_eq!(runs, 1);
+        // The paired positive: a new revision works it out again, and each key is its own.
+        assert_eq!(
+            cache.get_or(2, "mario", || {
+                runs += 1;
+                5
+            }),
+            5
+        );
+        assert_eq!(
+            cache.get_or(2, "mario#c08", || {
+                runs += 1;
+                1
+            }),
+            1
+        );
+        assert_eq!(runs, 3);
+    }
+
+    /// Review finding 10: Vision's effect file is read from Vision's folder, never from another
+    /// mod's copy of the c08 file; without one there, from Mario's own file. Mario's files and
+    /// a base costume's file take the ordinary lookup.
+    #[test]
+    fn a_made_characters_effect_file_comes_from_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut roster = crate::mod_project::RosterMod::default();
+        roster.authored.push(crate::mod_project::AuthoredEntry {
+            key: crate::roster::RosterKey::slot("mario", 8),
+            donor: "mario".into(),
+            slot: 8,
+            slots: (9..=15).collect(),
+            display_name: "Vision".into(),
+            name_id: "vision".into(),
+            moveset_scaffolded: false,
+            files_root: None,
+        });
+        let rel = "effect/fighter/mario/ef_mario_c08.eff";
+        let root = dir.path().join("characters/vision");
+        let folder = |_: &crate::roster::RosterKey| Some(root.clone());
+        assert_eq!(
+            made_effect_lookup(rel, &roster, folder),
+            Some(Err("effect/fighter/mario/ef_mario.eff".to_string()))
+        );
+        std::fs::create_dir_all(root.join("effect/fighter/mario")).unwrap();
+        std::fs::write(root.join(rel), b"eff").unwrap();
+        assert_eq!(
+            made_effect_lookup(rel, &roster, folder),
+            Some(Ok(root.join(rel)))
+        );
+        for other in [
+            "effect/fighter/mario/ef_mario.eff",
+            "effect/fighter/mario/ef_mario_c03.eff",
+        ] {
+            assert_eq!(made_effect_lookup(other, &roster, folder), None, "{other}");
+        }
+    }
+
+    /// Review finding 12: removing a made character published Mario's rules while Vision was
+    /// still in the roster, so they kept leaving Vision's costumes out until the next publish,
+    /// and Vision's effect aliases stayed. The entry goes first, then the edits, and removing
+    /// the edits publishes both the rules and the aliases.
+    #[test]
+    fn removing_a_made_character_publishes_after_its_entry_is_gone() {
+        let page = include_str!("app/project_page.rs")
+            .split("fn remove_character(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("remove_character");
+        let entry_gone = page
+            .find("NewCharacterAction::Remove")
+            .expect("removes the entry");
+        let edits_gone = page
+            .find("self.remove_character_edits(")
+            .expect("removes edits");
+        assert!(entry_gone < edits_gone);
+        let edits = include_str!("app.rs")
+            .split("pub(crate) fn remove_character_edits(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("remove_character_edits");
+        assert!(edits.contains("self.publish_live_rule_union();"));
+        assert!(edits.contains("self.push_effect_aliases();"));
+    }
+
     #[test]
     fn kinetic_energy_only_edit_is_detected_for_commit() {
         let state = AppState {
@@ -41223,7 +41713,7 @@ mod live_effect_capture_tests {
             ..AppState::default()
         };
         assert_eq!(state.script.to_kinetic_energy_events().len(), 1);
-        assert!(VisionaryApp::current_point_events_edited(&state));
+        assert!(state.point_events_edited());
     }
 
     #[test]
@@ -46731,12 +47221,14 @@ mod blocked_export_writes_nothing_tests {
     /// A made character's effects ship as the file of each of its costumes, rebuilt from its
     /// own file, and its base fighter's file is not written for them. Paired with the same
     /// project whose made character has no effect edits, which writes none of those files.
+    ///
+    /// It needs the game's own `ef_mario.eff`, which is not in the repository, so it is ignored
+    /// (and counted as ignored) unless run with `--ignored` and `VISIONARY_EFF_ROOT` set to the
+    /// extracted effect tree; run that way without the tree it fails rather than passing empty.
     #[test]
+    #[ignore = "needs VISIONARY_EFF_ROOT, the game's extracted effect/ tree"]
     fn a_made_characters_effects_ship_as_each_of_its_costumes_files() {
-        let Some(root) = corpus_root() else {
-            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
-            return;
-        };
+        let root = corpus_root().expect("set VISIONARY_EFF_ROOT to the extracted effect/ tree");
         let src_eff = root.join("effect/fighter/mario/ef_mario.eff");
         assert!(src_eff.exists(), "{} is missing", src_eff.display());
         // Vision's own copy, as made with the character.

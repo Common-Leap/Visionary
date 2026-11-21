@@ -7518,7 +7518,12 @@ pub struct AppState {
     pub fighters: Vec<FighterEntry>,
     pub labels: HashMap<u64, String>,
     pub selected_fighter: Option<usize>,
+    /// Set only through [`AppState::open_move`], which also records whose move it is.
     pub selected_move: Option<MoveEntry>,
+    /// The character (store key spelling, `mario` or `mario#c08`) the open move was loaded for.
+    /// Everything saved from the loaded move state goes back under this key, whatever the
+    /// active character is by the time the save runs.
+    pub move_owner: Option<String>,
     pub hitboxes: Vec<Hitbox>,
     pub script: AcmdScript,
     pub current_frame: u32,
@@ -7658,6 +7663,7 @@ impl Default for AppState {
             fighters: Vec::new(),
             labels: HashMap::new(),
             selected_fighter: None,
+            move_owner: None,
             selected_move: None,
             hitboxes: Vec::new(),
             script: AcmdScript::default(),
@@ -7759,6 +7765,19 @@ macro_rules! define_point_originals {
 with_point_families!(define_point_originals);
 
 impl AppState {
+    /// Open `entry` as `owner`'s move. The owner travels with the loaded move state, so a save
+    /// made after the active character changed still lands on the character it was opened for.
+    pub fn open_move(&mut self, owner: &str, entry: MoveEntry) {
+        self.move_owner = Some(owner.to_owned());
+        self.selected_move = Some(entry);
+    }
+
+    /// Whose move is open: the key it was opened under, or `None` when no move is open.
+    pub fn open_move_owner(&self) -> Option<&str> {
+        self.selected_move.as_ref()?;
+        self.move_owner.as_deref()
+    }
+
     /// Install a freshly loaded script and re-baseline the hurtbox spans it resolves to.
     ///
     /// A method rather than two assignments at each of the four call sites, so the baseline

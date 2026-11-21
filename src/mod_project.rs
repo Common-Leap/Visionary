@@ -16,7 +16,13 @@ use serde::{Deserialize, Serialize};
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-pub const PROJECT_VERSION: u32 = 7;
+pub const PROJECT_VERSION: u32 = 8;
+
+/// The first project version in which characters made in Visionary keep their own edits in
+/// [`ModProjectFile::characters`]. Before it, a made character played its donor's edits on its
+/// own costumes; [`ModProjectFile::migrate`] gives such a project's made characters a copy of
+/// them, once.
+pub const OWN_CHARACTER_STORES_VERSION: u32 = 8;
 
 /// Oldest project version supported by the load-time field defaults and migrations.
 pub const OLDEST_SUPPORTED_VERSION: u32 = 1;
@@ -167,18 +173,57 @@ pub fn scope_acmd_project(project: &ModProjectFile, scope: AcmdProjectScope<'_>)
                     scoped
                         .characters
                         .insert(character.roster_key().clone(), selected);
-                    scoped.roster.authored = project
-                        .roster
-                        .authored
-                        .iter()
-                        .filter(|entry| &entry.key == character.roster_key())
-                        .cloned()
-                        .collect();
                 } else {
                     scoped
                         .fighters
                         .insert(selected_fighter.to_string(), selected);
                 }
+            }
+            // The move ships as one function for every costume of the fighter, so it carries
+            // every character's version of it and the costumes each one owns: a donor's edit
+            // must not reach a made character's costumes, and the reverse. A fighter with no
+            // made characters is exported exactly as before.
+            let engine = character.engine_fighter();
+            let made: Vec<&AuthoredEntry> =
+                crate::character::made_on(engine, &project.roster).collect();
+            if !made.is_empty() {
+                let only_the_move = |edits: &FighterMod| {
+                    let moves = scoped_fighter(edits, Some(selected_move), &HashSet::new());
+                    FighterMod {
+                        display: moves.display,
+                        acmd: moves.acmd,
+                        effect_calls: moves.effect_calls,
+                        effect_calls_full: moves.effect_calls_full,
+                        effect_scripts: moves.effect_scripts,
+                        effect_dropped_lines: moves.effect_dropped_lines,
+                        effect_frame_residue: moves.effect_frame_residue,
+                        sound_scripts: moves.sound_scripts,
+                        expression_scripts: moves.expression_scripts,
+                        move_sources: moves.move_sources,
+                        move_graphs: moves.move_graphs,
+                        capture_branch_warnings: moves.capture_branch_warnings,
+                        ..FighterMod::default()
+                    }
+                };
+                if let Some((name, edits)) = project
+                    .fighters
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(engine))
+                {
+                    scoped
+                        .fighters
+                        .entry(name.clone())
+                        .or_insert_with(|| only_the_move(edits));
+                }
+                for entry in &made {
+                    if let Some(edits) = project.characters.get(&entry.key) {
+                        scoped
+                            .characters
+                            .entry(entry.key.clone())
+                            .or_insert_with(|| only_the_move(edits));
+                    }
+                }
+                scoped.roster.authored = made.into_iter().cloned().collect();
             }
         }
     }
@@ -279,24 +324,7 @@ impl ModProjectFile {
     /// still count as empty — otherwise "No edits to export yet" turns into an export that
     /// produces no files.
     pub fn is_empty(&self) -> bool {
-        self.all_move_edits().all(|f| {
-            f.acmd.is_empty()
-                && f.effect_calls.values().all(|v| v.is_empty())
-                && f.effect_calls_full.values().all(|v| v.is_empty())
-                // An empty category script is an explicit replacement: it means the user
-                // removed every call and wants the generated plugin to silence the stock
-                // category. The map's presence, not the statement count, carries that intent.
-                && f.sound_scripts.is_empty()
-                && f.expression_scripts.is_empty()
-                && f.effect_scripts.is_empty()
-                && f.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
-                && f.live_tweaks.is_empty()
-                && f.params.is_empty()
-                && f.behavior.is_unset()
-                && f.meters.is_empty()
-                && f.move_graphs.is_empty()
-                && f.controller_charts.is_empty()
-        }) && self.roster.is_empty()
+        self.all_move_edits().all(|f| !f.has_edits()) && self.roster.is_empty()
     }
 
     /// Every fighter's and every made character's edits. Anything that asks a question of all
@@ -431,7 +459,7 @@ impl ModProjectFile {
     ///
     /// Legacy move behavior is folded into the main controller during deserialization.
     /// Stamp the current version and refuse newer files before they can be saved.
-    pub fn migrate(&mut self) -> anyhow::Result<()> {
+    pub fn migrate(&mut self) -> anyhow::Result<Vec<String>> {
         if self.version > PROJECT_VERSION {
             anyhow::bail!(
                 "this project was saved by a newer Visionary (project version {}, this build \
@@ -443,8 +471,165 @@ impl ModProjectFile {
         if self.version < OLDEST_SUPPORTED_VERSION {
             anyhow::bail!("unsupported project version {}", self.version);
         }
+        // Decided before the version is stamped. A project saved before made characters had
+        // their own stores is one whose version predates them. Builds between the change and the
+        // version bump wrote the old version number with a `characters` map, so a file that
+        // already has one is not shared, whatever its version says: copying the donor's edits
+        // into it again would hand the character donor edits made after it was created. A file
+        // with no made characters needs nothing, so a base-only project is unchanged.
+        let shared_with_donor = self.version < OWN_CHARACTER_STORES_VERSION
+            && self.characters.is_empty()
+            && !self.roster.authored.is_empty();
         self.version = PROJECT_VERSION;
-        Ok(())
+        let mut findings = self.migrate_scoped_records();
+        if shared_with_donor {
+            findings.extend(self.copy_shared_donor_edits());
+        }
+        Ok(findings)
+    }
+
+    /// Give each made character its own copy of every donor edit it played before it had a
+    /// store of its own, the way creating it copies them now: unscoped move edits with their
+    /// node graphs, sound, expression and effect calls; the donor's gimmick and meters when
+    /// they ran on every costume; the donor's effect file edits onto the character's own file.
+    /// A move whose game record is limited to some costumes belongs to that limit and is left
+    /// alone. Never replaces anything the character already has. Returns one line per
+    /// character that got a copy.
+    fn copy_shared_donor_edits(&mut self) -> Vec<String> {
+        fn copy<V: Clone>(
+            from: &HashMap<String, V>,
+            to: &mut HashMap<String, V>,
+            limited: &HashSet<String>,
+        ) -> usize {
+            let mut copied = 0;
+            for (move_name, value) in from.iter().filter(|(name, _)| !limited.contains(*name)) {
+                if !to.contains_key(move_name) {
+                    to.insert(move_name.clone(), value.clone());
+                    copied += 1;
+                }
+            }
+            copied
+        }
+        let mut findings = Vec::new();
+        for entry in self.roster.authored.clone() {
+            let Some(donor) = self
+                .fighters
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&entry.donor))
+                .map(|(_, edits)| edits.clone())
+            else {
+                continue;
+            };
+            let key = crate::character::CharacterKey::made(entry.key.clone());
+            let slots = entry.all_slots();
+            let limited: HashSet<String> = donor
+                .acmd
+                .iter()
+                .filter(|(_, record)| !record.effective_scopes().is_empty())
+                .map(|(move_name, _)| move_name.clone())
+                .collect();
+            let existed = self.characters.contains_key(&entry.key);
+            let mut own = self.characters.remove(&entry.key).unwrap_or_default();
+            let mut copied = 0;
+            for (move_name, record) in donor.acmd.iter() {
+                if !limited.contains(move_name) && !own.acmd.contains_key(move_name) {
+                    let mut record = record.clone();
+                    record.slot_scope = None;
+                    record.slot_scopes.clear();
+                    own.acmd.insert(move_name.clone(), record);
+                    copied += 1;
+                }
+            }
+            copied += copy(&donor.effect_calls, &mut own.effect_calls, &limited);
+            copied += copy(&donor.effect_scripts, &mut own.effect_scripts, &limited);
+            copied += copy(&donor.sound_scripts, &mut own.sound_scripts, &limited);
+            copied += copy(
+                &donor.expression_scripts,
+                &mut own.expression_scripts,
+                &limited,
+            );
+            for (move_name, graph) in &donor.move_graphs {
+                if !limited.contains(move_name) && !own.move_graphs.contains_key(move_name) {
+                    own.move_graphs.insert(move_name.clone(), graph.clone());
+                    copied += 1;
+                }
+            }
+            // Companions of the copies above, not edits of their own.
+            copy(
+                &donor.effect_calls_full,
+                &mut own.effect_calls_full,
+                &limited,
+            );
+            copy(
+                &donor.effect_dropped_lines,
+                &mut own.effect_dropped_lines,
+                &limited,
+            );
+            copy(
+                &donor.effect_frame_residue,
+                &mut own.effect_frame_residue,
+                &limited,
+            );
+            copy(
+                &donor.capture_branch_warnings,
+                &mut own.capture_branch_warnings,
+                &limited,
+            );
+            copy(&donor.move_sources, &mut own.move_sources, &HashSet::new());
+            // The donor's gimmick, when it ran on all of the character's costumes. One limited
+            // to exactly them was the character's and is claimed on load instead.
+            let costumes = &donor.behavior.costumes;
+            let ran_here = costumes.is_empty()
+                || (costumes != &slots && slots.iter().all(|slot| costumes.contains(slot)));
+            let has_gimmick = !donor.behavior.is_unset() || !donor.controller_charts.is_empty();
+            if has_gimmick
+                && own.behavior.is_unset()
+                && own.controller_charts.is_empty()
+                && ran_here
+            {
+                own.behavior = donor.behavior.clone();
+                own.behavior.costumes = slots.clone();
+                own.behavior_layout = donor.behavior_layout.clone();
+                own.controller_charts = donor.controller_charts.clone();
+                copied += 1;
+            } else if has_gimmick
+                && !ran_here
+                && costumes != &slots
+                && slots.iter().any(|slot| costumes.contains(slot))
+            {
+                findings.push(format!(
+                    "{}'s gimmick ran on some of {}'s costumes; it stays with {}",
+                    entry.donor, entry.display_name, entry.donor
+                ));
+            }
+            if own.meters.is_empty() && ran_here && !donor.meters.is_empty() {
+                own.meters = donor.meters.clone();
+                copied += 1;
+            }
+            if let Some(mut eff) = donor.eff.clone().filter(|eff| !eff.is_empty()) {
+                if own.eff.is_none() {
+                    eff.source_rel = key.effect_rel(&self.roster);
+                    eff.transplants.retain(|op| op.one_slot_slots.is_empty());
+                    own.eff = Some(eff);
+                    copied += 1;
+                }
+            }
+            if copied > 0 && own.display.is_empty() {
+                own.display = donor.display.clone();
+            }
+            if copied > 0 {
+                findings.push(format!(
+                    "{} keeps its own copy of {copied} {} edit{} it used to share",
+                    entry.display_name,
+                    entry.donor,
+                    if copied == 1 { "" } else { "s" }
+                ));
+            }
+            if existed || copied > 0 {
+                self.characters.insert(entry.key.clone(), own);
+            }
+        }
+        findings
     }
 }
 
@@ -498,6 +683,29 @@ pub struct RosterMod {
     /// roster row — `color_num`, etc. — without touching the file copy.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub chara_overrides: std::collections::BTreeMap<crate::roster::RosterKey, CharaOverrides>,
+}
+
+impl FighterMod {
+    /// Whether this holds any edit. A browsed move's game source and the notes kept beside an
+    /// edit are not edits of their own.
+    pub fn has_edits(&self) -> bool {
+        !(self.acmd.is_empty()
+            && self.effect_calls.values().all(|v| v.is_empty())
+            && self.effect_calls_full.values().all(|v| v.is_empty())
+            // An empty category script is an explicit replacement: it means the user
+            // removed every call and wants the generated plugin to silence the stock
+            // category. The map's presence, not the statement count, carries that intent.
+            && self.sound_scripts.is_empty()
+            && self.expression_scripts.is_empty()
+            && self.effect_scripts.is_empty()
+            && self.eff.as_ref().map(|e| e.is_empty()).unwrap_or(true)
+            && self.live_tweaks.is_empty()
+            && self.params.is_empty()
+            && self.behavior.is_unset()
+            && self.meters.is_empty()
+            && self.move_graphs.is_empty()
+            && self.controller_charts.is_empty())
+    }
 }
 
 impl RosterMod {
