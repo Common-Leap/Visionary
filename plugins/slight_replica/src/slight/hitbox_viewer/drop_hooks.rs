@@ -536,11 +536,13 @@ unsafe fn drop_statusmodule_change_status_request_from_script(
     original!()(boma, status, arg3)
 }
 
+// The game passes these SIMD vectors by value; the hook only forwards them unchanged.
+#[allow(improper_ctypes_definitions)]
 #[skyline::hook(replace = smash::app::lua_bind::EffectModule::request_post_effect_line_circle)]
 unsafe fn drop_effectmodule_request_post_effect_line_circle(
     boma: *mut Boma,
-    effHash: smash::phx::Hash40,
-    boneHash: smash::phx::Hash40,
+    eff_hash: smash::phx::Hash40,
+    bone_hash: smash::phx::Hash40,
     radius: smash::phx::simd::Vector2,
     offsets: smash::phx::simd::Vector3,
     arg6: bool,
@@ -551,7 +553,7 @@ unsafe fn drop_effectmodule_request_post_effect_line_circle(
         return Default::default();
     }
     original!()(
-        boma, effHash, boneHash, radius, offsets, arg6, duration, fade,
+        boma, eff_hash, bone_hash, radius, offsets, arg6, duration, fade,
     )
 }
 
