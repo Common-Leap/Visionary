@@ -10794,49 +10794,32 @@ impl VisionaryApp {
         };
         let mut spawns: Vec<crate::article_preview::Spawn> = Vec::new();
         // Objects are spawned from any of the move's scripts; Fox draws his blaster in the
-        // expression script.
-        let mut events = self.state.script.to_article_spawns();
-        events.extend(self.state.expression_script.to_article_spawns());
-        events.extend(self.state.sound_script.to_article_spawns());
-        events.sort_by_key(|(frame, ..)| *frame);
-        let mut shots = self.state.script.to_article_shots();
-        shots.extend(self.state.expression_script.to_article_shots());
-        shots.sort_by_key(|(frame, _)| *frame);
-        let mut motions = Vec::new();
-        let mut shown = Vec::new();
-        for script in [
-            &self.state.script,
-            &self.state.expression_script,
-            &self.state.sound_script,
-        ] {
-            motions.extend(script.to_article_motions());
-            shown.extend(script.to_article_visibility());
-        }
-        motions.sort_by_key(|(frame, ..)| *frame);
-        shown.sort_by_key(|(frame, ..)| *frame);
-        for (spawned, symbol, created) in &events {
-            if !created {
-                continue;
-            }
-            let spawned = *spawned;
-            // The first removal of this object after it appears.
-            let removed = events
-                .iter()
-                .find(|(at, other, created)| !created && other == symbol && *at > spawned)
-                .map(|(at, ..)| *at);
-            let Some(name) = crate::article_preview::article_name(symbol) else {
+        // expression script. Use the typed ArticleCall stream so remove/shoot/visibility/motion
+        // honor ArticleTarget::All, First and Last, and resolve cloned/rewritten article IDs
+        // through the moveset catalog when available.
+        let mut owned_calls = self.state.script.to_article_calls();
+        owned_calls.extend(self.state.expression_script.to_article_calls());
+        owned_calls.extend(self.state.sound_script.to_article_calls());
+        let call_refs: Vec<(u32, &crate::data::ArticleCall)> = owned_calls
+            .iter()
+            .map(|(f, call)| (*f, call))
+            .collect();
+        let empty_locals: HashMap<String, String> = HashMap::new();
+        let plans = crate::article_preview::plan_spawns_from_calls(&call_refs, &|call| {
+            self.article_catalog
+                .as_ref()
+                .filter(|cache| cache.fighter == fighter.name)
+                .and_then(|cache| cache.catalog.resolve_id(&call.article, &empty_locals))
+                .map(|article| article.name.clone())
+                .or_else(|| crate::article_preview::article_name(&call.article))
+        });
+        for plan in plans {
+            let Some(mut kind) = self.object_kind(&fighter, &plan.name) else {
                 continue;
             };
-            let Some(mut kind) = self.object_kind(&fighter, &name) else {
-                continue;
-            };
-            let alive = |at: u32| at >= spawned && removed.is_none_or(|removed| at < removed);
             // The motion the move gives it (Samus's grab beam plays `catch`), in place of its own.
-            if let Some((_, _, motion)) = motions
-                .iter()
-                .find(|(at, other, _)| other == symbol && alive(*at))
-            {
-                kind = self.object_in_motion(&fighter, &name, kind, motion);
+            if let Some(motion) = &plan.motion {
+                kind = self.object_in_motion(&fighter, &plan.name, kind, motion);
             }
             // The hand the move's effect is on as the object appears: the flame in Sephiroth's
             // hand as his flare leaves it.
@@ -10846,30 +10829,18 @@ impl VisionaryApp {
                 .iter()
                 .filter(|effect| {
                     crate::article_preview::HANDS.contains(&effect.bone_name.as_str())
-                        && effect.active_start <= spawned
-                        && (effect.follows_bone || effect.active_end >= spawned)
+                        && effect.active_start <= plan.spawned
+                        && (effect.follows_bone || effect.active_end >= plan.spawned)
                 })
                 .max_by_key(|effect| effect.active_start)
                 .map(|effect| effect.bone_name.clone());
             spawns.push(crate::article_preview::Spawn {
                 kind,
                 hand,
-                shown: shown
-                    .iter()
-                    .filter(|(at, other, _)| other == symbol && alive(*at))
-                    .map(|(at, _, visible)| (*at, *visible))
-                    .collect(),
-                spawned,
-                removed,
-                // The first throw of it while it is out.
-                shot: shots
-                    .iter()
-                    .find(|(at, other)| {
-                        other == symbol
-                            && *at >= spawned
-                            && removed.is_none_or(|removed| *at < removed)
-                    })
-                    .map(|(at, _)| *at),
+                shown: plan.shown,
+                spawned: plan.spawned,
+                removed: plan.removed,
+                shot: plan.shot,
             });
         }
         // Objects the fighter's status code creates for a special, final smash, entrance, taunt
@@ -11180,16 +11151,141 @@ impl VisionaryApp {
                     let labels = self.state.labels.clone();
                     let fighter = fighter.clone();
                     let name = name.to_owned();
+                    let catalog_article = self
+                        .article_catalog
+                        .as_ref()
+                        .filter(|cache| cache.fighter == fighter.name)
+                        .and_then(|cache| {
+                            let direct = format!("{}_{name}", fighter.name);
+                            cache
+                                .catalog
+                                .get(&direct)
+                                .or_else(|| {
+                                    cache.catalog.articles.iter().find(|a| a.name == name)
+                                })
+                                .cloned()
+                        });
+                    let agent = catalog_article
+                        .as_ref()
+                        .map(|a| a.agent.clone())
+                        .unwrap_or_else(|| format!("{}_{name}", fighter.name));
+                    let owner = catalog_article
+                        .as_ref()
+                        .map(|a| a.owner.clone())
+                        .unwrap_or_else(|| fighter.name.clone());
+                    let mut extra_scripts: Vec<String> = Vec::new();
+                    if let Some(article) = &catalog_article {
+                        // Prefer game_ scripts first so hitbox scripts win over effect-only ones.
+                        for want_game in [true, false] {
+                            for raw in &article.source_scripts {
+                                let is_game = raw.starts_with("game_");
+                                if is_game != want_game {
+                                    continue;
+                                }
+                                let stripped = raw
+                                    .strip_prefix("game_")
+                                    .or_else(|| raw.strip_prefix("effect_"))
+                                    .or_else(|| raw.strip_prefix("sound_"))
+                                    .or_else(|| raw.strip_prefix("expression_"))
+                                    .unwrap_or(raw);
+                                if !stripped.is_empty()
+                                    && !extra_scripts.iter().any(|s| s == stripped)
+                                {
+                                    extra_scripts.push(stripped.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    let acmd_src = self.acmd_src.clone();
+                    let (param_layers, _) = self.article_param_layers(&owner);
+                    let param_overrides: Vec<crate::articles::params::ParamOverride> = self
+                        .article_catalog
+                        .as_ref()
+                        .filter(|cache| cache.fighter == fighter.name)
+                        .map(|cache| cache.overrides.clone())
+                        .unwrap_or_default();
+                    let mut extra_fighter_dirs: Vec<PathBuf> = Vec::new();
+                    if let Some(index) = self.acmd_src.as_ref() {
+                        let dir = index.root.join("romfs").join("fighter").join(&owner);
+                        if dir.is_dir() {
+                            extra_fighter_dirs.push(dir);
+                        }
+                    }
+                    if let Some(romfs) = self.project_romfs() {
+                        let dir = romfs.join("fighter").join(&owner);
+                        if dir.is_dir() && !extra_fighter_dirs.contains(&dir) {
+                            extra_fighter_dirs.push(dir);
+                        }
+                    }
+                    if !extra_fighter_dirs.contains(&fighter.fighter_dir) {
+                        extra_fighter_dirs.push(fighter.fighter_dir.clone());
+                    }
+                    for root in self.shared_roots().into_iter().rev() {
+                        let dir = root.join("fighter").join(&owner);
+                        if dir.is_dir() && !extra_fighter_dirs.contains(&dir) {
+                            extra_fighter_dirs.push(dir);
+                        }
+                    }
                     std::thread::spawn(move || {
-                        let agent = format!("{}_{name}", fighter.name);
-                        let kind = crate::article_preview::load_kind(
+                        let settings = acmd_src
+                            .as_ref()
+                            .map(|index| crate::articles::settings_for(index, &agent))
+                            .unwrap_or_default();
+                        let block_of = |block_short: &str| {
+                            let full = format!("param_{block_short}");
+                            let set = crate::articles::params::block_overrides(
+                                &param_overrides,
+                                &owner,
+                                &full,
+                            );
+                            crate::articles::params::param_block(
+                                &param_layers,
+                                &set,
+                                block_short,
+                                &labels,
+                            )
+                        };
+                        // Clones read the new owner's `param_<new_name>`, never the source's.
+                        let params = block_of(&name);
+                        let own_block = format!("param_{name}");
+                        let other_blocks: HashMap<String, crate::articles::params::ParamBlock> =
+                            settings
+                                .iter()
+                                .filter_map(|s| match &s.value {
+                                    crate::articles::settings::SettingValue::Param {
+                                        block,
+                                        ..
+                                    } if *block != own_block => Some(block.clone()),
+                                    _ => None,
+                                })
+                                .collect::<BTreeSet<String>>()
+                                .into_iter()
+                                .filter_map(|full| {
+                                    let short = full.strip_prefix("param_")?.to_owned();
+                                    Some((full, block_of(&short)))
+                                })
+                                .collect();
+                        let inputs = crate::article_preview::ResolvedArticleInputs {
+                            extra_fighter_dirs: &extra_fighter_dirs,
+                            extra_scripts: &extra_scripts,
+                            params: Some(&params),
+                            other_blocks: Some(&other_blocks),
+                            settings: &settings,
+                        };
+                        let kind = crate::article_preview::load_kind_resolved(
                             &fighter.fighter_dir,
                             &fighter.param_path,
                             fighter.base_slot(),
                             &name,
                             &labels,
+                            &inputs,
                             &|script| {
-                                crate::acmd::fetch_object_script(&fighter.name, &agent, script)
+                                crate::article_preview::script_from_index_or_dump(
+                                    acmd_src.as_ref(),
+                                    &agent,
+                                    script,
+                                    &|s| crate::acmd::fetch_object_script(&owner, &agent, s),
+                                )
                             },
                         );
                         let _ = tx.send((key, kind));
@@ -11198,6 +11294,14 @@ impl VisionaryApp {
                 None
             }
         }
+    }
+
+    /// Drop cached preview `ObjectKind`s for `fighter` so edits to settings, params, or scripts
+    /// take effect immediately in the 3D preview.
+    fn invalidate_object_kinds(&mut self, fighter: &str) {
+        let prefix = format!("{fighter}/");
+        self.object_kinds.retain(|k, _| !k.starts_with(&prefix));
+        self.object_pending.retain(|k| !k.starts_with(&prefix));
     }
 
     /// `kind` playing `motion` (by name) when it has one, placed by that motion's own space;
@@ -20319,6 +20423,7 @@ impl VisionaryApp {
                 match rx.try_recv() {
                     Ok(ArticleJobResult::Cache(cache)) => {
                         if cache.fighter == fighter {
+                            self.invalidate_object_kinds(&cache.fighter);
                             self.article_catalog = Some(cache);
                             self.article_catalog_generation = job_generation;
                         }
@@ -20608,6 +20713,14 @@ impl VisionaryApp {
             Ok(said) => {
                 card.message = Some(said);
                 card.edits.clear();
+                if let Some(fighter) = self
+                    .state
+                    .selected_fighter
+                    .and_then(|i| self.state.fighters.get(i))
+                    .map(|f| f.name.clone())
+                {
+                    self.invalidate_object_kinds(&fighter);
+                }
                 self.rebuild_acmd_index();
                 self.ensure_article_catalog();
                 self.reload_article_settings(card);

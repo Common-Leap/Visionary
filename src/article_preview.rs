@@ -123,10 +123,172 @@ impl Flight {
         let next = if outward { speed } else { -speed };
         (distance + next * part).max(0.0)
     }
+
+    /// Overlay resolved status settings on top of the params-derived flight.
+    ///
+    /// `Literal`, `Const` (with a known value) and `Param` settings replace the
+    /// params-derived fields; `Computed` values leave them as they are. Per
+    /// design ruling R3, only fields `Flight` simulates are mapped (`speed`,
+    /// `angle`, `accel`, `gravity`, `max_speed`, `life`); `Brake`, `SpeedMul`
+    /// and unmodelled kinetic calls stay on the Settings card without altering
+    /// the flight path.
+    pub fn with_settings(
+        self,
+        settings: &[crate::articles::settings::Setting],
+        params: &crate::articles::params::ParamBlock,
+    ) -> Self {
+        self.with_settings_and_blocks(settings, params, &HashMap::new())
+    }
+
+    /// Like [`Flight::with_settings`], also resolving `SettingValue::Param` entries that read
+    /// from another block (e.g. `param_common` or another article's block) when present in
+    /// `other_blocks`.
+    pub fn with_settings_and_blocks(
+        mut self,
+        settings: &[crate::articles::settings::Setting],
+        params: &crate::articles::params::ParamBlock,
+        other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+    ) -> Self {
+        use crate::articles::settings::SettingField;
+
+        let mut vx: Option<f32> = None;
+        let mut vy: Option<f32> = None;
+
+        for setting in settings {
+            let Some(value) = resolve_setting_number(&setting.value, params, other_blocks) else {
+                continue;
+            };
+            match setting.field {
+                SettingField::SpeedX => {
+                    // The 3D preview faces right (+1.0), so both signed and facing-multiplied
+                    // speeds keep their value.
+                    vx = Some(value);
+                }
+                SettingField::SpeedY => {
+                    vy = Some(value);
+                }
+                SettingField::AccelX => {
+                    if value > 0.0 {
+                        self.accel = value;
+                    }
+                }
+                SettingField::Gravity => {
+                    self.gravity = value.abs();
+                }
+                SettingField::AccelY => {
+                    if value < 0.0 {
+                        self.gravity = value.abs();
+                    }
+                }
+                SettingField::MaxSpeedX => {
+                    if value.abs() > 0.0 {
+                        self.max_speed = Some(value.abs());
+                    }
+                }
+                SettingField::StableSpeedX => {
+                    if self.max_speed.is_none() && value.abs() > 0.0 {
+                        self.max_speed = Some(value.abs());
+                    }
+                }
+                SettingField::Life => {
+                    if value > 0.0 {
+                        self.life = value;
+                    }
+                }
+                SettingField::Scale
+                | SettingField::StableSpeedY
+                | SettingField::MaxSpeedY
+                | SettingField::BrakeX
+                | SettingField::BrakeY
+                | SettingField::SpeedMul
+                | SettingField::PowerMul
+                | SettingField::OtherMovement => {}
+            }
+        }
+
+        match (vx, vy) {
+            (Some(x), Some(y)) => {
+                self.speed = x.hypot(y);
+                self.angle = y.atan2(x).to_degrees();
+            }
+            (Some(x), None) => {
+                self.speed = x.abs();
+                if x < 0.0 {
+                    self.angle = 180.0;
+                }
+            }
+            (None, Some(y)) => {
+                let x = self.speed * self.angle.to_radians().cos();
+                self.speed = x.hypot(y);
+                self.angle = y.atan2(x).to_degrees();
+            }
+            (None, None) => {}
+        }
+
+        self
+    }
+}
+
+fn resolve_setting_number(
+    value: &crate::articles::settings::SettingValue,
+    params: &crate::articles::params::ParamBlock,
+    other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+) -> Option<f32> {
+    use crate::articles::params::ParamValue;
+    use crate::articles::settings::SettingValue;
+
+    let num = match value {
+        SettingValue::Literal(v) => Some(*v as f32),
+        SettingValue::Const { value: Some(v), .. } => Some(*v as f32),
+        SettingValue::Const { value: None, .. } => None,
+        SettingValue::Param { block, field } => {
+            let source = other_blocks.get(block).unwrap_or(params);
+            let entry = source
+                .fields
+                .get(field)
+                .or_else(|| source.fields.get(field.trim_end_matches('_')));
+            match entry.map(|(v, _)| v) {
+                Some(ParamValue::Float(v)) => Some(*v),
+                Some(ParamValue::Int(v)) => Some(*v as f32),
+                _ => None,
+            }
+        }
+        SettingValue::Computed(_) => None,
+    }?;
+    num.is_finite().then_some(num)
+}
+
+/// Uniform scale resolved from an article's status settings (`ModelModule::set_scale` /
+/// `PostureModule::set_scale`). `Computed` and non-positive values fall back to `1.0`.
+pub fn scale_from_settings(
+    settings: &[crate::articles::settings::Setting],
+    params: &crate::articles::params::ParamBlock,
+) -> f32 {
+    scale_from_settings_and_blocks(settings, params, &HashMap::new())
+}
+
+/// Like [`scale_from_settings`], also resolving `SettingValue::Param` entries against
+/// `other_blocks`.
+pub fn scale_from_settings_and_blocks(
+    settings: &[crate::articles::settings::Setting],
+    params: &crate::articles::params::ParamBlock,
+    other_blocks: &HashMap<String, crate::articles::params::ParamBlock>,
+) -> f32 {
+    let mut scale = 1.0f32;
+    for setting in settings {
+        if setting.field == crate::articles::settings::SettingField::Scale {
+            if let Some(v) = resolve_setting_number(&setting.value, params, other_blocks) {
+                if v > 0.0 {
+                    scale = v;
+                }
+            }
+        }
+    }
+    scale
 }
 
 /// Everything needed to show one kind of object.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ObjectKind {
     /// "fireball", from `FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL`.
     pub name: String,
@@ -139,6 +301,8 @@ pub struct ObjectKind {
     /// Effects from the object's own script; for many projectiles they are all you see.
     pub effects: Vec<ObjectEffect>,
     pub flight: Flight,
+    /// Uniform visual scale applied on top of the object's world placement (default `1.0`).
+    pub scale: f32,
     /// Every motion of the object that has an animation, by hash40 of the motion kind. A move
     /// picks one with `ArticleModule::change_motion`: Samus's grab beam plays `catch` alongside
     /// her grab.
@@ -146,6 +310,23 @@ pub struct ObjectKind {
     /// The animation is one of those motions, made in step with the fighter's and in the
     /// fighter's space, so the object rides the fighter's `top` rather than a hand.
     pub synced: bool,
+}
+
+impl Default for ObjectKind {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            model_dir: None,
+            skel: None,
+            anim: None,
+            hitboxes: Vec::new(),
+            effects: Vec::new(),
+            flight: Flight::default(),
+            scale: 1.0,
+            motions: Vec::new(),
+            synced: false,
+        }
+    }
 }
 
 /// An effect an object's script shows, on one of its bones.
@@ -296,9 +477,8 @@ pub fn article_name(symbol: &str) -> Option<String> {
 
 /// Reads one object's flight from its parameter block, `param_<name>`.
 pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, String>) -> Flight {
-    let mut flight = Flight::default();
     let Ok(param) = prc::open(param_path) else {
-        return flight;
+        return Flight::default();
     };
     let wanted = format!("param_{name}");
     let block = param.0.iter().find_map(|(hash, value)| {
@@ -309,9 +489,9 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
         Some(prc::ParamKind::Struct(fields)) => fields,
         Some(prc::ParamKind::List(list)) => match list.0.first() {
             Some(prc::ParamKind::Struct(fields)) => fields,
-            _ => return flight,
+            _ => return Flight::default(),
         },
-        _ => return flight,
+        _ => return Flight::default(),
     };
     let listed: Vec<(&str, f32)> = fields
         .0
@@ -331,6 +511,33 @@ pub fn flight_from_params(param_path: &Path, name: &str, labels: &HashMap<u64, S
             Some((label.trim_end_matches('_'), number))
         })
         .collect();
+    flight_from_listed(&listed)
+}
+
+/// Reads one object's flight from a merged [`crate::articles::params::ParamBlock`]
+/// (dump + reference mods + moveset `vl.prc`/`vl.prcxml` + `param_config` overrides).
+pub fn flight_from_param_block(params: &crate::articles::params::ParamBlock) -> Flight {
+    use crate::articles::params::ParamValue;
+    if !params.present {
+        return Flight::default();
+    }
+    let listed: Vec<(&str, f32)> = params
+        .fields
+        .iter()
+        .filter_map(|(label, (value, _))| {
+            let number = match value {
+                ParamValue::Float(v) => *v,
+                ParamValue::Int(v) => *v as f32,
+                ParamValue::Other(_) => return None,
+            };
+            Some((label.trim_end_matches('_'), number))
+        })
+        .collect();
+    flight_from_listed(&listed)
+}
+
+fn flight_from_listed(listed: &[(&str, f32)]) -> Flight {
+    let mut flight = Flight::default();
     let mut values: HashMap<String, f32> = listed
         .iter()
         .map(|(label, number)| ((*label).to_owned(), *number))
@@ -478,6 +685,59 @@ fn split_variant(label: &str) -> Option<(String, String)> {
         })
 }
 
+/// Read an article script from the linked moveset `SourceIndex` first, falling back to `dump`
+/// (e.g. `acmd::fetch_object_script`) only when the source does not define it.
+pub fn script_from_index_or_dump(
+    index: Option<&crate::acmd_src::SourceIndex>,
+    agent: &str,
+    script_name: &str,
+    dump: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(index) = index {
+        let lower = script_name.to_ascii_lowercase();
+        let snake = pascal_to_snake(script_name);
+        for candidate in [lower.as_str(), snake.as_str()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            if let Some(project) = index.script_source(agent, candidate) {
+                if !project.body.trim().is_empty() {
+                    return Some(project.body);
+                }
+            }
+        }
+    }
+    dump(script_name)
+}
+
+fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i > 0 && !out.ends_with('_') {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Optional moveset-resolved overrides for [`load_kind_resolved`].
+#[derive(Default)]
+pub struct ResolvedArticleInputs<'a> {
+    /// Additional `fighter/<owner>` directories searched before `fighter_dir` (for example the
+    /// moveset's `romfs/fighter/<owner>` so custom/cloned models and motions load).
+    pub extra_fighter_dirs: &'a [PathBuf],
+    /// Extra candidate script names (such as a clone's `source_scripts`) probed if
+    /// `motion_list.bin` is absent or yields nothing.
+    pub extra_scripts: &'a [String],
+    /// Merged `ParamBlock` for this article (the new owner's `param_<new_name>` for clones).
+    pub params: Option<&'a crate::articles::params::ParamBlock>,
+    /// Any other param blocks referenced by `settings` (`param_common`, another article's block).
+    pub other_blocks: Option<&'a HashMap<String, crate::articles::params::ParamBlock>>,
+    /// Resolved status settings from `crate::articles::settings_for`.
+    pub settings: &'a [crate::articles::settings::Setting],
+}
+
 /// Loads an object's model, skeleton, animation, hitboxes and flight. `script` gives the body of
 /// one of the object's game scripts by name ("Regular"), or nothing.
 pub fn load_kind(
@@ -488,14 +748,46 @@ pub fn load_kind(
     labels: &HashMap<u64, String>,
     script: &dyn Fn(&str) -> Option<String>,
 ) -> Option<ObjectKind> {
-    let skel_path =
-        crate::data::find_part_skel(&fighter_dir.join("model").join(model_folder(name)), slot);
+    load_kind_resolved(
+        fighter_dir,
+        param_path,
+        slot,
+        name,
+        labels,
+        &ResolvedArticleInputs::default(),
+        script,
+    )
+}
+
+/// Like [`load_kind`], overlaying a moveset's resolved `ParamBlock`, status `Setting`s, extra
+/// script candidates, and extra `fighter/<owner>` roots (such as `romfs/`).
+pub fn load_kind_resolved(
+    fighter_dir: &Path,
+    param_path: &Path,
+    slot: u8,
+    name: &str,
+    labels: &HashMap<u64, String>,
+    inputs: &ResolvedArticleInputs<'_>,
+    script: &dyn Fn(&str) -> Option<String>,
+) -> Option<ObjectKind> {
+    let search_dirs: Vec<&Path> = inputs
+        .extra_fighter_dirs
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(fighter_dir))
+        .collect();
+    let model_name = model_folder(name);
+    let skel_path = search_dirs.iter().find_map(|dir| {
+        crate::data::find_part_skel(&dir.join("model").join(model_name), slot)
+    });
     let model_dir = skel_path
         .as_ref()
         .and_then(|path| path.parent())
         .map(Path::to_path_buf);
     let skel = skel_path.and_then(|path| SkelData::from_file(path).ok());
-    let motion_dir = costume_dir(&fighter_dir.join("motion").join(name), slot);
+    let motion_dir = search_dirs
+        .iter()
+        .find_map(|dir| costume_dir(&dir.join("motion").join(name), slot));
     // The object plays the first motion in its list that has a script, "regular" first.
     let mut motions: Vec<(String, Option<PathBuf>)> = Vec::new();
     let mut by_kind: Vec<(u64, PathBuf)> = Vec::new();
@@ -535,6 +827,14 @@ pub fn load_kind(
             );
         }
     }
+    // Always include "regular" and any caller-supplied source script names as fallback candidates
+    // so clones or articles without a local motion_list.bin still load their source hitboxes.
+    for fallback in std::iter::once("regular").chain(inputs.extra_scripts.iter().map(String::as_str))
+    {
+        if !fallback.is_empty() && !motions.iter().any(|(label, _)| label == fallback) {
+            motions.push((fallback.to_owned(), None));
+        }
+    }
     motions.sort_by_key(|(label, _)| label != "regular");
     let mut chosen = motions.first().cloned();
     let mut hitboxes = Vec::new();
@@ -551,7 +851,9 @@ pub fn load_kind(
         if !found.is_empty() || !shown.is_empty() {
             hitboxes = found;
             effects = shown;
-            chosen = Some((label.clone(), anim.clone()));
+            if anim.is_some() || chosen.as_ref().and_then(|(_, p)| p.as_ref()).is_none() {
+                chosen = Some((label.clone(), anim.clone()));
+            }
             if !hitboxes.is_empty() {
                 break;
             }
@@ -577,7 +879,24 @@ pub fn load_kind(
             Some((kind, anim))
         })
         .collect();
-    let flight = flight_from_params(param_path, name, labels);
+    let base_flight = match inputs.params {
+        Some(params) if params.present => flight_from_param_block(params),
+        _ => flight_from_params(param_path, name, labels),
+    };
+    let empty_params = crate::articles::params::ParamBlock::default();
+    let params_ref = inputs.params.unwrap_or(&empty_params);
+    let flight = match inputs.other_blocks {
+        Some(others) if !others.is_empty() => {
+            base_flight.with_settings_and_blocks(inputs.settings, params_ref, others)
+        }
+        _ => base_flight.with_settings(inputs.settings, params_ref),
+    };
+    let scale = match inputs.other_blocks {
+        Some(others) if !others.is_empty() => {
+            scale_from_settings_and_blocks(inputs.settings, params_ref, others)
+        }
+        _ => scale_from_settings(inputs.settings, params_ref),
+    };
     if skel.is_none() && hitboxes.is_empty() && effects.is_empty() && flight.speed == 0.0 {
         return None;
     }
@@ -589,6 +908,7 @@ pub fn load_kind(
         hitboxes,
         effects,
         flight,
+        scale,
         motions,
         synced: false,
     })
@@ -775,6 +1095,126 @@ pub struct Spawn {
 /// The hands an object can leave from.
 pub const HANDS: [&str; 4] = ["havel", "haver", "handl", "handr"];
 
+/// Planned lifecycle for one spawned copy of an article, built from typed
+/// [`crate::data::ArticleCall`]s while honoring `ArticleTarget::All`, `First`, and `Last`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnPlan {
+    pub name: String,
+    pub spawned: u32,
+    pub removed: Option<u32>,
+    pub shot: Option<u32>,
+    pub shown: Vec<(u32, bool)>,
+    pub motion: Option<String>,
+}
+
+fn target_live_indices(
+    plans: &[SpawnPlan],
+    name: &str,
+    frame: u32,
+    target: crate::data::ArticleTarget,
+) -> Vec<usize> {
+    use crate::data::ArticleTarget;
+    let live: Vec<usize> = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.name == name && p.spawned <= frame && p.removed.is_none_or(|r| frame < r))
+        .map(|(i, _)| i)
+        .collect();
+    match target {
+        ArticleTarget::All | ArticleTarget::Unspecified => live,
+        ArticleTarget::First => live.first().copied().into_iter().collect(),
+        ArticleTarget::Last | ArticleTarget::Term => live.last().copied().into_iter().collect(),
+        ArticleTarget::None => Vec::new(),
+    }
+}
+
+fn parse_bool_arg(args: &[String], index: usize) -> Option<bool> {
+    match args.get(index).map(|s| s.trim()) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_quoted_motion(arg: &str) -> Option<String> {
+    let (_, rest) = arg.split_once('"')?;
+    let (motion, _) = rest.split_once('"')?;
+    (!motion.is_empty()).then(|| motion.to_owned())
+}
+
+/// Turn a move's `(frame, ArticleCall)` stream into per-copy spawn plans, applying
+/// `Remove`, `Shoot`, `SetVisibility*`, and `ChangeMotion` to `All`, `First`, or `Last`
+/// live copies of each article.
+pub fn plan_spawns_from_calls(
+    calls: &[(u32, &crate::data::ArticleCall)],
+    resolve_name: &dyn Fn(&crate::data::ArticleCall) -> Option<String>,
+) -> Vec<SpawnPlan> {
+    use crate::data::ArticleOp;
+
+    let mut ordered: Vec<(usize, u32, &crate::data::ArticleCall)> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (frame, call))| (i, *frame, *call))
+        .collect();
+    ordered.sort_by_key(|(i, frame, _)| (*frame, *i));
+
+    let mut plans: Vec<SpawnPlan> = Vec::new();
+    for (_, frame, call) in ordered {
+        let Some(name) = resolve_name(call) else {
+            continue;
+        };
+        match call.op {
+            ArticleOp::Generate | ArticleOp::GenerateEnable => {
+                plans.push(SpawnPlan {
+                    name,
+                    spawned: frame,
+                    removed: None,
+                    shot: None,
+                    shown: Vec::new(),
+                    motion: None,
+                });
+            }
+            ArticleOp::Remove | ArticleOp::RemoveExist => {
+                for idx in target_live_indices(&plans, &name, frame, call.target) {
+                    plans[idx].removed = Some(frame);
+                }
+            }
+            ArticleOp::Shoot | ArticleOp::ShootExist => {
+                for idx in target_live_indices(&plans, &name, frame, call.target) {
+                    if plans[idx].shot.is_none() {
+                        plans[idx].shot = Some(frame);
+                    }
+                }
+            }
+            ArticleOp::SetVisibilityWhole => {
+                if let Some(visible) = parse_bool_arg(&call.args, 0) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        plans[idx].shown.push((frame, visible));
+                    }
+                }
+            }
+            ArticleOp::SetVisibility => {
+                if let Some(visible) = parse_bool_arg(&call.args, 1) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        plans[idx].shown.push((frame, visible));
+                    }
+                }
+            }
+            ArticleOp::ChangeMotion => {
+                if let Some(motion) = call.args.first().and_then(|arg| parse_quoted_motion(arg)) {
+                    for idx in target_live_indices(&plans, &name, frame, call.target) {
+                        if plans[idx].motion.is_none() {
+                            plans[idx].motion = Some(motion.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    plans
+}
+
 /// The objects out at `frame`, placed in the world. `bones_at` gives the fighter's bone
 /// matrices at a game frame.
 pub fn place(
@@ -804,6 +1244,12 @@ pub fn place(
         if hidden {
             continue;
         }
+        let scale = if kind.scale.is_finite() && kind.scale > 0.0 {
+            kind.scale
+        } else {
+            1.0
+        };
+        let scale_mat = glam::Mat4::from_scale(glam::Vec3::splat(scale));
         let flies = !(kind.flight.speed == 0.0 && kind.flight.start_ahead == 0.0);
         // Something that doesn't fly rides the fighter until the move removes it; something
         // thrown later is held in the hand until it is.
@@ -826,7 +1272,7 @@ pub fn place(
                 glam::Mat4::from_rotation_translation(rotation, position)
             } else {
                 ride_bone(&bones, &kind.name)
-            };
+            } * scale_mat;
             placed.push(PlacedObject {
                 kind: kind.clone(),
                 spawned: *spawned,
@@ -860,7 +1306,7 @@ pub fn place(
             shot: *shot,
             hand: hand.clone(),
             age,
-            placement: glam::Mat4::from_rotation_translation(rotation, position),
+            placement: glam::Mat4::from_rotation_translation(rotation, position) * scale_mat,
         });
     }
     placed
@@ -1410,5 +1856,217 @@ mod object_effect_rotation_tests {
         let effects = super::object_effects_as_written(body);
         assert_eq!(effects[0].rotation, [-4.0, 80.0, 96.0]);
         assert_eq!(effects[0].offset, [0.0, 1.0, 2.0]);
+    }
+}
+
+#[cfg(test)]
+mod resolved_settings_preview_tests {
+    use super::*;
+    use crate::articles::params::{ParamBlock, ParamValue};
+    use crate::articles::settings::{Setting, SettingField, SettingValue};
+    use crate::data::{ArticleCall, ArticleOp, ArticleOrigin, ArticleTarget};
+
+    fn make_setting(field: SettingField, value: SettingValue, facing_factor: bool) -> Setting {
+        Setting {
+            field,
+            value,
+            status: "STATUS_FLY".into(),
+            phase: "Main".into(),
+            file: PathBuf::from("status.rs"),
+            span: 0..1,
+            facing_factor,
+            referenced_params: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn settings_override_params() {
+        let mut params = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        params
+            .fields
+            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        let base = flight_from_param_block(&params);
+        assert_eq!(base.speed, 1.0);
+
+        let settings = vec![
+            make_setting(
+                SettingField::SpeedX,
+                SettingValue::Const {
+                    name: "SHOT_SPEED".into(),
+                    value: Some(2.0),
+                },
+                true,
+            ),
+            make_setting(SettingField::Life, SettingValue::Literal(45.0), false),
+            make_setting(SettingField::Gravity, SettingValue::Literal(0.08), false),
+        ];
+        let resolved = base.with_settings(&settings, &params);
+        assert_eq!(resolved.speed, 2.0);
+        assert_eq!(resolved.life, 45.0);
+        assert!((resolved.gravity - 0.08).abs() < 1e-6);
+    }
+
+    #[test]
+    fn computed_keeps_params() {
+        let mut params = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        params
+            .fields
+            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        let base = flight_from_param_block(&params);
+        let settings = vec![make_setting(
+            SettingField::SpeedX,
+            SettingValue::Computed("lerp(1.0, 3.0, charge)".into()),
+            true,
+        )];
+        let resolved = base.with_settings(&settings, &params);
+        assert_eq!(resolved.speed, 1.0);
+    }
+
+    #[test]
+    fn scale_applies_to_placement() {
+        let scale_setting = Setting {
+            field: SettingField::Scale,
+            value: SettingValue::Literal(2.0),
+            facing_factor: false,
+            status: "regular".into(),
+            phase: "main".into(),
+            file: PathBuf::from("status.rs"),
+            span: 0..3,
+            referenced_params: Vec::new(),
+        };
+        let resolved_scale = scale_from_settings(&[scale_setting], &ParamBlock::default());
+        assert!((resolved_scale - 2.0).abs() < 1e-5);
+        let kind = Arc::new(ObjectKind {
+            scale: resolved_scale,
+            flight: Flight {
+                speed: 1.0,
+                life: 30.0,
+                ..Flight::default()
+            },
+            ..ObjectKind::default()
+        });
+        let spawn = Spawn {
+            kind,
+            spawned: 1,
+            ..Spawn::default()
+        };
+        let bones = |_: f32| HashMap::from([("top".to_owned(), glam::Mat4::IDENTITY)]);
+        let placed = place(&[spawn], 5.0, &bones);
+        assert_eq!(placed.len(), 1);
+        let bx = placed[0].placement.x_axis.truncate().length();
+        let by = placed[0].placement.y_axis.truncate().length();
+        let bz = placed[0].placement.z_axis.truncate().length();
+        assert!((bx - 2.0).abs() < 1e-5, "expected x basis length 2.0, got {bx}");
+        assert!((by - 2.0).abs() < 1e-5, "expected y basis length 2.0, got {by}");
+        assert!((bz - 2.0).abs() < 1e-5, "expected z basis length 2.0, got {bz}");
+    }
+
+    #[test]
+    fn source_script_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"latios\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            r#"
+unsafe extern "C" fn game_regular(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 14.0, 361, 80, 0, 40, 4.5, 0.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, true, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_elec"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_ELEC, *ATTACK_REGION_ENERGY);
+    }
+}
+
+pub fn install() {
+    smashline::Agent::new("samus_lativolt")
+        .game_acmd("game_regular", game_regular, smashline::Priority::Default)
+        .install();
+}
+"#,
+        )
+        .unwrap();
+        let index = crate::acmd_src::SourceIndex::build(root).expect("build index");
+        let dump_called = std::cell::Cell::new(false);
+        let dump_body = r#"unsafe extern "C" fn game_regular(agent: &mut L2CAgentBase) {
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("top"), 5.0, 361, 50, 0, 20, 2.0, 0.0, 0.0, 0.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, true, false, false, false, false, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_fire"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_FIRE, *ATTACK_REGION_NONE);
+    }
+}"#;
+        let kind = load_kind(
+            &root.join("fighter/samus"),
+            &root.join("fighter/samus/param/vl.prc"),
+            0,
+            "lativolt",
+            &HashMap::new(),
+            &|script_name| {
+                script_from_index_or_dump(
+                    Some(&index),
+                    "samus_lativolt",
+                    script_name,
+                    &|_| {
+                        dump_called.set(true);
+                        Some(dump_body.to_string())
+                    },
+                )
+            },
+        )
+        .expect("load_kind should build from source index script");
+        assert!(
+            !dump_called.get(),
+            "dump fallback must not be used when SourceIndex defines samus_lativolt game_regular"
+        );
+        assert_eq!(kind.hitboxes.len(), 1);
+        assert_eq!(kind.hitboxes[0].damage, 14.0);
+    }
+
+    #[test]
+    fn remove_all_removes_every_copy() {
+        let mk = |op: ArticleOp, target: ArticleTarget| ArticleCall {
+            op,
+            article: "*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL".into(),
+            args: Vec::new(),
+            target,
+            source: String::new(),
+            edited: false,
+            origin: ArticleOrigin::Script,
+        };
+        let c1 = mk(ArticleOp::Generate, ArticleTarget::None);
+        let c2 = mk(ArticleOp::Generate, ArticleTarget::None);
+        let rm = mk(ArticleOp::Remove, ArticleTarget::All);
+        let plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].spawned, 5);
+        assert_eq!(plans[0].removed, Some(20));
+        assert_eq!(plans[1].spawned, 12);
+        assert_eq!(plans[1].removed, Some(20));
+
+        // Also check Last vs First targeting.
+        let rm_last = mk(ArticleOp::Remove, ArticleTarget::Last);
+        let last_plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm_last)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(last_plans[0].removed, None);
+        assert_eq!(last_plans[1].removed, Some(20));
+
+        let rm_first = mk(ArticleOp::Remove, ArticleTarget::First);
+        let first_plans = plan_spawns_from_calls(
+            &[(5, &c1), (12, &c2), (20, &rm_first)],
+            &|call| article_name(&call.article),
+        );
+        assert_eq!(first_plans[0].removed, Some(20));
+        assert_eq!(first_plans[1].removed, None);
     }
 }
