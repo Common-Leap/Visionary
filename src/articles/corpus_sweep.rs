@@ -439,11 +439,12 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                 let first = line_of(&text, site.span.start);
                 let locals = let_bindings(body);
                 for (offset, line) in body.lines().enumerate() {
-                    if !line.contains("ArticleModule::") {
+                    // The rows the app lists: what `status_call_rows` reads from each line.
+                    let Some(read) = super::view::status_line_call(line) else {
                         continue;
-                    }
+                    };
                     let place = format!("`{}:{}`", short(&site.file), first + offset);
-                    let Some(call) = ArticleCall::parse(line) else {
+                    let Some(call) = read else {
                         out.status_unresolved.push(format!("{place} {agent} status: not a statement Visionary reads: `{}`", line.trim()));
                         continue;
                     };
