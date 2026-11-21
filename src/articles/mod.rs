@@ -209,7 +209,8 @@ impl ArticleCatalog {
     /// A vanilla id the game spells differently from the article's folder:
     /// `FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME` for `mario/model/hugeflame`, and the id an
     /// article uses for its owner's other articles, `WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET`
-    /// for `murabito/model/bullet`. Only the game's own articles (clones are bound by name), and
+    /// for `murabito/model/bullet`, and `FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON` for
+    /// `peach/motion/peachdaikon`. Only the game's own articles (clones are bound by name), and
     /// only when exactly one matches.
     fn by_vanilla_spelling(&self, ident: &str) -> Option<&Article> {
         let (head, name) = ident.split_once("_GENERATE_ARTICLE_")?;
@@ -219,7 +220,11 @@ impl ArticleCatalog {
             let owner = a.owner.to_uppercase();
             let owned = head == format!("FIGHTER_{owner}")
                 || head.strip_prefix(&format!("WEAPON_{owner}_")).is_some_and(|rest| !rest.is_empty());
-            owned && !matches!(a.origin, ArticleOrigin::Clone(_)) && squash(&a.name) == name
+            // The folder may also carry the owner's name: `peach/motion/peachdaikon`.
+            let folder = squash(&a.name);
+            owned
+                && !matches!(a.origin, ArticleOrigin::Clone(_))
+                && (folder == name || folder == format!("{}{name}", a.owner.to_lowercase()))
         });
         let first = found.next()?;
         found.next().is_none().then_some(first)
@@ -480,6 +485,11 @@ pub fn install() {
         assert_eq!(c.resolve_id("*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", &none).unwrap().name, "hugeflame");
         let c = named("murabito", "bullet");
         assert_eq!(c.resolve_id("*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).unwrap().name, "bullet");
+        // HDR-Standalone-Movesets · vendor/hdr/fighters/peach/src/acmd/specials.rs:379 spawns
+        // `*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON` (0x3); the dump's folder is `peachdaikon`.
+        let c = named("peach", "peachdaikon");
+        assert_eq!(c.resolve_id("*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON", &none).unwrap().name, "peachdaikon");
+        let c = named("murabito", "bullet");
         // Another fighter's id is not this fighter's article.
         assert!(c.resolve_id("*FIGHTER_SHIZUE_GENERATE_ARTICLE_BULLET", &none).is_none());
         assert!(c.resolve_id("*WEAPON_SHIZUE_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).is_none());
