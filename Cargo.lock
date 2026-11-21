@@ -1215,7 +1215,7 @@ dependencies = [
 [[package]]
 name = "eff_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/Common-Leap/eff_wgpu?rev=f304e6bc8b7f14cecb014028190011f548676492#f304e6bc8b7f14cecb014028190011f548676492"
+source = "git+https://github.com/Common-Leap/eff_wgpu?rev=910b235c8af5ebd3c70e34d5aeb74872dc83c2f3#910b235c8af5ebd3c70e34d5aeb74872dc83c2f3"
 dependencies = [
  "binrw 0.15.2",
  "bntx",
