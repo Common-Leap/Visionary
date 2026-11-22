@@ -161,49 +161,39 @@ struct Loop {
 /// 73 frames of particles, is gone, and the next charge level replaces it). So the effect is
 /// killed when the last timed emitter stops emitting, and no earlier than one particle life
 /// after the last running emitter starts, so every emitter shows; the loop ends when the last
-/// particle is gone. With no timed emitter at all it plays for 240 frames and restarts.
+/// particle is gone, every part played with that kill. With no timed emitter at all it plays
+/// for 240 frames and restarts.
 fn effect_loop(emitters: &[Emitter]) -> Loop {
     const CAP: usize = 240;
     let runs_on = |e: &Emitter| !e.data.emission.is_one_time;
-    let mut timed_end = None::<usize>;
-    let mut particles_end = 0;
-    for emitter in emitters.iter().filter(|e| !runs_on(e)) {
-        let emission = &emitter.data.emission;
-        let stops = emission.start as usize + emission.duration.max(1) as usize;
-        timed_end = Some(timed_end.unwrap_or(0).max(stops));
-        let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
-        for step in 1..=CAP {
-            s.step();
-            if s.count() > 0 {
-                particles_end = particles_end.max(step + 1);
-            }
-        }
-    }
-    let Some(timed_end) = timed_end else {
+    let Some(timed_end) = emitters
+        .iter()
+        .filter(|e| !runs_on(e))
+        .map(|e| e.data.emission.start as usize + e.data.emission.duration.max(1) as usize)
+        .max()
+    else {
         return Loop {
             length: CAP,
             kill: None,
         };
     };
-    if !emitters.iter().any(runs_on) {
-        return Loop {
-            length: particles_end.max(1),
-            kill: None,
-        };
-    }
-    let shown = emitters
-        .iter()
-        .filter(|e| runs_on(e))
-        .map(|e| e.data.emission.start as usize + e.data.particle_data.life.max(1) as usize)
-        .max()
-        .unwrap_or(0);
-    let kill = timed_end.max(shown).min(CAP);
-    // After the kill the running emitters stop and their particles live out their lives.
-    let mut length = kill.max(particles_end);
-    for emitter in emitters.iter().filter(|e| runs_on(e)) {
+    let kill = emitters.iter().any(runs_on).then(|| {
+        let shown = emitters
+            .iter()
+            .filter(|e| runs_on(e))
+            .map(|e| e.data.emission.start as usize + e.data.particle_data.life.max(1) as usize)
+            .max()
+            .unwrap_or(0);
+        timed_end.max(shown).min(CAP)
+    });
+    // Played as the view plays it: the kill reaches every part, timed ones too. Measured
+    // without it, a timed part can keep particles until one comes (Sephiroth's Fire1 bullet),
+    // which left the view empty for most of the loop.
+    let mut length = kill.unwrap_or(1);
+    for emitter in emitters {
         let mut s = sim::EmitterSim::new(&emitter.data, &emitter.fixed);
-        for step in 1..=CAP + kill {
-            if step > kill {
+        for step in 1..=CAP + kill.unwrap_or(0) {
+            if kill.is_some_and(|kill| step > kill) {
                 s.kill();
             }
             s.step();
@@ -212,17 +202,9 @@ fn effect_loop(emitters: &[Emitter]) -> Loop {
             }
         }
     }
-    // Every particle is gone one particle life after the kill, so the loop ends there. Measured
-    // without a kill, some parts keep particles until one comes (Sephiroth's Fire1 bullet), which
-    // held the loop at the cap with an empty view for 200 frames.
-    let longest_life = emitters
-        .iter()
-        .map(|e| e.data.particle_data.life.max(1) as usize)
-        .max()
-        .unwrap_or(0);
     Loop {
-        length: length.min(kill + CAP).min(kill + longest_life + 1),
-        kill: Some(kill),
+        length: length.min(kill.unwrap_or(0) + CAP),
+        kill,
     }
 }
 
@@ -1153,12 +1135,12 @@ mod tests {
         assert_eq!(alive(rays, period), 0, "{plan:?}");
     }
 
-    /// Sephiroth's Fire1 bullet played on its own was empty for about 200 of its 256 frames:
-    /// a never-stopping part kept invisible particles alive after the kill, so the loop ran to
-    /// the cap. It ends one particle life after the kill; the charge, timed throughout, keeps
-    /// its length.
+    /// Sephiroth's Fire1 bullet played on its own was empty for about 200 of its 256 frames,
+    /// then for about 30 of 68: its parts were measured without the kill the view plays them
+    /// with, so particles the kill ends counted as alive. It ends when the last particle is
+    /// gone; a set of only timed parts is never killed.
     #[test]
-    fn a_loop_ends_one_particle_life_after_the_kill() {
+    fn a_loop_ends_when_its_last_particle_is_gone() {
         let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
         else {
             eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
@@ -1179,7 +1161,8 @@ mod tests {
         };
         let bullet = named("P_EdgeFire1Bullet");
         assert!(bullet.kill.is_some(), "{bullet:?}");
-        assert!(bullet.length < 80, "{bullet:?}");
+        // Every part is out of particles by step 36 with the kill applied.
+        assert!(bullet.length <= 40, "{bullet:?}");
         // Only timed parts: the loop is as long as their particles last, as before.
         let timed = (0..sets.len())
             .find(|&at| {
