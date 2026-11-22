@@ -22089,6 +22089,19 @@ impl VisionaryApp {
             }
         }
 
+        // Every costume effect file must be listed for its costume, whoever wrote it: the game
+        // crashes when that costume is picked otherwise, so the mod is not built.
+        let mod_root = if developer {
+            dest.join("effect_mod")
+        } else {
+            dest.clone()
+        };
+        for file in crate::roster::costume_config::undeclared_costume_effects(&mod_root) {
+            errors.push(format!(
+                "{file} is not listed for its costume in config.json, so the game would crash when that costume is picked"
+            ));
+        }
+
         // 3. Mod-folder exports compile the generated plugin in the background and keep the NRO
         // inside that ARCropolis mod. Developer exports intentionally stop at editable source.
         let has_combined_runtime = combined_runtime.is_some();
@@ -38258,6 +38271,8 @@ fn run_export_preverified(
         .values()
         .chain(project.characters.values())
         .any(|fighter| fighter.eff.as_ref().is_some_and(|eff| !eff.is_empty()));
+    // A costume's own effect file loads only when the costume's directory entry lists it.
+    let mut costume_effects: Vec<String> = Vec::new();
     for (fighter, fm) in &project.fighters {
         match &fm.eff {
             Some(eff) if !eff.is_empty() => {
@@ -38265,6 +38280,18 @@ fn run_export_preverified(
                     .get(fighter)
                     .cloned()
                     .unwrap_or_else(|| eff_export_root.join(&eff.source_rel));
+                let rel_for = |slot: Option<u8>| match slot {
+                    None => eff.source_rel.clone(),
+                    Some(s) => {
+                        // effect/fighter/mario/ef_mario.eff → …/ef_mario_c0X.eff
+                        let p = std::path::Path::new(&eff.source_rel);
+                        let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("ef");
+                        let file = format!("{stem}_c{s:02}.eff");
+                        p.parent()
+                            .map(|d| d.join(&file).to_string_lossy().replace('\\', "/"))
+                            .unwrap_or(file)
+                    }
+                };
                 let write_variant = |slot: Option<u8>| -> anyhow::Result<()> {
                     let bytes = std::fs::read(&src_path)?;
                     let rebuilt = crate::eff_export::rebuild_eff_bytes_for_slot(
@@ -38273,18 +38300,7 @@ fn run_export_preverified(
                         Some(eff_export_root),
                         slot,
                     )?;
-                    let rel = match slot {
-                        None => eff.source_rel.clone(),
-                        Some(s) => {
-                            // effect/fighter/mario/ef_mario.eff → …/ef_mario_c0X.eff
-                            let p = std::path::Path::new(&eff.source_rel);
-                            let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("ef");
-                            let file = format!("{stem}_c{s:02}.eff");
-                            p.parent()
-                                .map(|d| d.join(&file).to_string_lossy().replace('\\', "/"))
-                                .unwrap_or(file)
-                        }
-                    };
+                    let rel = rel_for(slot);
                     let out = mod_dir.join(&rel);
                     if let Some(parent) = out.parent() {
                         std::fs::create_dir_all(parent)?;
@@ -38311,9 +38327,12 @@ fn run_export_preverified(
                 slots.sort();
                 slots.dedup();
                 for s in &slots {
-                    if let Err(e) = write_variant(Some(*s)) {
-                        errors.push(format!("{fighter} eff c{s:02}: {e}"));
-                        ok = false;
+                    match write_variant(Some(*s)) {
+                        Ok(()) => costume_effects.push(rel_for(Some(*s))),
+                        Err(e) => {
+                            errors.push(format!("{fighter} eff c{s:02}: {e}"));
+                            ok = false;
+                        }
                     }
                 }
                 if ok {
@@ -38339,6 +38358,11 @@ fn run_export_preverified(
             _ => report.push(format!(
                 "{fighter}: no authored eff edits — spawn/live edits ship via the plugin"
             )),
+        }
+    }
+    if !costume_effects.is_empty() {
+        if let Err(error) = declare_costume_effects(&mod_dir, &costume_effects) {
+            errors.push(format!("config.json: {error}"));
         }
     }
     // A made character's effects: its own file rebuilt with its edits, written as the file of
@@ -38496,6 +38520,29 @@ fn run_export_preverified(
         built_source_root,
         has_source,
     })
+}
+
+/// List each costume effect file (paths from `mod_dir`) in the costume's directory entry of
+/// the mod's `config.json`, keeping whatever the config already says. One-Slot Effects panics
+/// when a costume with its own effect file is picked and the entry does not list it.
+fn declare_costume_effects(mod_dir: &std::path::Path, files: &[String]) -> anyhow::Result<()> {
+    let path = mod_dir.join("config.json");
+    let mut config = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(_) => serde_json::json!({}),
+    };
+    for file in files {
+        if let Some((fighter, costume)) = crate::roster::costume_config::costume_effect_of(file) {
+            crate::roster::costume_config::declare(
+                &mut config,
+                &fighter,
+                costume,
+                std::slice::from_ref(file),
+            );
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(())
 }
 
 // ── Persistent config ─────────────────────────────────────────────────────────
@@ -48133,6 +48180,53 @@ mod blocked_export_writes_nothing_tests {
             assert_eq!(std::fs::read(dest.join("sentinel")).unwrap(), b"unchanged");
             assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 1);
         }
+    }
+
+    /// A borrowed effect scoped to one costume is written as that costume's own file, and the
+    /// export lists it for the costume in config.json: without the entry the game panics when
+    /// the costume is picked. The same folder without the entry is flagged, so the check can
+    /// fail.
+    #[test]
+    fn a_costume_effect_file_is_listed_for_its_costume() {
+        let Some(root) = corpus_root() else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the folder holding effect/");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = ModProjectFile::default();
+        project.fighters.entry("bayonetta".into()).or_default().eff = Some(EffMod {
+            source_rel: "effect/fighter/bayonetta/ef_bayonetta.eff".into(),
+            transplants: vec![crate::mod_project::TransplantOp {
+                new_entry_name: "mario_fb_shoot_for_bayonetta_afterburner_line2".into(),
+                src_file_rel: "effect/fighter/mario/ef_mario.eff".into(),
+                src_set_name: "mario_fb_shoot".into(),
+                src_set_idx: 0,
+                one_slot_slots: vec![1],
+                replace_entry: Some("bayonetta_afterburner_line2".into()),
+            }],
+            ..Default::default()
+        });
+        let dest = dir.path().join("mod");
+        let mut input = inputs(&dest, &dir.path().join("source"));
+        input.eff_export_root = root;
+        let outcome =
+            run_export_preverified(&project, &input, None, false, None, Vec::new()).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let costume = "effect/fighter/bayonetta/ef_bayonetta_c01.eff";
+        assert!(dest.join(costume).is_file());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dest.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["new-dir-files"]["fighter/bayonetta/c01"],
+            serde_json::json!([costume])
+        );
+        assert!(crate::roster::costume_config::undeclared_costume_effects(&dest).is_empty());
+
+        std::fs::remove_file(dest.join("config.json")).unwrap();
+        assert_eq!(
+            crate::roster::costume_config::undeclared_costume_effects(&dest),
+            [costume]
+        );
     }
 
     fn selected_chart_project() -> (ModProjectFile, crate::mod_export::SelectedGimmickRuntime) {

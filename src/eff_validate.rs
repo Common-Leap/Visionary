@@ -1809,8 +1809,9 @@ mod tests {
         );
     }
 
-    /// Every effect file under `VISIONARY_VALIDATE_DIR` (an exported mod's folder) passes: the
-    /// check an export runs, for a folder written without the editor's file dialog.
+    /// Every effect file under `VISIONARY_VALIDATE_DIR` (an exported mod's folder) passes and
+    /// every costume effect file is listed for its costume: the checks an export runs, for a
+    /// folder written without the editor's file dialog.
     #[test]
     fn a_folders_effect_files_pass() {
         let Some(root) = std::env::var_os("VISIONARY_VALIDATE_DIR").map(std::path::PathBuf::from)
@@ -1831,6 +1832,11 @@ mod tests {
         let mut files = Vec::new();
         walk(&root, &mut files);
         assert!(!files.is_empty(), "no effect files in {}", root.display());
+        let unlisted = crate::roster::costume_config::undeclared_costume_effects(&root);
+        assert!(
+            unlisted.is_empty(),
+            "costume effect files not listed in config.json: {unlisted:?}"
+        );
         for path in &files {
             let bytes = std::fs::read(path).unwrap();
             let found = problems(&bytes);
