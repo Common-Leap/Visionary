@@ -642,13 +642,6 @@ fn emission() -> Vec<Attr> {
         ),
         fb!(
             G_EMISSION,
-            "emission.is_world_gravity",
-            "World gravity",
-            "Whether to apply gravity in world coordinates",
-            emission.is_world_gravity
-        ),
-        fb!(
-            G_EMISSION,
             "emission.is_emit_dist_enabled",
             "Distance emission",
             "Whether to use distance emission",
@@ -1856,6 +1849,15 @@ fn rotation_and_motion() -> Vec<Attr> {
             0.01,
             emitter_static.gravity_scale
         ),
+        // res+0x7f1, the flag the preview's gravity reads (eff_wgpu sim.rs, move_particles).
+        fb!(
+            G_MOTION,
+            "emission.is_world_gravity",
+            "Gravity pulls along the world's axes",
+            "On: gravity pulls along the stage's axes, down stays down however the effect is \
+             turned. Off: it pulls along the part's own axes and turns with the effect.",
+            emission.is_world_gravity
+        ),
         fl!(
             G_MOTION,
             "emitter_static.air_res",
@@ -1868,7 +1870,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_MOTION,
             "emitter_static.center_x",
             "Centre X",
-            "Particle centre",
+            "Stored with the part. What it changes has not been worked out yet.",
             0.01,
             emitter_static.center_x
         ),
@@ -1876,7 +1878,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_MOTION,
             "emitter_static.center_y",
             "Centre Y",
-            "Particle centre",
+            "Stored with the part. What it changes has not been worked out yet.",
             0.01,
             emitter_static.center_y
         ),
@@ -1884,7 +1886,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_MOTION,
             "emitter_static.offset",
             "Offset",
-            "Particle offset",
+            "Stored with the part. What it changes has not been worked out yet.",
             0.01,
             emitter_static.offset
         ),
@@ -1892,7 +1894,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_MOTION,
             "emitter_static.add_vel_to_scale",
             "Add velocity to scale",
-            "Add velocity to scale",
+            "Stored with the part. What it changes has not been worked out yet.",
             0.01,
             emitter_static.add_vel_to_scale
         ),
@@ -3096,6 +3098,11 @@ mod tests {
             Some("Movement")
         );
         assert_eq!(section_of("emitter_static.gravity_scale"), Some("Movement"));
+        // The flag the preview's gravity reads sits with the gravity it turns.
+        assert_eq!(
+            section_of("emission.is_world_gravity"),
+            section_of("emitter_static.gravity_scale")
+        );
         assert_eq!(section_of("particle_data.billboard_type"), Some("Drawing"));
         assert_eq!(section_of("particle_data.life"), Some("Where and when"));
         assert_eq!(section_of("render_state.blend_type"), Some("Drawing"));

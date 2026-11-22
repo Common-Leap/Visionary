@@ -3301,6 +3301,14 @@ fn call_sig(c: &crate::data::EffectCall) -> (u64, u64, u64, u32, u64) {
 /// the source/effect IR and remains a visible, source-backed row, but it has no viewport marker
 /// because drawing one would fabricate geometry. A flip with a real alternate graphic is still a
 /// meaningful visual spawn and therefore is not treated as a sentinel.
+/// The effect a click on its timeline bar opens on the Effects page: none for a control line or
+/// the empty `null` spawn, or when it is the one already open.
+fn timeline_effect_to_open(call: &crate::data::EffectCall, open: Option<&str>) -> Option<String> {
+    let opens = call.control.is_none() && !is_null_effect_sentinel(call);
+    let already = open.is_some_and(|open| open.eq_ignore_ascii_case(&call.effect_name));
+    (opens && !already).then(|| call.effect_name.clone())
+}
+
 fn is_null_effect_sentinel(call: &crate::data::EffectCall) -> bool {
     call.control.is_none()
         && call.color.is_none()
@@ -33200,6 +33208,16 @@ impl VisionaryApp {
             TimelineSelection::Effect(index) => {
                 self.state.selected_effect_call = Some(*index);
                 self.primary_tab = PrimaryEditorTab::Effects;
+                // On the Effects page a bar opens its effect for editing, in whichever file
+                // holds it.
+                if self.eff_editor.open {
+                    let name = self.state.effects.get(*index).and_then(|call| {
+                        timeline_effect_to_open(call, self.eff_editor.selected_entry_name())
+                    });
+                    if let Some(name) = name {
+                        self.open_effect_for_editing(&name);
+                    }
+                }
             }
             TimelineSelection::Command { family, site } => {
                 self.selected_command = Some((family.clone(), *site));
@@ -33492,10 +33510,32 @@ impl VisionaryApp {
                             Color32::from_rgba_unmultiplied(255, 255, 255, 5),
                         );
                     }
+                    // Effects from the shared file say so: an edit to one reaches every
+                    // fighter.
+                    let shared = effects_page
+                        && match &row.selection {
+                            TimelineSelection::Effect(i) => {
+                                self.state.effects.get(*i).is_some_and(|call| {
+                                    crate::eff_editor::is_shared_effect(&call.effect_name)
+                                })
+                            }
+                            _ => false,
+                        };
+                    let mut label_right = grid_left - 2.0;
+                    if shared {
+                        let tag = painter.text(
+                            egui::pos2(grid_left - 4.0, y + row_height * 0.5),
+                            egui::Align2::RIGHT_CENTER,
+                            "shared",
+                            egui::FontId::proportional(9.0),
+                            crate::eff_editor::SHARED_TINT,
+                        );
+                        label_right = tag.left() - 3.0;
+                    }
                     painter
                         .with_clip_rect(egui::Rect::from_min_max(
                             egui::pos2(rect.left(), y),
-                            egui::pos2(grid_left - 2.0, y + row_height),
+                            egui::pos2(label_right, y + row_height),
                         ))
                         .text(
                             egui::pos2(rect.left() + 4.0, y + row_height * 0.5),
@@ -33549,6 +33589,36 @@ impl VisionaryApp {
                     ],
                     egui::Stroke::new(2.0, Color32::WHITE),
                 );
+                // On the Effects page an effect row says which file it is in, as clicking it
+                // opens it there.
+                let hovered = response
+                    .hover_pos()
+                    .filter(|pos| effects_page && pos.y >= rect.top() + 22.0)
+                    .and_then(|pos| rows.get(((pos.y - rect.top() - 22.0) / row_height) as usize))
+                    .and_then(|row| match &row.selection {
+                        TimelineSelection::Effect(i) => self.state.effects.get(*i),
+                        _ => None,
+                    })
+                    .filter(|call| call.control.is_none() && !is_null_effect_sentinel(call));
+                let response = match hovered {
+                    Some(call) => {
+                        let shown = effect_words(&effect_call_display_name(call));
+                        let text = if crate::eff_editor::is_shared_effect(&call.effect_name) {
+                            format!(
+                                "{shown} ({})\n{}\nClick to edit it",
+                                call.effect_name,
+                                crate::eff_editor::SHARED_EFFECT_NOTE
+                            )
+                        } else {
+                            format!(
+                                "{shown} ({}), in this fighter's effects\nClick to edit it",
+                                call.effect_name
+                            )
+                        };
+                        response.on_hover_text_at_pointer(text)
+                    }
+                    None => response,
+                };
                 if response.dragged() || response.clicked() {
                     if let Some(pos) = response.interact_pointer_pos() {
                         // A row is picked by its name or its bar; anywhere else scrubs.
@@ -34312,7 +34382,11 @@ impl eframe::App for VisionaryApp {
                     };
                     crate::eff_editor::EditSource {
                         fighter: f.clone(),
-                        label: self.character_name(&crate::character::CharacterKey::parse(f)),
+                        label: if f == "common" {
+                            "Shared effects".to_owned()
+                        } else {
+                            self.character_name(&crate::character::CharacterKey::parse(f))
+                        },
                         base,
                         alt_base,
                         merged,
@@ -34373,6 +34447,22 @@ impl eframe::App for VisionaryApp {
             open_move.map(|m| crate::move_kinds::plain_name(&m.name)),
             open_move.map(|m| m.name.clone()),
         );
+        // What the open move spawns and when: the list puts its first effect up when the move
+        // is picked, and lists the move's shared effects.
+        let move_effects = if open_move.is_some() {
+            self.state
+                .effects
+                .iter()
+                .filter(|call| call.control.is_none() && !is_null_effect_sentinel(call))
+                .map(|call| (call.effect_name.to_ascii_lowercase(), call.active_start))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.eff_editor.set_open_move_effects(move_effects);
+        if let Some(name) = self.eff_editor.open_effect_request.take() {
+            self.open_effect_for_editing(&name);
+        }
         // The Effects page's own character and move pickers: every fighter and the characters
         // made on it, each opening its own effect file.
         let made_count = self.roster.project.authored.len();
@@ -48717,6 +48807,30 @@ mod spawn_random_range_tests {
     use super::spawn_with_random_ranges;
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    /// A bar on the Effects page's timeline opens its effect, shared ones included, unless it is
+    /// already open; a null spawn opens nothing.
+    #[test]
+    fn a_timeline_bar_opens_its_effect() {
+        let flame = call(None);
+        assert_eq!(
+            super::timeline_effect_to_open(&flame, Some("mario_fb_shoot")),
+            Some("sys_flame".to_owned())
+        );
+        assert_eq!(
+            super::timeline_effect_to_open(&flame, None),
+            Some("sys_flame".to_owned())
+        );
+        assert_eq!(
+            super::timeline_effect_to_open(&flame, Some("SYS_FLAME")),
+            None
+        );
+        let mut null = call(None);
+        null.effect_name = "null".into();
+        assert_eq!(super::timeline_effect_to_open(&null, None), None);
+        assert!(crate::eff_editor::is_shared_effect(&flame.effect_name));
+        assert!(!crate::eff_editor::is_shared_effect("mario_fb_shoot"));
+    }
 
     fn call(extra: Option<&[&str]>) -> crate::data::EffectCall {
         crate::data::EffectCall {

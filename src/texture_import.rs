@@ -29,6 +29,8 @@ pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
     pub mipmaps: u32,
+    /// How many pictures the texture stacks (an array texture), 1 for a flat one.
+    pub layers: u32,
     /// Format name as `bntx` calls it, e.g. `BC7Srgb` — shown verbatim in the UI.
     pub format: String,
     /// Whether this texture's format can be decoded to a PNG and encoded back.
@@ -113,6 +115,7 @@ pub fn describe(pool: &[u8], index: usize, _name: &str) -> Result<TextureDesc> {
         width: le_u32(pool, brti + 0x24)?,
         height: le_u32(pool, brti + 0x28)?,
         mipmaps: le_u16(pool, brti + 0x16)? as u32,
+        layers: le_u32(pool, brti + 0x30)?.max(1),
         format: match format {
             Some(f) => format!("{f:?}"),
             None => format!("unknown ({format_code:#06x})"),

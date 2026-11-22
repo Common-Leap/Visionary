@@ -80,6 +80,10 @@ pub struct TextureInfo {
     /// Zero when the pool's BNTX could not be read for this entry.
     pub width: u32,
     pub height: u32,
+    /// How many pictures the texture stacks, 1 for a flat texture. A part samples a stacked
+    /// texture through a different kind of texture view, so the two do not stand in for each
+    /// other.
+    pub layers: u32,
     /// Surface format as `bntx` names it, e.g. `BC7Srgb`; empty when unreadable.
     pub format: String,
     /// Whether this texture can be exported to a PNG and replaced by one.
@@ -264,6 +268,7 @@ fn convert_ptcl(source: &effect_library::PtclFile) -> PtclFile {
                 id: Some(texture.id),
                 width: described.as_ref().map(|d| d.width).unwrap_or(0),
                 height: described.as_ref().map(|d| d.height).unwrap_or(0),
+                layers: described.as_ref().map(|d| d.layers).unwrap_or(1),
                 format: described
                     .as_ref()
                     .map(|d| d.format.clone())

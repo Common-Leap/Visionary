@@ -29,10 +29,25 @@ pub(crate) fn search_field(ui: &mut Ui, id: &str, query: &mut String, hint: &str
 /// A colour: the picker, its colour code (`#FF8800`), and R G B numbers for exact values. The
 /// numbers go above 1 as the game's do (`LAST_EFFECT_SET_COLOR(agent, 0.25, 1.3, 2.5)` is an
 /// over-bright blue); the picker and the code show such a colour at its brightest.
+///
+/// The numbers are the game's own, which it draws in linear light. The swatch and the picker show
+/// them as the screen does, in sRGB, and the code is in that same space, so a code typed from a
+/// palette is the colour the swatch shows.
 pub(crate) fn colour_field(
     ui: &mut Ui,
     id: impl std::hash::Hash + std::fmt::Debug,
     rgb: &mut [f32; 3],
+) -> bool {
+    colour_field_with(ui, id, rgb, true)
+}
+
+/// [`colour_field`], without the R G B numbers when `numbers` is false: they move to the code's
+/// hover, for a narrow panel.
+pub(crate) fn colour_field_with(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    rgb: &mut [f32; 3],
+    numbers: bool,
 ) -> bool {
     let mut changed = false;
     let id = ui.make_persistent_id(id);
@@ -53,7 +68,14 @@ pub(crate) fn colour_field(
                 .font(egui::TextStyle::Monospace)
                 .desired_width(76.0),
         )
-        .on_hover_text("Colour code, like #FF8800");
+        .on_hover_text(if numbers {
+            "Colour code, like #FF8800".to_owned()
+        } else {
+            format!(
+                "Colour code, like #FF8800\nR {:.3}  G {:.3}  B {:.3}",
+                rgb[0], rgb[1], rgb[2]
+            )
+        });
     if response.has_focus() {
         if response.changed() {
             if let Some(code) = parse_colour_code(&text) {
@@ -64,6 +86,9 @@ pub(crate) fn colour_field(
         ui.data_mut(|d| d.insert_temp(id, text));
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
+    }
+    if !numbers {
+        return changed;
     }
     for (value, name) in rgb.iter_mut().zip(["R ", "G ", "B "]) {
         changed |= ui
@@ -79,13 +104,13 @@ pub(crate) fn colour_field(
     changed
 }
 
-/// `#RRGGBB` for a colour, each channel at most 1.
+/// `#RRGGBB` for a linear colour, in sRGB as the swatch shows it, each channel at most 1.
 pub(crate) fn colour_code(rgb: [f32; 3]) -> String {
-    let [r, g, b] = rgb.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let [r, g, b] = rgb.map(egui::ecolor::gamma_u8_from_linear_f32);
     format!("#{r:02X}{g:02X}{b:02X}")
 }
 
-/// Reads `#RRGGBB`, `RRGGBB` or `#RGB`.
+/// Reads `#RRGGBB`, `RRGGBB` or `#RGB` as sRGB, giving the linear colour the game takes.
 pub(crate) fn parse_colour_code(text: &str) -> Option<[f32; 3]> {
     let hex = text.trim().trim_start_matches('#');
     let hex: String = match hex.len() {
@@ -94,7 +119,7 @@ pub(crate) fn parse_colour_code(text: &str) -> Option<[f32; 3]> {
         _ => return None,
     };
     let channel = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
-    Some([channel(0)?, channel(2)?, channel(4)?].map(|v| v as f32 / 255.0))
+    Some([channel(0)?, channel(2)?, channel(4)?].map(egui::ecolor::linear_f32_from_gamma_u8))
 }
 
 /// One choice in a [`picker`].
@@ -408,14 +433,33 @@ mod colour_code_tests {
 
     #[test]
     fn colour_codes_read_and_write() {
-        assert_eq!(colour_code([1.0, 0.5333, 0.0]), "#FF8800");
+        assert_eq!(colour_code([1.0, 0.0, 0.0]), "#FF0000");
         assert_eq!(colour_code([2.5, -1.0, 0.0]), "#FF0000");
-        assert_eq!(
-            parse_colour_code("#ff8800"),
-            Some([1.0, 136.0 / 255.0, 0.0])
-        );
-        assert_eq!(parse_colour_code("f80"), Some([1.0, 136.0 / 255.0, 0.0]));
+        assert_eq!(parse_colour_code("#ff0000"), Some([1.0, 0.0, 0.0]));
+        assert_eq!(parse_colour_code("f00"), Some([1.0, 0.0, 0.0]));
         assert_eq!(parse_colour_code("#ff88"), None);
         assert_eq!(parse_colour_code("#gg8800"), None);
+    }
+
+    /// Mario's Fb shoot, Flare 1, first key: the code read #C61300 (the stored numbers times
+    /// 255) beside a swatch and picker showing R 228 G 77 B 0.
+    #[test]
+    fn the_colour_code_is_the_colour_the_swatch_shows() {
+        let stored = [198.0 / 255.0, 19.0 / 255.0, 0.0];
+        let swatch = egui::Color32::from(egui::Rgba::from_rgb(stored[0], stored[1], stored[2]));
+        assert_eq!((swatch.r(), swatch.g(), swatch.b()), (228, 77, 0));
+        assert_eq!(colour_code(stored), "#E44D00");
+        // A typed code comes back as the same code, and as the colour the swatch shows.
+        let typed = parse_colour_code("#E44D00").unwrap();
+        assert_eq!(colour_code(typed), "#E44D00");
+        assert!(typed.iter().zip(stored).all(|(a, b)| (a - b).abs() < 0.005));
+        // The stored numbers are never rewritten through the code: only typing one sets them.
+        let mut rgb = [1.3, 0.25, 0.0];
+        let before = rgb;
+        let ctx = egui::Context::default();
+        let _ = ctx.run_test_ui(Default::default(), |ui| {
+            colour_field(ui, "test", &mut rgb);
+        });
+        assert_eq!(rgb, before);
     }
 }
