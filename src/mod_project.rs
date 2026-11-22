@@ -1005,6 +1005,31 @@ pub struct EffMod {
 }
 
 impl EffMod {
+    /// How many effects differ from the file: a part's values or texture, the part list, or the
+    /// timing. Counted by effect name, so an effect with all three is one.
+    pub fn changed_effects(&self) -> usize {
+        let name = |entry: &str, set: &str| {
+            if entry.is_empty() {
+                format!("set:{set}")
+            } else {
+                entry.to_lowercase()
+            }
+        };
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        names.extend(
+            self.authored
+                .iter()
+                .map(|e| name(&e.entry_name, &e.set_name)),
+        );
+        names.extend(
+            self.rosters
+                .iter()
+                .map(|r| name(&r.entry_name, &r.set_name)),
+        );
+        names.extend(self.entry_edits.iter().map(|e| e.entry_name.to_lowercase()));
+        names.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.authored.is_empty()
             && self.transplants.is_empty()
@@ -1342,6 +1367,40 @@ pub fn fighter_from_source_rel(source_rel: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Edited chip counts effects, whatever changed in them, once each: a part list or a
+    /// timing change alone counts, and an effect with every kind of change is one.
+    #[test]
+    fn changed_effects_count_each_effect_once() {
+        let edit = |entry: &str| AuthoredEdit {
+            set_name: format!("P_{entry}"),
+            entry_name: entry.into(),
+            set_idx: 0,
+            emitter_name: "em0".into(),
+            emitter_idx: 0,
+            fields: Default::default(),
+        };
+        let roster = |entry: &str| EmitterRoster {
+            set_name: format!("P_{entry}"),
+            entry_name: entry.into(),
+            set_idx: 0,
+            slots: Vec::new(),
+        };
+        let timing = |entry: &str| EntryEdit {
+            entry_name: entry.into(),
+            emitter_set: None,
+            variants: None,
+            model: None,
+        };
+        let eff = EffMod {
+            authored: vec![edit("a"), edit("a"), edit("b")],
+            rosters: vec![roster("b"), roster("c")],
+            entry_edits: vec![timing("a"), timing("d")],
+            ..Default::default()
+        };
+        assert_eq!(eff.changed_effects(), 4);
+        assert_eq!(EffMod::default().changed_effects(), 0);
+    }
     use crate::data::{EffectCall, EffectCallOp};
 
     /// A `modproject.json` exactly as builds before the transplant/one-slot rename wrote it:

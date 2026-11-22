@@ -379,7 +379,8 @@ pub struct EditSource {
     pub alt_base: Option<PathBuf>,
     pub merged: Option<PathBuf>,
     pub transplant_count: usize,
-    pub authored: usize,
+    /// How many effects differ from the file, by [`crate::mod_project::EffMod::changed_effects`].
+    pub changed_effects: usize,
     /// How many of this eff's pool textures the user has replaced with their own image.
     pub textures: usize,
     pub transplants: Vec<EffTransplant>,
@@ -408,6 +409,8 @@ pub struct EffTransplantRemoval {
 /// they were before an edit.
 #[derive(Clone)]
 struct EffHistoryStep {
+    /// What the step changed, for the Undo and Redo hovers: "Brightness in Afterburner line".
+    label: String,
     set_idx: usize,
     selected_entry: Option<usize>,
     selected_emitter: usize,
@@ -430,7 +433,15 @@ struct EffHistory {
     seen_rev: u64,
     undo: Vec<EffHistoryStep>,
     redo: Vec<EffHistoryStep>,
+    /// The name the open step gets when it closes, for edits better named by their button than
+    /// by the first value they changed (a reset changes them all).
+    next_label: Option<String>,
+    /// Why the steps were dropped, until the next step: the Undo hover says so.
+    cleared: Option<&'static str>,
 }
+
+/// The most files whose history is kept while another is open.
+const HISTORY_FILES: usize = 8;
 
 /// How long the edits of one step may pause before the step closes.
 const HISTORY_STEP_GAP: std::time::Duration = std::time::Duration::from_millis(500);
@@ -546,6 +557,8 @@ pub struct EffEditor {
     move_filter: String,
     /// List only the effects the open move plays.
     only_open_move: bool,
+    /// The user turned that off: picking a move leaves it off until they turn it on.
+    only_open_move_declined: bool,
     /// A move just picked in the header: once it is open, show one of its effects in it.
     show_in_picked_move: Option<String>,
     /// The open move's motion name, to know whether it plays the selected effect.
@@ -632,6 +645,9 @@ pub struct EffEditor {
     last_sent_note: Option<String>,
     /// Undo and redo for effect edits on this page.
     history: EffHistory,
+    /// The history of each file opened before, with the file's fingerprint when it was put
+    /// aside (see [`Self::file_fingerprint`]).
+    history_store: Vec<(PathBuf, u64, EffHistory)>,
 }
 
 impl Default for EffEditor {
@@ -685,6 +701,7 @@ impl Default for EffEditor {
             texture_filter: String::new(),
             move_filter: String::new(),
             only_open_move: false,
+            only_open_move_declined: false,
             show_in_picked_move: None,
             open_motion: None,
             entry_filter: String::new(),
@@ -718,6 +735,7 @@ impl Default for EffEditor {
             deploy_defer: false,
             last_sent_note: None,
             history: EffHistory::default(),
+            history_store: Vec::new(),
         }
     }
 }
@@ -746,6 +764,77 @@ fn scan_eff_files(root: &Path, out: &mut Vec<PathBuf>) {
 
 fn diff(a: f32, b: f32) -> bool {
     (a - b).abs() > 1e-3
+}
+
+/// Whether a set's part list is the file's: the same parts, in the same order and nesting, under
+/// the same names. A set that fails this is what a roster records.
+fn part_list_untouched(emitters: &[EmitterDef], pristine: &[EmitterSnapshot]) -> bool {
+    emitters.len() == pristine.len()
+        && emitters.iter().enumerate().all(|(i, em)| {
+            em.source_idx == i
+                && pristine
+                    .get(i)
+                    .is_some_and(|p| p.depth == em.depth && p.name == em.name)
+        })
+}
+
+/// How wide a row of small buttons with these labels is.
+fn small_buttons_width(ui: &Ui, labels: &[&str]) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let spacing = ui.spacing();
+    labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+                + 2.0 * spacing.button_padding.x
+        })
+        .sum::<f32>()
+        + spacing.item_spacing.x * (labels.len() + 1) as f32
+}
+
+/// The line a part's hover gets when it was copied in or moved.
+fn part_place_note(moved: bool, source_idx: usize) -> String {
+    if moved {
+        format!("\nCopied or moved from part {} in the game", source_idx + 1)
+    } else {
+        String::new()
+    }
+}
+
+/// Which parts of a list were added or moved, from where each came from in the file and
+/// whether it is a copy (a copy is always given a name of its own).
+///
+/// A copy is always marked. Of the rest, the parts left in place are the longest run whose
+/// file positions still rise; every other part was moved. On a tie the later part counts as in
+/// place, so the part that was dragged up above another is the one marked, not the one it
+/// passed.
+fn added_or_moved(parts: &[(usize, bool)]) -> Vec<bool> {
+    let n = parts.len();
+    let mut run = vec![0usize; n];
+    let mut prev: Vec<Option<usize>> = vec![None; n];
+    for i in 0..n {
+        if parts[i].1 {
+            continue;
+        }
+        run[i] = 1;
+        for j in 0..i {
+            if run[j] > 0 && parts[j].0 < parts[i].0 && run[j] + 1 >= run[i] {
+                run[i] = run[j] + 1;
+                prev[i] = Some(j);
+            }
+        }
+    }
+    let mut moved = vec![true; n];
+    // `max_by_key` keeps the last of equal keys: the latest part ending a longest run.
+    let mut at = (0..n).filter(|&i| run[i] > 0).max_by_key(|&i| run[i]);
+    while let Some(i) = at {
+        moved[i] = false;
+        at = prev[i];
+    }
+    moved
 }
 
 /// Which authored fields of ONE emitter differ from its pristine snapshot, as the
@@ -916,9 +1005,38 @@ fn unique_emitter_name(base: &str, existing: &[EmitterDef]) -> String {
 /// an effect edit almost always starts from; every one of them is also in its own group below.
 const BASIC_ATTRS: &[&str] = &[
     "emitter_static.color_scale",
+    "render_state.blend_type",
     "emission.rate",
     "particle_data.life",
 ];
+
+/// The two speeds a particle starts with, which the Look tab's Speed row scales together: out
+/// from where it starts, and along the part's direction.
+const SPEED_ATTRS: [&str; 2] = [
+    "particle_velocity.all_direction",
+    "particle_velocity.designated_dir_scale",
+];
+
+/// The speed the Speed row shows: the larger of the two, as that is the one you see.
+fn shown_speed(speeds: [f32; 2]) -> f32 {
+    if speeds[1].abs() > speeds[0].abs() {
+        speeds[1]
+    } else {
+        speeds[0]
+    }
+}
+
+/// Both speeds set so the shown one is `to`, keeping their ratio. From zero, the outward speed
+/// takes the new value: a part that did not move gets particles flying out.
+fn scaled_speeds(speeds: [f32; 2], to: f32) -> [f32; 2] {
+    let from = shown_speed(speeds);
+    if from.abs() < 1e-6 {
+        [to, speeds[1]]
+    } else {
+        let ratio = to / from;
+        [speeds[0] * ratio, speeds[1] * ratio]
+    }
+}
 
 /// The area a part's particles start in, X Y Z.
 const SPREAD_ATTRS: [&str; 3] = [
@@ -1345,7 +1463,7 @@ fn attr_grid_rows(
                 if edited
                     && ui
                         .small_button("↺")
-                        .on_hover_text("Reset to the file's value")
+                        .on_hover_text("Reset to the game's value")
                         .clicked()
                 {
                     em.attrs[i] = Some(orig);
@@ -1383,6 +1501,31 @@ fn unused_texture_groups(em: &EmitterDef) -> Vec<&'static str> {
         .collect()
 }
 
+/// Words a settings search also looks for: people search by what they want ("speed", "count"),
+/// and the rows are named by what they are ("Outward speed", "Particles per frame").
+const FILTER_SYNONYMS: &[&[&str]] = &[
+    &["speed", "velocity", "fast", "slow"],
+    &["count", "amount", "number", "particles per frame"],
+    &["size", "scale", "bigger", "smaller"],
+    &["colour", "color", "tint"],
+    &["opacity", "alpha", "transparen", "fade"],
+    &["glow", "blend", "additive"],
+    &["life", "lifetime", "how long"],
+    &["spin", "rotat"],
+];
+
+/// The search's own text, and the words it stands for.
+fn filter_terms(needle: &str) -> Vec<String> {
+    let mut terms = vec![needle.to_owned()];
+    for group in FILTER_SYNONYMS {
+        if group.contains(&needle) {
+            terms.extend(group.iter().map(|w| w.to_string()));
+        }
+    }
+    terms.dedup();
+    terms
+}
+
 /// The whole emitter, one collapsible group per section of the format.
 ///
 /// Three hundred rows is more than anyone wants to scroll, so the groups start collapsed and the
@@ -1395,6 +1538,7 @@ fn draw_attribute_groups(
     pr: &EmitterSnapshot,
     filter: &mut String,
     textures: &[TextureInfo],
+    part: egui::Id,
 ) -> bool {
     let table = crate::eff_attrs::table();
     ui.horizontal(|ui| {
@@ -1409,13 +1553,16 @@ fn draw_attribute_groups(
         }
     });
 
-    let needle = filter.to_lowercase();
+    let needle = filter.trim().to_lowercase();
+    let terms = filter_terms(&needle);
     let matches = |a: &crate::eff_attrs::Attr| {
         needle.is_empty()
-            || a.label.to_lowercase().contains(&needle)
-            || a.id.to_lowercase().contains(&needle)
-            || a.doc.to_lowercase().contains(&needle)
-            || a.group.to_lowercase().contains(&needle)
+            || terms.iter().any(|term| {
+                a.label.to_lowercase().contains(term)
+                    || a.id.to_lowercase().contains(term)
+                    || a.doc.to_lowercase().contains(term)
+                    || a.group.to_lowercase().contains(term)
+            })
     };
 
     // Each group's rows and how many of them are edited. An attribute the emitter does not carry
@@ -1461,6 +1608,10 @@ fn draw_attribute_groups(
             egui::RichText::new(format!("{name}  ({rows})"))
         }
     };
+    // A header is open or closed for every part alike, so one opened stays open while parts are
+    // compared. A header with an edit in it opens by itself, and is this part's own: shared, the
+    // first edited part opened it for every part after it.
+    let salt = |edited: usize| (edited > 0).then_some(part);
     let totals = |list: &[&(&str, Vec<usize>, usize)]| {
         list.iter().fold((0, 0), |(rows, edited), (_, r, e)| {
             (rows + r.len(), edited + e)
@@ -1470,7 +1621,7 @@ fn draw_attribute_groups(
         // A filter opens every group holding a match: `default_open` alone only applied the
         // first time a group was seen, so groups closed before stayed closed.
         egui::CollapsingHeader::new(heading(shown, rows.len(), edited))
-            .id_salt(group)
+            .id_salt((group, salt(edited)))
             .default_open(edited > 0)
             .open(filtering.then_some(true))
             .show(ui, |ui| {
@@ -1492,94 +1643,98 @@ fn draw_attribute_groups(
         .iter()
         .map(|(name, members)| (*name, members.to_vec()))
         .chain((!other.is_empty()).then_some(("Other", other)));
-    for (section, members) in sections {
-        // In the section's own order: where the table lists them put a colour group eight
-        // headers from its "over life" partner.
-        let present: Vec<&(&str, Vec<usize>, usize)> = members
-            .iter()
-            .filter_map(|member| groups.iter().find(|(group, _, _)| group == member))
-            .collect();
-        if present.is_empty() {
-            continue;
-        }
-        let (rows, edited) = totals(&present);
-        egui::CollapsingHeader::new(heading(section, rows, edited).strong())
-            .id_salt(("attr_section", section))
-            .default_open(edited > 0)
-            .open(filtering.then_some(true))
-            .show(ui, |ui| {
-                let by_slot = present
-                    .iter()
-                    .any(|(group, _, _)| crate::eff_attrs::texture_slot_of(group).is_some());
-                if !by_slot {
-                    for (group, rows, edited) in &present {
-                        draw_group(ui, group, group, rows, *edited);
+    // The filter opens every header holding a match. Under its own ids, so clearing the filter
+    // leaves each header as it was before the search, not open for every part from then on.
+    ui.push_id(("attr_tree", filtering), |ui| {
+        for (section, members) in sections {
+            // In the section's own order: where the table lists them put a colour group eight
+            // headers from its "over life" partner.
+            let present: Vec<&(&str, Vec<usize>, usize)> = members
+                .iter()
+                .filter_map(|member| groups.iter().find(|(group, _, _)| group == member))
+                .collect();
+            if present.is_empty() {
+                continue;
+            }
+            let (rows, edited) = totals(&present);
+            egui::CollapsingHeader::new(heading(section, rows, edited).strong())
+                .id_salt(("attr_section", section, salt(edited)))
+                .default_open(edited > 0)
+                .open(filtering.then_some(true))
+                .show(ui, |ui| {
+                    let by_slot = present
+                        .iter()
+                        .any(|(group, _, _)| crate::eff_attrs::texture_slot_of(group).is_some());
+                    if !by_slot {
+                        for (group, rows, edited) in &present {
+                            draw_group(ui, group, group, rows, *edited);
+                        }
+                        return;
                     }
-                    return;
-                }
-                // One header per texture slot, each holding that slot's groups.
-                for slot in 0..3 {
-                    let slot_groups: Vec<&(&str, Vec<usize>, usize)> = present
+                    // One header per texture slot, each holding that slot's groups.
+                    for slot in 0..3 {
+                        let slot_groups: Vec<&(&str, Vec<usize>, usize)> = present
+                            .iter()
+                            .copied()
+                            .filter(|(group, _, _)| {
+                                crate::eff_attrs::texture_slot_of(group) == Some(slot)
+                                    && !unused.contains(group)
+                            })
+                            .collect();
+                        if slot_groups.is_empty() {
+                            continue;
+                        }
+                        let (rows, edited) = totals(&slot_groups);
+                        let title = format!("Texture {}", slot + 1);
+                        egui::CollapsingHeader::new(heading(&title, rows, edited))
+                            .id_salt(("attr_texture_slot", slot, salt(edited)))
+                            .default_open(edited > 0)
+                            .open(filtering.then_some(true))
+                            .show(ui, |ui| {
+                                for (group, rows, edited) in &slot_groups {
+                                    // "Texture 2 sampling" reads "Sampling" under "Texture 2".
+                                    let shown = group
+                                        .strip_prefix(title.as_str())
+                                        .map(str::trim)
+                                        .map(|rest| {
+                                            let mut chars = rest.chars();
+                                            chars
+                                                .next()
+                                                .map(|c| c.to_uppercase().chain(chars).collect())
+                                                .unwrap_or_default()
+                                        })
+                                        .filter(|rest: &String| !rest.is_empty())
+                                        .unwrap_or_else(|| group.to_string());
+                                    draw_group(ui, group, &shown, rows, *edited);
+                                }
+                            });
+                    }
+                    let spare: Vec<&(&str, Vec<usize>, usize)> = present
                         .iter()
                         .copied()
-                        .filter(|(group, _, _)| {
-                            crate::eff_attrs::texture_slot_of(group) == Some(slot)
-                                && !unused.contains(group)
-                        })
+                        .filter(|(group, _, _)| unused.contains(group))
                         .collect();
-                    if slot_groups.is_empty() {
-                        continue;
+                    if spare.is_empty() {
+                        return;
                     }
-                    let (rows, edited) = totals(&slot_groups);
-                    let title = format!("Texture {}", slot + 1);
-                    egui::CollapsingHeader::new(heading(&title, rows, edited))
-                        .id_salt(("attr_texture_slot", slot))
+                    let (rows, edited) = totals(&spare);
+                    egui::CollapsingHeader::new(heading("Unused texture slots", rows, edited))
+                        .id_salt(("unused_texture_slots", salt(edited)))
                         .default_open(edited > 0)
                         .open(filtering.then_some(true))
                         .show(ui, |ui| {
-                            for (group, rows, edited) in &slot_groups {
-                                // "Texture 2 sampling" reads "Sampling" under "Texture 2".
-                                let shown = group
-                                    .strip_prefix(title.as_str())
-                                    .map(str::trim)
-                                    .map(|rest| {
-                                        let mut chars = rest.chars();
-                                        chars
-                                            .next()
-                                            .map(|c| c.to_uppercase().chain(chars).collect())
-                                            .unwrap_or_default()
-                                    })
-                                    .filter(|rest: &String| !rest.is_empty())
-                                    .unwrap_or_else(|| group.to_string());
-                                draw_group(ui, group, &shown, rows, *edited);
+                            for (group, rows, edited) in &spare {
+                                draw_group(ui, group, group, rows, *edited);
                             }
-                        });
-                }
-                let spare: Vec<&(&str, Vec<usize>, usize)> = present
-                    .iter()
-                    .copied()
-                    .filter(|(group, _, _)| unused.contains(group))
-                    .collect();
-                if spare.is_empty() {
-                    return;
-                }
-                let (rows, edited) = totals(&spare);
-                egui::CollapsingHeader::new(heading("Unused texture slots", rows, edited))
-                    .id_salt("unused_texture_slots")
-                    .default_open(edited > 0)
-                    .open(filtering.then_some(true))
-                    .show(ui, |ui| {
-                        for (group, rows, edited) in &spare {
-                            draw_group(ui, group, group, rows, *edited);
-                        }
-                    })
-                    .header_response
-                    .on_hover_text(
-                        "The settings of texture slots this part samples no texture through. \
-                         They are kept as the file has them.",
-                    );
-            });
-    }
+                        })
+                        .header_response
+                        .on_hover_text(
+                            "The settings of texture slots this part samples no texture through. \
+                             They are kept as the file has them.",
+                        );
+                });
+        }
+    });
     if !needle.is_empty() && !changed {
         // A filter that matches nothing is otherwise indistinguishable from every group being
         // collapsed.
@@ -1619,8 +1774,10 @@ impl EffEditor {
     fn load_eff(&mut self, path: &Path) {
         self.remember_picks();
         self.edit_rev += 1;
-        // A step holds emitters of the file it was taken in, by position.
-        self.history = EffHistory::default();
+        // A step holds emitters of the file it was taken in, by position: it is kept with that
+        // file and comes back when the file does.
+        self.history_close_step();
+        self.stash_history();
         self.load_error = None;
         self.ptcl = None;
         self.pristine.clear();
@@ -1688,6 +1845,7 @@ impl EffEditor {
         self.texture_pool = loaded.texture_pool;
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
+        self.restore_history(path);
         // The queued edits for it, if any, are applied right after this.
         self.working_stale = false;
         // Back on a file: the effect and part that were open in it are again.
@@ -1865,6 +2023,9 @@ impl EffEditor {
         // What is open was loaded for the project before: its diff is not this one's. It
         // loads again, and the app hands it the new project's edits for it.
         self.working_stale = true;
+        // Another project's steps would put its edits into this one.
+        self.history = EffHistory::default();
+        self.history_store.clear();
         if self.pending_load.is_none() {
             self.pending_load = self.loaded_path.clone();
         }
@@ -1962,8 +2123,7 @@ impl EffEditor {
     fn adopt_appended_texture(&mut self, pool: Vec<u8>, info: TextureInfo) {
         self.texture_pool = Some(pool);
         self.texture_pool_gen += 1;
-        // A step's texture numbers point into the pool as it was.
-        self.history = EffHistory::default();
+        // An appended texture leaves every texture number the steps hold where it was.
         let Some(ptcl) = self.ptcl.as_mut() else {
             return;
         };
@@ -2060,14 +2220,7 @@ impl EffEditor {
         };
         let mut out = Vec::new();
         for (set_idx, (set, pristine)) in ptcl.emitter_sets.iter().zip(&self.pristine).enumerate() {
-            let untouched = set.emitters.len() == pristine.len()
-                && set.emitters.iter().enumerate().all(|(i, em)| {
-                    em.source_idx == i
-                        && pristine
-                            .get(i)
-                            .is_some_and(|p| p.depth == em.depth && p.name == em.name)
-                });
-            if untouched {
+            if part_list_untouched(&set.emitters, pristine) {
                 continue;
             }
             out.push(crate::mod_project::EmitterRoster {
@@ -2597,10 +2750,12 @@ impl EffEditor {
             .zip(&self.pristine)
             .enumerate()
             .filter(|(_, (set, pristine))| {
-                set.emitters
-                    .iter()
-                    .zip(pristine.iter())
-                    .any(|(e, p)| !field_edits(e, p, &tex_names).is_empty())
+                !part_list_untouched(&set.emitters, pristine)
+                    || set.emitters.iter().any(|e| {
+                        pristine
+                            .get(e.source_idx)
+                            .is_none_or(|p| !field_edits(e, p, &tex_names).is_empty())
+                    })
             })
             .map(|(index, _)| index)
             .collect()
@@ -2629,7 +2784,185 @@ impl EffEditor {
             .collect()
     }
 
+    /// The parts of a set that were copied in or moved, by position in the list.
+    fn moved_parts(&self, set_idx: usize) -> Vec<bool> {
+        let Some(set) = self.ptcl.as_ref().and_then(|p| p.emitter_sets.get(set_idx)) else {
+            return Vec::new();
+        };
+        let pristine = self.pristine.get(set_idx).map_or(&[][..], |p| p);
+        let parts: Vec<(usize, bool)> = set
+            .emitters
+            .iter()
+            .map(|e| {
+                let copy = pristine.get(e.source_idx).is_none_or(|p| p.name != e.name);
+                (e.source_idx, copy)
+            })
+            .collect();
+        added_or_moved(&parts)
+    }
+
+    /// Whether an effect's timing (its extra parts, their frames, its model) differs from the
+    /// file's.
+    fn entry_timing_edited(&self, entry_name: &str) -> bool {
+        let now = self.entry_info.iter().find(|e| e.name == entry_name);
+        let was = self.entry_pristine.iter().find(|e| e.name == entry_name);
+        now != was
+    }
+
+    /// The effects in the list that differ from the game, by position: a part's values, the
+    /// part list, or the effect's timing.
+    fn edited_entries(&self) -> Vec<bool> {
+        let edited_sets = self.edited_sets();
+        self.entries
+            .iter()
+            .map(|e| edited_sets.contains(&e.set_idx) || self.entry_timing_edited(&e.name))
+            .collect()
+    }
+
     // ── History ─────────────────────────────────────────────────────────────────
+
+    /// What a file's steps depend on: its effects, their parts and its textures, as loaded. A
+    /// step holds parts by position, so a file that loads with another list (a borrow, a
+    /// texture deleted) must not get its old steps back.
+    fn file_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.loaded_is_merged.hash(&mut h);
+        if let Some(ptcl) = &self.ptcl {
+            for set in &ptcl.emitter_sets {
+                set.name.hash(&mut h);
+            }
+            for texture in &ptcl.bntx_textures {
+                texture.tex_name.hash(&mut h);
+            }
+        }
+        for set in &self.pristine {
+            set.len().hash(&mut h);
+            for part in set {
+                part.name.hash(&mut h);
+            }
+        }
+        for entry in &self.entry_pristine {
+            entry.name.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// Put the open file's history aside, to come back when the file does.
+    fn stash_history(&mut self) {
+        let mut history = std::mem::take(&mut self.history);
+        let (Some(path), Some(_)) = (self.loaded_path.clone(), self.ptcl.as_ref()) else {
+            return;
+        };
+        if history.undo.is_empty() && history.redo.is_empty() {
+            return;
+        }
+        let key = self.file_fingerprint();
+        self.history_store.retain(|(p, _, _)| *p != path);
+        history.baseline = None;
+        history.open_since = None;
+        history.cleared = None;
+        self.history_store.push((path, key, history));
+        if self.history_store.len() > HISTORY_FILES {
+            self.history_store.remove(0);
+        }
+    }
+
+    /// Take back the history `path` had, when the file is still the one it was taken in.
+    fn restore_history(&mut self, path: &Path) {
+        let key = self.file_fingerprint();
+        if let Some(at) = self.history_store.iter().position(|(p, _, _)| p == path) {
+            let (_, was, history) = self.history_store.remove(at);
+            if was == key {
+                self.history = history;
+            } else {
+                self.history.cleared = Some("the file's effects or textures changed");
+            }
+        }
+    }
+
+    /// Drop every step of the open file, saying why in the Undo hover.
+    fn clear_history(&mut self, why: &'static str) {
+        let had = !self.history.undo.is_empty() || !self.history.redo.is_empty();
+        self.history = EffHistory {
+            cleared: had.then_some(why),
+            ..Default::default()
+        };
+    }
+
+    /// What changed between two states of one set, in words, with the effect it is in.
+    fn step_label(&self, before: &EffHistoryStep, after: &EffHistoryStep) -> String {
+        let table = crate::eff_attrs::table();
+        let parts_same = before.emitters.len() == after.emitters.len()
+            && before.emitters.iter().zip(&after.emitters).all(|(a, b)| {
+                a.source_idx == b.source_idx && a.name == b.name && a.depth == b.depth
+            });
+        let what = if !parts_same {
+            "the part list".to_owned()
+        } else if let Some((a, b)) = before
+            .emitters
+            .iter()
+            .zip(&after.emitters)
+            .find(|(a, b)| a != b)
+        {
+            if let Some(i) =
+                (0..a.attrs.len().min(b.attrs.len())).find(|&i| a.attrs[i] != b.attrs[i])
+            {
+                table.get(i).map(|t| t.label.to_owned()).unwrap_or_default()
+            } else if a.color0 != b.color0 || a.color1 != b.color1 {
+                "Colour".to_owned()
+            } else if a.alpha0_keys != b.alpha0_keys {
+                "Opacity".to_owned()
+            } else if a.texture_index != b.texture_index {
+                "Texture".to_owned()
+            } else {
+                "Animation".to_owned()
+            }
+        } else if before.entry_info != after.entry_info {
+            "timing".to_owned()
+        } else {
+            "an edit".to_owned()
+        };
+        let effect = before
+            .selected_entry
+            .filter(|i| {
+                self.entries
+                    .get(*i)
+                    .is_some_and(|e| e.set_idx == before.set_idx)
+            })
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| e.set_idx == before.set_idx)
+            })
+            .and_then(|i| entry_list_names(&self.entries).get(i).cloned());
+        match effect {
+            Some(effect) => format!("{what} in {effect}"),
+            None => what,
+        }
+    }
+
+    /// What Undo would undo now, in words.
+    fn undo_label(&self) -> Option<String> {
+        if self.history.open_since.is_some() {
+            let before = self.history.baseline.as_ref()?;
+            let now = self.history_capture_set(before.set_idx)?;
+            return Some(
+                self.history
+                    .next_label
+                    .clone()
+                    .unwrap_or_else(|| self.step_label(before, &now)),
+            );
+        }
+        self.history.undo.last().map(|step| step.label.clone())
+    }
+
+    fn redo_label(&self) -> Option<String> {
+        if self.history.open_since.is_some() {
+            return None;
+        }
+        self.history.redo.last().map(|step| step.label.clone())
+    }
 
     /// The selected effect's set as it is now, to keep as a step.
     fn history_capture(&self) -> Option<EffHistoryStep> {
@@ -2640,6 +2973,7 @@ impl EffEditor {
     fn history_capture_set(&self, set_idx: usize) -> Option<EffHistoryStep> {
         let set = self.ptcl.as_ref()?.emitter_sets.get(set_idx)?;
         Some(EffHistoryStep {
+            label: String::new(),
             set_idx,
             selected_entry: self.selected_entry,
             selected_emitter: self.selected_emitter,
@@ -2653,14 +2987,31 @@ impl EffEditor {
         if self.history.open_since.take().is_none() {
             return;
         }
-        if let Some(before) = self.history.baseline.take() {
-            self.history.undo.push(before);
-            if self.history.undo.len() > HISTORY_LIMIT {
-                self.history.undo.remove(0);
+        let now = self.history_capture();
+        if let Some(mut before) = self.history.baseline.take() {
+            // An edit that changed nothing (a value typed back to what it was) is no step.
+            let same = now.as_ref().is_some_and(|now| {
+                now.set_idx == before.set_idx
+                    && now.emitters == before.emitters
+                    && now.entry_info == before.entry_info
+            });
+            if !same {
+                before.label = self
+                    .history
+                    .next_label
+                    .take()
+                    .or_else(|| now.as_ref().map(|now| self.step_label(&before, now)))
+                    .unwrap_or_default();
+                self.history.undo.push(before);
+                if self.history.undo.len() > HISTORY_LIMIT {
+                    self.history.undo.remove(0);
+                }
+                self.history.redo.clear();
+                self.history.cleared = None;
             }
-            self.history.redo.clear();
         }
-        self.history.baseline = self.history_capture();
+        self.history.next_label = None;
+        self.history.baseline = now;
     }
 
     /// Runs before the page draws: closes a finished step, and keeps the baseline on the
@@ -2727,6 +3078,7 @@ impl EffEditor {
     /// Put `step` back, returning the state it replaced.
     fn history_restore(&mut self, step: EffHistoryStep) -> Option<EffHistoryStep> {
         let mut replaced = self.history_capture_set(step.set_idx)?;
+        replaced.label = step.label.clone();
         // The step being undone was made with this selection; the redo step returns to it.
         replaced.selected_entry = step.selected_entry;
         replaced.selected_emitter = step.selected_emitter;
@@ -2746,8 +3098,10 @@ impl EffEditor {
         Some(replaced)
     }
 
-    /// Put every part of the effect in `set_idx` back as the game has it.
-    fn reset_set_fields(&mut self, set_idx: usize) {
+    /// Put the effect `entry_name` playing set `set_idx` back as the game has it: every part's
+    /// values, the part list (copies gone, removed parts back, the file's order) and the
+    /// effect's timing.
+    fn reset_effect(&mut self, set_idx: usize, entry_name: &str) {
         let (Some(ptcl), Some(pristine_set)) = (self.ptcl.as_mut(), self.pristine.get(set_idx))
         else {
             return;
@@ -2755,12 +3109,49 @@ impl EffEditor {
         let Some(set) = ptcl.emitter_sets.get_mut(set_idx) else {
             return;
         };
-        for e in set.emitters.iter_mut() {
-            if let Some(p) = pristine_set.get(e.source_idx) {
-                p.restore(e);
-            }
+        set.emitters = pristine_set
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.to_def(i))
+            .collect();
+        let was = self
+            .entry_pristine
+            .iter()
+            .find(|e| e.name == entry_name)
+            .cloned();
+        if let (Some(now), Some(was)) = (
+            self.entry_info.iter_mut().find(|e| e.name == entry_name),
+            was,
+        ) {
+            *now = was;
         }
+        self.clamp_selected_emitter(set_idx);
         touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+    }
+
+    /// Whether the effect differs from the game in anything Reset effect puts back.
+    fn effect_edited(&self, set_idx: usize, entry_name: &str) -> bool {
+        self.edited_sets().contains(&set_idx) || self.entry_timing_edited(entry_name)
+    }
+
+    /// "Reset Flare 1 in Afterburner line blue", for the Undo hover.
+    fn reset_part_label(&self, set_idx: usize, part: usize) -> String {
+        let part_name = self
+            .ptcl
+            .as_ref()
+            .and_then(|p| p.emitter_sets.get(set_idx))
+            .and_then(|set| {
+                let names: Vec<&str> = set.emitters.iter().map(|e| e.name.as_str()).collect();
+                part_list_names(&names).get(part).cloned()
+            })
+            .unwrap_or_else(|| "part".to_owned());
+        let effect = self
+            .selected_entry
+            .and_then(|i| entry_list_names(&self.entries).get(i).cloned());
+        match effect {
+            Some(effect) => format!("Reset {part_name} in {effect}"),
+            None => format!("Reset {part_name}"),
+        }
     }
 
     /// Put one part of the effect in `set_idx` back as the game has it.
@@ -3307,7 +3698,7 @@ impl EffEditor {
                     }
                     if let Some(motion) = picked {
                         self.move_filter.clear();
-                        self.only_open_move = true;
+                        self.only_open_move = self.only_in_move_on_pick(&motion);
                         if self.open_motion.as_deref() != Some(motion.as_str()) {
                             self.open_move_request = Some(motion.clone());
                         }
@@ -3473,11 +3864,11 @@ impl EffEditor {
                 if src.transplant_count > 0 {
                     badges.push(format!("{} borrowed", src.transplant_count));
                 }
-                if src.authored > 0 {
-                    // One stored edit per part: the effect list counts effects, this counts parts.
-                    badges.push(match src.authored {
-                        1 => "1 part changed".to_owned(),
-                        n => format!("{n} parts changed"),
+                if src.changed_effects > 0 {
+                    // Effects, as the list's "N edited" counts them.
+                    badges.push(match src.changed_effects {
+                        1 => "1 effect changed".to_owned(),
+                        n => format!("{n} effects changed"),
                     });
                 }
                 if src.textures > 0 {
@@ -3530,13 +3921,20 @@ impl EffEditor {
         }
     }
 
+    /// Whether picking `motion` turns on "Only in <move>": when the move plays one of this
+    /// file's effects, and the user has not turned the filter off.
+    fn only_in_move_on_pick(&self, motion: &str) -> bool {
+        !self.only_open_move_declined
+            && self.entries.iter().any(|entry| {
+                self.effect_uses
+                    .get(&entry.hash)
+                    .is_some_and(|moves| moves.iter().any(|m| m.motion.as_deref() == Some(motion)))
+            })
+    }
+
     fn draw_entry_list(&mut self, ui: &mut Ui, link: &GameLink) {
-        let edited_sets = self.edited_sets();
-        let edited_entries = self
-            .entries
-            .iter()
-            .filter(|e| edited_sets.contains(&e.set_idx))
-            .count();
+        let edited_flags = self.edited_entries();
+        let edited_entries = edited_flags.iter().filter(|e| **e).count();
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("Effects in this file ({})", self.entries.len()))
@@ -3564,11 +3962,16 @@ impl EffEditor {
         {
             let count = self.entries.iter().filter(|e| self.in_open_move(e)).count();
             ui.horizontal(|ui| {
-                ui.toggle_value(
-                    &mut self.only_open_move,
-                    format!("Only in {open_move} ({count})"),
-                )
-                .on_hover_text("List only the effects this move plays");
+                if ui
+                    .toggle_value(
+                        &mut self.only_open_move,
+                        format!("Only in {open_move} ({count})"),
+                    )
+                    .on_hover_text("List only the effects this move plays")
+                    .changed()
+                {
+                    self.only_open_move_declined = !self.only_open_move;
+                }
             });
         }
         let only_move = self.only_open_move && self.open_motion.is_some();
@@ -3599,7 +4002,7 @@ impl EffEditor {
                         moves.iter().any(|m| m.motion.as_deref() == open_motion)
                     })
                 };
-                let matches = |(i, entry): (usize, &EffEntry)| {
+                let strict = |(i, entry): (usize, &EffEntry)| {
                     (!only_move || in_move(entry))
                         && (filter.is_empty()
                             || entry.name.to_lowercase().contains(&filter)
@@ -3610,7 +4013,13 @@ impl EffEditor {
                                     .any(|m| m.label.to_lowercase().contains(&filter))
                             }))
                 };
-                if !self.entries.is_empty() && !self.entries.iter().enumerate().any(&matches) {
+                // The open effect stays listed, so a search or a move never hides what is being
+                // edited.
+                let selected_entry = self.selected_entry;
+                let matches = |(i, entry): (usize, &EffEntry)| {
+                    selected_entry == Some(i) || strict((i, entry))
+                };
+                if !self.entries.is_empty() && !self.entries.iter().enumerate().any(&strict) {
                     ui.weak(if only_move {
                         "This move plays none of this file's effects"
                     } else {
@@ -3642,7 +4051,7 @@ impl EffEditor {
                         // the one thing you need to find again after scrolling away.
                         let text = egui::RichText::new(&shown_names[i]);
                         let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
-                        let text = if edited_sets.contains(&entry.set_idx) {
+                        let text = if edited_flags[i] {
                             text.color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
                         } else if unused && !selected {
                             // Grey on the selection's blue did not read.
@@ -3665,7 +4074,7 @@ impl EffEditor {
                                     .to_owned(),
                                 None => "Reading the moves…".to_owned(),
                             };
-                            let edited = if edited_sets.contains(&entry.set_idx) {
+                            let edited = if edited_flags[i] {
                                 "\nHas unsent changes"
                             } else {
                                 ""
@@ -3745,6 +4154,7 @@ impl EffEditor {
         // mutable borrow below, which is what makes it usable while the fields are drawn.
         let edited: std::collections::HashSet<usize> =
             self.edited_emitters(set_idx).into_iter().collect();
+        let moved = self.moved_parts(set_idx);
 
         self.clamp_selected_emitter(set_idx);
 
@@ -3760,6 +4170,7 @@ impl EffEditor {
             .cloned()
             .unwrap_or_else(|| entry_name.clone());
         let mut reset_entry = false;
+        let effect_edited = self.effect_edited(set_idx, &entry_name);
         // Some(true) to undo, Some(false) to redo.
         let mut history = None;
         // Wraps in a narrow panel: a long effect name widened the panel past its edge.
@@ -3782,23 +4193,49 @@ impl EffEditor {
                 .color(egui::Color32::LIGHT_GRAY),
             );
             reset_entry = ui
-                .small_button("Reset effect")
-                .on_hover_text("Put every part of this effect back as the game has it")
+                .add_enabled(effect_edited, egui::Button::new("Reset effect").small())
+                .on_hover_text(
+                    "Put this effect back as the game has it: every part's values, the part \
+                     list and its timing",
+                )
+                .on_disabled_hover_text("This effect is as the game has it")
                 .clicked();
-            // Kept together when the row wraps.
+            // Kept together when the row wraps. A row nested in a wrapping one cannot wrap by
+            // itself: it ran past a narrow panel's edge and widened everything under it.
+            if ui.available_size_before_wrap().x < small_buttons_width(ui, &["Undo", "Redo"]) {
+                ui.end_row();
+            }
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.can_undo(), egui::Button::new("Undo").small())
-                    .on_hover_text("Undo the last effect edit (Ctrl+Z)")
-                    .clicked()
-                {
+                let cleared = self
+                    .history
+                    .cleared
+                    .map(|why| format!("Undo history cleared: {why}"));
+                let undo = ui.add_enabled(self.can_undo(), egui::Button::new("Undo").small());
+                let undo = match (undo.contains_pointer(), undo.enabled()) {
+                    (true, true) => undo.on_hover_text(format!(
+                        "Undo {} (Ctrl+Z)",
+                        self.undo_label().unwrap_or_default()
+                    )),
+                    (true, false) => undo.on_disabled_hover_text(
+                        cleared
+                            .clone()
+                            .unwrap_or_else(|| "Nothing to undo".to_owned()),
+                    ),
+                    _ => undo,
+                };
+                if undo.clicked() {
                     history = Some(true);
                 }
-                if ui
-                    .add_enabled(self.can_redo(), egui::Button::new("Redo").small())
-                    .on_hover_text("Redo the last undone effect edit (Ctrl+Shift+Z)")
-                    .clicked()
-                {
+                let redo = ui.add_enabled(self.can_redo(), egui::Button::new("Redo").small());
+                let redo = match (redo.contains_pointer(), redo.enabled()) {
+                    (true, true) => redo.on_hover_text(format!(
+                        "Redo {} (Ctrl+Shift+Z)",
+                        self.redo_label().unwrap_or_default()
+                    )),
+                    (true, false) => redo.on_disabled_hover_text("Nothing to redo"),
+                    _ => redo,
+                };
+                if redo.clicked() {
                     history = Some(false);
                 }
             });
@@ -3869,7 +4306,8 @@ impl EffEditor {
         // Before the tab branch: the button is on both tabs.
         if reset_entry {
             self.history_close_step();
-            self.reset_set_fields(set_idx);
+            self.reset_effect(set_idx, &entry_name);
+            self.history.next_label = Some(format!("Reset effect in {shown_name}"));
         }
         // Drawn before the borrows below, because it edits the emitter LIST and the entry's
         // header rather than one emitter's fields.
@@ -3898,7 +4336,8 @@ impl EffEditor {
         ui.horizontal_wrapped(|ui| {
             for (i, em) in set.emitters.iter().enumerate() {
                 let name = &part_names[i];
-                let text = if edited.contains(&i) {
+                let moved = moved.get(i).copied().unwrap_or(false);
+                let text = if edited.contains(&i) || moved {
                     egui::RichText::new(format!("{name} •"))
                         .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
                 } else {
@@ -3907,8 +4346,9 @@ impl EffEditor {
                 if ui
                     .selectable_label(self.selected_emitter == i, text)
                     .on_hover_text(format!(
-                        "{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
-                        em.name
+                        "{}{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
+                        em.name,
+                        part_place_note(moved, em.source_idx),
                     ))
                     .clicked()
                 {
@@ -3988,6 +4428,39 @@ impl EffEditor {
                             if (was - attr_f32(em, particle_scale[0])).abs() > 1e-6 {
                                 ui.label(
                                     egui::RichText::new(format!("was {was:.3}"))
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                        // How fast the particles go: both starting speeds together, as the
+                        // preview moves them.
+                        if SPEED_ATTRS.iter().all(|id| attr(em, id).is_some()) {
+                            ui.label("Speed").on_hover_text(
+                                "How fast the particles fly. Scales Outward speed and Speed \
+                                 along direction together; both are under Movement.",
+                            );
+                            let speeds = SPEED_ATTRS.map(|id| attr_f32(em, id));
+                            let mut v = shown_speed(speeds);
+                            if ui.add(egui::DragValue::new(&mut v).speed(0.01)).changed() {
+                                for (id, value) in SPEED_ATTRS.iter().zip(scaled_speeds(speeds, v))
+                                {
+                                    set_attr(em, id, AttrValue::Float(value));
+                                }
+                                changed = true;
+                            }
+                            let was = SPEED_ATTRS.map(|id| {
+                                crate::eff_attrs::index_of(id)
+                                    .and_then(|at| pr.attrs.get(at).copied().flatten())
+                                    .map(|v| v.as_f32())
+                                    .unwrap_or(0.0)
+                            });
+                            if was.iter().zip(&speeds).any(|(a, b)| (a - b).abs() > 1e-6) {
+                                ui.label(
+                                    egui::RichText::new(format!("was {:.3}", shown_speed(was)))
                                         .small()
                                         .color(egui::Color32::GRAY),
                                 );
@@ -4153,7 +4626,15 @@ impl EffEditor {
                 };
 
                 ui.add_space(6.0);
-                if ui.small_button("Reset this part").clicked() {
+                if ui
+                    .add_enabled(
+                        edited.contains(&ei),
+                        egui::Button::new("Reset this part").small(),
+                    )
+                    .on_hover_text("Put this part's values back as the game has them")
+                    .on_disabled_hover_text("This part has the game's values")
+                    .clicked()
+                {
                     reset_part = true;
                 }
 
@@ -4164,8 +4645,9 @@ impl EffEditor {
 
                 ui.add_space(10.0);
                 ui.separator();
+                let part = egui::Id::unique((self.loaded_path.clone(), set_idx, em.source_idx));
                 let attributes_changed =
-                    draw_attribute_groups(ui, em, pr, &mut self.attr_filter, &textures);
+                    draw_attribute_groups(ui, em, pr, &mut self.attr_filter, &textures, part);
                 if attributes_changed {
                     attrs_to_effective_keys(em);
                     changed = true;
@@ -4187,6 +4669,7 @@ impl EffEditor {
             // A reset is a step of its own, never part of the edit just before it.
             self.history_close_step();
             self.reset_part_fields(set_idx, ei);
+            self.history.next_label = Some(self.reset_part_label(set_idx, ei));
         }
     }
 
@@ -4221,6 +4704,7 @@ impl EffEditor {
     fn draw_emitter_roster(&mut self, ui: &mut Ui, set_idx: usize) {
         let edited: std::collections::HashSet<usize> =
             self.edited_emitters(set_idx).into_iter().collect();
+        let moved = self.moved_parts(set_idx);
         let pristine_set: &[EmitterSnapshot] = self.pristine.get(set_idx).map_or(&[], |p| p);
         ui.label(egui::RichText::new("Parts").strong())
             .on_hover_text(
@@ -4373,19 +4857,21 @@ impl EffEditor {
                         ui.add_space(em.depth as f32 * 12.0);
                         let name = &part_names[i];
                         // Marked as on the Look tab's part tabs.
-                        let label = if edited.contains(&i) {
+                        let moved = moved.get(i).copied().unwrap_or(false);
+                        let label = if edited.contains(&i) || moved {
                             egui::RichText::new(format!("{name} •"))
                                 .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
                         } else {
                             egui::RichText::new(name)
                         };
+                        let place = part_place_note(moved, em.source_idx);
                         let hover = if em.depth > 0 {
                             format!(
-                                "{}\n\nMade from the particles of the part above it",
+                                "{}{place}\n\nMade from the particles of the part above it",
                                 em.name
                             )
                         } else {
-                            em.name.clone()
+                            format!("{}{place}", em.name)
                         };
                         if ui
                             .selectable_label(selected == i, label)
@@ -4421,11 +4907,11 @@ impl EffEditor {
                                     }
                                     if let Some(was) = was {
                                         let response = response.on_hover_text(format!(
-                                            "was {}. Right-click to put it back.",
+                                            "was {}. Right-click to reset.",
                                             attr_text(&table[at], was)
                                         ));
                                         response.context_menu(|ui| {
-                                            if ui.button("Reset to the file's value").clicked() {
+                                            if ui.button("Reset to the game's value").clicked() {
                                                 em.attrs[at] = Some(was);
                                                 changed = true;
                                                 ui.close();
@@ -4538,6 +5024,7 @@ impl EffEditor {
         if let Some(i) = reset {
             self.history_close_step();
             self.reset_part_fields(set_idx, i);
+            self.history.next_label = Some(self.reset_part_label(set_idx, i));
         }
     }
 
@@ -4887,8 +5374,8 @@ impl EffEditor {
                     } else {
                         ui.add_enabled(false, egui::Button::selectable(false, label))
                             .on_disabled_hover_text(format!(
-                                "Not {}×{} — an emitter's UV rects are authored for its texture's \
-                             size, so a different one resamples the effect.",
+                                "Not {}×{}: a texture of another size would stretch this part's \
+                                 pictures.",
                                 texture.width, texture.height
                             ));
                     }
@@ -5091,7 +5578,7 @@ impl EffEditor {
         );
         ui.checkbox(
             &mut self.show_raw_textures,
-            egui::RichText::new("Raw channels").small(),
+            egui::RichText::new("Show channels as stored").small(),
         )
         .on_hover_text(hover);
     }
@@ -5126,7 +5613,7 @@ impl EffEditor {
                      copy is byte-identical, not re-encoded.",
                 )
                 .on_disabled_hover_text(if pool.is_none() {
-                    "This eff has no texture archive"
+                    "This file has no textures"
                 } else if !first_slot {
                     "Works on texture 1 only"
                 } else {
@@ -5173,7 +5660,7 @@ impl EffEditor {
                      texture it takes over from.",
                 )
                 .on_disabled_hover_text(if pool.is_none() {
-                    "This eff has no texture archive".to_string()
+                    "This file has no textures".to_string()
                 } else if !first_slot {
                     "Works on texture 1 only".to_string()
                 } else if !has_emitter {
@@ -5240,17 +5727,19 @@ impl EffEditor {
             if ui
                 .add_enabled(deletable, egui::Button::new("Delete texture").small())
                 .on_hover_text(
-                    "Remove this texture from the eff. Only possible once nothing samples it.",
+                    "Remove this texture from the file. Only possible once no part uses it.",
                 )
                 .on_disabled_hover_text(if pool.is_none() {
-                    "This eff has no texture archive".to_string()
+                    "This file has no textures".to_string()
                 } else if names.len() <= 1 {
-                    "This is the eff's only texture".to_string()
+                    "This is the file's only texture".to_string()
                 } else {
-                    format!(
-                        "{users} emitter(s) still sample this texture. Point them at another one \
-                         first — use the texture picker on each."
-                    )
+                    match users {
+                        1 => "1 part uses this texture. Give it another texture first.".to_owned(),
+                        n => {
+                            format!("{n} parts use this texture. Give them another texture first.")
+                        }
+                    }
                 })
                 .clicked()
             {
@@ -5286,7 +5775,7 @@ impl EffEditor {
         self.texture_pool = Some(pool);
         self.texture_pool_gen += 1;
         // A step's texture numbers point into the pool as it was.
-        self.history = EffHistory::default();
+        self.clear_history("a texture was deleted");
         let shift = |slot: &mut Option<u32>| {
             if let Some(i) = slot {
                 if *i as usize > index {
@@ -5320,19 +5809,18 @@ impl EffEditor {
             .cloned();
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new(if texture.format.is_empty() {
-                    format!("{}×{}", texture.width, texture.height)
-                } else {
-                    format!("{}×{} · {}", texture.width, texture.height, texture.format)
-                })
-                .small()
-                .color(egui::Color32::GRAY),
+            let size = ui.label(
+                egui::RichText::new(format!("{}×{}", texture.width, texture.height))
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
+            if !texture.format.is_empty() {
+                size.on_hover_text(format!("Stored as {}", texture.format));
+            }
             let pool = self.texture_pool.clone();
             let can_convert = texture.convertible && pool.is_some();
 
-            // ONE export button, whose form the "Raw channels" box decides — the same box that
+            // ONE export button, whose form the "Show channels as stored" box decides — the same box that
             // decides what the preview shows and how an imported PNG is read. Two buttons made
             // the form settable in two places that could disagree with the preview; with one,
             // what you see is what you get and there is nothing to keep in sync.
@@ -5348,12 +5836,12 @@ impl EffEditor {
                     }
                     crate::texture_import::Form::Raw => {
                         "Save the texture's stored channels as the file holds them. Only useful \
-                         if you know the packing — and 'Raw channels' has to stay ticked to \
-                         import it back."
+                         if you know the packing, and 'Show channels as stored' has to stay \
+                         ticked to import it back."
                     }
                 })
                 .on_disabled_hover_text(if pool.is_none() {
-                    "This eff has no texture archive".to_string()
+                    "This file has no textures".to_string()
                 } else {
                     format!("Visionary cannot convert {}", texture.format)
                 })
@@ -5401,13 +5889,13 @@ impl EffEditor {
                     }
                     crate::texture_import::Form::Raw => {
                         "Use your own image, read as the texture's stored channels. Only correct \
-                         for a PNG exported with 'Raw channels' ticked.\n\nEVERY emitter that \
+                         for a PNG exported with 'Show channels as stored' ticked.\n\nEVERY emitter that \
                          samples this texture changes — it replaces the texture, not just this \
                          emitter's use of it."
                     }
                 })
                 .on_disabled_hover_text(if pool.is_none() {
-                    "This eff has no texture archive".to_string()
+                    "This file has no textures".to_string()
                 } else {
                     format!("Visionary cannot convert {}", texture.format)
                 })
@@ -6298,6 +6786,374 @@ mod tests {
         assert!(!editor.can_undo() && !editor.can_redo());
     }
 
+    /// One effect of two parts, with one extra part starting at frame 3.
+    fn editor_with_two_parts() -> EffEditor {
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        let mut second = editor.ptcl.as_ref().unwrap().emitter_sets[0].emitters[0].clone();
+        second.name = "em1".into();
+        second.source_idx = 1;
+        editor.pristine[0].push(EmitterSnapshot::of(&second));
+        editor.ptcl.as_mut().unwrap().emitter_sets[0]
+            .emitters
+            .push(second);
+        let info = EffEntryInfo {
+            name: "kirby_dash".into(),
+            set_idx: Some(0),
+            variants: vec![EffVariantInfo {
+                start_frame: 3,
+                set_idx: Some(0),
+                bone: String::new(),
+            }],
+            model: None,
+        };
+        editor.entry_info = vec![info.clone()];
+        editor.entry_pristine = vec![info];
+        editor.selected_entry = Some(0);
+        editor
+    }
+
+    /// Copy a part, move the second above the first, and start the extra part later.
+    fn change_structure(editor: &mut EffEditor) {
+        let set = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0];
+        let mut copy = set.emitters[0].clone();
+        copy.name = "em0 copy".into();
+        set.emitters.push(copy);
+        set.emitters.swap(0, 1);
+        editor.entry_info[0].variants[0].start_frame = 9;
+    }
+
+    /// Reset effect is the game's effect again: copies gone, the file's order, its timing, and
+    /// no roster left to save. Before it, the copy and the move are marked as edits.
+    #[test]
+    fn reset_effect_puts_back_the_part_list_and_timing() {
+        let mut editor = editor_with_two_parts();
+        assert_eq!(editor.edited_entries(), vec![false]);
+        assert!(!editor.effect_edited(0, "kirby_dash"));
+        change_structure(&mut editor);
+        // No value of any part changed: only the list and the timing did.
+        assert!(editor.edited_emitters(0).is_empty());
+        assert_eq!(editor.edited_entries(), vec![true]);
+        assert!(editor.effect_edited(0, "kirby_dash"));
+        assert_eq!(editor.moved_parts(0), vec![true, false, true]);
+        assert_eq!(editor.collect_rosters().len(), 1);
+        assert_eq!(editor.collect_entry_edits().len(), 1);
+
+        click_in_emitter_editor(&mut editor, "Reset effect");
+        let names: Vec<&str> = editor.ptcl.as_ref().unwrap().emitter_sets[0]
+            .emitters
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(names, ["em0", "em1"]);
+        assert!(editor.collect_rosters().is_empty());
+        assert!(editor.collect_entry_edits().is_empty());
+        assert_eq!(editor.edited_entries(), vec![false]);
+        assert_eq!(editor.moved_parts(0), vec![false, false]);
+
+        // Timing alone is an edit too.
+        editor.entry_info[0].variants[0].start_frame = 4;
+        assert_eq!(editor.edited_entries(), vec![true]);
+    }
+
+    /// A reset of an effect or a part that is as the game has it is greyed out and makes no
+    /// step; the same buttons work once there is an edit (the paired case).
+    #[test]
+    fn resets_of_unedited_effects_do_nothing() {
+        for label in ["Reset effect", "Reset this part"] {
+            let t0 = Instant::now();
+            let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+            editor.selected_entry = Some(0);
+            history_frame(&mut editor, t0, false, None);
+            let rev = editor.edit_rev;
+            click_in_emitter_editor(&mut editor, label);
+            assert_eq!(editor.edit_rev, rev, "{label} on an unedited part");
+            assert!(!editor.can_undo(), "{label}");
+            tune(&mut editor, 2.5);
+            click_in_emitter_editor(&mut editor, label);
+            assert_eq!(tuned(&editor), 1.0, "{label} on an edited part");
+        }
+    }
+
+    /// An edit put back by hand before its step closed is no step.
+    #[test]
+    fn an_edit_that_changes_nothing_is_no_step() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        history_frame(&mut editor, ms(10), false, Some(2.0));
+        history_frame(&mut editor, ms(20), false, Some(1.0));
+        history_frame(&mut editor, ms(2000), false, None);
+        assert!(editor.history.undo.is_empty());
+        // The same edit kept is one.
+        history_frame(&mut editor, ms(2010), false, Some(2.0));
+        history_frame(&mut editor, ms(4000), false, None);
+        assert_eq!(editor.history.undo.len(), 1);
+    }
+
+    /// Undo says what it will undo and where; Redo says what it will redo.
+    #[test]
+    fn undo_and_redo_name_their_step() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        history_frame(&mut editor, ms(10), false, Some(2.0));
+        let field = crate::eff_attrs::table()
+            .iter()
+            .find(|a| a.id == TUNED)
+            .unwrap()
+            .label;
+        let effect = entry_list_names(&editor.entries)[0].clone();
+        let want = format!("{field} in {effect}");
+        // While the step is open, and once it has closed.
+        assert_eq!(editor.undo_label().as_deref(), Some(want.as_str()));
+        history_frame(&mut editor, ms(2000), false, None);
+        assert_eq!(editor.undo_label().as_deref(), Some(want.as_str()));
+        editor.undo();
+        assert_eq!(editor.redo_label().as_deref(), Some(want.as_str()));
+        // A reset is named by its button.
+        history_frame(&mut editor, ms(3000), false, Some(2.0));
+        history_frame(&mut editor, ms(5000), false, None);
+        click_in_emitter_editor(&mut editor, "Reset effect");
+        editor.history_note_edit(ms(5000));
+        assert_eq!(
+            editor.undo_label(),
+            Some(format!("Reset effect in {effect}"))
+        );
+    }
+
+    /// Opening another file and coming back keeps the first file's steps; a file that comes
+    /// back with other effects or textures loses them, and the Undo hover says so.
+    #[test]
+    fn undo_history_is_kept_per_file() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        history_frame(&mut editor, ms(10), false, Some(2.0));
+        history_frame(&mut editor, ms(2000), false, None);
+        assert!(editor.can_undo());
+        let kirby = editor.loaded_path.clone().unwrap();
+
+        // Away to another file: its own, empty history.
+        editor.history_close_step();
+        editor.stash_history();
+        editor.loaded_path = Some(PathBuf::from("/fx/ef_mario.eff"));
+        editor.restore_history(Path::new("/fx/ef_mario.eff"));
+        assert!(!editor.can_undo());
+
+        // Back, as loaded before: the step is there and undoes.
+        editor.stash_history();
+        editor.loaded_path = Some(kirby.clone());
+        editor.restore_history(&kirby);
+        assert!(editor.can_undo());
+        editor.undo();
+        assert_eq!(tuned(&editor), 1.0);
+        editor.redo();
+        assert_eq!(tuned(&editor), 2.0);
+
+        // Back with another set list (a borrowed effect added): dropped, and said.
+        editor.stash_history();
+        editor.ptcl.as_mut().unwrap().emitter_sets[0].name = "P_Other".into();
+        editor.restore_history(&kirby);
+        assert!(!editor.can_undo() && !editor.can_redo());
+        assert!(editor.history.cleared.is_some());
+    }
+
+    /// "Only in <move>" comes on with a move that plays this file's effects, not with one that
+    /// plays none, and stays off once the user turns it off.
+    #[test]
+    fn only_in_move_turns_on_for_moves_with_effects() {
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        let uses = vec![MoveUse {
+            motion: Some("attack_s4_s".into()),
+            label: "Forward smash".into(),
+            bones: Vec::new(),
+        }];
+        editor.effect_uses.insert(editor.entries[0].hash, uses);
+        assert!(editor.only_in_move_on_pick("attack_s4_s"));
+        assert!(!editor.only_in_move_on_pick("attack_11"));
+        editor.only_open_move_declined = true;
+        assert!(!editor.only_in_move_on_pick("attack_s4_s"));
+    }
+
+    /// Copies are always marked; of the rest, the part dragged up is, not the one it passed.
+    #[test]
+    fn copied_and_moved_parts_are_found() {
+        let plain = |list: &[usize]| list.iter().map(|&i| (i, false)).collect::<Vec<_>>();
+        assert_eq!(added_or_moved(&plain(&[0, 1, 2])), [false; 3]);
+        assert_eq!(
+            added_or_moved(&plain(&[1, 0, 2, 3])),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            added_or_moved(&plain(&[0, 2, 3, 1])),
+            [false, false, false, true]
+        );
+        assert_eq!(
+            added_or_moved(&[(0, false), (0, true), (1, false)]),
+            [false, true, false]
+        );
+        // A removed part leaves the rest in place.
+        assert_eq!(added_or_moved(&plain(&[0, 2])), [false, false]);
+    }
+
+    /// Once the filter is cleared, each section is as it was before the search: a search for
+    /// "gravity" opened the sections it matched for every part from then on.
+    #[test]
+    fn clearing_the_filter_closes_what_it_opened() {
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[0];
+        let pr = editor.pristine[0][0].clone();
+        let context = egui::Context::default();
+        let row = "Gravity strength";
+        let mut shows_row = |filter: &str| {
+            let mut filter = filter.to_owned();
+            let mut found = false;
+            for _ in 0..2 {
+                let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                    draw_attribute_groups(ui, em, &pr, &mut filter, &[], egui::Id::NULL);
+                });
+                found = output
+                    .shapes
+                    .iter()
+                    .any(|shape| text_position(&shape.shape, row).is_some());
+            }
+            found
+        };
+        assert!(!shows_row(""), "closed to begin with");
+        assert!(shows_row("gravity"), "the filter opens it");
+        assert!(!shows_row(""), "and clearing it closes it again");
+    }
+
+    /// A part with an edit opens the section holding it; the next part, with none, does not
+    /// open that section too.
+    #[test]
+    fn an_edited_part_opens_its_sections_for_itself_only() {
+        let mut editor = editor_with_two_parts();
+        tune(&mut editor, 2.5);
+        let row = crate::eff_attrs::table()
+            .iter()
+            .find(|a| a.id == TUNED)
+            .unwrap()
+            .label;
+        let context = egui::Context::default();
+        let pr = editor.pristine[0].clone();
+        let mut shows_row = |part: usize| {
+            let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[part];
+            let mut filter = String::new();
+            let mut found = false;
+            for _ in 0..2 {
+                let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                    draw_attribute_groups(
+                        ui,
+                        em,
+                        &pr[part],
+                        &mut filter,
+                        &[],
+                        egui::Id::unique(part),
+                    );
+                });
+                found = output
+                    .shapes
+                    .iter()
+                    .any(|shape| text_position(&shape.shape, row).is_some());
+            }
+            found
+        };
+        assert!(shows_row(0), "the edited part shows its edit");
+        assert!(!shows_row(1), "the other part's section stays closed");
+        assert!(shows_row(0), "and the edited one is still open");
+    }
+
+    /// Undo and Redo move to the next row together when the header has no room for them, at
+    /// any panel width: nested in the wrapping row, they ran past a narrow panel's edge.
+    #[test]
+    fn undo_and_redo_stay_inside_a_narrow_panel() {
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        let context = egui::Context::default();
+        let mut overflowed = Vec::new();
+        for width in (200..=420).step_by(2) {
+            let width = width as f32;
+            let mut right = 0.0;
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(context.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        right = ui.max_rect().right();
+                        editor.draw_emitter_editor(ui);
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let redo_right = output
+                .shapes
+                .iter()
+                .find_map(|shape| text_right(&shape.shape, "Redo"))
+                .expect("Redo is drawn");
+            if redo_right > right + 0.5 {
+                overflowed.push(width);
+            }
+        }
+        assert!(
+            overflowed.is_empty(),
+            "Redo past the edge at widths {overflowed:?}"
+        );
+    }
+
+    fn text_right(shape: &egui::epaint::Shape, label: &str) -> Option<f32> {
+        match shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos.x + text.galley.size().x)
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                shapes.iter().find_map(|shape| text_right(shape, label))
+            }
+            _ => None,
+        }
+    }
+
+    /// A search finds rows by what people call them, through the hover as well as the label.
+    #[test]
+    fn the_filter_finds_speed_and_count() {
+        let finds = |needle: &str, id: &str| {
+            let a = crate::eff_attrs::table()
+                .iter()
+                .find(|a| a.id == id)
+                .unwrap();
+            filter_terms(needle).iter().any(|term| {
+                a.label.to_lowercase().contains(term) || a.doc.to_lowercase().contains(term)
+            })
+        };
+        assert!(finds("speed", "particle_velocity.all_direction"));
+        assert!(finds("speed", "particle_velocity.designated_dir_scale"));
+        assert!(finds("count", "emission.rate"));
+        assert!(finds("size", "particle_scale.scale_x"));
+        assert!(finds("color", "particle_color.color0_r"));
+        assert!(!finds("count", "particle_velocity.all_direction"));
+    }
+
+    /// Speed scales both starting speeds together and shows the larger.
+    #[test]
+    fn the_speed_row_scales_both_speeds() {
+        assert_eq!(shown_speed([0.5, 2.0]), 2.0);
+        assert_eq!(scaled_speeds([0.5, 2.0], 4.0), [1.0, 4.0]);
+        // A part that did not move gets an outward speed.
+        assert_eq!(scaled_speeds([0.0, 0.0], 1.5), [1.5, 0.0]);
+    }
+
     /// The Edited chip of another character opens that character, so Character, Move and file
     /// agree; the open character's chip just reopens its file.
     #[test]
@@ -6309,7 +7165,7 @@ mod tests {
             alt_base: None,
             merged: None,
             transplant_count: 1,
-            authored: 2,
+            changed_effects: 2,
             textures: 0,
             transplants: Vec::new(),
         };
@@ -6842,7 +7698,7 @@ mod tests {
         let pr = EmitterSnapshot::of(&em);
         let mut filter = String::new();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
             let basics: Vec<usize> = BASIC_ATTRS
                 .iter()
                 .filter_map(|id| crate::eff_attrs::index_of(id))
@@ -6855,15 +7711,15 @@ mod tests {
         // bad index would surface.
         let mut filter = "e".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
         });
         let mut filter = "gravity".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
         });
         let mut filter = "no such attribute".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[], egui::Id::NULL);
         });
     }
 

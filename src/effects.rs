@@ -29,7 +29,7 @@ pub struct ColorKey {
     pub a: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EmitterDef {
     pub name: String,
     /// Every attribute of this emitter, aligned to [`crate::eff_attrs::table`]. `None` where the
@@ -97,7 +97,7 @@ pub struct PtclFile {
 ///
 /// This is the spawn side of an effect, and it lives in the eff's header rather than in the PTCL
 /// — which is why none of it was reachable from [`PtclFile`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EffEntryInfo {
     pub name: String,
     /// The entry's own emitter set, or None when it has none of its own (multi-part entries

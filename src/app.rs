@@ -771,6 +771,15 @@ fn history_shortcut(ctx: &egui::Context) -> Option<HistoryAction> {
     })
 }
 
+/// The Effects page's undo or redo shortcut. While a text box has focus the keys are the box's
+/// own: Ctrl+Z after typing in the search undid an effect edit, possibly in another effect.
+fn effects_history_shortcut(ctx: &egui::Context) -> Option<HistoryAction> {
+    if ctx.text_edit_focused() {
+        return None;
+    }
+    history_shortcut(ctx)
+}
+
 /// A session-only snapshot for the currently open move.  Scripts and edit records are stored as
 /// JSON bytes because several of the deliberately lossless ACMD enums do not implement
 /// `PartialEq`; serializing them also means the equality check sees raw source tokens exactly as
@@ -1088,6 +1097,45 @@ mod picker_state_tests {
         assert_eq!(pressed(ctrl, egui::Key::Y), Some(HistoryAction::Redo));
         assert_eq!(pressed(ctrl, egui::Key::Z), Some(HistoryAction::Undo));
         assert_eq!(pressed(egui::Modifiers::NONE, egui::Key::Z), None);
+    }
+
+    /// Ctrl+Z in a focused text box is the box's: the Effects page's history leaves the key
+    /// for it, and takes it again once nothing is being typed in.
+    #[test]
+    fn ctrl_z_in_a_text_box_is_not_an_effect_undo() {
+        let ctx = egui::Context::default();
+        let mut text = String::from("wind");
+        let ctrl_z = || egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        };
+        let mut frame = |input: egui::RawInput, focus: Option<bool>| {
+            let mut got = None;
+            let _ = crate::ui::TestFrame::run_test_ui(&ctx, input, |ui| {
+                got = effects_history_shortcut(ui.ctx());
+                let response = ui.text_edit_singleline(&mut text);
+                match focus {
+                    Some(true) => response.request_focus(),
+                    Some(false) => response.surrender_focus(),
+                    None => {}
+                }
+            });
+            got
+        };
+        // Nothing focused: the page's undo.
+        assert_eq!(frame(ctrl_z(), None), Some(HistoryAction::Undo));
+        frame(egui::RawInput::default(), Some(true));
+        assert!(ctx.text_edit_focused());
+        assert_eq!(frame(ctrl_z(), None), None);
+        frame(egui::RawInput::default(), Some(false));
+        assert!(!ctx.text_edit_focused());
+        assert_eq!(frame(ctrl_z(), None), Some(HistoryAction::Undo));
     }
 
     #[test]
@@ -33747,7 +33795,13 @@ impl eframe::App for VisionaryApp {
         // one from that page would change something the user cannot see.
         let effects_page = self.eff_editor.open && !self.roster.open;
         if let Some(action) = (!self.node_workspace)
-            .then(|| history_shortcut(&ctx))
+            .then(|| {
+                if effects_page {
+                    effects_history_shortcut(&ctx)
+                } else {
+                    history_shortcut(&ctx)
+                }
+            })
             .flatten()
         {
             match (effects_page, action) {
@@ -34263,7 +34317,7 @@ impl eframe::App for VisionaryApp {
                         alt_base,
                         merged,
                         transplant_count: e.transplants.len(),
-                        authored: e.authored.len(),
+                        changed_effects: e.changed_effects(),
                         textures: e.textures.len(),
                         transplants: e
                             .transplants
