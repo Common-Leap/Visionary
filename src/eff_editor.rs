@@ -504,6 +504,8 @@ pub struct EffEditor {
     /// A character picked in the header, for the app to open.
     pub fighter_request: Option<String>,
     fighter_filter: String,
+    /// The texture picker's search.
+    texture_filter: String,
     move_filter: String,
     /// List only the effects the open move plays.
     only_open_move: bool,
@@ -639,6 +641,7 @@ impl Default for EffEditor {
             move_choices: Vec::new(),
             fighter_request: None,
             fighter_filter: String::new(),
+            texture_filter: String::new(),
             move_filter: String::new(),
             only_open_move: false,
             show_in_picked_move: None,
@@ -964,51 +967,19 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
     }
 }
 
-/// A whole number as the attribute rows show it: the all-ones value means no id is set.
-fn uint_text(value: u64) -> String {
-    if value == u64::MAX {
-        "None".to_owned()
-    } else {
-        value.to_string()
+/// The Look tab's bottom split, holding the part's texture and the game's view: its smallest,
+/// starting and largest heights in a right panel this tall. With a texture it always fits the
+/// picture and the buttons under it; with no texture and no game it holds one line.
+fn texture_split_sizes(panel_height: f32, has_texture: bool, connected: bool) -> (f32, f32, f32) {
+    if !has_texture && !connected {
+        return (40.0, 40.0, 40.0);
     }
-}
-
-/// The number typed into a whole-number row: decimal, `0x` hex, or `None` for the all-ones "no
-/// id" value. Anything else, an empty box included, is not a number yet.
-fn parse_uint_text(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.eq_ignore_ascii_case("none") {
-        return Some(u64::MAX);
-    }
-    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(hex) => u64::from_str_radix(hex, 16).ok(),
-        None => text.parse().ok(),
-    }
-}
-
-/// A text box for a whole number. While it has focus the typed text is kept as typed, so a
-/// half-typed number is not snapped back; the value changes when the text reads as a number.
-fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
-    let id = ui.make_persistent_id(("uint_text", id_salt));
-    let mut text = ui
-        .data(|d| d.get_temp::<String>(id))
-        .unwrap_or_else(|| uint_text(*value));
-    let response = ui
-        .add(egui::TextEdit::singleline(&mut text).desired_width(150.0))
-        .on_hover_text("A whole number, 0x for hex, or None for no id");
-    let mut changed = false;
-    if response.changed() {
-        if let Some(parsed) = parse_uint_text(&text) {
-            changed = parsed != *value;
-            *value = parsed;
-        }
-    }
-    if response.has_focus() {
-        ui.data_mut(|d| d.insert_temp(id, text));
-    } else {
-        ui.data_mut(|d| d.remove::<String>(id));
-    }
-    changed
+    // The picture is 112 px; with the picker, the raw-channels box and the button row it needs
+    // 200. It starts there, leaving the rest to the settings above, and drags taller.
+    let max = (panel_height * 0.6).max(200.0);
+    let min = 200.0_f32.min(max);
+    let default = (panel_height * 0.3).clamp(min, max);
+    (min, default, max)
 }
 
 /// What each effect is listed as: its name in words, as the timeline shows it, or its file name
@@ -1058,6 +1029,53 @@ fn search_rank(search: &str, names: &[&str]) -> Option<u8> {
             }
         })
         .min()
+}
+
+/// A whole number as the attribute rows show it: the all-ones value means no id is set.
+fn uint_text(value: u64) -> String {
+    if value == u64::MAX {
+        "None".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The number typed into a whole-number row: decimal, `0x` hex, or `None` for the all-ones "no
+/// id" value. Anything else, an empty box included, is not a number yet.
+fn parse_uint_text(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(u64::MAX);
+    }
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+/// A text box for a whole number. While it has focus the typed text is kept as typed, so a
+/// half-typed number is not snapped back; the value changes when the text reads as a number.
+fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
+    let id = ui.make_persistent_id(("uint_text", id_salt));
+    let mut text = ui
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| uint_text(*value));
+    let response = ui
+        .add(egui::TextEdit::singleline(&mut text).desired_width(150.0))
+        .on_hover_text("A whole number, 0x for hex, or None for no id");
+    let mut changed = false;
+    if response.changed() {
+        if let Some(parsed) = parse_uint_text(&text) {
+            changed = parsed != *value;
+            *value = parsed;
+        }
+    }
+    if response.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    changed
 }
 
 /// How an attribute's value reads in the "orig" column.
@@ -2554,10 +2572,19 @@ impl EffEditor {
             egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
             return;
         }
+        // Tall enough for the texture's picture and its buttons: a smaller size, saved from
+        // an earlier session or squeezed by a short window, left only the picker showing.
+        let connected = link.status().is_connected();
+        let (min, default, max) = texture_split_sizes(
+            ui.available_height(),
+            self.selected_texture.is_some(),
+            connected,
+        );
         egui::Panel::bottom("eff_game_panel_split")
             .resizable(true)
-            .default_size(240.0)
-            .min_size(60.0)
+            .default_size(default)
+            .min_size(min)
+            .max_size(max)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("eff_game_panel")
@@ -4206,7 +4233,9 @@ impl EffEditor {
             .unwrap_or_default();
         let offered = same_size.iter().filter(|ok| **ok).count();
         let mut swap_to = None;
-        egui::ComboBox::from_id_salt("emitter_texture_swap")
+        let texture_filter = &mut self.texture_filter;
+        let picker = egui::ComboBox::from_id_salt("emitter_texture_swap")
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .selected_text(
                 labels
                     .get(index)
@@ -4214,11 +4243,32 @@ impl EffEditor {
                     .unwrap_or_else(|| "(not in this pool)".to_string()),
             )
             .width(280.0)
+            .height(420.0)
             .show_ui(ui, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(texture_filter)
+                        .hint_text("Search textures")
+                        .desired_width(260.0),
+                );
+                let opened = !search.has_focus() && !ui.memory(|m| m.focused().is_some());
+                if opened {
+                    search.request_focus();
+                }
+                let mut any = false;
                 for (i, label) in labels.iter().enumerate() {
+                    if search_rank(texture_filter, &[label.as_str()]).is_none() {
+                        continue;
+                    }
+                    any = true;
                     if same_size.get(i).copied().unwrap_or(true) {
-                        if ui.selectable_label(index == i, label).clicked() {
+                        let row = ui.selectable_label(index == i, label);
+                        // Opens on the current texture rather than at the top of the list.
+                        if opened && index == i {
+                            row.scroll_to_me(Some(egui::Align::Center));
+                        }
+                        if row.clicked() {
                             swap_to = Some(i as u32);
+                            ui.close();
                         }
                     } else {
                         ui.add_enabled(false, egui::Button::selectable(false, label))
@@ -4229,13 +4279,19 @@ impl EffEditor {
                             ));
                     }
                 }
-            })
-            .response
-            .on_hover_text(format!(
-                "Point this emitter at another of the eff's textures. Only the {offered} at \
+                if !any {
+                    ui.weak("No matching textures");
+                }
+            });
+        // A search left behind when the list closed would greet the next opening.
+        if picker.inner.is_none() {
+            self.texture_filter.clear();
+        }
+        picker.response.on_hover_text(format!(
+            "Point this part at another of the eff's textures. Only the {offered} at \
                  {}×{} are offered. Ships with the next Send, like any other emitter edit.",
-                texture.width, texture.height
-            ));
+            texture.width, texture.height
+        ));
         // Every other control in this window shows what it started as; a swap is an edit like
         // any other and gets the same treatment, so a changed texture is visible without
         // opening the picker to compare.
@@ -4288,7 +4344,7 @@ impl EffEditor {
     /// result kept as a GPU handle. Doing it per frame at 60fps would spend more time
     /// decompressing this thumbnail than rendering the rest of the app.
     fn draw_texture_preview(&mut self, ui: &mut Ui, index: usize, texture: &TextureInfo) {
-        const PREVIEW: u32 = 168;
+        const PREVIEW: u32 = 112;
         // A replaced texture previews from the PNG the user picked. The pool still holds the
         // game's original — it is only rebuilt when the carrier is built — so decoding the pool
         // here would show the texture that was just replaced and read as "the import did nothing".
@@ -5171,22 +5227,18 @@ mod tests {
     }
 
     #[test]
-    fn whole_number_rows_hold_64_bit_ids_and_none() {
-        // The no-primitive value reads None, not 2^64, and types back exactly.
-        assert_eq!(uint_text(u64::MAX), "None");
-        assert_eq!(parse_uint_text("None"), Some(u64::MAX));
-        // Clearing the box to type a new id does not set "none" on the way.
-        assert_eq!(parse_uint_text(""), None);
-        // A texture GUID above 2^53 (where a drag's f64 rounds) survives text both ways.
-        let guid = 0x9E37_79B9_7F4A_7C15_u64;
-        assert_eq!(parse_uint_text(&uint_text(guid)), Some(guid));
-        assert_eq!(parse_uint_text("0x10"), Some(16));
-        assert_eq!(parse_uint_text("12a"), None);
-        let primitive = crate::eff_attrs::table()
-            .iter()
-            .find(|a| a.id == "particle_data.primitive_id")
-            .unwrap();
-        assert_eq!(attr_text(primitive, AttrValue::UInt(u64::MAX)), "None");
+    fn texture_split_always_fits_the_picture_and_buttons() {
+        // A short right panel still gives the texture its floor.
+        for height in [300.0, 500.0, 900.0] {
+            let (min, default, max) = texture_split_sizes(height, true, false);
+            assert!(min >= 200.0, "{height}");
+            assert!(min <= default && default <= max, "{height}");
+        }
+        // And a tall one keeps most of its height for the settings.
+        assert!(texture_split_sizes(680.0, true, false).1 < 680.0 * 0.35);
+        // A part with no texture, and no game to show, needs one line.
+        assert_eq!(texture_split_sizes(900.0, false, false), (40.0, 40.0, 40.0));
+        assert!(texture_split_sizes(900.0, false, true).0 >= 200.0);
     }
 
     #[test]
@@ -5229,6 +5281,25 @@ mod tests {
         }
         choices.sort_by_key(|c| c.1);
         assert_eq!(choices[0].0, "Mario");
+    }
+
+    #[test]
+    fn whole_number_rows_hold_64_bit_ids_and_none() {
+        // The no-primitive value reads None, not 2^64, and types back exactly.
+        assert_eq!(uint_text(u64::MAX), "None");
+        assert_eq!(parse_uint_text("None"), Some(u64::MAX));
+        // Clearing the box to type a new id does not set "none" on the way.
+        assert_eq!(parse_uint_text(""), None);
+        // A texture GUID above 2^53 (where a drag's f64 rounds) survives text both ways.
+        let guid = 0x9E37_79B9_7F4A_7C15_u64;
+        assert_eq!(parse_uint_text(&uint_text(guid)), Some(guid));
+        assert_eq!(parse_uint_text("0x10"), Some(16));
+        assert_eq!(parse_uint_text("12a"), None);
+        let primitive = crate::eff_attrs::table()
+            .iter()
+            .find(|a| a.id == "particle_data.primitive_id")
+            .unwrap();
+        assert_eq!(attr_text(primitive, AttrValue::UInt(u64::MAX)), "None");
     }
 
     /// A blank emitter at the version Smash's own files use, for the attribute vector.
