@@ -11066,7 +11066,6 @@ mod link_policy_tests {
         for (file, needle) in [
             ("src/app.rs", "game_link::link_address_row"),
             ("src/app.rs", "game_link::link_problem_and_action"),
-            ("src/eff_editor.rs", "game_link::link_status_line"),
             ("src/app/project_page.rs", "game_link::link_status_line"),
             (
                 "src/gimmicks/operations_view.rs",

@@ -2430,9 +2430,7 @@ impl EffEditor {
             {
                 self.request_live_apply();
             }
-            if !connected {
-                crate::game_link::link_status_line(ui, link);
-            }
+            // The connection state and its Connect button are the top bar's, shown once.
             if self.sending || self.awaiting_game.is_some() {
                 ui.add(egui::Spinner::new().size(14.0));
                 let (text, tint) = if self.sending {
@@ -3060,7 +3058,8 @@ impl EffEditor {
             .map(|s| s.emitters.len())
             .unwrap_or(0);
         let mut reset_entry = false;
-        ui.horizontal(|ui| {
+        // Wraps in a narrow panel: a long effect name widened the panel past its edge.
+        ui.horizontal_wrapped(|ui| {
             ui.heading(&entry_name);
             ui.label(
                 egui::RichText::new(if emitter_count == 1 {
@@ -3203,7 +3202,9 @@ impl EffEditor {
         let mut texture_actions: Option<(usize, TextureInfo)> = None;
         // Each part keeps its own place in the list: one scroll position for every effect left
         // the next one opened halfway down, with its colours out of sight.
-        egui::ScrollArea::vertical()
+        // Both ways: a row wider than a narrow panel scrolls inside it instead of running
+        // under the view.
+        egui::ScrollArea::both()
             .id_salt(("emitter_fields", self.selected_entry, self.selected_emitter))
             .show(ui, |ui| {
                 // The handful of values that get changed on nearly every edit, kept at the top
@@ -3448,7 +3449,7 @@ impl EffEditor {
     ///   PARTS     the extra emitter sets a multi-part effect brings in on later frames, and
     ///             the model that comes with the whole thing
     fn draw_spawning_panel(&mut self, ui: &mut Ui, set_idx: usize, entry_name: &str) {
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt(("spawning_panel", entry_name))
             .show(ui, |ui| {
                 self.draw_emitter_roster(ui, set_idx);

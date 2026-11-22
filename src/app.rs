@@ -1023,6 +1023,43 @@ mod picker_state_tests {
     }
 
     #[test]
+    fn effects_page_keeps_a_usable_view_in_a_small_window() {
+        // 1000 px wide: the side panels leave the view at least a third of the window.
+        let (left, right, right_max) = effects_page_side_widths(1000.0);
+        assert!(1000.0 - left.min(260.0) - right >= 1000.0 / 3.0);
+        // And the right panel keeps room for a colour row (swatch, code, R G B and time).
+        assert!(right >= 380.0);
+        assert!(right <= right_max);
+        // A wide window keeps the old 460 px start.
+        assert_eq!(effects_page_side_widths(1800.0).1, 460.0);
+        // The view switch never sits on the stage picker: beside it, or under it.
+        for width in [240.0, 400.0, 900.0] {
+            let at = effect_view_switch_offset(width);
+            assert!(
+                at.x >= 8.0 + STAGE_PICKER_WIDTH || at.y >= 36.0,
+                "{width}: {at:?}"
+            );
+        }
+        assert_eq!(effect_view_switch_offset(240.0).y, 40.0);
+        assert_eq!(effect_view_switch_offset(900.0).y, 8.0);
+    }
+
+    #[test]
+    fn effects_page_timeline_is_sized_to_its_own_rows() {
+        // The move pages keep every shown row; the Effects page caps them and scrolls the rest.
+        assert_eq!(effects_page_timeline_rows(false, 20), 20);
+        assert_eq!(effects_page_timeline_rows(true, 3), 3);
+        assert_eq!(
+            effects_page_timeline_rows(true, 20),
+            EFFECTS_PAGE_TIMELINE_MAX_ROWS
+        );
+        // An effect alone (one row) is far shorter than a full move, and still fits its controls.
+        let alone = scrubber_panel_max_height(1, 500.0);
+        assert!(alone < scrubber_panel_max_height(12, 500.0));
+        assert!(alone >= 72.0);
+    }
+
+    #[test]
     fn compact_panel_limits_follow_content_without_forcing_extra_space() {
         assert_eq!(scrubber_panel_max_height(0, 500.0), 116.0);
         assert!(scrubber_panel_max_height(2, 500.0) < scrubber_panel_max_height(20, 500.0));
@@ -1148,7 +1185,8 @@ fn facing_live_guard(ec: &crate::data::EffectCall) -> Option<crate::game_link::L
 }
 
 /// An effect name as words: `sys_attack_line` reads "Attack line", `mario_fb_shoot` "Fb shoot".
-fn effect_words(name: &str) -> String {
+/// The timeline and the Effects page's list both name effects this way.
+pub(crate) fn effect_words(name: &str) -> String {
     if let Some((name, facing)) = name.split_once(" (facing ") {
         return format!("{} (facing {facing}", effect_words(name));
     }
@@ -1792,6 +1830,44 @@ fn paint_timeline_ruler(
 /// above an empty stretch of timeline when the current filters leave only a few rows.
 fn scrubber_chart_height(row_count: usize) -> f32 {
     (row_count as f32 * SCRUBBER_ROW_HEIGHT + 28.0).max(60.0)
+}
+
+/// Width of the stage picker over the view's top-left corner.
+const STAGE_PICKER_WIDTH: f32 = 150.0;
+
+/// Where the Effects page's Alone / In a move switch sits from the view's top-left corner: beside
+/// the stage picker, or under it when the view is too narrow for both on one line.
+fn effect_view_switch_offset(view_width: f32) -> egui::Vec2 {
+    let beside = 8.0 + STAGE_PICKER_WIDTH + 30.0;
+    let switch_width = 280.0;
+    if view_width >= beside + switch_width {
+        egui::vec2(beside, 8.0)
+    } else {
+        egui::vec2(8.0, 40.0)
+    }
+}
+
+/// The Effects page's side panels for a window this wide: the left list's largest width, then
+/// the right panel's starting and largest widths. Both stay at least as wide as their minimums.
+fn effects_page_side_widths(window_width: f32) -> (f32, f32, f32) {
+    let left_max = (window_width * 0.24).max(160.0);
+    let right_default = (window_width * 0.4).clamp(280.0, 460.0);
+    let right_max = (window_width * 0.5).max(280.0);
+    (left_max, right_default, right_max)
+}
+
+/// Rows the Effects page's timeline is sized for before it scrolls, so the effect's own
+/// settings above it keep most of the height.
+const EFFECTS_PAGE_TIMELINE_MAX_ROWS: usize = 6;
+
+/// Rows the bottom panel is sized for: every shown row on the move pages, at most
+/// [`EFFECTS_PAGE_TIMELINE_MAX_ROWS`] on the Effects page (the rest scroll).
+fn effects_page_timeline_rows(effects_page: bool, shown_rows: usize) -> usize {
+    if effects_page {
+        shown_rows.min(EFFECTS_PAGE_TIMELINE_MAX_ROWS)
+    } else {
+        shown_rows
+    }
 }
 
 /// Maximum bottom-panel height, including the playback/filter row and the small top inset.
@@ -4057,6 +4133,10 @@ pub struct VisionaryApp {
     /// The Effects page's looping play of the open effect, shown alone.
     effect_loop: EffectLoopClock,
     effect_loop_for: Option<String>,
+    /// The window width the Effects page's side panels were last sized for. When it changes the
+    /// panels go back to their share of the new width: a panel squeezed in a small window kept
+    /// that narrow width after the window grew again.
+    effects_page_sized_for: f32,
     /// How many times playback has come round to the move's start. The game spawns a move's
     /// effects anew each time it is played, each with its own random particles and offsets, so
     /// each time round the preview plays them with new numbers too.
@@ -4530,6 +4610,7 @@ impl VisionaryApp {
             effect_uses: EffectUseIndex::default(),
             effect_loop: EffectLoopClock::default(),
             effect_loop_for: None,
+            effects_page_sized_for: 0.0,
             playthrough: 0,
             carrier_push_callers: Vec::new(),
             carrier_push_reports: false,
@@ -9952,20 +10033,41 @@ impl VisionaryApp {
         egui::Panel::top("effects_page_top").show(ui, |ui| {
             self.eff_editor.page_top(ui, &self.game_link);
         });
-        egui::Panel::left("effects_page_left")
-            .default_size(260.0)
-            .min_size(160.0)
-            .resizable(true)
-            .show(ui, |ui| {
+        // The side panels take a share of the window, so a small window keeps a usable view.
+        let window_width = ui.available_width();
+        let (left_max, right_default, right_max) = effects_page_side_widths(window_width);
+        let left_default = 260.0_f32.min(left_max);
+        let resized = (window_width - self.effects_page_sized_for).abs() > 0.5;
+        self.effects_page_sized_for = window_width;
+        let left = egui::Panel::left("effects_page_left");
+        let left = if resized {
+            left.exact_size(left_default)
+        } else {
+            left.default_size(left_default)
+                .min_size(160.0)
+                .max_size(left_max)
+        };
+        // Fixed contents: the panels keep their width whatever their rows need. Measured from
+        // the contents, the right panel shrank to its minimum once its heading could wrap.
+        left.resizable(true).show(ui, |ui| {
+            show_fixed_panel_contents(ui, "effects_page_left_contents", |ui| {
                 self.eff_editor.page_left(ui, &self.game_link);
             });
-        egui::Panel::right("effects_page_right")
-            .default_size(460.0)
-            .min_size(280.0)
-            .resizable(true)
-            .show(ui, |ui| {
+        });
+        let right = egui::Panel::right("effects_page_right");
+        let right = if resized {
+            right.exact_size(right_default)
+        } else {
+            right
+                .default_size(right_default)
+                .min_size(280.0)
+                .max_size(right_max)
+        };
+        right.resizable(true).show(ui, |ui| {
+            show_fixed_panel_contents(ui, "effects_page_right_contents", |ui| {
                 self.eff_editor.page_right(ui, &self.game_link);
             });
+        });
         egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
     }
 
@@ -10243,7 +10345,7 @@ impl VisionaryApp {
     /// over the top of the view.
     fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
         egui::Area::new(egui::Id::unique("effect_view_switch"))
-            .fixed_pos(rect.center_top() + egui::vec2(-110.0, 8.0))
+            .fixed_pos(rect.left_top() + effect_view_switch_offset(rect.width()))
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -10303,7 +10405,7 @@ impl VisionaryApp {
             .show(ui.ctx(), |ui| {
                 egui::ComboBox::from_id_salt("preview_stage_combo")
                     .selected_text(current)
-                    .width(150.0)
+                    .width(STAGE_PICKER_WIDTH)
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.preview_stage, None, "No stage")
                             .on_hover_text(
@@ -33045,7 +33147,7 @@ impl VisionaryApp {
             .text(
                 egui::pos2(rect.left() + 4.0, y + SCRUBBER_ROW_HEIGHT * 0.5),
                 egui::Align2::LEFT_CENTER,
-                &name,
+                effect_words(&name),
                 egui::FontId::monospace(10.0),
                 Color32::from_rgb(120, 200, 255),
             );
@@ -33569,7 +33671,8 @@ impl eframe::App for VisionaryApp {
         // Top menu bar: File / Windows / Project + status
         let t_menu = self.perf.start();
         egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal(|ui| {
+            // Wraps onto a second line in a narrow window rather than running off its edge.
+            ui.horizontal_wrapped(|ui| {
                 // Menus contain persistent controls such as the project-name field. The default
                 // menu policy closes on every click, which steals focus from text edits before
                 // a character can be typed. Commands still close themselves explicitly below.
@@ -33928,23 +34031,26 @@ impl eframe::App for VisionaryApp {
         // Bottom timeline
         let t = self.perf.start();
         let total = self.timeline_total_frames();
-        let timeline_row_count = if total == 0 {
+        // The Characters page has no move to scrub through, nor does an effect shown alone: it
+        // gets a one-row timeline of its own loop.
+        let effect_alone = self.effect_alone(&[]);
+        let timeline_row_count = if effect_alone {
+            1
+        } else if total == 0 {
             0
         } else {
-            // Counted as the move pages show them, on the Effects page too, so the view keeps
-            // its size when switching between them.
-            self.timeline_rows(total)
+            // Counted as drawn: the move pages' filters, or the Effects page's effect rows.
+            let rows = self
+                .timeline_rows(total)
                 .into_iter()
-                .filter(|row| self.timeline_filters.shows(row.category))
-                .count()
+                .filter(|row| self.timeline_row_shown(row))
+                .count();
+            effects_page_timeline_rows(self.eff_editor.open, rows)
         };
         let max_scrubber_height = scrubber_panel_max_height(
             timeline_row_count,
             (ui.available_height() * 0.55).max(100.0),
         );
-        // The Characters page has no move to scrub through, nor does an effect shown alone. The
-        // panel stays for an effect alone, so the view does not jump in size when it is picked.
-        let effect_alone = self.effect_alone(&[]);
         if !self.roster.open {
             // Sized to the rows each frame: a panel the user could resize kept the height of
             // the last short move, so a longer one showed a single row until dragged open.
