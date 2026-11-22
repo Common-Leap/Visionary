@@ -3179,6 +3179,35 @@ fn alias_status_is_routine(status: &str) -> bool {
     status.starts_with("Sending to the game:") || status.starts_with("Ready for the game:")
 }
 
+/// `n` with the singular or plural noun: "1 edited effect", "2 edited effects".
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What a send carries, counted in effects: "1 edited effect and 2 borrowed effects".
+fn effect_counts(edited: usize, borrowed: usize) -> String {
+    let edited = counted(edited, "edited effect", "edited effects");
+    match borrowed {
+        0 => edited,
+        n if edited.starts_with("0 ") => counted(n, "borrowed effect", "borrowed effects"),
+        n => format!(
+            "{edited} and {}",
+            counted(n, "borrowed effect", "borrowed effects")
+        ),
+    }
+}
+
+/// The status line a send starts with, `opening` being "Sending to the game" or "Ready for the
+/// game": the outcome rewrites that opening once the game answers.
+fn send_note(opening: &str, fighter: &str, edited: usize, borrowed: usize) -> String {
+    match (fighter, edited + borrowed) {
+        ("", 0) => format!("{opening}: the game's own effects"),
+        (fighter, 0) => format!("{opening}: {fighter}'s own effects"),
+        ("", _) => format!("{opening}: {}", effect_counts(edited, borrowed)),
+        (fighter, _) => format!("{opening}: {fighter}, {}", effect_counts(edited, borrowed)),
+    }
+}
+
 /// The status line once the game link drops: a send's line goes back to "Ready for the game",
 /// which is what the next connection will send. Any other line is left alone.
 fn status_after_disconnect(status: &str) -> Option<String> {
@@ -4242,6 +4271,9 @@ pub struct VisionaryApp {
     carrier_send_armed: bool,
     /// The effect open on the Effects page last frame, to notice another one opening.
     eff_open_seen: Option<String>,
+    /// The call the Effects page's "Use in <move>" last added: the move, its index and the
+    /// effect, for the Undo beside the button.
+    use_in_move_added: Option<(String, usize, String)>,
     /// Background param-label download (ultimate-research/param-labels); None once done.
     param_labels_rx: Option<std::sync::mpsc::Receiver<crate::param_labels::Msg>>,
     /// Labels from the downloaded/cached ParamLabels.csv — re-merged after any
@@ -4755,6 +4787,7 @@ impl VisionaryApp {
             last_carrier_fingerprint: None,
             carrier_send_armed: false,
             eff_open_seen: None,
+            use_in_move_added: None,
             param_labels_rx: Some(crate::param_labels::spawn_fetch()),
             downloaded_labels: HashMap::new(),
             use_scan: None,
@@ -10174,6 +10207,68 @@ impl VisionaryApp {
         self.state.selected_effect_call = Some(idx);
         self.push_effect_rules();
         idx
+    }
+
+    /// The Effects page's "Use in <move>": add the effect to the open move and stay on the
+    /// page, with an Undo beside the button and the Classic editor one click away.
+    fn service_use_in_move(&mut self) {
+        let shown_move = |state: &AppState| {
+            state
+                .selected_move
+                .as_ref()
+                .map(|m| crate::move_kinds::plain_name(&m.name))
+                .unwrap_or_default()
+        };
+        if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
+            let name = self.eff_editor.selected_entry_name().map(str::to_owned);
+            if let (Some(name), Some(mv)) = (name, self.current_move_key()) {
+                let frame = self.state.current_frame;
+                let index = self.add_effect_call(&name, frame);
+                let move_name = shown_move(&self.state);
+                self.eff_editor.use_in_move_note =
+                    Some(format!("Added to {move_name} at frame {frame}"));
+                self.state.status = format!(
+                    "Added {} to {move_name} at frame {frame}",
+                    effect_words(&name)
+                );
+                self.use_in_move_added = Some((mv, index, name));
+            }
+        }
+        // Still the call it added: the same move, and that index still holds the effect.
+        let added = self.use_in_move_added.clone().filter(|(mv, index, name)| {
+            self.current_move_key().as_ref() == Some(mv)
+                && self.eff_editor.selected_entry_name() == Some(name.as_str())
+                && self
+                    .state
+                    .effects
+                    .get(*index)
+                    .is_some_and(|call| call.effect_name == *name)
+        });
+        if std::mem::take(&mut self.eff_editor.use_in_move_undo_requested) {
+            if let Some((_, index, name)) = &added {
+                self.delete_effect_call(*index);
+                self.state.status = format!(
+                    "Took {} out of {} again",
+                    effect_words(name),
+                    shown_move(&self.state)
+                );
+            }
+            self.use_in_move_added = None;
+        } else if std::mem::take(&mut self.eff_editor.open_classic_requested) {
+            // Over to the move, with the new spawn selected for placing.
+            self.state.selected_effect_call = added.as_ref().map(|(_, index, _)| *index);
+            self.eff_editor.open = false;
+            self.node_workspace = false;
+            self.roster.open = false;
+            self.primary_tab = PrimaryEditorTab::Effects;
+            self.use_in_move_added = None;
+        } else if added.is_none() {
+            // Another effect or move opened, or the call went another way.
+            self.use_in_move_added = None;
+        }
+        if self.use_in_move_added.is_none() {
+            self.eff_editor.use_in_move_note = None;
+        }
     }
 
     fn open_effects_page(&mut self) {
@@ -30271,8 +30366,8 @@ impl VisionaryApp {
         }
         if !carrier_name_conflicts.is_empty() {
             self.state.status = format!(
-                "Effect name clash — rename the transplant(s) for: {}. The authored edit was \
-                 not applied because another alias already claims that kind.",
+                "Not sent: the edit to {} has the name of a borrowed effect. Rename the \
+                 borrowed copy and send again.",
                 carrier_name_conflicts.join(", ")
             );
         }
@@ -30656,24 +30751,28 @@ impl VisionaryApp {
         // here would be describing a build the user's effect is not in.
         if !skipped_donors.is_empty() {
             self.state.status = format!(
-                "NOT sent — the live carrier cannot take {}. Export the eff to use these.",
-                skipped_donors.join(", ")
+                "Not sent: {} cannot go into a running match. Export the mod to use {}.",
+                skipped_donors.join(", "),
+                if skipped_donors.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                }
             );
         } else if let Some(conflict) = &carrier_mesh_conflict {
-            self.state.status = format!("Model data — {conflict}");
+            self.state.status = format!("Sent, but a model in it may look wrong: {conflict}");
         } else if carrier_added && !carrier_textures_in_use.is_empty() {
             self.state.status = format!(
-                "Texture(s) {} were NOT deleted — emitters still sample them, through a sampler \
-                 slot the editor cannot see. Point those emitters elsewhere first.",
+                "Not removed: parts still use {}. Point those parts at another picture first.",
                 carrier_textures_in_use.join(", ")
             );
         } else if carrier_added && !carrier_dropped_textures.is_empty() {
             // Ranked above the ordinary success line: the carrier shipped, but the replacement
             // the user is waiting to see is not in it, and nothing in game will explain why.
             self.state.status = format!(
-                "Carrier sent, but the replaced texture(s) {} are not in it — the carrier only \
-                 carries textures belonging to effects that ride it. Transplant or edit an \
-                 effect that uses the texture and send again.",
+                "Sent, but the new picture for {} is not in it: a running match only gets the \
+                 pictures of edited and borrowed effects. Edit an effect that uses it and send \
+                 again.",
                 carrier_dropped_textures.join(", ")
             );
         } else if carrier_added && !carrier_authored.is_empty() {
@@ -30684,36 +30783,43 @@ impl VisionaryApp {
             } else {
                 "Ready for the game"
             };
-            self.state.status = format!(
-                "{sent}: {} borrowed and {} edited effect(s)",
-                carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
+            let fighter = carrier_owner
+                .as_deref()
+                .map(|owner| self.character_name(&crate::character::CharacterKey::parse(owner)))
+                .unwrap_or_default();
+            self.state.status = send_note(
+                sent,
+                &fighter,
                 carrier_authored.len(),
+                carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
             );
         } else if carrier_added && !carrier_dropped_edits.is_empty() {
             // The carrier shipped, but every edit in it was dropped. Saying nothing here would
             // read as success.
             self.state.status = format!(
-                "Carrier sent, but edits to {} could not be placed and were NOT applied",
+                "Sent, but the edits to {} could not be placed and are not in it",
                 carrier_dropped_edits.join(", ")
             );
         } else if carrier_added && !carrier_textures.is_empty() {
             // Texture-only send: no authored edit and no transplant to report, so without this
             // branch a successful send said nothing at all.
+            let sent = if self.game_link.status().is_connected() {
+                "Sending to the game"
+            } else {
+                "Ready for the game"
+            };
             self.state.status = format!(
-                "Live carrier sent: {} replaced texture(s)",
-                carrier_textures.len()
+                "{sent}: {}",
+                counted(
+                    carrier_textures.len(),
+                    "replaced picture",
+                    "replaced pictures"
+                )
             );
         } else if (!carrier_authored.is_empty() || !carrier_textures.is_empty()) && !carrier_added {
-            let what = if carrier_authored.is_empty() {
-                "Texture replacements"
-            } else {
-                "Edited effects"
-            };
             self.state.status = match &carrier_error {
-                Some(e) => format!("{what} NOT sent — carrier build failed: {e}"),
-                None => {
-                    format!("{what} NOT sent — carrier was not built (see donor debug log)")
-                }
+                Some(e) => format!("Not sent: the edit could not be built ({e})"),
+                None => "Not sent: the edit could not be built".to_owned(),
             };
         }
         if carrier_needed && !carrier_added {
@@ -30722,7 +30828,7 @@ impl VisionaryApp {
                 donor_specs.retain(|spec| &spec.target != target);
             }
             if let Some(e) = &carrier_error {
-                self.state.status = format!("Live transplant carrier not built — {e}");
+                self.state.status = format!("Not sent: the edit could not be built ({e})");
             }
         }
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
@@ -30931,6 +31037,22 @@ impl VisionaryApp {
         self.eff_editor.awaiting_game = Some(std::time::Instant::now());
     }
 
+    /// Re-push the authoritative live state after every fresh plugin connection. This also
+    /// restores state when the game restarted between socket sessions. It sends every effect
+    /// edit the editor holds, so nothing is left unsent afterwards.
+    fn resend_live_state(&mut self) {
+        let spawn: Vec<_> = self.live_effect_rule_union();
+        self.game_link.send_spawn_rules(&spawn);
+        let controls: Vec<_> = self.live_effect_control_rule_union();
+        self.game_link.send_effect_control_rules(&controls);
+        let hit: Vec<_> = self.live_hitbox_rule_union();
+        self.game_link.send_hitbox_rules(&hit);
+        self.sync_eff_mods_from_editor();
+        self.push_effect_aliases();
+        self.eff_editor.mark_sent();
+        self.live_overrides.resend_tweaks(&self.game_link);
+    }
+
     fn apply_authored_eff_live(&mut self) -> String {
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return "no eff loaded — nothing to apply".to_string();
@@ -30941,8 +31063,12 @@ impl VisionaryApp {
         let owner = self.eff_owner(&rel);
         let entry = self.eff_mods.get(&owner);
         let known = entry.is_some();
+        // Effects, not parts: the status line counts one thing for one send.
         let (edits, transplants) = entry
-            .map(|e| (e.authored.len(), e.transplants.len()))
+            .map(|e| {
+                let sets: HashSet<&str> = e.authored.iter().map(|a| a.set_name.as_str()).collect();
+                (sets.len(), e.transplants.len())
+            })
             .unwrap_or((0, 0));
         // The completion condition depends on what we are asking the plugin to do. A populated
         // snapshot succeeds when a new live carrier object appears; an empty snapshot succeeds
@@ -30970,12 +31096,12 @@ impl VisionaryApp {
             self.deploy_live_eff(&owner);
         }
         let fighter = self.character_name(&crate::character::CharacterKey::parse(&owner));
-        let note = match (edits, transplants) {
-            (0, 0) => format!("{fighter}: the game plays its own effects again"),
-            (0, t) => format!("{fighter}: sending {t} borrowed effect(s)"),
-            (e, 0) => format!("{fighter}: sending {e} edited part(s)"),
-            (e, t) => format!("{fighter}: sending {e} edited part(s) and {t} borrowed effect(s)"),
+        let sending = if self.game_link.status().is_connected() {
+            "Sending to the game"
+        } else {
+            "Ready for the game"
         };
+        let note = send_note(sending, &fighter, edits, transplants);
         self.state.status = note.clone();
         note
     }
@@ -33604,7 +33730,7 @@ impl VisionaryApp {
                         let tag = painter.text(
                             egui::pos2(grid_left - 4.0, y + row_height * 0.5),
                             egui::Align2::RIGHT_CENTER,
-                            "shared",
+                            "Shared",
                             egui::FontId::proportional(9.0),
                             crate::eff_editor::SHARED_TINT,
                         );
@@ -34273,6 +34399,7 @@ impl eframe::App for VisionaryApp {
                     {
                         self.sync_eff_mods_from_editor();
                         self.push_effect_aliases();
+                        self.eff_editor.mark_sent();
                         ui.close();
                     }
                     if ui.button("Put the game back to normal")
@@ -34616,18 +34743,7 @@ impl eframe::App for VisionaryApp {
             }
             self.eff_open_seen = open_now;
         }
-        if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
-            if let Some(name) = self.eff_editor.selected_entry_name().map(str::to_owned) {
-                let frame = self.state.current_frame;
-                self.add_effect_call(&name, frame);
-                // Over to the move, with the new spawn selected for placing.
-                self.eff_editor.open = false;
-                self.node_workspace = false;
-                self.roster.open = false;
-                self.primary_tab = PrimaryEditorTab::Effects;
-                self.state.status = format!("Added {name} to the move at frame {frame}");
-            }
-        }
+        self.service_use_in_move();
         self.poll_effect_preview_build(&ctx);
         if self.eff_editor.open {
             self.poll_effect_uses(&ctx);
@@ -34919,16 +35035,7 @@ impl eframe::App for VisionaryApp {
             self.pin_sync_prompt = None;
             self.pin_sync_wait = client.map(|_| std::time::Instant::now());
             if client.is_some() {
-                // Re-push the authoritative live state after every fresh plugin connection.
-                // This also restores state when the game restarted between socket sessions.
-                let spawn: Vec<_> = self.live_effect_rule_union();
-                self.game_link.send_spawn_rules(&spawn);
-                let controls: Vec<_> = self.live_effect_control_rule_union();
-                self.game_link.send_effect_control_rules(&controls);
-                let hit: Vec<_> = self.live_hitbox_rule_union();
-                self.game_link.send_hitbox_rules(&hit);
-                self.push_effect_aliases();
-                self.live_overrides.resend_tweaks(&self.game_link);
+                self.resend_live_state();
             }
         }
         if let Some(t0) = self.pin_sync_wait {
@@ -42564,29 +42671,125 @@ mod live_effect_capture_tests {
     #[test]
     fn the_status_line_follows_the_games_answer() {
         use crate::eff_editor::SendOutcome;
-        let sending = "Sending to the game: 0 borrowed and 1 edited effect(s)";
+        let sending = send_note("Sending to the game", "Mario", 1, 0);
+        assert_eq!(sending, "Sending to the game: Mario, 1 edited effect");
         assert_eq!(
-            status_after_send(sending, SendOutcome::InGame).as_deref(),
-            Some("In the game: 0 borrowed and 1 edited effect(s)")
+            status_after_send(&sending, SendOutcome::InGame).as_deref(),
+            Some("In the game: Mario, 1 edited effect")
         );
         assert_eq!(
-            status_after_send(sending, SendOutcome::NextMatch).as_deref(),
-            Some("Saved for the next match: 0 borrowed and 1 edited effect(s)")
+            status_after_send(&sending, SendOutcome::NextMatch).as_deref(),
+            Some("Saved for the next match: Mario, 1 edited effect")
+        );
+        // A reset says what it is sending, and waits for the game like any other send.
+        let reset = send_note("Sending to the game", "Mario", 0, 0);
+        assert_eq!(reset, "Sending to the game: Mario's own effects");
+        let restored = status_after_send(&reset, SendOutcome::Restored).unwrap();
+        assert_eq!(restored, "In the game: Mario's own effects");
+        // A drop after it stops saying it is in the game.
+        assert_eq!(
+            status_after_disconnect(&restored).as_deref(),
+            Some("Ready for the game: Mario's own effects")
         );
         // Another line, such as a refusal, is not rewritten.
         assert_eq!(
             status_after_send("Removed Vision.", SendOutcome::InGame),
             None
         );
-        for line in [sending, "In the game: 0 borrowed and 1 edited effect(s)"] {
+        for line in [sending.as_str(), "In the game: Mario, 1 edited effect"] {
             assert_eq!(
                 status_after_disconnect(line).as_deref(),
-                Some("Ready for the game: 0 borrowed and 1 edited effect(s)")
+                Some("Ready for the game: Mario, 1 edited effect")
             );
         }
         assert_eq!(status_after_disconnect("Removed Vision."), None);
         // The line a push writes while connected is one the outcome rewrites.
-        assert!(alias_status_is_routine(sending));
+        assert!(alias_status_is_routine(&sending));
+        // Counted in effects with real plurals, one count style for one send.
+        assert_eq!(
+            effect_counts(2, 1),
+            "2 edited effects and 1 borrowed effect"
+        );
+        assert_eq!(effect_counts(0, 3), "3 borrowed effects");
+        assert_eq!(effect_counts(1, 0), "1 edited effect");
+        // Every send path builds its line with `send_note`, so none starts any other way.
+        let app = include_str!("app.rs");
+        let live = app
+            .split("fn apply_authored_eff_live(&mut self) -> String {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("apply_authored_eff_live");
+        assert!(live.contains("send_note(sending, &fighter, edits, transplants)"));
+        assert!(!live.contains("own effects again"));
+        // No internal words or shouting on the send's status lines.
+        let push = app
+            .split("fn send_effect_aliases(&mut self)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("send_effect_aliases");
+        // The quoted text of each status line, without the code around it.
+        let status_lines: String = push
+            .split("self.state.status =")
+            .skip(1)
+            .map(|rest| rest.split(';').next().unwrap_or(""))
+            .flat_map(|code| code.split('"').skip(1).step_by(2))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(status_lines.contains("Not sent: the edit could not be built"));
+        for word in [
+            "NOT", "carrier", "Carrier", "emitter", "sampler", "donor", "—", "(s)",
+        ] {
+            assert!(!status_lines.contains(word), "{word}");
+        }
+    }
+
+    /// "Use in <move>" adds the call and stays on the Effects page; only "Open in Classic
+    /// editor" leaves it.
+    #[test]
+    fn use_in_a_move_stays_on_the_effects_page() {
+        let body = include_str!("app.rs")
+            .split("fn service_use_in_move(&mut self) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("service_use_in_move");
+        let (adding, rest) = body.split_once("use_in_move_undo_requested").expect("undo");
+        assert!(adding.contains("self.add_effect_call(&name, frame)"));
+        assert!(!adding.contains("self.eff_editor.open = false"));
+        let (undo, classic) = rest.split_once("open_classic_requested").expect("classic");
+        assert!(undo.contains("self.delete_effect_call(*index)"));
+        assert!(!undo.contains("self.eff_editor.open = false"));
+        assert!(classic.contains("self.eff_editor.open = false"));
+    }
+
+    /// The send of everything on connect clears "unsent" the way Send edits does: the row
+    /// said "unsent" beside a status line that said the edits were sent.
+    #[test]
+    fn the_send_on_connect_leaves_nothing_unsent() {
+        let app = include_str!("app.rs");
+        let body = |name: &str| {
+            app.split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("{name}"))
+                .to_owned()
+        };
+        let resend = body("fn resend_live_state(&mut self) {");
+        // What the editor holds goes in first, then the send, then the marker goes.
+        let sync = resend
+            .find("self.sync_eff_mods_from_editor();")
+            .expect("sync");
+        let push = resend.find("self.push_effect_aliases();").expect("push");
+        let sent = resend
+            .find("self.eff_editor.mark_sent();")
+            .expect("mark_sent");
+        assert!(sync < push && push < sent);
+        // And the connection is what runs it.
+        let connect = app
+            .split("if client != self.pin_sync_client {")
+            .nth(1)
+            .and_then(|rest| rest.split("if let Some(t0) = self.pin_sync_wait").next())
+            .expect("connect");
+        assert!(connect.contains("self.resend_live_state();"));
     }
 
     /// The removal (or creation) keeps its own status line: the effect aliases' success line
@@ -42594,13 +42797,13 @@ mod live_effect_capture_tests {
     #[test]
     fn a_routine_alias_line_does_not_replace_a_characters_status() {
         assert!(alias_status_is_routine(
-            "Ready for the game: 1 borrowed and 1 edited effect(s)"
+            "Ready for the game: Mario, 1 edited effect and 1 borrowed effect"
         ));
         assert!(alias_status_is_routine(
-            "Sending to the game: 0 borrowed and 2 edited effect(s)"
+            "Sending to the game: Mario, 2 edited effects"
         ));
         assert!(!alias_status_is_routine(
-            "NOT sent — the live carrier cannot take ef_mario. Export the eff to use these."
+            "Not sent: ef_mario cannot go into a running match. Export the mod to use it."
         ));
         assert!(!alias_status_is_routine(
             "Removed Vision. Its files are still in its folder."
@@ -42621,7 +42824,7 @@ mod live_effect_capture_tests {
         for line in [
             "\"Ready for the game\"",
             "\"Sending to the game\"",
-            "\"{sent}: {} borrowed and {} edited effect(s)\"",
+            "self.state.status = send_note(",
         ] {
             assert!(push.contains(line), "{line}");
         }

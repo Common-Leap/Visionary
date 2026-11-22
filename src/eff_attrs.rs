@@ -102,6 +102,25 @@ pub enum AttrKind {
     Enum(&'static [&'static str]),
 }
 
+/// What a value is counted in, shown after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    None,
+    /// Stored as 0 to 100.
+    Percent,
+    Degrees,
+}
+
+/// The unit of attribute `id`, where its stored value is known to be one. Checked against the
+/// game's files by `units_hold_the_games_values`.
+pub fn unit_of(id: &str) -> Unit {
+    match id {
+        "particle_velocity.vel_random" => Unit::Percent,
+        "particle_velocity.diffusion_dir_angle" => Unit::Degrees,
+        _ => Unit::None,
+    }
+}
+
 pub struct Attr {
     /// Stable id and project-file key: the Rust field path.
     pub id: &'static str,
@@ -170,7 +189,7 @@ pub const G_PTCL_VELOCITY: &str = "Speed and direction";
 pub const G_PTCL_COLOR: &str = "Particle colour";
 pub const G_PTCL_SCALE: &str = "Particle size";
 pub const G_PTCL_ROTATE: &str = "Spin";
-pub const G_MOTION: &str = "Gravity & air resistance";
+pub const G_MOTION: &str = "Gravity and air resistance";
 pub const G_FLUCTUATION: &str = "Flicker";
 pub const G_ANIM_RATES: &str = "Animation timing";
 pub const G_COLOR_KEYS: &str = "Colour over life";
@@ -3239,6 +3258,72 @@ mod tests {
                 "writing '{}' also changed {spilled:?}",
                 attr.id
             );
+        }
+    }
+
+    /// A unit is only claimed where the game's own values fit it: no percent over 100 and no
+    /// angle past a full turn in any of the game's effect files.
+    #[test]
+    fn units_hold_the_games_values() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('_'))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root.join("effect"), &mut files);
+        assert!(files.len() > 300, "{} files", files.len());
+        let with_units: Vec<(usize, Unit)> = table()
+            .iter()
+            .enumerate()
+            .map(|(at, attr)| (at, unit_of(attr.id)))
+            .filter(|(_, unit)| *unit != Unit::None)
+            .collect();
+        assert_eq!(with_units.len(), 2);
+        let mut seen = vec![0usize; with_units.len()];
+        let mut largest = vec![0f32; with_units.len()];
+        for path in &files {
+            let Ok(loaded) = crate::effects::load_effect(path) else {
+                continue;
+            };
+            for em in loaded
+                .ptcl
+                .emitter_sets
+                .iter()
+                .flat_map(|set| &set.emitters)
+            {
+                for (n, (at, _)) in with_units.iter().enumerate() {
+                    if let Some(Some(value)) = em.attrs.get(*at) {
+                        seen[n] += 1;
+                        largest[n] = largest[n].max(value.as_f32().abs());
+                    }
+                }
+            }
+        }
+        for (n, (at, unit)) in with_units.iter().enumerate() {
+            let id = table()[*at].id;
+            assert!(seen[n] > 1000, "{id}: {} parts", seen[n]);
+            let limit = match unit {
+                Unit::Percent => 100.0,
+                _ => 360.0,
+            };
+            assert!(largest[n] <= limit, "{id}: {}", largest[n]);
+            eprintln!("{id}: largest {} over {} parts", largest[n], seen[n]);
         }
     }
 }

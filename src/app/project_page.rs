@@ -2036,7 +2036,7 @@ impl VisionaryApp {
             let tiles: [(Tile, &str, &str, bool); 4] = [
                 (
                     Tile::Part(Part::Effects),
-                    "Effects",
+                    "Other effect files",
                     &effects,
                     !edited.is_empty() || picked,
                 ),
@@ -2107,7 +2107,7 @@ impl VisionaryApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
-                    RichText::new("Effects of no fighter")
+                    RichText::new("Other effect files")
                         .size(19.0)
                         .strong()
                         .color(look.text),
