@@ -10951,8 +10951,11 @@ mod link_policy_tests {
             Duration::from_secs(secs) >= t.ping * 4,
             "plugin limit {secs}s"
         );
-        // The notice the plugin sends a replaced editor is the one handled here.
-        assert!(plugin.contains(r#"{"header":"Replaced","body":"{}"}"#));
+        // The plugin serves an editor on its accept thread, with no Accept pending meanwhile:
+        // a receive thread beside a pending Accept stopped every write after the second batch
+        // on Eden, and the editor never heard a carrier report or a pong again.
+        assert!(plugin.contains("            receive_loop(client);"));
+        assert!(!plugin.contains("spawn(move || receive_loop"));
     }
 
     #[test]

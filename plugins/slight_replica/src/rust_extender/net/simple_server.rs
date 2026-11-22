@@ -32,9 +32,6 @@ const SEND_BATCH_CAP: usize = 256;
 const FRAME_OPEN: &str = "<TCP_MESSAGE>";
 const FRAME_CLOSE: &str = "</TCP_MESSAGE>";
 const PONG_INNER: &str = r#"{"header":"Pong","body":"{}"}"#;
-/// Told to the current editor just before a newer one takes over, so it does not dial back and
-/// knock the newcomer off in turn. The desktop `GameLink` stops on it.
-const REPLACED_INNER: &str = r#"{"header":"Replaced","body":"{}"}"#;
 /// An editor not heard from for this long is dropped. Several missed pings, so a slow Wi-Fi link
 /// keeps its session; the desktop test `the_limits_suit_a_switch_on_wifi_and_the_plugin` pins it.
 const CLIENT_SILENCE_SECS: u64 = 30;
@@ -164,17 +161,6 @@ fn server_loop(port: u16) {
                 continue;
             }
             failures = 0;
-            // A new editor replaces the current one. The old socket may be dead without a FIN
-            // (Wi-Fi lost, PC asleep), and serving one client at a time used to leave every new
-            // editor queued behind it until TCP gave up minutes later.
-            let previous = CLIENT_FD.load(Ordering::Acquire);
-            if previous >= 0 {
-                crate::slight::diag::note(format!(
-                    "SRV new editor fd={client} replaces fd={previous}"
-                ));
-                tell_replaced(previous);
-                mark_client_disconnected(previous);
-            }
             // Keep the client unpublished while the two handshake frames are sent.  The sender
             // thread keys off CLIENT_FD, so publishing it first would let queued application
             // frames race ahead of RemoveAll/GiveClientId on a reconnect.
@@ -188,9 +174,13 @@ fn server_loop(port: u16) {
             LAST_RX_TICK.store(now_tick(), Ordering::Release);
             CLIENT_FD.store(client, Ordering::Release);
             crate::rust_extender::debuggable_server::on_rpm_client_connected(cid);
-            // Inbound only, on its own thread so this one can take the next editor. Recv
-            // blocks until data/disconnect; outbound is the sender thread's job.
-            thread::spawn(move || receive_loop(client));
+            // Inbound only, on this thread: no Accept may be pending while an editor is served.
+            // Receiving on a thread of its own, with this one back in Accept, stopped the
+            // sender's writes after its second batch on Eden (outbox grew for the rest of the
+            // match, so the editor never heard a carrier report again). An editor that goes
+            // silent is dropped by `watchdog_loop`, which ends this loop and frees Accept for
+            // the next one.
+            receive_loop(client);
         }
     }
 }
@@ -272,20 +262,6 @@ fn receive_loop(client: i32) {
         unsafe { recv_once(client, &mut buf) };
     }
     close_client(client);
-}
-
-/// Best-effort `Replaced` notice to the editor being displaced. Never waits on a sender that may
-/// be blocked on a dead socket: if the write lock does not come free quickly, skip the notice.
-fn tell_replaced(client: i32) {
-    for _ in 0..200 {
-        if let Some(_guard) = SEND_LOCK.try_lock() {
-            unsafe {
-                let _ = send_frame_unlocked(client, REPLACED_INNER);
-            }
-            return;
-        }
-        sleep_ms(1);
-    }
 }
 
 /// The one line a reader should be able to grep `diag.txt` for. Kept short and unmistakable so
@@ -631,7 +607,8 @@ mod tests {
 
     #[test]
     fn extractor_reassembles_torn_frames_and_recovers_from_orphan_close() {
-        let mut buf = format!("stale{FRAME_CLOSE}{FRAME_OPEN}{{\"command\":\"ping\"}}").into_bytes();
+        let mut buf =
+            format!("stale{FRAME_CLOSE}{FRAME_OPEN}{{\"command\":\"ping\"}}").into_bytes();
         assert!(extract_payloads(&mut buf).is_empty());
         buf.extend_from_slice(FRAME_CLOSE.as_bytes());
         assert_eq!(
@@ -643,7 +620,8 @@ mod tests {
 
     #[test]
     fn extractor_handles_multiple_frames_in_one_read() {
-        let mut buf = format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}").into_bytes();
+        let mut buf =
+            format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}").into_bytes();
         assert_eq!(extract_payloads(&mut buf), vec!["one", "two"]);
         assert!(buf.is_empty());
     }
