@@ -232,6 +232,60 @@ pub const GROUPS: &[&str] = &[
     G_TEXUV2,
 ];
 
+/// The sections the groups are filed under, in the order the UI stacks them: the six questions
+/// someone changing an effect asks (where and when, how it moves, its colour and size, how it is
+/// drawn, which textures, what its child parts take).
+pub const SECTIONS: &[(&str, &[&str])] = &[
+    (
+        "Where and when",
+        &[G_COMMON, G_EMISSION, G_SHAPE, G_INFO, G_INFO_FLAGS],
+    ),
+    (
+        "Movement",
+        &[
+            G_PARTICLE,
+            G_PTCL_VELOCITY,
+            G_MOTION,
+            G_PTCL_ROTATE,
+            G_FLUCTUATION,
+        ],
+    ),
+    (
+        "Colour and size",
+        &[
+            G_PTCL_COLOR,
+            G_PTCL_SCALE,
+            G_COMBINER,
+            G_COLOR_KEYS,
+            G_ALPHA_KEYS,
+            G_SCALE_KEYS,
+        ],
+    ),
+    (
+        "Drawing",
+        &[G_RENDER, G_ALPHA_FX, G_SHADER, G_PARAM_KEYS, G_ANIM_RATES],
+    ),
+    (
+        "Textures",
+        &[
+            G_SAMPLER0, G_TEXANIM0, G_TEXPAT0, G_TEXUV0, G_SAMPLER1, G_TEXANIM1, G_TEXPAT1,
+            G_TEXUV1, G_SAMPLER2, G_TEXANIM2, G_TEXPAT2, G_TEXUV2,
+        ],
+    ),
+    ("Child parts", &[G_INHERIT]),
+];
+
+/// The texture slot (0 to 2) a group belongs to, for the groups filed under "Textures".
+pub fn texture_slot_of(group: &str) -> Option<usize> {
+    [
+        [G_SAMPLER0, G_TEXANIM0, G_TEXPAT0, G_TEXUV0],
+        [G_SAMPLER1, G_TEXANIM1, G_TEXPAT1, G_TEXUV1],
+        [G_SAMPLER2, G_TEXANIM2, G_TEXPAT2, G_TEXUV2],
+    ]
+    .iter()
+    .position(|slot| slot.contains(&group))
+}
+
 // ── Table constructors ────────────────────────────────────────────────────────
 //
 // Each macro builds one row. The closures are non-capturing, so they coerce to the `fn` pointers
@@ -254,6 +308,18 @@ macro_rules! it {
         Attr {
             id: $id, group: $g, label: $label, doc: $doc,
             kind: AttrKind::Int,
+            get: |d| Some(AttrValue::Int(d.$($f).+ as i64)),
+            set: |d, v| AssignI64::assign_i64(&mut d.$($f).+, v.as_i64()),
+        }
+    };
+}
+
+/// A whole number with a name per value, stored as the field's integer.
+macro_rules! en {
+    ($g:expr, $id:expr, $label:expr, $doc:expr, $names:expr, $($f:ident).+) => {
+        Attr {
+            id: $id, group: $g, label: $label, doc: $doc,
+            kind: AttrKind::Enum($names),
             get: |d| Some(AttrValue::Int(d.$($f).+ as i64)),
             set: |d, v| AssignI64::assign_i64(&mut d.$($f).+, v.as_i64()),
         }
@@ -479,6 +545,34 @@ macro_rules! cmb_wide_fg {
 
 pub const WRAP_MODES: &[&str] = &["Mirror", "Repeat", "ClampEdge", "MirrorOnce"];
 pub const COLOR_TYPES: &[&str] = &["Constant", "Random", "Animated 8-key"];
+/// How a part mixes with what is behind it, as eff_wgpu's renderer reads the value
+/// (`Blend::from_type`, src/render.rs).
+pub const BLEND_TYPES: &[&str] = &["Normal", "Add", "Subtract", "Multiply", "Screen"];
+/// How a texture is sampled: eff_wgpu's renderer samples the nearest pixel for any value but 0
+/// (`make_sampler`, src/render.rs).
+pub const FILTER_MODES: &[&str] = &["Smooth", "Sharp pixels"];
+/// Whether a part's particles move with the effect: eff_wgpu's simulation keeps them where they
+/// were made for 1 only (src/sim.rs, the `follows` reads of 0x753). Other values have no name.
+pub const FOLLOW_TYPES: &[&str] = &["Follow the effect", "Stay where they were made"];
+/// The shape particles start in, as eff_wgpu's simulation places them for each value
+/// (`match shape.volume_type`, src/sim.rs).
+pub const VOLUME_TYPES: &[&str] = &[
+    "Point",
+    "Circle",
+    "Circle in equal steps",
+    "Filled circle",
+    "Sphere",
+    "Sphere in 32 equal steps",
+    "Sphere in 64 equal steps",
+    "Filled sphere",
+    "Cylinder",
+    "Filled cylinder",
+    "Box",
+    "Filled box",
+    "Line",
+    "Line in equal steps",
+    "Rectangle",
+];
 
 fn build() -> Vec<Attr> {
     let mut v = Vec::with_capacity(320);
@@ -705,11 +799,12 @@ fn emission() -> Vec<Attr> {
 
 fn shape() -> Vec<Attr> {
     vec![
-        it!(
+        en!(
             G_SHAPE,
             "shape_info.volume_type",
-            "Volume type",
-            "Emitter volume type",
+            "Shape",
+            "The shape the particles start in",
+            VOLUME_TYPES,
             shape_info.volume_type
         ),
         it!(
@@ -723,7 +818,8 @@ fn shape() -> Vec<Attr> {
             G_SHAPE,
             "shape_info.arc_type",
             "Arc type",
-            "Arc type",
+            "For a sphere: 1 makes the particles start in a cap around one axis (Volume latitude \
+             sets its size); other values use the swept arc",
             shape_info.arc_type
         ),
         fg!(
@@ -940,7 +1036,7 @@ fn emitter_info() -> Vec<Attr> {
             G_INFO_FLAGS,
             "emitter_info.sort_type",
             "Sort type",
-            "Particle sort type",
+            "The order this part's particles are drawn in",
             emitter_info.sort_type
         ),
         it!(
@@ -950,11 +1046,13 @@ fn emitter_info() -> Vec<Attr> {
             "Behavior calculation type",
             emitter_info.calc_type
         ),
-        it!(
+        en!(
             G_INFO_FLAGS,
             "emitter_info.follow_type",
-            "Follow type",
-            "Emitter follow type",
+            "Particles",
+            "Whether the particles move with the effect once they are made, or stay where they \
+             were made",
+            FOLLOW_TYPES,
             emitter_info.follow_type
         ),
         fg!(
@@ -1282,21 +1380,21 @@ fn particle() -> Vec<Attr> {
             G_PARTICLE,
             "particle_data.billboard_type",
             "Billboard type",
-            "Billboard type",
+            "How each particle turns toward the camera",
             particle_data.billboard_type
         ),
         it!(
             G_PARTICLE,
             "particle_data.rot_type",
             "Rotation type",
-            "Rotation type",
+            "How the particles' spin is applied",
             particle_data.rot_type
         ),
         it!(
             G_PARTICLE,
             "particle_data.offset_type",
             "Offset type",
-            "Camera depth offset type",
+            "How the part is pushed toward or away from the camera",
             particle_data.offset_type
         ),
         fb!(
@@ -1345,7 +1443,7 @@ fn particle() -> Vec<Attr> {
             G_PARTICLE,
             "particle_data.primitive_scale_type",
             "Primitive scale type",
-            "Primitive scale application type",
+            "How the part's size is applied to the model it draws",
             particle_data.primitive_scale_type
         ),
         it!(
@@ -1891,7 +1989,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             G_FLUCTUATION,
             "particle_fluctuation.is_wave_type",
             "Wave type",
-            "Fluctuation waveform type",
+            "The shape of the flicker's wave",
             particle_fluctuation,
             is_wave_type
         ),
@@ -2104,11 +2202,13 @@ fn render_and_combiner() -> Vec<Attr> {
             "Alpha test pass conditions",
             render_state.alpha_func
         ),
-        it!(
+        en!(
             G_RENDER,
             "render_state.blend_type",
-            "Blend type",
-            "Blending type for blending with the framebuffer",
+            "Blend mode",
+            "How the part's colour mixes with what is behind it. Add and Screen brighten, for a \
+             glow; Subtract and Multiply darken.",
+            BLEND_TYPES,
             render_state.blend_type
         ),
         it!(
@@ -2234,14 +2334,14 @@ fn render_and_combiner() -> Vec<Attr> {
             G_COMBINER,
             "combiner.color_combiner_process",
             "Colour process",
-            "Colour calculation formula type",
+            "How the colour inputs are combined",
             color_combiner_process
         ),
         cmb!(
             G_COMBINER,
             "combiner.alpha_combiner_process",
             "Alpha process",
-            "Alpha calculation formula type",
+            "How the opacity inputs are combined",
             alpha_combiner_process
         ),
         cmb_fg!(
@@ -2346,7 +2446,7 @@ fn render_and_combiner() -> Vec<Attr> {
             G_COMBINER,
             "combiner.shader_type",
             "Shader type",
-            "Shader type",
+            "The kind of shader that draws the part",
             shader_type
         ),
         cmb_wide!(
@@ -2384,7 +2484,7 @@ fn inheritance_and_shader() -> Vec<Attr> {
         fl!(G_INHERIT, "child_inheritance.velocity_rate", "Velocity rate", "Inherited velocity ratio", 0.01, child_inheritance.velocity_rate),
         fl!(G_INHERIT, "child_inheritance.scale_rate", "Scale rate", "Inherited scale ratio", 0.01, child_inheritance.scale_rate),
         it!(G_SHADER, "action.action_index", "Custom action index", "Selected custom action index", action.action_index),
-        it!(G_SHADER, "shader_references.type_", "Shader type", "Shader type", shader_references.type_),
+        it!(G_SHADER, "shader_references.type_", "Shader type", "The kind of shader that draws the part", shader_references.type_),
         it!(G_SHADER, "shader_references.shader_index", "Shader index", "Shader index to use. Pointing this outside the variations this eff ships is what makes a file fail to load.", shader_references.shader_index),
         it!(G_SHADER, "shader_references.compute_shader_index", "Compute shader index", "Compute shader index to use", shader_references.compute_shader_index),
         it!(G_SHADER, "shader_references.user_shader_index1", "User shader index 1", "User shader index 1", shader_references.user_shader_index1),
@@ -2426,7 +2526,14 @@ fn samplers() -> Vec<Attr> {
                     get: |d| d.$opt.as_ref().map(|s| AttrValue::Int(s.wrap_v.as_u8() as i64)),
                     set: |d, v| { if let Some(s) = d.$opt.as_mut() { s.wrap_v = WrapMode::from_u8(v.as_i64().clamp(0, 255) as u8); } },
                 },
-                opt_it!($g, ids[2], "Filter", "Filter mode", $opt, filter),
+                Attr {
+                    id: ids[2], group: $g, label: "Filter",
+                    doc: "Whether the texture is smoothed or drawn as sharp pixels when it is \
+                          scaled",
+                    kind: AttrKind::Enum(FILTER_MODES),
+                    get: |d| d.$opt.as_ref().map(|s| AttrValue::Int(s.filter as i64)),
+                    set: |d, v| { if let Some(s) = d.$opt.as_mut() { AssignI64::assign_i64(&mut s.filter, v.as_i64()); } },
+                },
                 opt_fg!($g, ids[3], "Sphere map", "Whether a sphere map is used", $opt, is_sphere_map),
                 opt_fl!($g, ids[4], "Max LOD", "Effective mip level (0.0 to 15.99)", 0.1, $opt, max_lod),
                 opt_fl!($g, ids[5], "LOD bias", "Mip level bias", 0.1, $opt, lod_bias),
@@ -2434,7 +2541,7 @@ fn samplers() -> Vec<Attr> {
                 opt_fg!($g, ids[7], "Fix density U", "Fix texture density option U", $opt, is_density_fixed_u),
                 opt_fg!($g, ids[8], "Fix density V", "Fix texture density option V", $opt, is_density_fixed_v),
                 opt_fg!($g, ids[9], "Square RGB", "Whether to square the texture's RGB values when reading them", $opt, is_square_rgb),
-                opt_uit!($g, ids[10], "Texture GUID", "GUID of the texture this sampler reads. The Texture panel is the safe way to change this — a GUID the pool has no descriptor for samples nothing.", $opt, texture_id),
+                opt_uit!($g, ids[10], "Texture", "The texture this slot reads, by its id. Pick it in the Texture section: an id the file has no texture for samples nothing.", $opt, texture_id),
                 Attr {
                     id: ids[11], group: $g, label: "External texture",
                     doc: "Whether the texture is stored in another binary", kind: AttrKind::Flag,

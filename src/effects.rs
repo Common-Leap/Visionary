@@ -74,6 +74,9 @@ pub struct EmitterSet {
 #[derive(Debug, Clone)]
 pub struct TextureInfo {
     pub tex_name: String,
+    /// The id texture slots name this texture by. None for a texture added in the editor, which
+    /// is given one when the file is written.
+    pub id: Option<u64>,
     /// Zero when the pool's BNTX could not be read for this entry.
     pub width: u32,
     pub height: u32,
@@ -258,6 +261,7 @@ fn convert_ptcl(source: &effect_library::PtclFile) -> PtclFile {
                 .and_then(|pool| crate::texture_import::describe(pool, index, &texture.name).ok());
             TextureInfo {
                 tex_name: texture.name.clone(),
+                id: Some(texture.id),
                 width: described.as_ref().map(|d| d.width).unwrap_or(0),
                 height: described.as_ref().map(|d| d.height).unwrap_or(0),
                 format: described

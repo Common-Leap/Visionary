@@ -505,6 +505,10 @@ pub struct EffEditor {
     /// Pool index + info of the texture the selected emitter samples, published by the emitter
     /// column for the texture panel on the right.
     selected_texture: Option<(usize, TextureInfo)>,
+    /// The texture slots the selected part samples a pool texture through, as (slot, pool
+    /// index), and the slot the Texture section shows.
+    texture_slots: Vec<(usize, usize)>,
+    texture_slot: usize,
     /// Decoded thumbnail for the selected texture. `None` in the second slot means "tried and
     /// could not" — kept so a failing texture is not re-decoded every frame.
     texture_preview: Option<(TexturePreviewKey, Option<egui::TextureHandle>)>,
@@ -660,6 +664,8 @@ impl Default for EffEditor {
             texture_imports: Vec::new(),
             texture_note: None,
             selected_texture: None,
+            texture_slots: Vec::new(),
+            texture_slot: 0,
             texture_preview: None,
             show_raw_textures: false,
             texture_form_note: String::new(),
@@ -929,16 +935,24 @@ const SPREAD_ATTRS: [&str; 3] = [
 /// clamped into range — vanilla data does carry a few, and silently rewriting one to "the nearest
 /// thing we have a name for" would be an edit the user never made.
 fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue) -> bool {
+    attr_control(ui, attr, value).0
+}
+
+/// [`attr_widget`], with the control's response for a hover or a menu.
+fn attr_control(
+    ui: &mut Ui,
+    attr: &crate::eff_attrs::Attr,
+    value: &mut AttrValue,
+) -> (bool, egui::Response) {
     match attr.kind {
         AttrKind::Float { speed } => {
             let mut v = value.as_f32();
-            let changed = ui
-                .add(egui::DragValue::new(&mut v).speed(speed as f64))
-                .changed();
+            let response = ui.add(egui::DragValue::new(&mut v).speed(speed as f64));
+            let changed = response.changed();
             if changed {
                 *value = AttrValue::Float(v);
             }
-            changed
+            (changed, response)
         }
         AttrKind::Int => {
             let mut v = value.as_i64();
@@ -946,49 +960,49 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
             if crate::eff_attrs::is_key_count(attr.id) {
                 drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as i64);
             }
-            let changed = ui.add(drag).changed();
+            let response = ui.add(drag);
+            let changed = response.changed();
             if changed {
                 *value = AttrValue::Int(v);
             }
-            changed
+            (changed, response)
         }
         AttrKind::UInt if crate::eff_attrs::is_key_count(attr.id) => {
             let mut v = value.as_u64();
             let drag = egui::DragValue::new(&mut v)
                 .speed(1.0)
                 .range(0..=crate::eff_attrs::KEY_SLOTS as u64);
-            let changed = ui.add(drag).changed();
+            let response = ui.add(drag);
+            let changed = response.changed();
             if changed {
                 *value = AttrValue::UInt(v);
             }
-            changed
+            (changed, response)
         }
         // Ids, seeds and flag words: typed, because a drag goes through f64 and cannot hold a
         // 64-bit id (u64::MAX, "none", showed as 18446744073709551616).
         AttrKind::UInt => {
             let mut v = value.as_u64();
-            let changed = uint_text_edit(ui, attr.id, &mut v);
+            let (changed, response) = uint_text_edit(ui, attr.id, &mut v);
             if changed {
                 *value = AttrValue::UInt(v);
             }
-            changed
+            (changed, response)
         }
         AttrKind::Flag => {
             let mut on = value.as_bool();
-            let changed = ui.checkbox(&mut on, "").changed();
+            let response = ui.checkbox(&mut on, "");
+            let changed = response.changed();
             if changed {
                 *value = AttrValue::Int(i64::from(on));
             }
-            changed
+            (changed, response)
         }
         AttrKind::Enum(names) => {
             let current = value.as_i64();
-            let label = names
-                .get(current.max(0) as usize)
-                .map(|n| (*n).to_string())
-                .unwrap_or_else(|| format!("{current} (unnamed)"));
+            let label = enum_label(names, current);
             let mut changed = false;
-            egui::ComboBox::from_id_salt(attr.id)
+            let response = egui::ComboBox::from_id_salt(attr.id)
                 .selected_text(label)
                 .show_ui(ui, |ui| {
                     for (i, name) in names.iter().enumerate() {
@@ -997,25 +1011,43 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
                             changed = true;
                         }
                     }
-                });
-            changed
+                })
+                .response
+                .on_hover_text(format!("Stored as {current}"));
+            (changed, response)
         }
     }
 }
 
-/// The Look tab's bottom split, holding the part's texture and the game's view: its smallest,
-/// starting and largest heights in a right panel this tall. With a texture it always fits the
-/// picture and the buttons under it; with no texture and no game it holds one line.
-fn texture_split_sizes(panel_height: f32, has_texture: bool, connected: bool) -> (f32, f32, f32) {
-    if !has_texture && !connected {
-        return (40.0, 40.0, 40.0);
-    }
-    // The picture is 112 px; with the picker, the raw-channels box and the button row it needs
-    // 200. It starts there, leaving the rest to the settings above, and drags taller.
-    let max = (panel_height * 0.6).max(200.0);
-    let min = 200.0_f32.min(max);
+/// A named choice's label: its name, or "Other (N)" for a value with no name.
+fn enum_label(names: &[&str], value: i64) -> String {
+    usize::try_from(value)
+        .ok()
+        .and_then(|i| names.get(i))
+        .map(|n| (*n).to_string())
+        .unwrap_or_else(|| format!("Other ({value})"))
+}
+
+/// The right panel's bottom split, holding the game's view while one is connected: its smallest,
+/// starting and largest heights in a right panel this tall.
+fn game_split_sizes(panel_height: f32) -> (f32, f32, f32) {
+    // The settings above keep at least half the panel.
+    let max = (panel_height * 0.5).max(80.0);
+    let min = 80.0_f32.min(max);
     let default = (panel_height * 0.3).clamp(min, max);
     (min, default, max)
+}
+
+/// Why Send edits cannot be clicked without a game: one plain line, not the socket's error.
+fn send_blocked_text(view: &crate::game_link::LinkView) -> String {
+    let state = match (view.status, view.dialled) {
+        (crate::game_link::LinkStatus::Connecting, Some(addr)) => {
+            format!("Looking for the game at {addr}")
+        }
+        (_, Some(addr)) => format!("Game not running at {addr}"),
+        (status, None) => status.label().to_owned(),
+    };
+    format!("Connect to the game first.\n\n{state}")
 }
 
 /// What each effect is listed as: its name in words, as the timeline shows it, or its file name
@@ -1091,7 +1123,7 @@ fn parse_uint_text(text: &str) -> Option<u64> {
 
 /// A text box for a whole number. While it has focus the typed text is kept as typed, so a
 /// half-typed number is not snapped back; the value changes when the text reads as a number.
-fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
+fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> (bool, egui::Response) {
     let id = ui.make_persistent_id(("uint_text", id_salt));
     let mut text = ui
         .data(|d| d.get_temp::<String>(id))
@@ -1111,7 +1143,101 @@ fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
     }
-    changed
+    (changed, response)
+}
+
+/// The attribute holding each texture slot's texture id. Slot 1's is read into
+/// `EmitterDef::texture_index` at load.
+const TEXTURE_SLOT_IDS: [&str; 3] = [
+    "sampler0.texture_id",
+    "sampler1.texture_id",
+    "sampler2.texture_id",
+];
+
+/// The texture slots `em` samples a pool texture through, as (slot, pool index). A slot whose id
+/// is the all-ones "none" value, or names no texture in this file, is left out.
+fn texture_slots(em: &EmitterDef, textures: &[TextureInfo]) -> Vec<(usize, usize)> {
+    let mut slots = Vec::new();
+    if let Some(at) = em
+        .texture_index
+        .map(|i| i as usize)
+        .filter(|i| *i < textures.len())
+    {
+        slots.push((0, at));
+    }
+    for (slot, id) in TEXTURE_SLOT_IDS.iter().enumerate().skip(1) {
+        let Some(guid) = attr(em, id)
+            .map(|v| v.as_u64())
+            .filter(|guid| *guid != u64::MAX)
+        else {
+            continue;
+        };
+        if let Some(at) = textures.iter().position(|t| t.id == Some(guid)) {
+            slots.push((slot, at));
+        }
+    }
+    slots
+}
+
+/// A part's name in words, as the effect list names effects: "flare1" reads "Flare 1".
+fn part_words(name: &str) -> String {
+    let mut words = String::new();
+    let mut last: Option<char> = None;
+    for c in name.chars() {
+        let c = if c == '_' { ' ' } else { c };
+        if let Some(prev) = last {
+            let boundary = (prev.is_ascii_alphabetic() && c.is_ascii_digit())
+                || (prev.is_ascii_digit() && c.is_ascii_alphabetic());
+            if boundary {
+                words.push(' ');
+            }
+        }
+        words.push(c);
+        last = Some(c);
+    }
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => words,
+    }
+}
+
+/// What each part is shown as: its name in words, or its own name where two would read the
+/// same, or "Part N" when it has none.
+fn part_list_names(names: &[&str]) -> Vec<String> {
+    let words: Vec<String> = names.iter().map(|name| part_words(name)).collect();
+    words
+        .iter()
+        .zip(names)
+        .enumerate()
+        .map(|(i, (word, name))| {
+            if name.is_empty() {
+                format!("Part {}", i + 1)
+            } else if words.iter().filter(|other| *other == word).count() > 1 {
+                (*name).to_owned()
+            } else {
+                word.clone()
+            }
+        })
+        .collect()
+}
+
+/// The selected part, and the file's own values for it.
+fn part_mut<'a>(
+    ptcl: &'a mut Option<PtclFile>,
+    pristine: &'a [Vec<EmitterSnapshot>],
+    set_idx: usize,
+    part: usize,
+) -> Option<(&'a mut EmitterDef, &'a EmitterSnapshot)> {
+    let em = ptcl
+        .as_mut()?
+        .emitter_sets
+        .get_mut(set_idx)?
+        .emitters
+        .get_mut(part)?;
+    let pr = pristine.get(set_idx)?.get(em.source_idx)?;
+    Some((em, pr))
 }
 
 /// How an attribute's value reads in the "orig" column.
@@ -1121,10 +1247,7 @@ fn attr_text(attr: &crate::eff_attrs::Attr, value: AttrValue) -> String {
         AttrKind::Int => value.as_i64().to_string(),
         AttrKind::UInt => uint_text(value.as_u64()),
         AttrKind::Flag => if value.as_bool() { "on" } else { "off" }.to_string(),
-        AttrKind::Enum(names) => names
-            .get(value.as_i64().max(0) as usize)
-            .map(|n| (*n).to_string())
-            .unwrap_or_else(|| value.as_i64().to_string()),
+        AttrKind::Enum(names) => enum_label(names, value.as_i64()),
     }
 }
 
@@ -1138,13 +1261,14 @@ fn attr_rows_by_index(
     em: &mut EmitterDef,
     pr: &EmitterSnapshot,
     indices: &[usize],
+    textures: &[TextureInfo],
 ) -> bool {
     let mut changed = false;
     egui::Grid::new(salt)
         .num_columns(3)
         .striped(true)
         .show(ui, |ui| {
-            changed = attr_grid_rows(ui, em, pr, indices);
+            changed = attr_grid_rows(ui, em, pr, indices, textures);
         });
     changed
 }
@@ -1156,6 +1280,7 @@ fn attr_grid_rows(
     em: &mut EmitterDef,
     pr: &EmitterSnapshot,
     indices: &[usize],
+    textures: &[TextureInfo],
 ) -> bool {
     let table = crate::eff_attrs::table();
     let mut changed = false;
@@ -1174,7 +1299,25 @@ fn attr_grid_rows(
         ui.label(label)
             .on_hover_text(format!("{}\n\n{}", attr.doc, attr.id));
 
-        if attr_widget(ui, attr, &mut value) {
+        // A texture id that names a texture in this file reads as that texture; the Texture
+        // section is where it is changed.
+        let texture_name = |id: u64| {
+            textures
+                .iter()
+                .find(|t| t.id == Some(id))
+                .map(|t| t.tex_name.clone())
+        };
+        let named = attr
+            .id
+            .ends_with(".texture_id")
+            .then(|| texture_name(value.as_u64()))
+            .flatten();
+        if let Some(name) = named {
+            ui.label(name).on_hover_text(format!(
+                "Texture id {}. Pick another in the Texture section.",
+                value.as_u64()
+            ));
+        } else if attr_widget(ui, attr, &mut value) {
             em.attrs[i] = Some(value);
             changed = true;
         }
@@ -1184,8 +1327,14 @@ fn attr_grid_rows(
                 // The file's value only matters once it differs; on every row it was
                 // a column of noise repeating the field beside it.
                 if edited {
+                    let was = attr
+                        .id
+                        .ends_with(".texture_id")
+                        .then(|| texture_name(orig.as_u64()))
+                        .flatten()
+                        .unwrap_or_else(|| attr_text(attr, orig));
                     ui.label(
-                        egui::RichText::new(format!("was {}", attr_text(attr, orig)))
+                        egui::RichText::new(format!("was {was}"))
                             .small()
                             .color(egui::Color32::GRAY),
                     );
@@ -1245,6 +1394,7 @@ fn draw_attribute_groups(
     em: &mut EmitterDef,
     pr: &EmitterSnapshot,
     filter: &mut String,
+    textures: &[TextureInfo],
 ) -> bool {
     let table = crate::eff_attrs::table();
     ui.horizontal(|ui| {
@@ -1300,54 +1450,135 @@ fn draw_attribute_groups(
     // Texture slots 2 and 3 sample nothing on most parts; their settings are kept, folded under
     // one header instead of eight.
     let unused = unused_texture_groups(em);
-    let (spare, used): (Vec<_>, Vec<_>) = groups
-        .into_iter()
-        .partition(|(group, _, _)| unused.contains(group));
 
     let mut changed = false;
     let filtering = !needle.is_empty();
-    let mut draw_group = |ui: &mut Ui, group: &str, rows: &[usize], edited: usize| {
-        let heading = if edited > 0 {
-            egui::RichText::new(format!("{group}  ({}, {edited} edited)", rows.len()))
+    let heading = |name: &str, rows: usize, edited: usize| {
+        if edited > 0 {
+            egui::RichText::new(format!("{name}  ({rows}, {edited} edited)"))
                 .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
         } else {
-            egui::RichText::new(format!("{group}  ({})", rows.len()))
-        };
+            egui::RichText::new(format!("{name}  ({rows})"))
+        }
+    };
+    let totals = |list: &[&(&str, Vec<usize>, usize)]| {
+        list.iter().fold((0, 0), |(rows, edited), (_, r, e)| {
+            (rows + r.len(), edited + e)
+        })
+    };
+    let mut draw_group = |ui: &mut Ui, group: &str, shown: &str, rows: &[usize], edited: usize| {
         // A filter opens every group holding a match: `default_open` alone only applied the
         // first time a group was seen, so groups closed before stayed closed.
-        egui::CollapsingHeader::new(heading)
+        egui::CollapsingHeader::new(heading(shown, rows.len(), edited))
             .id_salt(group)
             .default_open(edited > 0)
             .open(filtering.then_some(true))
             .show(ui, |ui| {
-                changed |= attr_rows_by_index(ui, group, em, pr, rows);
+                changed |= attr_rows_by_index(ui, group, em, pr, rows, textures);
             });
     };
-    for (group, rows, edited) in &used {
-        draw_group(ui, group, rows, *edited);
-    }
-    if !spare.is_empty() {
-        let edited: usize = spare.iter().map(|(_, _, edited)| edited).sum();
-        let heading = if edited > 0 {
-            egui::RichText::new(format!("Unused texture slots  ({edited} edited)"))
-                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
-        } else {
-            egui::RichText::new("Unused texture slots")
-        };
-        egui::CollapsingHeader::new(heading)
-            .id_salt("unused_texture_slots")
+    // Six sections of groups, rather than thirty headers in a row. A group no section names
+    // goes under "Other", so a group added to the table is never out of reach.
+    let filed: Vec<&str> = crate::eff_attrs::SECTIONS
+        .iter()
+        .flat_map(|(_, members)| members.iter().copied())
+        .collect();
+    let other: Vec<&str> = crate::eff_attrs::GROUPS
+        .iter()
+        .copied()
+        .filter(|group| !filed.contains(group))
+        .collect();
+    let sections = crate::eff_attrs::SECTIONS
+        .iter()
+        .map(|(name, members)| (*name, members.to_vec()))
+        .chain((!other.is_empty()).then_some(("Other", other)));
+    for (section, members) in sections {
+        // In the section's own order: where the table lists them put a colour group eight
+        // headers from its "over life" partner.
+        let present: Vec<&(&str, Vec<usize>, usize)> = members
+            .iter()
+            .filter_map(|member| groups.iter().find(|(group, _, _)| group == member))
+            .collect();
+        if present.is_empty() {
+            continue;
+        }
+        let (rows, edited) = totals(&present);
+        egui::CollapsingHeader::new(heading(section, rows, edited).strong())
+            .id_salt(("attr_section", section))
             .default_open(edited > 0)
             .open(filtering.then_some(true))
             .show(ui, |ui| {
-                for (group, rows, edited) in &spare {
-                    draw_group(ui, group, rows, *edited);
+                let by_slot = present
+                    .iter()
+                    .any(|(group, _, _)| crate::eff_attrs::texture_slot_of(group).is_some());
+                if !by_slot {
+                    for (group, rows, edited) in &present {
+                        draw_group(ui, group, group, rows, *edited);
+                    }
+                    return;
                 }
-            })
-            .header_response
-            .on_hover_text(
-                "The settings of texture slots this part samples no texture through. They are \
-                 kept as the file has them.",
-            );
+                // One header per texture slot, each holding that slot's groups.
+                for slot in 0..3 {
+                    let slot_groups: Vec<&(&str, Vec<usize>, usize)> = present
+                        .iter()
+                        .copied()
+                        .filter(|(group, _, _)| {
+                            crate::eff_attrs::texture_slot_of(group) == Some(slot)
+                                && !unused.contains(group)
+                        })
+                        .collect();
+                    if slot_groups.is_empty() {
+                        continue;
+                    }
+                    let (rows, edited) = totals(&slot_groups);
+                    let title = format!("Texture {}", slot + 1);
+                    egui::CollapsingHeader::new(heading(&title, rows, edited))
+                        .id_salt(("attr_texture_slot", slot))
+                        .default_open(edited > 0)
+                        .open(filtering.then_some(true))
+                        .show(ui, |ui| {
+                            for (group, rows, edited) in &slot_groups {
+                                // "Texture 2 sampling" reads "Sampling" under "Texture 2".
+                                let shown = group
+                                    .strip_prefix(title.as_str())
+                                    .map(str::trim)
+                                    .map(|rest| {
+                                        let mut chars = rest.chars();
+                                        chars
+                                            .next()
+                                            .map(|c| c.to_uppercase().chain(chars).collect())
+                                            .unwrap_or_default()
+                                    })
+                                    .filter(|rest: &String| !rest.is_empty())
+                                    .unwrap_or_else(|| group.to_string());
+                                draw_group(ui, group, &shown, rows, *edited);
+                            }
+                        });
+                }
+                let spare: Vec<&(&str, Vec<usize>, usize)> = present
+                    .iter()
+                    .copied()
+                    .filter(|(group, _, _)| unused.contains(group))
+                    .collect();
+                if spare.is_empty() {
+                    return;
+                }
+                let (rows, edited) = totals(&spare);
+                egui::CollapsingHeader::new(heading("Unused texture slots", rows, edited))
+                    .id_salt("unused_texture_slots")
+                    .default_open(edited > 0)
+                    .open(filtering.then_some(true))
+                    .show(ui, |ui| {
+                        for (group, rows, edited) in &spare {
+                            draw_group(ui, group, group, rows, *edited);
+                        }
+                    })
+                    .header_response
+                    .on_hover_text(
+                        "The settings of texture slots this part samples no texture through. \
+                         They are kept as the file has them.",
+                    );
+            });
     }
     if !needle.is_empty() && !changed {
         // A filter that matches nothing is otherwise indistinguishable from every group being
@@ -1673,10 +1904,40 @@ impl EffEditor {
                 p.emitter_sets
                     .iter()
                     .flat_map(|set| set.emitters.iter())
-                    .filter(|em| em.texture_index == Some(index as u32))
+                    .filter(|em| {
+                        texture_slots(em, &p.bntx_textures)
+                            .iter()
+                            .any(|(_, at)| *at == index)
+                    })
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Point texture slot `slot` of the selected part at pool texture `index`: texture 1 by its
+    /// place in the pool, as the export names it, and 2 and 3 by the texture's id.
+    fn point_slot_at(&mut self, slot: usize, index: usize) {
+        if slot == 0 {
+            self.point_selected_emitter_at(index);
+            return;
+        }
+        let (Some(entry_idx), Some(ptcl)) = (self.selected_entry, self.ptcl.as_mut()) else {
+            return;
+        };
+        let Some(guid) = ptcl.bntx_textures.get(index).and_then(|t| t.id) else {
+            return;
+        };
+        let set_idx = self.entries[entry_idx].set_idx;
+        if let Some(em) = ptcl
+            .emitter_sets
+            .get_mut(set_idx)
+            .and_then(|s| s.emitters.get_mut(self.selected_emitter))
+        {
+            if attr(em, TEXTURE_SLOT_IDS[slot]).is_some() {
+                set_attr(em, TEXTURE_SLOT_IDS[slot], AttrValue::UInt(guid));
+                touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+            }
+        }
     }
 
     /// Point the selected emitter at pool texture `index`.
@@ -2238,9 +2499,9 @@ impl EffEditor {
                     .on_hover_text("Play a move that spawns this effect, as it plays in the game");
             })
             .response
+            // Short lines: one long line ran off the view's edge, under the right panel.
             .on_disabled_hover_text(if self.effect_uses_ready {
-                "No move script spawns this effect. The game may spawn it from code \
-                 the editor can't read."
+                "No move script spawns this effect.\nThe game may spawn it\nfrom its own code."
             } else {
                 "Still reading the moves"
             });
@@ -2769,20 +3030,13 @@ impl EffEditor {
                 .on_hover_text("Pick an effect on the left to change how it looks.");
             return;
         }
-        // The texture of the part on the Look tab, and the game's view of the effect while one
-        // is connected; with neither there is nothing to put there.
-        if self.emitter_tab != EmitterTab::Attributes && !link.status().is_connected() {
+        // The game's view of the effect while one is connected; without one there is nothing to
+        // put there.
+        if !link.status().is_connected() {
             egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
             return;
         }
-        // Tall enough for the texture's picture and its buttons: a smaller size, saved from
-        // an earlier session or squeezed by a short window, left only the picker showing.
-        let connected = link.status().is_connected();
-        let (min, default, max) = texture_split_sizes(
-            ui.available_height(),
-            self.selected_texture.is_some(),
-            connected,
-        );
+        let (min, default, max) = game_split_sizes(ui.available_height());
         egui::Panel::bottom("eff_game_panel_split")
             .resizable(true)
             .default_size(default)
@@ -2812,7 +3066,8 @@ impl EffEditor {
                 })
                 .strong(),
             );
-            let btn = if unsent {
+            // Filled only when it can be clicked: the fill made a disabled button read as live.
+            let btn = if unsent && connected {
                 btn.fill(egui::Color32::from_rgb(0x7A, 0x5A, 0x10))
             } else {
                 btn
@@ -2827,7 +3082,7 @@ impl EffEditor {
                 .on_disabled_hover_text(if self.sending {
                     "Sending…".to_owned()
                 } else {
-                    link.view().hover()
+                    send_blocked_text(&link.view())
                 })
                 .clicked()
             {
@@ -2987,13 +3242,6 @@ impl EffEditor {
                     if !search.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                         search.request_focus();
                     }
-                    if !plays.is_empty() {
-                        ui.label(
-                            egui::RichText::new("● plays the selected effect")
-                                .small()
-                                .color(marked),
-                        );
-                    }
                     let mut enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                     use crate::move_kinds::MoveGroup;
                     let order: Vec<MoveGroup> = MoveGroup::ORDER
@@ -3044,7 +3292,13 @@ impl EffEditor {
                                 egui::RichText::new(label)
                             };
                             let enter_here = enter && best.as_deref() == Some(motion.as_str());
-                            if ui.selectable_label(open, text).clicked() || enter_here {
+                            let row = ui.selectable_label(open, text);
+                            let row = if plays.contains(motion) {
+                                row.on_hover_text("Plays the selected effect")
+                            } else {
+                                row
+                            };
+                            if row.clicked() || enter_here {
                                 enter = false;
                                 picked = Some(motion.clone());
                                 ui.close();
@@ -3064,9 +3318,12 @@ impl EffEditor {
         if response.inner.inner.is_none() {
             self.move_filter.clear();
         }
-        response
+        let response = response
             .response
             .on_disabled_hover_text("Pick a character first");
+        if !plays.is_empty() {
+            response.on_hover_text("Moves marked ● play the selected effect");
+        }
     }
 
     /// The effects of this file the open move plays, by its script or an object it makes.
@@ -3387,7 +3644,8 @@ impl EffEditor {
                         let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
                         let text = if edited_sets.contains(&entry.set_idx) {
                             text.color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
-                        } else if unused {
+                        } else if unused && !selected {
+                            // Grey on the selection's blue did not read.
                             text.weak()
                         } else {
                             text
@@ -3496,12 +3754,25 @@ impl EffEditor {
             .and_then(|p| p.emitter_sets.get(set_idx))
             .map(|s| s.emitters.len())
             .unwrap_or(0);
+        // In words, as the list shows it; the file name is in the hover.
+        let shown_name = entry_list_names(&self.entries)
+            .get(entry_idx)
+            .cloned()
+            .unwrap_or_else(|| entry_name.clone());
         let mut reset_entry = false;
         // Some(true) to undo, Some(false) to redo.
         let mut history = None;
         // Wraps in a narrow panel: a long effect name widened the panel past its edge.
         ui.horizontal_wrapped(|ui| {
-            ui.heading(&entry_name);
+            let heading = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&shown_name).heading())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(format!("{entry_name}\nRight-click to copy the name"));
+            if heading.secondary_clicked() {
+                ui.ctx().copy_text(entry_name.clone());
+            }
             ui.label(
                 egui::RichText::new(if emitter_count == 1 {
                     "1 part".to_owned()
@@ -3514,20 +3785,23 @@ impl EffEditor {
                 .small_button("Reset effect")
                 .on_hover_text("Put every part of this effect back as the game has it")
                 .clicked();
-            if ui
-                .add_enabled(self.can_undo(), egui::Button::new("Undo").small())
-                .on_hover_text("Undo the last effect edit (Ctrl+Z)")
-                .clicked()
-            {
-                history = Some(true);
-            }
-            if ui
-                .add_enabled(self.can_redo(), egui::Button::new("Redo").small())
-                .on_hover_text("Redo the last undone effect edit (Ctrl+Shift+Z)")
-                .clicked()
-            {
-                history = Some(false);
-            }
+            // Kept together when the row wraps.
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.can_undo(), egui::Button::new("Undo").small())
+                    .on_hover_text("Undo the last effect edit (Ctrl+Z)")
+                    .clicked()
+                {
+                    history = Some(true);
+                }
+                if ui
+                    .add_enabled(self.can_redo(), egui::Button::new("Redo").small())
+                    .on_hover_text("Redo the last undone effect edit (Ctrl+Shift+Z)")
+                    .clicked()
+                {
+                    history = Some(false);
+                }
+            });
             let label = match &self.open_move {
                 Some(name) => format!("Use in {name}"),
                 None => "Use in a move".to_owned(),
@@ -3610,22 +3884,20 @@ impl EffEditor {
         // Texture pool of the loaded eff, cloned up front so the `set`/`em` mutable borrows
         // below don't conflict with reading it.
         let textures = ptcl.bntx_textures.clone();
-        let Some(set) = ptcl.emitter_sets.get_mut(set_idx) else {
+        let Some(set) = ptcl.emitter_sets.get(set_idx) else {
             return;
         };
-        let Some(pristine_set) = self.pristine.get(set_idx) else {
+        if self.pristine.get(set_idx).is_none() {
             return;
-        };
+        }
+        let part_names: Vec<&str> = set.emitters.iter().map(|em| em.name.as_str()).collect();
+        let part_names = part_list_names(&part_names);
         // Emitter tabs. Edited ones carry a dot and are tinted: a set can have twenty
         // emitters, and without a marker the only way to find the two you changed was to
         // click through all of them.
         ui.horizontal_wrapped(|ui| {
             for (i, em) in set.emitters.iter().enumerate() {
-                let name = if em.name.is_empty() {
-                    format!("part {}", i + 1)
-                } else {
-                    em.name.clone()
-                };
+                let name = &part_names[i];
                 let text = if edited.contains(&i) {
                     egui::RichText::new(format!("{name} •"))
                         .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
@@ -3634,9 +3906,10 @@ impl EffEditor {
                 };
                 if ui
                     .selectable_label(self.selected_emitter == i, text)
-                    .on_hover_text(
-                        "One part of the effect. Tick \"Show only this part\" to see which.",
-                    )
+                    .on_hover_text(format!(
+                        "{}\n\nOne part of the effect. Tick \"Show only this part\" to see which.",
+                        em.name
+                    ))
                     .clicked()
                 {
                     self.selected_emitter = i;
@@ -3648,20 +3921,13 @@ impl EffEditor {
         ui.separator();
 
         let ei = self.selected_emitter;
-        let Some(em) = set.emitters.get_mut(ei) else {
+        if part_mut(&mut self.ptcl, &self.pristine, set_idx, ei).is_none() {
             ui.colored_label(egui::Color32::GRAY, "This effect has no parts.");
             return;
-        };
-        let Some(pr) = pristine_set.get(em.source_idx) else {
-            ui.colored_label(egui::Color32::GRAY, "This effect has no parts.");
-            return;
-        };
+        }
 
         let mut changed = false;
         let mut reset_part = false;
-        // The texture the selected emitter samples, handed to the import/export row that runs
-        // after the emitter borrow ends.
-        let mut texture_actions: Option<(usize, TextureInfo)> = None;
         // Each part keeps its own place in the list: one scroll position for every effect left
         // the next one opened halfway down, with its colours out of sight.
         // Both ways: a row wider than a narrow panel scrolls inside it instead of running
@@ -3669,6 +3935,9 @@ impl EffEditor {
         egui::ScrollArea::both()
             .id_salt(("emitter_fields", self.selected_entry, self.selected_emitter))
             .show(ui, |ui| {
+                let Some((em, pr)) = part_mut(&mut self.ptcl, &self.pristine, set_idx, ei) else {
+                    return;
+                };
                 // The handful of values that get changed on nearly every edit, kept at the top
                 // and out of the group tree. Each one is the SAME attribute the tree below
                 // holds, so editing it here or there is the same edit — there is no second
@@ -3686,7 +3955,7 @@ impl EffEditor {
                             .iter()
                             .filter_map(|id| crate::eff_attrs::index_of(id))
                             .collect();
-                        changed |= attr_grid_rows(ui, em, pr, &basic);
+                        changed |= attr_grid_rows(ui, em, pr, &basic, &textures);
                         // Uniform scale is the common intent, so it gets a control of its own:
                         // the per-axis rows are in the Particle scale group for anisotropy.
                         if particle_scale.iter().all(|id| attr(em, id).is_some()) {
@@ -3860,14 +4129,28 @@ impl EffEditor {
                     }
                 }
 
-                // The texture this emitter samples is shown, previewed and edited in the
-                // Texture panel on the right — it needs the width for a preview, and the
-                // import half is a whole-file operation that does not belong in a column of
-                // per-emitter fields. Only the pointer is recorded here.
-                texture_actions = em
-                    .texture_index
-                    .map(|i| i as usize)
-                    .and_then(|i| textures.get(i).map(|t| (i, t.clone())));
+                // The textures this part samples, in their own section of this scroll: as a
+                // strip of their own below it, they took the settings' height in a short
+                // window and clipped their buttons in a tall one.
+                let slots = texture_slots(em, &textures);
+                let shown = slots
+                    .iter()
+                    .find(|(slot, _)| *slot == self.texture_slot)
+                    .or(slots.first())
+                    .copied();
+                if let Some((slot, _)) = shown {
+                    self.texture_slot = slot;
+                }
+                self.texture_slots = slots;
+                self.selected_texture = shown.map(|(_, at)| (at, textures[at].clone()));
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(egui::RichText::new("Texture").strong())
+                    .id_salt("part_texture")
+                    .default_open(true)
+                    .show(ui, |ui| self.draw_texture_panel(ui));
+                let Some((em, pr)) = part_mut(&mut self.ptcl, &self.pristine, set_idx, ei) else {
+                    return;
+                };
 
                 ui.add_space(6.0);
                 if ui.small_button("Reset this part").clicked() {
@@ -3881,7 +4164,8 @@ impl EffEditor {
 
                 ui.add_space(10.0);
                 ui.separator();
-                let attributes_changed = draw_attribute_groups(ui, em, pr, &mut self.attr_filter);
+                let attributes_changed =
+                    draw_attribute_groups(ui, em, pr, &mut self.attr_filter, &textures);
                 if attributes_changed {
                     attrs_to_effective_keys(em);
                     changed = true;
@@ -3895,8 +4179,6 @@ impl EffEditor {
                     changed |= crate::eff_subsections::draw(ui, em, &pristine_def);
                 });
             });
-
-        self.selected_texture = texture_actions;
 
         if changed {
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
@@ -3939,6 +4221,7 @@ impl EffEditor {
     fn draw_emitter_roster(&mut self, ui: &mut Ui, set_idx: usize) {
         let edited: std::collections::HashSet<usize> =
             self.edited_emitters(set_idx).into_iter().collect();
+        let pristine_set: &[EmitterSnapshot] = self.pristine.get(set_idx).map_or(&[], |p| p);
         ui.label(egui::RichText::new("Parts").strong())
             .on_hover_text(
                 "Each part makes its own particles. Frames count from when the effect is spawned.",
@@ -3957,6 +4240,7 @@ impl EffEditor {
         let mut remove: Option<usize> = None;
         let mut move_by: Option<(usize, isize)> = None;
         let mut nest: Option<(usize, i8)> = None;
+        let mut reset: Option<usize> = None;
         let mut changed = false;
 
         let table = crate::eff_attrs::table();
@@ -3997,70 +4281,36 @@ impl EffEditor {
         ];
         let selected = self.selected_emitter;
         let mut select: Option<usize> = None;
+        let part_names: Vec<&str> = set.emitters.iter().map(|em| em.name.as_str()).collect();
+        let part_names = part_list_names(&part_names);
         egui::Grid::new(("parts_table", set_idx))
             .num_columns(COLUMNS.len() + 2)
             .striped(true)
             .spacing([6.0, 4.0])
             .show(ui, |ui| {
+                // The menu first: at the end of the row it was past a narrow panel's edge.
+                ui.label("");
                 ui.label(egui::RichText::new("Part").strong());
                 for (_, title, doc) in COLUMNS {
                     ui.label(egui::RichText::new(*title).strong())
                         .on_hover_text(*doc);
                 }
-                ui.label("");
                 ui.end_row();
                 let count = set.emitters.len();
                 let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
                 let copy_room: Vec<bool> = (0..count).map(|i| room_to_copy(&depths, i)).collect();
                 let nest_room: Vec<bool> = (0..count).map(|i| room_to_nest(&depths, i)).collect();
                 for (i, em) in set.emitters.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.add_space(em.depth as f32 * 12.0);
-                        let name = if em.name.is_empty() {
-                            format!("part {}", i + 1)
-                        } else {
-                            em.name.clone()
-                        };
-                        // Marked as on the Look tab's part tabs.
-                        let label = if edited.contains(&i) {
-                            egui::RichText::new(format!("{name} •"))
-                                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
-                        } else {
-                            egui::RichText::new(name)
-                        };
-                        let response = ui.selectable_label(selected == i, label);
-                        if response.clicked() {
-                            select = Some(i);
-                        }
-                        if em.depth > 0 {
-                            response.on_hover_text("Made from the particles of the part above it");
-                        }
-                    });
-                    let once = attr(em, "emission.is_one_time").is_some_and(|v| v.as_bool());
-                    for (id, _, _) in COLUMNS {
-                        let index = crate::eff_attrs::index_of(id);
-                        let current = index.and_then(|at| em.attrs.get(at).copied().flatten());
-                        match (index, current) {
-                            (Some(at), Some(mut value)) if *id != "emission.duration" || once => {
-                                ui.push_id((i, *id), |ui| {
-                                    if attr_widget(ui, &table[at], &mut value) {
-                                        em.attrs[at] = Some(value);
-                                        changed = true;
-                                    }
-                                });
-                            }
-                            (Some(_), Some(_)) => {
-                                ui.weak("–").on_hover_text(
-                                    "This part keeps going until the effect is removed. Tick \
-                                     Stops to give it a length.",
-                                );
-                            }
-                            _ => {
-                                ui.weak("–");
-                            }
-                        }
-                    }
                     ui.menu_button("⋯", |ui| {
+                        if ui
+                            .add_enabled(edited.contains(&i), egui::Button::new("Reset this part"))
+                            .on_hover_text("Put this part back as the game has it")
+                            .clicked()
+                        {
+                            reset = Some(i);
+                            ui.close();
+                        }
+                        ui.separator();
                         if ui
                             .add_enabled(copy_room[i], egui::Button::new("Copy"))
                             .on_hover_text("Add another part just like this one")
@@ -4119,6 +4369,82 @@ impl EffEditor {
                             ui.close();
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.add_space(em.depth as f32 * 12.0);
+                        let name = &part_names[i];
+                        // Marked as on the Look tab's part tabs.
+                        let label = if edited.contains(&i) {
+                            egui::RichText::new(format!("{name} •"))
+                                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
+                        } else {
+                            egui::RichText::new(name)
+                        };
+                        let hover = if em.depth > 0 {
+                            format!(
+                                "{}\n\nMade from the particles of the part above it",
+                                em.name
+                            )
+                        } else {
+                            em.name.clone()
+                        };
+                        if ui
+                            .selectable_label(selected == i, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            select = Some(i);
+                        }
+                    });
+                    let once = attr(em, "emission.is_one_time").is_some_and(|v| v.as_bool());
+                    for (id, _, _) in COLUMNS {
+                        let index = crate::eff_attrs::index_of(id);
+                        let current = index.and_then(|at| em.attrs.get(at).copied().flatten());
+                        match (index, current) {
+                            (Some(at), Some(mut value)) if *id != "emission.duration" || once => {
+                                // An edited cell is tinted, says what it was, and resets from
+                                // its menu, as a row on the Look tab does.
+                                let was = pristine_set
+                                    .get(em.source_idx)
+                                    .and_then(|p| p.attrs.get(at).copied().flatten())
+                                    .filter(|was| !was.same(value));
+                                ui.push_id((i, *id), |ui| {
+                                    if was.is_some() {
+                                        let tint = egui::Color32::from_rgb(0x60, 0x50, 0x20);
+                                        let widgets = &mut ui.visuals_mut().widgets;
+                                        widgets.inactive.weak_bg_fill = tint;
+                                        widgets.inactive.bg_fill = tint;
+                                    }
+                                    let (edit, response) = attr_control(ui, &table[at], &mut value);
+                                    if edit {
+                                        em.attrs[at] = Some(value);
+                                        changed = true;
+                                    }
+                                    if let Some(was) = was {
+                                        let response = response.on_hover_text(format!(
+                                            "was {}. Right-click to put it back.",
+                                            attr_text(&table[at], was)
+                                        ));
+                                        response.context_menu(|ui| {
+                                            if ui.button("Reset to the file's value").clicked() {
+                                                em.attrs[at] = Some(was);
+                                                changed = true;
+                                                ui.close();
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                            (Some(_), Some(_)) => {
+                                ui.weak("–").on_hover_text(
+                                    "This part keeps going until the effect is removed. Tick \
+                                     Stops to give it a length.",
+                                );
+                            }
+                            _ => {
+                                ui.weak("–");
+                            }
+                        }
+                    }
                     ui.end_row();
                 }
             });
@@ -4209,6 +4535,10 @@ impl EffEditor {
             self.clamp_selected_emitter(set_idx);
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
         }
+        if let Some(i) = reset {
+            self.history_close_step();
+            self.reset_part_fields(set_idx, i);
+        }
     }
 
     /// The entry's own spawn structure: the extra parts of a multi-part effect, and the external
@@ -4236,10 +4566,25 @@ impl EffEditor {
             );
             return;
         };
+        // Each set by the effect that plays it, in the list's words; a set no effect names
+        // keeps its own name.
+        let list_names = entry_list_names(&self.entries);
         let set_names: Vec<String> = self
             .ptcl
             .as_ref()
-            .map(|p| p.emitter_sets.iter().map(|s| s.name.clone()).collect())
+            .map(|p| {
+                p.emitter_sets
+                    .iter()
+                    .enumerate()
+                    .map(|(s, set)| {
+                        self.entries
+                            .iter()
+                            .position(|e| e.set_idx == s)
+                            .and_then(|e| list_names.get(e).cloned())
+                            .unwrap_or_else(|| set.name.clone())
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let pristine = self.entry_pristine.get(idx).cloned().unwrap_or_default();
         let Some(entry) = self.entry_info.get_mut(idx) else {
@@ -4428,7 +4773,21 @@ impl EffEditor {
     ///   SWAP   — point THIS emitter at another texture the eff already has. A per-emitter edit.
     ///   IMPORT — replace a pool texture's pixels. Every emitter sampling it changes.
     fn draw_texture_panel(&mut self, ui: &mut Ui) {
-        ui.label(egui::RichText::new("Texture").strong());
+        // One switch for the slots the part samples, rather than a texture id typed into a
+        // settings group for the second and third.
+        if self.texture_slots.len() > 1 {
+            ui.horizontal(|ui| {
+                for (slot, _) in self.texture_slots.clone() {
+                    ui.selectable_value(
+                        &mut self.texture_slot,
+                        slot,
+                        format!("Texture {}", slot + 1),
+                    )
+                    .on_hover_text(format!("Texture slot {} of this part", slot + 1));
+                }
+            });
+        }
+        let slot = self.texture_slot;
         let Some((index, texture)) = self.selected_texture.clone() else {
             ui.label(
                 egui::RichText::new(if self.ptcl.is_none() {
@@ -4471,20 +4830,25 @@ impl EffEditor {
         // size does not scale the effect — it resamples it, and the result reads as a bug rather
         // than an edit. Rather than let the picker offer a choice that is always wrong, the
         // mismatched ones are shown greyed with the reason.
+        // Texture 2 and 3 are pointed at a texture by its id, which a texture added here has
+        // only once the file is written.
         let same_size: Vec<bool> = self
             .ptcl
             .as_ref()
             .map(|p| {
                 p.bntx_textures
                     .iter()
-                    .map(|t| (t.width, t.height) == (texture.width, texture.height))
+                    .map(|t| {
+                        (t.width, t.height) == (texture.width, texture.height)
+                            && (slot == 0 || t.id.is_some())
+                    })
                     .collect()
             })
             .unwrap_or_default();
         let offered = same_size.iter().filter(|ok| **ok).count();
         let mut swap_to = None;
         let texture_filter = &mut self.texture_filter;
-        let picker = egui::ComboBox::from_id_salt("emitter_texture_swap")
+        let picker = egui::ComboBox::from_id_salt(("emitter_texture_swap", slot))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .selected_text(
                 labels
@@ -4559,7 +4923,18 @@ impl EffEditor {
                     .source_idx;
                 self.pristine.get(set_idx)?.get(source)
             })
-            .and_then(|snapshot| snapshot.texture_index);
+            .and_then(|snapshot| {
+                if slot == 0 {
+                    return snapshot.texture_index;
+                }
+                let at = crate::eff_attrs::index_of(TEXTURE_SLOT_IDS[slot])?;
+                let guid = snapshot.attrs.get(at).copied().flatten()?.as_u64();
+                let textures = &self.ptcl.as_ref()?.bntx_textures;
+                textures
+                    .iter()
+                    .position(|t| t.id == Some(guid))
+                    .map(|i| i as u32)
+            });
         if original.map(|o| o as usize) != Some(index) {
             let was = original
                 .and_then(|o| labels.get(o as usize).cloned())
@@ -4571,17 +4946,7 @@ impl EffEditor {
             );
         }
         if let Some(i) = swap_to {
-            if let (Some(entry_idx), Some(ptcl)) = (self.selected_entry, self.ptcl.as_mut()) {
-                let set_idx = self.entries[entry_idx].set_idx;
-                if let Some(em) = ptcl
-                    .emitter_sets
-                    .get_mut(set_idx)
-                    .and_then(|s| s.emitters.get_mut(self.selected_emitter))
-                {
-                    em.texture_index = Some(i);
-                    touch(&mut self.eff_dirty_at, &mut self.edit_rev);
-                }
-            }
+            self.point_slot_at(slot, i as usize);
         }
 
         self.draw_texture_preview(ui, index, &texture);
@@ -4741,7 +5106,10 @@ impl EffEditor {
         let pool = self.texture_pool.clone();
         let names = self.texture_names();
         let can_convert = texture.convertible && pool.is_some();
-        let has_emitter = self.selected_entry.is_some();
+        // A texture added here has no id until the file is written, and only texture 1 is
+        // pointed at a texture by name.
+        let first_slot = self.texture_slot == 0;
+        let has_emitter = self.selected_entry.is_some() && first_slot;
         let users = self.texture_users(index);
 
         ui.horizontal_wrapped(|ui| {
@@ -4759,6 +5127,8 @@ impl EffEditor {
                 )
                 .on_disabled_hover_text(if pool.is_none() {
                     "This eff has no texture archive"
+                } else if !first_slot {
+                    "Works on texture 1 only"
                 } else {
                     "Select a part first — the copy is pointed at it"
                 })
@@ -4775,6 +5145,7 @@ impl EffEditor {
                 ) {
                     Ok(rebuilt) => {
                         let mut info = texture.clone();
+                        info.id = None;
                         info.tex_name = new_name.clone();
                         self.adopt_appended_texture(rebuilt, info);
                         self.pending_texture_additions
@@ -4803,6 +5174,8 @@ impl EffEditor {
                 )
                 .on_disabled_hover_text(if pool.is_none() {
                     "This eff has no texture archive".to_string()
+                } else if !first_slot {
+                    "Works on texture 1 only".to_string()
                 } else if !has_emitter {
                     "Select a part first — the new texture is pointed at it".to_string()
                 } else {
@@ -4835,6 +5208,7 @@ impl EffEditor {
                         }) {
                         Ok((rebuilt, report)) => {
                             let mut info = texture.clone();
+                            info.id = None;
                             info.tex_name = new_name.clone();
                             self.adopt_appended_texture(rebuilt, info);
                             self.pending_texture_additions.push(
@@ -5123,15 +5497,11 @@ impl EffEditor {
     }
 
     fn draw_game_panel(&mut self, ui: &mut Ui, link: &GameLink) {
-        if self.emitter_tab == EmitterTab::Attributes {
-            self.draw_texture_panel(ui);
-        }
-        // The rest is about the running game: what it has spawned and what has been sent to
-        // it. Without a connection none of it says anything.
+        // About the running game: what it has spawned and what has been sent to it. Without a
+        // connection none of it says anything.
         if !link.status().is_connected() {
             return;
         }
-        ui.separator();
         ui.label("In game")
             .on_hover_text("Send edits, then do the move again in game to see them there.");
         ui.label(
@@ -5478,19 +5848,185 @@ mod tests {
         assert_eq!(zero, 0, "a zero id would be a second way to say none");
     }
 
+    /// Every blend and shape value in the game's files has a name, and the counts of the values
+    /// left as numbers are printed for the record.
     #[test]
-    fn texture_split_always_fits_the_picture_and_buttons() {
-        // A short right panel still gives the texture its floor.
+    fn game_files_use_only_named_blends_and_shapes() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('_'))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root.join("effect"), &mut files);
+        assert!(files.len() > 300, "only {} corpus files", files.len());
+        let table = crate::eff_attrs::table();
+        let named: Vec<usize> = ["render_state.blend_type", "shape_info.volume_type"]
+            .iter()
+            .map(|id| crate::eff_attrs::index_of(id).unwrap())
+            .collect();
+        let counted = [
+            "emitter_info.follow_type",
+            "particle_data.billboard_type",
+            "sampler0.filter",
+        ]
+        .map(crate::eff_attrs::index_of);
+        let mut seen: std::collections::BTreeMap<(&str, i64), usize> = Default::default();
+        let mut emitters = 0usize;
+        for path in &files {
+            let Ok(effect) = crate::effects::load_effect(path) else {
+                continue;
+            };
+            for em in effect.ptcl.emitter_sets.iter().flat_map(|s| &s.emitters) {
+                emitters += 1;
+                for &at in named.iter().chain(counted.iter().flatten()) {
+                    if let Some(value) = em.attrs[at] {
+                        *seen.entry((table[at].id, value.as_i64())).or_default() += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("{emitters} emitters: {seen:?}");
+        assert!(emitters > 10_000);
+        // Every blend is named. Of the shapes, only 15 is not: eff_wgpu places none of its
+        // particles by a shape of its own, so it reads "Other (15)".
+        for &at in &named {
+            let AttrKind::Enum(names) = table[at].kind else {
+                panic!("{} is not a named choice", table[at].id);
+            };
+            let unnamed: Vec<i64> = seen
+                .keys()
+                .filter(|(id, value)| {
+                    *id == table[at].id && !(0..names.len() as i64).contains(value)
+                })
+                .map(|(_, value)| *value)
+                .collect();
+            let expected: &[i64] = if table[at].id == "shape_info.volume_type" {
+                &[15]
+            } else {
+                &[]
+            };
+            assert_eq!(unnamed, expected, "{}", table[at].id);
+        }
+    }
+
+    /// Every group is filed in exactly one section, and the texture groups by their slot.
+    #[test]
+    fn every_settings_group_has_one_section() {
+        for group in crate::eff_attrs::GROUPS {
+            let homes = crate::eff_attrs::SECTIONS
+                .iter()
+                .filter(|(_, members)| members.contains(group))
+                .count();
+            assert_eq!(homes, 1, "{group}");
+        }
+        let textures = crate::eff_attrs::SECTIONS
+            .iter()
+            .find(|(name, _)| *name == "Textures")
+            .unwrap();
+        for group in textures.1 {
+            assert!(
+                crate::eff_attrs::texture_slot_of(group).is_some(),
+                "{group}"
+            );
+        }
+        assert_eq!(
+            crate::eff_attrs::texture_slot_of(crate::eff_attrs::G_TEXUV2),
+            Some(2)
+        );
+        assert_eq!(
+            crate::eff_attrs::texture_slot_of(crate::eff_attrs::G_SHADER),
+            None
+        );
+        assert_eq!(enum_label(crate::eff_attrs::BLEND_TYPES, 1), "Add");
+        assert_eq!(enum_label(crate::eff_attrs::VOLUME_TYPES, 15), "Other (15)");
+        assert_eq!(enum_label(crate::eff_attrs::FOLLOW_TYPES, -1), "Other (-1)");
+    }
+
+    #[test]
+    fn the_game_split_leaves_the_settings_half_the_panel() {
         for height in [300.0, 500.0, 900.0] {
-            let (min, default, max) = texture_split_sizes(height, true, false);
-            assert!(min >= 200.0, "{height}");
+            let (min, default, max) = game_split_sizes(height);
+            assert!(max <= height * 0.5 + 0.5 || max == 80.0, "{height}");
             assert!(min <= default && default <= max, "{height}");
         }
-        // And a tall one keeps most of its height for the settings.
-        assert!(texture_split_sizes(680.0, true, false).1 < 680.0 * 0.35);
-        // A part with no texture, and no game to show, needs one line.
-        assert_eq!(texture_split_sizes(900.0, false, false), (40.0, 40.0, 40.0));
-        assert!(texture_split_sizes(900.0, false, true).0 >= 200.0);
+    }
+
+    /// Texture 2 and 3 are found by id, and a slot whose id is "none" or names nothing in the
+    /// file is not offered.
+    #[test]
+    fn texture_slots_are_read_by_id_and_picked_by_id() {
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        let ptcl = editor.ptcl.as_mut().expect("ptcl");
+        ptcl.bntx_textures = [(Some(11), "ef_a"), (Some(22), "ef_b"), (None, "ef_added")]
+            .iter()
+            .map(|(id, name)| TextureInfo {
+                tex_name: (*name).into(),
+                id: *id,
+                width: 64,
+                height: 64,
+                format: "BC7Srgb".into(),
+                convertible: true,
+            })
+            .collect();
+        let em = &mut ptcl.emitter_sets[0].emitters[0];
+        em.texture_index = Some(0);
+        set_attr(em, TEXTURE_SLOT_IDS[1], AttrValue::UInt(22));
+        set_attr(em, TEXTURE_SLOT_IDS[2], AttrValue::UInt(u64::MAX));
+        let textures = ptcl.bntx_textures.clone();
+        assert_eq!(
+            texture_slots(&ptcl.emitter_sets[0].emitters[0], &textures),
+            vec![(0, 0), (1, 1)]
+        );
+        // An id the file has no texture for is not a slot either.
+        set_attr(
+            &mut ptcl.emitter_sets[0].emitters[0],
+            TEXTURE_SLOT_IDS[2],
+            AttrValue::UInt(99),
+        );
+        assert_eq!(
+            texture_slots(&ptcl.emitter_sets[0].emitters[0], &textures).len(),
+            2
+        );
+        // Picking for texture 2 writes the picked texture's id and leaves texture 1 alone.
+        editor.point_slot_at(1, 0);
+        let em = &editor.ptcl.as_ref().unwrap().emitter_sets[0].emitters[0];
+        assert_eq!(attr(em, TEXTURE_SLOT_IDS[1]).map(|v| v.as_u64()), Some(11));
+        assert_eq!(em.texture_index, Some(0));
+        // A texture with no id yet cannot be given to texture 2.
+        editor.point_slot_at(1, 2);
+        let em = &editor.ptcl.as_ref().unwrap().emitter_sets[0].emitters[0];
+        assert_eq!(attr(em, TEXTURE_SLOT_IDS[1]).map(|v| v.as_u64()), Some(11));
+        // Both parts that sample ef_a count as its users, through either slot.
+        assert_eq!(editor.texture_users(0), 1);
+        assert_eq!(editor.texture_users(1), 0);
+    }
+
+    #[test]
+    fn part_names_read_as_words_and_keep_colliding_names() {
+        assert_eq!(part_words("flare1"), "Flare 1");
+        assert_eq!(part_words("line2_add"), "Line 2 add");
+        assert_eq!(part_words("impact1_add"), "Impact 1 add");
+        assert_eq!(
+            part_list_names(&["flare1", "", "wind_2", "wind2"]),
+            vec!["Flare 1", "Part 2", "wind_2", "wind2"]
+        );
     }
 
     #[test]
@@ -5865,6 +6401,7 @@ mod tests {
             .iter()
             .map(|n| TextureInfo {
                 tex_name: (*n).into(),
+                id: None,
                 width: 64,
                 height: 64,
                 format: "BC7Srgb".into(),
@@ -6305,12 +6842,12 @@ mod tests {
         let pr = EmitterSnapshot::of(&em);
         let mut filter = String::new();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
             let basics: Vec<usize> = BASIC_ATTRS
                 .iter()
                 .filter_map(|id| crate::eff_attrs::index_of(id))
                 .collect();
-            attr_rows_by_index(ui, "basics", &mut em, &pr, &basics);
+            attr_rows_by_index(ui, "basics", &mut em, &pr, &basics, &[]);
         });
 
         // A filter matching almost everything opens almost every group, so this pass actually
@@ -6318,15 +6855,15 @@ mod tests {
         // bad index would surface.
         let mut filter = "e".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
         });
         let mut filter = "gravity".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
         });
         let mut filter = "no such attribute".to_string();
         egui::__run_test_ui(|ui| {
-            draw_attribute_groups(ui, &mut em, &pr, &mut filter);
+            draw_attribute_groups(ui, &mut em, &pr, &mut filter, &[]);
         });
     }
 
