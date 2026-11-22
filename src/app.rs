@@ -3228,11 +3228,19 @@ fn status_after_disconnect(status: &str) -> Option<String> {
     Some(send_note(false, what))
 }
 
-/// The status line once an edit lands after a send the game took: it no longer holds what the
-/// game shows.
-fn status_after_edit(status: &str) -> Option<String> {
-    let what = status.strip_prefix("In the game: ")?;
-    Some(format!("Not sent yet: {what}"))
+/// The status line once an edit lands after a send the game took, or after another edit: it
+/// no longer holds what the game shows, and names `what` a send would carry now. The old send's
+/// count was kept, so a second edited effect still read "1 edited effect".
+fn status_after_edit(status: &str, what: &str) -> Option<String> {
+    status_follows_edits(status).then(|| format!("Not sent yet: {what}"))
+}
+
+/// Whether the status line says what the game holds against the editor's edits, so an edit
+/// rewrites it.
+fn status_follows_edits(status: &str) -> bool {
+    ["In the game: ", "Not sent yet: "]
+        .iter()
+        .any(|prefix| status.starts_with(prefix))
 }
 
 /// The status line once a send has ended: the routine "Sending to the game: …" line keeps its
@@ -4094,6 +4102,9 @@ pub struct VisionaryApp {
     /// A project resume first loads its fighter, then waits for that fighter's asynchronous
     /// motion list before selecting the saved move through the normal interactive path.
     pending_project_move_selection: Option<(String, String)>,
+    /// The move last open on the Effects page for each character, by character key, this
+    /// session.
+    effects_moves_picked: HashMap<String, String>,
     /// In-flight "Fetch ACMD" result: `(fighter, move, body or error)`. The fetch used to run
     /// inline and blocked the UI thread for a whole GitHub round trip on every click.
     acmd_receiver: Option<std::sync::mpsc::Receiver<AcmdFetchResult>>,
@@ -4284,6 +4295,8 @@ pub struct VisionaryApp {
     /// Fingerprint of the carrier bytes last handed to the game. The game keeps the live
     /// carrier when the same bytes arrive again, so such a send must not wait for a new read.
     last_carrier_fingerprint: Option<u64>,
+    /// The editor's edit count the "Not sent yet" line was last written for.
+    status_edit_rev: u64,
     /// Set by Send edits; the carrier push later in the same frame decides whether that send
     /// carries new bytes.
     carrier_send_armed: bool,
@@ -4733,6 +4746,7 @@ impl VisionaryApp {
             last_frame_time: std::time::Instant::now(),
             move_list_receiver: None,
             pending_project_move_selection: None,
+            effects_moves_picked: HashMap::new(),
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
             source_mismatch_prompt: None,
@@ -4803,6 +4817,7 @@ impl VisionaryApp {
             merged_build_failed: std::collections::HashSet::new(),
             live_eff_probe_due: None,
             last_carrier_fingerprint: None,
+            status_edit_rev: 0,
             carrier_send_armed: false,
             eff_open_seen: None,
             use_in_move_added: None,
@@ -31375,13 +31390,17 @@ impl VisionaryApp {
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return;
         };
-        let fighter = if rel.contains("/fighter/") || rel.starts_with("fighter/") {
+        let own = rel.contains("/fighter/") || rel.starts_with("fighter/");
+        let fighter = if own {
             crate::mod_project::fighter_from_source_rel(&rel)
         } else if let Some(name) = selected {
             name
         } else {
             return;
         };
+        // On the shared file only this character's moves are read.
+        self.eff_editor
+            .set_effect_uses_of((!own).then(|| crate::data::fighter_display_name(&fighter)));
         // The moves a use names are this fighter's: resolved again when its move list arrives.
         let moves_known = self.move_list.len();
         let open_key = self.current_move_key();
@@ -33578,7 +33597,7 @@ impl VisionaryApp {
                 egui::pos2(rect.left() + 4.0, y + SCRUBBER_ROW_HEIGHT * 0.5),
                 egui::Align2::LEFT_CENTER,
                 effect_words(&name),
-                egui::FontId::monospace(10.0),
+                egui::FontId::proportional(12.0),
                 Color32::from_rgb(120, 200, 255),
             );
         let end = (length.max(1) as u32).min(total);
@@ -33783,7 +33802,7 @@ impl VisionaryApp {
                             egui::pos2(rect.left() + 4.0, y + row_height * 0.5),
                             egui::Align2::LEFT_CENTER,
                             &row.label,
-                            egui::FontId::monospace(10.0),
+                            egui::FontId::proportional(12.0),
                             row.color,
                         );
                     let start = frame_x(row.start.min(total));
@@ -34449,7 +34468,7 @@ impl eframe::App for VisionaryApp {
                     }
                 });
                 link_menu.0.on_hover_text(link_view.hover());
-                crate::game_link::link_problem_and_action(ui, &self.game_link, &link_view);
+                crate::game_link::link_action(ui, &self.game_link, &link_view);
             });
         });
         self.perf.end("menu_bar", t_menu);
@@ -34755,7 +34774,27 @@ impl eframe::App for VisionaryApp {
             self.eff_editor.move_choices = self.move_list.iter().map(|m| m.name.clone()).collect();
         }
         if let Some(name) = self.eff_editor.fighter_request.take() {
-            self.select_character(crate::character::CharacterKey::parse(&name));
+            // Each character's open move is kept for the session and opens again with it:
+            // back on a character through its Edited chip, Move read None.
+            if let Some(left) = self.active_key() {
+                let open = self.state.selected_move.as_ref().map(|m| m.name.clone());
+                match open {
+                    Some(name) => self
+                        .effects_moves_picked
+                        .insert(left.as_str().to_owned(), name),
+                    None => self.effects_moves_picked.remove(left.as_str()),
+                };
+            }
+            let key = crate::character::CharacterKey::parse(&name);
+            let switched = self.active_key().as_ref() != Some(&key) && self.select_character(key);
+            if let Some(motion) = self
+                .effects_moves_picked
+                .get(&name)
+                .cloned()
+                .filter(|_| switched && self.state.selected_move.is_none())
+            {
+                self.open_move_named(&motion);
+            }
         }
         // A move picked in the view's switch or the page's move picker.
         if let Some(motion) = self.eff_editor.open_move_request.take() {
@@ -34848,10 +34887,22 @@ impl eframe::App for VisionaryApp {
             if let Some(status) = status_after_disconnect(&self.state.status) {
                 self.state.status = status;
             }
-        } else if self.eff_editor.is_unsent() && self.eff_editor.awaiting_game.is_none() {
-            // An edit after the game took the last send: the line stops saying it is in the game.
-            if let Some(status) = status_after_edit(&self.state.status) {
-                self.state.status = status;
+        } else if self.eff_editor.is_unsent()
+            && self.eff_editor.awaiting_game.is_none()
+            && self.eff_editor.edit_rev() != self.status_edit_rev
+            && status_follows_edits(&self.state.status)
+            && !ui.ctx().input(|i| i.pointer.any_down())
+        {
+            // An edit after the game took the last send: the line stops saying it is in the
+            // game and names what a send would carry now, counted as Send counts it. Once a
+            // drag ends, not on each of its frames.
+            self.status_edit_rev = self.eff_editor.edit_rev();
+            self.sync_eff_mods_from_editor();
+            if let Some(rel) = self.eff_editor.loaded_rel() {
+                let what = self.live_send_what(&self.eff_owner(&rel));
+                if let Some(status) = status_after_edit(&self.state.status, &what) {
+                    self.state.status = status;
+                }
             }
         }
         // Resolve "waiting for game": the plugin reports carrier readiness as it changes.
@@ -42775,10 +42826,28 @@ mod live_effect_capture_tests {
         );
         // An edit after the game took a send: the game no longer shows what the editor holds.
         let in_game = "In the game: Mario, 1 edited effect";
-        let edited = status_after_edit(in_game).unwrap();
+        let edited = status_after_edit(in_game, &send_what("Mario", 1, 0)).unwrap();
         assert_eq!(edited, "Not sent yet: Mario, 1 edited effect");
-        assert_eq!(status_after_edit(&sending), None);
-        assert_eq!(status_after_edit(&edited), None);
+        assert_eq!(status_after_edit(&sending, "Mario, 2 edited effects"), None);
+        // A second edited effect after the send: the line counts what a send carries now, not
+        // the old send's count; and another character's file is named for itself.
+        assert_eq!(
+            status_after_edit(&edited, &send_what("Mario", 2, 0)).as_deref(),
+            Some("Not sent yet: Mario, 2 edited effects")
+        );
+        assert_eq!(
+            status_after_edit(in_game, &send_what("Bayonetta", 1, 0)).as_deref(),
+            Some("Not sent yet: Bayonetta, 1 edited effect")
+        );
+        // And the edit's line is built from what Send counts, for the open file's character.
+        let app = include_str!("app.rs");
+        let edit_branch = app
+            .split("&& status_follows_edits(&self.state.status)")
+            .nth(1)
+            .and_then(|rest| rest.split("\n        }").next())
+            .expect("the edit branch");
+        assert!(edit_branch.contains("self.sync_eff_mods_from_editor();"));
+        assert!(edit_branch.contains("self.live_send_what(&self.eff_owner(&rel))"));
         for line in [sending.as_str(), in_game, edited.as_str()] {
             assert_eq!(
                 status_after_disconnect(line).as_deref(),

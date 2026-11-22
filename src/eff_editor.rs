@@ -441,6 +441,9 @@ struct EffHistory {
     touched: Option<String>,
     /// Why the steps were dropped, until the next step: the Undo hover says so.
     cleared: Option<&'static str>,
+    /// The part open as this frame began: a step shows the part its first edit was made on,
+    /// not the one open when the step before it closed.
+    frame_part: usize,
 }
 
 /// The most files whose history is kept while another is open.
@@ -526,6 +529,9 @@ pub struct EffEditor {
     /// Decoded thumbnail for the selected texture. `None` in the second slot means "tried and
     /// could not" — kept so a failing texture is not re-decoded every frame.
     texture_preview: Option<(TexturePreviewKey, Option<egui::TextureHandle>)>,
+    /// The replacement PNG's modified time, with the path and when it was read: read again at
+    /// most once a second, not on every frame the Look tab is open.
+    replacement_stamp: Option<(String, Instant, u128)>,
     /// Small pictures of the file's textures for the texture picker.
     texture_thumbs: TextureThumbs,
     /// Show textures as the stored channels rather than in editable form.
@@ -540,6 +546,9 @@ pub struct EffEditor {
     /// read yet.
     effect_uses: std::collections::HashMap<u64, Vec<MoveUse>>,
     effect_uses_ready: bool,
+    /// The character whose moves were read, when the open file is not that character's own
+    /// (the shared file): only its moves were, so "no move" would be a claim about all of them.
+    effect_uses_of: Option<String>,
     /// How the view plays the selected effect.
     pub view: EffectView,
     /// The part last picked in each effect, by effect name.
@@ -713,6 +722,7 @@ impl Default for EffEditor {
             texture_slots: Vec::new(),
             texture_slot: 0,
             texture_preview: None,
+            replacement_stamp: None,
             texture_thumbs: TextureThumbs::default(),
             show_raw_textures: false,
             texture_form_note: String::new(),
@@ -720,6 +730,7 @@ impl Default for EffEditor {
             entries: Vec::new(),
             effect_uses: Default::default(),
             effect_uses_ready: false,
+            effect_uses_of: None,
             view: EffectView::Alone,
             parts_picked: Default::default(),
             entry_picked: Default::default(),
@@ -1383,18 +1394,47 @@ fn quick_label(ui: &mut Ui, label: &str, edited: bool) -> egui::Response {
 /// part's settings, so their values line up in one column.
 const LABEL_COLUMN: f32 = 170.0;
 
+/// Below this width a row's "was …" and reset go on a line of their own under its value: in the
+/// third column they ran past the panel's edge after the X Y Z boxes.
+const WAS_BELOW_PANEL: f32 = 520.0;
+
+/// The label column for a panel `width` wide: narrower in a narrow panel, so the values keep
+/// their room, X Y Z boxes included (about 200 px with their gaps).
+fn label_column(width: f32) -> f32 {
+    LABEL_COLUMN
+        .min(0.35 * width)
+        .min((width - 200.0).max(60.0))
+}
+
+/// The least room a label gets, however deep its group sits in a narrow panel.
+const MIN_LABEL_WIDTH: f32 = 72.0;
+
 fn label_column_id() -> egui::Id {
     egui::Id::unique("eff_label_column_end")
+}
+
+fn was_below_id() -> egui::Id {
+    egui::Id::unique("eff_was_below")
+}
+
+/// In a narrow panel, ends the grid row so what follows goes under the row's value instead of
+/// beside it. Call it before a row's "was …" once the row is edited.
+fn was_line(ui: &mut Ui) {
+    if ui
+        .data(|d| d.get_temp::<bool>(was_below_id()))
+        .unwrap_or(false)
+    {
+        ui.end_row();
+        ui.label("");
+    }
 }
 
 /// A settings row's label, padded to the shared label column when one is set, however deep the
 /// row's group is.
 fn column_label(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
     let end = ui.data(|d| d.get_temp::<f32>(label_column_id()));
-    let Some(width) = end
-        .map(|end| end - ui.cursor().left())
-        .filter(|width| *width > 0.0)
-    else {
+    // Never so thin that a deep row's label wraps word by word in a narrow panel.
+    let Some(width) = end.map(|end| (end - ui.cursor().left()).max(MIN_LABEL_WIDTH)) else {
         return ui.label(text);
     };
     let height = ui.spacing().interact_size.y;
@@ -1403,7 +1443,9 @@ fn column_label(ui: &mut Ui, text: impl Into<egui::WidgetText>) -> egui::Respons
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.set_min_width(width);
-            ui.label(text)
+            // A long label wraps inside the column rather than widening it.
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(text).wrap())
         },
     )
     .inner
@@ -1440,9 +1482,27 @@ fn float_drag(value: &mut f32, speed: f64, unit: crate::eff_attrs::Unit) -> egui
     }
 }
 
+/// A label and its box in a wrapping row, moved to the next line together when the rest of the
+/// line is narrower than they were last frame: a plain `horizontal` there never wraps, so its
+/// box ran past the panel's edge.
+fn wrapping_pair(ui: &mut Ui, key: &str, add: impl FnOnce(&mut Ui)) {
+    let id = ui.scope_id().with(("wrapping_pair", key));
+    let width = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0);
+    // What is left of this line: `available_width` is the whole line's in a wrapping row.
+    let left = ui.max_rect().right() - ui.cursor().left();
+    if ui.cursor().left() > ui.max_rect().left() + 1.0 && left < width {
+        ui.end_row();
+    }
+    let used = ui.horizontal(add).response.rect.width();
+    ui.data_mut(|d| d.insert_temp(id, used));
+}
+
 /// The last column of a Look row: once edited, what the game had and a reset. Returns whether
 /// the reset was clicked.
 fn quick_was(ui: &mut Ui, edited: bool, was: String) -> bool {
+    if edited {
+        was_line(ui);
+    }
     ui.horizontal(|ui| {
         if !edited {
             return false;
@@ -1655,8 +1715,19 @@ impl TextureThumbs {
                 ui.ctx().request_repaint();
             }
         }
+        // A mid-grey checker behind it, so a dark or clear texture does not read as an empty
+        // square.
         let painter = ui.painter();
-        painter.rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+        let cell = side / 4.0;
+        for (x, y) in (0..4).flat_map(|x| (0..4).map(move |y| (x, y))) {
+            let grey = if (x + y) % 2 == 0 { 96 } else { 128 };
+            let min = rect.min + egui::vec2(x as f32 * cell, y as f32 * cell);
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, egui::vec2(cell, cell)),
+                0.0,
+                egui::Color32::from_gray(grey),
+            );
+        }
         if let Some(Some(handle)) = self.thumbs.get(&index) {
             let size = handle.size_vec2();
             let scale = side / size.x.max(size.y).max(1.0);
@@ -2011,6 +2082,9 @@ fn attr_grid_rows(
             changed = true;
         }
 
+        if edited {
+            was_line(ui);
+        }
         ui.horizontal(|ui| {
             if let Some(orig) = orig {
                 // The file's value only matters once it differs; on every row it was
@@ -2072,6 +2146,20 @@ fn unused_texture_groups(em: &EmitterDef) -> Vec<&'static str> {
         .collect()
 }
 
+/// A settings group's header text, wrapped to the panel: a header never wraps its own text, so a
+/// long one ("Position, turn, area and colour  (26, 1 edited)") ran past a narrow panel's edge.
+fn wrapped_header(ui: &Ui, text: egui::RichText) -> egui::WidgetText {
+    let width = ui.available_width() - ui.spacing().indent;
+    egui::WidgetText::from(text)
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            width,
+            egui::TextStyle::Button,
+        )
+        .into()
+}
+
 /// Words a settings search also looks for: people search by what they want ("speed", "count"),
 /// and the rows are named by what they are ("Outward speed", "Particles per frame").
 const FILTER_SYNONYMS: &[&[&str]] = &[
@@ -2114,12 +2202,14 @@ fn draw_attribute_groups(
     let table = crate::eff_attrs::table();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("All attributes").strong());
+        // Room left for Clear after it, in a narrow panel.
+        let width = (ui.available_width() - 56.0).clamp(80.0, 160.0);
         ui.add(
             egui::TextEdit::singleline(filter)
                 .hint_text("filter, e.g. gravity")
-                .desired_width(160.0),
+                .desired_width(width),
         );
-        if !filter.is_empty() && ui.small_button("clear").clicked() {
+        if !filter.is_empty() && ui.small_button("Clear").clicked() {
             filter.clear();
         }
     });
@@ -2191,7 +2281,7 @@ fn draw_attribute_groups(
     let mut draw_group = |ui: &mut Ui, group: &str, shown: &str, rows: &[usize], edited: usize| {
         // A filter opens every group holding a match: `default_open` alone only applied the
         // first time a group was seen, so groups closed before stayed closed.
-        egui::CollapsingHeader::new(heading(shown, rows.len(), edited))
+        egui::CollapsingHeader::new(wrapped_header(ui, heading(shown, rows.len(), edited)))
             .id_salt((group, salt(edited)))
             .default_open(edited > 0)
             .open(filtering.then_some(true))
@@ -2228,82 +2318,88 @@ fn draw_attribute_groups(
                 continue;
             }
             let (rows, edited) = totals(&present);
-            egui::CollapsingHeader::new(heading(section, rows, edited).strong())
-                .id_salt(("attr_section", section, salt(edited)))
-                .default_open(edited > 0)
-                .open(filtering.then_some(true))
-                .show(ui, |ui| {
-                    let by_slot = present
-                        .iter()
-                        .any(|(group, _, _)| crate::eff_attrs::texture_slot_of(group).is_some());
-                    if !by_slot {
-                        for (group, rows, edited) in &present {
-                            draw_group(ui, group, group, rows, *edited);
-                        }
-                        return;
+            egui::CollapsingHeader::new(wrapped_header(
+                ui,
+                heading(section, rows, edited).strong(),
+            ))
+            .id_salt(("attr_section", section, salt(edited)))
+            .default_open(edited > 0)
+            .open(filtering.then_some(true))
+            .show(ui, |ui| {
+                let by_slot = present
+                    .iter()
+                    .any(|(group, _, _)| crate::eff_attrs::texture_slot_of(group).is_some());
+                if !by_slot {
+                    for (group, rows, edited) in &present {
+                        draw_group(ui, group, group, rows, *edited);
                     }
-                    // One header per texture slot, each holding that slot's groups.
-                    for slot in 0..3 {
-                        let slot_groups: Vec<&(&str, Vec<usize>, usize)> = present
-                            .iter()
-                            .copied()
-                            .filter(|(group, _, _)| {
-                                crate::eff_attrs::texture_slot_of(group) == Some(slot)
-                                    && !unused.contains(group)
-                            })
-                            .collect();
-                        if slot_groups.is_empty() {
-                            continue;
-                        }
-                        let (rows, edited) = totals(&slot_groups);
-                        let title = format!("Texture {}", slot + 1);
-                        egui::CollapsingHeader::new(heading(&title, rows, edited))
-                            .id_salt(("attr_texture_slot", slot, salt(edited)))
-                            .default_open(edited > 0)
-                            .open(filtering.then_some(true))
-                            .show(ui, |ui| {
-                                for (group, rows, edited) in &slot_groups {
-                                    // "Texture 2 sampling" reads "Sampling" under "Texture 2".
-                                    let shown = group
-                                        .strip_prefix(title.as_str())
-                                        .map(str::trim)
-                                        .map(|rest| {
-                                            let mut chars = rest.chars();
-                                            chars
-                                                .next()
-                                                .map(|c| c.to_uppercase().chain(chars).collect())
-                                                .unwrap_or_default()
-                                        })
-                                        .filter(|rest: &String| !rest.is_empty())
-                                        .unwrap_or_else(|| group.to_string());
-                                    draw_group(ui, group, &shown, rows, *edited);
-                                }
-                            });
-                    }
-                    let spare: Vec<&(&str, Vec<usize>, usize)> = present
+                    return;
+                }
+                // One header per texture slot, each holding that slot's groups.
+                for slot in 0..3 {
+                    let slot_groups: Vec<&(&str, Vec<usize>, usize)> = present
                         .iter()
                         .copied()
-                        .filter(|(group, _, _)| unused.contains(group))
+                        .filter(|(group, _, _)| {
+                            crate::eff_attrs::texture_slot_of(group) == Some(slot)
+                                && !unused.contains(group)
+                        })
                         .collect();
-                    if spare.is_empty() {
-                        return;
+                    if slot_groups.is_empty() {
+                        continue;
                     }
-                    let (rows, edited) = totals(&spare);
-                    egui::CollapsingHeader::new(heading("Unused texture slots", rows, edited))
-                        .id_salt(("unused_texture_slots", salt(edited)))
+                    let (rows, edited) = totals(&slot_groups);
+                    let title = format!("Texture {}", slot + 1);
+                    egui::CollapsingHeader::new(wrapped_header(ui, heading(&title, rows, edited)))
+                        .id_salt(("attr_texture_slot", slot, salt(edited)))
                         .default_open(edited > 0)
                         .open(filtering.then_some(true))
                         .show(ui, |ui| {
-                            for (group, rows, edited) in &spare {
-                                draw_group(ui, group, group, rows, *edited);
+                            for (group, rows, edited) in &slot_groups {
+                                // "Texture 2 sampling" reads "Sampling" under "Texture 2".
+                                let shown = group
+                                    .strip_prefix(title.as_str())
+                                    .map(str::trim)
+                                    .map(|rest| {
+                                        let mut chars = rest.chars();
+                                        chars
+                                            .next()
+                                            .map(|c| c.to_uppercase().chain(chars).collect())
+                                            .unwrap_or_default()
+                                    })
+                                    .filter(|rest: &String| !rest.is_empty())
+                                    .unwrap_or_else(|| group.to_string());
+                                draw_group(ui, group, &shown, rows, *edited);
                             }
-                        })
-                        .header_response
-                        .on_hover_text(
-                            "The settings of texture slots this part samples no texture through. \
+                        });
+                }
+                let spare: Vec<&(&str, Vec<usize>, usize)> = present
+                    .iter()
+                    .copied()
+                    .filter(|(group, _, _)| unused.contains(group))
+                    .collect();
+                if spare.is_empty() {
+                    return;
+                }
+                let (rows, edited) = totals(&spare);
+                egui::CollapsingHeader::new(wrapped_header(
+                    ui,
+                    heading("Unused texture slots", rows, edited),
+                ))
+                .id_salt(("unused_texture_slots", salt(edited)))
+                .default_open(edited > 0)
+                .open(filtering.then_some(true))
+                .show(ui, |ui| {
+                    for (group, rows, edited) in &spare {
+                        draw_group(ui, group, group, rows, *edited);
+                    }
+                })
+                .header_response
+                .on_hover_text(
+                    "The settings of texture slots this part samples no texture through. \
                              They are kept as the file has them.",
-                        );
-                });
+                );
+            });
         }
     });
     if !needle.is_empty() && !changed {
@@ -2581,8 +2677,47 @@ impl EffEditor {
         uses: std::collections::HashMap<u64, Vec<MoveUse>>,
         ready: bool,
     ) {
+        // The list moves the effects no move spawns into their fold once every move is read,
+        // which shifts the rows: the open one is revealed again where it now is.
+        if ready && !self.effect_uses_ready && self.selected_entry.is_some() {
+            self.scroll_to_selected = true;
+        }
         self.effect_uses = uses;
         self.effect_uses_ready = ready;
+    }
+
+    /// The character whose moves [`Self::set_effect_uses`] reads, when the open file is not
+    /// that character's own; `None` on a character's own file.
+    pub fn set_effect_uses_of(&mut self, of: Option<String>) {
+        if self.effect_uses_of != of {
+            self.effect_uses_of = of;
+        }
+    }
+
+    /// What a row of the fold of effects no move spawns says of itself, and the fold's name.
+    fn not_used_words(&self) -> (String, String, String) {
+        match &self.effect_uses_of {
+            Some(who) => (
+                format!("Not in {who}'s moves"),
+                format!(
+                    "None of {who}'s move scripts spawns these. Only {who}'s moves were read: \
+                     other characters' moves may."
+                ),
+                format!(
+                    "None of {who}'s move scripts spawns it. Only {who}'s moves were read: \
+                     other characters' moves may."
+                ),
+            ),
+            None => (
+                "Not used by any move".to_owned(),
+                "No move script spawns these. The game may spawn them from code the editor \
+                 can't read."
+                    .to_owned(),
+                "No move script spawns it. The game may spawn it from code the editor can't \
+                 read."
+                    .to_owned(),
+            ),
+        }
     }
 
     pub fn set_texture_imports(&mut self, imports: Vec<crate::mod_project::TextureImport>) {
@@ -3286,10 +3421,13 @@ impl EffEditor {
             })
             .response
             // Short lines: one long line ran off the view's edge, under the right panel.
-            .on_disabled_hover_text(if self.effect_uses_ready {
-                "No move script spawns this effect.\nThe game may spawn it\nfrom its own code."
-            } else {
-                "Still reading the moves"
+            .on_disabled_hover_text(match (&self.effect_uses_of, self.effect_uses_ready) {
+                (_, false) => "Still reading the moves".to_owned(),
+                (Some(who), true) => format!("None of {who}'s\nmove scripts spawns it"),
+                (None, true) => {
+                    "No move script spawns this effect.\nThe game may spawn it\nfrom its own code."
+                        .to_owned()
+                }
             });
         });
     }
@@ -3748,11 +3886,15 @@ impl EffEditor {
             self.history.baseline = self.history_capture();
         }
         self.history.seen_rev = self.edit_rev;
+        self.history.frame_part = self.selected_emitter;
     }
 
     /// An edit was made on the page this frame.
     fn history_note_edit(&mut self, now: Instant) {
-        if self.history.baseline.is_some() {
+        if let Some(baseline) = self.history.baseline.as_mut() {
+            if self.history.open_since.is_none() {
+                baseline.selected_emitter = self.history.frame_part;
+            }
             self.history.open_since = Some(now);
         }
         self.history.seen_rev = self.edit_rev;
@@ -4678,7 +4820,14 @@ impl EffEditor {
                 } else {
                     egui::RichText::new(label)
                 };
-                let resp = ui.selectable_label(selected, text).on_hover_text(if broken {
+                // A button on every page, so another character's reads as a way back; the
+                // open one is highlighted.
+                let chip = if selected {
+                    ui.selectable_label(true, text)
+                } else {
+                    ui.button(text)
+                };
+                let resp = chip.on_hover_text(if broken {
                     "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
@@ -4811,6 +4960,10 @@ impl EffEditor {
         } else {
             Vec::new()
         };
+        let (fold_name, fold_hover, row_not_used) = self.not_used_words();
+        // Each file's fold is its own: one fold for all of them opened Mario's because
+        // Bayonetta's held an edit.
+        let fold_file = self.loaded_path.clone();
         let mut open_shared = None;
         let mut clicked = None;
         let mut scroll_to_selected = self.scroll_to_selected;
@@ -4849,7 +5002,7 @@ impl EffEditor {
                     && !self.entries.iter().enumerate().any(&strict)
                     && shared_rows.is_empty()
                 {
-                    ui.weak(if only_move {
+                    ui.weak(if only_move && filter.is_empty() {
                         "This move plays none of this file's effects"
                     } else {
                         "No matching effects"
@@ -4896,10 +5049,7 @@ impl EffEditor {
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 ),
-                                None if unused(entry) => "No move script spawns it. The game \
-                                                       may spawn it from code the editor can't \
-                                                       read."
-                                    .to_owned(),
+                                None if unused(entry) => row_not_used.clone(),
                                 None => "Reading the moves…".to_owned(),
                             };
                             let edited = if edited_flags[i] {
@@ -4947,14 +5097,23 @@ impl EffEditor {
                     // a search's matches.
                     let open_effect = selected_entry.is_some_and(|i| not_used.contains(&i));
                     // An edited effect is the one thing to find again: never hidden.
-                    let wanted = !filter.is_empty() || not_used.iter().any(|&i| edited_flags[i]);
-                    let fold = egui::CollapsingHeader::new(format!(
-                        "Not used by any move ({})",
-                        not_used.len()
-                    ))
-                    .id_salt(("eff_entries_not_used", wanted))
-                    .default_open(wanted);
-                    let fold = if open_effect && reveal_selected {
+                    let wanted = open_effect
+                        || !filter.is_empty()
+                        || not_used.iter().any(|&i| edited_flags[i]);
+                    // It opens when it comes to hold one, and is otherwise left as the user left
+                    // it: keyed on `wanted`, a reset of the open effect closed it under them.
+                    let was_wanted_id =
+                        ui.make_persistent_id(("eff_entries_not_used_wanted", &fold_file));
+                    let was_wanted = ui.data_mut(|d| {
+                        let was = d.get_temp::<bool>(was_wanted_id).unwrap_or(false);
+                        d.insert_temp(was_wanted_id, wanted);
+                        was
+                    });
+                    let fold =
+                        egui::CollapsingHeader::new(format!("{fold_name} ({})", not_used.len()))
+                            .id_salt(("eff_entries_not_used", &fold_file))
+                            .default_open(wanted);
+                    let fold = if (wanted && !was_wanted) || (open_effect && reveal_selected) {
                         fold.open(Some(true))
                     } else {
                         fold
@@ -4965,10 +5124,7 @@ impl EffEditor {
                         }
                     })
                     .header_response
-                    .on_hover_text(
-                        "No move script spawns these. The game may spawn them from code the \
-                         editor can't read.",
-                    );
+                    .on_hover_text(fold_hover);
                 }
                 for name in &shared_rows {
                     ui.horizontal(|ui| {
@@ -5404,17 +5560,30 @@ impl EffEditor {
         let mut changed = false;
         // The Look row an edit was made on, to name its undo step.
         let mut touched: Option<&'static str> = None;
-        let narrow = ui.available_width() < NARROW_PANEL;
+        let width = ui.available_width();
+        let narrow = width < NARROW_PANEL;
         // Each part keeps its own place in the list: one scroll position for every effect left
         // the next one opened halfway down, with its colours out of sight.
         // Both ways: a row wider than a narrow panel scrolls inside it instead of running
         // under the view.
         egui::ScrollArea::both()
-            .id_salt(("emitter_fields", self.selected_entry, self.selected_emitter))
+            // By file and effect name: by list position, effect 20 of one file opened where
+            // effect 20 of another was left.
+            .id_salt((
+                "emitter_fields",
+                &self.loaded_path,
+                &entry_name,
+                self.selected_emitter,
+            ))
             .show(ui, |ui| {
+                // A scroll both ways has no width of its own, so without this no row wrapped.
+                ui.set_max_width(width - ui.spacing().scroll.allocated_width());
                 // The Look rows and the settings tree put their values in one column.
-                let label_end = ui.min_rect().left() + LABEL_COLUMN;
-                ui.data_mut(|d| d.insert_temp(label_column_id(), label_end));
+                let label_end = ui.min_rect().left() + label_column(width);
+                ui.data_mut(|d| {
+                    d.insert_temp(label_column_id(), label_end);
+                    d.insert_temp(was_below_id(), width < WAS_BELOW_PANEL);
+                });
                 // In the scroll, so it does not take the settings' room in a small window.
                 self.draw_whole_effect(ui, set_idx, &shown_name);
                 let Some((em, pr)) = part_mut(&mut self.ptcl, &self.pristine, set_idx, ei) else {
@@ -5820,7 +5989,7 @@ impl EffEditor {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     // Each label stays beside its box when the row wraps.
-                    ui.horizontal(|ui| {
+                    wrapping_pair(ui, "Hue", |ui| {
                         ui.label("Hue").on_hover_text(
                         "Turns the colour of every part, keeping how bright and how strong each \
                          colour is. 0 is the game's colours.",
@@ -5855,7 +6024,7 @@ impl EffEditor {
                             &mut factors.speed,
                         ),
                     ] {
-                        ui.horizontal(|ui| {
+                        wrapping_pair(ui, label, |ui| {
                             ui.label(label).on_hover_text(hover);
                             if ui
                                 .add(
@@ -6738,7 +6907,9 @@ impl EffEditor {
                     .cloned()
                     .unwrap_or_else(|| "(not in this file)".to_string()),
             )
-            .width(280.0)
+            // No wider than the panel: at 280 it widened a narrow panel's settings, and the
+            // texture buttons under it ran past the edge instead of wrapping.
+            .width(ui.available_width().min(280.0))
             .height(420.0)
             .show_ui(ui, |ui| {
                 let search = ui.add(
@@ -6770,17 +6941,59 @@ impl EffEditor {
                         )
                         .ok(),
                     };
-                    let row = ui.horizontal(|ui| {
+                    // One selectable row, picture and name: only the name was, beside the
+                    // picture.
+                    let background = ui.painter().add(egui::Shape::Noop);
+                    let selected = index == i;
+                    let why = blocked.get(i).cloned().flatten();
+                    let drawn = ui.horizontal(|ui| {
                         thumbs.draw(ui, i, picture);
-                        if let Some(Some(why)) = blocked.get(i) {
-                            ui.add_enabled(false, egui::Button::selectable(false, label))
-                                .on_disabled_hover_text(why);
-                            None
+                        let text = egui::RichText::new(label.as_str());
+                        let text = if why.is_some() {
+                            text.weak()
+                        } else if selected {
+                            text.color(ui.visuals().selection.stroke.color)
                         } else {
-                            Some(ui.selectable_label(index == i, label))
-                        }
+                            text
+                        };
+                        ui.add(egui::Label::new(text).selectable(false));
                     });
-                    if let Some(mut row) = row.inner {
+                    // The whole width of the list, as a selectable label's highlight is.
+                    let rect = drawn.response.rect;
+                    let right = ui.max_rect().right();
+                    let rect = if right.is_finite() {
+                        rect.with_max_x(right.max(rect.right()))
+                    } else {
+                        rect
+                    };
+                    let row = if let Some(why) = why {
+                        ui.interact(
+                            rect,
+                            ui.scope_id().with(("texture_row", i)),
+                            egui::Sense::hover(),
+                        )
+                        .on_hover_text(why);
+                        None
+                    } else {
+                        let row = ui.interact(
+                            rect,
+                            ui.scope_id().with(("texture_row", i)),
+                            egui::Sense::click(),
+                        );
+                        if selected || row.hovered() {
+                            let look = ui.style().interact_selectable(&row, selected);
+                            ui.painter().set(
+                                background,
+                                egui::epaint::RectShape::filled(
+                                    rect.expand(1.0),
+                                    look.corner_radius,
+                                    look.weak_bg_fill,
+                                ),
+                            );
+                        }
+                        Some(row)
+                    };
+                    if let Some(mut row) = row {
                         if other_size.get(i).copied().unwrap_or(false) {
                             row = row.on_hover_text(format!(
                                 "Another size than this part's texture ({}×{}). It fills the \
@@ -6858,6 +7071,28 @@ impl EffEditor {
         self.draw_texture_import(ui, index, &texture);
     }
 
+    /// When the replacement PNG at `path` was last changed, read from the disk at most once a
+    /// second: a file system call on every frame is free here and slow on Windows (antivirus,
+    /// synced folders). No path, no read.
+    fn replacement_stamp(&mut self, path: &str, now: Instant) -> u128 {
+        if path.is_empty() {
+            return 0;
+        }
+        if let Some((kept, at, stamp)) = &self.replacement_stamp {
+            if kept == path && now.duration_since(*at) < std::time::Duration::from_secs(1) {
+                return *stamp;
+            }
+        }
+        let stamp = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        self.replacement_stamp = Some((path.to_owned(), now, stamp));
+        stamp
+    }
+
     /// Draw the texture itself.
     ///
     /// Decoding is BCn → RGBA over up to a megapixel, so it is done ONCE per texture and the
@@ -6877,12 +7112,7 @@ impl EffEditor {
         let form = self.texture_form();
         // The form is part of the key: flipping the checkbox has to re-decode, and so does
         // re-importing the SAME path after painting it again — hence the file's mtime.
-        let stamp = std::fs::metadata(&replacement)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let stamp = self.replacement_stamp(&replacement, Instant::now());
         let key = (
             self.loaded_path.clone().unwrap_or_default(),
             index,
@@ -8326,6 +8556,25 @@ mod tests {
         assert_eq!(tuned(&editor), 2.5);
     }
 
+    /// Undo shows the part that was open when the edit was made: a Whole effect change on the
+    /// second part, undone, moved the tab to the part open when the step before it closed.
+    #[test]
+    fn undo_keeps_the_part_the_edit_was_made_on() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_two_parts();
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        editor.selected_emitter = 1;
+        history_frame(&mut editor, ms(600), false, None);
+        history_frame(&mut editor, ms(700), false, Some(2.5));
+        history_frame(&mut editor, ms(2000), false, None);
+        editor.selected_emitter = 0;
+        editor.undo();
+        assert_eq!(editor.selected_emitter, 1);
+        assert_eq!(tuned(&editor), 1.0);
+    }
+
     /// Resets need no confirmation because they undo: both buttons, on either tab.
     #[test]
     fn resets_are_undone_like_any_edit() {
@@ -8935,6 +9184,154 @@ mod tests {
         assert!(shows(&mut editor, &names[2]), "an edited effect shows");
     }
 
+    /// The replacement PNG's date is read at most once a second, and not at all with no PNG:
+    /// the Look tab read it from the disk on every frame.
+    #[test]
+    fn the_replacement_pngs_date_is_not_read_every_frame() {
+        let dir = std::env::temp_dir().join(format!("visionary-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("tex.png");
+        std::fs::write(&png, b"x").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let set = |secs: u64| {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&png)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        let mut editor = EffEditor::default();
+        let start = Instant::now();
+        assert_eq!(editor.replacement_stamp("", start), 0);
+        assert!(editor.replacement_stamp.is_none(), "no path, no read");
+        set(1_000);
+        assert_eq!(editor.replacement_stamp(&path, start), 1_000_000);
+        // Painted again: within the second the kept date stands, after it the new one is read.
+        set(2_000);
+        let soon = start + std::time::Duration::from_millis(500);
+        assert_eq!(editor.replacement_stamp(&path, soon), 1_000_000);
+        let later = start + std::time::Duration::from_millis(1_100);
+        assert_eq!(editor.replacement_stamp(&path, later), 2_000_000);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Resetting the open effect in the fold, its only edit there, leaves the fold open with
+    /// the effect in it: keyed on whether it held an edit, the fold closed under the user.
+    #[test]
+    fn resetting_the_open_effect_keeps_its_fold_open() {
+        let link = GameLink::default();
+        let context = egui::Context::default();
+        let shows = |editor: &mut EffEditor, text: &str| {
+            let mut found = false;
+            for _ in 0..2 {
+                let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                    editor.draw_entry_list(ui, &link)
+                });
+                found = output
+                    .shapes
+                    .iter()
+                    .any(|shape| text_position(&shape.shape, text).is_some());
+            }
+            found
+        };
+        let mut editor = editor_with_a_move();
+        let names = entry_list_names(&editor.entries);
+        let set = editor.ptcl.as_ref().unwrap().emitter_sets[0].clone();
+        editor.ptcl.as_mut().unwrap().emitter_sets.push(set);
+        editor.pristine.push(editor.pristine[0].clone());
+        editor.entries[2].set_idx = 1;
+        fn em(editor: &mut EffEditor) -> &mut EmitterDef {
+            &mut editor.ptcl.as_mut().unwrap().emitter_sets[1].emitters[0]
+        }
+        let game = attr_f32(em(&mut editor), TUNED);
+        set_attr(em(&mut editor), TUNED, AttrValue::Float(2.5));
+        assert!(shows(&mut editor, &names[2]), "the edit opens it");
+        editor.selected_entry = Some(2);
+        assert!(shows(&mut editor, &names[2]));
+        set_attr(em(&mut editor), TUNED, AttrValue::Float(game));
+        assert!(shows(&mut editor, &names[2]), "still open after the reset");
+        // Another file with nothing wanted in its fold starts with it closed, though this
+        // file's is open.
+        let mut other = editor_with_a_move();
+        other.loaded_path = Some(PathBuf::from("/fx/ef_luigi.eff"));
+        assert!(
+            !shows(&mut other, &names[2]),
+            "another file's fold is its own"
+        );
+    }
+
+    /// The list says a search matched nothing when there is one, even with Only in the move
+    /// on; it said the move plays none of the file's effects.
+    #[test]
+    fn a_search_that_matches_nothing_says_so() {
+        let link = GameLink::default();
+        let shows = |editor: &mut EffEditor, text: &str| {
+            let context = egui::Context::default();
+            let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                editor.draw_entry_list(ui, &link)
+            });
+            output
+                .shapes
+                .iter()
+                .any(|shape| text_position(&shape.shape, text).is_some())
+        };
+        let mut editor = editor_with_a_move();
+        editor.only_open_move = true;
+        editor.set_open_move(Some("Up special".into()), Some("special_hi".into()));
+        editor.entry_filter = "batw".into();
+        assert!(shows(&mut editor, "No matching effects"));
+        assert!(!shows(
+            &mut editor,
+            "This move plays none of this file's effects"
+        ));
+        editor.entry_filter.clear();
+        editor.set_open_move(Some("Down special".into()), Some("special_lw".into()));
+        assert!(shows(
+            &mut editor,
+            "This move plays none of this file's effects"
+        ));
+    }
+
+    /// Once every move is read, the list reveals the open effect again: the effects no move
+    /// spawns leave the list for their fold then, and the open row moved out of view.
+    #[test]
+    fn the_open_effect_is_revealed_when_the_moves_are_read() {
+        let mut editor = editor_with_a_move();
+        editor.set_effect_uses(Default::default(), false);
+        editor.selected_entry = Some(1);
+        editor.scroll_to_selected = false;
+        editor.set_effect_uses(Default::default(), true);
+        assert!(editor.scroll_to_selected);
+        // Only when the scan finishes, not on every later update.
+        editor.scroll_to_selected = false;
+        editor.set_effect_uses(Default::default(), true);
+        assert!(!editor.scroll_to_selected);
+    }
+
+    /// On the shared file the fold names the character whose moves were read, not every move.
+    #[test]
+    fn the_shared_files_fold_names_whose_moves_were_read() {
+        let link = GameLink::default();
+        let shows = |editor: &mut EffEditor, text: &str| {
+            let context = egui::Context::default();
+            let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                editor.draw_entry_list(ui, &link)
+            });
+            output
+                .shapes
+                .iter()
+                .any(|shape| text_position(&shape.shape, text).is_some())
+        };
+        let mut editor = editor_with_a_move();
+        editor.set_effect_uses_of(Some("Bayonetta".into()));
+        assert!(shows(&mut editor, "Not in Bayonetta's moves (1)"));
+        assert!(!shows(&mut editor, "Not used by any move (1)"));
+        editor.set_effect_uses_of(None);
+        assert!(shows(&mut editor, "Not used by any move (1)"));
+    }
+
     /// The Send button carries no marker, and "unsent" shows only once a game has connected:
     /// before that every edit is unsent.
     #[test]
@@ -9176,6 +9573,66 @@ mod tests {
             overflowed.is_empty(),
             "Redo past the edge at widths {overflowed:?}"
         );
+    }
+
+    /// Every text the Look tab draws stays inside the panel, down to a 260 px panel, with an
+    /// edited X Y Z row: its reset and the Whole effect boxes ran past a 385 px panel's edge.
+    #[test]
+    fn the_look_rows_fit_a_narrow_panel() {
+        fn texts(shape: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => out.push((
+                    text.galley.job.text.clone(),
+                    text.pos.x + text.galley.size().x,
+                )),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        let em = &mut editor.ptcl.as_mut().unwrap().emitter_sets[0].emitters[0];
+        set_attr(em, SPREAD_ATTRS[2], AttrValue::Float(12.5));
+        let context = egui::Context::default();
+        let mut overflowed = Vec::new();
+        let mut shown = Vec::new();
+        for width in (260..=720).step_by(5) {
+            let width = width as f32;
+            let mut right = 0.0;
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(context.run_test_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 2000.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        right = ui.max_rect().right();
+                        editor.draw_emitter_editor(ui);
+                    },
+                ));
+            }
+            let mut all = Vec::new();
+            for shape in &output.unwrap().shapes {
+                texts(&shape.shape, &mut all);
+            }
+            shown = all.iter().map(|(text, _)| text.clone()).collect();
+            if let Some((text, _)) = all.iter().find(|(_, end)| *end > right + 0.5) {
+                overflowed.push((width, text.clone()));
+            }
+        }
+        // The rows the claim is about were drawn at all.
+        for text in ["↺", "Speed ×", "Spread"] {
+            assert!(shown.iter().any(|t| t == text), "{text} is drawn");
+        }
+        assert!(
+            shown.iter().any(|t| t.starts_with("was ")),
+            "the was line is drawn"
+        );
+        assert!(overflowed.is_empty(), "past the edge: {overflowed:?}");
     }
 
     fn text_right(shape: &egui::epaint::Shape, label: &str) -> Option<f32> {

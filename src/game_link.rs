@@ -1500,9 +1500,13 @@ impl LinkView {
         egui::RichText::new(format!("● {}", self.status.label())).color(self.status.color(visuals))
     }
 
-    /// The explanation, the address and the full error: hover text only.
+    /// The explanation, why the last try failed, the address and the full error: hover text
+    /// only.
     pub fn hover(&self) -> String {
         let mut text = self.status.hover().to_string();
+        if let Some(problem) = self.problem_label() {
+            text.push_str(&format!("\n\nLast try: {problem}"));
+        }
         if let Some(addr) = self.dialled {
             text.push_str(&format!("\n\n{addr}"));
         }
@@ -1524,23 +1528,20 @@ impl LinkView {
     }
 }
 
-/// The link's status line: `● Game not connected  Refused  [Connect]`. Every surface that
+/// The link's status line: `● Game not connected  [Connect]`. Every surface that
 /// shows the link uses this, so the words, colours and the Connect control are the same
 /// everywhere.
 pub fn link_status_line(ui: &mut egui::Ui, link: &GameLink) {
     let view = link.view();
     ui.label(view.text(ui.visuals()))
         .on_hover_text(view.hover());
-    link_problem_and_action(ui, link, &view);
+    link_action(ui, link, &view);
 }
 
-/// The problem label and the action button, for a surface that draws the state itself (the
-/// top bar's menu button).
-pub fn link_problem_and_action(ui: &mut egui::Ui, link: &GameLink, view: &LinkView) {
-    if let Some(problem) = view.problem_label() {
-        ui.label(egui::RichText::new(problem).small().weak())
-            .on_hover_text(view.hover());
-    }
+/// The action button, for a surface that draws the state itself (the top bar's menu button).
+/// Why the last try failed is in the state's hover: as a bare word beside it ("Refused") it
+/// meant nothing to a modder and sat there all session.
+pub fn link_action(ui: &mut egui::Ui, link: &GameLink, view: &LinkView) {
     if let Some(action) = view.status.action() {
         if ui
             .small_button(action.label())
@@ -10635,6 +10636,38 @@ mod link_policy_tests {
         }
     }
 
+    /// A failed try is in the status's hover, not a bare word beside it.
+    #[test]
+    fn the_last_problem_is_in_the_hover_not_on_the_line() {
+        use crate::ui::TestFrame;
+        let link = GameLink::default();
+        let view = LinkView {
+            status: LinkStatus::NotConnected,
+            problem: Some(LinkProblem::Refused),
+            detail: Some("connect: Connection refused (os error 111)".into()),
+            dialled: None,
+            draft_is_new: false,
+        };
+        assert!(view.hover().contains("Last try: Refused"));
+        let context = egui::Context::default();
+        let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+            ui.horizontal(|ui| link_action(ui, &link, &view));
+        });
+        fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, out)),
+                _ => {}
+            }
+        }
+        let mut drawn = Vec::new();
+        for shape in &output.shapes {
+            texts(&shape.shape, &mut drawn);
+        }
+        assert!(drawn.iter().any(|t| t == "Connect"), "{drawn:?}");
+        assert!(!drawn.iter().any(|t| t.contains("Refused")), "{drawn:?}");
+    }
+
     #[test]
     fn opening_dials_for_a_bounded_window_then_waits_for_connect() {
         let addr = refused_port();
@@ -11068,7 +11101,7 @@ mod link_policy_tests {
         // And the surfaces that show the link do so through the shared pieces.
         for (file, needle) in [
             ("src/app.rs", "game_link::link_address_row"),
-            ("src/app.rs", "game_link::link_problem_and_action"),
+            ("src/app.rs", "game_link::link_action"),
             ("src/app/project_page.rs", "game_link::link_status_line"),
             (
                 "src/gimmicks/operations_view.rs",
