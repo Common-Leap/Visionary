@@ -831,6 +831,10 @@ fn part_list_untouched(emitters: &[EmitterDef], pristine: &[EmitterSnapshot]) ->
 }
 
 /// How wide a row of small buttons with these labels is.
+/// The effect header's undo and redo buttons; their hovers name the step and the shortcut.
+const UNDO_ICON: &str = "↩";
+const REDO_ICON: &str = "↪";
+
 fn small_buttons_width(ui: &Ui, labels: &[&str]) -> f32 {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let spacing = ui.spacing();
@@ -5247,7 +5251,8 @@ impl EffEditor {
                 .clicked();
             // Kept together when the row wraps. A row nested in a wrapping one cannot wrap by
             // itself: it ran past a narrow panel's edge and widened everything under it.
-            if ui.available_size_before_wrap().x < small_buttons_width(ui, &["Undo", "▾", "Redo"])
+            if ui.available_size_before_wrap().x
+                < small_buttons_width(ui, &[UNDO_ICON, "▾", REDO_ICON])
             {
                 ui.end_row();
             }
@@ -5256,7 +5261,7 @@ impl EffEditor {
                     .history
                     .cleared
                     .map(|why| format!("Undo history cleared: {why}"));
-                let undo = ui.add_enabled(self.can_undo(), egui::Button::new("Undo").small());
+                let undo = ui.add_enabled(self.can_undo(), egui::Button::new(UNDO_ICON).small());
                 let undo = match (undo.contains_pointer(), undo.enabled()) {
                     (true, true) => undo.on_hover_text(format!(
                         "Undo {} (Ctrl+Z)",
@@ -5308,7 +5313,7 @@ impl EffEditor {
                     .on_hover_text("Undo history")
                     .on_disabled_hover_text("Nothing to undo");
                 });
-                let redo = ui.add_enabled(self.can_redo(), egui::Button::new("Redo").small());
+                let redo = ui.add_enabled(self.can_redo(), egui::Button::new(REDO_ICON).small());
                 let redo = match (redo.contains_pointer(), redo.enabled()) {
                     (true, true) => redo.on_hover_text(format!(
                         "Redo {} (Ctrl+Shift+Z)",
@@ -9563,7 +9568,7 @@ mod tests {
             let redo_right = output
                 .shapes
                 .iter()
-                .find_map(|shape| text_right(&shape.shape, "Redo"))
+                .find_map(|shape| text_right(&shape.shape, REDO_ICON))
                 .expect("Redo is drawn");
             if redo_right > right + 0.5 {
                 overflowed.push(width);
