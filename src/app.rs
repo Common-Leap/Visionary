@@ -3176,7 +3176,7 @@ fn made_effect_lookup(
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
-    status.starts_with("Sending to the game:") || status.starts_with("Ready for the game:")
+    status.starts_with("Sending to the game:") || status.starts_with("Not connected:")
 }
 
 /// `n` with the singular or plural noun: "1 edited effect", "2 edited effects".
@@ -3197,24 +3197,42 @@ fn effect_counts(edited: usize, borrowed: usize) -> String {
     }
 }
 
-/// The status line a send starts with, `opening` being "Sending to the game" or "Ready for the
-/// game": the outcome rewrites that opening once the game answers.
-fn send_note(opening: &str, fighter: &str, edited: usize, borrowed: usize) -> String {
+/// What a send carries, for its status line: "Mario, 1 edited effect", "Mario's own effects".
+fn send_what(fighter: &str, edited: usize, borrowed: usize) -> String {
     match (fighter, edited + borrowed) {
-        ("", 0) => format!("{opening}: the game's own effects"),
-        (fighter, 0) => format!("{opening}: {fighter}'s own effects"),
-        ("", _) => format!("{opening}: {}", effect_counts(edited, borrowed)),
-        (fighter, _) => format!("{opening}: {fighter}, {}", effect_counts(edited, borrowed)),
+        ("", 0) => "the game's own effects".to_owned(),
+        (fighter, 0) => format!("{fighter}'s own effects"),
+        ("", _) => effect_counts(edited, borrowed),
+        (fighter, _) => format!("{fighter}, {}", effect_counts(edited, borrowed)),
     }
 }
 
-/// The status line once the game link drops: a send's line goes back to "Ready for the game",
-/// which is what the next connection will send. Any other line is left alone.
+/// The status line a send starts with. Connected, it is "Sending to the game: …", which the
+/// outcome rewrites once the game answers; with no game, it says that what it carries goes to
+/// the game when one connects (the connection sends every edit).
+fn send_note(connected: bool, what: &str) -> String {
+    if connected {
+        format!("Sending to the game: {what}")
+    } else {
+        format!("Not connected: {what} will be sent when the game connects")
+    }
+}
+
+/// The status line once the game link drops: a send's line says the game is gone and that the
+/// next connection sends it. A line saved for the next match stays true. Any other line is
+/// left alone.
 fn status_after_disconnect(status: &str) -> Option<String> {
-    let rest = ["Sending to the game:", "In the game:"]
+    let what = ["Sending to the game: ", "In the game: ", "Not sent yet: "]
         .iter()
         .find_map(|prefix| status.strip_prefix(prefix))?;
-    Some(format!("Ready for the game:{rest}"))
+    Some(send_note(false, what))
+}
+
+/// The status line once an edit lands after a send the game took: it no longer holds what the
+/// game shows.
+fn status_after_edit(status: &str) -> Option<String> {
+    let what = status.strip_prefix("In the game: ")?;
+    Some(format!("Not sent yet: {what}"))
 }
 
 /// The status line once a send has ended: the routine "Sending to the game: …" line keeps its
@@ -30791,20 +30809,17 @@ impl VisionaryApp {
         } else if carrier_added && !carrier_authored.is_empty() {
             // "Sent" only once the game says it took them: the resolver in `update` rewrites
             // this opening once the carrier report arrives.
-            let sent = if self.game_link.status().is_connected() {
-                "Sending to the game"
-            } else {
-                "Ready for the game"
-            };
             let fighter = carrier_owner
                 .as_deref()
                 .map(|owner| self.character_name(&crate::character::CharacterKey::parse(owner)))
                 .unwrap_or_default();
             self.state.status = send_note(
-                sent,
-                &fighter,
-                carrier_authored.len(),
-                carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
+                self.game_link.status().is_connected(),
+                &send_what(
+                    &fighter,
+                    carrier_authored.len(),
+                    carrier_ops.len() - carrier_authored.len().min(carrier_ops.len()),
+                ),
             );
         } else if carrier_added && !carrier_dropped_edits.is_empty() {
             // The carrier shipped, but every edit in it was dropped. Saying nothing here would
@@ -30816,18 +30831,13 @@ impl VisionaryApp {
         } else if carrier_added && !carrier_textures.is_empty() {
             // Texture-only send: no authored edit and no transplant to report, so without this
             // branch a successful send said nothing at all.
-            let sent = if self.game_link.status().is_connected() {
-                "Sending to the game"
-            } else {
-                "Ready for the game"
-            };
-            self.state.status = format!(
-                "{sent}: {}",
-                counted(
+            self.state.status = send_note(
+                self.game_link.status().is_connected(),
+                &counted(
                     carrier_textures.len(),
                     "replaced picture",
-                    "replaced pictures"
-                )
+                    "replaced pictures",
+                ),
             );
         } else if (!carrier_authored.is_empty() || !carrier_textures.is_empty()) && !carrier_added {
             self.state.status = match &carrier_error {
@@ -31061,6 +31071,16 @@ impl VisionaryApp {
         let hit: Vec<_> = self.live_hitbox_rule_union();
         self.game_link.send_hitbox_rules(&hit);
         self.sync_eff_mods_from_editor();
+        // Connecting sends like the button does, so it gets the same line and outcome. Only a
+        // character with effect edits has anything to report.
+        let owner = self.eff_editor.loaded_rel().map(|rel| self.eff_owner(&rel));
+        if let Some(owner) = owner.filter(|owner| {
+            self.eff_mods
+                .get(owner)
+                .is_some_and(|edits| !edits.is_empty())
+        }) {
+            self.state.status = send_note(true, &self.live_send_what(&owner));
+        }
         self.push_effect_aliases();
         self.eff_editor.mark_sent();
         self.live_overrides.resend_tweaks(&self.game_link);
@@ -31076,13 +31096,6 @@ impl VisionaryApp {
         let owner = self.eff_owner(&rel);
         let entry = self.eff_mods.get(&owner);
         let known = entry.is_some();
-        // Effects, not parts: the status line counts one thing for one send.
-        let (edits, transplants) = entry
-            .map(|e| {
-                let sets: HashSet<&str> = e.authored.iter().map(|a| a.set_name.as_str()).collect();
-                (sets.len(), e.transplants.len())
-            })
-            .unwrap_or((0, 0));
         // The completion condition depends on what we are asking the plugin to do. A populated
         // snapshot succeeds when a new live carrier object appears; an empty snapshot succeeds
         // when the old object and all of its kinds are gone. Treating both as "wait for live"
@@ -31108,15 +31121,27 @@ impl VisionaryApp {
         if known {
             self.deploy_live_eff(&owner);
         }
-        let fighter = self.character_name(&crate::character::CharacterKey::parse(&owner));
-        let sending = if self.game_link.status().is_connected() {
-            "Sending to the game"
-        } else {
-            "Ready for the game"
-        };
-        let note = send_note(sending, &fighter, edits, transplants);
+        let note = send_note(
+            self.game_link.status().is_connected(),
+            &self.live_send_what(&owner),
+        );
         self.state.status = note.clone();
         note
+    }
+
+    /// What a send for `owner` carries, counted in effects, not parts: the status line counts
+    /// one thing for one send.
+    fn live_send_what(&self, owner: &str) -> String {
+        let (edits, transplants) = self
+            .eff_mods
+            .get(owner)
+            .map(|e| {
+                let sets: HashSet<&str> = e.authored.iter().map(|a| a.set_name.as_str()).collect();
+                (sets.len(), e.transplants.len())
+            })
+            .unwrap_or((0, 0));
+        let fighter = self.character_name(&crate::character::CharacterKey::parse(owner));
+        send_what(&fighter, edits, transplants)
     }
 
     /// Record the [`TransplantOp`](crate::mod_project::TransplantOp) for `fighter` and open
@@ -34821,6 +34846,11 @@ impl eframe::App for VisionaryApp {
         if !self.game_link.status().is_connected() {
             self.last_carrier_fingerprint = None;
             if let Some(status) = status_after_disconnect(&self.state.status) {
+                self.state.status = status;
+            }
+        } else if self.eff_editor.is_unsent() && self.eff_editor.awaiting_game.is_none() {
+            // An edit after the game took the last send: the line stops saying it is in the game.
+            if let Some(status) = status_after_edit(&self.state.status) {
                 self.state.status = status;
             }
         }
@@ -42718,7 +42748,7 @@ mod live_effect_capture_tests {
     #[test]
     fn the_status_line_follows_the_games_answer() {
         use crate::eff_editor::SendOutcome;
-        let sending = send_note("Sending to the game", "Mario", 1, 0);
+        let sending = send_note(true, &send_what("Mario", 1, 0));
         assert_eq!(sending, "Sending to the game: Mario, 1 edited effect");
         assert_eq!(
             status_after_send(&sending, SendOutcome::InGame).as_deref(),
@@ -42729,27 +42759,46 @@ mod live_effect_capture_tests {
             Some("Saved for the next match: Mario, 1 edited effect")
         );
         // A reset says what it is sending, and waits for the game like any other send.
-        let reset = send_note("Sending to the game", "Mario", 0, 0);
+        let reset = send_note(true, &send_what("Mario", 0, 0));
         assert_eq!(reset, "Sending to the game: Mario's own effects");
         let restored = status_after_send(&reset, SendOutcome::Restored).unwrap();
         assert_eq!(restored, "In the game: Mario's own effects");
         // A drop after it stops saying it is in the game.
         assert_eq!(
             status_after_disconnect(&restored).as_deref(),
-            Some("Ready for the game: Mario's own effects")
+            Some("Not connected: Mario's own effects will be sent when the game connects")
         );
         // Another line, such as a refusal, is not rewritten.
         assert_eq!(
             status_after_send("Removed Vision.", SendOutcome::InGame),
             None
         );
-        for line in [sending.as_str(), "In the game: Mario, 1 edited effect"] {
+        // An edit after the game took a send: the game no longer shows what the editor holds.
+        let in_game = "In the game: Mario, 1 edited effect";
+        let edited = status_after_edit(in_game).unwrap();
+        assert_eq!(edited, "Not sent yet: Mario, 1 edited effect");
+        assert_eq!(status_after_edit(&sending), None);
+        assert_eq!(status_after_edit(&edited), None);
+        for line in [sending.as_str(), in_game, edited.as_str()] {
             assert_eq!(
                 status_after_disconnect(line).as_deref(),
-                Some("Ready for the game: Mario, 1 edited effect")
+                Some("Not connected: Mario, 1 edited effect will be sent when the game connects")
             );
         }
+        // Saved for the next match stays true after a drop; so does any other line.
+        assert_eq!(
+            status_after_disconnect("Saved for the next match: Mario, 1 edited effect"),
+            None
+        );
         assert_eq!(status_after_disconnect("Removed Vision."), None);
+        // With no game, a send says when it will go; the push's routine line either way.
+        let waiting = send_note(false, &send_what("Mario", 1, 2));
+        assert_eq!(
+            waiting,
+            "Not connected: Mario, 1 edited effect and 2 borrowed effects will be sent when the \
+             game connects"
+        );
+        assert!(alias_status_is_routine(&waiting));
         // The line a push writes while connected is one the outcome rewrites.
         assert!(alias_status_is_routine(&sending));
         // Counted in effects with real plurals, one count style for one send.
@@ -42766,7 +42815,7 @@ mod live_effect_capture_tests {
             .nth(1)
             .and_then(|rest| rest.split("\n    fn ").next())
             .expect("apply_authored_eff_live");
-        assert!(live.contains("send_note(sending, &fighter, edits, transplants)"));
+        assert!(live.contains("&self.live_send_what(&owner),"));
         assert!(!live.contains("own effects again"));
         // No internal words or shouting on the send's status lines.
         let push = app
@@ -42837,6 +42886,15 @@ mod live_effect_capture_tests {
             .and_then(|rest| rest.split("if let Some(t0) = self.pin_sync_wait").next())
             .expect("connect");
         assert!(connect.contains("self.resend_live_state();"));
+        // And says what it sends, the way the button does.
+        let resend = app
+            .split("fn resend_live_state(&mut self) {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("resend_live_state");
+        assert!(
+            resend.contains("self.state.status = send_note(true, &self.live_send_what(&owner));")
+        );
     }
 
     /// The removal (or creation) keeps its own status line: the effect aliases' success line
@@ -42844,7 +42902,8 @@ mod live_effect_capture_tests {
     #[test]
     fn a_routine_alias_line_does_not_replace_a_characters_status() {
         assert!(alias_status_is_routine(
-            "Ready for the game: Mario, 1 edited effect and 1 borrowed effect"
+            "Not connected: Mario, 1 edited effect and 1 borrowed effect will be sent when the \
+             game connects"
         ));
         assert!(alias_status_is_routine(
             "Sending to the game: Mario, 2 edited effects"
@@ -42869,9 +42928,8 @@ mod live_effect_capture_tests {
             .expect("flush_effect_aliases");
         assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
         for line in [
-            "\"Ready for the game\"",
-            "\"Sending to the game\"",
             "self.state.status = send_note(",
+            "self.game_link.status().is_connected(),",
         ] {
             assert!(push.contains(line), "{line}");
         }

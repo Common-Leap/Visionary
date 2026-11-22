@@ -566,6 +566,11 @@ pub struct EffEditor {
     only_open_move_declined: bool,
     /// A move just picked in the header: once it is open, show one of its effects in it.
     show_in_picked_move: Option<String>,
+    /// A file just loaded with nothing to select: open the open move's effect once.
+    open_first_effect: bool,
+    /// A game has been connected in this session. Before one has, every edit is unsent and
+    /// saying so tells the user nothing.
+    game_seen: bool,
     /// The open move's motion name, to know whether it plays the selected effect.
     open_motion: Option<String>,
     entry_filter: String,
@@ -729,6 +734,8 @@ impl Default for EffEditor {
             only_open_move: false,
             only_open_move_declined: false,
             show_in_picked_move: None,
+            open_first_effect: false,
+            game_seen: false,
             open_motion: None,
             entry_filter: String::new(),
             selected_entry: None,
@@ -2348,6 +2355,7 @@ impl EffEditor {
         self.entries.clear();
         self.selected_entry = None;
         self.selected_emitter = 0;
+        self.open_first_effect = true;
         // `eff_dirty_at` deliberately SURVIVES a load: it tracks project-vs-game divergence,
         // not the working copy. Clearing it here silently undid the `mark_unsent` a transplant
         // had just done, because recording one reloads the eff from the merged preview — so the
@@ -3111,6 +3119,11 @@ impl EffEditor {
     /// silent, without taking the decision to send away from the user.
     pub fn mark_unsent(&mut self) {
         self.touch();
+    }
+
+    /// The project holds edits the running game was not given.
+    pub fn is_unsent(&self) -> bool {
+        self.eff_dirty_at.is_some()
     }
 
     /// An edit happened: there is something unsent, and the preview is out of date.
@@ -4067,6 +4080,8 @@ impl EffEditor {
         // the editor can no longer see, and a reconnect sends everything again.
         if !link.status().is_connected() {
             self.forget_send_result();
+        } else {
+            self.game_seen = true;
         }
         // A project load queues its edits here; they apply even while the page is closed, so
         // the project store and the preview see them without the page having been opened.
@@ -4076,6 +4091,9 @@ impl EffEditor {
             return;
         }
         link.ensure_started();
+        // Before a load: the app sets the open move from the loaded file after this runs, so a
+        // file is looked at the frame after it loads.
+        self.open_first_effect_once();
         if self.eff_files.is_empty() && self.scan_error.is_none() {
             self.rescan();
         }
@@ -4167,104 +4185,113 @@ impl EffEditor {
     }
 
     fn draw_header(&mut self, ui: &mut Ui, link: &GameLink) {
-        ui.horizontal_wrapped(|ui| {
-            // The ONLY send control, in the header so it is reachable from every panel. A
-            // second copy used to sit in the game panel reporting none of the phases below it,
-            // so whichever one you happened to be looking at decided how much you were told
-            // about a stalled send.
-            let connected = link.status().is_connected();
-            let unsent = self.eff_dirty_at.is_some();
-            let btn = egui::Button::new(
-                egui::RichText::new(if unsent {
-                    "⬆ Send edits •"
-                } else {
-                    "⬆ Send edits"
-                })
-                .strong(),
-            );
-            // Filled only when it can be clicked: the fill made a disabled button read as live.
-            let btn = if unsent && connected {
-                btn.fill(egui::Color32::from_rgb(0x7A, 0x5A, 0x10))
-            } else {
-                btn
-            };
-            if ui
-                .add_enabled(connected && !self.sending, btn)
-                .on_hover_text(
-                    "Send every effect edit, borrowed effect and texture to the running game. \
-                     Do the move again to see it.",
-                )
-                .on_disabled_hover_text(if self.sending {
-                    "Sending…".to_owned()
-                } else {
-                    send_blocked_text(&link.view())
-                })
-                .clicked()
-            {
-                self.request_live_apply();
-            }
-            // The connection state and its Connect button are the top bar's, shown once.
-            if self.sending || self.awaiting_game.is_some() {
-                ui.add(egui::Spinner::new().size(14.0));
-                // The phase in words; the game's own numbers go in the hover.
-                let (text, hover) = if self.sending {
-                    ("Sending to the game…".to_string(), None)
-                } else {
-                    let secs = self
-                        .awaiting_game
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0);
-                    let (st, kinds, spawned) = self.carrier_report;
-                    // `took_ours` is the difference between "an edit is up" and "THIS edit is
-                    // up". Without it the previous send answers for this one.
-                    let took_ours =
-                        !self.carrier_needs_new_bytes || self.carrier_gen_now > self.gen_at_send;
-                    let phase = send_phase(st, spawned, took_ours, secs);
-                    (
-                        if secs >= 2 {
-                            format!("{phase}… {secs}s")
-                        } else {
-                            format!("{phase}…")
-                        },
-                        Some(carrier_numbers(st, kinds, spawned)),
-                    )
-                };
-                let label = ui.label(
-                    egui::RichText::new(text)
-                        .small()
-                        .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
-                );
-                if let Some(hover) = hover {
-                    label.on_hover_text(hover);
-                }
-            } else if unsent {
-                ui.label(
-                    egui::RichText::new("unsent")
-                        .small()
-                        .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30)),
-                );
-            } else if let Some(r) = &self.last_carrier_result {
-                let label = ui.label(egui::RichText::new(r).small().color(if self.carrier_ok {
-                    egui::Color32::from_rgb(0x70, 0xB0, 0x70)
-                } else {
-                    egui::Color32::from_rgb(0xD0, 0x80, 0x60)
-                }));
-                if let Some(detail) = &self.last_carrier_detail {
-                    label.on_hover_text(detail);
-                }
-            }
-        });
-
-        // Which character and move, then which file: the project's edited ones first, then
-        // any of the game's.
+        // Which character and move, with Send at the row's right end, then which file: the
+        // project's edited ones first, then any of the game's.
         ui.horizontal_wrapped(|ui| {
             self.draw_fighter_picker(ui);
             ui.add_space(8.0);
             self.draw_move_picker(ui);
+            const SEND_ROOM: f32 = 260.0;
+            if ui.available_size_before_wrap().x < SEND_ROOM {
+                ui.end_row();
+            }
+            let size = egui::vec2(
+                ui.available_size_before_wrap().x,
+                ui.spacing().interact_size.y,
+            );
+            ui.allocate_ui_with_layout(
+                size,
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| self.draw_send(ui, link),
+            );
         });
         ui.horizontal_wrapped(|ui| {
             self.draw_file_picker(ui);
         });
+    }
+
+    /// The ONLY send control, in the header so it is reachable from every panel, with the
+    /// send's state beside it. A second copy used to sit in the game panel reporting none of
+    /// the phases below it, so whichever one you happened to be looking at decided how much you
+    /// were told about a stalled send. Laid out right to left: the button is drawn first.
+    fn draw_send(&mut self, ui: &mut Ui, link: &GameLink) {
+        let connected = link.status().is_connected();
+        let unsent = self.eff_dirty_at.is_some();
+        let btn = egui::Button::new(egui::RichText::new("⬆ Send edits").strong());
+        // Filled only when it can be clicked: the fill made a disabled button read as live.
+        let btn = if unsent && connected {
+            btn.fill(egui::Color32::from_rgb(0x7A, 0x5A, 0x10))
+        } else {
+            btn
+        };
+        if ui
+            .add_enabled(connected && !self.sending, btn)
+            .on_hover_text(
+                "Send every effect edit, borrowed effect and texture to the running game. \
+                 Do the move again to see it.",
+            )
+            .on_disabled_hover_text(if self.sending {
+                "Sending…".to_owned()
+            } else {
+                send_blocked_text(&link.view())
+            })
+            .clicked()
+        {
+            self.request_live_apply();
+        }
+        // The connection state and its Connect button are the top bar's, shown once.
+        if self.sending || self.awaiting_game.is_some() {
+            ui.add(egui::Spinner::new().size(14.0));
+            // The phase in words; the game's own numbers go in the hover.
+            let (text, hover) = if self.sending {
+                ("Sending to the game…".to_string(), None)
+            } else {
+                let secs = self
+                    .awaiting_game
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let (st, kinds, spawned) = self.carrier_report;
+                // `took_ours` is the difference between "an edit is up" and "THIS edit is
+                // up". Without it the previous send answers for this one.
+                let took_ours =
+                    !self.carrier_needs_new_bytes || self.carrier_gen_now > self.gen_at_send;
+                let phase = send_phase(st, spawned, took_ours, secs);
+                (
+                    if secs >= 2 {
+                        format!("{phase}… {secs}s")
+                    } else {
+                        format!("{phase}…")
+                    },
+                    Some(carrier_numbers(st, kinds, spawned)),
+                )
+            };
+            let label = ui.label(
+                egui::RichText::new(text)
+                    .small()
+                    .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
+            );
+            if let Some(hover) = hover {
+                label.on_hover_text(hover);
+            }
+        } else if unsent {
+            if self.game_seen {
+                ui.label(
+                    egui::RichText::new("unsent")
+                        .small()
+                        .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30)),
+                )
+                .on_hover_text("Edits the game has not been sent");
+            }
+        } else if let Some(r) = &self.last_carrier_result {
+            let label = ui.label(egui::RichText::new(r).small().color(if self.carrier_ok {
+                egui::Color32::from_rgb(0x70, 0xB0, 0x70)
+            } else {
+                egui::Color32::from_rgb(0xD0, 0x80, 0x60)
+            }));
+            if let Some(detail) = &self.last_carrier_detail {
+                label.on_hover_text(detail);
+            }
+        }
     }
 
     fn draw_fighter_picker(&mut self, ui: &mut Ui) {
@@ -4473,15 +4500,49 @@ impl EffEditor {
         }
     }
 
-    /// The effect of this file the open move spawns first; list order breaks ties, and effects
-    /// an object of the move plays come after those its script spawns.
+    /// The effect of this file the open move spawns first, an edited one before the rest; list
+    /// order breaks ties, and effects an object of the move plays come after those its script
+    /// spawns.
     fn first_spawned_in_open_move(&self) -> Option<usize> {
+        let edited = self.edited_entries();
         self.entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| self.in_open_move(entry))
-            .min_by_key(|(i, entry)| (self.open_move_start(&entry.name).unwrap_or(u32::MAX), *i))
+            .min_by_key(|(i, entry)| {
+                (
+                    !edited[*i],
+                    self.open_move_start(&entry.name).unwrap_or(u32::MAX),
+                    *i,
+                )
+            })
             .map(|(i, _)| i)
+    }
+
+    /// A file just opened with nothing selected shows something at once: the open move's
+    /// first effect, or with no move open, the first edited effect. It waits for the moves to
+    /// be read, by when the app has set the open move for the file.
+    fn open_first_effect_once(&mut self) {
+        if !self.open_first_effect
+            || self.entries.is_empty()
+            || self.pending_select.is_some()
+            || !self.effect_uses_ready
+        {
+            return;
+        }
+        self.open_first_effect = false;
+        if self.selected_entry.is_some() || self.show_in_picked_move.is_some() {
+            return;
+        }
+        match self.open_motion.clone() {
+            Some(motion) => self.show_in_picked_move = Some(motion),
+            None => {
+                if let Some(i) = self.edited_entries().iter().position(|edited| *edited) {
+                    self.select_entry(i);
+                    self.scroll_to_selected = true;
+                }
+            }
+        }
     }
 
     fn draw_file_picker(&mut self, ui: &mut Ui) {
@@ -4752,8 +4813,11 @@ impl EffEditor {
         };
         let mut open_shared = None;
         let mut clicked = None;
+        let mut scroll_to_selected = self.scroll_to_selected;
+        // As wide as the panel, so the bar sits at its edge rather than after the longest name.
         egui::ScrollArea::vertical()
             .id_salt("eff_entries")
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 // A search finds an effect by its name or by a move that spawns it ("forward
                 // smash" lists that move's effects).
@@ -4791,10 +4855,12 @@ impl EffEditor {
                         "No matching effects"
                     });
                 }
-                for (i, entry) in self.entries.iter().enumerate() {
-                    if !matches((i, entry)) {
-                        continue;
-                    }
+                // Effects no move script spawns go in a fold of their own at the end: greyed in
+                // place they read as disabled.
+                let unused =
+                    |entry: &EffEntry| self.effect_uses_ready && !uses.contains_key(&entry.hash);
+                let reveal_selected = scroll_to_selected;
+                let mut row = |ui: &mut Ui, i: usize, entry: &EffEntry| {
                     ui.horizontal(|ui| {
                         // Whether the game has spawned it, only while there is a game to ask.
                         if link.status().is_connected() {
@@ -4815,12 +4881,8 @@ impl EffEditor {
                         // word of text per row would push the names out of view, and this is
                         // the one thing you need to find again after scrolling away.
                         let text = egui::RichText::new(&shown_names[i]);
-                        let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
                         let text = if edited_flags[i] {
                             text.color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
-                        } else if unused && !selected {
-                            // Grey on the selection's blue did not read.
-                            text.weak()
                         } else {
                             text
                         };
@@ -4834,8 +4896,9 @@ impl EffEditor {
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 ),
-                                None if unused => "No move script spawns it. The game may \
-                                                       spawn it from code the editor can't read."
+                                None if unused(entry) => "No move script spawns it. The game \
+                                                       may spawn it from code the editor can't \
+                                                       read."
                                     .to_owned(),
                                 None => "Reading the moves…".to_owned(),
                             };
@@ -4862,11 +4925,50 @@ impl EffEditor {
                         if response.clicked() {
                             clicked = Some(i);
                         }
-                        if selected && self.scroll_to_selected {
+                        if selected && scroll_to_selected {
                             response.scroll_to_me(Some(egui::Align::Center));
-                            self.scroll_to_selected = false;
+                            scroll_to_selected = false;
                         }
                     });
+                };
+                let mut not_used = Vec::new();
+                for (i, entry) in self.entries.iter().enumerate() {
+                    if !matches((i, entry)) {
+                        continue;
+                    }
+                    if unused(entry) {
+                        not_used.push(i);
+                    } else {
+                        row(ui, i, entry);
+                    }
+                }
+                if !not_used.is_empty() {
+                    // Closed until it holds what is wanted: the open effect, an edited one, or
+                    // a search's matches.
+                    let open_effect = selected_entry.is_some_and(|i| not_used.contains(&i));
+                    // An edited effect is the one thing to find again: never hidden.
+                    let wanted = !filter.is_empty() || not_used.iter().any(|&i| edited_flags[i]);
+                    let fold = egui::CollapsingHeader::new(format!(
+                        "Not used by any move ({})",
+                        not_used.len()
+                    ))
+                    .id_salt(("eff_entries_not_used", wanted))
+                    .default_open(wanted);
+                    let fold = if open_effect && reveal_selected {
+                        fold.open(Some(true))
+                    } else {
+                        fold
+                    };
+                    fold.show(ui, |ui| {
+                        for &i in &not_used {
+                            row(ui, i, &self.entries[i]);
+                        }
+                    })
+                    .header_response
+                    .on_hover_text(
+                        "No move script spawns these. The game may spawn them from code the \
+                         editor can't read.",
+                    );
                 }
                 for name in &shared_rows {
                     ui.horizontal(|ui| {
@@ -4883,6 +4985,7 @@ impl EffEditor {
                     });
                 }
             });
+        self.scroll_to_selected = scroll_to_selected;
         if let Some(i) = clicked {
             self.select_entry(i);
         }
@@ -5062,39 +5165,6 @@ impl EffEditor {
                     history = Some((false, 1));
                 }
             });
-            let label = match &self.open_move {
-                Some(name) => format!("Use in {name}"),
-                None => "Use in a move".to_owned(),
-            };
-            let (enabled, hover) = self.use_in_move_state(&entry_name);
-            let button = ui.add_enabled(enabled, egui::Button::new(label).small());
-            let button = if enabled {
-                button.on_hover_text(hover)
-            } else {
-                button.on_disabled_hover_text(hover)
-            };
-            if button.clicked() {
-                self.use_in_move_requested = true;
-            }
-            if let Some(note) = &self.use_in_move_note {
-                ui.label(egui::RichText::new(note).small().weak());
-                if ui
-                    .small_button("Undo")
-                    .on_hover_text("Take it out of the move again")
-                    .clicked()
-                {
-                    self.use_in_move_undo_requested = true;
-                }
-                if ui
-                    .small_button("Open in Classic editor")
-                    .on_hover_text(
-                        "Place it in the move: where it sits, its size and when it stops",
-                    )
-                    .clicked()
-                {
-                    self.open_classic_requested = true;
-                }
-            }
         });
         if let Some((undo, steps)) = history {
             // It may open another effect: draw that one next frame.
@@ -5131,7 +5201,9 @@ impl EffEditor {
                 }
             });
         }
-        ui.horizontal(|ui| {
+        // The tabs, then putting the effect in the open move: a row of its own held one
+        // control, greyed whenever the move already plays the effect.
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.emitter_tab, EmitterTab::Attributes, "Look")
                 .on_hover_text("How the selected part looks and moves");
             ui.selectable_value(
@@ -5143,6 +5215,40 @@ impl EffEditor {
                 "The parts this effect plays: each makes its own particles. When each starts, on \
                  the timeline's frames, how long it runs, and the model that comes with it.",
             );
+            ui.add_space(8.0);
+            let label = match &self.open_move {
+                Some(name) => format!("Use in {name}"),
+                None => "Use in a move".to_owned(),
+            };
+            let (enabled, hover) = self.use_in_move_state(&entry_name);
+            let button = ui.add_enabled(enabled, egui::Button::new(label).small());
+            let button = if enabled {
+                button.on_hover_text(hover)
+            } else {
+                button.on_disabled_hover_text(hover)
+            };
+            if button.clicked() {
+                self.use_in_move_requested = true;
+            }
+            if let Some(note) = &self.use_in_move_note {
+                ui.label(egui::RichText::new(note).small().weak());
+                if ui
+                    .small_button("Undo")
+                    .on_hover_text("Take it out of the move again")
+                    .clicked()
+                {
+                    self.use_in_move_undo_requested = true;
+                }
+                if ui
+                    .small_button("Open in Classic editor")
+                    .on_hover_text(
+                        "Place it in the move: where it sits, its size and when it stops",
+                    )
+                    .clicked()
+                {
+                    self.open_classic_requested = true;
+                }
+            }
         });
         // Before the tab branch: the button is on both tabs.
         if reset_entry {
@@ -8712,6 +8818,146 @@ mod tests {
         editor.loaded_path = Some("/fx/effect/system/common/ef_common.eff".into());
         assert!(editor.loaded_is_shared());
         assert!(editor.open_move_shared_effects().is_empty());
+    }
+
+    /// An editor on Mario's super jump effects, both played by Up special, and a third no move
+    /// spawns.
+    fn editor_with_a_move() -> EffEditor {
+        let mut editor = editor_with_one_emitter("/fx/ef_mario.eff");
+        editor.entries = [
+            "mario_superjump_fnish",
+            "mario_superjump_power",
+            "mario_unused_spark",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| EffEntry {
+            name: (*name).into(),
+            hash: i as u64,
+            set_idx: 0,
+        })
+        .collect();
+        let uses = vec![MoveUse {
+            label: "Up special".into(),
+            motion: Some("special_hi".into()),
+            bones: Vec::new(),
+        }];
+        editor.set_effect_uses([(0, uses.clone()), (1, uses)].into(), true);
+        editor
+    }
+
+    /// A file opening with a move open shows that move's first effect at once rather than an
+    /// empty panel, and does it once: a later frame with nothing open is left alone. With no
+    /// move open, nothing is opened for an unedited file.
+    #[test]
+    fn a_file_opens_on_its_moves_first_effect() {
+        let mut editor = editor_with_a_move();
+        // Nothing is decided before the moves are read: the open move may not be set yet.
+        editor.effect_uses_ready = false;
+        editor.open_first_effect = true;
+        editor.open_first_effect_once();
+        assert!(editor.open_first_effect && editor.show_in_picked_move.is_none());
+        editor.effect_uses_ready = true;
+        editor.set_open_move(Some("Up special".into()), Some("special_hi".into()));
+        editor.set_open_move_effects(vec![
+            ("mario_superjump_fnish".into(), 20),
+            ("mario_superjump_power".into(), 4),
+        ]);
+        editor.open_first_effect = true;
+        editor.open_first_effect_once();
+        editor.settle_picked_move();
+        assert_eq!(editor.selected_entry, Some(1));
+        assert_eq!(editor.view, EffectView::InMove);
+
+        editor.selected_entry = None;
+        editor.open_first_effect_once();
+        editor.settle_picked_move();
+        assert_eq!(editor.selected_entry, None);
+
+        let mut editor = editor_with_a_move();
+        editor.open_first_effect = true;
+        editor.open_first_effect_once();
+        editor.settle_picked_move();
+        assert_eq!(editor.selected_entry, None);
+        assert!(!editor.open_first_effect);
+    }
+
+    /// Effects no move spawns are listed in a closed fold at the end, not greyed in place; a
+    /// search opens it, and so does opening one of them.
+    #[test]
+    fn effects_no_move_spawns_are_listed_in_a_closed_fold() {
+        let link = GameLink::default();
+        let shows = |editor: &mut EffEditor, text: &str| {
+            let context = egui::Context::default();
+            let mut found = false;
+            for _ in 0..2 {
+                let output = context.run_test_ui(egui::RawInput::default(), |ui| {
+                    editor.draw_entry_list(ui, &link)
+                });
+                found = output
+                    .shapes
+                    .iter()
+                    .any(|shape| text_position(&shape.shape, text).is_some());
+            }
+            found
+        };
+        let mut editor = editor_with_a_move();
+        let names = entry_list_names(&editor.entries);
+        assert!(shows(&mut editor, &names[0]));
+        assert!(shows(&mut editor, "Not used by any move (1)"));
+        assert!(!shows(&mut editor, &names[2]), "closed to begin with");
+        editor.entry_filter = "spark".into();
+        assert!(shows(&mut editor, &names[2]), "a search opens it");
+        assert!(!shows(&mut editor, &names[0]));
+
+        let mut editor = editor_with_a_move();
+        editor.queue_select("mario_unused_spark");
+        editor.apply_pending_select();
+        assert!(shows(&mut editor, &names[2]), "the open effect shows");
+        // An edited effect no move spawns is never hidden: the fold opens for it, and only
+        // for it.
+        let mut editor = editor_with_a_move();
+        let set = editor.ptcl.as_ref().unwrap().emitter_sets[0].clone();
+        editor.ptcl.as_mut().unwrap().emitter_sets.push(set);
+        editor.pristine.push(editor.pristine[0].clone());
+        editor.entries[2].set_idx = 1;
+        assert!(!shows(&mut editor, &names[2]));
+        let mut editor = editor_with_a_move();
+        let set = editor.ptcl.as_ref().unwrap().emitter_sets[0].clone();
+        editor.ptcl.as_mut().unwrap().emitter_sets.push(set);
+        editor.pristine.push(editor.pristine[0].clone());
+        editor.entries[2].set_idx = 1;
+        set_attr(
+            &mut editor.ptcl.as_mut().unwrap().emitter_sets[1].emitters[0],
+            TUNED,
+            AttrValue::Float(2.5),
+        );
+        assert!(shows(&mut editor, &names[2]), "an edited effect shows");
+    }
+
+    /// The Send button carries no marker, and "unsent" shows only once a game has connected:
+    /// before that every edit is unsent.
+    #[test]
+    fn unsent_shows_only_after_a_game_has_connected() {
+        let link = GameLink::default();
+        let shows = |editor: &mut EffEditor, text: &str| {
+            let context = egui::Context::default();
+            let output =
+                context.run_test_ui(egui::RawInput::default(), |ui| editor.draw_send(ui, &link));
+            output
+                .shapes
+                .iter()
+                .any(|shape| text_position(&shape.shape, text).is_some())
+        };
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.mark_unsent();
+        assert!(
+            shows(&mut editor, "⬆ Send edits"),
+            "the whole label, with no marker"
+        );
+        assert!(!shows(&mut editor, "unsent"));
+        editor.game_seen = true;
+        assert!(shows(&mut editor, "unsent"));
     }
 
     /// Any texture of the file can be picked but one that stacks another number of pictures,
