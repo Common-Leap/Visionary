@@ -1011,6 +1011,55 @@ fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
     changed
 }
 
+/// What each effect is listed as: its name in words, as the timeline shows it, or its file name
+/// where two effects would read the same.
+fn entry_list_names(entries: &[EffEntry]) -> Vec<String> {
+    let words: Vec<String> = entries
+        .iter()
+        .map(|entry| crate::app::effect_words(&entry.name))
+        .collect();
+    let mut seen = std::collections::HashMap::<String, usize>::new();
+    for word in &words {
+        *seen.entry(word.to_lowercase()).or_default() += 1;
+    }
+    words
+        .into_iter()
+        .zip(entries)
+        .map(|(word, entry)| {
+            if seen[&word.to_lowercase()] > 1 {
+                entry.name.clone()
+            } else {
+                word
+            }
+        })
+        .collect()
+}
+
+/// How well a search matches a choice shown under any of `names`: 0 is an exact name, 1 a name
+/// starting with it, 2 a name containing it, and None no match. An empty search matches all
+/// alike. Case and surrounding spaces are ignored.
+fn search_rank(search: &str, names: &[&str]) -> Option<u8> {
+    let search = search.trim().to_lowercase();
+    if search.is_empty() {
+        return Some(0);
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            let name = name.to_lowercase();
+            if name == search {
+                Some(0)
+            } else if name.starts_with(&search) {
+                Some(1)
+            } else if name.contains(&search) {
+                Some(2)
+            } else {
+                None
+            }
+        })
+        .min()
+}
+
 /// How an attribute's value reads in the "orig" column.
 fn attr_text(attr: &crate::eff_attrs::Attr, value: AttrValue) -> String {
     match attr.kind {
@@ -2646,19 +2695,21 @@ impl EffEditor {
                 if !search.has_focus() && !ui.memory(|m| m.focused().is_some()) {
                     search.request_focus();
                 }
-                // Enter picks the first match.
+                // Best matches first (exact, then starting with, then containing), and Enter
+                // picks the top one: "mario" is Mario, not Dr. Mario.
                 let mut enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let filter = self.fighter_filter.trim().to_lowercase();
+                let mut matches: Vec<(u8, &String, &String)> = self
+                    .fighter_choices
+                    .iter()
+                    .filter_map(|(name, shown)| {
+                        search_rank(&self.fighter_filter, &[shown.as_str(), name.as_str()])
+                            .map(|rank| (rank, name, shown))
+                    })
+                    .collect();
+                matches.sort_by_key(|(rank, _, _)| *rank);
                 let mut picked = None;
-                let mut any = false;
-                for (name, shown) in &self.fighter_choices {
-                    if !filter.is_empty()
-                        && !shown.to_lowercase().contains(&filter)
-                        && !name.contains(&filter)
-                    {
-                        continue;
-                    }
-                    any = true;
+                let any = !matches.is_empty();
+                for (_, name, shown) in matches {
                     let open = self.open_fighter.as_deref() == Some(name.as_str());
                     if ui.selectable_label(open, shown).clicked() || std::mem::take(&mut enter) {
                         if !open {
@@ -2714,29 +2765,37 @@ impl EffEditor {
                         );
                     }
                     let mut enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let filter = self.move_filter.trim().to_lowercase();
                     use crate::move_kinds::MoveGroup;
                     let order: Vec<MoveGroup> = MoveGroup::ORDER
                         .iter()
                         .copied()
                         .chain(std::iter::once(MoveGroup::Other))
                         .collect();
-                    let mut groups: Vec<Vec<(String, String)>> = vec![Vec::new(); order.len()];
+                    let mut groups: Vec<Vec<(u8, String, String)>> = vec![Vec::new(); order.len()];
                     for motion in &self.move_choices {
                         let label = crate::move_kinds::plain_name(motion);
-                        if !filter.is_empty()
-                            && !label.to_lowercase().contains(&filter)
-                            && !motion.contains(&filter)
-                        {
+                        let Some(rank) =
+                            search_rank(&self.move_filter, &[label.as_str(), motion.as_str()])
+                        else {
                             continue;
-                        }
+                        };
                         let group = crate::move_kinds::group_of(motion);
                         let at = order
                             .iter()
                             .position(|g| *g == group)
                             .unwrap_or(order.len() - 1);
-                        groups[at].push((motion.clone(), label));
+                        groups[at].push((rank, motion.clone(), label));
                     }
+                    // Best matches first in each group, and Enter takes the best of all:
+                    // "forward smash" is Forward smash, not Forward smash angled up.
+                    for moves in &mut groups {
+                        moves.sort_by_key(|(rank, _, _)| *rank);
+                    }
+                    let best = groups
+                        .iter()
+                        .flatten()
+                        .min_by_key(|(rank, _, _)| *rank)
+                        .map(|(_, motion, _)| motion.clone());
                     if groups.iter().all(Vec::is_empty) {
                         ui.weak("No matching moves");
                     }
@@ -2747,16 +2806,16 @@ impl EffEditor {
                         }
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new(group.label()).small().strong());
-                        for (motion, label) in moves {
+                        for (_, motion, label) in moves {
                             let open = self.open_motion.as_deref() == Some(motion.as_str());
                             let text = if plays.contains(motion) {
                                 egui::RichText::new(format!("● {label}")).color(marked)
                             } else {
                                 egui::RichText::new(label)
                             };
-                            if ui.selectable_label(open, text).clicked()
-                                || std::mem::take(&mut enter)
-                            {
+                            let enter_here = enter && best.as_deref() == Some(motion.as_str());
+                            if ui.selectable_label(open, text).clicked() || enter_here {
+                                enter = false;
                                 picked = Some(motion.clone());
                                 ui.close();
                             }
@@ -3018,6 +3077,8 @@ impl EffEditor {
                     .collect()
             })
             .unwrap_or_default();
+        // Rows read as the timeline names them; the file name stays in the hover.
+        let shown_names = entry_list_names(&self.entries);
         let mut clicked = None;
         egui::ScrollArea::vertical()
             .id_salt("eff_entries")
@@ -3031,17 +3092,18 @@ impl EffEditor {
                         moves.iter().any(|m| m.motion.as_deref() == open_motion)
                     })
                 };
-                let matches = |entry: &EffEntry| {
+                let matches = |(i, entry): (usize, &EffEntry)| {
                     (!only_move || in_move(entry))
                         && (filter.is_empty()
                             || entry.name.to_lowercase().contains(&filter)
+                            || shown_names[i].to_lowercase().contains(&filter)
                             || uses.get(&entry.hash).is_some_and(|moves| {
                                 moves
                                     .iter()
                                     .any(|m| m.label.to_lowercase().contains(&filter))
                             }))
                 };
-                if !self.entries.is_empty() && !self.entries.iter().any(&matches) {
+                if !self.entries.is_empty() && !self.entries.iter().enumerate().any(&matches) {
                     ui.weak(if only_move {
                         "This move plays none of this file's effects"
                     } else {
@@ -3049,7 +3111,7 @@ impl EffEditor {
                     });
                 }
                 for (i, entry) in self.entries.iter().enumerate() {
-                    if !matches(entry) {
+                    if !matches((i, entry)) {
                         continue;
                     }
                     ui.horizontal(|ui| {
@@ -3071,7 +3133,7 @@ impl EffEditor {
                         // An edited entry is tinted rather than badged: the list is narrow, a
                         // word of text per row would push the names out of view, and this is
                         // the one thing you need to find again after scrolling away.
-                        let text = egui::RichText::new(&entry.name).monospace();
+                        let text = egui::RichText::new(&shown_names[i]);
                         let unused = self.effect_uses_ready && !uses.contains_key(&entry.hash);
                         let text = if edited_sets.contains(&entry.set_idx) {
                             text.color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
@@ -3100,7 +3162,10 @@ impl EffEditor {
                             } else {
                                 ""
                             };
-                            format!("{plays}{edited}\nRight-click to copy the name")
+                            format!(
+                                "{}\n{plays}{edited}\nRight-click to copy the name",
+                                entry.name
+                            )
                         });
                         // The entry name is what goes into an ACMD `EFFECT` call, and the list
                         // is the only place it appears in full — the label is truncated once
@@ -5122,6 +5187,48 @@ mod tests {
             .find(|a| a.id == "particle_data.primitive_id")
             .unwrap();
         assert_eq!(attr_text(primitive, AttrValue::UInt(u64::MAX)), "None");
+    }
+
+    #[test]
+    fn effect_list_reads_as_the_timeline_and_keeps_colliding_file_names() {
+        let entry = |name: &str| EffEntry {
+            name: name.into(),
+            hash: 0,
+            set_idx: 0,
+        };
+        let entries = [
+            entry("mariod_smash_aura"),
+            entry("mariod_smash_impact"),
+            entry("mario_hit"),
+            entry("mariod_hit"),
+        ];
+        let names = entry_list_names(&entries);
+        // The same words the timeline row shows for the effect.
+        assert_eq!(names[0], crate::app::effect_words("mariod_smash_aura"));
+        assert_eq!(names[0], "Smash aura");
+        assert_eq!(names[1], "Smash impact");
+        // Two effects that would both read "Hit" keep their file names.
+        assert_eq!(names[2], "mario_hit");
+        assert_eq!(names[3], "mariod_hit");
+    }
+
+    #[test]
+    fn search_ranks_the_exact_name_before_longer_ones() {
+        let rank = |search, name| search_rank(search, &[name]);
+        assert_eq!(rank("mario", "Mario"), Some(0));
+        assert_eq!(rank("mario", "Dr. Mario"), Some(2));
+        assert_eq!(rank(" Forward Smash ", "Forward smash"), Some(0));
+        assert_eq!(rank("forward smash", "Forward smash angled up"), Some(1));
+        assert_eq!(rank("zelda", "Mario"), None);
+        // Either name matches: the shown one or the internal one.
+        assert_eq!(search_rank("mariod", &["Dr. Mario", "mariod"]), Some(0));
+        // Sorted by rank, Mario comes before Dr. Mario whatever the list order.
+        let mut choices = vec![("Dr. Mario", 0u8), ("Mario", 0u8)];
+        for choice in &mut choices {
+            choice.1 = rank("mario", choice.0).unwrap();
+        }
+        choices.sort_by_key(|c| c.1);
+        assert_eq!(choices[0].0, "Mario");
     }
 
     /// A blank emitter at the version Smash's own files use, for the attribute vector.
