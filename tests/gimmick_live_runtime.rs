@@ -16,6 +16,9 @@ mod article_lifetime_tests;
 #[path = "slight/damage_expression_tests.rs"]
 mod damage_expression_tests;
 
+#[path = "slight/meter_costume_tests.rs"]
+mod meter_costume_tests;
+
 use std::sync::LazyLock;
 
 static TEST_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
@@ -85,14 +88,33 @@ pub mod app {
     pub mod lua_bind {
         pub struct WorkModule;
         impl WorkModule {
-            /// Every test fighter wears costume 0.
-            pub unsafe fn get_int(
-                _module: *mut super::BattleObjectModuleAccessor,
-                _id: i32,
-            ) -> i32 {
-                0
+            /// Every test fighter wears costume 0 unless a test dresses it with [`dress`].
+            pub unsafe fn get_int(module: *mut super::BattleObjectModuleAccessor, id: i32) -> i32 {
+                if id != *crate::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR {
+                    return 0;
+                }
+                COSTUMES
+                    .lock()
+                    .unwrap()
+                    .get(&(module as u64))
+                    .copied()
+                    .unwrap_or(0)
             }
         }
+
+        static COSTUMES: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::BTreeMap<u64, i32>>,
+        > = std::sync::LazyLock::new(Default::default);
+
+        /// Put the fighter whose module accessor is `accessor` in costume `color`.
+        pub fn dress(accessor: u64, color: i32) {
+            COSTUMES.lock().unwrap().insert(accessor, color);
+        }
+
+        pub fn undress_all() {
+            COSTUMES.lock().unwrap().clear();
+        }
+
         pub struct StatusModule;
         impl StatusModule {
             pub unsafe fn status_kind(module: *mut super::BattleObjectModuleAccessor) -> i32 {
@@ -207,6 +229,9 @@ pub mod app {
 }
 
 mod slight {
+    #[path = "../../plugins/slight_replica/src/slight/costume_scope.rs"]
+    pub mod costume_scope;
+
     pub mod agents {
         pub fn newest_registered(_objects: &[u32]) -> Option<u32> {
             None
@@ -1096,6 +1121,46 @@ mod slight {
             ) -> Result<(), String> {
                 preflight_write(boid, fighter, expected, action)
             }
+            #[derive(Debug, Clone, Copy)]
+            pub(crate) struct WorkSource<'a> {
+                pub symbol: &'a str,
+                pub kind: super::registry::IdentifierKind,
+            }
+
+            #[derive(Debug, Clone, Copy, PartialEq)]
+            pub(crate) enum WorkValue {
+                Float(f32),
+                Int(i32),
+                Flag(bool),
+            }
+
+            /// The test sample for each source, after the same identity check the plugin makes.
+            pub(crate) fn sample_work_values(
+                boid: u32,
+                fighter: &str,
+                expected: Identity,
+                sources: &[WorkSource<'_>],
+            ) -> Result<Vec<WorkValue>, String> {
+                if Identity::from_live_fighter(boid, fighter) != Some(expected) {
+                    return Err("stale work identity".into());
+                }
+                if FAIL_SAMPLE.load(Ordering::SeqCst) {
+                    return Err("simulated work sample failure".into());
+                }
+                Ok(sources
+                    .iter()
+                    .map(|source| match source.kind {
+                        super::registry::IdentifierKind::WorkFloat => {
+                            WorkValue::Float(f32::from_bits(SAMPLE_BITS.load(Ordering::SeqCst)))
+                        }
+                        super::registry::IdentifierKind::WorkInt => {
+                            WorkValue::Int(SAMPLE_INT.load(Ordering::SeqCst))
+                        }
+                        _ => WorkValue::Flag(SAMPLE_FLAG.load(Ordering::SeqCst)),
+                    })
+                    .collect())
+            }
+
             pub(crate) const MAX_WORK_SAMPLES: usize = 64;
             static SAMPLE_BITS: AtomicU32 = AtomicU32::new(75.0f32.to_bits());
             static SAMPLE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1300,10 +1365,9 @@ mod slight {
         #[path = "../../../plugins/slight_replica/src/slight/gimmicks/behavior.rs"]
         pub mod behavior;
 
-        pub mod meter_snapshot {
-            // The emitted fixture has zero bindings; no HUD getter is mocked.
-            pub struct MeterBinding;
-        }
+        // The plugin's own meter pass, run against the mocked object table.
+        #[path = "../../../plugins/slight_replica/src/slight/gimmicks/meter_snapshot.rs"]
+        pub mod meter_snapshot;
 
         pub fn on_reset_fighter(boid: u32) {
             live_behavior::clear_boid(boid);
@@ -1420,6 +1484,7 @@ fn reset() {
     slight::gimmicks::dispatcher::clear();
     slight::agents::clear();
     smash::app::sv_battle_object::clear();
+    smash::app::lua_bind::undress_all();
     slight::gimmicks::operations::take_actions();
     slight::gimmicks::operations::reset_controls();
     slight::gimmicks::phase_control::set_sample(None);
@@ -1630,6 +1695,7 @@ fn program(
     }
     model::LiveProgram {
         costumes: Vec::new(),
+        except_costumes: Vec::new(),
         custom_statuses: Default::default(),
         status_bindings: Vec::new(),
         event_bindings: Vec::new(),

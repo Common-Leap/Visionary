@@ -1959,7 +1959,10 @@ pub fn inspector_for_fighter(ui: &mut egui::Ui, call: &mut NativeCall, fighter: 
         ui.label("Opaque source line");
         ui.monospace(&line.source);
         if let Some((expected, actual)) = line.sdk_arity() {
-            ui.weak(format!("Decompiler supplied {actual} of {expected} SDK arguments. Missing values are unresolved."));
+            ui.weak(format!(
+                "Decompiler supplied {actual} of {expected} SDK arguments"
+            ))
+            .on_hover_text("Missing values are unresolved.");
         }
         return;
     }

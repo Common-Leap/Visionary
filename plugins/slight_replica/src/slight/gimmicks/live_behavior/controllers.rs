@@ -4,8 +4,43 @@
 use std::io::{self, Write};
 
 use super::super::controller_protocol as protocol;
-use super::super::controller_runtime::{ControllerCoordinator, ControllerState};
+use super::super::controller_runtime::{
+    coordinator_for_costume, ControllerCoordinator, ControllerState,
+};
 use super::*;
+
+/// One fighter's installed gimmicks: its own and one per character made on it, each on its own
+/// costumes, in the bundle's stable order.
+pub(super) type Owners = Vec<Arc<ControllerCoordinator>>;
+
+/// The costume a fighter object is wearing, or -1 when the game does not say. Read at dispatch,
+/// where the object's identity has just been checked; no allocation and no I/O.
+pub(crate) fn costume_of(boid: u32) -> i32 {
+    unsafe {
+        if smash::app::sv_battle_object::is_null(boid)
+            || !smash::app::sv_battle_object::is_active(boid)
+        {
+            return -1;
+        }
+        let module = smash::app::sv_battle_object::module_accessor(boid);
+        if module.is_null() {
+            return -1;
+        }
+        smash::app::lua_bind::WorkModule::get_int(
+            module,
+            *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
+        )
+    }
+}
+
+/// True when `coordinator` is one of a fighter's installed gimmicks.
+fn holds(owners: Option<&Owners>, coordinator: &Arc<ControllerCoordinator>) -> bool {
+    owners.is_some_and(|owners| owners.iter().any(|owner| Arc::ptr_eq(owner, coordinator)))
+}
+
+fn into_owners(coordinators: Vec<ControllerCoordinator>) -> Owners {
+    coordinators.into_iter().map(Arc::new).collect()
+}
 
 mod form_switch;
 pub(super) use form_switch::observe_form;
@@ -53,15 +88,20 @@ fn same_programs(left: &ControllerCoordinator, right: &ControllerCoordinator) ->
             .all(|id| left.program(id) == right.program(id))
 }
 
-fn same_bundle(
-    left: &BTreeMap<String, Arc<ControllerCoordinator>>,
-    right: &BTreeMap<String, Arc<ControllerCoordinator>>,
-) -> bool {
+fn same_owners(left: &Owners, right: &Owners) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(old, next)| old.same_costumes(next) && same_programs(old, next))
+}
+
+fn same_bundle(left: &BTreeMap<String, Owners>, right: &BTreeMap<String, Owners>) -> bool {
     left.len() == right.len()
         && left.iter().all(|(fighter, old)| {
             right
                 .get(fighter)
-                .is_some_and(|next| same_programs(old, next))
+                .is_some_and(|next| same_owners(old, next))
         })
 }
 
@@ -84,10 +124,10 @@ pub(super) fn install_compiled_baseline(raw: &str) -> Result<(), String> {
     }
     let manifest =
         super::super::status_model::manifest(request.charts.iter().map(|c| c.program.clone()))?;
-    let candidate: BTreeMap<String, Arc<ControllerCoordinator>> = request
+    let candidate: BTreeMap<String, Owners> = request
         .coordinators()?
         .into_iter()
-        .map(|(fighter, coordinator)| (fighter, Arc::new(coordinator)))
+        .map(|(fighter, coordinators)| (fighter, into_owners(coordinators)))
         .collect();
     let mut runtime = RUNTIME.lock();
     if runtime.compiled_controllers.is_empty() {
@@ -148,7 +188,12 @@ pub(super) fn test_insert_hidden_baseline_state(boid: u32, fighter: &str) -> boo
         return false;
     };
     let mut runtime = RUNTIME.lock();
-    let Some(coordinator) = runtime.compiled_controllers.get(fighter).cloned() else {
+    let Some(coordinator) = runtime
+        .compiled_controllers
+        .get(fighter)
+        .and_then(|owners| owners.first())
+        .cloned()
+    else {
         return false;
     };
     let state = coordinator.initial_state();
@@ -174,10 +219,10 @@ pub(super) fn replace(raw: &str) -> Ack {
             return Ack::rejected(revision, format!("chart {:?}: {error}", chart.chart_id));
         }
     }
-    let mut candidate: BTreeMap<String, Arc<ControllerCoordinator>> = match request.coordinators() {
+    let mut candidate: BTreeMap<String, Owners> = match request.coordinators() {
         Ok(configurations) => configurations
             .into_iter()
-            .map(|(fighter, coordinator)| (fighter, Arc::new(coordinator)))
+            .map(|(fighter, coordinators)| (fighter, into_owners(coordinators)))
             .collect(),
         Err(error) => return Ack::rejected(revision, error),
     };
@@ -232,7 +277,7 @@ pub(super) fn replace(raw: &str) -> Ack {
         && runtime.controllers.iter().all(|(fighter, old)| {
             candidate
                 .get(fighter)
-                .is_some_and(|next| same_programs(old, next))
+                .is_some_and(|next| same_owners(old, next))
         });
     if runtime.has_snapshot && revision == runtime.revision {
         return if same {
@@ -249,7 +294,7 @@ pub(super) fn replace(raw: &str) -> Ack {
     let mut changed = BTreeSet::new();
     for (fighter, old) in &runtime.controllers {
         match candidate.get_mut(fighter) {
-            Some(next) if same_programs(old, next) => *next = Arc::clone(old),
+            Some(next) if same_owners(old, next) => next.clone_from(old),
             _ => {
                 changed.insert(fighter.clone());
             }
@@ -270,12 +315,21 @@ pub(super) fn replace(raw: &str) -> Ack {
 
     // Reconcile EVERY retained actor into the same new configuration for its
     // fighter, before committing any part of the candidate snapshot.
+    // An actor's state belongs to one character's gimmick; it carries over into the gimmick
+    // running on the same costumes, and starts fresh when those costumes changed.
     let mut objects = BTreeMap::new();
     for (boid, object) in &runtime.controller_objects {
-        let (Some(next), Some(previous)) = (
-            candidate.get(&object.fighter),
-            runtime.controllers.get(&object.fighter),
-        ) else {
+        let Some(previous) = runtime
+            .controllers
+            .get(&object.fighter)
+            .and_then(|owners| owners.iter().find(|owner| owner.holds(&object.state)))
+        else {
+            continue;
+        };
+        let Some(next) = candidate
+            .get(&object.fighter)
+            .and_then(|owners| owners.iter().find(|owner| owner.same_costumes(previous)))
+        else {
             continue;
         };
         let state = match next.reconcile_state(previous, &object.state) {
@@ -345,10 +399,7 @@ impl DispatchContext {
         let configuration_current = match self.source {
             DispatchSource::Live { revision } => {
                 runtime.revision == revision
-                    && runtime
-                        .controllers
-                        .get(&self.fighter)
-                        .is_some_and(|active| Arc::ptr_eq(active, &self.coordinator))
+                    && holds(runtime.controllers.get(&self.fighter), &self.coordinator)
             }
             DispatchSource::Status { epoch } => {
                 runtime.status_leases.get(&self.boid).is_some_and(|lease| {
@@ -359,10 +410,10 @@ impl DispatchContext {
             }
             DispatchSource::Compiled => {
                 effective_compiled_owner(runtime, &self.fighter)
-                    && runtime
-                        .compiled_controllers
-                        .get(&self.fighter)
-                        .is_some_and(|active| Arc::ptr_eq(active, &self.coordinator))
+                    && holds(
+                        runtime.compiled_controllers.get(&self.fighter),
+                        &self.coordinator,
+                    )
             }
         };
         configuration_current
@@ -433,18 +484,11 @@ fn begin(
                 && Arc::ptr_eq(&lease.coordinator, &coordinator)
         }),
         DispatchSource::Live { revision } => {
-            runtime.revision == revision
-                && runtime
-                    .controllers
-                    .get(fighter)
-                    .is_some_and(|active| Arc::ptr_eq(active, &coordinator))
+            runtime.revision == revision && holds(runtime.controllers.get(fighter), &coordinator)
         }
         DispatchSource::Compiled => {
             effective_compiled_owner(&runtime, fighter)
-                && runtime
-                    .compiled_controllers
-                    .get(fighter)
-                    .is_some_and(|active| Arc::ptr_eq(active, &coordinator))
+                && holds(runtime.compiled_controllers.get(fighter), &coordinator)
         }
     };
     if !source_is_current {
@@ -494,27 +538,35 @@ fn begin(
     ))
 }
 
-fn active(fighter: &str) -> Result<(Arc<ControllerCoordinator>, DispatchSource), String> {
+/// The gimmick running for a `fighter` in costume `color`: the character's whose costume it is.
+/// A live owner masks the compiled baseline for the whole fighter, even on a costume none of its
+/// gimmicks runs on.
+fn active(fighter: &str, color: i32) -> Result<(Arc<ControllerCoordinator>, DispatchSource), String> {
     let runtime = RUNTIME.lock();
-    if let Some(coordinator) = runtime.controllers.get(fighter) {
-        return Ok((
-            Arc::clone(coordinator),
-            DispatchSource::Live {
-                revision: runtime.revision,
-            },
-        ));
+    if let Some(owners) = runtime.controllers.get(fighter) {
+        return coordinator_for_costume(owners, color)
+            .map(|coordinator| {
+                (
+                    Arc::clone(coordinator),
+                    DispatchSource::Live {
+                        revision: runtime.revision,
+                    },
+                )
+            })
+            .ok_or_else(|| "this costume has no gimmick".into());
     }
     if runtime.disabled_fighters.contains(fighter) {
         return Err(format!(
             "live behavior overrides compiled controllers for {fighter:?}"
         ));
     }
-    runtime
+    let owners = runtime
         .compiled_controllers
         .get(fighter)
-        .cloned()
-        .map(|coordinator| (coordinator, DispatchSource::Compiled))
-        .ok_or_else(|| format!("no live or compiled controller bundle for {fighter:?}"))
+        .ok_or_else(|| format!("no live or compiled controller bundle for {fighter:?}"))?;
+    coordinator_for_costume(owners, color)
+        .map(|coordinator| (Arc::clone(coordinator), DispatchSource::Compiled))
+        .ok_or_else(|| "this costume has no gimmick".into())
 }
 
 fn preflight_actions(
@@ -599,11 +651,15 @@ pub fn read_controller_value(
     {
         return lease.object.state.chart(chart_id)?.values.get(var).copied();
     }
-    let (coordinator, objects) = if let Some(coordinator) = runtime.controllers.get(fighter) {
-        (coordinator, &runtime.controller_objects)
+    let color = costume_of(boid);
+    let (coordinator, objects) = if let Some(owners) = runtime.controllers.get(fighter) {
+        (
+            coordinator_for_costume(owners, color)?,
+            &runtime.controller_objects,
+        )
     } else if effective_compiled_owner(&runtime, fighter) {
         (
-            runtime.compiled_controllers.get(fighter)?,
+            coordinator_for_costume(runtime.compiled_controllers.get(fighter)?, color)?,
             &runtime.compiled_controller_objects,
         )
     } else {
@@ -701,7 +757,7 @@ pub fn restart_controller_chart(
     chart_id: &str,
     expected_revision: u64,
 ) -> Ack {
-    let (coordinator, source) = match active(fighter) {
+    let (coordinator, source) = match active(fighter, costume_of(boid)) {
         Ok((_, DispatchSource::Compiled)) => {
             return Ack::rejected(
                 expected_revision,
@@ -892,10 +948,14 @@ pub(super) fn wire_snapshot() -> Option<(u64, Vec<ControllerStateRow>)> {
     let mut rows = Vec::new();
     let mut accepted_actors = 0usize;
     for (record, fighter, identity) in identities {
-        let live_v5 = runtime.controllers.get(fighter);
-        let compiled_v5 = (!runtime.disabled_fighters.contains(fighter))
+        // Each actor shows the gimmick its costume runs: its character's.
+        let color = costume_of(record.boid);
+        let live_owners = runtime.controllers.get(fighter);
+        let live_v5 = live_owners.and_then(|owners| coordinator_for_costume(owners, color));
+        let compiled_v5 = (live_owners.is_none() && !runtime.disabled_fighters.contains(fighter))
             .then(|| runtime.compiled_controllers.get(fighter))
-            .flatten();
+            .flatten()
+            .and_then(|owners| coordinator_for_costume(owners, color));
         if live_v5.is_none() && compiled_v5.is_none() {
             continue;
         }
@@ -971,12 +1031,14 @@ pub(super) fn resource_consumer(runtime: &Runtime) -> bool {
     runtime
         .controllers
         .values()
+        .flatten()
         .any(|coordinator| consumes(coordinator))
         || runtime
             .compiled_controllers
             .iter()
-            .any(|(fighter, coordinator)| {
-                effective_compiled_owner(runtime, fighter) && consumes(coordinator)
+            .any(|(fighter, owners)| {
+                effective_compiled_owner(runtime, fighter)
+                    && owners.iter().any(|coordinator| consumes(coordinator))
             })
 }
 
@@ -1002,21 +1064,8 @@ fn active_for_object(
             ));
         }
     }
-    let (coordinator, source) = active(fighter)?;
-    // A gimmick made for some costumes leaves the fighter's other costumes alone.
-    let module = unsafe { smash::app::sv_battle_object::module_accessor(boid) };
-    let costume = unsafe {
-        smash::app::lua_bind::WorkModule::get_int(
-            module,
-            *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-        )
-    };
-    if module.is_null()
-        || !u8::try_from(costume).is_ok_and(|costume| coordinator.runs_for_costume(costume))
-    {
-        return Err("this costume has no gimmick".into());
-    }
-    Ok((coordinator, source))
+    // A costume runs its own character's gimmick, and none when no gimmick is its.
+    active(fighter, costume_of(boid))
 }
 
 pub(crate) fn owns_status(boid: u32, status: i32) -> bool {
@@ -1063,7 +1112,7 @@ pub(crate) fn status_inputs(
     let identity =
         Identity::from_live_fighter(boid, fighter).ok_or("status actor is unavailable")?;
     if phase == Phase::Pre {
-        let (coordinator, source) = match active(fighter) {
+        let (coordinator, source) = match active(fighter, costume_of(boid)) {
             Ok(active) => active,
             Err(_) => return Ok(None),
         };
@@ -1280,7 +1329,7 @@ fn finish_status(boid: u32, epoch: u64) {
         (lease, pending)
     };
     if let Some(lease) = lease {
-        if let Ok((next, source)) = active(&lease.object.fighter) {
+        if let Ok((next, source)) = active(&lease.object.fighter, costume_of(boid)) {
             if let Ok(state) = next.reconcile_state(&lease.coordinator, &lease.object.state) {
                 let object = ObjectState {
                     state,

@@ -186,9 +186,16 @@ impl RosterIndex {
             .iter()
             .filter_map(|entry| entry.name_id.clone())
             .collect();
+        // A new character has a cell of its own: after the last one until the project places
+        // it, the same place the export gives it.
+        let mut place = db.map_or(0, CharaDb::last_position);
         for authored in &project.authored {
             if present_rows.contains(&authored.name_id) {
                 continue;
+            }
+            place += 1;
+            if place == super::css::RANDOM_SLOT_ORDER {
+                place += 1;
             }
             if !known.contains(authored.donor.as_str()) {
                 stale_overrides.push(StaleOverride {
@@ -205,11 +212,11 @@ impl RosterIndex {
                     .get(&key)
                     .cloned()
                     .unwrap_or_else(|| authored.display_name.clone()),
-                css_order: project.order.get(&key).copied(),
+                css_order: Some(project.order.get(&key).copied().unwrap_or(place)),
                 providers: library.providers_for_fighter(&authored.donor),
                 origin: EntryOrigin::Authored,
                 hidden: project.hidden.contains(&key),
-                on_roster: false,
+                on_roster: true,
                 name_id: Some(authored.name_id.clone()),
                 fighter: Some(authored.donor.clone()),
                 backing: RosterBacking::SlotClone {
@@ -298,7 +305,7 @@ impl RosterIndex {
         let mut ordered: Vec<&RosterEntry> = self.entries.iter().collect();
         ordered.sort_by_key(|entry| {
             (
-                entry.css_order.is_none(),
+                entry.css_order.is_none() || !entry.on_roster,
                 entry.css_order.unwrap_or(0),
                 entry.id.0,
             )
@@ -346,6 +353,8 @@ fn display_name_for(
     }
     match fighter {
         Some(fighter) => fighter.display_name.clone(),
+        // The one cell for the three Mii Fighters, shown when echo fighters are stacked.
+        None if row.name_id == "miiall" => "Mii Fighter".to_owned(),
         None => crate::data::fighter_display_name(&row.name_id),
     }
 }
@@ -559,7 +568,9 @@ mod tests {
         let entry = before.by_key(&key).unwrap();
         assert_eq!(entry.origin, EntryOrigin::Authored);
         assert_eq!(entry.backing.slot(), Some(8));
-        assert!(!entry.on_roster);
+        // It has a cell of its own from the start, after the last character.
+        assert!(entry.on_roster);
+        assert_eq!(entry.css_order, Some(1));
         assert!(before.stale_overrides.is_empty());
 
         // Once exported, the row exists and must merge with the authored entry rather than

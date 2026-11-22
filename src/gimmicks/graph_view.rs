@@ -219,7 +219,11 @@ impl GraphView {
                         );
                         ui.checkbox(&mut config.repeats, "Repeat");
                     });
-                    ui.weak(format!("{:.2} seconds at 60 fps · expiry and stock-start bookkeeping update together", config.duration_frames as f32 / 60.0));
+                    ui.weak(format!(
+                        "{:.2} seconds at 60 fps",
+                        config.duration_frames as f32 / 60.0
+                    ))
+                    .on_hover_text("Expiry and stock-start bookkeeping update together.");
                     if config != original {
                         let result = super::controller::configure_timer(graph, fighter, config)
                             .map(|updated| updated.graph);
@@ -350,9 +354,8 @@ impl GraphView {
                     let managed = managed_timer_action(graph, &action);
                     let mut result = None;
                     if managed {
-                        ui.weak(
-                            "Managed timer action; edit Duration and Repeat in Quick controls.",
-                        );
+                        ui.weak("Managed timer action")
+                            .on_hover_text("Edit Duration and Repeat in Quick controls.");
                     } else if let Some(mut edited) = editable_timer_action(graph, &action) {
                         if let Action::Set {
                             var,
@@ -436,8 +439,9 @@ impl GraphView {
                                         action: edited,
                                     });
                                     self.status.clear();
-                                    ui.weak("Finish choosing this condition to update the draft.")
-                                        .on_hover_text(error);
+                                    ui.weak("Condition not finished").on_hover_text(format!(
+                                        "Finish choosing this condition to update the draft.\n{error}"
+                                    ));
                                 }
                             }
                         } else {
@@ -550,9 +554,10 @@ impl GraphView {
                                 }
                             });
                             ui.weak(format!(
-                                "Runs {} transitions when a move sends this event. Wire a move's Emit event block here.",
+                                "Runs {} transitions when a move sends this event",
                                 binding.transitions.len()
-                            ));
+                            ))
+                            .on_hover_text("Wire a move's Emit event block here.");
                         }
                     }
                     SourceBindingRef::Status(index) => {
@@ -572,7 +577,9 @@ impl GraphView {
                 self.predicate_inspector(ui, fighter, graph, *transition, path);
             }
             _ => {
-                ui.weak("This reference is unresolved. Validation notes explain what needs repair; the original controller is retained.");
+                ui.weak("Unresolved reference").on_hover_text(
+                    "Validation notes explain what needs repair; the original controller is retained.",
+                );
             }
         }
         if !self.status.is_empty() {
@@ -646,7 +653,14 @@ impl GraphView {
                 );
             }
             Expr::Add(..) | Expr::Sub(..) | Expr::Mul(..) => {
-                ui.weak("Select a Left or Right card to edit an operand. Drag a numeric variable onto a Value port to replace that subtree.");
+                let reads = match &original {
+                    Expr::Add(..) => "Left plus Right",
+                    Expr::Sub(..) => "Left minus Right",
+                    _ => "Left times Right",
+                };
+                ui.weak(reads).on_hover_text(
+                    "Select a Left or Right card to edit an operand. Drag a numeric variable onto a Value port to replace that subtree.",
+                );
             }
         }
         let zero = || {
@@ -769,10 +783,13 @@ impl GraphView {
                             ui.selectable_value(op, candidate, candidate.to_string());
                         }
                     });
-                ui.weak("Select the comparison's number cards to edit Left and Right.");
+                ui.weak("Compares Left and Right")
+                    .on_hover_text("Select the comparison's number cards to edit Left and Right.");
             }
             _ => {
-                ui.weak("Select a child condition to edit it. All requires both; Any requires either; Not inverts its child.");
+                ui.weak("Combined condition").on_hover_text(
+                    "Select a child condition to edit it. All requires both; Any requires either; Not inverts its child.",
+                );
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -894,7 +911,10 @@ impl GraphView {
         else {
             return;
         };
-        ui.weak("Export the plugin again after binding a status or adding a custom one.");
+        ui.weak("Applies after the next plugin export")
+            .on_hover_text(
+                "Export the plugin again after binding a status or adding a custom one.",
+            );
         if binding.policy == Policy::Owned {
             let (ground, air) = recipes::motions(graph, name);
             for (is_air, mut motion) in [(false, ground), (true, air)] {
@@ -1008,8 +1028,9 @@ impl GraphView {
                         ui.close();
                     }
                 }
-            });
-            ui.weak("Recipes add ordinary rules. Select their blocks to customize them.");
+            })
+            .response
+            .on_hover_text("Recipes add ordinary rules. Select their blocks to customize them.");
         }
         ui.collapsing("Advanced phases", |ui| {
             let mut policy = binding.policy;
@@ -1066,11 +1087,16 @@ impl GraphView {
                                 });
                             }
                         }
-                        if ui.small_button("Add rule").clicked() {
+                        if ui
+                            .small_button("Add rule")
+                            .on_hover_text(
+                                "Phase rules are also editable as blocks in the workspace.",
+                            )
+                            .clicked()
+                        {
                             let result = recipes::add_phase_rule(graph, fighter, name, phase);
                             self.apply(graph, result);
                         }
-                        ui.weak("Phase rules are also editable as blocks in the workspace.");
                     });
                 });
             }
@@ -1539,7 +1565,8 @@ fn guarded_condition_ui(
         guard_control(ui, fighter, graph, guard, scope)
     });
     if managed {
-        ui.weak("Timer lifecycle condition · use Duration and Repeat.");
+        ui.weak("Timer lifecycle condition")
+            .on_hover_text("Use Duration and Repeat.");
     }
 }
 
@@ -1745,7 +1772,8 @@ fn guard_control(
                 }
             }
             _ => {
-                ui.weak("Add a compatible variable first.");
+                ui.weak("No compatible variable")
+                    .on_hover_text("Add a compatible variable first.");
                 original.clone()
             }
         };
@@ -1879,7 +1907,9 @@ fn guard_control(
         }
         _ => {
             if kind == 20 {
-                ui.weak("This compound condition is retained. Select a simple condition to replace it, or use Advanced JSON.");
+                ui.weak("Compound condition kept as it is").on_hover_text(
+                    "Select a simple condition to replace it, or use Advanced JSON.",
+                );
             }
         }
     }

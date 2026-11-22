@@ -35,11 +35,16 @@ pub enum MeterSource {
 }
 
 /// A static meter declaration. `id` must be unique across all declarations;
-/// duplicates are rejected for the whole synchronization pass.
+/// duplicates are rejected for the whole synchronization pass. A character's
+/// meter shows only on its costumes: `costumes` lists the only ones it shows
+/// on (empty = all) and `except_costumes` the ones it never shows on, so a
+/// fighter's meter stays off the costumes of a character made on it.
 #[derive(Clone, Copy)]
 pub struct MeterBinding {
     pub id: &'static str,
     pub fighter: &'static str,
+    pub costumes: &'static [u8],
+    pub except_costumes: &'static [u8],
     pub source: MeterSource,
     pub presentation: MeterPresentation,
 }
@@ -130,6 +135,10 @@ pub fn on_frame(bindings: &'static [MeterBinding]) {
     let live = crate::slight::agents::all_records()
         .into_iter()
         .filter_map(LiveFighter::from_record)
+        .map(|fighter| LiveFighter {
+            costume: super::live_behavior::costume_of(fighter.identity.boid),
+            ..fighter
+        })
         .collect::<Vec<_>>();
     synchronize(bindings, live, read_live);
 }
@@ -288,6 +297,8 @@ pub fn wire_rows(bindings: &[MeterBinding]) -> Vec<serde_json::Value> {
 struct LiveFighter {
     identity: FighterIdentity,
     fighter: &'static str,
+    /// The costume it wears, or -1 when the game does not say.
+    costume: i32,
 }
 
 impl LiveFighter {
@@ -304,6 +315,7 @@ impl LiveFighter {
                 module_accessor_addr: record.module_accessor_addr,
             },
             fighter,
+            costume: -1,
         })
     }
 }
@@ -336,10 +348,14 @@ where
             continue;
         }
         let mut values = BTreeMap::new();
-        for binding in bindings
-            .iter()
-            .filter(|binding| binding.fighter == fighter.fighter)
-        {
+        for binding in bindings.iter().filter(|binding| {
+            binding.fighter == fighter.fighter
+                && crate::slight::costume_scope::costume_is(
+                    fighter.costume,
+                    binding.costumes,
+                    binding.except_costumes,
+                )
+        }) {
             if let Ok(value) = read(binding, fighter) {
                 values.insert(
                     binding.id,
@@ -420,6 +436,8 @@ mod tests {
     const CLOUD: MeterBinding = MeterBinding {
         id: "cloud.limit",
         fighter: "cloud",
+        costumes: &[],
+        except_costumes: &[],
         source: MeterSource::Work {
             symbol: "FIGHTER_CLOUD_INSTANCE_WORK_ID_FLOAT_LIMIT_GAUGE",
             kind: registry::IdentifierKind::WorkFloat,
@@ -439,6 +457,7 @@ mod tests {
                 module_accessor_addr: boid as u64 + 1,
             },
             fighter,
+            costume: 0,
         }
     }
 

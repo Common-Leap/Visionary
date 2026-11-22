@@ -12,6 +12,8 @@ pub struct EffectUse {
     pub script: Option<String>,
     /// The object that plays the effect for the move, like "fireball".
     pub object: Option<String>,
+    /// The bone the script spawns it on ("top", "haver").
+    pub bone: Option<String>,
 }
 
 /// Effect name hash to the moves that play it.
@@ -79,14 +81,16 @@ fn object_agents(fighter: &str) -> Vec<String> {
     .collect()
 }
 
-/// The effects a script spawns, by name: the first name of every effect macro that makes one,
-/// in every branch (a left-facing fighter's `mario_fb_bullet_l` as well as the right's).
+/// The effects a script spawns, each with the bone it spawns it on: the first name of every
+/// effect macro that makes one and the bone name after it (the third name of a flip macro,
+/// whose second is the effect for the other facing), in every branch (a left-facing fighter's
+/// `mario_fb_bullet_l` as well as the right's), sorted, once each.
 ///
 /// A call is found with or without `macros::` in front: a moveset that glob-imports
 /// `smash_script::macros::*` writes `EFFECT(agent, …)`, and the game's dump never does.
-fn spawned_effects(body: &str) -> Vec<String> {
+fn spawns(body: &str) -> Vec<(String, Option<String>)> {
     let is_name_char = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_';
-    let mut names: Vec<String> = body
+    let mut found: Vec<(String, Option<String>)> = body
         .lines()
         // Only the code of a line: a commented-out spawn plays nothing.
         .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
@@ -116,14 +120,21 @@ fn spawned_effects(body: &str) -> Vec<String> {
                 // The effect is the argument after the agent.
                 let (_, rest) = line[open + 1..].split_once(',')?;
                 let rest = rest.trim_start().strip_prefix("Hash40::new(\"")?;
-                let (name, _) = rest.split_once('"')?;
-                Some(name.to_owned())
+                let (name, rest) = rest.split_once('"')?;
+                // A flip macro names the effect for the other facing second and the bone third.
+                let names_before_bone = if macro_name.contains("FLIP") { 2 } else { 1 };
+                let bone = rest
+                    .split("Hash40::new(\"")
+                    .nth(names_before_bone)
+                    .and_then(|rest| rest.split_once('"'))
+                    .map(|(bone, _)| bone.to_owned());
+                Some((name.to_owned(), bone))
             })
         })
         .collect();
-    names.sort();
-    names.dedup();
-    names
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// The uses a linked moveset's own scripts add, from [`crate::acmd_src::SourceIndex::
@@ -140,28 +151,24 @@ pub fn project_uses(fighter: &str, scripts: &[(String, String, String)]) -> Uses
                 .unwrap_or(agent)
                 .to_owned()
         });
-        let found = match object {
-            Some(object) => EffectUse {
-                script: None,
-                object: Some(object),
-            },
-            None => {
-                let script = crate::acmd::SCRIPT_PREFIXES
-                    .iter()
-                    .find_map(|prefix| script.strip_prefix(prefix))
-                    .unwrap_or(script);
-                EffectUse {
-                    script: Some(script.to_owned()),
-                    object: None,
-                }
-            }
-        };
-        for effect in spawned_effects(body) {
+        let script_name = object.is_none().then(|| {
+            crate::acmd::SCRIPT_PREFIXES
+                .iter()
+                .find_map(|prefix| script.strip_prefix(prefix))
+                .unwrap_or(script)
+                .to_owned()
+        });
+        for (effect, bone) in spawns(body) {
+            let found = EffectUse {
+                script: script_name.clone(),
+                object: object.clone(),
+                bone,
+            };
             let list = uses
                 .entry(crate::app::effect_name_hash(&effect))
                 .or_default();
             if !list.contains(&found) {
-                list.push(found.clone());
+                list.push(found);
             }
         }
     }
@@ -212,13 +219,14 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
         };
         let mut creators: HashMap<String, Vec<String>> = HashMap::new();
         for (script, body) in &bodies {
-            for effect in spawned_effects(body) {
+            for (effect, bone) in spawns(body) {
                 add(
                     &mut uses,
                     &effect,
                     EffectUse {
                         script: Some(script.clone()),
                         object: None,
+                        bone,
                     },
                 );
             }
@@ -240,7 +248,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
             });
             let movers = creators.get(&object).cloned().unwrap_or_default();
             for (_, body) in &bodies {
-                for effect in spawned_effects(body) {
+                for (effect, bone) in spawns(body) {
                     if movers.is_empty() {
                         add(
                             &mut uses,
@@ -248,6 +256,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
                             EffectUse {
                                 script: None,
                                 object: Some(object.clone()),
+                                bone: bone.clone(),
                             },
                         );
                     }
@@ -258,6 +267,7 @@ pub fn spawn_scan(fighter: &str) -> std::sync::mpsc::Receiver<(Uses, bool)> {
                             EffectUse {
                                 script: Some(mover.clone()),
                                 object: Some(object.clone()),
+                                bone: bone.clone(),
                             },
                         );
                     }
@@ -345,7 +355,10 @@ mod tests {
                     EFFECT_OFF_KIND(agent, Hash40::new(\"carrot_trail\"), false, false);\n\
                     foo.EFFECT(agent, Hash40::new(\"method_call\"));\n\
                     }\n";
-        assert_eq!(spawned_effects(body), vec!["carrot_pull".to_owned()]);
+        assert_eq!(
+            spawns(body),
+            vec![("carrot_pull".to_owned(), Some("top".to_owned()))]
+        );
     }
 
     #[test]
@@ -364,7 +377,8 @@ mod tests {
             carrot,
             &vec![EffectUse {
                 script: Some("attacklw3".to_owned()),
-                object: None
+                object: None,
+                bone: Some("top".to_owned()),
             }],
             "one use however many of the move's scripts spawn it"
         );
@@ -373,7 +387,8 @@ mod tests {
             uses[&crate::app::effect_name_hash("fryguy_fire")],
             vec![EffectUse {
                 script: None,
-                object: Some("bigpacman".to_owned())
+                object: Some("bigpacman".to_owned()),
+                bone: Some("top".to_owned()),
             }]
         );
     }
@@ -399,8 +414,24 @@ mod tests {
                     macros::EFFECT_FOLLOW(agent, Hash40::new(\"mario_fb_bullet_l\"), Hash40::new(\"rot\"), 0, 1.8, 0, 0, 0, 0, 1, true);\n\
                     }\n}\n";
         assert_eq!(
-            spawned_effects(body),
-            vec!["mario_fb_bullet_l".to_owned(), "mario_fb_shoot".to_owned()]
+            spawns(body),
+            vec![
+                ("mario_fb_bullet_l".to_owned(), Some("rot".to_owned())),
+                ("mario_fb_shoot".to_owned(), Some("havel".to_owned())),
+            ]
+        );
+    }
+
+    /// A flip macro names the effect twice, the second time for the other facing, and the bone
+    /// third. Read as the second name, the bone of Diddy Kong's down tilt arc was the arc
+    /// itself, no root bone, and the arc played on its own in the world's axes, a quarter turn
+    /// off the way his move throws it. Verbatim from diddy/AttackLw3.
+    #[test]
+    fn a_flip_macro_spawns_on_its_third_name() {
+        let body = "macros::EFFECT_FOLLOW_FLIP(agent, Hash40::new(\"diddy_attack_arc_c\"), Hash40::new(\"diddy_attack_arc_c\"), Hash40::new(\"top\"), -0.5, 5, 6, -9, 28, -158, 1, true, *EF_FLIP_YZ);";
+        assert_eq!(
+            spawns(body),
+            vec![("diddy_attack_arc_c".to_owned(), Some("top".to_owned()))]
         );
     }
 }

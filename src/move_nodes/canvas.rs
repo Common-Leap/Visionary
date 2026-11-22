@@ -422,7 +422,8 @@ impl CanvasState {
                     }
                 }
                 None => {
-                    ui.weak("Right-click a script lane to clear it.");
+                    ui.weak("No lane here")
+                        .on_hover_text("Right-click a script lane to clear it.");
                 }
             });
         }
@@ -2133,7 +2134,7 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].title, "Visual effects");
-        assert_eq!(matching[0].detail, "Effect rate · Native effect");
+        assert_eq!(matching[0].detail, "Effect speed · Native effect");
         assert_eq!(serde_json::to_value(&graph).unwrap(), before);
     }
 

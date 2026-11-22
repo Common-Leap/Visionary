@@ -11,6 +11,58 @@ use super::{behavior, controller_protocol, controller_runtime, field_projection,
 
 pub const MAIN_CHART: &str = "main";
 
+/// Which costumes of its fighter one character's gimmick runs on. Derived when the gimmick is
+/// sent or exported, never saved: a made character's gimmick runs on exactly its costumes, and
+/// the fighter's own never runs on any costume a made character owns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CostumeScope {
+    /// The only costumes it runs on; empty is every costume not in `except_costumes`.
+    pub costumes: Vec<u8>,
+    pub except_costumes: Vec<u8>,
+}
+
+/// One character's gimmick, ready to compile: its owner key (a fighter's name, or a made
+/// character's roster key such as "mario#c08"), its engine fighter, and its costumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GimmickOwner {
+    pub key: String,
+    pub fighter: String,
+    pub scope: CostumeScope,
+}
+
+impl GimmickOwner {
+    /// The owner a gimmick keyed by `key` with no derived costumes is: a base fighter's gimmick
+    /// on the costumes it saved.
+    pub fn saved(key: &str, main: &behavior::BehaviorGraph) -> Self {
+        Self {
+            key: key.to_owned(),
+            fighter: owner_fighter(key).to_owned(),
+            scope: CostumeScope {
+                costumes: main.costumes.clone(),
+                except_costumes: Vec::new(),
+            },
+        }
+    }
+}
+
+/// True when a program ID that [`compile_owner`] gave belongs to the character keyed `key`.
+/// Players' live gimmick rows carry it: rows of one fighter can be any of its characters'.
+pub fn program_belongs_to(program_id: &str, key: &str) -> bool {
+    let made = key.split_once('#').map_or("", |(_, slot)| slot);
+    if let Some(owner) = program_id.strip_prefix("live:") {
+        return owner == key;
+    }
+    program_id
+        .strip_prefix("chart:")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(kind, _)| kind.split_once('#').map_or("", |(_, slot)| slot) == made)
+}
+
+/// The engine fighter a gimmick owner key belongs to: "mario#c08" → "mario".
+pub fn owner_fighter(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(fighter, _)| fighter)
+}
+
 /// Bound all additional authored charts before a project or compiler clones them.
 /// Semantic errors remain repairable authored data; compilation checks them below.
 pub fn preflight(
@@ -71,6 +123,24 @@ pub fn compile(
     main: &behavior::BehaviorGraph,
     charts: &BTreeMap<String, ControllerChart>,
 ) -> Result<Vec<controller_protocol::ControllerProgram>, String> {
+    compile_owner(&GimmickOwner::saved(fighter, main), main, charts)
+}
+
+/// [`compile`] for one character's gimmick of a fighter, on that character's costumes. A made
+/// character's program IDs carry its key, so its gimmick and its fighter's can be installed
+/// side by side.
+pub fn compile_owner(
+    owner: &GimmickOwner,
+    main: &behavior::BehaviorGraph,
+    charts: &BTreeMap<String, ControllerChart>,
+) -> Result<Vec<controller_protocol::ControllerProgram>, String> {
+    let fighter = owner.fighter.as_str();
+    // "mario#c08" → "#c08"; empty for the fighter's own gimmick.
+    let made = owner
+        .key
+        .strip_prefix(fighter)
+        .filter(|rest| rest.starts_with('#'))
+        .unwrap_or_default();
     preflight(main, charts)?;
     behavior::preflight_bounds(main)?;
     let kind = registry::FIGHTER_KINDS
@@ -103,17 +173,18 @@ pub fn compile(
         // Preserve legacy IDs exactly. The pinned kind gives additional IDs a
         // short, unambiguous namespace even for 48-byte UTF-8 chart identities.
         let program_id = if id == MAIN_CHART {
-            format!("live:{fighter}")
+            format!("live:{fighter}{made}")
         } else {
-            format!("chart:{}:{id}", kind.value)
+            format!("chart:{}{made}:{id}", kind.value)
         };
         let mut program =
             super::live_protocol::from_graph(program_id, fighter, &lowered, &lowered.emission_plan)
                 .map_err(|errors| {
                     format!("fighter {fighter} controller {id:?}: {}", errors.join("; "))
                 })?;
-        // The costume choice is the fighter's, so every chart of it follows the main one.
-        program.costumes = main.costumes.clone();
+        // The costume choice is the character's, so every chart of it follows it.
+        program.costumes = owner.scope.costumes.clone();
+        program.except_costumes = owner.scope.except_costumes.clone();
         records.push(controller_protocol::ControllerProgram {
             chart_id: id.into(),
             program,
@@ -163,7 +234,7 @@ mod tests {
             };
             let coordinators = request.coordinators().unwrap();
             assert_eq!(
-                coordinators[fighter].chart_ids().collect::<Vec<_>>(),
+                coordinators[fighter][0].chart_ids().collect::<Vec<_>>(),
                 ["main", "second"]
             );
         }

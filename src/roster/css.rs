@@ -24,6 +24,20 @@ use prc::ParamKind;
 /// Where the roster database lives inside a dumped arc root.
 pub const CHARA_DB_PATH: &str = "ui/param/database/ui_chara_db.prc";
 
+/// A patch for a database file: the same path with this in place of `.prc`. ARCropolis merges
+/// it into the game's file, so two mods can each change their own entries, and plugins that
+/// rebuild the database themselves (the CSK Collection) still see the change, which a whole
+/// replaced file does not get them.
+pub const PATCH_EXTENSION: &str = "prcxml";
+
+/// The layout database beside it: where each character's portraits sit in their frames.
+pub const LAYOUT_DB_PATH: &str = "ui/param/database/ui_layout_db.prc";
+
+/// The field the CSK Collection plugin reads on an added character: the fighter costume its
+/// first colour is. The game has no such field; without the plugin an added character plays
+/// in the base fighter's own costumes.
+pub const COLOR_START_FIELD: &str = "color_start_index";
+
 /// `disp_order` for an entry that is not on the select screen.
 pub const OFF_ROSTER: i8 = -1;
 
@@ -69,9 +83,34 @@ pub struct CharaRow {
     pub can_select: bool,
     /// Number of costume slots the select screen offers for this character.
     pub color_num: u8,
+    /// How the entry takes part in echo stacking; see [`Stacking`].
+    pub fighter_type: u64,
+    /// The entry this one is paired with: an echo's base, a base's echo.
+    pub alt_chara_id: u64,
+}
+
+/// An entry's part in the game's "Echo Fighters: Stacked / Separate" option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stacking {
+    /// Always shown.
+    Always,
+    /// Only with echoes separate: an echo, and each of the three Mii Fighters.
+    SeparateOnly,
+    /// Only with echoes stacked: the one Mii Fighter cell.
+    StackedOnly,
 }
 
 impl CharaRow {
+    pub fn stacking(&self) -> Stacking {
+        if self.fighter_type == hash40::hash40("fighter_type_opened").0 {
+            Stacking::SeparateOnly
+        } else if self.fighter_type == hash40::hash40("fighter_type_closed").0 {
+            Stacking::StackedOnly
+        } else {
+            Stacking::Always
+        }
+    }
+
     /// True when this entry occupies a cell on the select screen.
     pub fn on_roster(&self) -> bool {
         self.disp_order != OFF_ROSTER && self.disp_order != RANDOM_SLOT_ORDER && self.can_select
@@ -107,6 +146,7 @@ impl CharaDb {
         Ok(db)
     }
 
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -114,6 +154,11 @@ impl CharaDb {
         prc::save(path, &self.root)
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The whole parsed file, to compare against another for a patch.
+    pub fn tree(&self) -> &prc::ParamStruct {
+        &self.root
     }
 
     pub fn entries(&self) -> &[CharaRow] {
@@ -187,6 +232,77 @@ impl CharaDb {
         missing
     }
 
+    /// The highest position any character on the select screen holds.
+    pub fn last_position(&self) -> i8 {
+        self.entries
+            .iter()
+            .filter(|row| row.on_roster())
+            .map(|row| row.disp_order)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Add a character of its own that plays as `fighter` in the costumes `slots`: a copy of
+    /// that fighter's entry under `name_id`, at `order` on the select screen. Colour `k` of the
+    /// new character is costume `slots[k]`, which the CSK Collection plugin acts on.
+    pub fn add_character(
+        &mut self,
+        fighter: &str,
+        name_id: &str,
+        slots: &[u8],
+        order: i8,
+    ) -> Result<()> {
+        use prc::hash40::Hash40;
+        if self.row(name_id).is_some() {
+            anyhow::bail!("the select screen already has a character called {name_id}");
+        }
+        let (Some(first), true) = (slots.first().copied(), slots.len() <= 8) else {
+            anyhow::bail!("a character needs one to eight costumes");
+        };
+        let kind = fighter_kind_hash(fighter);
+        let base = self
+            .entries
+            .iter()
+            .find(|row| row.fighter_kind == kind)
+            .map(|row| row.index)
+            .with_context(|| format!("the select screen has no entry for the fighter {fighter}"))?;
+        let Some(ParamKind::List(list)) = db_root_mut(&mut self.root) else {
+            anyhow::bail!("db_root is missing");
+        };
+        let Some(ParamKind::Struct(mut entry)) = list.0.get(base).cloned() else {
+            anyhow::bail!("db_root entry {base} is not a struct");
+        };
+        let hash = |name: &str| Hash40(hash40::hash40(name).0);
+        let mut set = |name: &str, value: ParamKind| {
+            let wanted = hash(name);
+            match entry.0.iter_mut().find(|(field, _)| *field == wanted) {
+                Some((_, slot)) => *slot = value,
+                None => entry.0.push((wanted, value)),
+            }
+        };
+        set(
+            "ui_chara_id",
+            ParamKind::Hash(hash(&format!("ui_chara_{name_id}"))),
+        );
+        set("name_id", ParamKind::Str(name_id.to_owned()));
+        // Not an echo of anyone, whatever the base fighter is.
+        set("alt_chara_id", ParamKind::Hash(Hash40(0)));
+        set("fighter_type", ParamKind::Hash(hash("fighter_type_normal")));
+        set("disp_order", ParamKind::I8(order));
+        set("can_select", ParamKind::Bool(order != OFF_ROSTER));
+        set("color_num", ParamKind::U8(slots.len() as u8));
+        for colour in 0..8usize {
+            let slot = slots.get(colour).copied().unwrap_or(first);
+            set(&format!("c{colour:02}_index"), ParamKind::U8(slot));
+            set(&format!("n{colour:02}_index"), ParamKind::U8(0));
+            set(&format!("c{colour:02}_group"), ParamKind::U8(0));
+        }
+        set(COLOR_START_FIELD, ParamKind::U8(first));
+        list.0.push(ParamKind::Struct(entry));
+        self.refresh();
+        Ok(())
+    }
+
     fn set_field(&mut self, name_id: &str, field: &str, value: ParamKind) -> Result<()> {
         let index = self
             .entries
@@ -232,9 +348,269 @@ impl CharaDb {
                 save_no: i8_field(entry, "save_no").unwrap_or(OFF_ROSTER),
                 can_select: bool_field(entry, "can_select").unwrap_or(false),
                 color_num: u8_field(entry, "color_num").unwrap_or(0),
+                fighter_type: hash_field(entry, "fighter_type").unwrap_or(0),
+                alt_chara_id: hash_field(entry, "alt_chara_id").unwrap_or(0),
             });
         }
     }
+}
+
+/// Give each added character the portrait layout of the fighter it plays as: `ui_layout_db`
+/// read from `source`, with a copy of that fighter's rows per `(its ui_chara_id, name_id)`.
+/// Returns the file as it was and as it is with them.
+pub fn add_layouts(
+    source: &Path,
+    added: &[(u64, String)],
+) -> Result<(prc::ParamStruct, prc::ParamStruct)> {
+    use prc::hash40::Hash40;
+    let base = prc::open(source)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))
+        .with_context(|| format!("reading {}", source.display()))?;
+    let mut root = base.clone();
+    let Some(ParamKind::List(list)) = db_root_mut(&mut root) else {
+        anyhow::bail!("{} has no db_root", source.display());
+    };
+    for (own, name_id) in added {
+        let rows: Vec<prc::ParamStruct> = list
+            .0
+            .iter()
+            .filter_map(|row| match row {
+                ParamKind::Struct(row) if hash_field(row, "ui_chara_id") == Some(*own) => {
+                    Some(row.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for mut row in rows {
+            let colour = u8_field(&row, "chara_color").unwrap_or(0);
+            for (field, value) in row.0.iter_mut() {
+                if field.0 == hash40::hash40("ui_chara_id").0 {
+                    *value =
+                        ParamKind::Hash(Hash40(hash40::hash40(&format!("ui_chara_{name_id}")).0));
+                } else if field.0 == hash40::hash40("ui_layout_id").0 {
+                    *value = ParamKind::Hash(Hash40(
+                        hash40::hash40(&format!("ui_chara_{name_id}_{colour:02}")).0,
+                    ));
+                }
+            }
+            list.0.push(ParamKind::Struct(row));
+        }
+    }
+    Ok((base, root))
+}
+
+/// What `edited` changes in the `db_root` of `base`, as a `.prcxml` patch: each changed entry
+/// by its index with only the fields that differ, and each added entry in full. `None` when
+/// nothing differs. `labels` names the fields; one it does not know is written as its hash.
+pub fn patch_xml(
+    base: &prc::ParamStruct,
+    edited: &prc::ParamStruct,
+    labels: &std::collections::HashMap<u64, String>,
+) -> Option<String> {
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) =
+        (db_root(base), db_root(edited))
+    else {
+        return None;
+    };
+    let name = |hash: u64| {
+        labels
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| format!("0x{hash:010x}"))
+    };
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let field = |hash: u64, value: &ParamKind| -> Option<String> {
+        let (tag, text) = match value {
+            ParamKind::Bool(value) => (
+                "bool",
+                if *value {
+                    "True".to_owned()
+                } else {
+                    "False".to_owned()
+                },
+            ),
+            ParamKind::I8(value) => ("sbyte", value.to_string()),
+            ParamKind::U8(value) => ("byte", value.to_string()),
+            ParamKind::I16(value) => ("short", value.to_string()),
+            ParamKind::U16(value) => ("ushort", value.to_string()),
+            ParamKind::I32(value) => ("int", value.to_string()),
+            ParamKind::U32(value) => ("uint", value.to_string()),
+            ParamKind::Float(value) => ("float", value.to_string()),
+            ParamKind::Hash(value) => ("hash40", name(value.0)),
+            ParamKind::Str(value) => ("string", escape(value)),
+            // No entry of these databases nests another.
+            ParamKind::List(_) | ParamKind::Struct(_) => return None,
+        };
+        Some(format!(
+            "      <{tag} hash=\"{}\">{text}</{tag}>",
+            name(hash)
+        ))
+    };
+    let mut rows = Vec::new();
+    for (index, row) in edited.0.iter().enumerate() {
+        let ParamKind::Struct(row) = row else {
+            continue;
+        };
+        let before = match base.0.get(index) {
+            Some(ParamKind::Struct(before)) => Some(before),
+            _ => None,
+        };
+        let fields: Vec<String> = row
+            .0
+            .iter()
+            .filter(|(hash, value)| {
+                before.is_none_or(|before| {
+                    before
+                        .0
+                        .iter()
+                        .find(|(known, _)| known == hash)
+                        .map(|(_, old)| old)
+                        != Some(value)
+                })
+            })
+            .filter_map(|(hash, value)| field(hash.0, value))
+            .collect();
+        if !fields.is_empty() {
+            rows.push(format!(
+                "    <struct index=\"{index}\">\n{}\n    </struct>",
+                fields.join("\n")
+            ));
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<struct>\n  <list hash=\"db_root\">\n{}\n  </list>\n</struct>\n",
+        rows.join("\n")
+    ))
+}
+
+/// What `edited` changes in the `db_root` of `base`, as entries for the CSK Collection's own
+/// database files (`database/*.json` in a mod). That plugin rebuilds these databases from the
+/// game's files and its own entries, so it is the one place a change reaches it. A changed
+/// entry carries its id and the fields that differ; an added one names the entry it is closest
+/// to as the one to copy, and the fields that differ from that. `id_field` is the entries' id
+/// (`ui_chara_id`, `ui_layout_id`).
+pub fn csk_entries(
+    base: &prc::ParamStruct,
+    edited: &prc::ParamStruct,
+    labels: &std::collections::HashMap<u64, String>,
+    id_field: &str,
+) -> Vec<serde_json::Value> {
+    use serde_json::{json, Map, Value};
+    let (Some(ParamKind::List(base)), Some(ParamKind::List(edited))) =
+        (db_root(base), db_root(edited))
+    else {
+        return Vec::new();
+    };
+    let id_hash = hash40::hash40(id_field).0;
+    let name = |hash: u64| match hash {
+        0 => String::new(),
+        hash => labels
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| format!("0x{hash:010x}")),
+    };
+    // Per-colour tables (`c00_index`, `characall_label_c00`, ...) are maps in the plugin's
+    // format, which `color_start_index` fills; they are not written field by field.
+    let per_colour = |field: &str| {
+        field.starts_with("characall_label")
+            || (field.len() > 4
+                && matches!(field.as_bytes()[0], b'c' | b'n')
+                && field[1..3].bytes().all(|b| b.is_ascii_digit())
+                && field.as_bytes()[3] == b'_')
+    };
+    let value = |value: &ParamKind| -> Option<Value> {
+        Some(match value {
+            ParamKind::Bool(value) => json!(value),
+            ParamKind::I8(value) => json!(value),
+            ParamKind::U8(value) => json!(value),
+            ParamKind::I16(value) => json!(value),
+            ParamKind::U16(value) => json!(value),
+            ParamKind::I32(value) => json!(value),
+            ParamKind::U32(value) => json!(value),
+            ParamKind::Float(value) => json!(value),
+            ParamKind::Hash(value) => json!(name(value.0)),
+            ParamKind::Str(value) => json!(value),
+            ParamKind::List(_) | ParamKind::Struct(_) => return None,
+        })
+    };
+    let differing = |row: &prc::ParamStruct, from: &prc::ParamStruct| -> Vec<(String, Value)> {
+        row.0
+            .iter()
+            .filter(|(hash, _)| hash.0 != id_hash)
+            .filter(|(hash, new)| {
+                from.0
+                    .iter()
+                    .find(|(known, _)| known == hash)
+                    .map(|(_, old)| old)
+                    != Some(new)
+            })
+            .filter_map(|(hash, new)| Some((name(hash.0), value(new)?)))
+            .filter(|(field, _)| !per_colour(field))
+            // The plugin keeps the first costume in its map of per-colour numbers (seen in
+            // game: as a field of the entry it is ignored and the base costumes load).
+            .map(|(field, value)| {
+                if field == COLOR_START_FIELD {
+                    (
+                        "extra_index_maps".to_owned(),
+                        json!({ COLOR_START_FIELD: value }),
+                    )
+                } else {
+                    (field, value)
+                }
+            })
+            .collect()
+    };
+    let rows = |list: &prc::ParamList| -> Vec<prc::ParamStruct> {
+        list.0
+            .iter()
+            .filter_map(|row| {
+                if let ParamKind::Struct(row) = row {
+                    Some(row.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let (base, edited) = (rows(base), rows(edited));
+    let mut entries = Vec::new();
+    for (index, row) in edited.iter().enumerate() {
+        let Some(id) = hash_field(row, id_field) else {
+            continue;
+        };
+        let mut entry = Map::new();
+        entry.insert(id_field.to_owned(), json!(name(id)));
+        let fields = match base.get(index) {
+            Some(before) => differing(row, before),
+            None => {
+                let Some((like, fields)) = base
+                    .iter()
+                    .map(|like| (like, differing(row, like)))
+                    .min_by_key(|(_, fields)| fields.len())
+                else {
+                    continue;
+                };
+                entry.insert(
+                    format!("clone_from_{id_field}"),
+                    json!(name(hash_field(like, id_field).unwrap_or(0))),
+                );
+                fields
+            }
+        };
+        if fields.is_empty() && entry.len() == 1 {
+            continue;
+        }
+        entry.extend(fields);
+        entries.push(Value::Object(entry));
+    }
+    entries
 }
 
 fn db_root(root: &prc::ParamStruct) -> Option<&ParamKind> {
@@ -471,6 +847,35 @@ mod tests {
         assert_eq!(row.disp_order, 3);
         assert!(row.can_select);
         assert!(row.on_roster());
+    }
+
+    #[test]
+    fn an_added_character_is_a_copy_of_its_fighter_in_its_own_costumes() {
+        let mut db = test_db(&[
+            ("mario", 0, fighter_kind_hash("mario"), true),
+            ("lucina", 23, fighter_kind_hash("lucina"), true),
+        ]);
+        db.add_character("lucina", "shade", &[8, 9, 10], 24)
+            .unwrap();
+        let row = db.row("shade").unwrap().clone();
+        assert_eq!(row.fighter_kind, fighter_kind_hash("lucina"));
+        assert_eq!(row.ui_chara_id, hash40::hash40("ui_chara_shade").0);
+        assert_eq!(
+            (row.disp_order, row.can_select, row.color_num),
+            (24, true, 3)
+        );
+        let Some(ParamKind::List(list)) = db_root(&db.root) else {
+            panic!()
+        };
+        let Some(ParamKind::Struct(entry)) = list.0.last() else {
+            panic!()
+        };
+        assert_eq!(u8_field(entry, COLOR_START_FIELD), Some(8));
+        assert_eq!(u8_field(entry, "c02_index"), Some(10));
+        // The base fighter's own entry is untouched, and a second one of the same name refused.
+        assert_eq!(db.row("lucina").unwrap().disp_order, 23);
+        assert!(db.add_character("lucina", "shade", &[8], 25).is_err());
+        assert!(db.add_character("nobody", "x", &[8], 25).is_err());
     }
 
     #[test]

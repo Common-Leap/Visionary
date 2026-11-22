@@ -421,7 +421,7 @@ fn steer_projectile(fighter: &str) -> Result<BehaviorGraph, String> {
                 .next()
                 .map(|entry| entry.symbol)
         })
-        .ok_or_else(|| format!("{fighter} has no owned projectile"))?;
+        .ok_or_else(|| "This fighter has no projectile of its own.".to_string())?;
     let stick =
         |axis: serde_json::Value| serde_json::json!({"Mul": [axis, {"Const": {"Float": 2.0}}]});
     let alive =
@@ -448,7 +448,7 @@ fn steer_projectile(fighter: &str) -> Result<BehaviorGraph, String> {
 fn fill_meter_on_hit(fighter: &str) -> Result<BehaviorGraph, String> {
     let resource = super::resource_commands::Resource::for_fighter(fighter)
         .next()
-        .ok_or_else(|| format!("{fighter} has no native resource gauge"))?;
+        .ok_or_else(|| "This fighter has no built-in meter to fill.".to_string())?;
     serde_json::from_value(serde_json::json!({
         "initial": "Ready", "states": [{"name": "Ready"}], "vars": [],
         "transitions": [{
@@ -464,13 +464,16 @@ fn fill_meter_on_hit(fighter: &str) -> Result<BehaviorGraph, String> {
 /// fighter, then hold it one higher every frame.
 fn extra_jump(fighter: &str) -> Result<BehaviorGraph, String> {
     let max = format!("work_int:{fighter}:FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT_MAX");
+    // The base is the fighter's own setting, not the live value: a gimmick sent again
+    // mid-match would otherwise measure its own raised value and add one more each time.
+    let own = format!("param_int:{fighter}:jump_count_max:");
     let raised = serde_json::json!({"Add": [{"Var": "base"}, {"Const": {"Int": 1}}]});
     serde_json::from_value(serde_json::json!({
         "initial": "Measure", "states": [{"name": "Measure"}, {"name": "Raised"}],
         "vars": [{"name": "base", "kind": "Int", "initial": {"Int": 0}}],
         "transitions": [
             {"from": "Measure", "to": "Raised", "on_frame": true, "guard": always(), "actions": [
-                {"Set": {"var": "base", "value": {"NativeInt": max}}},
+                {"Set": {"var": "base", "value": {"NativeInt": own}}},
             ]},
             {"from": "Raised", "to": "Raised", "on_frame": true,
              "guard": {"Compare": {"op": "Lt", "left": {"NativeInt": max}, "right": raised}},
@@ -1560,15 +1563,15 @@ mod tests {
         let max = NativeInput::from_reference(
             "work_int:kirby:FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT_MAX",
         );
-        let mut state = program.initial_state();
-        let mut tick = |value: i32| {
+        let own = NativeInput::from_reference("param_int:kirby:jump_count_max:");
+        let tick = |state: &mut _, value: i32| {
             let snapshot = NativeSnapshot::from_observations(
-                std::slice::from_ref(&max),
-                &[NativeObservation::Int(value)],
+                &[own.clone(), max.clone()],
+                &[NativeObservation::Int(6), NativeObservation::Int(value)],
             )
             .unwrap();
             program
-                .step_frame_with_snapshot(&mut state, &snapshot)
+                .step_frame_with_snapshot(state, &snapshot)
                 .unwrap()
                 .engine_actions
         };
@@ -1578,12 +1581,27 @@ mod tests {
                 value: Expr::Const(Value::Int(value)),
             }]
         };
-        assert_eq!(tick(6), write(7), "the first tick measures vanilla's six");
+        let mut state = program.initial_state();
+        assert_eq!(
+            tick(&mut state, 6),
+            write(7),
+            "the first tick reads vanilla's six"
+        );
         assert!(
-            tick(7).is_empty(),
+            tick(&mut state, 7).is_empty(),
             "held at the raised maximum, nothing is written"
         );
-        assert_eq!(tick(6), write(7), "a reset to vanilla is repaired");
+        assert_eq!(
+            tick(&mut state, 6),
+            write(7),
+            "a reset to vanilla is repaired"
+        );
+        // A live re-send starts a fresh controller while the game still holds 7.
+        let mut resent = program.initial_state();
+        assert!(
+            tick(&mut resent, 7).is_empty(),
+            "a re-send must not stack an eighth jump"
+        );
     }
 
     #[test]
@@ -1692,6 +1710,28 @@ mod tests {
                     .unwrap_or_else(|error| panic!("{defense:?} {fighter}: {error}"));
             }
         }
+    }
+
+    /// Live re-sends restart the controller mid-match. Measuring the value it writes made
+    /// every re-send add one more jump (seen in game: 2, then 3 after an editor restart).
+    #[test]
+    fn extra_jump_measures_the_fighters_setting_not_what_it_writes() {
+        let graph = serde_json::to_string(&extra_jump("pickel").unwrap()).unwrap();
+        let measure = graph.find("\"Measure\",\"to\"").unwrap();
+        let measured = &graph[measure..];
+        assert!(
+            measured.contains("param_int:pickel:jump_count_max:"),
+            "{graph}"
+        );
+        assert!(graph.contains("\"SetNative\":{\"input\":\"work_int:pickel:FIGHTER_INSTANCE_WORK_ID_INT_JUMP_COUNT_MAX\""), "{graph}");
+        let own: super::super::native_inputs::NativeInput =
+            serde_json::from_str("\"param_int:pickel:jump_count_max:\"").unwrap();
+        assert!(own.valid_for("pickel"), "the plugin would refuse {own:?}");
+        assert_eq!(
+            super::super::native_inputs::hash40(""),
+            0,
+            "the key must reach the game as 0"
+        );
     }
 
     #[test]

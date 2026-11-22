@@ -128,7 +128,7 @@ pub fn detect_arc_root(base: &Path) -> Result<(PathBuf, RootDetection)> {
     }
 
     bail!(
-        "no fighter/, effect/, or ui/ folder found under {} — is this an Arcropolis-style mod?",
+        "no fighter/, effect/, or ui/ folder found under {}. Is this an Arcropolis-style mod?",
         base.display()
     )
 }
@@ -353,17 +353,18 @@ impl ImportedMod {
         let fighters = self.manifest.fighters.len();
         let files = self.manifest.paths.len();
         let mut parts = vec![format!(
-            "{files} file{} across {fighters} fighter{}",
+            "{files} file{} for {fighters} fighter{}",
             if files == 1 { "" } else { "s" },
             if fighters == 1 { "" } else { "s" }
         )];
         if self.manifest.provides_ui {
-            parts.push("ships UI files".to_string());
+            parts.push("select screen images".to_string());
         }
         if self.ships_plugin() {
-            parts.push(format!("{} plugin(s)", self.manifest.plugins.len()));
+            let n = self.manifest.plugins.len();
+            parts.push(format!("{n} plugin{}", if n == 1 { "" } else { "s" }));
         }
-        parts.join(" · ")
+        parts.join(", ")
     }
 }
 
@@ -432,6 +433,10 @@ pub struct ModLibrary {
     pub mods: Vec<ImportedMod>,
     #[serde(default)]
     next_id: u32,
+    /// Folders of characters made in a project. The project adds them while it is open; they
+    /// are never installed mods, so no other project sees their costumes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub project_owned: std::collections::BTreeSet<PathBuf>,
 }
 
 impl ModLibrary {
@@ -560,6 +565,50 @@ impl ModLibrary {
             .collect()
     }
 
+    /// Mark `folders` as belonging to a project, taking any of them out of the installed mods
+    /// (older versions added a made character's folder there). True when anything changed.
+    pub fn release_project_folders(&mut self, folders: &[PathBuf]) -> bool {
+        let before = (self.mods.len(), self.project_owned.len());
+        self.mods.retain(|entry| {
+            !folders
+                .iter()
+                .any(|folder| entry.source.scan_base() == folder || entry.root == *folder)
+        });
+        self.project_owned.extend(folders.iter().cloned());
+        before != (self.mods.len(), self.project_owned.len())
+    }
+
+    /// Forget a removed made character's folder entirely: it is no installed mod, and no
+    /// longer the project's. Its files stay on disk; [`is_made_character_folder`] keeps an old
+    /// root list from installing it. True when anything changed.
+    pub fn forget_project_folder(&mut self, folder: &Path) -> bool {
+        let before = (self.mods.len(), self.project_owned.len());
+        self.mods
+            .retain(|entry| entry.source.scan_base() != folder && entry.root != folder);
+        self.project_owned.remove(folder);
+        before != (self.mods.len(), self.project_owned.len())
+    }
+
+    /// Clear what a saved library may carry about made characters' folders: one an older build
+    /// installed as a mod (its `project_owned` list lost when that build rewrote the file) goes
+    /// back to its project, and a folder that no longer exists is forgotten. True when anything
+    /// changed.
+    fn tidy_project_folders(&mut self) -> bool {
+        let installed: Vec<PathBuf> = self
+            .mods
+            .iter()
+            .filter(|entry| {
+                is_made_character_folder(entry.source.scan_base())
+                    || is_made_character_folder(&entry.root)
+            })
+            .map(|entry| entry.source.scan_base().to_path_buf())
+            .collect();
+        let released = !installed.is_empty() && self.release_project_folders(&installed);
+        let before = self.project_owned.len();
+        self.project_owned.retain(|folder| folder.is_dir());
+        released || before != self.project_owned.len()
+    }
+
     /// Enabled roots, earliest first — what the existing fighter scan consumes as extra roots.
     pub fn enabled_roots(&self) -> Vec<PathBuf> {
         self.enabled().map(|entry| entry.root.clone()).collect()
@@ -601,28 +650,51 @@ pub fn save(library: &ModLibrary) {
     }
 }
 
-/// Load the saved library, dropping mods whose files are gone.
+/// Load the saved library, dropping mods whose files are gone and taking made characters'
+/// folders out of the installed mods. True when the saved file needs writing back.
 ///
 /// A missing root is dropped rather than kept broken for the same reason `load_mod_roots`
 /// drops missing paths: an unplugged drive should not leave a permanently failing entry.
-pub fn load() -> ModLibrary {
+pub fn load() -> (ModLibrary, bool) {
     let Ok(body) = std::fs::read_to_string(library_path()) else {
-        return ModLibrary::default();
+        return (ModLibrary::default(), false);
     };
     let mut library: ModLibrary = serde_json::from_str(&body).unwrap_or_default();
+    let count = library.mods.len();
     library.mods.retain(|entry| entry.root.is_dir());
-    library
+    let tidied = library.tidy_project_folders();
+    let changed = tidied || count != library.mods.len();
+    (library, changed)
+}
+
+/// True when `folder` is a character made in a project: `<project>/characters/<name>` beside
+/// the project's file. Read from the disk rather than the library's list, so a library written
+/// by an older build (which keeps no list) still never installs one. The folder itself may be
+/// gone.
+pub fn is_made_character_folder(folder: &Path) -> bool {
+    folder
+        .parent()
+        .filter(|parent| parent.file_name() == Some(std::ffi::OsStr::new("characters")))
+        .and_then(Path::parent)
+        .is_some_and(|project| {
+            project
+                .join(crate::mod_project::PROJECT_FILE_NAME)
+                .is_file()
+        })
 }
 
 /// Adopt paths from the pre-library `mod_roots` config so an upgrading user keeps their
-/// setup. Paths already present as a mod root are skipped.
+/// setup. Paths already present as a mod root are skipped, and so are made characters'
+/// folders: the open project lists those among the roots it saves, but they are its own.
 pub fn adopt_legacy_roots(library: &mut ModLibrary, roots: &[PathBuf]) -> Vec<String> {
     let mut notes = Vec::new();
     for root in roots {
-        if library
-            .mods
-            .iter()
-            .any(|entry| entry.source.scan_base() == root.as_path())
+        if library.project_owned.contains(root)
+            || is_made_character_folder(root)
+            || library
+                .mods
+                .iter()
+                .any(|entry| entry.source.scan_base() == root.as_path())
         {
             continue;
         }
@@ -641,6 +713,107 @@ mod tests {
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"").unwrap();
+    }
+
+    #[test]
+    fn a_made_characters_folder_leaves_the_installed_mods_and_is_never_adopted_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let vision = dir.path().join("project/characters/vision");
+        let other = dir.path().join("skins");
+        touch(&vision.join("fighter/mario/model/body/c08/model.numdlb"));
+        touch(&other.join("fighter/mario/model/body/c01/model.numdlb"));
+        let mut library = ModLibrary::default();
+        library
+            .import_directory(ModSource::Folder(vision.clone()), Some("Vision".into()))
+            .unwrap();
+        library
+            .import_directory(ModSource::Folder(other.clone()), None)
+            .unwrap();
+        assert!(library.release_project_folders(std::slice::from_ref(&vision)));
+        assert_eq!(library.enabled_roots(), vec![other.clone()]);
+        // Doing it again changes nothing, so nothing is saved again.
+        assert!(!library.release_project_folders(std::slice::from_ref(&vision)));
+        // The open project's roots are saved as the old root list; reading them back on the
+        // next start must not install the character's folder for every project.
+        let notes = adopt_legacy_roots(&mut library, &[other.clone(), vision.clone()]);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(library.enabled_roots(), vec![other]);
+        // A folder of no project is still adopted, so the old migration keeps working.
+        let third = dir.path().join("third");
+        touch(&third.join("fighter/link/model/body/c00/model.numdlb"));
+        assert_eq!(adopt_legacy_roots(&mut library, &[third]).len(), 1);
+        let saved: ModLibrary =
+            serde_json::from_str(&serde_json::to_string(&library).unwrap()).unwrap();
+        assert!(saved.project_owned.contains(&vision));
+    }
+
+    /// A project folder with a made character's folder in it, as the New character page makes
+    /// one: `<project>/characters/<name>` beside the project's file.
+    fn made_character(dir: &Path, name: &str) -> PathBuf {
+        let project = dir.join("project");
+        touch(&project.join(crate::mod_project::PROJECT_FILE_NAME));
+        let folder = project.join("characters").join(name);
+        touch(&folder.join("fighter/mario/model/body/c08/model.numdlb"));
+        folder
+    }
+
+    /// An older build that rewrites the library keeps no list of made characters' folders, and
+    /// may have installed one as a mod. Loading takes it back out, and the old root list never
+    /// installs it again; an ordinary mod beside it is kept and still adopted.
+    #[test]
+    fn a_library_written_without_the_list_never_installs_a_made_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let vision = made_character(dir.path(), "vision");
+        let skins = dir.path().join("skins");
+        touch(&skins.join("fighter/mario/model/body/c01/model.numdlb"));
+        let mut library = ModLibrary::default();
+        library
+            .import_directory(ModSource::Folder(vision.clone()), Some("Vision".into()))
+            .unwrap();
+        library
+            .import_directory(ModSource::Folder(skins.clone()), None)
+            .unwrap();
+        // What an older build writes: no `project_owned` field at all.
+        let mut old: serde_json::Value = serde_json::to_value(&library).unwrap();
+        old.as_object_mut().unwrap().remove("project_owned");
+        let mut loaded: ModLibrary = serde_json::from_value(old).unwrap();
+        assert!(loaded.project_owned.is_empty());
+        assert!(loaded.tidy_project_folders());
+        assert_eq!(loaded.enabled_roots(), vec![skins.clone()]);
+        assert!(
+            !loaded.tidy_project_folders(),
+            "a second load changes nothing"
+        );
+
+        let mut fresh = ModLibrary::default();
+        let notes = adopt_legacy_roots(&mut fresh, &[vision.clone(), skins.clone()]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(fresh.enabled_roots(), vec![skins]);
+        assert!(is_made_character_folder(&vision));
+        // A folder named like one but in no project is an ordinary folder.
+        let loose = dir.path().join("elsewhere/characters/vision");
+        touch(&loose.join("fighter/mario/model/body/c08/model.numdlb"));
+        assert!(!is_made_character_folder(&loose));
+        assert_eq!(adopt_legacy_roots(&mut fresh, &[loose]).len(), 1);
+    }
+
+    /// A made character's folder that no longer exists leaves the list on load; one that still
+    /// exists stays. Removing the character forgets its folder.
+    #[test]
+    fn missing_and_removed_made_characters_leave_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let kept = made_character(dir.path(), "kept");
+        let gone = dir.path().join("project/characters/gone");
+        let mut library = ModLibrary::default();
+        library.release_project_folders(&[kept.clone(), gone.clone()]);
+        assert!(library.tidy_project_folders());
+        assert_eq!(
+            library.project_owned.iter().cloned().collect::<Vec<_>>(),
+            vec![kept.clone()]
+        );
+        assert!(library.forget_project_folder(&kept));
+        assert!(library.project_owned.is_empty());
+        assert!(!library.forget_project_folder(&kept));
     }
 
     #[test]

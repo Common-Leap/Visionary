@@ -46,7 +46,10 @@ impl ControllerLibrary {
     ) {
         let source = charts.and_then(|charts| charts.get(selected));
         ui.menu_button("Library", |ui| {
-            if ui.add_enabled(source.is_some(), egui::Button::new("Copy controller")).clicked() {
+            if ui
+                .add_enabled(source.is_some(), egui::Button::new("Copy controller"))
+                .clicked()
+            {
                 match capture(fighter, selected, source) {
                     Ok(asset) => {
                         self.status = Some(Ok(format!("Copied {}", asset.label())));
@@ -56,21 +59,36 @@ impl ControllerLibrary {
                 }
                 ui.close();
             }
-            if ui.add_enabled(self.clipboard.is_some(), egui::Button::new("Paste controller")).clicked() {
-                self.stage(self.clipboard.as_ref().expect("enabled clipboard").clone(), charts);
+            if ui
+                .add_enabled(
+                    self.clipboard.is_some(),
+                    egui::Button::new("Paste controller"),
+                )
+                .clicked()
+            {
+                self.stage(
+                    self.clipboard.as_ref().expect("enabled clipboard").clone(),
+                    charts,
+                );
                 ui.close();
             }
             ui.separator();
-            if ui.add_enabled(source.is_some(), egui::Button::new("Export controller")).clicked() {
+            if ui
+                .add_enabled(source.is_some(), egui::Button::new("Export controller"))
+                .clicked()
+            {
                 match capture(fighter, selected, source) {
                     Ok(asset) => {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_title("Export portable controller")
                             .add_filter("Controller library", &["json"])
-                            .set_file_name("controller.json").save_file()
+                            .set_file_name("controller.json")
+                            .save_file()
                         {
-                            self.status = Some(crate::gimmicks::controller_asset_io::save_new(&path, &asset)
-                                .map(|()| format!("Exported {}", asset.label())));
+                            self.status = Some(
+                                crate::gimmicks::controller_asset_io::save_new(&path, &asset)
+                                    .map(|()| format!("Exported {}", asset.label())),
+                            );
                         }
                     }
                     Err(error) => self.status = Some(Err(error)),
@@ -80,16 +98,24 @@ impl ControllerLibrary {
             if ui.button("Import controller").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Import portable controller")
-                    .add_filter("Controller library", &["json"]).pick_file()
+                    .add_filter("Controller library", &["json"])
+                    .pick_file()
                 {
                     match crate::gimmicks::controller_asset_io::load(&path) {
                         Ok(asset) => self.stage(asset, charts),
-                        Err(error) => { self.pending = None; self.status = Some(Err(error)); }
+                        Err(error) => {
+                            self.pending = None;
+                            self.status = Some(Err(error));
+                        }
                     }
                 }
                 ui.close();
             }
-        }).response.on_hover_text("Reuse an additional controller's applied graph and card layout. Main and unapplied edits are not copied. Native character resources keep their exact ownership.");
+        })
+        .response
+        .on_hover_text(
+            "Reuse a gimmick from the library. Rules you have not applied yet are not copied.",
+        );
     }
 
     /// Render outside the toolbar so the preview has the field's full width.
@@ -103,16 +129,15 @@ impl ControllerLibrary {
                     ui.weak(format!("from {} / {}", asset.donor_fighter(), asset.source_chart_id()));
                 });
                 let graph = &asset.chart().graph;
-                ui.weak(format!("{} states · {} variables · {} named events", graph.states.len(), graph.vars.len(), graph.emission_plan.event_bindings.len()));
+                ui.weak(format!("{} states · {} values", graph.states.len(), graph.vars.len()));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Controller ID");
+                    ui.label("Name");
                     ui.add(egui::TextEdit::singleline(&mut self.target_id).desired_width(180.0).char_limit(48));
-                    if ui.button("Add controller").on_hover_text("Validate the complete character, then add this applied controller. Existing controllers are never replaced. Compatible live preview updates automatically.").clicked() {
+                    if ui.button("Add gimmick").on_hover_text("Adds this as one more gimmick; the ones you have stay. It runs in the game right away. It keeps its own values. Save the project after adding.").clicked() {
                         requested = Some((asset.clone(), self.target_id.clone()));
                     }
                     cancel = ui.small_button("Cancel").clicked();
                 });
-                ui.weak("New independent state; native identifiers are not remapped. Save the project after adding.");
             });
         }
         if cancel {
@@ -141,7 +166,7 @@ fn capture(
         fighter,
         selected,
         selected,
-        source.ok_or("Select an additional controller first")?,
+        source.ok_or("Pick a gimmick first")?,
     )
 }
 

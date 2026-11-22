@@ -25,6 +25,12 @@ pub struct CharacterContext {
     pub fighter: String,
     pub name: String,
     pub costume_slots: Vec<u8>,
+    /// The made character picked here, when it is one. The app makes it the character being
+    /// edited, so every page agrees on who is open.
+    pub character: Option<crate::roster::RosterKey>,
+    /// For a base fighter: the costumes characters made on it own, which its gimmick never
+    /// runs on.
+    pub made_costumes: Vec<u8>,
 }
 
 impl CharacterContext {
@@ -33,6 +39,8 @@ impl CharacterContext {
             fighter: fighter.to_string(),
             name: name.to_string(),
             costume_slots,
+            character: None,
+            made_costumes: Vec::new(),
         }
     }
 }
@@ -44,34 +52,51 @@ fn costume_scope_ui(
     roots: &[PathBuf],
     behaviors: &mut BTreeMap<String, BehaviorGraph>,
 ) {
+    // A gimmick not made yet starts on the open character's own costumes. A made character's
+    // gimmick runs on its costumes alone, always: it is the made character's own.
+    let made = context.character.is_some();
+    if made
+        || behaviors
+            .get(&context.fighter)
+            .is_some_and(BehaviorGraph::is_empty)
+    {
+        let graph = behaviors.entry(context.fighter.clone()).or_default();
+        if graph.costumes != context.costume_slots {
+            graph.costumes = context.costume_slots.clone();
+        }
+    }
+    if made {
+        let range = crate::character::slot_range(&context.costume_slots).unwrap_or_default();
+        ui.label(format!("Runs on {range}"))
+            .on_hover_text(format!("Only {}'s costumes", context.name));
+        return;
+    }
     let current = behaviors
         .get(&context.fighter)
         .map(|graph| graph.costumes.clone())
         .unwrap_or_default();
-    let mut all = crate::data::costume_slots_or_default(roots, &context.fighter);
-    all.extend(context.costume_slots.iter().copied());
-    all.sort_unstable();
-    all.dedup();
-    let label = match current.as_slice() {
-        [] => "Runs on every costume".to_owned(),
-        slots => format!(
-            "Runs on {}",
-            slots
-                .iter()
-                .map(|slot| format!("c{slot:02}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    // A fighter's gimmick never runs on the costumes of characters made on it: those are
+    // theirs. With no limit it runs on every costume of its own, which is stored as no limit.
+    let unlimited: Vec<u8> = Vec::new();
+    let all: Vec<u8> = crate::data::costume_slots_or_default(roots, &context.fighter)
+        .into_iter()
+        .filter(|slot| !context.made_costumes.contains(slot))
+        .collect();
+    let own: &[u8] = if context.made_costumes.is_empty() {
+        &[]
+    } else {
+        &all
     };
+    let label = costume_scope_label(&current, own);
     let mut chosen = None;
     ui.menu_button(label, |ui| {
-        if ui.button("Every costume").clicked() {
-            chosen = Some(Vec::new());
-        }
-        if !context.costume_slots.is_empty()
-            && ui.button(format!("Only {}'s costumes", context.name)).clicked()
-        {
-            chosen = Some(context.costume_slots.clone());
+        let every = if context.made_costumes.is_empty() {
+            "Every costume".to_owned()
+        } else {
+            format!("Every {} costume", context.name)
+        };
+        if ui.button(every).clicked() {
+            chosen = Some(unlimited.clone());
         }
         ui.separator();
         for &slot in &all {
@@ -87,7 +112,7 @@ fn costume_scope_ui(
                 next.dedup();
                 // Every slot ticked is the same as no limit.
                 if next == all {
-                    next.clear();
+                    next = unlimited.clone();
                 }
                 chosen = Some(next);
             }
@@ -100,6 +125,17 @@ fn costume_scope_ui(
             .entry(context.fighter.clone())
             .or_default()
             .costumes = next;
+    }
+}
+
+/// The costumes a fighter's gimmick runs on, as its header shows them. With no limit it runs
+/// on every costume that is the fighter's own (`own`), which leaves out the costumes of
+/// characters made on it; with none made on it (`own` empty), on every costume.
+fn costume_scope_label(limit: &[u8], own: &[u8]) -> String {
+    let shown = if limit.is_empty() { own } else { limit };
+    match crate::character::slot_range(shown) {
+        None => "Runs on every costume".to_owned(),
+        Some(range) => format!("Runs on {range}"),
     }
 }
 
@@ -211,6 +247,8 @@ pub struct GimmicksEditor {
     pending: Option<(String, BehaviorGraph)>,
     pending_setup: Option<(String, super::blueprint::PreparedGimmicks)>,
     character: Option<crate::roster::RosterKey>,
+    /// The character whose gimmick the page last showed; drafts belong to it.
+    shown_character: Option<crate::roster::RosterKey>,
     advanced_params: super::view::PersonalView,
     chart: String,
     chart_sessions: BTreeMap<String, controllers::ControllerSession>,
@@ -225,13 +263,16 @@ impl GimmicksEditor {
         self.live.set_recipe_errors(errors);
     }
 
+    /// `graphs` (and `charts` below) are keyed by character; `roster` says which costumes each
+    /// character's gimmick runs on.
     pub fn sync_live(
         &mut self,
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
+        roster: &crate::mod_project::RosterMod,
         link: &GameLink,
     ) {
-        self.live.update(params, graphs, link);
+        self.live.update(params, graphs, roster, link);
     }
 
     pub fn pack_messages(
@@ -239,8 +280,9 @@ impl GimmicksEditor {
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
+        roster: &crate::mod_project::RosterMod,
     ) -> Result<Vec<String>, String> {
-        self.live.pack_messages(params, graphs, charts)
+        self.live.pack_messages(params, graphs, charts, roster)
     }
 
     pub fn sync_live_controllers(
@@ -248,10 +290,11 @@ impl GimmicksEditor {
         params: &BTreeMap<String, ParamMod>,
         graphs: &BTreeMap<String, BehaviorGraph>,
         charts: &BTreeMap<String, BTreeMap<String, crate::mod_project::ControllerChart>>,
+        roster: &crate::mod_project::RosterMod,
         link: &GameLink,
     ) {
         self.live
-            .update_with_controllers(params, graphs, charts, link);
+            .update_with_controllers(params, graphs, charts, roster, link);
     }
 
     fn live_status(&mut self, ui: &mut Ui, fighter: &str, link: &GameLink) {
@@ -287,14 +330,10 @@ impl GimmicksEditor {
         fighter: &str,
         name: &str,
         authored: &[crate::mod_project::AuthoredEntry],
-        suggested_slots: &[u8],
+        active: Option<&crate::roster::RosterKey>,
     ) -> CharacterContext {
-        if self.fighter != fighter {
-            self.character = authored
-                .iter()
-                .find(|entry| entry.donor == fighter && entry.all_slots() == suggested_slots)
-                .map(|entry| entry.key.clone());
-        }
+        // The character open in the editor is the one shown here.
+        self.character = active.cloned();
         if self.character.as_ref().is_some_and(|key| {
             !authored
                 .iter()
@@ -326,17 +365,33 @@ impl GimmicksEditor {
             .character
             .as_ref()
             .and_then(|key| authored.iter().find(|entry| &entry.key == key));
-        CharacterContext::new(
-            fighter,
-            selected.map_or(name, |entry| entry.display_name.as_str()),
-            selected.map_or_else(Vec::new, |entry| entry.all_slots()),
-        )
+        CharacterContext {
+            character: selected.map(|entry| entry.key.clone()),
+            made_costumes: if selected.is_some() {
+                Vec::new()
+            } else {
+                authored
+                    .iter()
+                    .filter(|entry| entry.donor == fighter)
+                    .flat_map(crate::mod_project::AuthoredEntry::all_slots)
+                    .collect()
+            },
+            ..CharacterContext::new(
+                fighter,
+                selected.map_or(name, |entry| entry.display_name.as_str()),
+                selected.map_or_else(Vec::new, |entry| entry.all_slots()),
+            )
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, context: &CharacterContext, mut data: EditorData<'_>) {
         let saved = SavedGimmicks::capture(&context.fighter, &data);
-        if self.fighter != context.fighter || self.roots != data.roots {
+        if self.fighter != context.fighter
+            || self.shown_character != context.character
+            || self.roots != data.roots
+        {
             self.fighter = context.fighter.clone();
+            self.shown_character = context.character.clone();
             self.roots = data.roots.to_vec();
             self.base = None;
             self.profile = super::catalog::profile(&context.fighter);
@@ -368,7 +423,7 @@ impl GimmicksEditor {
             .map_or(0, BTreeMap::len);
         if additional_count > 0 {
             self.pending_setup = None;
-            ui.weak(format!("{additional_count} additional controller{}", if additional_count == 1 { "" } else { "s" }))
+            ui.weak(format!("{additional_count} more gimmick{}", if additional_count == 1 { "" } else { "s" }))
                 .on_hover_text("Live updates need the Visionary plugin in the game. Exported mods include every gimmick.");
         }
         ui.horizontal_wrapped(|ui| {
@@ -376,7 +431,7 @@ impl GimmicksEditor {
             let setup_hint = if setup_available {
                 "Export only this donor's authored personal values, behavior, and meters as a reusable setup. No base-game files are included."
             } else {
-                "This character has additional controllers. Save the project to retain them; the current setup format cannot include them."
+                "This character has more than one gimmick. Save the project to keep them; a gimmick file holds only one."
             };
             if ui.add_enabled(setup_available, egui::Button::new("Save gimmick to a file")).on_hover_text(setup_hint).clicked() {
                 let empty = ParamMod::default();
@@ -402,11 +457,20 @@ impl GimmicksEditor {
                     self.pending_setup = None;
                     if self.base.is_none() { self.base = Some(super::view::load_base(data.roots, &context.fighter)); }
                     let base = match self.base.as_ref() { Some(BaseState::Present(tree)) => Some(tree), _ => None };
-                    match read_text(&path).and_then(|text| super::blueprint::GimmickBlueprint::decode(&text)).and_then(|blueprint| {
+                    let text = read_text(&path);
+                    match text.clone().and_then(|text| super::blueprint::GimmickBlueprint::decode(&text)).and_then(|blueprint| {
                         let prepared = blueprint.prepare(&context.fighter, base)?;
                         Ok((blueprint.name, prepared))
                     }) {
-                        Ok(prepared) => self.pending_setup = Some(prepared), Err(error) => self.status = error,
+                        Ok(prepared) => self.pending_setup = Some(prepared),
+                        // Files saved as rules only by older versions load into the rules.
+                        Err(error) => match text.and_then(|text| BehaviorTemplate::decode(&text)).and_then(|template| {
+                            let graph = template.instantiate(&context.fighter)?;
+                            Ok((template.name, graph))
+                        }) {
+                            Ok(pending) => self.pending = Some(pending),
+                            Err(_) => self.status = error,
+                        },
                     }
                 }
             }
@@ -416,9 +480,13 @@ impl GimmicksEditor {
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Load {name}?"));
-                ui.weak("Replaces this fighter's gimmicks, values and meters. Other edits stay.");
                 ui.horizontal(|ui| {
-                    apply = ui.button("Apply setup").clicked();
+                    apply = ui
+                        .button("Apply setup")
+                        .on_hover_text(
+                            "Replaces this fighter's gimmicks, values and meters. Other edits stay.",
+                        )
+                        .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -475,7 +543,11 @@ impl GimmicksEditor {
         let has_articles = profile
             .as_ref()
             .is_some_and(|profile| profile.articles + profile.weapon_statuses > 0);
-        self.live_status(ui, &context.fighter, data.link);
+        let key = context
+            .character
+            .as_ref()
+            .map_or(context.fighter.as_str(), crate::roster::RosterKey::as_str);
+        self.live_status(ui, key, data.link);
         egui::ScrollArea::vertical()
             .id_salt(("main_gimmicks", &context.fighter))
             .show(ui, |ui| {
@@ -489,7 +561,10 @@ impl GimmicksEditor {
                             self.operations.ui(ui, &context.fighter, data.link);
                         }
                     }
-                    Section::Meters => self.meter.ui(ui, &context.fighter, data.meters, data.link),
+                    Section::Meters => {
+                        self.meter
+                            .ui(ui, &context.fighter, key, data.meters, data.link)
+                    }
                 }
                 if let Err(error) = saved.validate_change(&context.fighter, &mut data) {
                     self.status = error;
@@ -523,14 +598,14 @@ impl GimmicksEditor {
             egui::CollapsingHeader::new("Live parameter diagnostics").id_salt("parameter_getter_health").show(ui, |ui| {
                 match health.getter_backend {
                     Some(super::live_params::ParameterGetterBackend::NativeParamData) => { ui.weak("Values read from the game"); }
-                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("The game may change some of these in ways the preview doesn't show."); }
+                    Some(super::live_params::ParameterGetterBackend::WorkModuleExport) => { ui.weak("Values may change in the game").on_hover_text("The game may change some of these in ways the preview doesn't show."); }
                     None => { ui.weak("Getter backend not reported by this plugin."); }
                 }
-                ui.weak("Game-wide counters since the accepted parameter snapshot; field read counts remain fighter-specific.");
-                ui.weak(format!("Getter reads: {} float · {} integer; {} overrides returned", health.float_wrapper_calls, health.int_wrapper_calls, health.overrides_returned));
+                ui.weak(format!("Getter reads: {} float · {} integer; {} overrides returned", health.float_wrapper_calls, health.int_wrapper_calls, health.overrides_returned))
+                    .on_hover_text("Game-wide counters since the accepted parameter snapshot; field read counts remain fighter-specific.");
                 ui.weak(format!("Fighter identity: {} matches · {} misses; parameter keys: {} matches · {} misses", health.identity_matches, health.identity_misses, health.parameter_key_matches, health.parameter_key_misses));
                 ui.weak(format!("{} type mismatches · {} lock contentions · {} disabled-table reads", health.type_mismatches, health.identity_lock_busy.saturating_add(health.overlay_lock_busy), health.overlay_disabled));
-                if health.float_wrapper_calls == 0 && health.int_wrapper_calls == 0 { ui.weak("No reads reached the installed getters. An accepted table alone does not prove live application."); }
+                if health.float_wrapper_calls == 0 && health.int_wrapper_calls == 0 { ui.weak("No reads reached the installed getters").on_hover_text("An accepted table alone does not prove live application."); }
             });
         }
         ui.horizontal(|ui| {
@@ -721,23 +796,45 @@ impl GimmicksEditor {
         link: &GameLink,
         recipes: Option<&BTreeMap<String, crate::move_nodes::model::MoveGraph>>,
     ) {
+        if let Some(graph) = graphs.get(fighter).filter(|graph| !graph.is_empty()) {
+            let names: Vec<&str> = graph
+                .states
+                .iter()
+                .map(|state| state.name.as_str())
+                .collect();
+            let plural =
+                |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+            ui.weak(format!(
+                "Has {} ({}), {} and {}.",
+                plural(names.len(), "stage"),
+                names.join(", "),
+                plural(graph.vars.len(), "value"),
+                plural(graph.transitions.len(), "rule"),
+            ));
+        }
         // Every way to fill the controller from somewhere else lives in one menu; each stages
         // a confirmation below instead of replacing the graph immediately.
-        let has_graph = graphs.get(fighter).is_some_and(|graph| !graph.is_empty());
         ui.menu_button("Start from", |ui| {
             ui.menu_button("Preset", |ui| {
                 for preset in Preset::ALL {
-                    if ui.button(preset.label()).clicked() {
+                    if ui.button(preset.label()).on_hover_text(preset.hover()).clicked() {
                         self.pending = Some((preset.label().to_string(), preset.graph()));
                         ui.close();
                     }
                 }
                 ui.separator();
                 for defense in super::status_recipes::Defense::ALL {
-                    if ui.button(defense.label()).on_hover_text(defense.hover()).clicked() {
-                        match defense.graph(fighter) {
-                            Ok(graph) => self.pending = Some((defense.label().to_string(), graph)),
-                            Err(error) => self.status = error,
+                    // Ones this fighter can't use stay listed, greyed out with the reason.
+                    let graph = defense.graph(fighter);
+                    let reason = graph.as_ref().err().cloned().unwrap_or_default();
+                    if ui
+                        .add_enabled(graph.is_ok(), egui::Button::new(defense.label()))
+                        .on_hover_text(defense.hover())
+                        .on_disabled_hover_text(reason)
+                        .clicked()
+                    {
+                        if let Ok(graph) = graph {
+                            self.pending = Some((defense.label().to_string(), graph));
                         }
                         ui.close();
                     }
@@ -770,62 +867,25 @@ impl GimmicksEditor {
                     });
                 });
             }
-            ui.separator();
-            if ui.button("Import template").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Gimmick template", &["json"])
-                    .pick_file()
-                {
-                    self.pending = None;
-                    match read_template(&path).and_then(|template| {
-                        let graph = template.instantiate(fighter)?;
-                        Ok((template.name, graph))
-                    }) {
-                        Ok(pending) => self.pending = Some(pending),
-                        Err(error) => self.status = error,
-                    }
-                }
-                ui.close();
-            }
-            if ui.add_enabled(has_graph, egui::Button::new("Export template")).clicked() {
-                if let Some(graph) = graphs.get(fighter) {
-                    match BehaviorTemplate::from_graph(
-                        &format!("{fighter} behavior"),
-                        Some(fighter),
-                        graph.clone(),
-                    ) {
-                        Ok(template) => {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Gimmick template", &["json"])
-                                .set_file_name(format!("{fighter}-gimmick.json"))
-                                .save_file()
-                            {
-                                self.status = match write_template(&path, &template) {
-                                    Ok(()) => format!("Template saved to {}", path.display()),
-                                    Err(error) => error,
-                                };
-                            }
-                        }
-                        Err(error) => self.status = error,
-                    }
-                }
-                ui.close();
-            }
         })
         .response
-        .on_hover_text("Fill this controller from a preset, another character or a template file. You confirm before anything is replaced.");
+        .on_hover_text("A gimmick is a set of rules that run all match, like a meter that fills when you land hits. Fill this one from a ready-made gimmick or another character, or build the rules in Move nodes. You confirm before anything is replaced.");
         if let Some((name, _)) = &self.pending {
             let mut apply = false;
             let mut cancel = false;
             ui.group(|ui| {
                 ui.label(format!("Use {name}?"));
+                let mut about: Vec<String> = preset_about(name).into_iter().collect();
                 if graphs.get(fighter).is_some_and(|graph| !graph.is_empty()) {
-                    ui.weak(
-                        "This replaces the selected controller's saved graph and unapplied draft.",
-                    );
+                    about.push("This replaces the rules this gimmick has now.".to_owned());
                 }
                 ui.horizontal(|ui| {
-                    apply = ui.button("Apply").clicked();
+                    let button = ui.button("Apply");
+                    apply = if about.is_empty() {
+                        button.clicked()
+                    } else {
+                        button.on_hover_text(about.join("\n")).clicked()
+                    };
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -837,7 +897,7 @@ impl GimmicksEditor {
                     Ok(graph) => {
                         graphs.insert(fighter.to_string(), graph);
                         self.status =
-                            "Controller saved; supported live preview updates automatically."
+                            "Added. It runs in the game right away when the game is connected."
                                 .into();
                     }
                     Err(error) => self.status = error,
@@ -879,12 +939,11 @@ impl GimmicksEditor {
         let mut add_variable = None;
         ui.scope(|ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Duration");
+                ui.label("Duration").on_hover_text("Counts down automatically. Each expiry increments elapsed_events and raises ready; stock loss resets its state.");
                 changed |= ui.add(egui::DragValue::new(&mut config.duration_frames).range(1..=super::live_model::MAX_TIMER_FRAMES as u32).suffix(" frames")).changed();
                 ui.weak(format!("{:.2} seconds at 60 fps", config.duration_frames as f32 / 60.0));
                 changed |= ui.checkbox(&mut config.repeats, "Repeat").changed();
             });
-            ui.weak("Counts down automatically. Each expiry increments elapsed_events and raises ready; stock loss resets its state.");
             egui::CollapsingHeader::new("When the timer expires").id_salt(("timer_expiry", fighter)).default_open(true).show(ui, |ui| {
                 let mut command = None;
                 let count = config.expiry_actions.len();
@@ -946,7 +1005,7 @@ impl GimmicksEditor {
             Ok(applied) => {
                 graphs.insert(fighter.into(), applied.graph.clone());
                 self.preview.clear();
-                self.status = "Timer updated; live preview synchronizes automatically.".into();
+                self.status = "Timer changed. The game picks it up right away.".into();
                 applied.graph
             }
             Err(error) => {
@@ -962,6 +1021,9 @@ impl GimmicksEditor {
             .iter()
             .filter(|agent| agent.category == 0 && agent.fighter.as_deref() == Some(fighter))
             .collect();
+        if players.is_empty() {
+            return;
+        }
         if self
             .action_test_boid
             .is_some_and(|boid| !players.iter().any(|agent| agent.boid == boid))
@@ -972,7 +1034,7 @@ impl GimmicksEditor {
             self.action_test_boid = Some(players[0].boid);
         }
         ui.horizontal_wrapped(|ui| {
-            ui.weak("Test actions on");
+            ui.weak("Try its actions on");
             egui::ComboBox::from_id_salt(("controller_test_player", fighter))
                 .selected_text(
                     players
@@ -992,9 +1054,6 @@ impl GimmicksEditor {
                         );
                     }
                 });
-            if players.is_empty() {
-                ui.weak("Start a match with this fighter to test objects.");
-            }
         });
     }
 
@@ -1042,8 +1101,11 @@ impl GimmicksEditor {
         egui::CollapsingHeader::new("What the gimmick is doing now").id_salt(("behavior_state", fighter)).default_open(link.gimmick_controller_snapshot().is_some()).show(ui, |ui| {
             if let Some(snapshot) = link.gimmick_controller_snapshot().filter(|snapshot| self.live.error_for("behavior").is_none() && link.gimmick_live_ack("behavior")
                 .is_some_and(|ack| ack.accepted && ack.revision == snapshot.behavior_revision)) {
+                // Players of this fighter in another character's costumes run that one's gimmick.
+                let key = self.shown_character.as_ref().map_or(fighter, crate::roster::RosterKey::as_str).to_owned();
                 for row in snapshot.behavior.iter().filter(|row| row.get("fighter").and_then(|v| v.as_str()) == Some(fighter)
-                    && row.get("chart_id").and_then(|value| value.as_str()).unwrap_or(super::controller_project::MAIN_CHART) == chart_id) {
+                    && row.get("chart_id").and_then(|value| value.as_str()).unwrap_or(super::controller_project::MAIN_CHART) == chart_id
+                    && row.get("program_id").and_then(|value| value.as_str()).is_none_or(|id| super::controller_project::program_belongs_to(id, &key))) {
                     ui.push_id(("live_actor", row.get("boid").and_then(|value| value.as_u64()), row.get("entry_id").and_then(|value| value.as_i64())), |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("Player {} · {}", row.get("entry_id").and_then(|v| v.as_i64()).map_or(0, |id| id + 1), row.get("state").and_then(|v| v.as_str()).unwrap_or("unknown")));
@@ -1124,11 +1186,12 @@ fn live_values_ui(
     let captures = values.keys().filter(|name| is_call_capture(name)).count();
     if captures > 0 {
         ui.collapsing(format!("Call storage ({captures})"), |ui| {
-            ui.weak("Private argument snapshots and results; not editable character state.");
             for (name, value) in values.iter().filter(|(name, _)| is_call_capture(name)) {
                 live_value_row(ui, name, value, None);
             }
-        });
+        })
+        .header_response
+        .on_hover_text("Private argument snapshots and results; not editable character state.");
     }
 }
 
@@ -1957,12 +2020,15 @@ pub(super) fn action_picker(
                     ui.label("y");
                     ui.push_id("object_speed_y", |ui| value_editor(ui, fighter, graph, y, VarType::Float, scope));
                 }
-                ui.weak("Acts on the newest live one, on its own next frame; run it every frame to steer.");
+                ui.weak("Acts on the newest live one")
+                    .on_hover_text("On its own next frame; run it every frame to steer.");
             }
             ControllerAction::ArticleMovement { symbol, op } => {
                 article_picker(ui, fighter, symbol);
                 movement_fields(ui, op);
-                ui.weak("Every live one moves by this much each time the rule runs; run it every frame to steer.");
+                ui.weak("Moves every live one").on_hover_text(
+                    "Every live one moves by this much each time the rule runs; run it every frame to steer.",
+                );
             }
             ControllerAction::GenerateArticle { symbol }
             | ControllerAction::RemoveArticle { symbol } => {
@@ -2061,7 +2127,9 @@ pub(super) fn action_picker(
                     ui.label("value").on_hover_text("Multipliers: 1 is normal (0..=10). Every jump's height is Jump height ÷ Gravity. Armor: hits up to this much damage cause no flinch.");
                     value_editor(ui, fighter, graph, value, VarType::Float, scope);
                 }
-                ui.weak("A later policy on the same channel replaces this one; the channel returns to normal when the scope ends.");
+                ui.weak("Lasts until the scope ends").on_hover_text(
+                    "A later policy on the same channel replaces this one; the channel returns to normal when the scope ends.",
+                );
             }
             ControllerAction::CancelIncomingHit => {}
             ControllerAction::Movement(op) => movement_fields(ui, op),
@@ -2310,10 +2378,6 @@ fn param_control(ui: &mut Ui, value: &mut ParamValue) -> bool {
     }
 }
 
-fn read_template(path: &Path) -> Result<BehaviorTemplate, String> {
-    BehaviorTemplate::decode(&read_text(path)?)
-}
-
 fn read_text(path: &Path) -> Result<String, String> {
     let mut text = String::new();
     std::fs::File::open(path)
@@ -2322,11 +2386,6 @@ fn read_text(path: &Path) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|error| error.to_string())?;
     Ok(text)
-}
-
-fn write_template(path: &Path, template: &BehaviorTemplate) -> Result<(), String> {
-    let text = template.encode()?;
-    write_text(path, &text)
 }
 
 fn write_text(path: &Path, text: &str) -> Result<(), String> {
@@ -2433,11 +2492,36 @@ fn projectile_inputs(fighter: &str) -> Vec<NativeInput> {
         .collect()
 }
 
+/// What a ready-made gimmick does, looked up by the name it was staged under.
+fn preset_about(name: &str) -> Option<String> {
+    Preset::ALL
+        .into_iter()
+        .find(|preset| preset.label() == name)
+        .map(|preset| preset.hover().to_string())
+        .or_else(|| {
+            super::status_recipes::Defense::ALL
+                .into_iter()
+                .find(|defense| defense.label() == name)
+                .map(|defense| defense.hover())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    /// Cloud's gimmick header says the costumes it really runs on: with Nova owning c08-c15 an
+    /// unlimited gimmick runs on c00-c07, not "every costume"; with nobody made on Cloud it does
+    /// run on every costume; a limit is shown as it is.
+    #[test]
+    fn a_fighters_gimmick_header_names_the_costumes_it_runs_on() {
+        let own: Vec<u8> = (0..8).collect();
+        assert_eq!(costume_scope_label(&[], &own), "Runs on c00\u{2013}c07");
+        assert_eq!(costume_scope_label(&[], &[]), "Runs on every costume");
+        assert_eq!(costume_scope_label(&[0, 1], &own), "Runs on c00\u{2013}c01");
+    }
 
     #[test]
     fn projectile_picker_defaults_are_typed_and_keep_the_projectile_action() {

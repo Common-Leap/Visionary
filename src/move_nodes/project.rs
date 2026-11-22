@@ -338,6 +338,43 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
             }
         }
     }
+    for (key, data) in &project.characters {
+        // A made character's store carries its moves, its own effect file, its own gimmick and
+        // its own meters. Fighter values stay with the engine fighter (the game keeps one set per
+        // fighter); any here would be saved and never exported, so they are refused rather than
+        // dropped.
+        if !data.params.is_empty() {
+            errors.push(NodeError {
+                subject: format!("character {key}"),
+                reason: "fighter values belong to the base fighter, not to a made character".into(),
+            });
+        }
+        if let Err(reason) =
+            crate::gimmicks::controller_project::preflight(&data.behavior, &data.controller_charts)
+        {
+            errors.push(NodeError {
+                subject: format!("character {key} controllers"),
+                reason,
+            });
+        }
+        if let Err(reason) = crate::gimmicks::behavior::preflight_bounds(&data.behavior) {
+            errors.push(NodeError {
+                subject: format!("character {key} behavior"),
+                reason,
+            });
+        }
+        for (move_name, graph) in &data.move_graphs {
+            if let Err(reason) = super::block_clipboard::preflight_graph(graph) {
+                errors.push(NodeError {
+                    subject: format!(
+                        "character {key} move {}",
+                        move_name.chars().take(64).collect::<String>()
+                    ),
+                    reason,
+                });
+            }
+        }
+    }
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -345,6 +382,61 @@ pub fn expand(project: &ModProjectFile) -> Result<ModProjectFile, Vec<NodeError>
 
     let mut fighter_names = project.fighters.keys().collect::<Vec<_>>();
     fighter_names.sort();
+
+    // A made character's graphs compile as its engine fighter into its own store, against its
+    // own gimmick: in the game its costumes run its gimmick, never its fighter's.
+    for (key, source_character) in &project.characters {
+        if source_character.move_graphs.is_empty() {
+            continue;
+        }
+        let character = crate::character::CharacterKey::made(key.clone());
+        let fighter_name = character.engine_fighter();
+        let start = errors.len();
+        validate_identifier(fighter_name, "fighter", &mut errors);
+        for move_name in source_character.move_graphs.keys() {
+            validate_identifier(move_name, &format!("character {key} move"), &mut errors);
+        }
+        if errors.len() != start {
+            continue;
+        }
+        let compiled = match compile_recipes_with_controllers_internal(
+            fighter_name,
+            &source_character.behavior,
+            &source_character.controller_charts,
+            &source_character.move_graphs,
+            has_persisted_chart_event(source_character),
+        ) {
+            Ok(compiled) => compiled,
+            Err(compile_errors) => {
+                errors.extend(compile_errors);
+                continue;
+            }
+        };
+        let Some(output) = expanded.characters.get_mut(key) else {
+            continue;
+        };
+        output.behavior = compiled.behavior;
+        for (move_name, tracks) in compiled.tracks {
+            let mut generated_categories = BTreeSet::new();
+            for (track, script) in tracks {
+                let category = match track {
+                    Track::Game => "game",
+                    Track::Sound => "sound",
+                    Track::Expression => "expression",
+                    Track::Effect => "effect",
+                };
+                if !generated_categories.insert(category) {
+                    errors.push(NodeError {
+                        subject: format!("character {key} move {move_name}"),
+                        reason: format!("compiler produced more than one {category} track"),
+                    });
+                    continue;
+                }
+                merge_track(output, fighter_name, &move_name, track, script, &mut errors);
+            }
+        }
+        output.move_graphs.clear();
+    }
 
     for fighter_name in fighter_names {
         let Some(source_fighter) = project.fighters.get(fighter_name) else {
@@ -1350,6 +1442,45 @@ mod tests {
     use crate::mod_project::ModProjectFile;
     use crate::move_nodes::test_support as fixture;
     use crate::move_nodes::test_support::assert_json_eq;
+
+    /// A made character has its own gimmick and meters: export keeps them. Fighter values stay
+    /// the fighter's (the game keeps one set per fighter), so a made character's are refused,
+    /// not dropped.
+    #[test]
+    fn a_made_characters_own_gimmick_is_exported_and_its_values_refused() {
+        let key = crate::roster::RosterKey::slot("mario", 8);
+        let mut project = ModProjectFile::default();
+        let graph = crate::gimmicks::templates::Preset::Timer.graph();
+        project.characters.entry(key.clone()).or_default().behavior = graph.clone();
+        let meter = crate::gimmicks::meter::MeterBinding {
+            fighter: "mario".into(),
+            enabled: true,
+            style: crate::gimmicks::meter::MeterStyle::Pips,
+            value: crate::gimmicks::meter::MeterValue::Pips {
+                symbol: "WEAPON_MARIO_FIREBALL_INSTANCE_WORK_ID_INT_BOUND_COUNT".into(),
+                count: 3,
+            },
+        };
+        project.characters.get_mut(&key).unwrap().meters = vec![meter.clone()];
+        let expanded = expand(&project).unwrap_or_else(|errors| panic!("{errors:?}"));
+        assert_eq!(expanded.characters[&key].behavior, graph);
+        assert_eq!(expanded.characters[&key].meters, [meter]);
+
+        project
+            .characters
+            .get_mut(&key)
+            .unwrap()
+            .params
+            .files
+            .entry("fighter_param".into())
+            .or_default()
+            .insert(
+                "walk_speed_max".into(),
+                crate::mod_project::ParamValue::Float(1.0),
+            );
+        let refused = expand(&project).unwrap_err();
+        assert!(refused[0].reason.contains("fighter values"), "{refused:?}");
+    }
 
     fn project_with_graph(fighter: &str, move_name: &str) -> ModProjectFile {
         let mut project = ModProjectFile::default();

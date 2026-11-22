@@ -242,7 +242,8 @@ pub(super) fn selector(
             "Receiver missing. Choose a controller and one of its move events.",
         );
     }
-    ui.weak("Only this gimmick hears it.");
+    ui.weak("Heard by this gimmick only")
+        .on_hover_text("Other gimmicks don't receive this event.");
 }
 
 #[cfg(test)]

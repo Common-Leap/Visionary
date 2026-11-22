@@ -24,6 +24,8 @@ use super::RosterKey;
 pub struct TraitsView {
     /// The entry whose traits are shown.
     selected: Option<RosterKey>,
+    /// Narrows the fighter list.
+    fighter_filter: String,
     /// The loaded row, and which fighter it belongs to.
     loaded: Option<FighterTraits>,
     load_error: Option<String>,
@@ -33,10 +35,20 @@ pub struct TraitsView {
     show_all_fields: bool,
     filter: String,
     status: String,
+    /// Inside width of a value card, set so a row of cards spans the page.
+    card_width: f32,
+    /// Another page picked the fighter: bring it into view in the list once.
+    reveal_selected: bool,
 }
 
 impl TraitsView {
     /// Drop the loaded file. Called when the library changes, since a mod may now provide it.
+    /// Show `key`'s values next.
+    pub fn select(&mut self, key: RosterKey) {
+        self.selected = Some(key);
+        self.reveal_selected = true;
+    }
+
     pub fn invalidate(&mut self) {
         self.loaded = None;
         self.load_error = None;
@@ -50,56 +62,186 @@ impl TraitsView {
         labels: &HashMap<u64, String>,
         index: &RosterIndex,
         params: &mut BTreeMap<String, ParamMod>,
+        faces: &HashMap<String, egui::TextureHandle>,
     ) {
         let Some(path) = FighterTraits::locate(roots) else {
             self.draw_missing_file(ui);
             return;
         };
-
-        // Header with picker and global controls — same group styling as the main editor
-        self.draw_traits_header(ui, index, params);
-        let Some(key) = self.selected.clone() else {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("◈  Pick a character").size(13.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Choose a fighter above to edit its fighter-wide values — weight, speed, jumps, shield and more.")
-                                .small()
-                                .weak(),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("Values are per fighter, not per costume. A new character that shares a donor shares all of them.")
-                                .small()
-                                .weak(),
-                        );
-                    });
+        // The fighters down the side and the picked one's values beside them; stacked when
+        // the page is narrow.
+        let width = ui.available_width();
+        if width >= 760.0 {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(250.0);
+                    let height = ui.available_height() - 40.0;
+                    self.draw_fighter_list(ui, index, params, faces, height);
                 });
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    // Fixed both ways so the value cards wrap at the page's edge.
+                    ui.set_width(width - 264.0);
+                    ui.set_max_width(width - 264.0);
+                    self.draw_values(ui, &path, labels, index, params);
+                });
+            });
+        } else {
+            self.draw_fighter_list(ui, index, params, faces, 220.0);
+            ui.add_space(10.0);
+            self.draw_values(ui, &path, labels, index, params);
+        }
+    }
+
+    /// Every fighter, with how many of its values the project changes; click one to edit it.
+    fn draw_fighter_list(
+        &mut self,
+        ui: &mut Ui,
+        index: &RosterIndex,
+        params: &BTreeMap<String, ParamMod>,
+        faces: &HashMap<String, egui::TextureHandle>,
+        height: f32,
+    ) {
+        let look = crate::ui::look(ui);
+        crate::ui::search_field(
+            ui,
+            "traits_fighter_search",
+            &mut self.fighter_filter,
+            "Find a fighter",
+        );
+        ui.add_space(4.0);
+        let wanted = self.fighter_filter.trim().to_lowercase();
+        let mut entries: Vec<&super::RosterEntry> = index
+            .sorted()
+            .into_iter()
+            .filter(|entry| entry.fighter.is_some() && !entry.backing.shares_engine_fighter())
+            .filter(|entry| {
+                wanted.is_empty() || entry.display_name.to_lowercase().contains(&wanted)
+            })
+            .collect();
+        // Fighters this project changes come first, then by name.
+        entries.sort_by_cached_key(|entry| {
+            let changed = entry
+                .fighter
+                .as_ref()
+                .and_then(|f| params.get(f))
+                .is_some_and(|p| p.field_count() > 0);
+            (!changed, entry.display_name.to_lowercase())
+        });
+        if self.selected.is_none() {
+            self.selected = entries.first().map(|entry| entry.key.clone());
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("traits_fighters")
+            .max_height(height.max(120.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for entry in entries {
+                    let fighter = entry.fighter.clone().unwrap_or_default();
+                    let changed = params.get(&fighter).map_or(0, |p| p.field_count());
+                    let picked = self.selected.as_ref() == Some(&entry.key);
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::Sense::click(),
+                    );
+                    let painter = ui.painter();
+                    let fill = if picked {
+                        look.accent.gamma_multiply(0.35)
+                    } else if response.hovered() {
+                        look.sunk
+                    } else {
+                        look.card
+                    };
+                    painter.rect_filled(rect, 6.0, fill);
+                    let face = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(4.0, 4.0),
+                        egui::vec2(32.0, 32.0),
+                    );
+                    if let Some(texture) = faces.get(&fighter) {
+                        egui::Image::new(texture)
+                            .corner_radius(4.0)
+                            .paint_at(ui, face);
+                    }
+                    let painter = ui.painter();
+                    painter.text(
+                        egui::pos2(face.right() + 8.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &entry.display_name,
+                        egui::FontId::proportional(15.0),
+                        look.text,
+                    );
+                    if changed > 0 {
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            changed.to_string(),
+                            egui::FontId::proportional(14.0),
+                            look.accent,
+                        );
+                    }
+                    if picked && std::mem::take(&mut self.reveal_selected) {
+                        response.scroll_to_me(Some(egui::Align::Center));
+                    }
+                    if response.clicked() {
+                        self.selected = Some(entry.key.clone());
+                    }
+                }
+            });
+    }
+
+    fn draw_values(
+        &mut self,
+        ui: &mut Ui,
+        path: &std::path::Path,
+        labels: &HashMap<u64, String>,
+        index: &RosterIndex,
+        params: &mut BTreeMap<String, ParamMod>,
+    ) {
+        let look = crate::ui::look(ui);
+        let path = path.to_path_buf();
+        let Some(key) = self.selected.clone() else {
+            ui.label(
+                RichText::new("No fighter picked")
+                    .size(19.0)
+                    .strong()
+                    .color(crate::ui::look(ui).dim),
+            );
             return;
         };
         let Some(entry) = index.by_key(&key) else {
             return;
         };
         let Some(fighter) = entry.fighter.clone() else {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(Color32::from_rgb(240, 180, 120), "⚠");
-                        ui.label(
-                            RichText::new(
-                                "This roster entry has no fighter behind it, so it has no fighter values to edit.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    });
-                });
+            ui.label(RichText::new("No fighter behind this entry").color(look.dim));
             return;
         };
+        // The game keeps one set of values per fighter: characters made on this one use them.
+        let sharing: Vec<&str> = index
+            .entries
+            .iter()
+            .filter(|other| {
+                other.backing.shares_engine_fighter() && other.fighter.as_ref() == Some(&fighter)
+            })
+            .map(|other| other.display_name.as_str())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&entry.display_name)
+                    .size(24.0)
+                    .strong()
+                    .color(look.text),
+            );
+            if !sharing.is_empty() {
+                ui.label(
+                    RichText::new(format!("Also used by {}", sharing.join(", ")))
+                        .color(look.accent)
+                        .strong(),
+                )
+                .on_hover_text(
+                    "The game keeps one set of values per fighter; every costume uses them",
+                );
+            }
+        });
 
         // Reload when the selection moved to a different fighter.
         if self.loaded.as_ref().map(|traits| traits.fighter.as_str()) != Some(fighter.as_str()) {
@@ -117,14 +259,7 @@ impl TraitsView {
         }
 
         if let Some(error) = &self.load_error.clone() {
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(Color32::from_rgb(240, 120, 120), "✘");
-                        ui.label(RichText::new(error).small().weak());
-                    });
-                });
+            ui.label(RichText::new(error).color(Color32::from_rgb(255, 120, 120)));
             return;
         }
         // Lifted out of `self` for the duration of the draw and put back below: the field
@@ -134,66 +269,39 @@ impl TraitsView {
             return;
         };
 
-        if entry.backing.shares_engine_fighter() {
-            self.draw_shared_notice(ui, entry.display_name.as_str(), &fighter);
-        }
-
         let edits = params.entry(fighter.clone()).or_default();
         let count = traits::edits_for(edits).len();
 
-        // Toolbar: filter + toggles + reset — matches main editor's horizontal_wrapped toolbars
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(8, 6))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.show_all_fields, RichText::new("Show every field").small())
-                        .on_hover_text(
-                            "The grouped sections cover the values most edits touch. This shows all of \
-                             them, including ones with no plain-language explanation.",
-                        );
-                    ui.separator();
-                    ui.scope(|ui| {
-                        ui.set_width(190.0);
-                        crate::ui::search_field(ui, "traits_search", &mut self.filter, "Search values…");
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                count > 0,
-                                egui::Button::new(RichText::new("  ↺ Reset all  ").small()),
-                            )
-                            .on_hover_text("Return every value to the game's own")
-                            .clicked()
-                        {
-                            edits.files.remove(traits::FIGHTER_PARAM_PATH);
-                            self.drafts.clear();
-                            self.status = format!("{fighter} returned to the game's values.");
-                        }
-                        if count > 0 {
-                            ui.colored_label(
-                                Color32::from_rgb(240, 200, 120),
-                                format!("{count} change{}", if count == 1 { "" } else { "s" }),
-                            );
-                        } else {
-                            ui.label(RichText::new("No changes").small().weak());
-                        }
-                    });
-                });
-            });
-        ui.add_space(6.0);
-
-        // Info banner about saved/export model — uses group style like main editor banners
-        ui.horizontal(|ui| {
-            ui.colored_label(Color32::from_rgb(120, 185, 235), "ⓘ");
-            ui.label(
-                RichText::new(
-                    "Edits are saved with your project and included when you export — no separate apply step.",
+        ui.horizontal_wrapped(|ui| {
+            let all = self.show_all_fields;
+            if crate::ui::act(ui, look, "Every value", all.then_some(look.accent))
+                .on_hover_text(
+                    "The sections hold the values most edits touch; this lists all of them",
                 )
-                .small()
-                .weak(),
-            );
+                .clicked()
+            {
+                self.show_all_fields = !all;
+            }
+            ui.scope(|ui| {
+                ui.set_width(200.0);
+                crate::ui::search_field(ui, "traits_search", &mut self.filter, "Find a value");
+            });
+            let reset = ui
+                .add_enabled_ui(count > 0, |ui| crate::ui::act(ui, look, "Reset all", None))
+                .inner;
+            if reset
+                .on_hover_text("Every value back to the game's")
+                .clicked()
+            {
+                edits.files.remove(traits::FIGHTER_PARAM_PATH);
+                self.drafts.clear();
+                self.status = format!("{fighter} is back to the game's values.");
+            }
+            if count > 0 {
+                ui.label(RichText::new(format!("{count} changed")).color(look.accent));
+            }
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
         let mut pending: Vec<(String, Option<ParamValue>)> = Vec::new();
         // No inner scroll: the window already scrolls vertically, and a second
@@ -229,42 +337,8 @@ impl TraitsView {
 
         if !self.status.is_empty() {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(Color32::from_rgb(120, 185, 235), "●");
-                ui.label(RichText::new(&self.status).small().weak());
-            });
+            ui.label(RichText::new(&self.status).color(look.text));
         }
-    }
-
-    fn draw_traits_header(
-        &mut self,
-        ui: &mut Ui,
-        index: &RosterIndex,
-        params: &BTreeMap<String, ParamMod>,
-    ) {
-        // Header card — uses group frame like the main sidebar headings
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    self.draw_picker(ui, index);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let total: usize = params.values().map(|p| p.field_count()).sum();
-                        if total > 0 {
-                            ui.colored_label(
-                                Color32::from_rgb(240, 200, 120),
-                                format!("{total} edited"),
-                            );
-                        }
-                        ui.label(
-                            RichText::new(format!("{} fighter(s) have edits", params.len()))
-                                .small()
-                                .weak(),
-                        );
-                    });
-                });
-            });
-        ui.add_space(6.0);
     }
 
     fn draw_missing_file(&mut self, ui: &mut Ui) {
@@ -297,35 +371,6 @@ impl TraitsView {
             });
     }
 
-    /// The one notice that matters for a slot-backed character.
-    fn draw_shared_notice(&self, ui: &mut Ui, display_name: &str, donor: &str) {
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(Color32::from_rgb(240, 200, 120), "⚠");
-                    ui.label(
-                        RichText::new(format!(
-                            "{display_name} is a costume of {donor} — these values belong to {donor} as a whole."
-                        ))
-                        .strong(),
-                    );
-                });
-                ui.add_space(2.0);
-                ui.label(
-                    RichText::new(
-                        "The game stores them per fighter, not per costume — there is no \
-                         per-costume version of any of them. Changing a value here changes it \
-                         for the donor and for every other costume of the donor, in the same \
-                         match.",
-                    )
-                    .small()
-                    .weak(),
-                );
-            });
-        ui.add_space(6.0);
-    }
-
     fn draw_sections(
         &mut self,
         ui: &mut Ui,
@@ -349,27 +394,34 @@ impl TraitsView {
                 continue;
             }
             any_visible = true;
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(section.title).size(12.0).strong());
-                        let edited_in_section = matching
-                            .iter()
-                            .filter(|f| traits::edits_for(edits).contains_key(f.key))
-                            .count();
-                        if edited_in_section > 0 {
-                            ui.colored_label(
-                                Color32::from_rgb(240, 200, 120),
-                                format!("{edited_in_section} edited"),
-                            );
-                        }
-                    });
-                    ui.label(RichText::new(section.description).small().weak());
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    for field in matching {
+            let look = crate::ui::look(ui);
+            let edited_in_section = matching
+                .iter()
+                .filter(|f| traits::edits_for(edits).contains_key(f.key))
+                .count();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(section.title)
+                        .size(18.0)
+                        .strong()
+                        .color(look.text),
+                )
+                .on_hover_text(section.description);
+                if edited_in_section > 0 {
+                    ui.label(
+                        RichText::new(format!("{edited_in_section} changed"))
+                            .color(Color32::from_rgb(240, 190, 70)),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+            // As many cards to a row as fit, in rows: egui's wrapping row measures a framed
+            // child only after placing it, so it ran off the edge instead of wrapping.
+            let per_row = self.cards_per_row(ui.available_width());
+            for row in matching.chunks(per_row) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for field in row {
                         self.draw_field(
                             ui,
                             loaded,
@@ -379,22 +431,27 @@ impl TraitsView {
                             Some(field.description),
                             pending,
                         );
-                        ui.add_space(2.0);
                     }
                 });
+                ui.add_space(6.0);
+            }
             ui.add_space(8.0);
         }
         if !any_visible && !filter.is_empty() {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(format!("No fields match \"{}\"", self.filter)).weak());
-                ui.label(
-                    RichText::new("Try a shorter term or clear the filter.")
-                        .small()
-                        .weak(),
-                );
             });
         }
+    }
+
+    /// How many value cards fit in `width`, stretching them to fill it.
+    fn cards_per_row(&mut self, width: f32) -> usize {
+        const GAP: f32 = 8.0;
+        let per_row = ((width + GAP) / (196.0 + GAP)).floor().max(1.0);
+        // The frame adds an 8 px margin and a stroke of up to 2 px on each side.
+        self.card_width = ((width - GAP * (per_row - 1.0)) / per_row - 20.0).floor();
+        per_row as usize
     }
 
     fn draw_all_fields(
@@ -411,23 +468,24 @@ impl TraitsView {
             .map(|value| value.key.clone())
             .filter(|key| filter.is_empty() || key.to_lowercase().contains(&filter))
             .collect();
-        egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("All fields").strong());
-                    ui.label(
-                        RichText::new(format!("{} field(s)", keys.len()))
-                            .small()
-                            .weak(),
-                    );
-                });
-                ui.add_space(6.0);
-                for key in keys {
-                    self.draw_field(ui, loaded, edits, &key, &key, None, pending);
-                    ui.add_space(1.0);
+        let look = crate::ui::look(ui);
+        ui.label(
+            RichText::new(format!("Every value ({})", keys.len()))
+                .size(18.0)
+                .strong()
+                .color(look.text),
+        );
+        ui.add_space(4.0);
+        let per_row = self.cards_per_row(ui.available_width());
+        for row in keys.chunks(per_row) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for key in row {
+                    self.draw_field(ui, loaded, edits, key, key, None, pending);
                 }
             });
+            ui.add_space(6.0);
+        }
     }
 
     // One row needs ui, data, edits, key, label, description, draft state,
@@ -450,143 +508,62 @@ impl TraitsView {
         let current = edited.unwrap_or(base);
         let is_edited = edited.is_some();
 
-        let bg = if is_edited {
-            Color32::from_rgb(42, 40, 32)
-        } else {
-            ui.visuals().faint_bg_color
-        };
-        let stroke = if is_edited {
-            Color32::from_rgb(80, 70, 40)
-        } else {
-            ui.visuals().widgets.noninteractive.bg_stroke.color
-        };
+        let look = crate::ui::look(ui);
+        let changed = Color32::from_rgb(240, 190, 70);
         egui::Frame::new()
-            .fill(bg)
-            .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(8, 5))
-            .stroke(egui::Stroke::new(1.0, stroke))
+            .fill(look.sunk)
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .stroke(egui::Stroke::new(
+                if is_edited { 2.0 } else { 1.0 },
+                if is_edited { changed } else { look.edge },
+            ))
             .show(ui, |ui| {
-                // One layout that wraps: label row on top at any width, value
-                // row below. The old narrow/wide split duplicated this whole
-                // body for a 420px breakpoint.
-                ui.horizontal_wrapped(|ui| {
-                    let name =
-                        ui.label(RichText::new(label).small().strong().color(if is_edited {
-                            Color32::from_rgb(240, 200, 120)
-                        } else {
-                            ui.visuals().text_color()
-                        }));
+                ui.set_width(self.card_width.max(150.0));
+                ui.vertical(|ui| {
+                    let name = ui.label(RichText::new(label).strong().color(if is_edited {
+                        changed
+                    } else {
+                        look.text
+                    }));
                     if let Some(description) = description {
                         name.on_hover_text(description);
                     }
-                    if is_edited {
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(68, 55, 20))
-                            .corner_radius(8)
-                            .inner_margin(egui::Margin::symmetric(5, 1))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("edited")
-                                        .small()
-                                        .strong()
-                                        .color(Color32::from_rgb(240, 200, 120)),
-                                );
-                            });
-                    }
-                    if let Some(desc) = description {
-                        ui.label(
-                            RichText::new("ⓘ")
-                                .small()
-                                .weak()
-                                .color(Color32::from_rgb(120, 140, 170)),
-                        )
-                        .on_hover_text(desc);
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    let draft = self
-                        .drafts
-                        .entry(key.to_string())
-                        .or_insert_with(|| render(current));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(draft)
-                            .desired_width(96.0)
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if resp.lost_focus() || resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        match parse(draft, base) {
-                            Some(value) if Some(value) != edited.or(Some(base)) => {
-                                pending.push((key.to_string(), Some(value)));
-                            }
-                            Some(_) => {
-                                *draft = render(current);
-                            }
-                            None => {
-                                *draft = render(current);
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let draft = self
+                            .drafts
+                            .entry(key.to_string())
+                            .or_insert_with(|| render(current));
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(draft)
+                                .desired_width(90.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if resp.lost_focus() || resp.ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            match parse(draft, base) {
+                                Some(value) if Some(value) != edited.or(Some(base)) => {
+                                    pending.push((key.to_string(), Some(value)));
+                                }
+                                Some(_) => {
+                                    *draft = render(current);
+                                }
+                                None => {
+                                    *draft = render(current);
+                                }
                             }
                         }
-                    }
-                    if is_edited {
-                        if ui
-                            .small_button(RichText::new(" ↺ ").small())
-                            .on_hover_text("Return to the game's value")
-                            .clicked()
+                        if is_edited
+                            && crate::ui::act(ui, look, "Undo", None)
+                                .on_hover_text(format!("Back to the game's {}", render(base)))
+                                .clicked()
                         {
                             pending.push((key.to_string(), None));
                         }
-                        ui.label(
-                            RichText::new(format!("was {}", render(base)))
-                                .small()
-                                .weak(),
-                        );
-                    }
+                    });
                 });
             });
-    }
-
-    fn draw_picker(&mut self, ui: &mut Ui, index: &RosterIndex) {
-        let entries: Vec<&super::RosterEntry> = index
-            .sorted()
-            .into_iter()
-            .filter(|entry| entry.fighter.is_some())
-            .collect();
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|key| index.by_key(key))
-            .map(|entry| entry.display_name.clone())
-            .unwrap_or_else(|| "Select a character".to_string());
-        let current_key = self.selected.clone();
-        let picker_w = (ui.available_width() - 200.0).clamp(140.0, 220.0);
-        let picks: Vec<crate::ui::Pick> = entries
-            .iter()
-            .map(|entry| crate::ui::Pick {
-                label: entry.display_name.clone(),
-                hover: entry.fighter.clone().unwrap_or_default(),
-                group: Some(if entry.backing.shares_engine_fighter() {
-                    (
-                        "Costume characters",
-                        "Characters that share another fighter's moves",
-                    )
-                } else {
-                    ("Fighters", "Fighters with their own moves")
-                }),
-            })
-            .collect();
-        let selected = entries
-            .iter()
-            .position(|entry| current_key.as_ref() == Some(&entry.key));
-        if let Some(index) = crate::ui::picker(
-            ui,
-            "traits_character_picker",
-            picker_w,
-            &current,
-            &picks,
-            selected,
-        ) {
-            self.selected = Some(entries[index].key.clone());
-        }
     }
 }
 

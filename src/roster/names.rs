@@ -13,7 +13,8 @@
 //! the gap.
 //!
 //! Format confirmed against real name-mod templates: UTF-16 little-endian with a BOM, and
-//! entries labelled `nam_chr{0,1,2}_<slot>_<name_id>`. `chr0` and `chr1` carry the name in
+//! entries labelled `nam_chr{0,1,2,3}_<slot>_<name_id>` (`chr3` is the name on the select
+//! screen cell, uppercase like `chr2`). `chr0` and `chr1` carry the name in
 //! mixed case and `chr2` carries it uppercase; all three are written together because a mod
 //! that sets one and not the others shows two different names in different menus.
 
@@ -46,6 +47,11 @@ impl NameOverride {
             (format!("nam_chr1_{slot}_{name_id}"), self.display.clone()),
             (
                 format!("nam_chr2_{slot}_{name_id}"),
+                self.display.to_uppercase(),
+            ),
+            // The name on the character's cell of the select screen.
+            (
+                format!("nam_chr3_{slot}_{name_id}"),
                 self.display.to_uppercase(),
             ),
         ]
@@ -220,7 +226,8 @@ mod tests {
             vec![
                 "nam_chr0_00_pickel",
                 "nam_chr1_00_pickel",
-                "nam_chr2_00_pickel"
+                "nam_chr2_00_pickel",
+                "nam_chr3_00_pickel"
             ]
         );
     }
@@ -244,7 +251,7 @@ mod tests {
             .into_iter()
             .map(|(_, text)| text)
             .collect();
-        assert_eq!(texts, vec!["Steve", "Steve", "STEVE"]);
+        assert_eq!(texts, vec!["Steve", "Steve", "STEVE", "STEVE"]);
     }
 
     #[test]

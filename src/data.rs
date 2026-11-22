@@ -1091,11 +1091,11 @@ impl HurtboxStatus {
     /// "intangible" while another calls it "XLU".
     pub(crate) fn label(self) -> String {
         match self {
-            Self::Normal => "NORMAL".to_string(),
-            Self::Invincible => "INVINCIBLE".to_string(),
-            Self::Xlu => "XLU (INTANGIBLE)".to_string(),
-            Self::Off => "OFF".to_string(),
-            Self::Unknown(raw) => format!("UNKNOWN ({raw:#x})"),
+            Self::Normal => "normal".to_string(),
+            Self::Invincible => "invincible".to_string(),
+            Self::Xlu => "intangible".to_string(),
+            Self::Off => "off".to_string(),
+            Self::Unknown(raw) => format!("unknown ({raw:#x})"),
         }
     }
 
@@ -7925,38 +7925,34 @@ impl EditRecord {
     }
 }
 
+/// The costume scope a re-saved record carries: exactly the one it had.
+pub fn kept_scope(existing: Option<&EditRecord>) -> (Option<u8>, Vec<u8>) {
+    existing.map_or((None, Vec::new()), |record| {
+        (record.slot_scope, record.slot_scopes.clone())
+    })
+}
+
 impl EditLog {
-    /// Record an edit scoped to every slot in `slots` (empty = every costume).
-    /// A re-save with an empty scope keeps the existing scopes: widening to
-    /// every costume must be explicit, since an unscoped save of a move that
-    /// was scoped would silently widen it to every costume of the donor, which
-    /// is the one direction of this change nobody would notice until they
-    /// played the donor.
+    /// Record an edit under `owner`, the character it belongs to (a base fighter's name or a
+    /// made character's key). `fighter` is the engine fighter written into the record.
+    ///
+    /// Saving never changes a record's costume scope. An existing record keeps the scope it has,
+    /// and a new one has none: a made character's edits live under its own key instead of being
+    /// scoped on its donor. Re-scoping on save is how browsing a donor's move while a made
+    /// character was the edit target once moved the donor's edit onto that character.
     #[allow(clippy::too_many_arguments)]
-    pub fn save_scoped_multi(
+    pub fn save(
         &mut self,
+        owner: &str,
         fighter: &str,
         fighter_display: &str,
         move_name: &str,
         script: AcmdScript,
         hitboxes_pristine: Vec<Hitbox>,
         hitboxes: Vec<Hitbox>,
-        slots: &[u8],
     ) {
-        let moves = self.entries.entry(fighter.to_string()).or_default();
-        let (slot_scope, slot_scopes) = if slots.is_empty() {
-            match moves.get(move_name) {
-                Some(existing) => (existing.slot_scope, existing.slot_scopes.clone()),
-                None => (None, Vec::new()),
-            }
-        } else {
-            let mut sorted: Vec<u8> = slots.to_vec();
-            sorted.sort_unstable();
-            sorted.dedup();
-            let primary = sorted.first().copied();
-            let rest: Vec<u8> = sorted.into_iter().skip(1).collect();
-            (primary, rest)
-        };
+        let moves = self.entries.entry(owner.to_string()).or_default();
+        let (slot_scope, slot_scopes) = kept_scope(moves.get(move_name));
         moves.insert(
             move_name.to_string(),
             EditRecord {
@@ -8126,7 +8122,12 @@ pub struct AppState {
     pub fighters: Vec<FighterEntry>,
     pub labels: HashMap<u64, String>,
     pub selected_fighter: Option<usize>,
+    /// Set only through [`AppState::open_move`], which also records whose move it is.
     pub selected_move: Option<MoveEntry>,
+    /// The character (store key spelling, `mario` or `mario#c08`) the open move was loaded for.
+    /// Everything saved from the loaded move state goes back under this key, whatever the
+    /// active character is by the time the save runs.
+    pub move_owner: Option<String>,
     pub hitboxes: Vec<Hitbox>,
     pub script: AcmdScript,
     pub current_frame: u32,
@@ -8269,6 +8270,7 @@ impl Default for AppState {
             fighters: Vec::new(),
             labels: HashMap::new(),
             selected_fighter: None,
+            move_owner: None,
             selected_move: None,
             hitboxes: Vec::new(),
             script: AcmdScript::default(),
@@ -8371,6 +8373,19 @@ macro_rules! define_point_originals {
 with_point_families!(define_point_originals);
 
 impl AppState {
+    /// Open `entry` as `owner`'s move. The owner travels with the loaded move state, so a save
+    /// made after the active character changed still lands on the character it was opened for.
+    pub fn open_move(&mut self, owner: &str, entry: MoveEntry) {
+        self.move_owner = Some(owner.to_owned());
+        self.selected_move = Some(entry);
+    }
+
+    /// Whose move is open: the key it was opened under, or `None` when no move is open.
+    pub fn open_move_owner(&self) -> Option<&str> {
+        self.selected_move.as_ref()?;
+        self.move_owner.as_deref()
+    }
+
     /// Install a freshly loaded script and re-baseline the hurtbox spans it resolves to.
     ///
     /// A method rather than two assignments at each of the four call sites, so the baseline
@@ -9767,90 +9782,6 @@ pub struct EffectScript {
     pub stmts: Vec<EffectStmt>,
 }
 
-impl EffectScript {
-    /// The calls a right-facing fighter spawns from `if <facing is left> { … } else { … }`
-    /// blocks, which [`Self::to_effect_calls`] leaves out (both arms are guarded, and the dumps
-    /// often nest the `else` inside the `if`). Preview only: the timeline and the export keep
-    /// the script as written.
-    pub fn facing_right_calls(&self) -> Vec<EffectCall> {
-        fn is_facing_left(header: &str) -> bool {
-            header.contains("SO_VAR_FLOAT_LR") && header.contains("< 0")
-        }
-        /// An `is_excute` block holding bare effects becomes the `Excute` statement the walk
-        /// reads; anything else is kept as written.
-        fn unwrap_excute(stmt: EffectStmt) -> Vec<EffectStmt> {
-            match stmt {
-                EffectStmt::Cond { header, body } if header == "if macros::is_excute(agent) {" => {
-                    let mut out = Vec::new();
-                    let mut bare = Vec::new();
-                    for inner in body {
-                        match inner {
-                            EffectStmt::BareEffect(effect) => bare.push(*effect),
-                            other => out.push(other),
-                        }
-                    }
-                    if !bare.is_empty() {
-                        out.insert(0, EffectStmt::Excute(bare));
-                    }
-                    out
-                }
-                other => vec![other],
-            }
-        }
-        fn resolve(stmts: &[EffectStmt]) -> Vec<EffectStmt> {
-            let mut out = Vec::new();
-            let mut skip_else = false;
-            for stmt in stmts {
-                match stmt {
-                    EffectStmt::Cond { header, body } if is_facing_left(header) => {
-                        // The dump's shape: `else` nested inside, after the left arm.
-                        let nested_else: Vec<EffectStmt> = body
-                            .iter()
-                            .filter_map(|inner| match inner {
-                                EffectStmt::Cond { header, body } if header == "else {" => {
-                                    Some(body.clone())
-                                }
-                                _ => None,
-                            })
-                            .flatten()
-                            .collect();
-                        for inner in resolve(&nested_else) {
-                            out.extend(unwrap_excute(inner));
-                        }
-                        // The proper shape: a sibling `else` right after this block.
-                        skip_else = nested_else.is_empty();
-                    }
-                    EffectStmt::Cond { header, body } if header == "else {" && skip_else => {
-                        skip_else = false;
-                        for inner in resolve(body) {
-                            out.extend(unwrap_excute(inner));
-                        }
-                    }
-                    other => {
-                        skip_else = false;
-                        out.push(other.clone());
-                    }
-                }
-            }
-            out
-        }
-        let resolved = EffectScript {
-            stmts: resolve(&self.stmts),
-        };
-        let written = self.to_effect_calls();
-        resolved
-            .to_effect_calls()
-            .into_iter()
-            .filter(|call| {
-                !call.effect_name.is_empty()
-                    && !written.iter().any(|w| {
-                        w.effect_name == call.effect_name && w.active_start == call.active_start
-                    })
-            })
-            .collect()
-    }
-}
-
 /// A resolved effect event with computed active frame range.
 ///
 /// Effect spawns that do not have an `EFFECT_OFF_KIND` remain active through the move.  ACMD
@@ -10293,6 +10224,62 @@ pub(crate) fn script_to_motion_frame(frame: u32) -> f32 {
     frame.max(1).saturating_sub(1) as f32
 }
 
+/// The game's "facing left" test, as the dumps write it.
+pub(crate) const FACING_LEFT_GUARD: &str =
+    "if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) < 0.0 {";
+/// Its other arm as a guard of its own, so a spawn from either arm stands alone in the flat
+/// list and is written back as its own block.
+pub(crate) const FACING_RIGHT_GUARD: &str =
+    "if get_value_float(agent.lua_state_agent, *SO_VAR_FLOAT_LR) >= 0.0 {";
+
+/// Which arm of a facing test an effect call belongs to: `Some(true)` facing left.
+pub fn facing_arm_of(guard: Option<&str>) -> Option<bool> {
+    match guard? {
+        FACING_LEFT_GUARD => Some(true),
+        FACING_RIGHT_GUARD => Some(false),
+        _ => None,
+    }
+}
+
+/// `is_excute` blocks inside a facing arm, as the `Excute` statements the walk reads.
+fn unwrap_execute_arms(stmts: &[EffectStmt]) -> Vec<EffectStmt> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            EffectStmt::Cond { header, body } if header == "if macros::is_excute(agent) {" => {
+                let mut bare = Vec::new();
+                for inner in body {
+                    match inner {
+                        EffectStmt::BareEffect(effect) => bare.push((**effect).clone()),
+                        EffectStmt::Excute(macros) => bare.extend(macros.iter().cloned()),
+                        other => out.push(other.clone()),
+                    }
+                }
+                if !bare.is_empty() {
+                    out.push(EffectStmt::Excute(bare));
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    out
+}
+
+/// The left arm of a facing test and, when the dump nested it inside, the `else` arm.
+fn facing_arms(body: &[EffectStmt]) -> (Vec<EffectStmt>, Option<Vec<EffectStmt>>) {
+    let mut left = Vec::new();
+    let mut right = None;
+    for stmt in body {
+        match stmt {
+            EffectStmt::Cond { header, body } if header == "else {" => {
+                right = Some(unwrap_execute_arms(body));
+            }
+            other => left.push(other.clone()),
+        }
+    }
+    (unwrap_execute_arms(&left), right)
+}
+
 fn eval_effect_stmts_unchecked(
     stmts: &[EffectStmt],
     start_frame: f32,
@@ -10300,7 +10287,35 @@ fn eval_effect_stmts_unchecked(
     walk: &mut EffectWalk,
 ) -> f32 {
     let mut frame = start_frame;
+    // Set after a facing test whose `else` is its next sibling rather than nested inside.
+    let mut facing_else_next = false;
     for (index, stmt) in stmts.iter().enumerate() {
+        let facing_else = std::mem::take(&mut facing_else_next);
+        if walk.guard.is_none() {
+            if let EffectStmt::Cond { header, body } = stmt {
+                if header == FACING_LEFT_GUARD {
+                    let (left, right) = facing_arms(body);
+                    let start = frame;
+                    walk.guard = Some(FACING_LEFT_GUARD.into());
+                    frame = eval_effect_stmts_unchecked(&left, start, calls, walk);
+                    if let Some(right) = right {
+                        walk.guard = Some(FACING_RIGHT_GUARD.into());
+                        frame = frame.max(eval_effect_stmts_unchecked(&right, start, calls, walk));
+                    } else {
+                        facing_else_next = true;
+                    }
+                    walk.guard = None;
+                    continue;
+                }
+                if facing_else && header == "else {" {
+                    walk.guard = Some(FACING_RIGHT_GUARD.into());
+                    frame =
+                        eval_effect_stmts_unchecked(&unwrap_execute_arms(body), frame, calls, walk);
+                    walk.guard = None;
+                    continue;
+                }
+            }
+        }
         if effect_execute_arm(stmts, index) {
             continue;
         }
@@ -11583,11 +11598,11 @@ mod tests {
 
     #[test]
     fn hurtbox_status_labels_are_explicit_and_unknown_values_are_not_guessed() {
-        assert_eq!(HurtboxStatus::Normal.label(), "NORMAL");
-        assert_eq!(HurtboxStatus::Invincible.label(), "INVINCIBLE");
-        assert_eq!(HurtboxStatus::Xlu.label(), "XLU (INTANGIBLE)");
-        assert_eq!(HurtboxStatus::Off.label(), "OFF");
-        assert_eq!(HurtboxStatus::Unknown(7).label(), "UNKNOWN (0x7)");
+        assert_eq!(HurtboxStatus::Normal.label(), "normal");
+        assert_eq!(HurtboxStatus::Invincible.label(), "invincible");
+        assert_eq!(HurtboxStatus::Xlu.label(), "intangible");
+        assert_eq!(HurtboxStatus::Off.label(), "off");
+        assert_eq!(HurtboxStatus::Unknown(7).label(), "unknown (0x7)");
         assert_eq!(HurtboxStatus::Unknown(7).source_token(), None);
     }
 
@@ -12780,5 +12795,102 @@ mod tests {
                 }
             ]
         ));
+    }
+}
+
+#[cfg(test)]
+mod save_scope_tests {
+    use super::*;
+
+    fn scoped_record(scopes: (Option<u8>, Vec<u8>)) -> EditRecord {
+        EditRecord {
+            fighter: "mario".into(),
+            fighter_display: "Mario".into(),
+            move_name: "attack_11".into(),
+            script: AcmdScript::default(),
+            hitboxes_pristine: Vec::new(),
+            hitboxes: Vec::new(),
+            slot_scope: scopes.0,
+            slot_scopes: scopes.1,
+        }
+    }
+
+    /// Browsing a donor's move while another character is open re-saves the move every frame.
+    /// The save must not move the record to anyone's costumes.
+    #[test]
+    fn saving_keeps_an_unscoped_record_unscoped() {
+        let mut log = EditLog::default();
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        let record = &log.entries["mario"]["attack_11"];
+        assert!(record.effective_scopes().is_empty());
+        assert_eq!(record.hitboxes.len(), 1, "the save itself still landed");
+    }
+
+    /// The paired positive: a record that already has a scope keeps exactly that scope, so the
+    /// test above is not passing because scopes are always cleared.
+    #[test]
+    fn saving_keeps_an_existing_scope_exactly() {
+        let mut log = EditLog::default();
+        log.entries
+            .entry("mario".into())
+            .or_default()
+            .insert("attack_11".into(), scoped_record((Some(8), vec![9, 10])));
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        let record = &log.entries["mario"]["attack_11"];
+        assert_eq!(record.effective_scopes(), vec![8, 9, 10]);
+        assert_eq!(record.hitboxes.len(), 1);
+        assert_eq!(kept_scope(None), (None, Vec::new()));
+    }
+
+    /// A made character's edit lives under its own key and leaves the donor's record alone.
+    #[test]
+    fn a_made_character_saves_beside_its_donor() {
+        let mut log = EditLog::default();
+        log.save(
+            "mario",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        log.save(
+            "mario#c08",
+            "mario",
+            "Mario",
+            "attack_11",
+            AcmdScript::default(),
+            Vec::new(),
+            vec![Hitbox::default()],
+        );
+        assert!(log.entries["mario"]["attack_11"].hitboxes.is_empty());
+        assert_eq!(log.entries["mario#c08"]["attack_11"].hitboxes.len(), 1);
+        assert_eq!(log.entries["mario#c08"]["attack_11"].fighter, "mario");
     }
 }

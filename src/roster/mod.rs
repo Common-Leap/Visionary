@@ -17,6 +17,7 @@
 //!    editing the CSS or trait editors.
 
 pub mod archive;
+pub mod costume_config;
 pub mod css;
 pub mod css_view;
 pub mod export;
@@ -141,6 +142,20 @@ impl RosterBacking {
         match self {
             Self::Fighter => None,
             Self::SlotClone { slot, .. } => Some(*slot),
+        }
+    }
+
+    /// The colour number the select screen knows costume `slot` by. A character of its own
+    /// counts its colours from 0 whatever costumes of the base fighter they are, and its names
+    /// and portraits are filed under those numbers.
+    pub fn colour_of(&self, slot: u8) -> u8 {
+        match self {
+            Self::Fighter => slot,
+            Self::SlotClone { .. } => self
+                .all_slots()
+                .iter()
+                .position(|own| *own == slot)
+                .unwrap_or(0) as u8,
         }
     }
 

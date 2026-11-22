@@ -41,6 +41,7 @@ pub struct NodeEditor {
     add_kind: usize,
     palette_query: String,
     joint_options: Vec<String>,
+    move_length: Option<f32>,
     controller_charts: BTreeMap<String, crate::mod_project::ControllerChart>,
     controller_events: super::chart_event_view::EventChoices,
     controller_values: super::character_values::Choices,
@@ -185,6 +186,10 @@ impl NodeEditor {
         }
     }
 
+    /// The open move's animation length in frames, for fitting starters.
+    pub fn set_move_length(&mut self, frames: u32) {
+        self.move_length = (frames > 0).then_some(frames as f32);
+    }
     pub fn set_toolbar_rect(&mut self, rect: egui::Rect) {
         self.toolbar_rect = Some(rect);
     }
@@ -211,6 +216,10 @@ impl NodeEditor {
             self.controller_events.clear();
             self.controller_values.clear();
         }
+    }
+    /// Reloads the open move's saved graph on the next frame.
+    pub fn reload_move(&mut self) {
+        self.key.clear();
     }
     pub fn invalidate(&mut self) {
         *self = Self::default();
@@ -449,15 +458,17 @@ impl NodeEditor {
         }
         node_edit_error(ui, &self.error);
         if !self.workspace {
-            ui.weak("Tracks replace move scripts.");
             if self.draft.tracks.is_empty() {
-                ui.label("Import a move to edit its timed nodes.");
+                ui.label("No tracks").on_hover_text(
+                    "Import a move to edit its timed nodes. Tracks replace move scripts.",
+                );
             } else {
                 self.track = self.track.min(self.draft.tracks.len() - 1);
                 let previous_track = self.track;
                 ui.horizontal_wrapped(|ui| {
                     for (index, track) in self.draft.tracks.iter().enumerate() {
-                        ui.selectable_value(&mut self.track, index, format!("{:?}", track.track));
+                        ui.selectable_value(&mut self.track, index, format!("{:?}", track.track))
+                            .on_hover_text("Tracks replace move scripts.");
                     }
                 });
                 if self.track != previous_track {
@@ -542,8 +553,8 @@ impl NodeEditor {
                 };
                 if ui.add_enabled(can_add, egui::Button::new("Add node"))
                     .on_disabled_hover_text(if self.add_kind == 101 {
-                        "Add a Named event to an additional controller in Gimmicks → Behavior first."
-                    } else { "Add a named event receiver in a character controller first. The timed block selects a declared event; it cannot dispatch an unknown name." })
+                        "Add a Named event to a gimmick in Gimmicks first."
+                    } else { "Add a Named event to a gimmick in Gimmicks first, then this block can send it." })
                     .clicked() {
                     let Some(kind) = self.make_node(self.add_kind, fighter, next, current_track) else { return; };
                     self.draft.tracks[self.track]
@@ -588,7 +599,9 @@ impl NodeEditor {
                     ui.weak("Opening field…");
                 }
                 if self.canvas.selected_node().is_none() {
-                    ui.weak("Drag blocks to arrange. Connect execution, event or matching Value ports. Select a block to edit.");
+                    ui.weak("No block selected").on_hover_text(
+                        "Drag blocks to arrange. Connect execution, event or matching Value ports. Select a block to edit.",
+                    );
                 }
             }
         }
@@ -632,8 +645,9 @@ impl NodeEditor {
                 } else if self.canvas.selected.is_none() {
                     self.story_ui(ui);
                     ui.separator();
-                    ui.weak("Click a block to edit it. Blocks run left to right, and wires show what runs next.");
-                    ui.weak("F  Fit · Space + drag  Pan\nShift + click / drag  Select group\nCtrl + D  Duplicate · Delete  Remove");
+                    ui.weak("No block selected").on_hover_text(
+                        "Click a block to edit it. Blocks run left to right, and wires show what runs next.\n\nF  Fit · Space + drag  Pan\nShift + click / drag  Select group\nCtrl + D  Duplicate · Delete  Remove",
+                    );
                 }
             }
             ui.separator();
@@ -744,7 +758,6 @@ impl NodeEditor {
         egui::CollapsingHeader::new("Code")
             .id_salt("block_code")
             .show(ui, |ui| {
-                ui.weak("The lines this block writes. Change them and press Use this code.");
                 if let Some((_, _, text)) = &mut self.code_edit {
                     ui.add(
                         egui::TextEdit::multiline(text)
@@ -756,6 +769,12 @@ impl NodeEditor {
                     ui.horizontal(|ui| {
                         apply = ui
                             .add_enabled(changed, egui::Button::new("Use this code"))
+                            .on_hover_text(
+                                "The lines this block writes. Change them and press Use this code.",
+                            )
+                            .on_disabled_hover_text(
+                                "The lines this block writes. Change them and press Use this code.",
+                            )
                             .clicked();
                         if ui
                             .add_enabled(changed, egui::Button::new("Reset"))
@@ -812,7 +831,6 @@ impl NodeEditor {
             .collapsible(false)
             .default_width(420.0)
             .show(ui.ctx(), |ui| {
-                ui.label("Type a few lines of game code. Each line must be a call Visionary knows, so the block can update live.");
                 ui.add(
                     egui::TextEdit::multiline(text)
                         .code_editor()
@@ -827,7 +845,10 @@ impl NodeEditor {
                 if !self.code_error.is_empty() {
                     ui.colored_label(ui.visuals().warn_fg_color, &self.code_error);
                 }
-                add = ui.button("Add block").clicked();
+                add = ui
+                    .button("Add block")
+                    .on_hover_text("Type a few lines of game code. Each line must be a call Visionary knows, so the block can update live.")
+                    .clicked();
             });
         if !open {
             self.new_code = None;
@@ -899,7 +920,8 @@ impl NodeEditor {
                 );
             }
             if !self.workspace {
-                ui.weak("Press Apply nodes to use your edits");
+                ui.weak("Not applied yet")
+                    .on_hover_text("Press Apply nodes to use your edits.");
             }
         });
         if open {
@@ -1712,7 +1734,8 @@ pub(crate) fn native_source_ui(
         .response.on_hover_text(format!("Read from the game: {}\nChecked once each frame. If the game has no value, this step is skipped.", source.reference()));
     ui.weak(format!("Read-only · {type_label}"));
     if !source.valid_for(fighter) || source.kind() != Some(kind) {
-        ui.weak("Pick something to read first.");
+        ui.weak("Nothing picked")
+            .on_hover_text("Pick something to read first.");
     }
 }
 
@@ -1817,10 +1840,10 @@ fn nodes(
                         NodeKind::Branch { .. } => { ui.label("If"); },
                         // Same titles as the block on the field.
                         NodeKind::Execute { commands } => { ui.label(match commands.as_slice() { [command] => super::plain::block_name(super::canvas::command_caption(command).0).to_string(), _ => format!("Actions ({})", commands.len()) }); },
-                        NodeKind::MixedExecute { commands } => { ui.label(format!("Imported actions ({})", commands.len())).on_hover_text("Change these actions in place. Grey ones are kept from the game and stay where they are."); },
-                        NodeKind::EffectExecute { commands } => { ui.label(match commands.as_slice() { [command] => super::canvas::effect_caption(command).0.to_string(), _ => format!("Visual effects ({})", commands.len()) }); },
-                        NodeKind::MixedEffectExecute { commands, .. } => { ui.label(format!("Imported effects ({})", commands.len())).on_hover_text("Change these effects in place. Grey ones are kept from the game and stay where they are."); },
-                        NodeKind::Preserved { .. } => { ui.label("Imported structure (read-only)").on_hover_text("Part of the game's move that Visionary keeps exactly as it is. Open Code to see it."); },
+                        NodeKind::MixedExecute { commands } => { ui.label(format!("Actions ({})", commands.len())).on_hover_text("Change these actions in place. Grey ones are kept from the game and stay where they are."); },
+                        NodeKind::EffectExecute { commands } => { ui.label(match commands.as_slice() { [command] => super::plain::block_name(super::canvas::effect_caption(command).0).to_string(), _ => format!("Visual effects ({})", commands.len()) }); },
+                        NodeKind::MixedEffectExecute { commands, .. } => { ui.label(format!("Visual effects ({})", commands.len())).on_hover_text("Change these effects in place. Grey ones are kept from the game and stay where they are."); },
+                        NodeKind::Preserved { .. } => { ui.label("Part of the original move (read-only)").on_hover_text("Part of the game's move that Visionary keeps exactly as it is. Open Code to see it."); },
                     }).response.on_hover_text(format!("Block number {}", node.id));
                     if node_count > 1 {
                         if ui.add_enabled(index > 0, egui::Button::new("Up").small()).on_hover_text("Move earlier in this region").clicked() { reorder = Some((index, index - 1)); }
@@ -1988,8 +2011,10 @@ fn command_ui(ui: &mut Ui, fighter: &str, command: &mut ExcuteStmt, options: Com
             });
         }
         ExcuteStmt::AttackAbs(call) => {
-            ui.weak("Sets the throw's damage. Apply throw is what hits the held opponent with it.")
-                .on_hover_text(&call.kind);
+            ui.weak("Throw damage").on_hover_text(format!(
+                "Sets the throw's damage. Apply throw is what hits the held opponent with it.\n{}",
+                call.kind
+            ));
             ui.horizontal_wrapped(|ui| {
                 ui.label("Number");
                 ui.add(egui::DragValue::new(&mut call.id).range(0..=255));
@@ -4365,7 +4390,7 @@ fn native_command_ui(
                 egui::ComboBox::from_id_salt("native_attack_indexed_id")
                     .selected_text(id.to_string())
                     .show_ui(ui, |ui| {
-                        for value in 0..=3 {
+                        for value in 0..=7 {
                             ui.selectable_value(id, value, value.to_string());
                         }
                     });
@@ -5513,30 +5538,30 @@ pub(super) fn set_effect_spawn_variant(command: &mut crate::data::EffectMacro, n
 
 fn effect_spawn_mode_label(name: &str) -> &str {
     match name {
-        "EFFECT" => "Free effect",
-        "EFFECT_ALPHA" => "Free with opacity",
-        "EFFECT_ATTR" => "Free with attributes",
-        "EFFECT_FLIP" => "Free, flipped",
-        "EFFECT_FLIP_ALPHA" => "Free, flipped with opacity",
-        "EFFECT_FOLLOW" => "Follow joint",
-        "EFFECT_FOLLOW_ALPHA" => "Follow with opacity",
-        "EFFECT_FOLLOW_COLOR" => "Follow with color",
-        "EFFECT_FOLLOW_FLIP" => "Follow, flipped",
-        "EFFECT_FOLLOW_FLIP_ALPHA" => "Follow, flipped with opacity",
-        "EFFECT_FOLLOW_FLIP_COLOR" => "Follow, flipped with color",
-        "EFFECT_FOLLOW_FLIP_RND" => "Follow, randomized flip",
-        "EFFECT_FOLLOW_NO_SCALE" => "Follow, no scale",
-        "EFFECT_FOLLOW_NO_STOP" => "Follow, no stop",
-        "EFFECT_FOLLOW_NO_STOP_FLIP" => "Follow, no stop, flipped",
-        "EFFECT_FLW_POS" => "Follow position",
-        "EFFECT_FLW_POS_NO_STOP" => "Follow position, no stop",
-        "EFFECT_FLW_POS_UNSYNC_VIS" => "Follow position, unsynced visibility",
-        "EFFECT_FLW_UNSYNC_VIS" => "Follow, unsynced visibility",
-        "LANDING_EFFECT" => "Landing",
-        "LANDING_EFFECT_FLIP" => "Landing, flipped",
-        "FOOT_EFFECT" => "Foot",
-        "FOOT_EFFECT_FLIP" => "Foot, flipped",
-        "DOWN_EFFECT" => "Down",
+        "EFFECT" => "Stays where it starts",
+        "EFFECT_ALPHA" => "Stays where it starts, see-through",
+        "EFFECT_ATTR" => "Stays where it starts, with extra settings",
+        "EFFECT_FLIP" => "Stays where it starts, mirrored facing left",
+        "EFFECT_FLIP_ALPHA" => "Stays where it starts, mirrored, see-through",
+        "EFFECT_FOLLOW" => "Follows the body part",
+        "EFFECT_FOLLOW_ALPHA" => "Follows, see-through",
+        "EFFECT_FOLLOW_COLOR" => "Follows, tinted",
+        "EFFECT_FOLLOW_FLIP" => "Follows, mirrored facing left",
+        "EFFECT_FOLLOW_FLIP_ALPHA" => "Follows, mirrored, see-through",
+        "EFFECT_FOLLOW_FLIP_COLOR" => "Follows, mirrored, tinted",
+        "EFFECT_FOLLOW_FLIP_RND" => "Follows, randomly mirrored",
+        "EFFECT_FOLLOW_NO_SCALE" => "Follows, ignores the fighter's size",
+        "EFFECT_FOLLOW_NO_STOP" => "Follows, keeps playing after the move",
+        "EFFECT_FOLLOW_NO_STOP_FLIP" => "Follows, keeps playing, mirrored",
+        "EFFECT_FLW_POS" => "Follows position only, doesn't turn",
+        "EFFECT_FLW_POS_NO_STOP" => "Follows position only, keeps playing",
+        "EFFECT_FLW_POS_UNSYNC_VIS" => "Follows position only, stays visible",
+        "EFFECT_FLW_UNSYNC_VIS" => "Follows, stays visible when the fighter hides",
+        "LANDING_EFFECT" => "Dust on the ground",
+        "LANDING_EFFECT_FLIP" => "Dust on the ground, mirrored",
+        "FOOT_EFFECT" => "Dust at the feet",
+        "FOOT_EFFECT_FLIP" => "Dust at the feet, mirrored",
+        "DOWN_EFFECT" => "Dust when knocked down",
         _ => name,
     }
 }
@@ -5900,24 +5925,40 @@ fn effect_command_ui_mode(
             scale,
             ..
         } => {
-            ui.label("Graphic");
-            ui.add(egui::TextEdit::singleline(effect_name).desired_width(130.0));
-            ui.label("Body part");
-            ui.add(egui::TextEdit::singleline(bone_name).desired_width(70.0));
-            number_field_ui(ui, "effect_scale", "Scale", scale, 0.1, None);
-            if let Some(alternate) = effect_name_alt {
-                ui.label("Alternate graphic");
-                ui.add(egui::TextEdit::singleline(alternate).desired_width(130.0));
-            }
-            ui.collapsing("Transform", |ui| {
-                for (label, values) in [("Offset", offset), ("Rotation", rotation)] {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(label);
-                        for value in values {
+            ui.vertical(|ui| {
+                egui::Grid::new("effect_spawn_basics").num_columns(2).show(ui, |ui| {
+                    ui.label("Effect");
+                    ui.add(egui::TextEdit::singleline(effect_name).desired_width(160.0));
+                    ui.end_row();
+                    if let Some(alternate) = effect_name_alt {
+                        ui.label("When facing left").on_hover_text(
+                            "The effect shown instead while the fighter faces left.",
+                        );
+                        ui.add(egui::TextEdit::singleline(alternate).desired_width(160.0));
+                        ui.end_row();
+                    }
+                    ui.label("Body part");
+                    joint_picker(ui, bone_name, joints);
+                    ui.end_row();
+                    ui.label("Size");
+                    ui.add(egui::DragValue::new(scale).speed(0.01).range(0.0..=100.0));
+                    ui.end_row();
+                    // Rotation is stored Z, Y, X; show it X, Y, Z like the game's script.
+                    ui.label("Position");
+                    ui.horizontal(|ui| {
+                        for value in offset {
                             ui.add(egui::DragValue::new(value).speed(0.1));
                         }
                     });
-                }
+                    ui.end_row();
+                    ui.label("Rotation");
+                    ui.horizontal(|ui| {
+                        for value in rotation.iter_mut().rev() {
+                            ui.add(egui::DragValue::new(value).speed(1.0).suffix("°"));
+                        }
+                    });
+                    ui.end_row();
+                });
             });
         }
         EffectMacro::LastEffectSetRate { rate } => {

@@ -193,11 +193,13 @@ fn install(mode: u8) {
         .unwrap(),
     );
     if mode == 1 {
-        runtime.controllers.insert("cloud".into(), coordinator);
+        runtime
+            .controllers
+            .insert("cloud".into(), vec![coordinator]);
     } else {
         runtime
             .compiled_controllers
-            .insert("cloud".into(), coordinator);
+            .insert("cloud".into(), vec![coordinator]);
     }
 }
 

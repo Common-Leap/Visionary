@@ -67,6 +67,22 @@ impl Preset {
         }
     }
 
+    /// One plain sentence on what the preset does, shown before it is applied.
+    pub fn hover(self) -> &'static str {
+        match self {
+            Self::KoTally => "Counts how many fighters this character has knocked out.",
+            Self::Timer => "Counts from 0 to 60 frames (one second), then starts over.",
+            Self::Charge => "Fills a gauge to 100, then empties it and fills again.",
+            Self::Meter => "A 0 to 100 meter. Moves you pick fill it or spend it.",
+            Self::Stance => "Three stances. A move you pick switches to the next one.",
+            Self::Ammo => {
+                "Three charges. A move you pick spends one, and they refill one at a time."
+            }
+            Self::Rage => "A 0 to 100 gauge that fills with the damage this character deals.",
+            Self::Combo => "Counts hits landed less than 1.5 seconds apart.",
+        }
+    }
+
     /// Short name new controllers made from this preset are numbered after.
     pub fn stem(self) -> &'static str {
         match self {
@@ -352,19 +368,6 @@ impl BehaviorTemplate {
             .map_err(|error| format!("invalid template document: {error}"))?;
         template.validate()?;
         Ok(template)
-    }
-
-    /// Serialize a validated document in a stable, readable form.
-    pub fn encode(&self) -> Result<String, String> {
-        self.validate()?;
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|error| format!("could not encode behavior template: {error}"))?;
-        if json.len() > MAX_DOCUMENT_BYTES {
-            return Err(format!(
-                "template document exceeds {MAX_DOCUMENT_BYTES} bytes"
-            ));
-        }
-        Ok(json)
     }
 
     /// Clone the graph for a target fighter only after exact registry,
@@ -1179,7 +1182,7 @@ mod tests {
     fn template_round_trip_and_outer_unknown_fields_are_strict() {
         let template =
             BehaviorTemplate::from_graph("Charge", None, Preset::Charge.graph()).unwrap();
-        let json = template.encode().unwrap();
+        let json = serde_json::to_string_pretty(&template).unwrap();
         assert_eq!(BehaviorTemplate::decode(&json).unwrap(), template);
         let unknown = json.replace(
             "\"schema_version\": 1",
@@ -1206,7 +1209,7 @@ mod tests {
         let template =
             BehaviorTemplate::from_graph("Counter", None, Preset::KoTally.graph()).unwrap();
         let mut json: serde_json::Value =
-            serde_json::from_str(&template.encode().unwrap()).unwrap();
+            serde_json::from_str(&serde_json::to_string_pretty(&template).unwrap()).unwrap();
         json["schema_version"] = 2.into();
         assert!(BehaviorTemplate::decode(&json.to_string())
             .unwrap_err()
@@ -1228,17 +1231,6 @@ mod tests {
         );
         assert!(BehaviorTemplate::decode("{\"schema_version\":1,\"name\":\"x\",\"description\":\"\",\"source_fighter\":null,\"graph\":{\"initial\":NaN}}").is_err());
         assert!(BehaviorTemplate::from_graph("bad", None, BehaviorGraph::default()).is_err());
-    }
-
-    #[test]
-    fn encode_refuses_documents_that_its_decoder_cannot_accept() {
-        let mut template =
-            BehaviorTemplate::from_graph("Counter", None, Preset::KoTally.graph()).unwrap();
-        template.graph.states.push(StateDef {
-            status: None,
-            name: "unused".repeat(MAX_DOCUMENT_BYTES / 6 + 1),
-        });
-        assert!(template.encode().unwrap_err().contains("exceeds"));
     }
 
     #[test]

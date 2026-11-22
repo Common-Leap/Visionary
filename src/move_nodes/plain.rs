@@ -25,13 +25,14 @@ pub fn block_name(internal: &str) -> &str {
         "Set airborne" => "Go airborne",
         "Armor / damage reaction" => "Armor",
         "Modify hitbox power" => "Change hitbox power",
-        "Reaction frames" | "Reaction frames · revised" => "Hit reaction time",
+        "Reaction frames" => "Hit reaction time",
+        "Reaction frames · revised" => "Hit reaction time (alternate)",
         "Wind area" => "Wind push",
         "Erase wind" => "End wind",
         "Define throw damage" => "Throw damage",
         "Define absolute attack" => "Fixed attack",
         "Apply throw" => "Throw opponent",
-        "Native flag" | "Work flag" => "Game flag",
+        "Native flag" | "Work flag" => "Turn a move setting on or off",
         "Set slowdown" => "Slow down time",
         "Clear slowdown" => "Back to normal time",
         "Slow opponents" => "Slow opponents",
@@ -57,7 +58,8 @@ pub fn block_name(internal: &str) -> &str {
         "Effect spawn" | "Spawn effect" => "Visual effect",
         "Follow native effect" => "Effect that follows the fighter",
         "Slope" | "Slope alignment" => "Lean with the ground",
-        "Effect off" | "Native effect off" => "End visual effect",
+        "Effect off" => "End visual effect",
+        "Native effect off" => "End stored visual effect",
         "Imported effect" => "Visual effect",
         "Rumble pattern" => "Rumble",
         "Attack module set no damage fly smoke all" => "No launch smoke",
@@ -122,7 +124,6 @@ pub fn block_name(internal: &str) -> &str {
         "Initialize attack position" => "Reset hitbox positions",
         "Interpolate attacks" => "Smooth hitbox movement",
         "Model default" => "Model back to normal",
-        "Top-level sound" => "Sound",
         "Unique attack effects" => "Hit sparks",
         "Vector target" => "Pull opponents to a point",
         "Sync effect initial position" | "Sync initial position" => {
@@ -137,6 +138,16 @@ pub fn block_name(internal: &str) -> &str {
         "Default visibility status" => "Model back to normal",
         "Stop status sounds" => "Stop this action's sounds",
         "Counter" => "Number",
+        "Final fear face" => "Final Smash scared face",
+        "Final-start camera" => "Final Smash start camera",
+        "Final finish cut-in" => "Final Smash finish cut-in",
+        "Effect rate" => "Effect speed",
+        "Effect camera offset" => "Move effect toward the camera",
+        "Detach effect" => "Effect stops following",
+        "Cancel screen fill" => "End screen fill",
+        "Camera depth influence" => "Effect ignores camera distance",
+        "Top-level sound" => "Sound",
+        "Keep attack rumble" => "Keep hit rumble going",
         "Gauge" => "Meter",
         other => other,
     }
@@ -198,6 +209,67 @@ pub fn block_help(name: &str) -> Option<&'static str> {
         "Camera shake" => "Shakes the screen.",
         "Original game code" => "Part of the game's own move kept exactly as it is.",
         "New gimmick" => "Adds a set of rules that run all the time for this fighter.",
+        "Turn a move setting on or off" => "Turns on or off one of this move's settings, like when the next jab is allowed.",
+        "Wait for animation loop" => "Waits until the animation starts over, like a rapid jab.",
+        "Match animation loop" => "Runs the blocks after it again every time the animation loops.",
+        "Change hitbox power" => "Changes the damage of a hitbox that is already on.",
+        "Hit reaction time" => "Makes opponents hit by this hitbox stay stunned for longer.",
+        "Hit reaction time (alternate)" => "Another way the game adds stun time to a hitbox.",
+        "Wind push" => "An area that pushes opponents without hurting them.",
+        "End wind" => "Stops a wind push area.",
+        "Lean with the ground" => "Tilts the fighter to match a slope.",
+        "Smooth hitbox movement" => "Fills in hitboxes between frames so fast swings don't miss.",
+        "Remember a safe spot" => "Remembers where the fighter is so the game can return them there.",
+        "No hitbox tip effect" => "Turns off the extra hit effect at a weapon's tip.",
+        "Ledge grab range" => "Changes how far away this fighter can grab a ledge.",
+        "Push box" => "Whether this fighter pushes other fighters away when they overlap.",
+        "Model visibility" => "Shows or hides one part of the fighter's model.",
+        "Whole model visibility" => "Shows or hides the whole fighter.",
+        "Model back to normal" => "Shows every part of the model the usual way again.",
+        "Held item visibility" => "Shows or hides the item the fighter is holding.",
+        "Hitbox can't KO" => "Hitboxes from now on can't knock an opponent out.",
+        "Hitbox only grabs" => "Hitboxes from now on only catch opponents.",
+        "Object animation" => "Plays an animation on one of this fighter's objects.",
+        "Object state" => "Changes what one of this fighter's objects is doing.",
+        "Launch object" => "Fires an object the fighter is holding.",
+        "Launch object if out" => "Fires the object only if it already exists.",
+        "Show or hide object" => "Shows or hides one of this fighter's objects.",
+        "Spawn object if allowed" => "Creates an object only when the game allows another one.",
+        "Grab bounce-off" => "Whether two grabs meeting bounce off each other.",
+        "Finishing-hit camera" => "Uses the dramatic camera when this hit KOs.",
+        "Force hit reaction" => "Makes the hit always cause a reaction, even through armor.",
+        "Hitbox height" => "Sets whether the hitbox counts as high, middle or low.",
+        "Reset hitbox positions" => "Makes moving hitboxes start over from where they are now.",
+        "Hitbox follows a body part" => "Makes hitbox positions follow this body part.",
+        "Launch smoke" => "Whether opponents launched by this move trail smoke.",
+        "Hit shake amount" => "How much opponents shake when hit.",
+        "Hit sparks" => "Uses this fighter's own hit sparks.",
+        "What the hitbox can hit" => "Limits what kinds of targets the hitbox can hit.",
+        "Hitbox size" => "Changes the size of a hitbox that is already on.",
+        "Pull opponents to a point" => "Pulls hit opponents toward a point, like a multi-hit move.",
+        "Optional hit effect" => "Adds a hit effect only some hits use.",
+        "Optional hit sound" => "Adds a hit sound only some hits use.",
+        "Keep hit rumble going" => "Keeps the controller shaking from the hit.",
+        "Standard grab setup" => "Sets up a grab the usual way.",
+        "Fire held item" => "Fires or throws the item the fighter holds.",
+        "Eye flash" => "Makes the fighter's eyes flash.",
+        "Zoom camera out" => "Pulls the camera back.",
+        "Start cut-in" => "Shows a Final Smash cut-in picture.",
+        "Effect speed" => "Speeds up or slows down the last effect. 1 is normal.",
+        "Effect color" => "Tints the last effect.",
+        "Effect opacity" => "Makes the last effect more or less see-through.",
+        "Particle color" => "Tints the last effect's particles.",
+        "Effect scale" => "Stretches the last effect.",
+        "Effect stops following" => "The effect stays where it is instead of following the fighter.",
+        "Effect stays in place" => "The last effect ignores the model's offset.",
+        "Effect starts where the fighter is" => "The last effect starts at the fighter's position.",
+        "Fighter color" => "Flashes or tints the fighter.",
+        "End sword trail" => "Stops a weapon trail.",
+        "Fill the screen with color" => "Covers the screen with a color.",
+        "End screen fill" => "Removes the color covering the screen.",
+        "Screen effect" => "Shows an effect over the whole screen.",
+        "End stored visual effect" => "Stops an effect this fighter keeps running, like a charge glow.",
+        "Sound" => "Plays a sound outside the usual timing.",
         _ => return None,
     })
 }
@@ -618,11 +690,14 @@ fn hitbox(damage: f32, size: f32) -> NodeKind {
 }
 
 /// The action blocks of a starter. `first_id` numbers them; `shot` is the fighter's spawn block.
+/// `length` is the move's animation length: a starter longer than it is squeezed to fit, so
+/// its hits land before the move ends.
 pub fn starter_nodes(
     starter: Starter,
     first_id: u32,
     speed: NodeKind,
     shot: Option<NodeKind>,
+    length: Option<f32>,
 ) -> Vec<MoveNode> {
     let end = || NodeKind::Execute {
         commands: vec![crate::data::ExcuteStmt::ClearAll],
@@ -657,6 +732,26 @@ pub fn starter_nodes(
         ],
         Starter::Shoot => shot.map_or_else(Vec::new, |shot| vec![frame(10.0), shot]),
     };
+    let span: f32 = kinds
+        .iter()
+        .map(|kind| match kind {
+            NodeKind::Frame { frame } => *frame,
+            NodeKind::Wait { frames } => *frames,
+            _ => 0.0,
+        })
+        .sum();
+    let scale = length
+        .filter(|length| *length > 2.0 && span > *length - 1.0)
+        .map_or(1.0, |length| (length - 1.0) / span);
+    let kinds = kinds.into_iter().map(|kind| match kind {
+        NodeKind::Frame { frame } => NodeKind::Frame {
+            frame: (frame * scale).round().max(1.0),
+        },
+        NodeKind::Wait { frames } => NodeKind::Wait {
+            frames: (frames * scale).round().max(1.0),
+        },
+        other => other,
+    });
     kinds
         .into_iter()
         .zip(first_id..)

@@ -102,7 +102,10 @@ pub(crate) fn observe_form(boid: u32, fighter: &str) {
             let (coordinator, source) = active_for_object(boid, fighter)?;
             let (context, mut state) = begin(boid, fighter, coordinator, source, None)?;
             if let Some((previous, previous_state)) = &old.saved {
-                if active(&old.fighter).is_ok_and(|(current, _)| Arc::ptr_eq(&current, previous)) {
+                // The outgoing form is the same player, in the same costume.
+                if active(&old.fighter, costume_of(boid))
+                    .is_ok_and(|(current, _)| Arc::ptr_eq(&current, previous))
+                {
                     context.coordinator.carry_form_variables(
                         &mut state,
                         previous,

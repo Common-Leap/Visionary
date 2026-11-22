@@ -1270,6 +1270,9 @@ impl NativeInput {
             Self::Fighter { value, .. } => value.label(),
             Self::OwnedObject { field, .. } => field.label(),
             Self::ParamFloat { .. } => "Cape gravity acceleration",
+            Self::ParamInt { table, .. } if table == JUMP_COUNT_PARAM => {
+                "Max jumps (fighter's own setting)"
+            }
             Self::ParamInt { .. } => "Reflector air stop frames",
             Self::EnergySpeed { energy, axis, .. } => match (energy, axis) {
                 (super::status_commands::Energy::Stop, Axis::X) => "Stop speed X",
@@ -1763,6 +1766,13 @@ impl NativeInput {
             }
         }
         let known_fighter = super::registry::fighter_kind_symbol(fighter).is_some();
+        if kind == NativeKind::Int && known_fighter {
+            result.push(Self::ParamInt {
+                fighter: fighter.into(),
+                table: JUMP_COUNT_PARAM.into(),
+                key: String::new(),
+            });
+        }
         if kind == NativeKind::Float && known_fighter {
             for energy in ENERGIES {
                 for axis in [Axis::X, Axis::Y] {
@@ -1906,7 +1916,10 @@ impl NativeInput {
                 fighter,
                 table,
                 key,
-            } => [fighter, table, key].iter().all(|v| text_ok(v)) && short(),
+            } => {
+                // An empty key is index 0, as in `get_param_int(hash40("jump_count_max"), 0)`.
+                text_ok(fighter) && text_ok(table) && (key.is_empty() || text_ok(key)) && short()
+            }
             Self::EnergySpeed { fighter, .. }
             | Self::AttackResultFlag { fighter, .. }
             | Self::Fighter { fighter, .. }
@@ -2831,7 +2844,12 @@ mod tests {
     /// The table's values are hand-transcribed, so compare them with the source of truth.
     #[test]
     fn common_work_values_match_the_pinned_lua_const_table() {
-        let path = std::path::Path::new(env!("HOME"))
+        let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        else {
+            eprintln!("skipped: no HOME or USERPROFILE environment variable");
+            return;
+        };
+        let path = std::path::Path::new(&home)
             .join(".cargo/git/checkouts/skyline-smash-f820da3599566683/258a566/src/lua_const.rs");
         let Ok(source) = std::fs::read_to_string(&path) else {
             eprintln!("skipped: no pinned checkout at {}", path.display());
@@ -3321,8 +3339,15 @@ const REVIEWED_PARAMS: &[(&str, &str, &str, NativeKind)] = &[
         NativeKind::Int,
     ),
 ];
+/// Every fighter's own jump count, read as `get_param_int(hash40("jump_count_max"), 0)`;
+/// the empty key hashes to 0. Unlike the live Max jumps value, nothing a gimmick writes changes it.
+const JUMP_COUNT_PARAM: &str = "jump_count_max";
 fn reviewed_param(fighter: &str, table: &str, key: &str, kind: NativeKind) -> bool {
     REVIEWED_PARAMS.contains(&(fighter, table, key, kind))
+        || (table == JUMP_COUNT_PARAM
+            && key.is_empty()
+            && kind == NativeKind::Int
+            && super::registry::fighter_kind_symbol(fighter).is_some())
 }
 
 /// Standard grounded fighter throws. Command captures require their own native setup.

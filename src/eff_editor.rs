@@ -44,6 +44,8 @@ pub struct MoveUse {
     pub label: String,
     /// The move's motion name, to open it; `None` when it is not in the fighter's move list.
     pub motion: Option<String>,
+    /// The bones the move spawns the effect on, as its scripts name them.
+    pub bones: Vec<String>,
 }
 
 /// How the Effects page's view plays the selected effect.
@@ -369,7 +371,10 @@ struct EffEntry {
 /// present; `alt_base` covers the data-root path when it differs from the export root.
 #[derive(Clone, PartialEq)]
 pub struct EditSource {
+    /// The key the project keeps these edits under: a fighter, or a made character's key.
     pub fighter: String,
+    /// The name it is shown by.
+    pub label: String,
     pub base: PathBuf,
     pub alt_base: Option<PathBuf>,
     pub merged: Option<PathBuf>,
@@ -409,6 +414,10 @@ pub struct EffEditor {
     pending_select: Option<String>,
     /// Authored edits applied once the queued eff loads.
     pending_edits: Option<Vec<AuthoredEdit>>,
+    /// The open file's working copy is from before the project in the app now: a project was
+    /// opened or closed since it loaded. Its diff is not the project's until a load gives it
+    /// the project's edits, so nothing may be read back from it until then.
+    working_stale: bool,
     /// Emitter lists and spawn structures to apply once the queued eff loads. Applied BEFORE
     /// [`Self::pending_edits`], for the same reason the exporter applies them first: they decide
     /// which emitters an authored edit has to land on.
@@ -428,6 +437,8 @@ pub struct EffEditor {
     scan_error: Option<String>,
 
     loaded_path: Option<PathBuf>,
+    /// Game paths of files opened from outside the game folder. See [`Self::load_as`].
+    game_paths: std::collections::HashMap<PathBuf, String>,
     /// Base eff path → merged (transplants applied) file to ACTUALLY parse when that base
     /// is opened. Makes the merged view character-centric: picking ef_kirby.eff shows
     /// kirby WITH its transplants, wherever it's opened from.
@@ -596,6 +607,7 @@ impl Default for EffEditor {
             pending_load: None,
             pending_select: None,
             pending_edits: None,
+            working_stale: false,
             pending_structure: None,
             pending_edits_push_live: false,
             export_root: std::env::current_dir().unwrap_or_default(),
@@ -603,6 +615,7 @@ impl Default for EffEditor {
             file_filter: String::new(),
             scan_error: None,
             loaded_path: None,
+            game_paths: Default::default(),
             merged_overlays: std::collections::HashMap::new(),
             loaded_is_merged: false,
             edit_sources: Vec::new(),
@@ -803,6 +816,41 @@ fn shift_subtree_depth(emitters: &mut [EmitterDef], i: usize, delta: i16) -> boo
     true
 }
 
+/// Whether copying row `i` (and what is made from it) keeps the set inside what the game loads:
+/// at most [`MAX_CHILDREN`] parts made from one part.
+///
+/// [`MAX_CHILDREN`]: crate::eff_validate::MAX_CHILDREN
+fn room_to_copy(depths: &[u8], i: usize) -> bool {
+    match depths.get(i) {
+        None => false,
+        Some(0) => true,
+        Some(_) => {
+            let parent = (0..i).rev().find(|&k| depths[k] == 0).unwrap_or(0);
+            children_of(depths, parent) < crate::eff_validate::MAX_CHILDREN
+        }
+    }
+}
+
+/// Whether row `i` can be made from the part above it. The game plays one level of parts made
+/// from parts, so only a part on its own with nothing made from it qualifies, and the part it
+/// would be made from must have room for another.
+fn room_to_nest(depths: &[u8], i: usize) -> bool {
+    if i == 0 || depths.get(i) != Some(&0) || depths.get(i + 1).is_some_and(|d| *d > 0) {
+        return false;
+    }
+    let parent = (0..i).rev().find(|&k| depths[k] == 0).unwrap_or(0);
+    children_of(depths, parent) < crate::eff_validate::MAX_CHILDREN
+}
+
+/// How many parts are made directly from row `parent`.
+fn children_of(depths: &[u8], parent: usize) -> usize {
+    depths[parent + 1..]
+        .iter()
+        .take_while(|d| **d > 0)
+        .filter(|d| **d == 1)
+        .count()
+}
+
 /// A name for a duplicated emitter that no sibling already has.
 ///
 /// Emitters are addressed by name by every path that ships an edit — the exporter resolves an
@@ -866,7 +914,11 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
         }
         AttrKind::Int => {
             let mut v = value.as_i64();
-            let changed = ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed();
+            let mut drag = egui::DragValue::new(&mut v).speed(1.0);
+            if crate::eff_attrs::is_key_count(attr.id) {
+                drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as i64);
+            }
+            let changed = ui.add(drag).changed();
             if changed {
                 *value = AttrValue::Int(v);
             }
@@ -874,7 +926,11 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
         }
         AttrKind::UInt => {
             let mut v = value.as_u64();
-            let changed = ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed();
+            let mut drag = egui::DragValue::new(&mut v).speed(1.0);
+            if crate::eff_attrs::is_key_count(attr.id) {
+                drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as u64);
+            }
+            let changed = ui.add(drag).changed();
             if changed {
                 *value = AttrValue::UInt(v);
             }
@@ -1183,6 +1239,8 @@ impl EffEditor {
         self.texture_pool = loaded.texture_pool;
         self.texture_note = None;
         self.loaded_path = Some(path.to_path_buf());
+        // The queued edits for it, if any, are applied right after this.
+        self.working_stale = false;
         // Back on a file: the effect and part that were open in it are again.
         if let Some(name) = self.entry_picked.get(path).cloned() {
             if let Some(i) = self.entries.iter().position(|e| e.name == name) {
@@ -1215,11 +1273,7 @@ impl EffEditor {
     /// The loaded eff's game path (project `source_rel`), wherever the file was opened from.
     /// See [`crate::mod_project::eff_game_rel`].
     pub fn loaded_rel(&self) -> Option<String> {
-        let path = self.loaded_path.as_ref()?;
-        Some(crate::mod_project::eff_game_rel(
-            path,
-            Some(&self.export_root),
-        ))
+        Some(self.game_path_of(self.loaded_path.as_ref()?))
     }
 
     /// The file on disk the editor has open, when it is the eff recorded as `source_rel`.
@@ -1227,6 +1281,49 @@ impl EffEditor {
         self.loaded_rel()
             .filter(|rel| rel.eq_ignore_ascii_case(source_rel))
             .and(self.loaded_path.as_deref())
+    }
+
+    /// The game path a file on disk stands for: the one it was given when opened from a project
+    /// or a folder the author picked, or its inferred game path via [`crate::mod_project::eff_game_rel`].
+    fn game_path_of(&self, path: &Path) -> String {
+        if let Some(rel) = self.game_paths.get(path) {
+            return rel.clone();
+        }
+        crate::mod_project::eff_game_rel(path, Some(&self.export_root))
+    }
+
+    /// Open `path` as the game's `rel` (e.g. `effect/fighter/pickel/ef_pickel.eff`), so edits
+    /// to an effect file kept outside the game folder are keyed and exported as that file.
+    /// Opens it again even when it is already open, as a changed file needs.
+    pub fn load_as(&mut self, path: &Path, rel: String) {
+        self.game_paths.insert(path.to_path_buf(), rel);
+        self.replace_pending_load(path);
+    }
+
+    /// Queue `path` to load next. Edits queued for another file that has not loaded yet were
+    /// that file's: they are dropped rather than applied to this one, and the app queues this
+    /// file's own (see [`Self::load_needing_edits`]).
+    fn replace_pending_load(&mut self, path: &Path) {
+        if self
+            .pending_load
+            .as_deref()
+            .is_some_and(|pending| pending != path)
+        {
+            self.pending_edits = None;
+            self.pending_structure = None;
+            self.pending_edits_push_live = false;
+        }
+        self.pending_load = Some(path.to_path_buf());
+    }
+
+    /// Whether the open file's working copy holds the project's edits, so its diff may be read
+    /// back into the project. Not while a project's edits for it wait to be applied, nor after
+    /// another project opened until a file loads for it.
+    pub fn working_is_current(&self) -> bool {
+        !self.working_stale
+            && !(self.pending_load.is_some()
+                && self.pending_load == self.loaded_path
+                && (self.pending_edits.is_some() || self.pending_structure.is_some()))
     }
 
     pub fn export_root(&self) -> &Path {
@@ -1269,11 +1366,7 @@ impl EffEditor {
         if self.pending_edits.is_some() || self.pending_structure.is_some() {
             return None;
         }
-        let path = self.pending_load.as_ref()?;
-        Some(crate::mod_project::eff_game_rel(
-            path,
-            Some(&self.export_root),
-        ))
+        Some(self.game_path_of(self.pending_load.as_ref()?))
     }
 
     /// The project's edits for the file a queued load opens. Applied without sending anything
@@ -1343,6 +1436,12 @@ impl EffEditor {
     /// Drop project-owned overlays and queued operations before another project replaces it.
     /// Reloading the base file immediately afterwards resets the current authored diff too.
     pub fn reset_project_state(&mut self) {
+        // What is open was loaded for the project before: its diff is not this one's. It
+        // loads again, and the app hands it the new project's edits for it.
+        self.working_stale = true;
+        if self.pending_load.is_none() {
+            self.pending_load = self.loaded_path.clone();
+        }
         self.pending_edits = None;
         self.pending_structure = None;
         self.pending_edits_push_live = false;
@@ -1871,6 +1970,17 @@ impl EffEditor {
             .unwrap_or_default()
     }
 
+    /// The bones the moves that play the selected effect spawn it on, once every move has been
+    /// read.
+    pub fn selected_spawn_bones(&self) -> Option<Vec<&str>> {
+        self.effect_uses_ready.then(|| {
+            self.selected_uses()
+                .iter()
+                .flat_map(|found| found.bones.iter().map(String::as_str))
+                .collect()
+        })
+    }
+
     /// Whether the open move plays the selected effect, by its script or an object it makes.
     pub fn open_move_plays_selected(&self) -> bool {
         self.open_motion.as_deref().is_some_and(|motion| {
@@ -2068,10 +2178,14 @@ impl EffEditor {
     pub fn queue_load(&mut self, path: &Path) {
         // Already showing this file and no reload pending → nothing to do. (A pending
         // reload — e.g. a merged overlay just changed under the loaded file — survives.)
-        if self.loaded_path.as_deref() == Some(path) && self.pending_load.is_none() {
+        // A working copy from before another project opened loads again, with this one's edits.
+        if self.loaded_path.as_deref() == Some(path)
+            && self.pending_load.is_none()
+            && !self.working_stale
+        {
             return;
         }
-        self.pending_load = Some(path.to_path_buf());
+        self.replace_pending_load(path);
     }
 
     /// Replace the edit-source list (the app's per-fighter eff mods). This is the single
@@ -2291,7 +2405,8 @@ impl EffEditor {
     /// The selected effect's emitters, with its texture and the game's live values below.
     pub fn page_right(&mut self, ui: &mut Ui, link: &GameLink) {
         if self.selected_entry.is_none() {
-            ui.weak("Pick an effect on the left to change how it looks.");
+            ui.weak("No effect selected")
+                .on_hover_text("Pick an effect on the left to change how it looks.");
             return;
         }
         // The texture of the part on the Look tab, and the game's view of the effect while one
@@ -2760,9 +2875,9 @@ impl EffEditor {
                     ));
                 }
                 let label = if badges.is_empty() {
-                    src.fighter.clone()
+                    src.label.clone()
                 } else {
-                    format!("{} ({})", src.fighter, badges.join(", "))
+                    format!("{} ({})", src.label, badges.join(", "))
                 };
                 // A slotted fighter whose merged build is missing signals a failed merge —
                 // surface it instead of silently showing the base file.
@@ -2777,7 +2892,7 @@ impl EffEditor {
                     "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
-                    format!("open {}'s eff with its edits applied", src.fighter)
+                    format!("open {}'s eff with its edits applied", src.label)
                 });
                 if resp.clicked() {
                     self.pending_load = Some(src.base.clone());
@@ -2863,10 +2978,8 @@ impl EffEditor {
                                     .any(|m| m.label.to_lowercase().contains(&filter))
                             }))
                 };
-                if !self.entries.iter().any(&matches) {
-                    ui.weak(if self.entries.is_empty() {
-                        "Open an effect file above to see its effects"
-                    } else if only_move {
+                if !self.entries.is_empty() && !self.entries.iter().any(&matches) {
+                    ui.weak(if only_move {
                         "This move plays none of this file's effects"
                     } else {
                         "No matching effects"
@@ -2984,8 +3097,7 @@ impl EffEditor {
         // leaves the previous emitter's texture on screen, with working Replace buttons.
         self.selected_texture = None;
         let Some(entry_idx) = self.selected_entry else {
-            ui.colored_label(
-                egui::Color32::GRAY,
+            ui.colored_label(egui::Color32::GRAY, "No effect selected").on_hover_text(
                 "Pick an effect on the left to change how it looks. It plays in the view as you edit.",
             );
             return;
@@ -3489,6 +3601,9 @@ impl EffEditor {
                 ui.label("");
                 ui.end_row();
                 let count = set.emitters.len();
+                let depths: Vec<u8> = set.emitters.iter().map(|e| e.depth).collect();
+                let copy_room: Vec<bool> = (0..count).map(|i| room_to_copy(&depths, i)).collect();
+                let nest_room: Vec<bool> = (0..count).map(|i| room_to_nest(&depths, i)).collect();
                 for (i, em) in set.emitters.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_space(em.depth as f32 * 12.0);
@@ -3525,8 +3640,12 @@ impl EffEditor {
                     }
                     ui.menu_button("⋯", |ui| {
                         if ui
-                            .button("Copy")
+                            .add_enabled(copy_room[i], egui::Button::new("Copy"))
                             .on_hover_text("Add another part just like this one")
+                            .on_disabled_hover_text(format!(
+                                "The game holds at most {} parts made from one part",
+                                crate::eff_validate::MAX_CHILDREN
+                            ))
                             .clicked()
                         {
                             duplicate = Some(i);
@@ -3557,9 +3676,16 @@ impl EffEditor {
                         }
                         ui.separator();
                         if ui
-                            .add_enabled(i > 0, egui::Button::new("Make from the part above"))
+                            .add_enabled(
+                                nest_room[i],
+                                egui::Button::new("Make from the part above"),
+                            )
                             .on_hover_text(
                                 "Its particles come out of the particles of the part above",
+                            )
+                            .on_disabled_hover_text(
+                                "Only a part on its own, with nothing made from it, can be made \
+                                 from another, and one part makes at most 16",
                             )
                             .clicked()
                         {
@@ -3643,7 +3769,7 @@ impl EffEditor {
             } else {
                 set.emitters
                     .get(i - 1)
-                    .map(|p| p.depth.saturating_add(1))
+                    .map(|p| p.depth.saturating_add(1).min(1))
                     .unwrap_or(0)
             };
             if let Some(root) = set.emitters.get(i) {
@@ -4326,12 +4452,11 @@ impl EffEditor {
 
         if users > 1 {
             ui.label(
-                egui::RichText::new(format!(
-                    "{users} parts share this texture — editing it changes all of them"
-                ))
-                .small()
-                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
-            );
+                egui::RichText::new(format!("{users} parts share this texture"))
+                    .small()
+                    .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
+            )
+            .on_hover_text("Editing it changes all of them.");
         }
     }
 
@@ -4671,12 +4796,9 @@ impl EffEditor {
             ui.label(
                 egui::RichText::new(format!("{} of {total} parts changed", edited.len())).small(),
             )
-            .on_hover_text(edited_names);
-            ui.label(
-                egui::RichText::new("Send edits, then trigger the move again.")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
+            .on_hover_text(format!(
+                "{edited_names}\nSend edits, then trigger the move again."
+            ));
         }
         // Texture replacements are file-wide, not per-entry, so they are listed here in full
         // rather than filtered to the selected effect — a replaced texture changes every
@@ -4719,12 +4841,11 @@ impl EffEditor {
         let Some(kind) = kind else {
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(
-                    "Trigger the effect in game (training mode) to open its kind tab.",
-                )
-                .small()
-                .color(egui::Color32::DARK_GRAY),
-            );
+                egui::RichText::new("Not seen in the game yet")
+                    .small()
+                    .color(egui::Color32::DARK_GRAY),
+            )
+            .on_hover_text("Trigger the effect in game (training mode) to open its kind tab.");
             ui.separator();
             self.draw_transplant_section(ui, &entry_name);
             return;
@@ -4868,6 +4989,48 @@ mod tests {
             loaded_path: Some(PathBuf::from(path)),
             ..Default::default()
         }
+    }
+
+    /// A file loaded before a project opened holds none of that project's edits: reading its
+    /// diff back then wrote "no edits" over the project's (Mario's saved effect edit vanished
+    /// on every relaunch). Paired: an untouched editor's working copy is read back.
+    #[test]
+    fn a_working_copy_from_before_a_project_opened_is_not_read_back() {
+        let mut editor = editor_with_one_emitter("/fx/ef_mario.eff");
+        assert!(editor.working_is_current());
+        editor.reset_project_state();
+        assert!(!editor.working_is_current());
+        // It loads again, for the new project.
+        assert_eq!(
+            editor.pending_load.as_deref(),
+            Some(Path::new("/fx/ef_mario.eff"))
+        );
+        // Queued once more while stale, it still reloads instead of being skipped.
+        editor.pending_load = None;
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        assert!(editor.pending_load.is_some());
+    }
+
+    /// Edits queued for a file that has not loaded yet are that file's: another file queued
+    /// over it must not receive them. Paired: queuing the same file keeps them.
+    #[test]
+    fn edits_queued_for_one_file_never_reach_another() {
+        let mut editor = editor_with_one_emitter("/fx/ef_bayonetta.eff");
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        editor.queue_edits(Vec::new());
+        editor.queue_load(Path::new("/fx/ef_mario.eff"));
+        assert!(
+            editor.pending_edits.is_some(),
+            "the same file keeps its edits"
+        );
+        editor.load_as(
+            Path::new("/fx/ef_bayonetta.eff"),
+            "effect/fighter/bayonetta/ef_bayonetta.eff".into(),
+        );
+        assert!(
+            editor.pending_edits.is_none(),
+            "Mario's edits went to Bayonetta's file"
+        );
     }
 
     /// The attribute these tests move to make the fixture "edited".
@@ -5235,6 +5398,41 @@ mod tests {
         assert_eq!(subtree(&list, 3), 3..4);
         assert_eq!(subtree(&list, 4), 4..5, "the last emitter runs to the end");
         assert_eq!(subtree(&list, 9), 9..9, "an index past the end is empty");
+    }
+
+    /// The part list stops at what the game loads: 16 parts made from one part, and one level of
+    /// parts made from parts. Parts on their own have no limit (24 load and play in game).
+    #[test]
+    fn copying_and_nesting_stop_at_what_the_game_loads() {
+        assert!(
+            room_to_copy(&[0u8; 24], 3),
+            "parts on their own are not capped"
+        );
+
+        // A part made from part 0, which already has 15 others made from it.
+        let mut family = vec![0u8];
+        family.extend(std::iter::repeat_n(1u8, 15));
+        family.push(0);
+        assert!(room_to_copy(&family, 1), "the 16th child has room");
+        assert!(
+            room_to_nest(&family, 16),
+            "and so does nesting the part below"
+        );
+        family.insert(1, 1);
+        assert!(!room_to_copy(&family, 1), "a 17th child does not");
+        assert!(!room_to_nest(&family, 17));
+
+        // Only a top-level part with nothing made from it can be nested.
+        assert!(room_to_nest(&[0, 0], 1));
+        assert!(
+            !room_to_nest(&[0, 0, 1], 1),
+            "its child would become a grandchild"
+        );
+        assert!(!room_to_nest(&[0, 1, 1], 2), "a child is already nested");
+        assert!(
+            !room_to_nest(&[0], 0),
+            "the first part has nothing above it"
+        );
     }
 
     #[test]

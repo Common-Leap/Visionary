@@ -2180,3 +2180,153 @@ fn form_switch_carries_once_and_rebirth_does_not_switch() {
         );
     }
 }
+
+/// One Cloud gimmick for Cloud's own costumes and one for a character made on costume 8: the
+/// way the editor sends a fighter's gimmick beside a made character's.
+fn character_bundle(revision: u64, base_except: Vec<u8>, made: Option<Vec<u8>>) -> String {
+    let mut base = named_add_program(1, 1);
+    base.id = "live:cloud".into();
+    base.except_costumes = base_except;
+    let mut charts = vec![ControllerProgram {
+        chart_id: "main".into(),
+        program: base,
+    }];
+    if let Some(costumes) = made {
+        let mut vision = named_add_program(100, 10);
+        vision.id = "live:cloud#c08".into();
+        vision.costumes = costumes;
+        charts.push(ControllerProgram {
+            chart_id: "main".into(),
+            program: vision,
+        });
+    }
+    let bundle = protocol::ControllerBundleRequest {
+        version: protocol::REQUEST_VERSION,
+        revision,
+        disabled_fighters: Vec::new(),
+        charts,
+    };
+    protocol::encode_request(&bundle).unwrap()
+}
+
+fn main_row(boid: u32) -> Option<ControllerStateRow> {
+    runtime::controller_wire_rows()
+        .into_iter()
+        .find(|row| row.actor.boid == boid && row.chart_id == "main")
+}
+
+#[test]
+fn each_costume_runs_its_own_characters_gimmick_with_its_own_state() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    cloud(90, 0x9000, 0);
+    cloud(91, 0x9100, 1);
+    cloud(92, 0x9200, 2);
+    smash::app::lua_bind::dress(0x9100, 8);
+    smash::app::lua_bind::dress(0x9200, 3);
+    let ack = runtime::handle(&character_bundle(1, vec![8], Some(vec![8])));
+    assert!(ack.accepted, "{}", ack.message);
+
+    for boid in [90, 91, 92] {
+        runtime::dispatch_controller_named(boid, "cloud", "main", "external_action").unwrap();
+    }
+    // Cloud's costumes run Cloud's gimmick; costume 8 runs the made character's, and each player
+    // keeps its own count.
+    assert_eq!(controller_count(90, "main"), 2);
+    assert_eq!(controller_count(92, "main"), 2);
+    assert_eq!(controller_count(91, "main"), 110);
+    assert_eq!(controller_row(90, "main").program_id, "live:cloud");
+    assert_eq!(controller_row(91, "main").program_id, "live:cloud#c08");
+    runtime::dispatch_controller_named(91, "cloud", "main", "external_action").unwrap();
+    assert_eq!(controller_count(91, "main"), 120);
+    assert_eq!(controller_count(90, "main"), 2);
+}
+
+#[test]
+fn a_fighters_gimmick_never_runs_on_a_costume_it_excludes() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    cloud(93, 0x9300, 0);
+    cloud(94, 0x9400, 1);
+    smash::app::lua_bind::dress(0x9400, 8);
+    // Only the fighter's own gimmick, excluding the made character's costume: that player runs
+    // none, while costume 0 beside it does run it.
+    let ack = runtime::handle(&character_bundle(1, vec![8], None));
+    assert!(ack.accepted, "{}", ack.message);
+    runtime::dispatch_controller_named(93, "cloud", "main", "external_action").unwrap();
+    assert_eq!(controller_count(93, "main"), 2);
+    assert!(runtime::dispatch_controller_named(94, "cloud", "main", "external_action").is_err());
+    assert!(main_row(94).is_none());
+    // The same bundle without the exclusion runs on costume 8 as well.
+    let ack = runtime::handle(&character_bundle(2, Vec::new(), None));
+    assert!(ack.accepted, "{}", ack.message);
+    runtime::dispatch_controller_named(94, "cloud", "main", "external_action").unwrap();
+    assert_eq!(controller_count(94, "main"), 2);
+}
+
+#[test]
+fn two_gimmicks_claiming_one_costume_are_refused() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    // Both run on costume 8: which would run depends on order, so the bundle is refused whole.
+    let mut first = named_add_program(1, 1);
+    first.id = "live:cloud#c08".into();
+    first.costumes = vec![8, 9];
+    let mut second = named_add_program(1, 1);
+    second.id = "live:cloud#c09".into();
+    second.costumes = vec![8];
+    let bundle = protocol::ControllerBundleRequest {
+        version: protocol::REQUEST_VERSION,
+        revision: 1,
+        disabled_fighters: Vec::new(),
+        charts: vec![
+            ControllerProgram {
+                chart_id: "main".into(),
+                program: first,
+            },
+            ControllerProgram {
+                chart_id: "main".into(),
+                program: second.clone(),
+            },
+        ],
+    };
+    assert!(protocol::validate_request(&bundle)
+        .unwrap_err()
+        .contains("both run on costume c08"));
+    // Disjoint costumes are two owners side by side.
+    let mut disjoint = bundle;
+    disjoint.charts[1].program.costumes = vec![10];
+    assert!(protocol::validate_request(&disjoint).is_ok());
+    assert_eq!(disjoint.coordinators().unwrap()["cloud"].len(), 2);
+}
+
+#[test]
+fn a_new_snapshot_keeps_each_players_state_in_its_own_characters_gimmick() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    reset();
+    cloud(95, 0x9500, 0);
+    cloud(96, 0x9600, 1);
+    smash::app::lua_bind::dress(0x9600, 8);
+    assert!(runtime::handle(&character_bundle(1, vec![8], Some(vec![8]))).accepted);
+    runtime::dispatch_controller_named(95, "cloud", "main", "external_action").unwrap();
+    runtime::dispatch_controller_named(96, "cloud", "main", "external_action").unwrap();
+    // An unchanged resend carries both counts over, each into its own character's gimmick.
+    let ack = runtime::handle(&character_bundle(2, vec![8], Some(vec![8])));
+    assert!(ack.accepted, "{}", ack.message);
+    assert_eq!(controller_count(95, "main"), 2);
+    assert_eq!(controller_count(96, "main"), 110);
+    // Changing only the fighter's own gimmick starts its players over and leaves the made
+    // character's players where they were.
+    let mut changed =
+        protocol::decode_request(&character_bundle(3, vec![8], Some(vec![8]))).unwrap();
+    let base = changed
+        .charts
+        .iter_mut()
+        .find(|chart| chart.program.id == "live:cloud")
+        .unwrap();
+    base.program.vars[0].initial = model::Value::Int(5);
+    let ack = runtime::handle(&protocol::encode_request(&changed).unwrap());
+    assert!(ack.accepted, "{}", ack.message);
+    assert_eq!(controller_count(95, "main"), 5);
+    assert_eq!(controller_count(96, "main"), 110);
+}

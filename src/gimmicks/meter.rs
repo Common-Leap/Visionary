@@ -62,6 +62,19 @@ const fn enabled_by_default() -> bool {
     true
 }
 
+/// The id the game knows meter `index` of character `owner` by (a fighter's name or a made
+/// character's key, which holds no `.`).
+pub fn binding_id(owner: &str, index: usize) -> String {
+    format!("meter.{owner}.{index}")
+}
+
+/// The character a meter id from [`binding_id`] belongs to.
+pub fn binding_owner(id: &str) -> Option<&str> {
+    id.strip_prefix("meter.")?
+        .rsplit_once('.')
+        .map(|(owner, _)| owner)
+}
+
 /// Refuse malformed ranges, empty display states, incompatible styles, and
 /// every identifier not present in the pinned per-fighter registry.
 pub fn validate(binding: &MeterBinding) -> Vec<String> {

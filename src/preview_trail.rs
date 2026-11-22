@@ -122,9 +122,12 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 @fragment fn fs(o: Out) -> @location(0) vec4<f32> {
     let c = textureSample(colour, smp, o.uv);
-    let f = textureSample(fade, smp, o.uv).r;
+    let f = textureSample(fade, smp, o.uv);
+    // The first texture's alpha is the sheet and its colour the bright leading streak; the
+    // second is the sheet's light body. Taking colour from the first alone drew a dark sheet.
+    let rgb = min(c.rgb + f.rgb * 0.75, vec3<f32>(1.0));
     // The scene holds half intensity; the post pass doubles it (as for effects).
-    return vec4<f32>(c.rgb * 0.5, c.a * f);
+    return vec4<f32>(rgb * 0.5, c.a * f.r * 0.85);
 }
 ";
 
@@ -246,6 +249,7 @@ impl PreviewTrails {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
+                    // The trail calls ask for TRAIL_BLEND_ALPHA.
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -305,16 +309,17 @@ impl PreviewTrails {
             }
             let (Some(colour), Some(fade)) = (
                 self.texture(device, queue, &trail.texture, true),
-                self.texture(device, queue, &trail.fade, false),
+                self.texture(device, queue, &trail.fade, true),
             ) else {
                 continue;
             };
+            let edges = smooth(&trail.edges, 4);
             let mut vertices: Vec<f32> = Vec::new();
-            let last = (trail.edges.len() - 1) as f32;
+            let last = (edges.len() - 1) as f32;
             let vertex = |out: &mut Vec<f32>, p: Vec3, u: f32, v: f32| {
                 out.extend([p.x, p.y, p.z, u, v]);
             };
-            for (i, pair) in trail.edges.windows(2).enumerate() {
+            for (i, pair) in edges.windows(2).enumerate() {
                 // Time runs across the textures, newest at the right; the far point is the
                 // top edge.
                 let (u0, u1) = (i as f32 / last, (i + 1) as f32 / last);
@@ -374,6 +379,35 @@ impl PreviewTrails {
             pass.draw(0..trail.count, 0..1);
         }
     }
+}
+
+/// The blade's ends at `per` points between each pair of samples along a Catmull-Rom curve
+/// through them, so the ribbon bends smoothly instead of turning at every sample.
+fn smooth(edges: &[[Vec3; 2]], per: usize) -> Vec<[Vec3; 2]> {
+    if edges.len() < 3 || per < 2 {
+        return edges.to_vec();
+    }
+    let at = |i: isize| edges[i.clamp(0, edges.len() as isize - 1) as usize];
+    let curve = |p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32| {
+        let (t2, t3) = (t * t, t * t * t);
+        0.5 * ((2.0 * p1)
+            + (p2 - p0) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
+    };
+    let mut out = Vec::with_capacity((edges.len() - 1) * per + 1);
+    for i in 0..edges.len() as isize - 1 {
+        let (a, b, c, d) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        for k in 0..per {
+            let t = k as f32 / per as f32;
+            out.push([
+                curve(a[0], b[0], c[0], d[0], t),
+                curve(a[1], b[1], c[1], d[1], t),
+            ]);
+        }
+    }
+    out.push(*edges.last().unwrap());
+    out
 }
 
 fn load_texture(
@@ -471,6 +505,26 @@ mod tests {
             texture_path_for_slot(&dirs, Some(40), Some(&data_root), "tex_shared"),
             Some(shared_tex)
         );
+    }
+
+    #[test]
+    fn a_smoothed_ribbon_passes_through_its_samples_and_bends_between_them() {
+        // A blade end sweeping a quarter circle, sampled at 0, 45 and 90 degrees.
+        let p = |deg: f32| Vec3::new(deg.to_radians().cos(), deg.to_radians().sin(), 0.0) * 10.0;
+        let edges = [
+            [Vec3::ZERO, p(0.0)],
+            [Vec3::ZERO, p(45.0)],
+            [Vec3::ZERO, p(90.0)],
+        ];
+        let out = smooth(&edges, 4);
+        assert_eq!(out.len(), 2 * 4 + 1);
+        for (k, edge) in edges.iter().enumerate() {
+            assert!((out[k * 4][1] - edge[1]).length() < 1e-4);
+        }
+        // Between samples the end stays out near the circle, where a straight panel cuts in.
+        let mid = out[2][1].length();
+        let chord = ((p(0.0) + p(45.0)) * 0.5).length();
+        assert!(mid > chord + 0.1, "{mid} vs chord {chord}");
     }
 
     #[test]

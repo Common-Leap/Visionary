@@ -60,6 +60,7 @@ impl ModelReport {
         self.blocking().next().is_some()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.issues.is_empty()
     }

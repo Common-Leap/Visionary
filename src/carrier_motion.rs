@@ -7,9 +7,17 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub struct PreparedMotions {
     pub list: motion_lib::mlist::MList,
     pub files: Vec<(String, PathBuf)>,
+    /// Animations the motion list names that no file provides, played as `still` instead.
+    pub stand_ins: usize,
 }
 
-pub fn prepare(files: &BTreeMap<String, PathBuf>) -> anyhow::Result<PreparedMotions> {
+/// `still`, when given, is an empty animation used for any the motion list names that the
+/// files lack: Steve's names one no dump of the game contains, and refusing the whole preview
+/// for it left his model preview unusable.
+pub fn prepare(
+    files: &BTreeMap<String, PathBuf>,
+    still: Option<&std::path::Path>,
+) -> anyhow::Result<PreparedMotions> {
     let source = files.get("motion_list.bin").context(
         "motion_list.bin is required from the costume or its vanilla dump to follow the fighter",
     )?;
@@ -28,14 +36,22 @@ pub fn prepare(files: &BTreeMap<String, PathBuf>) -> anyhow::Result<PreparedMoti
         }
     }
     let mut assigned: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    let mut stand_ins = 0;
     let mut outputs = Vec::new();
     for (kind, motion) in &mut list.list {
         // This descriptor is ultimately bound to the main fighter. Preserve its ACMD names;
         // the temporary carrier stays asleep and never plays the fighter's motion graph.
         for animation in &mut motion.animations {
-            let (path, has_extension) = available.get(&animation.name.0)
-                .with_context(|| format!("motion {:#x} needs missing animation {:#x}; export the complete vanilla motion folder", kind.0, animation.name.0))?;
-            let index = if let Some(index) = assigned.get(*path) {
+            let stand_in = still.map(|still| (still.to_path_buf(), true));
+            let (path, has_extension) = match available.get(&animation.name.0) {
+                Some((path, has_extension)) => ((*path).clone(), *has_extension),
+                None => {
+                    stand_ins += 1;
+                    stand_in.with_context(|| format!("motion {:#x} needs missing animation {:#x}; export the complete vanilla motion folder", kind.0, animation.name.0))?
+                }
+            };
+            let (path, has_extension) = (&path, &has_extension);
+            let index = if let Some(index) = assigned.get(path) {
                 *index
             } else {
                 let index = assigned.len();
@@ -45,8 +61,8 @@ pub fn prepare(files: &BTreeMap<String, PathBuf>) -> anyhow::Result<PreparedMoti
                         pool::MOTION_CAPACITY
                     );
                 }
-                assigned.insert((*path).clone(), index);
-                outputs.push((pool::motion_name(index), (*path).clone()));
+                assigned.insert(path.clone(), index);
+                outputs.push((pool::motion_name(index), path.clone()));
                 index
             };
             let name = pool::motion_name(index);
@@ -64,6 +80,7 @@ pub fn prepare(files: &BTreeMap<String, PathBuf>) -> anyhow::Result<PreparedMoti
     Ok(PreparedMotions {
         list,
         files: outputs,
+        stand_ins,
     })
 }
 
@@ -107,7 +124,7 @@ mod tests {
             ("a00wait1.nuanmb".into(), animation),
             ("motion_list.bin".into(), list_path),
         ]);
-        let prepared = prepare(&files).unwrap();
+        let prepared = prepare(&files, None).unwrap();
         assert_eq!(prepared.files.len(), 1);
         let wait = &prepared.list.list[&hash40("wait")];
         let alias = &prepared.list.list[&hash40("custom_idle")];
@@ -135,9 +152,15 @@ mod tests {
         assert_eq!(prepared.list.motion_path, hash40(pool::MOTION_ROOT));
         let mut missing = files;
         missing.remove("a00wait1.nuanmb");
-        assert!(prepare(&missing)
+        assert!(prepare(&missing, None)
             .unwrap_err()
             .to_string()
             .contains("missing animation"));
+        // With a still animation the preview goes ahead and counts what it stood in for.
+        let still = dir.path().join("still.nuanmb");
+        std::fs::write(&still, b"still").unwrap();
+        let prepared = prepare(&missing, Some(&still)).unwrap();
+        assert_eq!(prepared.stand_ins, 2);
+        assert_eq!(prepared.files, vec![(pool::motion_name(0), still)]);
     }
 }

@@ -1,58 +1,5 @@
 //! Shared controls for editor windows.
-use egui::Ui;
-
-/// Browse only expanded folders; files open in their default application.
-pub(crate) fn file_tree(ui: &mut Ui, directory: &std::path::Path) {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            ui.weak(format!("Could not read folder: {error}"));
-            return;
-        }
-    };
-    let project_root = directory
-        .join(crate::mod_project::PROJECT_FILE_NAME)
-        .is_file();
-    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-    entries.sort_by_key(|entry| {
-        (
-            !(project_root && entry.file_name() == "romfs"),
-            !entry.file_type().is_ok_and(|kind| kind.is_dir()),
-            entry.file_name(),
-        )
-    });
-    if entries.is_empty() {
-        ui.weak("No files yet");
-    }
-    for entry in entries {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let label = if project_root {
-            match name.as_str() {
-                "romfs" => "Game files · romfs",
-                "assets" => "Managed images · assets",
-                "reference" => "Reference files · excluded from export",
-                "modproject.json" => "Saved edits · modproject.json",
-                _ => &name,
-            }
-        } else {
-            &name
-        };
-        if kind.is_dir() {
-            egui::CollapsingHeader::new(label)
-                .id_salt(&path)
-                .default_open(name == "romfs")
-                .show(ui, |ui| file_tree(ui, &path));
-        } else if kind.is_file() && ui.button(label).on_hover_text("Open file").clicked() {
-            if let Err(error) = crate::roster::reveal::reveal(&path) {
-                ui.colored_label(egui::Color32::LIGHT_RED, error.to_string());
-            }
-        }
-    }
-}
+use egui::{Color32, RichText, Ui};
 
 pub(crate) fn search_field(ui: &mut Ui, id: &str, query: &mut String, hint: &str) {
     ui.horizontal(|ui| {
@@ -369,6 +316,78 @@ pub(crate) fn bone_picker(
 
 /// Runs a test frame like `Context::run_ui`, dropping the texture uploads no test applies
 /// (egui panics when they are dropped unhandled).
+/// The page colours of the Project and Characters pages: solid surfaces and full-strength text, in either theme.
+#[derive(Clone, Copy)]
+pub(crate) struct Look {
+    pub page: Color32,
+    pub card: Color32,
+    pub sunk: Color32,
+    pub edge: Color32,
+    pub text: Color32,
+    pub dim: Color32,
+    pub accent: Color32,
+}
+
+pub(crate) fn look(ui: &Ui) -> Look {
+    if ui.visuals().dark_mode {
+        Look {
+            page: Color32::from_rgb(16, 17, 20),
+            card: Color32::from_rgb(34, 36, 42),
+            sunk: Color32::from_rgb(24, 25, 29),
+            edge: Color32::from_rgb(78, 82, 94),
+            text: Color32::from_rgb(245, 245, 247),
+            dim: Color32::from_rgb(178, 182, 192),
+            accent: Color32::from_rgb(90, 175, 255),
+        }
+    } else {
+        Look {
+            page: Color32::from_rgb(232, 234, 238),
+            card: Color32::WHITE,
+            sunk: Color32::from_rgb(240, 241, 244),
+            edge: Color32::from_rgb(170, 175, 186),
+            text: Color32::from_rgb(14, 15, 18),
+            dim: Color32::from_rgb(70, 74, 84),
+            accent: Color32::from_rgb(0, 110, 220),
+        }
+    }
+}
+
+pub(crate) fn chip(ui: &mut Ui, text: &str, colour: Color32) {
+    ui.label(RichText::new(text).color(colour).strong());
+}
+
+/// A page button: solid in `colour` for the main action, outlined for the rest. Every state
+/// draws the same outline width with no growth, so hovering only recolours it: egui sizes a
+/// button's padding by its state's outline, and an outline set on top moved it on hover.
+pub(crate) fn act(ui: &mut Ui, look: Look, label: &str, colour: Option<Color32>) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        let (fill, text) = match colour {
+            Some(colour) => (colour, Color32::from_rgb(18, 18, 22)),
+            None => (look.sunk, look.text),
+        };
+        for (state, edge) in [
+            (&mut widgets.inactive, colour.unwrap_or(look.edge)),
+            (&mut widgets.hovered, look.accent),
+            (&mut widgets.active, look.accent),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_fill = fill;
+            state.bg_stroke = egui::Stroke::new(1.5, edge);
+            state.expansion = 0.0;
+            state.corner_radius = egui::CornerRadius::same(6);
+        }
+        let label = RichText::new(label).color(text);
+        let label = if colour.is_some() {
+            label.strong()
+        } else {
+            label
+        };
+        ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 28.0)))
+    })
+    .inner
+}
+
 #[cfg(test)]
 pub(crate) trait TestFrame {
     fn run_test_ui(&self, input: egui::RawInput, ui: impl FnMut(&mut Ui)) -> egui::FullOutput;
