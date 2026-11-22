@@ -65,13 +65,42 @@ pub struct TrailDraw {
     pub edges: Vec<[Vec3; 2]>,
 }
 
-/// The texture file for a trail texture name: the fighter's own `trail` folder, then the shared
-/// one.
-pub fn texture_path(effect_dir: &Path, data_root: Option<&Path>, name: &str) -> Option<PathBuf> {
+/// Extract the costume slot number from a slot-scoped `.eff` path such as
+/// `ef_pacman_c40.eff` → `Some(40)`.
+pub fn slot_from_eff_path(path: &Path) -> Option<u8> {
+    let stem = path.file_stem()?.to_str()?;
+    let tail = stem.rsplit("_c").next()?;
+    if tail.len() >= 2 && tail.len() <= 3 && tail.bytes().all(|b| b.is_ascii_digit()) {
+        tail.parse::<u8>().ok()
+    } else {
+        None
+    }
+}
+
+/// The texture file for a trail texture name: the fighter's slot-scoped `trail_cNN` folder
+/// (for costume-slot movesets such as Shy Guy on Pac-Man `c40`), then the fighter's own `trail`
+/// folder across `effect_dirs`, then the shared `effect/fighter/trail` folder.
+pub fn texture_path_for_slot(
+    effect_dirs: &[PathBuf],
+    slot: Option<u8>,
+    data_root: Option<&Path>,
+    name: &str,
+) -> Option<PathBuf> {
     let file = format!("{name}.nutexb");
-    let own = effect_dir.join("trail").join(&file);
-    if own.exists() {
-        return Some(own);
+    if let Some(slot) = slot {
+        let slot_dir = format!("trail_c{slot:02}");
+        for dir in effect_dirs {
+            let candidate = dir.join(&slot_dir).join(&file);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    for dir in effect_dirs {
+        let own = dir.join("trail").join(&file);
+        if own.exists() {
+            return Some(own);
+        }
     }
     let shared = data_root?.join("effect/fighter/trail").join(&file);
     shared.exists().then_some(shared)
@@ -400,6 +429,48 @@ mod tests {
         assert_eq!(spec.bone_a, "sword1");
         assert_eq!(spec.point_a, Vec3::new(1.0, 0.0, 0.0));
         assert_eq!(spec.point_b, Vec3::new(14.6, 0.2, -0.2));
+    }
+
+    #[test]
+    fn slot_from_eff_path_reads_costume_suffix() {
+        assert_eq!(slot_from_eff_path(Path::new("ef_pacman_c40.eff")), Some(40));
+        assert_eq!(slot_from_eff_path(Path::new("/a/b/ef_mario_c08.eff")), Some(8));
+        assert_eq!(slot_from_eff_path(Path::new("ef_pacman.eff")), None);
+        assert_eq!(slot_from_eff_path(Path::new("ef_common.eff")), None);
+    }
+
+    #[test]
+    fn texture_path_for_slot_prefers_trail_cnn_then_trail_then_shared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mod_eff = tmp.path().join("mod/effect/fighter/pacman");
+        let data_root = tmp.path().join("data");
+        std::fs::create_dir_all(mod_eff.join("trail_c40")).unwrap();
+        std::fs::create_dir_all(mod_eff.join("trail")).unwrap();
+        std::fs::create_dir_all(data_root.join("effect/fighter/trail")).unwrap();
+        let slot_tex = mod_eff.join("trail_c40/tex_shyguy_stilt1.nutexb");
+        let base_tex = mod_eff.join("trail/tex_base.nutexb");
+        let shared_tex = data_root.join("effect/fighter/trail/tex_shared.nutexb");
+        std::fs::write(&slot_tex, b"").unwrap();
+        std::fs::write(&base_tex, b"").unwrap();
+        std::fs::write(&shared_tex, b"").unwrap();
+
+        let dirs = vec![mod_eff.clone()];
+        assert_eq!(
+            texture_path_for_slot(&dirs, Some(40), Some(&data_root), "tex_shyguy_stilt1"),
+            Some(slot_tex)
+        );
+        assert_eq!(
+            texture_path_for_slot(&dirs, Some(0), Some(&data_root), "tex_shyguy_stilt1"),
+            None
+        );
+        assert_eq!(
+            texture_path_for_slot(&dirs, Some(40), Some(&data_root), "tex_base"),
+            Some(base_tex)
+        );
+        assert_eq!(
+            texture_path_for_slot(&dirs, Some(40), Some(&data_root), "tex_shared"),
+            Some(shared_tex)
+        );
     }
 
     #[test]

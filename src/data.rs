@@ -10460,30 +10460,30 @@ fn eval_effect_stmts_unchecked(
                             // an effect the script leaves running. Invisible until C2 made trails
                             // parse, because with no trail call the wrong answer was the only
                             // answer.
-                            match calls
-                                .iter_mut()
-                                .rev()
-                                .find(|c| {
-                                    c.active_end == OPEN_ENDED_EFFECT_FRAME
-                                        && c.spawn_func == "AFTER_IMAGE_ON"
-                                })
-                            {
-                                Some(call) => {
-                                    call.active_end = script_frame(frame);
+                            let mut closed_any = false;
+                            let end_frame = script_frame(frame);
+                            for call in calls.iter_mut().rev() {
+                                if call.active_end == OPEN_ENDED_EFFECT_FRAME
+                                    && call.spawn_func == "AFTER_IMAGE_ON"
+                                {
+                                    call.active_end = end_frame;
                                     call.trail_off = Some(*arg);
+                                    closed_any = true;
                                 }
+                            }
+                            if !closed_any {
                                 // A trail this script did not start. Kirby `SpecialHi4` and
                                 // `SpecialAirHi4` end the trail `SpecialHi2` began — the two
                                 // halves of one move, in separate scripts — so there is no call
                                 // here to close and no way to make one. Dropping the line would
                                 // leave the trail running, so it is carried verbatim.
-                                None => walk.residue(
+                                walk.residue(
                                     &format!(
                                         "macros::AFTER_IMAGE_OFF(agent, {});",
                                         crate::acmd::attack_mod_num(*arg)
                                     ),
                                     calls,
-                                ),
+                                );
                             }
                             anchor = None;
                         }

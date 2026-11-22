@@ -5308,6 +5308,21 @@ impl VisionaryApp {
             .as_ref()
             .map(|index| index.costume_gated.iter().cloned().collect())
             .unwrap_or_default();
+        if let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        {
+            let eff_dirs = self.fighter_effect_dirs(&fighter);
+            let slot = self.active_article_slot(&fighter);
+            if let Some(eff_path) = fighter_eff_path(&fighter.name, slot, &eff_dirs) {
+                if self.current_eff_path.as_ref() != Some(&eff_path) {
+                    self.current_eff_path = Some(eff_path.clone());
+                    self.eff_editor.queue_load(&eff_path);
+                }
+            }
+        }
     }
 
     /// Link the moveset remembered in the app config, quietly, as startup does: a source that
@@ -6036,20 +6051,10 @@ impl VisionaryApp {
             &fighter.fighter_dir.join("param").join("expression_vl.prc"),
         );
 
-        // The desktop no longer simulates or renders particles. Keep the selected fighter's
-        // effect file queued for the editor; live preview is provided by slight_replica in game.
-        // The project's romfs is asked first, as the game would load its file: Shy Guy's
+        // The moveset's romfs is asked first, as the game would load its file: Shy Guy's
         // effects live only in `romfs/effect/fighter/pacman/ef_pacman_c40.eff`.
-        let eff_dirs: Vec<PathBuf> = self
-            .project_romfs()
-            .into_iter()
-            .map(|romfs| romfs.join("effect").join("fighter").join(&fighter.name))
-            .chain(fighter.effect_dir.clone())
-            .chain(self.state.data_root.as_ref().map(|root| {
-                root.join("effect").join("fighter").join(&fighter.name)
-            }))
-            .collect();
-        let eff_path = fighter_eff_path(&fighter.name, fighter.base_slot(), &eff_dirs);
+        let eff_dirs = self.fighter_effect_dirs(fighter);
+        let eff_path = fighter_eff_path(&fighter.name, self.active_article_slot(fighter), &eff_dirs);
         self.current_eff_path = eff_path.clone();
         if let Some(path) = eff_path {
             self.eff_editor.queue_load(&path);
@@ -11310,9 +11315,31 @@ impl VisionaryApp {
         if calls.is_empty() {
             return Vec::new();
         }
-        let Some(effect_dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) else {
+        let selected_fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i));
+        let mut effect_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = self.current_eff_path.as_ref().and_then(|p| p.parent()) {
+            effect_dirs.push(dir.to_path_buf());
+        }
+        if let Some(fighter) = selected_fighter {
+            for dir in self.fighter_effect_dirs(fighter) {
+                if !effect_dirs.contains(&dir) {
+                    effect_dirs.push(dir);
+                }
+            }
+        }
+        if effect_dirs.is_empty() {
             return Vec::new();
-        };
+        }
+        let slot = selected_fighter
+            .map(|fighter| self.active_article_slot(fighter))
+            .or_else(|| {
+                self.current_eff_path
+                    .as_deref()
+                    .and_then(crate::preview_trail::slot_from_eff_path)
+            });
         let Some(wgpu_state) = frame.wgpu_render_state() else {
             return Vec::new();
         };
@@ -11336,11 +11363,26 @@ impl VisionaryApp {
             }
             let root = self.state.data_root.as_deref();
             let (Some(texture), Some(fade)) = (
-                crate::preview_trail::texture_path(effect_dir, root, &spec.texture),
-                crate::preview_trail::texture_path(effect_dir, root, &spec.fade),
+                crate::preview_trail::texture_path_for_slot(
+                    &effect_dirs,
+                    slot,
+                    root,
+                    &spec.texture,
+                ),
+                crate::preview_trail::texture_path_for_slot(&effect_dirs, slot, root, &spec.fade),
             ) else {
                 continue;
             };
+            let bone_a = if ec.bone_name.is_empty() {
+                spec.bone_a.as_str()
+            } else {
+                ec.bone_name.as_str()
+            };
+            let bone_b = ec
+                .trail_bone2
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .unwrap_or(spec.bone_b.as_str());
             let steps = ((newest - oldest) * 4.0).ceil().max(1.0) as usize;
             let edges: Vec<[glam::Vec3; 2]> = (0..=steps)
                 .filter_map(|i| {
@@ -11353,8 +11395,8 @@ impl VisionaryApp {
                             .map(|m| m.transform_point3(p))
                     };
                     Some([
-                        point(&spec.bone_a, spec.point_a)?,
-                        point(&spec.bone_b, spec.point_b)?,
+                        point(bone_a, spec.point_a)?,
+                        point(bone_b, spec.point_b)?,
                     ])
                 })
                 .collect();
@@ -11363,6 +11405,28 @@ impl VisionaryApp {
                 fade,
                 edges,
             });
+        }
+        out
+    }
+
+    /// Candidate `effect/fighter/<fighter>` directories for `.eff` and `trail`/`trail_cNN`
+    /// lookup: linked moveset/project `romfs/` first, then the fighter's own `effect_dir`, then
+    /// the base data dump.
+    fn fighter_effect_dirs(&self, fighter: &crate::data::FighterEntry) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut push_unique = |dir: PathBuf| {
+            if dir.is_dir() && !out.contains(&dir) {
+                out.push(dir);
+            }
+        };
+        for romfs in self.acmd_romfs_roots() {
+            push_unique(romfs.join("effect").join("fighter").join(&fighter.name));
+        }
+        if let Some(dir) = &fighter.effect_dir {
+            push_unique(dir.clone());
+        }
+        if let Some(root) = &self.state.data_root {
+            push_unique(root.join("effect").join("fighter").join(&fighter.name));
         }
         out
     }

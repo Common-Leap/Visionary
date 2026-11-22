@@ -1195,7 +1195,18 @@ impl SourceIndex {
                 // A forwarding wrapper has no body of its own; show what it runs. The resolved
                 // text was built from the same snapshot as the span, at index time.
                 if let Some(delegate) = &site.delegate {
-                    let text = self.hash_macros.expand_in(&delegate.body);
+                    let text = if prefix == "effect_" {
+                        let expanded = std::fs::read_to_string(&delegate.file)
+                            .ok()
+                            .map(|file_text| {
+                                expand_same_file_effect_helpers(&delegate.body, &file_text)
+                            })
+                            .unwrap_or_else(|| delegate.body.clone());
+                        unroll_string_array_loops(&expanded)
+                    } else {
+                        delegate.body.clone()
+                    };
+                    let text = self.hash_macros.expand_in(&text);
                     let text = self.helpers.inline(&text);
                     let text = self.consts.substitute(&text);
                     body.push_str(&header_named(&text, &name));
@@ -1212,9 +1223,16 @@ impl SourceIndex {
                 if let Ok(text) = std::fs::read_to_string(&site.file) {
                     // The span came from this file's text; a concurrent edit can shrink it.
                     if let Some(source) = text.get(site.span.clone()) {
+                        let expanded = if prefix == "effect_" {
+                            unroll_string_array_loops(&expand_same_file_effect_helpers(
+                                source, &text,
+                            ))
+                        } else {
+                            source.to_string()
+                        };
                         // `cmn!("swing_06")` reads as the name it hashes; the file keeps the
                         // macro, and write-back puts edits back into it.
-                        let source = self.hash_macros.expand_in(source);
+                        let source = self.hash_macros.expand_in(&expanded);
                         // `RUMBLE_HIT(agent, kind)` reads as the vanilla call it makes.
                         let source = self.helpers.inline(&source);
                         // `WALK_LW_DAMAGE` reads as its value; an edit to it goes to the const.
@@ -2793,6 +2811,274 @@ fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
         });
     }
     found
+}
+
+/// Expand same-file agent-only helper calls inside an `effect_` script (for example Shy Guy's
+/// `stilt_trails_on(agent);` in `effect_special_air_lw` / `effect_special_air_lw_ledge`) so the
+/// effect parser, timeline, and 3D trail preview see the macros the helper emits.
+fn expand_same_file_effect_helpers(source: &str, file_text: &str) -> String {
+    const EFFECT_MACROS: &[&str] = &[
+        "AFTER_IMAGE",
+        "EFFECT",
+        "FOOT_EFFECT",
+        "LANDING_EFFECT",
+        "BURN_COLOR",
+        "FLASH",
+        "COL_NORMAL",
+        "LAST_EFFECT",
+    ];
+    let mut helpers: HashMap<String, Option<(String, String)>> = HashMap::new();
+    for func in scan_plain_functions(file_text) {
+        let Some(params) = func.params.as_ref() else {
+            continue;
+        };
+        if params.len() != 1 || !params[0].1.contains("L2CAgentBase") {
+            continue;
+        }
+        let inner = file_text[func.body.start + 1..func.body.end - 1].trim();
+        if inner.is_empty() || !EFFECT_MACROS.iter().any(|m| inner.contains(m)) {
+            continue;
+        }
+        let entry = (params[0].0.clone(), inner.to_string());
+        helpers
+            .entry(func.name)
+            .and_modify(|existing| *existing = None)
+            .or_insert(Some(entry));
+    }
+    let helpers: HashMap<String, (String, String)> = helpers
+        .into_iter()
+        .filter_map(|(k, v)| Some((k, v?)))
+        .collect();
+    if helpers.is_empty() {
+        return source.to_string();
+    }
+    fn expand_rec(
+        text: &str,
+        helpers: &HashMap<String, (String, String)>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) -> String {
+        if depth >= 3 {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let indent_len = line.len() - line.trim_start().len();
+            let indent = &line[..indent_len];
+            let expanded = trimmed
+                .strip_suffix(';')
+                .and_then(|stmt| {
+                    let open = stmt.find('(')?;
+                    let close = stmt.rfind(')')?;
+                    if close + 1 != stmt.len() {
+                        return None;
+                    }
+                    let callee = stmt[..open].trim();
+                    let arg = stmt[open + 1..close].trim();
+                    if !is_identifier(callee) || !is_identifier(arg) || visited.contains(callee) {
+                        return None;
+                    }
+                    let (param, body) = helpers.get(callee)?;
+                    let substituted = if param != arg {
+                        replace_identifier(body, param, arg)
+                    } else {
+                        body.clone()
+                    };
+                    visited.insert(callee.to_string());
+                    let nested = expand_rec(&substituted, helpers, visited, depth + 1);
+                    visited.remove(callee);
+                    let mut block = String::new();
+                    for body_line in nested.lines() {
+                        let t = body_line.trim();
+                        if !t.is_empty() {
+                            block.push_str(indent);
+                            block.push_str(t);
+                            block.push('\n');
+                        }
+                    }
+                    Some(block)
+                });
+            if let Some(block) = expanded {
+                out.push_str(&block);
+                changed = true;
+            } else {
+                out.push_str(line);
+            }
+        }
+        if changed {
+            out
+        } else {
+            text.to_string()
+        }
+    }
+    expand_rec(source, &helpers, &mut HashSet::new(), 0)
+}
+
+/// Replace every standalone identifier occurrence of `from` with `to`, skipping strings and
+/// comments.
+fn replace_identifier(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let end = ident_end(text, i);
+            if &text[i..end] == from {
+                out.push_str(&text[last..i]);
+                out.push_str(to);
+                last = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    if last == 0 {
+        return text.to_string();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Unroll `for <ident> in ["a", "b", ...] { <body> }` loops in effect scripts by substituting
+/// each string literal for `<ident>` inside `<body>` (for example Shy Guy's
+/// `for shoe in ["stiltshoel", "stiltshoer"] { AFTER_IMAGE4_ON_arg29(..., Hash40::new(shoe), ...); }`).
+fn unroll_string_array_loops(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < source.len() {
+        if let Some(next) = skip_trivia(source, i) {
+            i = next;
+            continue;
+        }
+        if !keyword_at(source, i, "for") {
+            i += 1;
+            continue;
+        }
+        let for_start = i;
+        let mut cur = i + 3;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        let var_end = ident_end(source, cur);
+        if var_end == cur {
+            i += 3;
+            continue;
+        }
+        let var = &source[cur..var_end];
+        cur = var_end;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if !keyword_at(source, cur, "in") {
+            i = var_end;
+            continue;
+        }
+        cur += 2;
+        while cur < source.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        if bytes.get(cur) != Some(&b'[') {
+            i = cur;
+            continue;
+        }
+        let Some(arr_close) = match_bracket(source, cur) else {
+            i = cur + 1;
+            continue;
+        };
+        let items = parse_string_literal_list(&source[cur + 1..arr_close]);
+        if items.is_empty() || items.len() > 16 {
+            i = arr_close + 1;
+            continue;
+        }
+        let mut brace = arr_close + 1;
+        while brace < source.len() && bytes[brace].is_ascii_whitespace() {
+            brace += 1;
+        }
+        if bytes.get(brace) != Some(&b'{') {
+            i = brace;
+            continue;
+        }
+        let Some(body_close) = match_brace(source, brace) else {
+            i = brace + 1;
+            continue;
+        };
+        let line_start = source[..for_start].rfind('\n').map_or(0, |n| n + 1);
+        let indent = &source[line_start..for_start];
+        let inner = &source[brace + 1..body_close];
+        out.push_str(&source[last..line_start]);
+        for (idx, item) in items.iter().enumerate() {
+            let expanded = replace_identifier(inner, var, item);
+            for body_line in expanded.lines() {
+                let t = body_line.trim();
+                if !t.is_empty() {
+                    out.push_str(indent);
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            if idx + 1 == items.len() && out.ends_with('\n') {
+                out.pop();
+            }
+        }
+        last = body_close + 1;
+        i = body_close + 1;
+    }
+    if last == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[last..]);
+    out
+}
+
+fn match_bracket(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_string_literal_list(inner: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    for raw in inner.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"')
+        {
+            items.push(t.to_string());
+        } else {
+            return Vec::new();
+        }
+    }
+    items
 }
 
 /// Every `impl … { … }` block's braces, with the type's last path segment for an inherent
@@ -19574,5 +19860,45 @@ mod rewrite_article_tests {
         assert_eq!(out, text);
         assert_eq!(report.changed, 0);
         assert!(report.skipped[0].contains("wait"), "{report:?}");
+    }
+
+    #[test]
+    fn effect_helper_with_string_array_loop_expands_both_trails() {
+        let file = r#"
+unsafe fn stilt_trails_on(agent: &mut L2CAgentBase) {
+    for shoe in ["stiltshoel", "stiltshoer"] {
+        macros::AFTER_IMAGE4_ON_arg29(agent, Hash40::new("tex_shyguy_stilt1"), Hash40::new("tex_shyguy_stilt2"), 4, Hash40::new(shoe), -3.0, 0.0, 0.0, Hash40::new(shoe), 4.0, -0.0, -0.0, true, Hash40::new("marth_sword_blue"), Hash40::new(shoe), 0, 0, 0, 0, 0, 0, 0.65, 0, *EFFECT_AXIS_X, 0, *TRAIL_BLEND_ALPHA, 101, *TRAIL_CULL_NONE, 1.4, 0.2);
+    }
+}
+
+unsafe extern "C" fn effect_special_air_lw(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 14.0);
+    if macros::is_excute(agent) {
+        stilt_trails_on(agent);
+    }
+    frame(agent.lua_state_agent, 23.0);
+    if macros::is_excute(agent) {
+        macros::AFTER_IMAGE_OFF(agent, 3);
+    }
+}
+"#;
+        let start = file.find("unsafe extern \"C\" fn effect_special_air_lw").unwrap();
+        let source = &file[start..];
+        let expanded =
+            super::unroll_string_array_loops(&super::expand_same_file_effect_helpers(source, file));
+        let calls = crate::acmd::parse_effect_script(&expanded).to_effect_calls();
+        assert_eq!(calls.len(), 2, "expected 2 trail calls, got {calls:?}\n{expanded}");
+        assert_eq!(calls[0].bone_name, "stiltshoel");
+        assert_eq!(calls[1].bone_name, "stiltshoer");
+        assert_eq!((calls[0].active_start, calls[0].active_end), (14, 23));
+        assert_eq!((calls[1].active_start, calls[1].active_end), (14, 23));
+        assert!(crate::trail_preview::trail_geometry(&calls[0]).is_some());
+        assert!(
+            calls[0]
+                .raw_line
+                .as_deref()
+                .and_then(crate::preview_trail::parse)
+                .is_some()
+        );
     }
 }
