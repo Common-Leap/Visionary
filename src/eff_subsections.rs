@@ -160,7 +160,7 @@ fn section_title(magic: &str) -> String {
         "EAER" => "Spawn rate animation",
         "EAPL" => "Particle life animation",
         "EAOV" => "Outward speed animation",
-        "EADV" => "Direction speed animation",
+        "EADV" => "Speed along direction animation",
         "EAGV" => "Gravity animation",
         _ if magic.starts_with("EA") => "Other animation",
         _ => "Extra data",

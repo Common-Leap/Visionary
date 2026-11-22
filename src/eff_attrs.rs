@@ -160,13 +160,13 @@ assign_u64!(u8, u16, u32, u64);
 
 // Groups, in the order the UI stacks them. Named after the sections of the emitter binary so a
 // row here can be found in the EffectResearch tables without translation.
-pub const G_COMMON: &str = "General";
+pub const G_COMMON: &str = "Stored flags and seed";
 pub const G_EMISSION: &str = "When and how many";
 pub const G_SHAPE: &str = "Where particles start";
 pub const G_INFO: &str = "Position, turn, area and colour";
 pub const G_INFO_FLAGS: &str = "Following and options";
-pub const G_PARTICLE: &str = "Particle basics";
-pub const G_PTCL_VELOCITY: &str = "Movement";
+pub const G_PARTICLE: &str = "Facing and shape";
+pub const G_PTCL_VELOCITY: &str = "Speed and direction";
 pub const G_PTCL_COLOR: &str = "Particle colour";
 pub const G_PTCL_SCALE: &str = "Particle size";
 pub const G_PTCL_ROTATE: &str = "Spin";
@@ -238,18 +238,9 @@ pub const GROUPS: &[&str] = &[
 pub const SECTIONS: &[(&str, &[&str])] = &[
     (
         "Where and when",
-        &[G_COMMON, G_EMISSION, G_SHAPE, G_INFO, G_INFO_FLAGS],
+        &[G_EMISSION, G_SHAPE, G_INFO, G_INFO_FLAGS, G_COMMON],
     ),
-    (
-        "Movement",
-        &[
-            G_PARTICLE,
-            G_PTCL_VELOCITY,
-            G_MOTION,
-            G_PTCL_ROTATE,
-            G_FLUCTUATION,
-        ],
-    ),
+    ("Movement", &[G_PTCL_VELOCITY, G_MOTION, G_PTCL_ROTATE]),
     (
         "Colour and size",
         &[
@@ -259,11 +250,19 @@ pub const SECTIONS: &[(&str, &[&str])] = &[
             G_COLOR_KEYS,
             G_ALPHA_KEYS,
             G_SCALE_KEYS,
+            G_FLUCTUATION,
         ],
     ),
     (
         "Drawing",
-        &[G_RENDER, G_ALPHA_FX, G_SHADER, G_PARAM_KEYS, G_ANIM_RATES],
+        &[
+            G_RENDER,
+            G_PARTICLE,
+            G_ALPHA_FX,
+            G_SHADER,
+            G_PARAM_KEYS,
+            G_ANIM_RATES,
+        ],
     ),
     (
         "Textures",
@@ -597,7 +596,7 @@ fn common() -> Vec<Attr> {
         uit!(
             G_COMMON,
             "random_seed",
-            "Random seed",
+            "Stored random seed",
             "Random seed for the emitter",
             random_seed
         ),
@@ -726,32 +725,32 @@ fn emission() -> Vec<Attr> {
         fl!(
             G_EMISSION,
             "emission.gravity_scale",
-            "Gravity scale",
-            "Gravity scale",
+            "Spawn gravity",
+            "Gravity kept with the emission settings. The preview does not draw it: Gravity strength under Movement is what pulls the particles there.",
             0.01,
             emission.gravity_scale
         ),
         fl!(
             G_EMISSION,
             "emission.gravity_dir_x",
-            "Gravity dir X",
-            "Gravity direction X",
+            "Spawn gravity X",
+            "The direction of Spawn gravity: its X part. The preview does not draw it.",
             0.01,
             emission.gravity_dir_x
         ),
         fl!(
             G_EMISSION,
             "emission.gravity_dir_y",
-            "Gravity dir Y",
-            "Gravity direction Y",
+            "Spawn gravity Y",
+            "The direction of Spawn gravity: its Y part. The preview does not draw it.",
             0.01,
             emission.gravity_dir_y
         ),
         fl!(
             G_EMISSION,
             "emission.gravity_dir_z",
-            "Gravity dir Z",
-            "Gravity direction Z",
+            "Spawn gravity Z",
+            "The direction of Spawn gravity: its Z part. The preview does not draw it.",
             0.01,
             emission.gravity_dir_z
         ),
@@ -1363,7 +1362,7 @@ fn emitter_info() -> Vec<Attr> {
 fn particle() -> Vec<Attr> {
     vec![
         fb!(
-            G_PARTICLE,
+            G_EMISSION,
             "particle_data.infinite_life",
             "Infinite life",
             "Infinite lifespan",
@@ -1384,7 +1383,7 @@ fn particle() -> Vec<Attr> {
             particle_data.billboard_type
         ),
         it!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.rot_type",
             "Rotation type",
             "How the particles' spin is applied",
@@ -1398,42 +1397,42 @@ fn particle() -> Vec<Attr> {
             particle_data.offset_type
         ),
         fb!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.rot_rev_rand_x",
             "Rotation reverse random X",
             "Random X for rotation direction",
             particle_data.rot_rev_rand_x
         ),
         fb!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.rot_rev_rand_y",
             "Rotation reverse random Y",
             "Random Y for rotation direction",
             particle_data.rot_rev_rand_y
         ),
         fb!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.rot_rev_rand_z",
             "Rotation reverse random Z",
             "Random Z for rotation direction",
             particle_data.rot_rev_rand_z
         ),
         fb!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.is_rotate_x",
             "Rotate X",
             "Whether to use rotate X",
             particle_data.is_rotate_x
         ),
         fb!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.is_rotate_y",
             "Rotate Y",
             "Whether to use rotate Y",
             particle_data.is_rotate_y
         ),
         fg!(
-            G_PARTICLE,
+            G_PTCL_ROTATE,
             "particle_data.is_rotate_z",
             "Rotate Z",
             "Whether to use rotate Z",
@@ -1468,21 +1467,21 @@ fn particle() -> Vec<Attr> {
             particle_data.enable_avoid_z_fighting
         ),
         it!(
-            G_PARTICLE,
+            G_EMISSION,
             "particle_data.life",
             "Particle life",
             "How many frames each particle stays on screen.",
             particle_data.life
         ),
         it!(
-            G_PARTICLE,
+            G_EMISSION,
             "particle_data.life_random",
             "Life random",
             "Life randomness",
             particle_data.life_random
         ),
         fl!(
-            G_PARTICLE,
+            G_PTCL_VELOCITY,
             "particle_data.momentum_random",
             "Momentum random",
             "Momentum random",
@@ -1634,18 +1633,18 @@ fn particle() -> Vec<Attr> {
 
 fn velocity_color_scale() -> Vec<Attr> {
     vec![
-        fl!(G_PTCL_VELOCITY, "particle_velocity.all_direction", "All direction", "All-direction initial velocity", 0.01, particle_velocity.all_direction),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_scale", "Designated dir scale", "Specified direction velocity", 0.01, particle_velocity.designated_dir_scale),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_x", "Designated dir X", "Specified direction X", 0.01, particle_velocity.designated_dir_x),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_y", "Designated dir Y", "Specified direction Y", 0.01, particle_velocity.designated_dir_y),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_z", "Designated dir Z", "Specified direction Z", 0.01, particle_velocity.designated_dir_z),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_dir_angle", "Diffusion angle", "Specified direction dispersion angle", 0.5, particle_velocity.diffusion_dir_angle),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.xz_diffusion", "XZ diffusion", "Y axis diffusion speed", 0.01, particle_velocity.xz_diffusion),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_x", "Diffusion X", "Diffusion initial velocity X", 0.01, particle_velocity.diffusion_x),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_y", "Diffusion Y", "Diffusion initial velocity Y", 0.01, particle_velocity.diffusion_y),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_z", "Diffusion Z", "Diffusion initial velocity Z", 0.01, particle_velocity.diffusion_z),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.vel_random", "Velocity random", "Velocity randomness", 0.01, particle_velocity.vel_random),
-        fl!(G_PTCL_VELOCITY, "particle_velocity.em_vel_inherit", "Emitter velocity inherit", "Inherited emitter velocity ratio", 0.01, particle_velocity.em_vel_inherit),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.all_direction", "Outward speed", "How fast particles fly out from where they start, away from the part's centre. The preview draws it.", 0.01, particle_velocity.all_direction),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_scale", "Speed along direction", "How fast particles fly the way Direction X, Y and Z point. The preview draws it.", 0.01, particle_velocity.designated_dir_scale),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_x", "Direction X", "The way particles fly at Speed along direction: its X part.", 0.01, particle_velocity.designated_dir_x),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_y", "Direction Y", "The way particles fly at Speed along direction: its Y part.", 0.01, particle_velocity.designated_dir_y),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.designated_dir_z", "Direction Z", "The way particles fly at Speed along direction: its Z part.", 0.01, particle_velocity.designated_dir_z),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_dir_angle", "Direction spread angle", "How far, in degrees, each particle may stray from the direction. 180 sends them every way.", 0.5, particle_velocity.diffusion_dir_angle),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.xz_diffusion", "Sideways speed", "How fast particles fly outward across the part's up axis, away from its centre.", 0.01, particle_velocity.xz_diffusion),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_x", "Random speed X", "Each particle gets a random extra speed of up to this along X.", 0.01, particle_velocity.diffusion_x),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_y", "Random speed Y", "Each particle gets a random extra speed of up to this along Y.", 0.01, particle_velocity.diffusion_y),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.diffusion_z", "Random speed Z", "Each particle gets a random extra speed of up to this along Z.", 0.01, particle_velocity.diffusion_z),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.vel_random", "Speed random", "Takes up to this percent off each particle's speed, at random.", 0.01, particle_velocity.vel_random),
+        fl!(G_PTCL_VELOCITY, "particle_velocity.em_vel_inherit", "Keep the effect's motion", "How much of the effect's own movement its particles keep when they are made: 1 keeps all of it, 0 none.", 0.01, particle_velocity.em_vel_inherit),
         fg!(G_PTCL_COLOR, "particle_color.is_soft_particle", "Soft particle", "Soft particles", particle_color.is_soft_particle),
         fg!(G_PTCL_COLOR, "particle_color.is_fresnel_alpha", "Fresnel alpha", "Fresnel alpha", particle_color.is_fresnel_alpha),
         fg!(G_PTCL_COLOR, "particle_color.is_near_dist_alpha", "Near distance alpha", "Near distance alpha", particle_color.is_near_dist_alpha),
@@ -1810,7 +1809,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             emitter_static.rotate_add_rand_z
         ),
         fl!(
-            G_PTCL_ROTATE,
+            G_PTCL_SCALE,
             "emitter_static.scale_limit_dist_near",
             "Scale limit distance near",
             "Scale limit distance in front of the camera (near)",
@@ -1818,7 +1817,7 @@ fn rotation_and_motion() -> Vec<Attr> {
             emitter_static.scale_limit_dist_near
         ),
         fl!(
-            G_PTCL_ROTATE,
+            G_PTCL_SCALE,
             "emitter_static.scale_limit_dist_far",
             "Scale limit distance far",
             "Scale limit distance in front of the camera (far)",
@@ -1828,32 +1827,32 @@ fn rotation_and_motion() -> Vec<Attr> {
         fl!(
             G_MOTION,
             "emitter_static.gravity_dir_x",
-            "Gravity X",
-            "Gravity X",
+            "Gravity direction X",
+            "The way gravity pulls the particles: its X part. Gravity strength sets how hard.",
             0.01,
             emitter_static.gravity_dir_x
         ),
         fl!(
             G_MOTION,
             "emitter_static.gravity_dir_y",
-            "Gravity Y",
-            "Gravity Y",
+            "Gravity direction Y",
+            "The way gravity pulls the particles: its Y part. Gravity strength sets how hard.",
             0.01,
             emitter_static.gravity_dir_y
         ),
         fl!(
             G_MOTION,
             "emitter_static.gravity_dir_z",
-            "Gravity Z",
-            "Gravity Z",
+            "Gravity direction Z",
+            "The way gravity pulls the particles: its Z part. Gravity strength sets how hard.",
             0.01,
             emitter_static.gravity_dir_z
         ),
         fl!(
             G_MOTION,
             "emitter_static.gravity_scale",
-            "Gravity scale",
-            "Gravity scale",
+            "Gravity strength",
+            "How hard particles are pulled the way Gravity direction X, Y and Z point. This is the gravity the preview draws.",
             0.01,
             emitter_static.gravity_scale
         ),
@@ -2062,40 +2061,40 @@ fn rotation_and_motion() -> Vec<Attr> {
         fl!(
             G_ANIM_RATES,
             "emitter_static.color0_loop_rate",
-            "Colour 0 loop rate",
-            "Colour 0 loop frame rate, as a percent of one cycle's lifespan",
+            "Colour 0 loop rate 2",
+            "A second colour 0 loop rate, kept with the part's fixed settings. Colour 0 loop frame rate, as a percent of one cycle's lifespan",
             0.01,
             emitter_static.color0_loop_rate
         ),
         fl!(
             G_ANIM_RATES,
             "emitter_static.alpha0_loop_rate",
-            "Alpha 0 loop rate",
-            "Alpha 0 loop frame rate, as a percent of one cycle's lifespan",
+            "Alpha 0 loop rate 2",
+            "A second alpha 0 loop rate, kept with the part's fixed settings. Alpha 0 loop frame rate, as a percent of one cycle's lifespan",
             0.01,
             emitter_static.alpha0_loop_rate
         ),
         fl!(
             G_ANIM_RATES,
             "emitter_static.color1_loop_rate",
-            "Colour 1 loop rate",
-            "Colour 1 loop frame rate, as a percent of one cycle's lifespan",
+            "Colour 1 loop rate 2",
+            "A second colour 1 loop rate, kept with the part's fixed settings. Colour 1 loop frame rate, as a percent of one cycle's lifespan",
             0.01,
             emitter_static.color1_loop_rate
         ),
         fl!(
             G_ANIM_RATES,
             "emitter_static.alpha1_loop_rate",
-            "Alpha 1 loop rate",
-            "Alpha 1 loop frame rate, as a percent of one cycle's lifespan",
+            "Alpha 1 loop rate 2",
+            "A second alpha 1 loop rate, kept with the part's fixed settings. Alpha 1 loop frame rate, as a percent of one cycle's lifespan",
             0.01,
             emitter_static.alpha1_loop_rate
         ),
         fl!(
             G_ANIM_RATES,
             "emitter_static.scale_loop_rate",
-            "Scale loop rate",
-            "Scale loop frame rate, as a percent of one cycle's lifespan",
+            "Scale loop rate 2",
+            "A second scale loop rate, kept with the part's fixed settings. Scale loop frame rate, as a percent of one cycle's lifespan",
             0.01,
             emitter_static.scale_loop_rate
         ),
@@ -2917,32 +2916,32 @@ fn array_attributes() -> Vec<Attr> {
         16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
 
     macro_rules! key_table {
-        ($group:expr, $field:ident, $prefix:literal; $($i:tt),+ $(,)?) => {
+        ($group:expr, $field:ident, $prefix:literal, $name:literal; $($i:tt),+ $(,)?) => {
             $(v.extend([
                 Attr {
                     id: concat!($prefix, ".keys[", stringify!($i), "].x"), group: $group,
-                    label: concat!("Key ", stringify!($i), " X"), doc: "Keyframe X component",
+                    label: concat!($name, " key ", stringify!($i), " X"), doc: "Keyframe X component",
                     kind: AttrKind::Float { speed: 0.01 },
                     get: |d| Some(AttrValue::Float(d.emitter_static.$field.keys[$i].x)),
                     set: |d, value| d.emitter_static.$field.keys[$i].x = value.as_f32(),
                 },
                 Attr {
                     id: concat!($prefix, ".keys[", stringify!($i), "].y"), group: $group,
-                    label: concat!("Key ", stringify!($i), " Y"), doc: "Keyframe Y component",
+                    label: concat!($name, " key ", stringify!($i), " Y"), doc: "Keyframe Y component",
                     kind: AttrKind::Float { speed: 0.01 },
                     get: |d| Some(AttrValue::Float(d.emitter_static.$field.keys[$i].y)),
                     set: |d, value| d.emitter_static.$field.keys[$i].y = value.as_f32(),
                 },
                 Attr {
                     id: concat!($prefix, ".keys[", stringify!($i), "].z"), group: $group,
-                    label: concat!("Key ", stringify!($i), " Z"), doc: "Keyframe Z component",
+                    label: concat!($name, " key ", stringify!($i), " Z"), doc: "Keyframe Z component",
                     kind: AttrKind::Float { speed: 0.01 },
                     get: |d| Some(AttrValue::Float(d.emitter_static.$field.keys[$i].z)),
                     set: |d, value| d.emitter_static.$field.keys[$i].z = value.as_f32(),
                 },
                 Attr {
                     id: concat!($prefix, ".keys[", stringify!($i), "].time"), group: $group,
-                    label: concat!("Key ", stringify!($i), " frame"), doc: "Keyframe time in frames",
+                    label: concat!($name, " key ", stringify!($i), " frame"), doc: "Keyframe time in frames",
                     kind: AttrKind::Float { speed: 0.1 },
                     get: |d| Some(AttrValue::Float(d.emitter_static.$field.keys[$i].time)),
                     set: |d, value| d.emitter_static.$field.keys[$i].time = value.as_f32(),
@@ -2950,12 +2949,12 @@ fn array_attributes() -> Vec<Attr> {
             ]);)+
         };
     }
-    key_table!(G_COLOR_KEYS, color0, "emitter_static.color0"; 0, 1, 2, 3, 4, 5, 6, 7);
-    key_table!(G_COLOR_KEYS, color1, "emitter_static.color1"; 0, 1, 2, 3, 4, 5, 6, 7);
-    key_table!(G_ALPHA_KEYS, alpha0, "emitter_static.alpha0"; 0, 1, 2, 3, 4, 5, 6, 7);
-    key_table!(G_ALPHA_KEYS, alpha1, "emitter_static.alpha1"; 0, 1, 2, 3, 4, 5, 6, 7);
-    key_table!(G_SCALE_KEYS, scale_anim, "emitter_static.scale_anim"; 0, 1, 2, 3, 4, 5, 6, 7);
-    key_table!(G_PARAM_KEYS, param_anim, "emitter_static.param_anim"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_COLOR_KEYS, color0, "emitter_static.color0", "Colour"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_COLOR_KEYS, color1, "emitter_static.color1", "Second colour"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_ALPHA_KEYS, alpha0, "emitter_static.alpha0", "Opacity"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_ALPHA_KEYS, alpha1, "emitter_static.alpha1", "Second opacity"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_SCALE_KEYS, scale_anim, "emitter_static.scale_anim", "Size"; 0, 1, 2, 3, 4, 5, 6, 7);
+    key_table!(G_PARAM_KEYS, param_anim, "emitter_static.param_anim", "Shader value"; 0, 1, 2, 3, 4, 5, 6, 7);
 
     macro_rules! shader_bytes {
         ($field:ident, $prefix:literal, $label:literal; $($i:tt),+ $(,)?) => {
@@ -3052,6 +3051,63 @@ pub fn blank_emitter_data(version: u16) -> EmitterData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One part's tree never shows two rows of one name under one section: two "Gravity scale"
+    /// rows, one the preview draws and one it does not, could not be told apart.
+    #[test]
+    fn no_two_rows_of_one_section_share_a_label() {
+        let mut seen = std::collections::HashMap::new();
+        for attr in table() {
+            let section = SECTIONS
+                .iter()
+                .find(|(_, groups)| groups.contains(&attr.group))
+                .map(|(name, _)| *name)
+                .unwrap_or("Other");
+            let key = (section, texture_slot_of(attr.group), attr.label);
+            if let Some(other) = seen.insert(key, attr.id) {
+                panic!(
+                    "'{}' and '{}' are both '{}' under {section}",
+                    other, attr.id, attr.label
+                );
+            }
+        }
+        // The two gravities are named apart wherever they are filed.
+        let gravity: Vec<&str> = table()
+            .iter()
+            .filter(|a| a.id.ends_with("gravity_scale"))
+            .map(|a| a.label)
+            .collect();
+        assert_eq!(gravity, ["Spawn gravity", "Gravity strength"]);
+    }
+
+    /// Each section holds what its name says: the speeds under Movement, the particle-facing
+    /// rows under Drawing, the flags last in Where and when.
+    #[test]
+    fn sections_hold_what_they_say() {
+        let section_of = |id: &str| {
+            let group = table().iter().find(|a| a.id == id).unwrap().group;
+            SECTIONS
+                .iter()
+                .position(|(_, groups)| groups.contains(&group))
+                .map(|at| SECTIONS[at].0)
+        };
+        assert_eq!(
+            section_of("particle_velocity.all_direction"),
+            Some("Movement")
+        );
+        assert_eq!(section_of("emitter_static.gravity_scale"), Some("Movement"));
+        assert_eq!(section_of("particle_data.billboard_type"), Some("Drawing"));
+        assert_eq!(section_of("particle_data.life"), Some("Where and when"));
+        assert_eq!(section_of("render_state.blend_type"), Some("Drawing"));
+        let (_, where_when) = SECTIONS[0];
+        assert_eq!(where_when.last(), Some(&G_COMMON));
+        assert!(!SECTIONS
+            .iter()
+            .find(|(name, _)| *name == "Movement")
+            .unwrap()
+            .1
+            .contains(&G_PARTICLE));
+    }
 
     /// Ids are the project-file keys and the lookup map's keys — a duplicate would make one of
     /// the two rows unreachable and silently drop its edits.
