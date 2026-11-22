@@ -103,18 +103,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Pause between reconnect attempts. Fixed 1s keeps recovery snappy without hammering.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
-/// A stalled emulator can stop reading while still holding the socket open. Without a
-/// write timeout the link thread wedges inside `write_all` forever: status stays
-/// "Connected" while nothing moves. 2s is generous for localhost yet bounds the stall.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A stalled peer can stop reading while still holding the socket open. Without a write
+/// timeout the link thread wedges inside `write` forever. The limit is per `write()` call and
+/// resets on progress, so it only fires when nothing moves at all; 15s rides out Wi-Fi
+/// retransmission back-off, which 2s did not.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle probe period. Forces traffic on an otherwise silent connection so a dead peer
 /// is noticed via a send/recv error rather than lingering as a phantom "Connected".
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-/// No inbound frame (Notify / capture / CarrierStatus heartbeat / Pong) for this long
-/// means the connection is half-open: drop it and reconnect rather than showing stale
-/// "Connected". 20s comfortably covers menu idling (no spawns) while still recovering
-/// within a reasonable wait — the 5s ping guarantees traffic in the meantime.
-const STALE_TIMEOUT: Duration = Duration::from_secs(20);
+/// No inbound frame (Notify / capture / CarrierStatus heartbeat / Pong) for this long from
+/// another machine means the connection is half-open: drop it and redial. Six missed pings,
+/// so a lossy Wi-Fi link is not cut off; on this PC silence never drops (see
+/// [`LinkTimings::silent_drop_local`]).
+const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound for queued outbound frames while offline. Full-replace families are coalesced
 /// to latest, so this is only reached by pathological churn; dropping oldest keeps
 /// memory bounded and preserves the newest (authoritative) state. Constrained gimmick
@@ -1387,11 +1388,213 @@ impl LiveOverrides {
 
 // ── Link state ────────────────────────────────────────────────────────────────
 
+/// The link's state. Every surface names these with [`LinkStatus::label`] and colours them
+/// with [`LinkStatus::color`], so the words never drift apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkStatus {
-    Disconnected,
+    /// Not dialling: the window ran out or the user stopped it.
+    NotConnected,
+    /// Dialling, or the socket is open and the plugin's greeting has not arrived yet.
     Connecting,
     Connected,
+    /// Connected, but nothing has come back for a while: paused, loading or frozen.
+    NotAnswering,
+}
+
+impl LinkStatus {
+    /// The one wording of each state, used by every surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotConnected => "Game not connected",
+            Self::Connecting => "Connecting to game",
+            Self::Connected => "Game connected",
+            Self::NotAnswering => "Game not answering",
+        }
+    }
+
+    /// A socket to the game is open (answering or not); sends go out or queue on it.
+    pub fn is_connected(self) -> bool {
+        matches!(self, Self::Connected | Self::NotAnswering)
+    }
+
+    pub fn color(self, visuals: &egui::Visuals) -> egui::Color32 {
+        use egui::Color32;
+        let dark = visuals.dark_mode;
+        match self {
+            Self::Connected if dark => Color32::from_rgb(90, 220, 90),
+            Self::Connected => Color32::from_rgb(0, 128, 40),
+            Self::Connecting => visuals.warn_fg_color,
+            Self::NotAnswering if dark => Color32::from_rgb(255, 150, 60),
+            Self::NotAnswering => Color32::from_rgb(190, 80, 0),
+            Self::NotConnected => visuals.error_fg_color,
+        }
+    }
+
+    /// The button that goes with this state.
+    pub fn action(self) -> Option<LinkAction> {
+        match self {
+            Self::NotConnected => Some(LinkAction::Connect),
+            Self::Connecting => Some(LinkAction::Stop),
+            Self::NotAnswering => Some(LinkAction::Reconnect),
+            Self::Connected => None,
+        }
+    }
+
+    fn hover(self) -> &'static str {
+        match self {
+            Self::NotConnected => {
+                "Start the game with Visionary's plugin installed, then press Connect. \
+                 Edits made meanwhile are sent once it connects."
+            }
+            Self::Connecting => {
+                "Trying to reach the game. Stops trying on its own after a short while."
+            }
+            Self::Connected => "Edits reach the running game as you make them.",
+            Self::NotAnswering => {
+                "Still connected, but the game has sent nothing for a while: it may be paused, \
+                 loading or frozen. Edits wait until it answers."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    Connect,
+    Stop,
+    Reconnect,
+}
+
+impl LinkAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect",
+            Self::Stop => "Stop",
+            Self::Reconnect => "Reconnect",
+        }
+    }
+
+    fn hover(self) -> &'static str {
+        match self {
+            Self::Connect => "Try to reach the game for 30 seconds",
+            Self::Stop => "Stop trying to reach the game",
+            Self::Reconnect => "Close this connection and connect again",
+        }
+    }
+}
+
+/// A snapshot of what a status line shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkView {
+    pub status: LinkStatus,
+    pub problem: Option<LinkProblem>,
+    pub detail: Option<String>,
+    pub dialled: Option<SocketAddr>,
+    /// The address box holds something other than the address in use.
+    pub draft_is_new: bool,
+}
+
+impl LinkView {
+    /// `● Game not connected`, in the state's colour.
+    pub fn text(&self, visuals: &egui::Visuals) -> egui::RichText {
+        egui::RichText::new(format!("● {}", self.status.label())).color(self.status.color(visuals))
+    }
+
+    /// The explanation, the address and the full error: hover text only.
+    pub fn hover(&self) -> String {
+        let mut text = self.status.hover().to_string();
+        if let Some(addr) = self.dialled {
+            text.push_str(&format!("\n\n{addr}"));
+        }
+        if let Some(detail) = self
+            .detail
+            .as_deref()
+            .filter(|_| !self.status.is_connected())
+        {
+            text.push_str(&format!("\n{detail}"));
+        }
+        text
+    }
+
+    /// The short error worth a line while not connected (refused, timed out, unreachable).
+    pub fn problem_label(&self) -> Option<&'static str> {
+        self.problem
+            .filter(|_| !self.status.is_connected())
+            .map(LinkProblem::label)
+    }
+}
+
+/// The link's status line: `● Game not connected  Refused  [Connect]`. Every surface that
+/// shows the link uses this, so the words, colours and the Connect control are the same
+/// everywhere.
+pub fn link_status_line(ui: &mut egui::Ui, link: &GameLink) {
+    let view = link.view();
+    ui.label(view.text(ui.visuals()))
+        .on_hover_text(view.hover());
+    link_problem_and_action(ui, link, &view);
+}
+
+/// The problem label and the action button, for a surface that draws the state itself (the
+/// top bar's menu button).
+pub fn link_problem_and_action(ui: &mut egui::Ui, link: &GameLink, view: &LinkView) {
+    if let Some(problem) = view.problem_label() {
+        ui.label(egui::RichText::new(problem).small().weak())
+            .on_hover_text(view.hover());
+    }
+    if let Some(action) = view.status.action() {
+        if ui
+            .small_button(action.label())
+            .on_hover_text(action.hover())
+            .clicked()
+        {
+            link.apply(action);
+        }
+    }
+}
+
+/// The address box with its Connect button.
+pub fn link_address_row(ui: &mut egui::Ui, link: &GameLink) {
+    let view = link.view();
+    ui.horizontal(|ui| {
+        let mut draft = link.address_draft();
+        let hint = view
+            .dialled
+            .map_or_else(|| PLUGIN_ADDR.to_string(), |addr| addr.to_string());
+        let edit = ui
+            .add(
+                egui::TextEdit::singleline(&mut draft)
+                    .hint_text(hint)
+                    .desired_width(150.0),
+            )
+            .on_hover_text(
+                "The game's address. Leave empty for an emulator on this PC. For a Switch, \
+                 its IP address from System Settings > Internet.",
+            );
+        if edit.changed() {
+            link.set_address_draft(draft);
+        }
+        let entered = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let action = if view.draft_is_new {
+            Some(LinkAction::Connect)
+        } else {
+            view.status.action()
+        };
+        if let Some(action) = action {
+            if ui
+                .button(action.label())
+                .on_hover_text(action.hover())
+                .clicked()
+                || (entered && action != LinkAction::Stop)
+            {
+                link.apply(action);
+            }
+        }
+    });
+    if view.draft_is_new {
+        if let Err(problem) = parse_game_address(&link.address_draft()) {
+            ui.colored_label(ui.visuals().error_fg_color, problem.label());
+        }
+    }
 }
 
 /// Plugin acknowledgement for the hidden asset-carrier lifecycle.
@@ -1845,6 +2048,23 @@ struct Shared {
     /// half-open detector in `serve_connection`: a connection that stops delivering
     /// anything for `STALE_TIMEOUT` is dropped and redialled.
     last_rx: Option<Instant>,
+    /// When the link may dial; see [`RetryPolicy`].
+    policy: RetryPolicy,
+    /// Stop pressed: abandon the attempt in progress.
+    stop_requested: bool,
+    /// Reconnect pressed, or Connect with a new address: end the current session.
+    reconnect_requested: bool,
+    /// The plugin said another editor took the game over.
+    replaced: bool,
+    /// Short form of `last_error`, for the status line.
+    problem: Option<LinkProblem>,
+    /// The address the user chose; `None` is this PC (environment, `gateway.txt`, 7878).
+    address: Option<SocketAddr>,
+    /// What is in the address box, which becomes `address` on Connect.
+    address_draft: String,
+    /// The address of the latest attempt, as dialled.
+    dialled: Option<SocketAddr>,
+    attempts: u64,
 }
 
 /// Markers for every full-list-replace family on the wire. Each such message replaces
@@ -1975,7 +2195,7 @@ fn push_outbox_capped(outbox: &mut Vec<String>, frame: String) {
 impl Default for Shared {
     fn default() -> Self {
         Self {
-            status: LinkStatus::Disconnected,
+            status: LinkStatus::NotConnected,
             client_id: None,
             connection_epoch: 0,
             gimmick_agents: BTreeMap::new(),
@@ -2022,6 +2242,15 @@ impl Default for Shared {
             frames_rx: 0,
             edits_tx: 0,
             last_rx: None,
+            policy: RetryPolicy::default(),
+            stop_requested: false,
+            reconnect_requested: false,
+            replaced: false,
+            problem: None,
+            address: None,
+            address_draft: String::new(),
+            dialled: None,
+            attempts: 0,
         }
     }
 }
@@ -2031,16 +2260,15 @@ pub struct GameLink {
     started: AtomicBool,
     rule_send_suppressed: AtomicBool,
     project_send_suppressed: AtomicBool,
+    /// Wakes the link thread when the user presses Connect or Stop. Dropping it (with the
+    /// `GameLink`) ends the thread.
+    wake: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    timings: LinkTimings,
 }
 
 impl Default for GameLink {
     fn default() -> Self {
-        Self {
-            shared: Arc::new(Mutex::new(Shared::default())),
-            started: AtomicBool::new(false),
-            rule_send_suppressed: AtomicBool::new(false),
-            project_send_suppressed: AtomicBool::new(false),
-        }
+        Self::with_timings(LINK_TIMINGS)
     }
 }
 
@@ -2105,7 +2333,7 @@ impl GameLink {
         }
         let mut shared = self.shared.lock().map_err(|_| "Live queue unavailable")?;
         if controller_bundle
-            && (shared.status != LinkStatus::Connected
+            && (!shared.status.is_connected()
                 || shared.client_id.is_none()
                 || shared
                     .gimmick_controller_capabilities
@@ -2120,7 +2348,7 @@ impl GameLink {
             let capabilities = shared
                 .gimmick_feature_capabilities
                 .as_ref()
-                .filter(|_| shared.client_id.is_some() && shared.status == LinkStatus::Connected)
+                .filter(|_| shared.client_id.is_some() && shared.status.is_connected())
                 .ok_or("The current plugin does not advertise optional native features")?;
             if required_features
                 .iter()
@@ -2146,14 +2374,14 @@ impl GameLink {
 
     pub fn gimmick_live_ack(&self, family: &str) -> Option<GimmickLiveAck> {
         let shared = self.shared.lock().ok()?;
-        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+        (shared.status.is_connected() && shared.client_id.is_some())
             .then(|| shared.gimmick_live_acks.get(family).cloned())
             .flatten()
     }
 
     pub fn gimmick_live_snapshot(&self) -> Option<GimmickLiveSnapshot> {
         let shared = self.shared.lock().ok()?;
-        if shared.status != LinkStatus::Connected || shared.client_id.is_none() {
+        if !shared.status.is_connected() || shared.client_id.is_none() {
             return None;
         }
         let mut snapshot = shared.gimmick_live_snapshot.clone()?;
@@ -2179,7 +2407,7 @@ impl GameLink {
     #[cfg(test)]
     pub fn gimmick_controller_capabilities(&self) -> Option<GimmickControllerCapabilities> {
         let shared = self.shared.lock().ok()?;
-        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+        (shared.status.is_connected() && shared.client_id.is_some())
             .then(|| shared.gimmick_controller_capabilities.clone())
             .flatten()
     }
@@ -2188,7 +2416,7 @@ impl GameLink {
     /// actor/program identities. Legacy editor surfaces use the projected getter above.
     pub fn gimmick_controller_snapshot(&self) -> Option<GimmickLiveSnapshot> {
         let shared = self.shared.lock().ok()?;
-        (shared.status == LinkStatus::Connected && shared.client_id.is_some())
+        (shared.status.is_connected() && shared.client_id.is_some())
             .then(|| shared.gimmick_live_snapshot.clone())
             .flatten()
     }
@@ -2229,8 +2457,8 @@ impl GameLink {
         revision: u64,
     ) -> Result<(), String> {
         let mut shared = self.shared.lock().map_err(|_| "Live queue unavailable")?;
-        if shared.status != LinkStatus::Connected || shared.client_id.is_none() {
-            return Err("Connect to the game before restarting a controller".into());
+        if !shared.status.is_connected() || shared.client_id.is_none() {
+            return Err(LinkStatus::NotConnected.label().to_string());
         }
         if shared.gimmick_live_expected.get("behavior") != Some(&revision)
             || !shared
@@ -2435,27 +2663,140 @@ impl GameLink {
             || self.rule_send_suppressed.load(Ordering::SeqCst)
     }
 
-    /// Spawn the connection thread (idempotent). Called lazily when the eff editor opens.
+    fn with_timings(timings: LinkTimings) -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(Shared::default())),
+            started: AtomicBool::new(false),
+            rule_send_suppressed: AtomicBool::new(false),
+            project_send_suppressed: AtomicBool::new(false),
+            wake: Mutex::new(None),
+            timings,
+        }
+    }
+
+    /// Start the connection thread (idempotent) and open the first dialling window. Called
+    /// every frame; only the first call does anything. After the window the link waits for
+    /// [`Self::connect`].
     pub fn ensure_started(&self) {
         if self.started.swap(true, Ordering::SeqCst) {
             return;
         }
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Ok(mut wake) = self.wake.lock() {
+            *wake = Some(tx);
+        }
+        if let Ok(mut s) = self.shared.lock() {
+            s.policy.allow(Instant::now(), self.timings.open_window);
+            s.status = LinkStatus::Connecting;
+        }
         let shared = Arc::clone(&self.shared);
+        let timings = self.timings;
         std::thread::Builder::new()
             .name("game-link".into())
-            .spawn(move || link_thread(shared))
+            .spawn(move || link_thread(shared, rx, timings, address_file()))
             .expect("spawn game-link thread");
+    }
+
+    fn wake(&self) {
+        if let Ok(wake) = self.wake.lock() {
+            if let Some(tx) = wake.as_ref() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    /// Dial for [`LinkTimings::ask_window`], using the address in the box. A connected link
+    /// reconnects (to the new address, if it changed).
+    pub fn connect(&self) {
+        self.ensure_started();
+        let saved = {
+            let Ok(mut s) = self.shared.lock() else {
+                return;
+            };
+            let addr = match parse_game_address(&s.address_draft) {
+                Ok(addr) => addr,
+                Err(problem) => {
+                    s.problem = Some(problem);
+                    s.last_error = Some(format!("{:?} is not an IP address", s.address_draft));
+                    return;
+                }
+            };
+            let changed = addr != s.address;
+            s.address = addr;
+            s.policy.allow(Instant::now(), self.timings.ask_window);
+            s.stop_requested = false;
+            s.reconnect_requested = s.status.is_connected() || changed;
+            if s.status == LinkStatus::NotConnected {
+                s.status = LinkStatus::Connecting;
+            }
+            changed.then(|| s.address_draft.trim().to_string())
+        };
+        if let (Some(text), Some(path)) = (saved, address_file()) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, text);
+        }
+        self.wake();
+    }
+
+    /// Stop dialling now. A working connection is left alone.
+    pub fn stop(&self) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.policy.stop();
+            s.stop_requested = true;
+            if s.status == LinkStatus::Connecting {
+                s.status = LinkStatus::NotConnected;
+            }
+        }
+        self.wake();
+    }
+
+    pub fn apply(&self, action: LinkAction) {
+        match action {
+            LinkAction::Connect | LinkAction::Reconnect => self.connect(),
+            LinkAction::Stop => self.stop(),
+        }
+    }
+
+    pub fn address_draft(&self) -> String {
+        self.shared
+            .lock()
+            .map(|s| s.address_draft.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_address_draft(&self, text: String) {
+        if let Ok(mut s) = self.shared.lock() {
+            s.address_draft = text;
+        }
+    }
+
+    /// Everything a status line shows, from one lock.
+    pub fn view(&self) -> LinkView {
+        self.shared
+            .lock()
+            .map(|s| LinkView {
+                status: s.status,
+                problem: s.problem,
+                detail: s.last_error.clone(),
+                dialled: s.dialled,
+                draft_is_new: parse_game_address(&s.address_draft) != Ok(s.address),
+            })
+            .unwrap_or(LinkView {
+                status: LinkStatus::NotConnected,
+                problem: None,
+                detail: None,
+                dialled: None,
+                draft_is_new: false,
+            })
     }
 
     pub fn status(&self) -> LinkStatus {
         self.shared
             .lock()
             .map(|s| s.status)
-            .unwrap_or(LinkStatus::Disconnected)
-    }
-
-    pub fn last_error(&self) -> Option<String> {
-        self.shared.lock().ok().and_then(|s| s.last_error.clone())
+            .unwrap_or(LinkStatus::NotConnected)
     }
 
     /// Current connection's complete live fighter/weapon snapshot.
@@ -2983,6 +3324,149 @@ impl GameLink {
 
 // ── Connection thread ─────────────────────────────────────────────────────────
 
+/// Every time limit the link keeps, in one place so the tests can shrink them.
+///
+/// The windows are wall-clock: an attempt still running when its window closes is allowed to
+/// finish, and after that the link stays down until the user asks again. There is no
+/// background retry loop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkTimings {
+    /// Dialling after the editor opens.
+    pub open_window: Duration,
+    /// Dialling after the user presses Connect or Reconnect.
+    pub ask_window: Duration,
+    /// Dialling after a working connection drops (game closed, Wi-Fi blip).
+    pub drop_window: Duration,
+    /// Pause between two attempts inside a window.
+    pub retry_delay: Duration,
+    /// `connect()` limit for this PC (an emulator): a refusal is instant here, so this only
+    /// matters when the emulator's network stack is stalled.
+    pub connect_local: Duration,
+    /// `connect()` limit for another machine (a Switch over Wi-Fi). Covers ARP on a dozing
+    /// radio and a lost SYN or two.
+    pub connect_remote: Duration,
+    /// A socket that opens but never delivers the plugin's greeting is not the game: an old
+    /// plugin still serving a dead client, or something else on the port.
+    pub handshake: Duration,
+    /// Silence after which a working connection shows as not answering. The editor pings
+    /// every `ping`, and the plugin answers from its socket thread, so a live game is never
+    /// quiet this long.
+    pub stall: Duration,
+    /// Silence after which a connection to another machine is given up: the peer may be
+    /// gone without a FIN (Switch asleep, Wi-Fi lost), which only silence can reveal.
+    pub silent_drop_remote: Duration,
+    /// The same for this PC. `None`: on loopback the kernel closes a dead peer's socket, so
+    /// silence means a paused or busy emulator, and dropping it would only lose the session.
+    pub silent_drop_local: Option<Duration>,
+    /// A single `write()` that makes no progress for this long means the peer stopped
+    /// reading. Progress resets it, so a large frame over slow Wi-Fi is not cut off.
+    pub write: Duration,
+    /// Idle probe period.
+    pub ping: Duration,
+}
+
+pub(crate) const LINK_TIMINGS: LinkTimings = LinkTimings {
+    open_window: Duration::from_secs(30),
+    ask_window: Duration::from_secs(30),
+    drop_window: Duration::from_secs(15),
+    retry_delay: RECONNECT_DELAY,
+    connect_local: CONNECT_TIMEOUT,
+    connect_remote: Duration::from_secs(5),
+    handshake: Duration::from_secs(10),
+    stall: Duration::from_secs(12),
+    silent_drop_remote: STALE_TIMEOUT,
+    silent_drop_local: None,
+    write: WRITE_TIMEOUT,
+    ping: PING_INTERVAL,
+};
+
+impl LinkTimings {
+    fn connect_timeout(&self, addr: &SocketAddr) -> Duration {
+        if addr.ip().is_loopback() {
+            self.connect_local
+        } else {
+            self.connect_remote
+        }
+    }
+
+    fn silent_drop(&self, addr: &SocketAddr) -> Option<Duration> {
+        if addr.ip().is_loopback() {
+            self.silent_drop_local
+        } else {
+            Some(self.silent_drop_remote)
+        }
+    }
+}
+
+/// When the link may dial. `until` is the end of the current window; `None` means the user
+/// has to ask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetryPolicy {
+    until: Option<Instant>,
+}
+
+impl RetryPolicy {
+    /// Open (or extend) a window ending `window` from `now`.
+    pub(crate) fn allow(&mut self, now: Instant, window: Duration) {
+        let end = now + window;
+        self.until = Some(self.until.map_or(end, |until| until.max(end)));
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.until = None;
+    }
+
+    pub(crate) fn wants_attempt(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+}
+
+/// Why the last attempt or connection ended, in the few words a status line can carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkProblem {
+    Refused,
+    TimedOut,
+    Unreachable,
+    NoAnswer,
+    Closed,
+    Lost,
+    Replaced,
+    BadAddress,
+    Failed,
+}
+
+impl LinkProblem {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Refused => "Refused",
+            Self::TimedOut => "Timed out",
+            Self::Unreachable => "Host unreachable",
+            Self::NoAnswer => "No answer",
+            Self::Closed => "Closed by the game",
+            Self::Lost => "Connection lost",
+            Self::Replaced => "Another editor connected",
+            Self::BadAddress => "Not an address",
+            Self::Failed => "Could not connect",
+        }
+    }
+
+    fn of_io(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match error.kind() {
+            ErrorKind::ConnectionRefused => Self::Refused,
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => Self::TimedOut,
+            ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => Self::Unreachable,
+            ErrorKind::AddrNotAvailable | ErrorKind::InvalidInput => Self::BadAddress,
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::NotConnected => Self::Lost,
+            _ => Self::Failed,
+        }
+    }
+}
+
 fn connect_hint(error: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
     match error.kind() {
@@ -2995,8 +3479,64 @@ fn connect_hint(error: &std::io::Error) -> &'static str {
             " — timed out; the emulator's virtual network may be stalled or the \
              Network Interface may be unset (Eden Configure → System → Network)"
         }
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+            " — no route to that address; check the Switch's IP address and that both \
+             machines are on the same network"
+        }
         _ => "",
     }
+}
+
+/// The address the user typed: an IP with or without a port (a Switch's IP from its
+/// Internet settings, or `127.0.0.1:7878`). Empty is `Ok(None)`: this PC, honouring the
+/// environment and `gateway.txt`. Host names are refused on purpose — resolving one is DNS,
+/// which can block, and a Switch has no name to resolve.
+pub(crate) fn parse_game_address(text: &str) -> Result<Option<SocketAddr>, LinkProblem> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let addr = text
+        .parse::<SocketAddr>()
+        .ok()
+        .or_else(|| {
+            text.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, DEFAULT_PLUGIN_PORT))
+        })
+        .filter(|addr| addr.port() != 0 && !addr.ip().is_unspecified())
+        .ok_or(LinkProblem::BadAddress)?;
+    Ok(Some(addr))
+}
+
+/// Where the typed address is kept between runs. Tests never touch it.
+fn address_file() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    dirs::config_dir().map(|dir| dir.join("visionary").join("game_address.txt"))
+}
+
+/// Forget everything that belongs to one plugin session.
+fn reset_session(s: &mut Shared) {
+    s.client_id = None;
+    s.gimmick_agents.clear();
+    s.gimmick_agents_wire_seq = None;
+    s.gimmick_agents_received = None;
+    s.gimmick_agents_error = None;
+    s.gimmick_meters.clear();
+    s.gimmick_meters_wire_seq = None;
+    s.gimmick_live_acks.clear();
+    s.gimmick_live_snapshot = None;
+    s.gimmick_controller_capabilities = None;
+    s.gimmick_controller_capabilities_seq = None;
+    s.gimmick_feature_capabilities = None;
+    s.gimmick_feature_capabilities_seq = None;
+    s.gimmick_operations_in_flight = 0;
+    s.last_rx = None;
+    s.replaced = false;
 }
 
 fn current_gimmick_agents_snapshot(shared: &Shared) -> bool {
@@ -3005,98 +3545,195 @@ fn current_gimmick_agents_snapshot(shared: &Shared) -> bool {
     // game also pauses game-thread publication, and that used to turn working
     // selectors back into raw ID fields after three seconds. Every operation is
     // revalidated in-game, so a paused snapshot is safe selection metadata.
-    shared.status == LinkStatus::Connected
+    shared.status.is_connected()
         && shared.client_id.is_some()
         && shared.gimmick_agents_epoch == shared.connection_epoch
         && shared.gimmick_agents_received.is_some()
 }
 
-fn link_thread(shared: Arc<Mutex<Shared>>) {
-    loop {
-        {
+fn link_thread(
+    shared: Arc<Mutex<Shared>>,
+    wake: std::sync::mpsc::Receiver<()>,
+    timings: LinkTimings,
+    address_file: Option<std::path::PathBuf>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    // The saved address is read here, off the UI thread.
+    if let Some(text) = address_file.and_then(|path| std::fs::read_to_string(path).ok()) {
+        let text = text.trim().to_string();
+        if let Ok(addr) = parse_game_address(&text) {
             let mut s = shared.lock().unwrap();
-            s.status = LinkStatus::Connecting;
-            s.client_id = None;
-            s.gimmick_agents.clear();
-            s.gimmick_agents_wire_seq = None;
-            s.gimmick_agents_received = None;
-            s.gimmick_agents_error = None;
-            s.gimmick_meters.clear();
-            s.gimmick_meters_wire_seq = None;
-            s.gimmick_live_acks.clear();
-            s.gimmick_live_snapshot = None;
-            s.gimmick_controller_capabilities = None;
-            s.gimmick_controller_capabilities_seq = None;
-            s.gimmick_feature_capabilities = None;
-            s.gimmick_feature_capabilities_seq = None;
-            discard_session_bound_messages(&mut s.outbox);
-            s.last_rx = None;
-            s.gimmick_operations_in_flight = 0;
+            // A Connect pressed before this read finished already chose an address.
+            if s.address.is_none() && s.address_draft.is_empty() {
+                s.address = addr;
+                s.address_draft = text;
+            }
         }
-        let addr = plugin_addr();
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+    }
+
+    loop {
+        let target = {
+            let mut s = shared.lock().unwrap();
+            reset_session(&mut s);
+            discard_session_bound_messages(&mut s.outbox);
+            if s.policy.wants_attempt(Instant::now()) {
+                s.status = LinkStatus::Connecting;
+                s.stop_requested = false;
+                s.reconnect_requested = false;
+                Some(s.address)
+            } else {
+                s.status = LinkStatus::NotConnected;
+                None
+            }
+        };
+        let Some(chosen) = target else {
+            // Idle until the user asks. A closed channel means the editor is gone.
+            if wake.recv().is_err() {
+                return;
+            }
+            continue;
+        };
+
+        // `plugin_addr` may read gateway.txt from disk: this thread, never the UI's.
+        let addr = chosen.unwrap_or_else(plugin_addr);
+        if let Ok(mut s) = shared.lock() {
+            s.dialled = Some(addr);
+            s.attempts += 1;
+        }
+        let result = TcpStream::connect_timeout(&addr, timings.connect_timeout(&addr));
+        let stopped = shared
+            .lock()
+            .map(|mut s| std::mem::take(&mut s.stop_requested))
+            .unwrap_or(false);
+        match result {
+            Ok(_) if stopped => {}
             Ok(stream) => {
-                {
-                    let mut s = shared.lock().unwrap();
-                    s.status = LinkStatus::Connected;
-                    s.last_error = None;
-                    // Fresh socket, fresh liveness baseline: the stale timer must not
-                    // inherit silence from the previous (dead) connection.
-                    s.last_rx = Some(Instant::now());
-                }
-                let reason = serve_connection(&shared, stream);
+                let end = serve_connection(&shared, stream, &timings, Some(&wake));
                 let mut s = shared.lock().unwrap();
-                s.status = LinkStatus::Disconnected;
-                s.last_error = reason;
-                s.client_id = None;
-                s.gimmick_agents.clear();
-                s.gimmick_agents_wire_seq = None;
-                s.gimmick_agents_received = None;
-                s.gimmick_agents_error = None;
-                s.gimmick_meters.clear();
-                s.gimmick_meters_wire_seq = None;
-                s.last_rx = None;
-                s.gimmick_live_acks.clear();
-                s.gimmick_live_snapshot = None;
-                s.gimmick_controller_capabilities = None;
-                s.gimmick_controller_capabilities_seq = None;
-                s.gimmick_feature_capabilities = None;
-                s.gimmick_feature_capabilities_seq = None;
-                s.gimmick_operations_in_flight = 0;
+                reset_session(&mut s);
+                s.last_error = Some(end.detail);
+                s.problem = end.problem;
+                if end.problem == Some(LinkProblem::Replaced) {
+                    // Another editor has the game now; dialling back would knock it off.
+                    s.policy.stop();
+                } else if end.worked && end.retry {
+                    s.policy.allow(Instant::now(), timings.drop_window);
+                }
+                if end.gone {
+                    s.status = LinkStatus::NotConnected;
+                    return;
+                }
             }
             Err(e) => {
                 let hint = connect_hint(&e);
                 let mut s = shared.lock().unwrap();
-                s.status = LinkStatus::Disconnected;
+                s.problem = Some(LinkProblem::of_io(&e));
                 s.last_error = Some(format!("connect to {addr}: {e}{hint}"));
-                s.client_id = None;
-                s.gimmick_agents.clear();
-                s.gimmick_agents_wire_seq = None;
-                s.gimmick_agents_received = None;
-                s.gimmick_agents_error = None;
-                s.gimmick_meters.clear();
-                s.gimmick_meters_wire_seq = None;
-                s.last_rx = None;
-                s.gimmick_live_acks.clear();
-                s.gimmick_live_snapshot = None;
-                s.gimmick_controller_capabilities = None;
-                s.gimmick_controller_capabilities_seq = None;
-                s.gimmick_feature_capabilities = None;
-                s.gimmick_feature_capabilities_seq = None;
             }
         }
-        std::thread::sleep(RECONNECT_DELAY);
+
+        let again = shared
+            .lock()
+            .map(|s| s.policy.wants_attempt(Instant::now()))
+            .unwrap_or(false);
+        if again {
+            // A Connect or Stop press cuts the pause short.
+            if let Err(RecvTimeoutError::Disconnected) = wake.recv_timeout(timings.retry_delay) {
+                return;
+            }
+        }
     }
 }
 
-fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Option<String> {
+/// How one socket session ended.
+#[derive(Debug)]
+struct ConnectionEnd {
+    /// The plugin's greeting arrived: this was the game, not just an open port.
+    worked: bool,
+    /// Dial again for a short window (false when the user or another editor ended it).
+    retry: bool,
+    /// The `GameLink` was dropped; the thread should exit.
+    gone: bool,
+    /// `None` when the editor itself ended it.
+    problem: Option<LinkProblem>,
+    detail: String,
+}
+
+impl ConnectionEnd {
+    fn new(worked: bool, problem: LinkProblem, detail: impl Into<String>) -> Self {
+        Self {
+            worked,
+            retry: true,
+            gone: false,
+            problem: Some(problem),
+            detail: detail.into(),
+        }
+    }
+
+    fn by_user(worked: bool) -> Self {
+        Self {
+            worked,
+            retry: false,
+            gone: false,
+            problem: None,
+            detail: "closed by the editor".into(),
+        }
+    }
+}
+
+/// Size of one `write()`: small enough that a slow link shows progress between calls.
+const WRITE_CHUNK: usize = 64 * 1024;
+/// A `write()` that blocked at least this long and then progressed proves the peer is
+/// reading (the kernel buffer was full and drained).
+const BLOCKED_WRITE: Duration = Duration::from_millis(200);
+
+/// Write one frame in chunks. Returns whether a chunk had to wait for the peer and then got
+/// through, which is evidence of a live reader that a buffered write is not.
+fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<bool> {
+    let mut sent = 0;
+    let mut peer_drained = false;
+    while sent < bytes.len() {
+        let end = (sent + WRITE_CHUNK).min(bytes.len());
+        let started = Instant::now();
+        match stream.write(&bytes[sent..end]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                sent += n;
+                peer_drained |= started.elapsed() >= BLOCKED_WRITE;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(peer_drained)
+}
+
+fn serve_connection(
+    shared: &Arc<Mutex<Shared>>,
+    mut stream: TcpStream,
+    timings: &LinkTimings,
+    wake: Option<&std::sync::mpsc::Receiver<()>>,
+) -> ConnectionEnd {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(timings.write));
     let _ = stream.set_nodelay(true);
-    let mut buf = String::new();
-    let mut chunk = [0u8; 8192];
+    let silent_drop = stream
+        .peer_addr()
+        .ok()
+        .and_then(|addr| timings.silent_drop(&addr));
+    let mut reader = FrameReader::default();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let opened = Instant::now();
     let mut last_ping = Instant::now();
     let mut ping_seq: u64 = 0;
+    // Most recent proof the game is there: an inbound frame or a drained write.
+    let mut heard: Option<Instant> = None;
+    let mut worked = false;
+    if let Ok(mut s) = shared.lock() {
+        s.last_rx = None;
+        s.replaced = false;
+    }
 
     // Requeue unsent frames at the FRONT, preserving order, so an interrupted flush
     // loses nothing: edits made while offline are delivered on the next connection.
@@ -3120,6 +3757,30 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
     };
 
     loop {
+        // The editor dropping its `GameLink` ends the thread; wake-ups carry no data.
+        if let Some(wake) = wake {
+            loop {
+                match wake.try_recv() {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        return ConnectionEnd {
+                            gone: true,
+                            ..ConnectionEnd::by_user(worked)
+                        };
+                    }
+                }
+            }
+        }
+        {
+            let mut s = shared.lock().unwrap();
+            if std::mem::take(&mut s.reconnect_requested)
+                || (!worked && std::mem::take(&mut s.stop_requested))
+            {
+                return ConnectionEnd::by_user(worked);
+            }
+        }
+
         // Outbound edits first — they're latency-sensitive.
         let pending: Vec<String> = {
             let mut s = shared.lock().unwrap();
@@ -3132,18 +3793,22 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         };
         let mut pending = pending;
         retain_latest_full_replace(&mut pending);
-        let mut failed_at: Option<(usize, String)> = None;
+        let mut failed_at: Option<(usize, std::io::Error)> = None;
         for (index, msg) in pending.iter().enumerate() {
-            if let Err(e) = stream.write_all(msg.as_bytes()) {
-                failed_at = Some((index, format!("send: {e}")));
-                break;
+            match write_frame(&mut stream, msg.as_bytes()) {
+                Ok(true) => heard = Some(Instant::now()),
+                Ok(false) => {}
+                Err(e) => {
+                    failed_at = Some((index, e));
+                    break;
+                }
             }
         }
-        if let Some((index, reason)) = failed_at {
-            // `index` failed; it and everything after it never hit the wire.
+        if let Some((index, e)) = failed_at {
+            // `index` failed; it and everything after it never fully hit the wire.
             let unsent: Vec<String> = pending.into_iter().skip(index).collect();
             requeue_front(shared, unsent);
-            return Some(reason);
+            return ConnectionEnd::new(worked, LinkProblem::of_io(&e), format!("send: {e}"));
         }
 
         // `write_all` accepted every pending frame. There is intentionally no
@@ -3155,85 +3820,173 @@ fn serve_connection(shared: &Arc<Mutex<Shared>>, mut stream: TcpStream) -> Optio
         }
 
         // Idle probe: force traffic so a half-open socket surfaces as an error even
-        // when the user makes no edits. The plugin answers with `Pong` (older builds
-        // log `unknown command: ping` and stay connected — harmless).
-        if last_ping.elapsed() >= PING_INTERVAL {
+        // when the user makes no edits. The plugin answers with `Pong` from its socket
+        // thread, so a paused game still answers.
+        if last_ping.elapsed() >= timings.ping {
             ping_seq = ping_seq.wrapping_add(1);
             let ping =
                 format!("<TCP_MESSAGE>{{\"command\":\"ping\",\"echo\":{ping_seq}}}</TCP_MESSAGE>");
-            if let Err(e) = stream.write_all(ping.as_bytes()) {
-                return Some(format!("send ping: {e}"));
+            if let Err(e) = write_frame(&mut stream, ping.as_bytes()) {
+                return ConnectionEnd::new(
+                    worked,
+                    LinkProblem::of_io(&e),
+                    format!("send ping: {e}"),
+                );
             }
             last_ping = Instant::now();
         }
 
         match stream.read(&mut chunk) {
-            Ok(0) => return Some("closed by plugin".into()),
+            Ok(0) => return ConnectionEnd::new(worked, LinkProblem::Closed, "closed by plugin"),
             Ok(n) => {
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-                for payload in extract_frames(&mut buf) {
+                for payload in reader.push(&chunk[..n]) {
                     handle_frame(shared, &payload);
                 }
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Some(format!("recv: {e}")),
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return ConnectionEnd::new(worked, LinkProblem::of_io(&e), format!("recv: {e}"))
+            }
         }
 
-        // Half-open detector: pings guarantee regular traffic, and the plugin emits a
-        // CarrierStatus heartbeat (~2s) while in a match, so a long silence means the
-        // peer is gone even though the socket never closed.
-        let stale = shared
-            .lock()
-            .ok()
-            .and_then(|s| s.last_rx)
-            .is_some_and(|t| t.elapsed() > STALE_TIMEOUT);
-        if stale {
-            return Some(
-                "stale: no frames from the game for 20s (emulator stalled or connection \
-                 half-open; reconnecting)"
-                    .into(),
+        let now = Instant::now();
+        let mut s = shared.lock().unwrap();
+        if s.replaced {
+            // Another editor took the game. Fighting it back would only bounce both.
+            return ConnectionEnd {
+                retry: false,
+                ..ConnectionEnd::new(
+                    worked,
+                    LinkProblem::Replaced,
+                    "another editor connected to the game",
+                )
+            };
+        }
+        let Some(rx) = s.last_rx else {
+            // Only a frame from the plugin proves this is the game; a drained write could be
+            // any program that reads.
+            if now.duration_since(opened) > timings.handshake {
+                return ConnectionEnd::new(
+                    false,
+                    LinkProblem::NoAnswer,
+                    format!(
+                        "the port opened but the game sent nothing for {}s (another program \
+                         on the port, or an older plugin still serving a lost editor)",
+                        timings.handshake.as_secs()
+                    ),
+                );
+            }
+            continue;
+        };
+        let heard_at = heard.map_or(rx, |h| h.max(rx));
+        heard = Some(heard_at);
+        if !worked {
+            worked = true;
+            s.problem = None;
+            s.last_error = None;
+        }
+        let quiet = now.duration_since(heard_at);
+        if silent_drop.is_some_and(|limit| quiet > limit) {
+            return ConnectionEnd::new(
+                true,
+                LinkProblem::Lost,
+                format!(
+                    "stale: no frames from the game for {}s (connection half-open; reconnecting)",
+                    quiet.as_secs()
+                ),
             );
         }
+        s.status = if quiet > timings.stall {
+            LinkStatus::NotAnswering
+        } else {
+            LinkStatus::Connected
+        };
     }
 }
 
-fn extract_frames(buf: &mut String) -> Vec<String> {
-    const OPEN: &str = "<TCP_MESSAGE>";
-    const CLOSE: &str = "</TCP_MESSAGE>";
-    let mut out = Vec::new();
-    while let (Some(s), Some(e)) = (buf.find(OPEN), buf.find(CLOSE)) {
-        if e < s {
-            // Torn close tag before an open — drop the garbage prefix.
-            *buf = buf[e + CLOSE.len()..].to_string();
-            continue;
-        }
-        let payload = buf[s + OPEN.len()..e].trim().to_string();
-        *buf = buf[e + CLOSE.len()..].to_string();
-        if !payload.is_empty() {
-            out.push(payload);
-        }
-    }
-    // Runaway guard that never drops an in-flight message. The old code cleared the
-    // whole buffer past 1 MiB, which discarded a fragmented frame mid-arrival. Only
-    // genuine garbage (no opening tag) is dropped. A prefix before a recent opening tag is
-    // trimmed, while one unterminated frame beyond the hard cap is rejected.
-    const GARBAGE_CAP: usize = 1 << 20;
-    const FRAME_CAP: usize = 16 << 20;
-    if buf.len() > GARBAGE_CAP && !buf.contains(OPEN) {
-        buf.clear();
-    } else if buf.len() > FRAME_CAP {
-        if let Some(last) = buf.rfind(OPEN) {
-            if last > 0 && buf.len() - last <= FRAME_CAP {
-                *buf = buf[last..].to_string();
-            } else {
-                buf.clear();
+/// Reassembles `<TCP_MESSAGE>…</TCP_MESSAGE>` frames from socket reads.
+///
+/// Bytes, not text: a read can end inside a multi-byte character (a non-ASCII path or name),
+/// and decoding each read on its own turned that character into two replacement marks. Only a
+/// complete frame is decoded. `scanned` remembers how far the buffer is known to hold no
+/// closing tag, so a large frame arriving in many reads is scanned once, not once per read.
+#[derive(Default)]
+struct FrameReader {
+    buf: Vec<u8>,
+    scanned: usize,
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+impl FrameReader {
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        const OPEN: &[u8] = b"<TCP_MESSAGE>";
+        const CLOSE: &[u8] = b"</TCP_MESSAGE>";
+        // Runaway guard that never drops an in-flight message. Only genuine garbage (no
+        // opening tag) is dropped. A prefix before a recent opening tag is trimmed, while one
+        // unterminated frame beyond the hard cap is rejected.
+        const GARBAGE_CAP: usize = 1 << 20;
+        const FRAME_CAP: usize = 16 << 20;
+
+        self.buf.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut start = 0;
+        loop {
+            let from = self.scanned.max(start);
+            let Some(close) = find_bytes(&self.buf[from..], CLOSE).map(|i| from + i) else {
+                self.scanned = self.buf.len().saturating_sub(CLOSE.len() - 1).max(start);
+                break;
+            };
+            // The newest opening tag before this close: a torn frame without its close is
+            // dropped rather than swallowing the next whole frame.
+            if let Some(open) = rfind_bytes(&self.buf[start..close], OPEN) {
+                let body = &self.buf[start + open + OPEN.len()..close];
+                let payload = String::from_utf8_lossy(body).trim().to_string();
+                if !payload.is_empty() {
+                    out.push(payload);
+                }
             }
-        } else {
-            buf.clear();
+            start = close + CLOSE.len();
+            self.scanned = start;
         }
+        if start > 0 {
+            self.buf.drain(..start);
+            self.scanned -= start;
+        }
+        if self.buf.len() > GARBAGE_CAP && find_bytes(&self.buf, OPEN).is_none() {
+            self.buf.clear();
+            self.scanned = 0;
+        } else if self.buf.len() > FRAME_CAP {
+            match rfind_bytes(&self.buf, OPEN) {
+                Some(last) if last > 0 && self.buf.len() - last <= FRAME_CAP => {
+                    self.buf.drain(..last);
+                    self.scanned = self.scanned.saturating_sub(last);
+                }
+                _ => {
+                    self.buf.clear();
+                    self.scanned = 0;
+                }
+            }
+        }
+        out
     }
+}
+
+/// String front end over [`FrameReader`] for tests that build streams as text.
+#[cfg(test)]
+fn extract_frames(buf: &mut String) -> Vec<String> {
+    let mut reader = FrameReader::default();
+    let out = reader.push(buf.as_bytes());
+    *buf = String::from_utf8_lossy(&reader.buf).into_owned();
     out
 }
 
@@ -3258,6 +4011,8 @@ fn handle_frame(shared: &Arc<Mutex<Shared>>, payload: &str) {
         // Heartbeat answer from the plugin. Any frame proves liveness; `Pong` carries
         // no state and needs no further handling.
         "Pong" => {}
+        // Sent by the plugin to this editor just before it switches to a newer one.
+        "Replaced" => s.replaced = true,
         "Notify" => {
             let Some(n) = body.get("Notify") else { return };
             let Some(id) = n.get("id").and_then(|i| i.as_u64()) else {
@@ -8082,12 +8837,10 @@ mod tests {
         ];
         shared.lock().unwrap().outbox = pending.clone();
 
-        let reason = serve_connection(&shared, server);
+        let end = serve_connection(&shared, server, &LINK_TIMINGS, None);
         assert!(
-            reason
-                .as_deref()
-                .is_some_and(|message| message.starts_with("send:")),
-            "a closed write half must report a send failure: {reason:?}"
+            end.detail.starts_with("send:"),
+            "a closed write half must report a send failure: {end:?}"
         );
         assert_eq!(
             shared.lock().unwrap().outbox,
@@ -8113,14 +8866,18 @@ mod tests {
         shared.lock().unwrap().outbox = expected.iter().map(|s| (*s).to_string()).collect();
 
         let thread_shared = Arc::clone(&shared);
-        let worker = std::thread::spawn(move || serve_connection(&thread_shared, server));
+        let worker = std::thread::spawn(move || {
+            serve_connection(&thread_shared, server, &LINK_TIMINGS, None)
+        });
         let mut received = vec![0u8; wire.len()];
         client.read_exact(&mut received).unwrap();
         assert_eq!(received, wire.as_bytes());
         assert!(shared.lock().unwrap().outbox.is_empty());
 
         drop(client);
-        assert_eq!(worker.join().unwrap(), Some("closed by plugin".into()));
+        let end = worker.join().unwrap();
+        assert_eq!(end.detail, "closed by plugin");
+        assert_eq!(end.problem, Some(LinkProblem::Closed));
     }
 
     #[test]
@@ -8180,9 +8937,7 @@ mod tests {
     }
 
     #[test]
-    fn pong_updates_liveness_and_silent_stale_connection_requests_reconnect() {
-        use std::net::{TcpListener, TcpStream};
-
+    fn pong_updates_liveness() {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stale = Instant::now() - STALE_TIMEOUT - Duration::from_secs(1);
         shared.lock().unwrap().last_rx = Some(stale);
@@ -8193,20 +8948,6 @@ mod tests {
         let refreshed = shared.lock().unwrap().last_rx.unwrap();
         assert!(refreshed > stale);
         assert_eq!(shared.lock().unwrap().frames_rx, 1);
-
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
-        shared.lock().unwrap().last_rx = Some(stale);
-
-        let reason = serve_connection(&shared, server);
-        assert_eq!(
-            reason.as_deref(),
-            Some(
-                "stale: no frames from the game for 20s (emulator stalled or connection half-open; reconnecting)"
-            )
-        );
-        drop(client);
     }
 
     #[test]
@@ -9730,5 +10471,623 @@ mod tests {
         );
         deliver(&link, "GimmickLiveState", controller_state(1, too_many));
         assert!(link.gimmick_controller_snapshot().is_none());
+    }
+}
+
+/// The connection policy, run on the real link thread against a stand-in game on loopback,
+/// with every limit shrunk so a window lasts well under a second.
+#[cfg(test)]
+mod link_policy_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicU64;
+
+    fn fast() -> LinkTimings {
+        LinkTimings {
+            open_window: Duration::from_millis(600),
+            ask_window: Duration::from_millis(600),
+            drop_window: Duration::from_millis(600),
+            retry_delay: Duration::from_millis(50),
+            connect_local: Duration::from_millis(500),
+            connect_remote: Duration::from_millis(500),
+            handshake: Duration::from_millis(300),
+            stall: Duration::from_millis(300),
+            silent_drop_remote: Duration::from_millis(800),
+            silent_drop_local: None,
+            write: Duration::from_secs(2),
+            ping: Duration::from_millis(100),
+        }
+    }
+
+    /// A link that dials `addr` as if the user had typed it.
+    fn link_to(addr: SocketAddr, timings: LinkTimings) -> GameLink {
+        let link = GameLink::with_timings(timings);
+        {
+            let mut s = link.shared.lock().unwrap();
+            s.address = Some(addr);
+            s.address_draft = addr.to_string();
+        }
+        link
+    }
+
+    fn attempts(link: &GameLink) -> u64 {
+        link.shared.lock().unwrap().attempts
+    }
+
+    fn problem(link: &GameLink) -> Option<LinkProblem> {
+        link.shared.lock().unwrap().problem
+    }
+
+    fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < limit, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A port nothing listens on: connecting is refused at once.
+    fn refused_port() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    fn frame(header: &str, body: &str) -> String {
+        let body = serde_json::Value::String(body.to_string());
+        format!("<TCP_MESSAGE>{{\"header\":\"{header}\",\"body\":{body}}}</TCP_MESSAGE>")
+    }
+
+    /// Stands in for the plugin's server: greets each client the way the plugin does,
+    /// answers pings while `answer` is set, and can drop the client (`kick`, optionally with
+    /// the `Replaced` notice) or stop listening (`close`).
+    struct FakeGame {
+        addr: SocketAddr,
+        answer: Arc<AtomicBool>,
+        kick: Arc<AtomicBool>,
+        replace: Arc<AtomicBool>,
+        open: Arc<AtomicBool>,
+        accepted: Arc<AtomicU64>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeGame {
+        fn start(greet: bool) -> Self {
+            Self::start_on(TcpListener::bind(("127.0.0.1", 0)).unwrap(), greet)
+        }
+
+        fn start_on(listener: TcpListener, greet: bool) -> Self {
+            let addr = listener.local_addr().unwrap();
+            let answer = Arc::new(AtomicBool::new(true));
+            let kick = Arc::new(AtomicBool::new(false));
+            let replace = Arc::new(AtomicBool::new(false));
+            let open = Arc::new(AtomicBool::new(true));
+            let accepted = Arc::new(AtomicU64::new(0));
+            let (a, k, r, o, n) = (
+                answer.clone(),
+                kick.clone(),
+                replace.clone(),
+                open.clone(),
+                accepted.clone(),
+            );
+            listener.set_nonblocking(true).unwrap();
+            let thread = std::thread::spawn(move || {
+                while o.load(Ordering::SeqCst) {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let id = n.fetch_add(1, Ordering::SeqCst) + 1;
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(Duration::from_millis(10)))
+                        .unwrap();
+                    if greet {
+                        let hello = frame("RemoveAll", "{}")
+                            + &frame(
+                                "GiveClientId",
+                                &format!("{{\"GiveClientId\":{{\"client_id\":{id}}}}}"),
+                            );
+                        let _ = conn.write_all(hello.as_bytes());
+                    }
+                    let mut buf = [0u8; 4096];
+                    while o.load(Ordering::SeqCst) {
+                        if k.swap(false, Ordering::SeqCst) {
+                            if r.load(Ordering::SeqCst) {
+                                let _ = conn.write_all(frame("Replaced", "{}").as_bytes());
+                            }
+                            break;
+                        }
+                        match conn.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&buf[..n]);
+                                if greet && a.load(Ordering::SeqCst) && text.contains("\"ping\"") {
+                                    let _ = conn.write_all(frame("Pong", "{}").as_bytes());
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                answer,
+                kick,
+                replace,
+                open,
+                accepted,
+                thread: Some(thread),
+            }
+        }
+
+        /// Stop listening and drop the client, like the emulator closing.
+        fn close(&mut self) {
+            self.open.store(false, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for FakeGame {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+
+    #[test]
+    fn opening_dials_for_a_bounded_window_then_waits_for_connect() {
+        let addr = refused_port();
+        let link = link_to(addr, fast());
+        let opened = Instant::now();
+        link.ensure_started();
+        assert_eq!(link.status(), LinkStatus::Connecting);
+
+        wait_for("the open window to close", Duration::from_secs(5), || {
+            link.status() == LinkStatus::NotConnected
+        });
+        assert!(
+            opened.elapsed() >= fast().open_window,
+            "gave up before the window ended"
+        );
+        assert_eq!(problem(&link), Some(LinkProblem::Refused));
+        let tried = attempts(&link);
+        assert!(tried >= 3, "it must keep trying inside the window: {tried}");
+
+        // A game that appears afterwards is not found on its own: no background retry.
+        let game = FakeGame::start_on(TcpListener::bind(addr).unwrap(), true);
+        std::thread::sleep(fast().retry_delay * 8);
+        assert_eq!(attempts(&link), tried, "dialled after the window closed");
+        assert_eq!(link.status(), LinkStatus::NotConnected);
+        assert_eq!(game.accepted.load(Ordering::SeqCst), 0);
+
+        // Connect finds it.
+        link.connect();
+        wait_for("Connect to reach the game", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        assert!(link.connection_epoch().is_some());
+        assert_eq!(problem(&link), None);
+    }
+
+    #[test]
+    fn a_game_that_starts_inside_the_open_window_is_found() {
+        let addr = refused_port();
+        let link = link_to(addr, fast());
+        link.ensure_started();
+        std::thread::sleep(fast().retry_delay * 3);
+        assert_eq!(link.status(), LinkStatus::Connecting);
+        let _game = FakeGame::start_on(TcpListener::bind(addr).unwrap(), true);
+        wait_for("the late game", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+    }
+
+    #[test]
+    fn a_dropped_connection_redials_for_a_short_window_then_stops() {
+        let mut game = FakeGame::start(true);
+        let link = link_to(game.addr, fast());
+        link.ensure_started();
+        wait_for("first connection", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        let first = link.connection_epoch().unwrap();
+
+        // The game drops the client but is still there: the link comes back by itself,
+        // long after the open window has closed.
+        std::thread::sleep(fast().open_window);
+        game.kick.store(true, Ordering::SeqCst);
+        wait_for("the redial", Duration::from_secs(5), || {
+            link.connection_epoch().is_some_and(|epoch| epoch != first)
+        });
+        assert_eq!(link.status(), LinkStatus::Connected);
+        assert_eq!(game.accepted.load(Ordering::SeqCst), 2);
+
+        // The game closes: a short burst of attempts, then nothing until asked.
+        game.close();
+        wait_for("the drop window to start", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connecting
+        });
+        let dropped = Instant::now();
+        wait_for("the drop window to close", Duration::from_secs(5), || {
+            link.status() == LinkStatus::NotConnected
+        });
+        assert!(dropped.elapsed() >= fast().drop_window - Duration::from_millis(100));
+        let tried = attempts(&link);
+        std::thread::sleep(fast().retry_delay * 8);
+        assert_eq!(
+            attempts(&link),
+            tried,
+            "kept dialling after the drop window"
+        );
+    }
+
+    #[test]
+    fn stop_ends_dialling_at_once_and_connect_starts_it_again() {
+        let timings = LinkTimings {
+            open_window: Duration::from_secs(30),
+            ..fast()
+        };
+        let link = link_to(refused_port(), timings);
+        link.ensure_started();
+        wait_for("some attempts", Duration::from_secs(5), || {
+            attempts(&link) >= 2
+        });
+        link.stop();
+        assert_eq!(link.status(), LinkStatus::NotConnected);
+        std::thread::sleep(timings.retry_delay * 2);
+        let tried = attempts(&link);
+        std::thread::sleep(timings.retry_delay * 8);
+        assert_eq!(attempts(&link), tried, "Stop did not stop");
+
+        link.connect();
+        assert_eq!(link.status(), LinkStatus::Connecting);
+        wait_for("Connect to dial again", Duration::from_secs(5), || {
+            attempts(&link) > tried
+        });
+    }
+
+    #[test]
+    fn an_open_port_that_never_greets_is_not_the_game() {
+        let mute = FakeGame::start(false);
+        let link = link_to(mute.addr, fast());
+        link.ensure_started();
+        let mut ever_connected = false;
+        wait_for("the window to close", Duration::from_secs(5), || {
+            ever_connected |= link.status().is_connected();
+            link.status() == LinkStatus::NotConnected
+        });
+        assert!(!ever_connected, "a silent port showed as the game");
+        assert_eq!(problem(&link), Some(LinkProblem::NoAnswer));
+        assert!(mute.accepted.load(Ordering::SeqCst) >= 1);
+
+        // The same link reaches a port that does greet.
+        let game = FakeGame::start(true);
+        link.set_address_draft(game.addr.to_string());
+        link.connect();
+        wait_for("the real game", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+    }
+
+    #[test]
+    fn a_silent_game_on_this_pc_shows_not_answering_and_recovers() {
+        let game = FakeGame::start(true);
+        let link = link_to(game.addr, fast());
+        link.ensure_started();
+        wait_for("connection", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        let epoch = link.connection_epoch();
+
+        game.answer.store(false, Ordering::SeqCst);
+        wait_for("not answering", Duration::from_secs(5), || {
+            link.status() == LinkStatus::NotAnswering
+        });
+        // Loopback cannot be half-open: a paused emulator keeps its session.
+        std::thread::sleep(fast().silent_drop_remote * 2);
+        assert_eq!(link.status(), LinkStatus::NotAnswering);
+        assert_eq!(
+            link.connection_epoch(),
+            epoch,
+            "a paused game lost its session"
+        );
+        assert_eq!(game.accepted.load(Ordering::SeqCst), 1);
+
+        game.answer.store(true, Ordering::SeqCst);
+        wait_for("answering again", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        assert_eq!(link.connection_epoch(), epoch);
+    }
+
+    #[test]
+    fn silence_ends_a_connection_where_the_peer_can_vanish() {
+        // Another machine can disappear without a FIN; only silence shows it.
+        let switch: SocketAddr = "192.168.1.20:7878".parse().unwrap();
+        let this_pc: SocketAddr = "127.0.0.1:7878".parse().unwrap();
+        assert_eq!(
+            LINK_TIMINGS.silent_drop(&switch),
+            Some(LINK_TIMINGS.silent_drop_remote)
+        );
+        assert_eq!(LINK_TIMINGS.silent_drop(&this_pc), None);
+        assert!(LINK_TIMINGS.connect_timeout(&switch) > LINK_TIMINGS.connect_timeout(&this_pc));
+
+        // Run the remote rule on loopback.
+        let timings = LinkTimings {
+            silent_drop_local: Some(fast().silent_drop_remote),
+            // Long enough to read the problem before the redial clears it.
+            retry_delay: Duration::from_millis(500),
+            ..fast()
+        };
+        let game = FakeGame::start(true);
+        let link = link_to(game.addr, timings);
+        link.ensure_started();
+        wait_for("connection", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        game.answer.store(false, Ordering::SeqCst);
+        wait_for("the silent drop", Duration::from_secs(5), || {
+            problem(&link) == Some(LinkProblem::Lost)
+        });
+        // …followed by the short redial window.
+        wait_for("the redial", Duration::from_secs(5), || {
+            game.accepted.load(Ordering::SeqCst) >= 2
+        });
+    }
+
+    #[test]
+    fn a_link_replaced_by_another_editor_does_not_fight_back() {
+        let game = FakeGame::start(true);
+        let link = link_to(game.addr, fast());
+        link.ensure_started();
+        wait_for("connection", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        std::thread::sleep(fast().open_window);
+
+        // A plain drop redials (the paired positive)…
+        game.kick.store(true, Ordering::SeqCst);
+        wait_for("the redial", Duration::from_secs(5), || {
+            game.accepted.load(Ordering::SeqCst) == 2 && link.status() == LinkStatus::Connected
+        });
+
+        // …but being replaced does not, though the game is still listening.
+        game.replace.store(true, Ordering::SeqCst);
+        game.kick.store(true, Ordering::SeqCst);
+        wait_for("the hand-over", Duration::from_secs(5), || {
+            link.status() == LinkStatus::NotConnected
+        });
+        assert_eq!(problem(&link), Some(LinkProblem::Replaced));
+        std::thread::sleep(fast().drop_window);
+        assert_eq!(game.accepted.load(Ordering::SeqCst), 2, "fought back");
+    }
+
+    #[test]
+    fn connect_moves_the_link_to_a_new_address_and_refuses_a_bad_one() {
+        let first = FakeGame::start(true);
+        let second = FakeGame::start(true);
+        let link = link_to(first.addr, fast());
+        link.ensure_started();
+        wait_for("first game", Duration::from_secs(5), || {
+            link.status() == LinkStatus::Connected
+        });
+        assert!(!link.view().draft_is_new);
+
+        link.set_address_draft("switch.local".into());
+        assert!(link.view().draft_is_new);
+        let tried = attempts(&link);
+        link.connect();
+        assert_eq!(problem(&link), Some(LinkProblem::BadAddress));
+        std::thread::sleep(fast().retry_delay * 4);
+        assert_eq!(attempts(&link), tried, "a bad address was dialled");
+        assert_eq!(link.view().dialled, Some(first.addr));
+
+        link.set_address_draft(second.addr.to_string());
+        link.connect();
+        wait_for("second game", Duration::from_secs(5), || {
+            second.accepted.load(Ordering::SeqCst) == 1 && link.status() == LinkStatus::Connected
+        });
+        assert_eq!(link.view().dialled, Some(second.addr));
+        assert!(!link.view().draft_is_new);
+    }
+
+    #[test]
+    fn typed_addresses_are_ips_with_an_optional_port() {
+        let ok = |text: &str| parse_game_address(text).unwrap().unwrap().to_string();
+        assert_eq!(ok("192.168.1.20"), "192.168.1.20:7878");
+        assert_eq!(ok(" 192.168.1.20:9000 "), "192.168.1.20:9000");
+        assert_eq!(ok("::1"), "[::1]:7878");
+        assert_eq!(ok("[::1]:7000"), "[::1]:7000");
+        assert_eq!(parse_game_address("  "), Ok(None));
+        for bad in [
+            "switch.local",
+            "0.0.0.0",
+            "1.2.3.4:0",
+            "1.2.3",
+            "1.2.3.4:99999",
+        ] {
+            assert_eq!(
+                parse_game_address(bad),
+                Err(LinkProblem::BadAddress),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limits_suit_a_switch_on_wifi_and_the_plugin() {
+        let t = LINK_TIMINGS;
+        assert!(
+            t.stall >= t.ping * 2,
+            "one late pong must not read as stalled"
+        );
+        assert!(t.silent_drop_remote > t.stall);
+        assert!(t.handshake > t.connect_remote);
+        assert!(
+            t.write >= Duration::from_secs(10),
+            "Wi-Fi retransmits can stall writes for seconds"
+        );
+        assert!(t.open_window > t.connect_remote * 3);
+        assert!(t.drop_window > t.retry_delay * 5);
+
+        // The plugin drops an editor it has not heard from; that must take several missed
+        // pings, or a slow link loses its session.
+        let plugin =
+            include_str!("../plugins/slight_replica/src/rust_extender/net/simple_server.rs");
+        let line = plugin
+            .lines()
+            .find(|line| line.contains("const CLIENT_SILENCE_SECS: u64 ="))
+            .expect("the plugin's client silence limit");
+        let secs: u64 = line
+            .rsplit('=')
+            .next()
+            .unwrap()
+            .trim()
+            .trim_end_matches(';')
+            .parse()
+            .unwrap();
+        assert!(
+            Duration::from_secs(secs) >= t.ping * 4,
+            "plugin limit {secs}s"
+        );
+        // The notice the plugin sends a replaced editor is the one handled here.
+        assert!(plugin.contains(r#"{"header":"Replaced","body":"{}"}"#));
+    }
+
+    #[test]
+    fn frames_survive_reads_that_split_characters_and_tags() {
+        let text = r#"{"name":"エフェクト é ✓","path":"C:\\Users\\José"}"#;
+        let stream =
+            format!("<TCP_MESSAGE>{text}</TCP_MESSAGE><TCP_MESSAGE>{{\"id\":2}}</TCP_MESSAGE>");
+        let mut reader = FrameReader::default();
+        let mut payloads = Vec::new();
+        for byte in stream.as_bytes().chunks(1) {
+            payloads.extend(reader.push(byte));
+        }
+        assert_eq!(payloads, vec![text.to_string(), r#"{"id":2}"#.to_string()]);
+        assert!(reader.buf.is_empty());
+    }
+
+    #[test]
+    fn a_torn_frame_does_not_swallow_the_next_one() {
+        let mut reader = FrameReader::default();
+        let good = r#"{"id":1}"#;
+        // The positive: the same frame on its own.
+        assert_eq!(
+            reader.push(format!("<TCP_MESSAGE>{good}</TCP_MESSAGE>").as_bytes()),
+            vec![good]
+        );
+        // A frame that lost its close tag, then a whole one.
+        let torn = format!("<TCP_MESSAGE>{{\"id\":0,<TCP_MESSAGE>{good}</TCP_MESSAGE>");
+        assert_eq!(reader.push(torn.as_bytes()), vec![good]);
+    }
+
+    #[test]
+    fn a_large_frame_in_many_reads_arrives_whole() {
+        let body = format!("{{\"blob\":\"{}\"}}", "a".repeat(8 << 20));
+        let stream = format!("<TCP_MESSAGE>{body}</TCP_MESSAGE>");
+        let mut reader = FrameReader::default();
+        let mut payloads = Vec::new();
+        let started = Instant::now();
+        for chunk in stream.as_bytes().chunks(4096) {
+            payloads.extend(reader.push(chunk));
+        }
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].len(), body.len());
+        // Rescanning the whole buffer on each of the 2048 reads took seconds; one pass is fast.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Every surface spells the link through `LinkStatus`, and no surface compares against
+    /// `Connected` alone (which would treat a paused game as gone).
+    #[test]
+    fn every_surface_uses_the_shared_status_words() {
+        const RETIRED: &[&str] = &[
+            "\"Game offline\"",
+            "\"Connecting to game…\"",
+            "\"Connecting…\"",
+            "● Live in game",
+            "\"● Connecting\"",
+            "● Game offline",
+            "not connected to the game yet",
+            "Goes to the game when it connects",
+            "Connect to the running game first",
+            "Start the game with the plugin first",
+            "Connect to the game before",
+        ];
+        const NARROW: &[&str] = &[
+            "== LinkStatus::Connected",
+            "!= LinkStatus::Connected",
+            "== crate::game_link::LinkStatus::Connected",
+            "!= crate::game_link::LinkStatus::Connected",
+        ];
+        fn offences(path: &str, text: &str) -> Vec<String> {
+            RETIRED
+                .iter()
+                .chain(NARROW)
+                .filter(|needle| text.contains(*needle))
+                .map(|needle| format!("{path}: {needle}"))
+                .collect()
+        }
+        // The scanner itself finds what it hunts for.
+        assert_eq!(offences("probe", "ui.label(\"Game offline\")").len(), 1);
+        assert_eq!(
+            offences("probe", "if status != LinkStatus::Connected {").len(),
+            1
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        let mut seen = 0;
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !path.ends_with("game_link.rs")
+                {
+                    seen += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    found.extend(offences(&path.display().to_string(), &text));
+                }
+            }
+        }
+        assert!(seen > 50, "scanned only {seen} files");
+        assert!(found.is_empty(), "{found:#?}");
+
+        // And the surfaces that show the link do so through the shared pieces.
+        for (file, needle) in [
+            ("src/app.rs", "game_link::link_address_row"),
+            ("src/app.rs", "game_link::link_problem_and_action"),
+            ("src/eff_editor.rs", "game_link::link_status_line"),
+            ("src/app/project_page.rs", "game_link::link_status_line"),
+            (
+                "src/gimmicks/operations_view.rs",
+                "link_status_line(ui, link)",
+            ),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let text = std::fs::read_to_string(path).unwrap();
+            assert!(text.contains(needle), "{file} does not use {needle}");
+        }
+
+        let labels: BTreeSet<_> = [
+            LinkStatus::NotConnected,
+            LinkStatus::Connecting,
+            LinkStatus::Connected,
+            LinkStatus::NotAnswering,
+        ]
+        .map(LinkStatus::label)
+        .into_iter()
+        .collect();
+        assert_eq!(labels.len(), 4);
+        assert!(labels.iter().all(|label| !label.ends_with('…')));
     }
 }

@@ -1915,16 +1915,18 @@ impl VisionaryApp {
                 if matches!(part, Part::Model | Part::Animations) {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        let online = self.game_link.status()
-                            == crate::game_link::LinkStatus::Connected;
+                        let online = self.game_link.status().is_connected();
                         if ui
                             .add_enabled_ui(online, |ui| act(ui, look, "Show in game", None))
                             .inner
                             .on_hover_text("The fighter must not hold an item while it loads")
-                            .on_disabled_hover_text("Start the game with the plugin first")
+                            .on_disabled_hover_text(self.game_link.status().label())
                             .clicked()
                         {
                             actions.push(files(FileAction::Send));
+                        }
+                        if !online {
+                            crate::game_link::link_status_line(ui, &self.game_link);
                         }
                         let status = self.game_link.asset_bundle_status();
                         let sent = status.target == fighter.to_ascii_lowercase()

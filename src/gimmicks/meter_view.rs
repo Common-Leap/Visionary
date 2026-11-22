@@ -6,7 +6,7 @@ use egui::{Color32, RichText, Ui};
 
 use super::meter::{self, MeterBinding, MeterStyle, MeterValue};
 use super::registry::{self, IdentifierKind};
-use crate::game_link::{GameLink, LinkStatus, LiveGimmickMeterValue};
+use crate::game_link::{GameLink, LiveGimmickMeterValue};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum ValueDraftKind {
@@ -406,7 +406,7 @@ impl MeterView {
         // Only players in this character's costumes show its meters.
         let values = link.gimmick_meter_values(&self.owner, &self.draft.symbol);
         if values.is_empty() {
-            if link.status() == LinkStatus::Connected {
+            if link.status().is_connected() {
                 ui.label(
                     RichText::new("Live value unavailable in the current plugin build")
                         .small()

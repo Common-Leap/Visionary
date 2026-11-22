@@ -2967,8 +2967,7 @@ fn made_effect_lookup(
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
-    status.starts_with("Sent to the game:")
-        || status.starts_with("Goes to the game when it connects:")
+    status.starts_with("Sent to the game:") || status.starts_with("Ready for the game:")
 }
 
 /// Values worked out from every edit, kept until the edit revision they were worked out at
@@ -20872,8 +20871,8 @@ impl VisionaryApp {
         slot: u8,
     ) {
         self.game_link.ensure_started();
-        if self.game_link.status() != crate::game_link::LinkStatus::Connected {
-            self.state.status = "Connect to the game before reloading the asset preview.".into();
+        if !self.game_link.status().is_connected() {
+            self.state.status = self.game_link.status().label().into();
             return;
         }
         let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
@@ -25529,10 +25528,13 @@ impl VisionaryApp {
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
-        self.state.status = if self.game_link.status() == crate::game_link::LinkStatus::Connected {
+        self.state.status = if self.game_link.status().is_connected() {
             format!("Sent {sent} playback-rate rule(s) live")
         } else {
-            format!("{sent} playback-rate rule(s) ready — not connected to the game yet")
+            format!(
+                "{sent} playback-rate rule(s) ready. {}",
+                self.game_link.status().label()
+            )
         };
     }
 
@@ -30354,10 +30356,10 @@ impl VisionaryApp {
                 carrier_dropped_textures.join(", ")
             );
         } else if carrier_added && !carrier_authored.is_empty() {
-            let sent = if self.game_link.status() == crate::game_link::LinkStatus::Connected {
+            let sent = if self.game_link.status().is_connected() {
                 "Sent to the game"
             } else {
-                "Goes to the game when it connects"
+                "Ready for the game"
             };
             self.state.status = format!(
                 "{sent}: {} borrowed and {} edited effect(s)",
@@ -33820,18 +33822,13 @@ impl eframe::App for VisionaryApp {
 
                 ui.separator();
                 // The live system: the running game, and what it holds.
-                let status = self.game_link.status();
-                egui::containers::menu::MenuButton::from_button(egui::Button::new(match status {
-                    crate::game_link::LinkStatus::Connected => egui::RichText::new("● Live in game").color(egui::Color32::from_rgb(90, 220, 90)),
-                    crate::game_link::LinkStatus::Connecting => egui::RichText::new("● Connecting").color(egui::Color32::YELLOW),
-                    crate::game_link::LinkStatus::Disconnected => egui::RichText::new("● Game offline").color(egui::Color32::from_rgb(220, 90, 90)),
-                }).frame(false))
+                let link_view = self.game_link.view();
+                let link_menu = egui::containers::menu::MenuButton::from_button(
+                    egui::Button::new(link_view.text(ui.visuals())).frame(false),
+                )
                     .config(menu_config)
                     .ui(ui, |ui| {
-                    ui.label(match status {
-                        crate::game_link::LinkStatus::Connected => "Edits reach the running game as you make them.",
-                        _ => "Start the game with Visionary's plugin installed; edits reach it as you make them.",
-                    });
+                    crate::game_link::link_address_row(ui, &self.game_link);
                     ui.separator();
                     if ui.button("Send effect edits now")
                         .on_hover_text("Effect file edits need the move played again to show")
@@ -33849,6 +33846,8 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                 });
+                link_menu.0.on_hover_text(link_view.hover());
+                crate::game_link::link_problem_and_action(ui, &self.game_link, &link_view);
                 ui.separator();
                 if ui
                     .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod"))
@@ -42058,7 +42057,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_routine_alias_line_does_not_replace_a_characters_status() {
         assert!(alias_status_is_routine(
-            "Goes to the game when it connects: 1 borrowed and 1 edited effect(s)"
+            "Ready for the game: 1 borrowed and 1 edited effect(s)"
         ));
         assert!(alias_status_is_routine(
             "Sent to the game: 0 borrowed and 2 edited effect(s)"
@@ -42083,7 +42082,7 @@ mod live_effect_capture_tests {
             .expect("flush_effect_aliases");
         assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
         for line in [
-            "\"Goes to the game when it connects\"",
+            "\"Ready for the game\"",
             "\"Sent to the game\"",
             "\"{sent}: {} borrowed and {} edited effect(s)\"",
         ] {

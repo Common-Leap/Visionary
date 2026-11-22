@@ -1,6 +1,6 @@
 //! Jorge rust_extender TCP simple_server — :7878, `<TCP_MESSAGE>` framing.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::thread;
 
 use parking_lot::Mutex;
@@ -13,7 +13,9 @@ static CLIENT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static STARTED: AtomicBool = AtomicBool::new(false);
 static OUTBOX: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static INBOUND: Mutex<Vec<String>> = Mutex::new(Vec::new());
-static RECV_BUF: Mutex<String> = Mutex::new(String::new());
+/// `GetSystemTick` of the last bytes received from the current client. The editor pings every
+/// 5 s, so a long silence means the editor is gone without a FIN (Wi-Fi lost, PC asleep).
+static LAST_RX_TICK: AtomicU64 = AtomicU64::new(0);
 // `handshake` runs on the accept thread while `drain` runs on the sender thread.  Both write
 // to the same stream, so a reconnect with queued frames could otherwise interleave bytes from
 // the handshake and the first queued message and make the XML-like framing unrecoverable.
@@ -30,6 +32,17 @@ const SEND_BATCH_CAP: usize = 256;
 const FRAME_OPEN: &str = "<TCP_MESSAGE>";
 const FRAME_CLOSE: &str = "</TCP_MESSAGE>";
 const PONG_INNER: &str = r#"{"header":"Pong","body":"{}"}"#;
+/// Told to the current editor just before a newer one takes over, so it does not dial back and
+/// knock the newcomer off in turn. The desktop `GameLink` stops on it.
+const REPLACED_INNER: &str = r#"{"header":"Replaced","body":"{}"}"#;
+/// An editor not heard from for this long is dropped. Several missed pings, so a slow Wi-Fi link
+/// keeps its session; the desktop test `the_limits_suit_a_switch_on_wifi_and_the_plugin` pins it.
+const CLIENT_SILENCE_SECS: u64 = 30;
+/// `nn::os::GetSystemTick` rate on the Switch (and in both emulators).
+const TICKS_PER_SEC: u64 = 19_200_000;
+/// Consecutive `Accept` failures before the listening socket is rebuilt. A Switch that slept
+/// can come back with a listener that fails every call; spinning on it burned a core forever.
+const ACCEPT_FAILURES_BEFORE_REBUILD: u32 = 20;
 
 extern "C" {
     #[link_name = "\u{1}_ZN2nn6socket4RecvEiPvmi"]
@@ -49,6 +62,31 @@ pub fn start(port: u16) {
     // Dedicated sender: the ONLY place blocking Send() runs. Keeps it off the game thread so a
     // slow RPM can never stall a frame (it just backs up in OUTBOX). See `queue`.
     thread::spawn(sender_loop);
+    // Drops an editor that went silent. Its own thread: the receive and send threads can both
+    // be blocked on that very socket.
+    thread::spawn(watchdog_loop);
+}
+
+fn now_tick() -> u64 {
+    unsafe { skyline::nn::os::GetSystemTick() }
+}
+
+fn watchdog_loop() {
+    loop {
+        sleep_ms(1000);
+        let fd = CLIENT_FD.load(Ordering::Acquire);
+        if fd < 0 {
+            continue;
+        }
+        let quiet = now_tick().wrapping_sub(LAST_RX_TICK.load(Ordering::Acquire));
+        if quiet > CLIENT_SILENCE_SECS * TICKS_PER_SEC {
+            crate::slight::diag::note(format!(
+                "SRV fd={fd} silent for {}s — dropping the editor",
+                quiet / TICKS_PER_SEC
+            ));
+            mark_client_disconnected(fd);
+        }
+    }
 }
 
 /// Sleep via nn::os directly — std::thread::sleep never wakes under skyline on Ryujinx
@@ -89,64 +127,12 @@ fn server_loop(port: u16) {
             sleep_ms(250);
         }
         crate::slight::diag::note("SRV game frames running — probing sockets");
-        // Do NOT call nn::socket::Initialize unconditionally: skyline's own TCP logger (:6969)
-        // already initializes nn::socket in this process, and the nn SDK ABORTS on double-init
-        // (on Ryujinx this silently killed the server thread before the socket was ever
-        // created — :7878 never bound). Probe with Socket() first; only Initialize if sockets
-        // aren't up yet (e.g. environments where the skyline logger is disabled).
-        let mut listen = nnsdk::nn::socket::Socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        crate::slight::diag::note(format!("SRV socket probe -> {listen}"));
-        if listen < 0 {
-            let rc = nnsdk::nn::socket::Initialize(
-                std::ptr::addr_of_mut!(SOCKET_POOL).cast::<u8>(),
-                0x40000,
-                0x20000,
-                0x20,
-            );
-            crate::slight::diag::note(format!("SRV nn::socket::Initialize rc={rc}"));
-            if rc != 0 {
-                skyline::println!("[SLight] nn::socket::Initialize failed: {rc}");
-                return;
-            }
-            listen = nnsdk::nn::socket::Socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            crate::slight::diag::note(format!("SRV socket retry -> {listen}"));
-        }
-        if listen < 0 {
-            skyline::println!("[SLight] socket create failed ({listen}) — no debuggable server");
+        let Some(mut listen) = open_listener(port, true) else {
             return;
-        }
-        LISTEN_FD.store(listen, Ordering::Release);
-
-        let reuse: i32 = 1;
-        nnsdk::nn::socket::SetSockOpt(
-            listen,
-            SOL_SOCKET,
-            SO_REUSEADDR,
-            &reuse as *const i32 as *const u8,
-            4,
-        );
-
-        let mut addr: nnsdk::nn::socket::SockAddrIn = std::mem::zeroed();
-        addr.sin_len = 16;
-        addr.sin_family = AF_INET as u8;
-        addr.sin_port = nnsdk::nn::socket::InetHtons(port);
-        addr.sin_addr = [0, 0, 0, 0];
-
-        let bind_rc = nnsdk::nn::socket::Bind(
-            listen,
-            &addr as *const _ as *const nnsdk::root::sockaddr,
-            16,
-        );
-        crate::slight::diag::note(format!("SRV bind :{port} rc={bind_rc}"));
-        if bind_rc != 0 {
-            report_bind_failure(port, bind_rc);
-            return;
-        }
-
-        nnsdk::nn::socket::Listen(listen, 2);
-        crate::slight::diag::note(format!("SRV listening on :{port}"));
+        };
         skyline::println!("[SLight] Accepting clients from debbugable server on :{port}");
 
+        let mut failures: u32 = 0;
         loop {
             let mut len: u32 = 16;
             let mut peer: nnsdk::nn::socket::SockAddrIn = std::mem::zeroed();
@@ -156,9 +142,39 @@ fn server_loop(port: u16) {
                 &mut len,
             ) as i32;
             if client < 0 {
+                // Back off instead of spinning, and rebuild a listener that keeps failing.
+                failures += 1;
+                if failures == 1 || failures % ACCEPT_FAILURES_BEFORE_REBUILD == 0 {
+                    crate::slight::diag::note(format!(
+                        "SRV accept failed rc={client} ({failures} in a row)"
+                    ));
+                }
+                sleep_ms(u64::from(failures.min(10)) * 100);
+                if failures % ACCEPT_FAILURES_BEFORE_REBUILD == 0 {
+                    let _ = Close(listen);
+                    LISTEN_FD.store(-1, Ordering::Release);
+                    listen = loop {
+                        if let Some(fd) = open_listener(port, false) {
+                            break fd;
+                        }
+                        sleep_ms(2000);
+                    };
+                    crate::slight::diag::note("SRV listener rebuilt");
+                }
                 continue;
             }
-            RECV_BUF.lock().clear();
+            failures = 0;
+            // A new editor replaces the current one. The old socket may be dead without a FIN
+            // (Wi-Fi lost, PC asleep), and serving one client at a time used to leave every new
+            // editor queued behind it until TCP gave up minutes later.
+            let previous = CLIENT_FD.load(Ordering::Acquire);
+            if previous >= 0 {
+                crate::slight::diag::note(format!(
+                    "SRV new editor fd={client} replaces fd={previous}"
+                ));
+                tell_replaced(previous);
+                mark_client_disconnected(previous);
+            }
             // Keep the client unpublished while the two handshake frames are sent.  The sender
             // thread keys off CLIENT_FD, so publishing it first would let queued application
             // frames race ahead of RemoveAll/GiveClientId on a reconnect.
@@ -169,14 +185,106 @@ fn server_loop(port: u16) {
                 close_client(client);
                 continue;
             };
+            LAST_RX_TICK.store(now_tick(), Ordering::Release);
             CLIENT_FD.store(client, Ordering::Release);
             crate::rust_extender::debuggable_server::on_rpm_client_connected(cid);
-            // Inbound only. Recv blocks until data/disconnect; outbound is the sender thread's job.
-            while CLIENT_FD.load(Ordering::Acquire) == client {
-                recv_once(client);
-            }
-            close_client(client);
+            // Inbound only, on its own thread so this one can take the next editor. Recv
+            // blocks until data/disconnect; outbound is the sender thread's job.
+            thread::spawn(move || receive_loop(client));
         }
+    }
+}
+
+/// Create, bind and listen. `first` reports a bind failure loudly (two plugin copies); a
+/// rebuild after a sleep retries quietly.
+unsafe fn open_listener(port: u16, first: bool) -> Option<i32> {
+    let mut listen = nnsdk::nn::socket::Socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if first {
+        crate::slight::diag::note(format!("SRV socket probe -> {listen}"));
+    }
+    // Do NOT call nn::socket::Initialize unconditionally: skyline's own TCP logger (:6969)
+    // already initializes nn::socket in this process, and the nn SDK ABORTS on double-init
+    // (on Ryujinx this silently killed the server thread before the socket was ever
+    // created — :7878 never bound). Probe with Socket() first; only Initialize if sockets
+    // aren't up yet (e.g. environments where the skyline logger is disabled).
+    if listen < 0 && first {
+        let rc = nnsdk::nn::socket::Initialize(
+            std::ptr::addr_of_mut!(SOCKET_POOL).cast::<u8>(),
+            0x40000,
+            0x20000,
+            0x20,
+        );
+        crate::slight::diag::note(format!("SRV nn::socket::Initialize rc={rc}"));
+        if rc != 0 {
+            skyline::println!("[SLight] nn::socket::Initialize failed: {rc}");
+            return None;
+        }
+        listen = nnsdk::nn::socket::Socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        crate::slight::diag::note(format!("SRV socket retry -> {listen}"));
+    }
+    if listen < 0 {
+        if first {
+            skyline::println!("[SLight] socket create failed ({listen}) — no debuggable server");
+        }
+        return None;
+    }
+
+    let reuse: i32 = 1;
+    nnsdk::nn::socket::SetSockOpt(
+        listen,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &reuse as *const i32 as *const u8,
+        4,
+    );
+
+    let mut addr: nnsdk::nn::socket::SockAddrIn = std::mem::zeroed();
+    addr.sin_len = 16;
+    addr.sin_family = AF_INET as u8;
+    addr.sin_port = nnsdk::nn::socket::InetHtons(port);
+    addr.sin_addr = [0, 0, 0, 0];
+
+    let bind_rc = nnsdk::nn::socket::Bind(
+        listen,
+        &addr as *const _ as *const nnsdk::root::sockaddr,
+        16,
+    );
+    if first {
+        crate::slight::diag::note(format!("SRV bind :{port} rc={bind_rc}"));
+    }
+    if bind_rc != 0 {
+        if first {
+            report_bind_failure(port, bind_rc);
+        }
+        let _ = Close(listen);
+        return None;
+    }
+
+    nnsdk::nn::socket::Listen(listen, 2);
+    LISTEN_FD.store(listen, Ordering::Release);
+    crate::slight::diag::note(format!("SRV listening on :{port}"));
+    Some(listen)
+}
+
+fn receive_loop(client: i32) {
+    let mut buf = Vec::new();
+    while CLIENT_FD.load(Ordering::Acquire) == client {
+        unsafe { recv_once(client, &mut buf) };
+    }
+    close_client(client);
+}
+
+/// Best-effort `Replaced` notice to the editor being displaced. Never waits on a sender that may
+/// be blocked on a dead socket: if the write lock does not come free quickly, skip the notice.
+fn tell_replaced(client: i32) {
+    for _ in 0..200 {
+        if let Some(_guard) = SEND_LOCK.try_lock() {
+            unsafe {
+                let _ = send_frame_unlocked(client, REPLACED_INNER);
+            }
+            return;
+        }
+        sleep_ms(1);
     }
 }
 
@@ -279,8 +387,8 @@ unsafe fn send_frame_unlocked(client: i32, inner: &str) -> i64 {
     sent as i64
 }
 
-unsafe fn recv_once(client: i32) {
-    let mut chunk = [0u8; 4096];
+unsafe fn recv_once(client: i32, buf: &mut Vec<u8>) {
+    let mut chunk = [0u8; 16384];
     let n = Recv(client, chunk.as_mut_ptr(), chunk.len() as u64, 0);
     if n <= 0 {
         // A reset/error is just as terminal as EOF.  Leaving the fd live strands the accept
@@ -289,13 +397,10 @@ unsafe fn recv_once(client: i32) {
         crate::slight::diag::note(format!("SRV recv fd={client} rc={n} — client disconnected"));
         return;
     }
-    let text = String::from_utf8_lossy(&chunk[..n as usize]);
-    let mut buf = RECV_BUF.lock();
-    buf.push_str(&text);
-    extract_inbound(&mut buf);
-}
-
-fn extract_inbound(buf: &mut String) {
+    LAST_RX_TICK.store(now_tick(), Ordering::Release);
+    // Bytes until a frame is complete: a read can end inside a multi-byte character, and
+    // decoding each read on its own turned it into replacement marks.
+    buf.extend_from_slice(&chunk[..n as usize]);
     for payload in extract_payloads(buf) {
         inbound_push(payload);
     }
@@ -304,54 +409,59 @@ fn extract_inbound(buf: &mut String) {
 /// Extract framed or legacy newline-delimited payloads without touching plugin state.  Keeping
 /// this pure makes the stream recovery rules testable on the host and avoids hiding parser bugs
 /// behind the game-only inbound queue.
-fn extract_payloads(buf: &mut String) -> Vec<String> {
+fn extract_payloads(buf: &mut Vec<u8>) -> Vec<String> {
+    let open = FRAME_OPEN.as_bytes();
+    let close = FRAME_CLOSE.as_bytes();
     let mut payloads = Vec::new();
+    let mut start = 0;
     loop {
-        let start = buf.find(FRAME_OPEN);
-        let end = buf.find(FRAME_CLOSE);
-        if let (Some(s), Some(e)) = (start, end) {
-            if e >= s {
-                let payload = buf[s + FRAME_OPEN.len()..e].trim().to_string();
-                *buf = buf[e + FRAME_CLOSE.len()..].to_string();
+        let rest = &buf[start..];
+        if let Some(e) = find_bytes(rest, close) {
+            // The newest opening tag before this close; none means a stale close tag, which
+            // would otherwise poison every later frame on this connection.
+            if let Some(s) = rfind_bytes(&rest[..e], open) {
+                let payload = decode(&rest[s + open.len()..e]);
                 if !payload.is_empty() {
                     payloads.push(payload);
                 }
-                continue;
             }
-            // A stale close tag before the next opening tag would otherwise remain forever and
-            // poison every subsequent frame on this connection.
-            *buf = buf[e + FRAME_CLOSE.len()..].to_string();
+            start += e + close.len();
             continue;
         }
-
-        if start.is_none() {
-            // Drop an orphan closing tag even when there is no opening tag yet. This is the same
-            // recovery policy as the desktop parser and handles a torn previous frame.
-            if let Some(e) = end {
-                *buf = buf[e + FRAME_CLOSE.len()..].to_string();
+        // Legacy newline-delimited command, only when no frame is in flight before it.
+        if let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+            if find_bytes(&rest[..nl], open).is_none() {
+                let line = decode(&rest[..nl]);
+                start += nl + 1;
+                if !line.is_empty() {
+                    payloads.push(line);
+                }
                 continue;
             }
-        }
-
-        if let Some(nl) = buf.find('\n') {
-            let line = buf[..nl].trim().to_string();
-            *buf = buf[nl + 1..].to_string();
-            if !line.is_empty() {
-                payloads.push(line);
-            }
-            continue;
-        }
-
-        // Runaway guard: only discard when we're NOT mid-message. A large frame in flight
-        // (e.g. a ~1.3 MB base64 donor eff) legitimately exceeds any small cap before its
-        // closing tag arrives — clearing it here silently dropped donor_bytes. Keep
-        // accumulating while an opening tag is present; only clear genuine garbage.
-        if buf.len() > 64 * 1024 * 1024 && !buf.contains("<TCP_MESSAGE>") {
-            buf.clear();
         }
         break;
     }
+    buf.drain(..start);
+    // Runaway guard: only discard when we're NOT mid-message. A large frame in flight
+    // (e.g. a ~1.3 MB base64 donor eff) legitimately exceeds any small cap before its
+    // closing tag arrives — clearing it here silently dropped donor_bytes. Keep
+    // accumulating while an opening tag is present; only clear genuine garbage.
+    if buf.len() > 64 * 1024 * 1024 && find_bytes(buf, open).is_none() {
+        buf.clear();
+    }
     payloads
+}
+
+fn decode(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 /// Server thread → INBOUND. try_lock + SleepThread retry — never parks (parked waiters
@@ -417,6 +527,12 @@ unsafe fn drain(client: i32) {
         crate::slight::diag::note(format!("SND drain {} msgs", msgs.len()));
     }
     let _send_guard = send_guard();
+    // The client may have been replaced (or its descriptor recycled) between reading
+    // CLIENT_FD and taking the lock: keep the batch for whoever is current now.
+    if CLIENT_FD.load(Ordering::Acquire) != client {
+        requeue_front(msgs);
+        return;
+    }
     for (index, msg) in msgs.iter().enumerate() {
         let rc = send_frame_unlocked(client, msg);
         if rc < 0 {
@@ -515,9 +631,9 @@ mod tests {
 
     #[test]
     fn extractor_reassembles_torn_frames_and_recovers_from_orphan_close() {
-        let mut buf = format!("stale{FRAME_CLOSE}{FRAME_OPEN}{{\"command\":\"ping\"}}");
+        let mut buf = format!("stale{FRAME_CLOSE}{FRAME_OPEN}{{\"command\":\"ping\"}}").into_bytes();
         assert!(extract_payloads(&mut buf).is_empty());
-        buf.push_str(FRAME_CLOSE);
+        buf.extend_from_slice(FRAME_CLOSE.as_bytes());
         assert_eq!(
             extract_payloads(&mut buf),
             vec![r#"{"command":"ping"}"#.to_owned()]
@@ -527,7 +643,7 @@ mod tests {
 
     #[test]
     fn extractor_handles_multiple_frames_in_one_read() {
-        let mut buf = format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}");
+        let mut buf = format!("{FRAME_OPEN}one{FRAME_CLOSE}{FRAME_OPEN}two{FRAME_CLOSE}").into_bytes();
         assert_eq!(extract_payloads(&mut buf), vec!["one", "two"]);
         assert!(buf.is_empty());
     }
