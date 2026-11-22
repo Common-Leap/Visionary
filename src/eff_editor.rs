@@ -913,13 +913,22 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
             }
             changed
         }
+        AttrKind::UInt if crate::eff_attrs::is_key_count(attr.id) => {
+            let mut v = value.as_u64();
+            let drag = egui::DragValue::new(&mut v)
+                .speed(1.0)
+                .range(0..=crate::eff_attrs::KEY_SLOTS as u64);
+            let changed = ui.add(drag).changed();
+            if changed {
+                *value = AttrValue::UInt(v);
+            }
+            changed
+        }
+        // Ids, seeds and flag words: typed, because a drag goes through f64 and cannot hold a
+        // 64-bit id (u64::MAX, "none", showed as 18446744073709551616).
         AttrKind::UInt => {
             let mut v = value.as_u64();
-            let mut drag = egui::DragValue::new(&mut v).speed(1.0);
-            if crate::eff_attrs::is_key_count(attr.id) {
-                drag = drag.range(0..=crate::eff_attrs::KEY_SLOTS as u64);
-            }
-            let changed = ui.add(drag).changed();
+            let changed = uint_text_edit(ui, attr.id, &mut v);
             if changed {
                 *value = AttrValue::UInt(v);
             }
@@ -955,12 +964,59 @@ fn attr_widget(ui: &mut Ui, attr: &crate::eff_attrs::Attr, value: &mut AttrValue
     }
 }
 
+/// A whole number as the attribute rows show it: the all-ones value means no id is set.
+fn uint_text(value: u64) -> String {
+    if value == u64::MAX {
+        "None".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+/// The number typed into a whole-number row: decimal, `0x` hex, or `None` for the all-ones "no
+/// id" value. Anything else, an empty box included, is not a number yet.
+fn parse_uint_text(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(u64::MAX);
+    }
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
+/// A text box for a whole number. While it has focus the typed text is kept as typed, so a
+/// half-typed number is not snapped back; the value changes when the text reads as a number.
+fn uint_text_edit(ui: &mut Ui, id_salt: &str, value: &mut u64) -> bool {
+    let id = ui.make_persistent_id(("uint_text", id_salt));
+    let mut text = ui
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| uint_text(*value));
+    let response = ui
+        .add(egui::TextEdit::singleline(&mut text).desired_width(150.0))
+        .on_hover_text("A whole number, 0x for hex, or None for no id");
+    let mut changed = false;
+    if response.changed() {
+        if let Some(parsed) = parse_uint_text(&text) {
+            changed = parsed != *value;
+            *value = parsed;
+        }
+    }
+    if response.has_focus() {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+    changed
+}
+
 /// How an attribute's value reads in the "orig" column.
 fn attr_text(attr: &crate::eff_attrs::Attr, value: AttrValue) -> String {
     match attr.kind {
         AttrKind::Float { .. } => format!("{:.3}", value.as_f32()),
         AttrKind::Int => value.as_i64().to_string(),
-        AttrKind::UInt => value.as_u64().to_string(),
+        AttrKind::UInt => uint_text(value.as_u64()),
         AttrKind::Flag => if value.as_bool() { "on" } else { "off" }.to_string(),
         AttrKind::Enum(names) => names
             .get(value.as_i64().max(0) as usize)
@@ -1050,6 +1106,31 @@ fn attr_grid_rows(
     changed
 }
 
+/// The attribute groups of texture slots 2 and 3 when the part samples no texture through them:
+/// the slot's texture id is the all-ones "none" value. Slot 1 is never counted as unused.
+fn unused_texture_groups(em: &EmitterDef) -> Vec<&'static str> {
+    use crate::eff_attrs::*;
+    let slots = [
+        (
+            "sampler1.texture_id",
+            [G_SAMPLER1, G_TEXANIM1, G_TEXPAT1, G_TEXUV1],
+        ),
+        (
+            "sampler2.texture_id",
+            [G_SAMPLER2, G_TEXANIM2, G_TEXPAT2, G_TEXUV2],
+        ),
+    ];
+    slots
+        .into_iter()
+        .filter(|(id, _)| {
+            index_of(id)
+                .and_then(|at| em.attrs.get(at).copied().flatten())
+                .is_some_and(|value| value.as_u64() == u64::MAX)
+        })
+        .flat_map(|(_, groups)| groups)
+        .collect()
+}
+
 /// The whole emitter, one collapsible group per section of the format.
 ///
 /// Three hundred rows is more than anyone wants to scroll, so the groups start collapsed and the
@@ -1084,43 +1165,86 @@ fn draw_attribute_groups(
             || a.group.to_lowercase().contains(&needle)
     };
 
-    let mut changed = false;
-    for group in crate::eff_attrs::GROUPS {
-        // An attribute the emitter does not carry is not listed at all, so a group that is
-        // entirely absent (no sampler 2 on this emitter) does not draw an empty header either.
-        let rows: Vec<usize> = table
-            .iter()
-            .enumerate()
-            .filter(|(i, a)| {
-                a.group == *group && matches(a) && em.attrs.get(*i).copied().flatten().is_some()
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let edited = rows
-            .iter()
-            .filter(
-                |&&i| match (em.attrs[i], pr.attrs.get(i).copied().flatten()) {
-                    (Some(now), Some(was)) => !now.same(was),
-                    _ => false,
-                },
-            )
-            .count();
+    // Each group's rows and how many of them are edited. An attribute the emitter does not carry
+    // is not listed at all, so a group that is entirely absent (no sampler 2 on this emitter)
+    // does not draw an empty header either.
+    let groups: Vec<(&str, Vec<usize>, usize)> = crate::eff_attrs::GROUPS
+        .iter()
+        .filter_map(|group| {
+            let rows: Vec<usize> = table
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| {
+                    a.group == *group && matches(a) && em.attrs.get(*i).copied().flatten().is_some()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if rows.is_empty() {
+                return None;
+            }
+            let edited = rows
+                .iter()
+                .filter(
+                    |&&i| match (em.attrs[i], pr.attrs.get(i).copied().flatten()) {
+                        (Some(now), Some(was)) => !now.same(was),
+                        _ => false,
+                    },
+                )
+                .count();
+            Some((*group, rows, edited))
+        })
+        .collect();
+    // Texture slots 2 and 3 sample nothing on most parts; their settings are kept, folded under
+    // one header instead of eight.
+    let unused = unused_texture_groups(em);
+    let (spare, used): (Vec<_>, Vec<_>) = groups
+        .into_iter()
+        .partition(|(group, _, _)| unused.contains(group));
 
+    let mut changed = false;
+    let filtering = !needle.is_empty();
+    let mut draw_group = |ui: &mut Ui, group: &str, rows: &[usize], edited: usize| {
         let heading = if edited > 0 {
-            egui::RichText::new(format!("{group}  ({edited} edited)"))
+            egui::RichText::new(format!("{group}  ({}, {edited} edited)", rows.len()))
                 .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
         } else {
-            egui::RichText::new(*group)
+            egui::RichText::new(format!("{group}  ({})", rows.len()))
         };
+        // A filter opens every group holding a match: `default_open` alone only applied the
+        // first time a group was seen, so groups closed before stayed closed.
         egui::CollapsingHeader::new(heading)
             .id_salt(group)
-            .default_open(edited > 0 || !needle.is_empty())
+            .default_open(edited > 0)
+            .open(filtering.then_some(true))
             .show(ui, |ui| {
-                changed |= attr_rows_by_index(ui, group, em, pr, &rows);
+                changed |= attr_rows_by_index(ui, group, em, pr, rows);
             });
+    };
+    for (group, rows, edited) in &used {
+        draw_group(ui, group, rows, *edited);
+    }
+    if !spare.is_empty() {
+        let edited: usize = spare.iter().map(|(_, _, edited)| edited).sum();
+        let heading = if edited > 0 {
+            egui::RichText::new(format!("Unused texture slots  ({edited} edited)"))
+                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
+        } else {
+            egui::RichText::new("Unused texture slots")
+        };
+        egui::CollapsingHeader::new(heading)
+            .id_salt("unused_texture_slots")
+            .default_open(edited > 0)
+            .open(filtering.then_some(true))
+            .show(ui, |ui| {
+                for (group, rows, edited) in &spare {
+                    draw_group(ui, group, rows, *edited);
+                }
+            })
+            .header_response
+            .on_hover_text(
+                "The settings of texture slots this part samples no texture through. They are \
+                 kept as the file has them.",
+            );
     }
     if !needle.is_empty() && !changed {
         // A filter that matches nothing is otherwise indistinguishable from every group being
@@ -4893,6 +5017,110 @@ mod tests {
     use crate::effects::{EmitterSet, PtclFile};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    #[test]
+    fn texture_slots_with_no_texture_fold_and_used_ones_stay() {
+        use crate::eff_attrs::{G_SAMPLER1, G_SAMPLER2, G_TEXANIM1, G_TEXUV2};
+        let mut em = EmitterDef {
+            name: "em0".into(),
+            attrs: crate::eff_attrs::read_all(&test_emitter_data()),
+            subsections: Vec::new(),
+            depth: 0,
+            source_idx: 0,
+            color0: Vec::new(),
+            color1: Vec::new(),
+            alpha0_keys: Vec::new(),
+            texture_index: None,
+        };
+        // Slot 2 samples nothing (the all-ones id), slot 3 samples a texture.
+        set_attr(&mut em, "sampler1.texture_id", AttrValue::UInt(u64::MAX));
+        set_attr(
+            &mut em,
+            "sampler2.texture_id",
+            AttrValue::UInt(0x1234_5678_9ABC),
+        );
+        let unused = unused_texture_groups(&em);
+        assert!(unused.contains(&G_SAMPLER1) && unused.contains(&G_TEXANIM1));
+        assert!(!unused.contains(&G_SAMPLER2) && !unused.contains(&G_TEXUV2));
+        assert_eq!(unused.len(), 4);
+        // And the other way round.
+        set_attr(&mut em, "sampler1.texture_id", AttrValue::UInt(7));
+        set_attr(&mut em, "sampler2.texture_id", AttrValue::UInt(u64::MAX));
+        let unused = unused_texture_groups(&em);
+        assert!(!unused.contains(&G_SAMPLER1) && unused.contains(&G_TEXUV2));
+    }
+
+    /// In the game's files a texture slot with no texture holds the all-ones id, which is what
+    /// the fold above keys on: both kinds occur, and nothing else stands for "none".
+    #[test]
+    fn game_files_mark_empty_texture_slots_with_the_all_ones_id() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('_'))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root.join("effect"), &mut files);
+        assert!(files.len() > 300, "only {} corpus files", files.len());
+        let id_at = crate::eff_attrs::index_of("sampler1.texture_id").unwrap();
+        let (mut folded, mut kept, mut zero) = (0usize, 0usize, 0usize);
+        for path in &files {
+            let Ok(effect) = crate::effects::load_effect(path) else {
+                continue;
+            };
+            for em in effect.ptcl.emitter_sets.iter().flat_map(|s| &s.emitters) {
+                let Some(id) = em.attrs[id_at].map(|v| v.as_u64()) else {
+                    continue;
+                };
+                if id == 0 {
+                    zero += 1;
+                }
+                if unused_texture_groups(em).contains(&crate::eff_attrs::G_SAMPLER1) {
+                    folded += 1;
+                    assert_eq!(id, u64::MAX);
+                } else {
+                    kept += 1;
+                }
+            }
+        }
+        eprintln!("slot 2: {folded} folded, {kept} kept");
+        assert!(folded > 1000 && kept > 1000, "{folded} folded, {kept} kept");
+        assert_eq!(zero, 0, "a zero id would be a second way to say none");
+    }
+
+    #[test]
+    fn whole_number_rows_hold_64_bit_ids_and_none() {
+        // The no-primitive value reads None, not 2^64, and types back exactly.
+        assert_eq!(uint_text(u64::MAX), "None");
+        assert_eq!(parse_uint_text("None"), Some(u64::MAX));
+        // Clearing the box to type a new id does not set "none" on the way.
+        assert_eq!(parse_uint_text(""), None);
+        // A texture GUID above 2^53 (where a drag's f64 rounds) survives text both ways.
+        let guid = 0x9E37_79B9_7F4A_7C15_u64;
+        assert_eq!(parse_uint_text(&uint_text(guid)), Some(guid));
+        assert_eq!(parse_uint_text("0x10"), Some(16));
+        assert_eq!(parse_uint_text("12a"), None);
+        let primitive = crate::eff_attrs::table()
+            .iter()
+            .find(|a| a.id == "particle_data.primitive_id")
+            .unwrap();
+        assert_eq!(attr_text(primitive, AttrValue::UInt(u64::MAX)), "None");
+    }
 
     /// A blank emitter at the version Smash's own files use, for the attribute vector.
     fn test_emitter_data() -> effect_library::EmitterData {
