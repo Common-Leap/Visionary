@@ -349,7 +349,7 @@ fn attrs_to_effective_keys(emitter: &mut EmitterDef) {
 }
 
 /// Which view the emitter column is showing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmitterTab {
     /// The selected emitter's own values.
     Attributes,
@@ -403,6 +403,39 @@ pub struct EffTransplantRemoval {
     pub entry_name: String,
     pub donor_name: String,
 }
+
+/// One step of the Effects page's history: one effect's parts, and every effect's timing, as
+/// they were before an edit.
+#[derive(Clone)]
+struct EffHistoryStep {
+    set_idx: usize,
+    selected_entry: Option<usize>,
+    selected_emitter: usize,
+    emitters: Vec<EmitterDef>,
+    entry_info: Vec<EffEntryInfo>,
+}
+
+/// Undo and redo for the open file's effect edits.
+///
+/// An edit is drawn before anyone can know it is coming, so the state before it is kept as
+/// `baseline`: the selected effect as of the last step. Edits made close together (one drag,
+/// a few keystrokes) become one step, closed once the pointer is up and the edits stop.
+#[derive(Default)]
+struct EffHistory {
+    baseline: Option<EffHistoryStep>,
+    /// When the last edit of the open step was made; None when no step is open.
+    open_since: Option<Instant>,
+    /// `edit_rev` as last seen by the history, so changes made elsewhere (a load, a project
+    /// applying its edits) refresh the baseline instead of becoming a step.
+    seen_rev: u64,
+    undo: Vec<EffHistoryStep>,
+    redo: Vec<EffHistoryStep>,
+}
+
+/// How long the edits of one step may pause before the step closes.
+const HISTORY_STEP_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+/// The most steps kept.
+const HISTORY_LIMIT: usize = 100;
 
 pub struct EffEditor {
     pub open: bool,
@@ -593,6 +626,8 @@ pub struct EffEditor {
     /// for one frame so the "sending" state is visible.
     deploy_defer: bool,
     last_sent_note: Option<String>,
+    /// Undo and redo for effect edits on this page.
+    history: EffHistory,
 }
 
 impl Default for EffEditor {
@@ -676,6 +711,7 @@ impl Default for EffEditor {
             carrier_ok: false,
             deploy_defer: false,
             last_sent_note: None,
+            history: EffHistory::default(),
         }
     }
 }
@@ -1352,6 +1388,8 @@ impl EffEditor {
     fn load_eff(&mut self, path: &Path) {
         self.remember_picks();
         self.edit_rev += 1;
+        // A step holds emitters of the file it was taken in, by position.
+        self.history = EffHistory::default();
         self.load_error = None;
         self.ptcl = None;
         self.pristine.clear();
@@ -1663,6 +1701,8 @@ impl EffEditor {
     fn adopt_appended_texture(&mut self, pool: Vec<u8>, info: TextureInfo) {
         self.texture_pool = Some(pool);
         self.texture_pool_gen += 1;
+        // A step's texture numbers point into the pool as it was.
+        self.history = EffHistory::default();
         let Some(ptcl) = self.ptcl.as_mut() else {
             return;
         };
@@ -2328,6 +2368,159 @@ impl EffEditor {
             .collect()
     }
 
+    // ── History ─────────────────────────────────────────────────────────────────
+
+    /// The selected effect's set as it is now, to keep as a step.
+    fn history_capture(&self) -> Option<EffHistoryStep> {
+        let set_idx = self.entries.get(self.selected_entry?)?.set_idx;
+        self.history_capture_set(set_idx)
+    }
+
+    fn history_capture_set(&self, set_idx: usize) -> Option<EffHistoryStep> {
+        let set = self.ptcl.as_ref()?.emitter_sets.get(set_idx)?;
+        Some(EffHistoryStep {
+            set_idx,
+            selected_entry: self.selected_entry,
+            selected_emitter: self.selected_emitter,
+            emitters: set.emitters.clone(),
+            entry_info: self.entry_info.clone(),
+        })
+    }
+
+    /// Close the open step, if there is one: what was there before it goes on the undo list.
+    fn history_close_step(&mut self) {
+        if self.history.open_since.take().is_none() {
+            return;
+        }
+        if let Some(before) = self.history.baseline.take() {
+            self.history.undo.push(before);
+            if self.history.undo.len() > HISTORY_LIMIT {
+                self.history.undo.remove(0);
+            }
+            self.history.redo.clear();
+        }
+        self.history.baseline = self.history_capture();
+    }
+
+    /// Runs before the page draws: closes a finished step, and keeps the baseline on the
+    /// effect on screen.
+    fn history_begin_frame(&mut self, pointer_down: bool, now: Instant) {
+        if self
+            .history
+            .open_since
+            .is_some_and(|at| !pointer_down && now.duration_since(at) >= HISTORY_STEP_GAP)
+        {
+            self.history_close_step();
+        }
+        let set_idx = self
+            .selected_entry
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.set_idx);
+        let other_set = self.history.baseline.as_ref().map(|b| b.set_idx) != set_idx;
+        if other_set {
+            self.history_close_step();
+        }
+        if other_set
+            || (self.history.open_since.is_none() && self.edit_rev != self.history.seen_rev)
+        {
+            self.history.baseline = self.history_capture();
+        }
+        self.history.seen_rev = self.edit_rev;
+    }
+
+    /// An edit was made on the page this frame.
+    fn history_note_edit(&mut self, now: Instant) {
+        if self.history.baseline.is_some() {
+            self.history.open_since = Some(now);
+        }
+        self.history.seen_rev = self.edit_rev;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.history.open_since.is_some() || !self.history.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        self.history.open_since.is_none() && !self.history.redo.is_empty()
+    }
+
+    /// Undo the last effect edit, and show the effect and part it was made in.
+    pub fn undo(&mut self) {
+        self.history_close_step();
+        if let Some(step) = self.history.undo.pop() {
+            if let Some(now) = self.history_restore(step) {
+                self.history.redo.push(now);
+            }
+        }
+    }
+
+    pub fn redo(&mut self) {
+        self.history_close_step();
+        if let Some(step) = self.history.redo.pop() {
+            if let Some(now) = self.history_restore(step) {
+                self.history.undo.push(now);
+            }
+        }
+    }
+
+    /// Put `step` back, returning the state it replaced.
+    fn history_restore(&mut self, step: EffHistoryStep) -> Option<EffHistoryStep> {
+        let mut replaced = self.history_capture_set(step.set_idx)?;
+        // The step being undone was made with this selection; the redo step returns to it.
+        replaced.selected_entry = step.selected_entry;
+        replaced.selected_emitter = step.selected_emitter;
+        let set = self.ptcl.as_mut()?.emitter_sets.get_mut(step.set_idx)?;
+        set.emitters = step.emitters;
+        self.entry_info = step.entry_info;
+        if step.selected_entry != self.selected_entry {
+            self.remember_picks();
+            self.selected_entry = step.selected_entry;
+            self.scroll_to_selected = true;
+        }
+        self.selected_emitter = step.selected_emitter;
+        self.clamp_selected_emitter(step.set_idx);
+        self.touch();
+        self.history.seen_rev = self.edit_rev;
+        self.history.baseline = self.history_capture();
+        Some(replaced)
+    }
+
+    /// Put every part of the effect in `set_idx` back as the game has it.
+    fn reset_set_fields(&mut self, set_idx: usize) {
+        let (Some(ptcl), Some(pristine_set)) = (self.ptcl.as_mut(), self.pristine.get(set_idx))
+        else {
+            return;
+        };
+        let Some(set) = ptcl.emitter_sets.get_mut(set_idx) else {
+            return;
+        };
+        for e in set.emitters.iter_mut() {
+            if let Some(p) = pristine_set.get(e.source_idx) {
+                p.restore(e);
+            }
+        }
+        touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+    }
+
+    /// Put one part of the effect in `set_idx` back as the game has it.
+    fn reset_part_fields(&mut self, set_idx: usize, part: usize) {
+        let (Some(ptcl), Some(pristine_set)) = (self.ptcl.as_mut(), self.pristine.get(set_idx))
+        else {
+            return;
+        };
+        let Some(e) = ptcl
+            .emitter_sets
+            .get_mut(set_idx)
+            .and_then(|set| set.emitters.get_mut(part))
+        else {
+            return;
+        };
+        if let Some(p) = pristine_set.get(e.source_idx) {
+            p.restore(e);
+            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+        }
+    }
+
     // ── UI ────────────────────────────────────────────────────────────────────
 
     /// Queue an eff to show in the editor (e.g. the selected fighter's ef_*.eff).
@@ -2561,6 +2754,16 @@ impl EffEditor {
 
     /// The selected effect's emitters, with its texture and the game's live values below.
     pub fn page_right(&mut self, ui: &mut Ui, link: &GameLink) {
+        let pointer_down = ui.ctx().input(|i| i.pointer.any_down());
+        self.history_begin_frame(pointer_down, Instant::now());
+        let rev = self.edit_rev;
+        self.draw_page_right(ui, link);
+        if self.edit_rev != rev {
+            self.history_note_edit(Instant::now());
+        }
+    }
+
+    fn draw_page_right(&mut self, ui: &mut Ui, link: &GameLink) {
         if self.selected_entry.is_none() {
             ui.weak("No effect selected")
                 .on_hover_text("Pick an effect on the left to change how it looks.");
@@ -3014,7 +3217,11 @@ impl EffEditor {
                     badges.push(format!("{} borrowed", src.transplant_count));
                 }
                 if src.authored > 0 {
-                    badges.push(format!("{} changed", src.authored));
+                    // One stored edit per part: the effect list counts effects, this counts parts.
+                    badges.push(match src.authored {
+                        1 => "1 part changed".to_owned(),
+                        n => format!("{n} parts changed"),
+                    });
                 }
                 if src.textures > 0 {
                     badges.push(format!(
@@ -3041,12 +3248,28 @@ impl EffEditor {
                     "Its borrowed effects couldn't be put together. The status bar says why; borrow them again"
                         .to_string()
                 } else {
-                    format!("open {}'s eff with its edits applied", src.label)
+                    format!("Open {}'s effects with your edits", src.label)
                 });
                 if resp.clicked() {
-                    self.pending_load = Some(src.base.clone());
+                    self.open_edit_source(src);
                 }
             }
+        }
+    }
+
+    /// Open an edited character's effects. Through the character, when it is not the open one:
+    /// opening only its file left Character and Move on the old fighter, and the move picker then
+    /// listed the old fighter's moves for the new file's effects.
+    fn open_edit_source(&mut self, src: &EditSource) {
+        let known = self
+            .fighter_choices
+            .iter()
+            .any(|(name, _)| *name == src.fighter);
+        if known && self.open_fighter.as_deref() != Some(src.fighter.as_str()) {
+            self.fighter_request = Some(src.fighter.clone());
+            self.only_open_move = false;
+        } else {
+            self.pending_load = Some(src.base.clone());
         }
     }
 
@@ -3274,6 +3497,8 @@ impl EffEditor {
             .map(|s| s.emitters.len())
             .unwrap_or(0);
         let mut reset_entry = false;
+        // Some(true) to undo, Some(false) to redo.
+        let mut history = None;
         // Wraps in a narrow panel: a long effect name widened the panel past its edge.
         ui.horizontal_wrapped(|ui| {
             ui.heading(&entry_name);
@@ -3289,6 +3514,20 @@ impl EffEditor {
                 .small_button("Reset effect")
                 .on_hover_text("Put every part of this effect back as the game has it")
                 .clicked();
+            if ui
+                .add_enabled(self.can_undo(), egui::Button::new("Undo").small())
+                .on_hover_text("Undo the last effect edit (Ctrl+Z)")
+                .clicked()
+            {
+                history = Some(true);
+            }
+            if ui
+                .add_enabled(self.can_redo(), egui::Button::new("Redo").small())
+                .on_hover_text("Redo the last undone effect edit (Ctrl+Shift+Z)")
+                .clicked()
+            {
+                history = Some(false);
+            }
             let label = match &self.open_move {
                 Some(name) => format!("Use in {name}"),
                 None => "Use in a move".to_owned(),
@@ -3305,6 +3544,16 @@ impl EffEditor {
                 self.use_in_move_requested = true;
             }
         });
+        if let Some(undo) = history {
+            // It may open another effect: draw that one next frame.
+            if undo {
+                self.undo();
+            } else {
+                self.redo();
+            }
+            ui.ctx().request_repaint();
+            return;
+        }
         // A borrowed effect says where it came from, and can be taken out again.
         if let Some((fighter, item)) = self.current_transplant_for_entry(&entry_name) {
             ui.horizontal_wrapped(|ui| {
@@ -3343,6 +3592,11 @@ impl EffEditor {
                  model comes with it",
             );
         });
+        // Before the tab branch: the button is on both tabs.
+        if reset_entry {
+            self.history_close_step();
+            self.reset_set_fields(set_idx);
+        }
         // Drawn before the borrows below, because it edits the emitter LIST and the entry's
         // header rather than one emitter's fields.
         if self.emitter_tab == EmitterTab::Spawning {
@@ -3362,15 +3616,6 @@ impl EffEditor {
         let Some(pristine_set) = self.pristine.get(set_idx) else {
             return;
         };
-        if reset_entry {
-            for e in set.emitters.iter_mut() {
-                if let Some(p) = pristine_set.get(e.source_idx) {
-                    p.restore(e);
-                }
-            }
-            touch(&mut self.eff_dirty_at, &mut self.edit_rev);
-        }
-
         // Emitter tabs. Edited ones carry a dot and are tinted: a set can have twenty
         // emitters, and without a marker the only way to find the two you changed was to
         // click through all of them.
@@ -3413,6 +3658,7 @@ impl EffEditor {
         };
 
         let mut changed = false;
+        let mut reset_part = false;
         // The texture the selected emitter samples, handed to the import/export row that runs
         // after the emitter borrow ends.
         let mut texture_actions: Option<(usize, TextureInfo)> = None;
@@ -3625,8 +3871,7 @@ impl EffEditor {
 
                 ui.add_space(6.0);
                 if ui.small_button("Reset this part").clicked() {
-                    pr.restore(em);
-                    changed = true;
+                    reset_part = true;
                 }
 
                 // The friendly controls above are projections of the complete attribute
@@ -3655,6 +3900,11 @@ impl EffEditor {
 
         if changed {
             touch(&mut self.eff_dirty_at, &mut self.edit_rev);
+        }
+        if reset_part {
+            // A reset is a step of its own, never part of the edit just before it.
+            self.history_close_step();
+            self.reset_part_fields(set_idx, ei);
         }
     }
 
@@ -4661,6 +4911,8 @@ impl EffEditor {
     fn drop_texture_at(&mut self, index: usize, pool: Vec<u8>) {
         self.texture_pool = Some(pool);
         self.texture_pool_gen += 1;
+        // A step's texture numbers point into the pool as it was.
+        self.history = EffHistory::default();
         let shift = |slot: &mut Option<u32>| {
             if let Some(i) = slot {
                 if *i as usize > index {
@@ -5343,6 +5595,208 @@ mod tests {
             loaded_path: Some(PathBuf::from(path)),
             ..Default::default()
         }
+    }
+
+    fn tuned(editor: &EffEditor) -> f32 {
+        attr_f32(
+            &editor.ptcl.as_ref().expect("ptcl").emitter_sets[0].emitters[0],
+            TUNED,
+        )
+    }
+
+    fn text_position(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos + text.galley.size() / 2.0)
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                shapes.iter().find_map(|shape| text_position(shape, label))
+            }
+            _ => None,
+        }
+    }
+
+    /// Draw the selected effect's panel, then click the control labelled `label` in it.
+    fn click_in_emitter_editor(editor: &mut EffEditor, label: &str) {
+        let context = egui::Context::default();
+        let frame = |editor: &mut EffEditor, events: Vec<egui::Event>| {
+            context.run_test_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| editor.draw_emitter_editor(ui),
+            )
+        };
+        frame(editor, Vec::new());
+        let output = frame(editor, Vec::new());
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| text_position(&shape.shape, label))
+            .unwrap_or_else(|| panic!("no {label:?} on the panel"));
+        for pressed in [true, false] {
+            frame(
+                editor,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    /// The button is on both tabs; on Parts & timing the panel returned before the reset ran.
+    #[test]
+    fn reset_effect_works_on_both_tabs() {
+        for tab in [EmitterTab::Spawning, EmitterTab::Attributes] {
+            let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+            editor.selected_entry = Some(0);
+            editor.emitter_tab = tab;
+            tune(&mut editor, 2.5);
+            click_in_emitter_editor(&mut editor, "Reset effect");
+            assert_eq!(tuned(&editor), 1.0, "{tab:?}");
+        }
+    }
+
+    /// Steps close once the edits pause with the pointer up; one drag is one step.
+    fn history_frame(editor: &mut EffEditor, at: Instant, pointer_down: bool, edit: Option<f32>) {
+        editor.history_begin_frame(pointer_down, at);
+        if let Some(value) = edit {
+            tune(editor, value);
+            editor.touch();
+            editor.history_note_edit(at);
+        }
+    }
+
+    #[test]
+    fn effect_edits_undo_and_redo_in_steps() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, ms(0), false, None);
+        assert!(!editor.can_undo());
+        // One drag through three values, held for two seconds: one step.
+        history_frame(&mut editor, ms(10), true, Some(1.5));
+        history_frame(&mut editor, ms(20), true, Some(2.0));
+        history_frame(&mut editor, ms(2000), true, Some(2.5));
+        history_frame(&mut editor, ms(4000), true, None);
+        assert!(
+            editor.history.undo.is_empty(),
+            "a held drag is still one open step"
+        );
+        // A second edit after a pause.
+        history_frame(&mut editor, ms(5000), false, None);
+        history_frame(&mut editor, ms(6000), false, Some(3.0));
+        editor.undo();
+        assert_eq!(tuned(&editor), 2.5);
+        editor.undo();
+        assert_eq!(tuned(&editor), 1.0);
+        assert!(!editor.can_undo());
+        editor.redo();
+        assert_eq!(tuned(&editor), 2.5);
+        editor.redo();
+        assert_eq!(tuned(&editor), 3.0);
+        assert!(!editor.can_redo());
+        // A new edit after an undo drops what could be redone.
+        editor.undo();
+        history_frame(&mut editor, ms(7000), false, Some(4.0));
+        history_frame(&mut editor, ms(8000), false, None);
+        assert!(!editor.can_redo());
+        editor.undo();
+        assert_eq!(tuned(&editor), 2.5);
+    }
+
+    /// Resets need no confirmation because they undo: both buttons, on either tab.
+    #[test]
+    fn resets_are_undone_like_any_edit() {
+        for label in ["Reset effect", "Reset this part"] {
+            let t0 = Instant::now();
+            let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+            editor.selected_entry = Some(0);
+            history_frame(&mut editor, t0, false, None);
+            // Edited just before the reset, inside one step's gap: the reset is still its own.
+            history_frame(&mut editor, t0, false, Some(2.5));
+            let rev = editor.edit_rev;
+            editor.history_begin_frame(false, t0);
+            click_in_emitter_editor(&mut editor, label);
+            assert!(editor.edit_rev != rev);
+            editor.history_note_edit(t0);
+            assert_eq!(tuned(&editor), 1.0, "{label}");
+            editor.undo();
+            assert_eq!(tuned(&editor), 2.5, "{label}");
+            editor.undo();
+            assert_eq!(tuned(&editor), 1.0, "{label}");
+        }
+    }
+
+    /// Undo shows the effect the edit was made in, and a load forgets the old file's steps.
+    #[test]
+    fn undo_opens_the_edited_effect_and_a_load_clears_it() {
+        let t0 = Instant::now();
+        let mut editor = editor_with_one_emitter("/fx/ef_kirby.eff");
+        editor.entries.push(EffEntry {
+            name: "kirby_other".into(),
+            hash: 1,
+            set_idx: 0,
+        });
+        editor.selected_entry = Some(0);
+        history_frame(&mut editor, t0, false, None);
+        history_frame(&mut editor, t0, false, Some(2.5));
+        editor.selected_entry = Some(1);
+        history_frame(&mut editor, t0, false, None);
+        editor.undo();
+        assert_eq!(editor.selected_entry, Some(0));
+        assert_eq!(tuned(&editor), 1.0);
+        editor.load_eff(Path::new("/no/such/file.eff"));
+        assert!(!editor.can_undo() && !editor.can_redo());
+    }
+
+    /// The Edited chip of another character opens that character, so Character, Move and file
+    /// agree; the open character's chip just reopens its file.
+    #[test]
+    fn the_edited_chip_opens_its_character() {
+        let source = EditSource {
+            fighter: "bayonetta".into(),
+            label: "Bayonetta".into(),
+            base: PathBuf::from("/fx/ef_bayonetta.eff"),
+            alt_base: None,
+            merged: None,
+            transplant_count: 1,
+            authored: 2,
+            textures: 0,
+            transplants: Vec::new(),
+        };
+        let mut editor = EffEditor {
+            fighter_choices: vec![
+                ("bayonetta".into(), "Bayonetta".into()),
+                ("edge".into(), "Sephiroth".into()),
+            ],
+            open_fighter: Some("edge".into()),
+            ..Default::default()
+        };
+        editor.open_edit_source(&source);
+        assert_eq!(editor.fighter_request.as_deref(), Some("bayonetta"));
+        assert!(editor.pending_load.is_none());
+
+        let mut editor = EffEditor {
+            fighter_choices: vec![("bayonetta".into(), "Bayonetta".into())],
+            open_fighter: Some("bayonetta".into()),
+            ..Default::default()
+        };
+        editor.open_edit_source(&source);
+        assert!(editor.fighter_request.is_none());
+        assert_eq!(editor.pending_load, Some(source.base.clone()));
     }
 
     /// A file loaded before a project opened holds none of that project's edits: reading its

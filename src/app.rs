@@ -755,6 +755,22 @@ enum HistoryAction {
     Redo,
 }
 
+/// The undo or redo shortcut pressed this frame, consumed. Redo is checked first: egui matches
+/// Ctrl+Z on Ctrl+Shift+Z too, as it ignores an extra Shift, so redo never ran.
+fn history_shortcut(ctx: &egui::Context) -> Option<HistoryAction> {
+    ctx.input_mut(|i| {
+        if i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+            || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
+        {
+            Some(HistoryAction::Redo)
+        } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::Z) {
+            Some(HistoryAction::Undo)
+        } else {
+            None
+        }
+    })
+}
+
 /// A session-only snapshot for the currently open move.  Scripts and edit records are stored as
 /// JSON bytes because several of the deliberately lossless ACMD enums do not implement
 /// `PartialEq`; serializing them also means the equality check sees raw source tokens exactly as
@@ -1042,6 +1058,61 @@ mod picker_state_tests {
         }
         assert_eq!(effect_view_switch_offset(240.0).y, 40.0);
         assert_eq!(effect_view_switch_offset(900.0).y, 8.0);
+    }
+
+    #[test]
+    fn ctrl_shift_z_redoes_and_ctrl_z_undoes() {
+        let pressed = |modifiers: egui::Modifiers, key: egui::Key| {
+            let ctx = egui::Context::default();
+            let mut got = None;
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let _ = crate::ui::TestFrame::run_test_ui(&ctx, input, |ui| {
+                got = history_shortcut(ui.ctx())
+            });
+            got
+        };
+        let ctrl = egui::Modifiers::CTRL;
+        assert_eq!(
+            pressed(ctrl | egui::Modifiers::SHIFT, egui::Key::Z),
+            Some(HistoryAction::Redo)
+        );
+        assert_eq!(pressed(ctrl, egui::Key::Y), Some(HistoryAction::Redo));
+        assert_eq!(pressed(ctrl, egui::Key::Z), Some(HistoryAction::Undo));
+        assert_eq!(pressed(egui::Modifiers::NONE, egui::Key::Z), None);
+    }
+
+    #[test]
+    fn a_dragged_effects_panel_keeps_its_share_of_a_resized_window() {
+        // Dragged to 340 of 1400: a 10 px smaller window keeps it near 340, not the 460 default.
+        let share = Some(340.0 / 1400.0);
+        let (_, default, max) = effects_page_side_widths(1390.0);
+        assert_eq!(default, 460.0);
+        let width = effects_page_resized_width(1390.0, share, default, 280.0, max);
+        assert!((width - 337.6).abs() < 0.5, "{width}");
+        // Never dragged: the default share, as before.
+        assert_eq!(
+            effects_page_resized_width(1390.0, None, default, 280.0, max),
+            460.0
+        );
+        // A share that would break the limits in a small window stays within them.
+        let (_, default, max) = effects_page_side_widths(700.0);
+        assert_eq!(
+            effects_page_resized_width(700.0, Some(0.9), default, 280.0, max),
+            max
+        );
+        assert_eq!(
+            effects_page_resized_width(700.0, Some(0.1), default, 280.0, max),
+            280.0
+        );
     }
 
     #[test]
@@ -1854,6 +1925,20 @@ fn effects_page_side_widths(window_width: f32) -> (f32, f32, f32) {
     let right_default = (window_width * 0.4).clamp(280.0, 460.0);
     let right_max = (window_width * 0.5).max(280.0);
     (left_max, right_default, right_max)
+}
+
+/// An Effects page side panel's width once the window is resized: the share of the window it
+/// was dragged to, or its default, within its limits.
+fn effects_page_resized_width(
+    window_width: f32,
+    share: Option<f32>,
+    default: f32,
+    min: f32,
+    max: f32,
+) -> f32 {
+    share.map_or(default, |share| {
+        (share * window_width).clamp(min, max.max(min))
+    })
 }
 
 /// Rows the Effects page's timeline is sized for before it scrolls, so the effect's own
@@ -4137,6 +4222,10 @@ pub struct VisionaryApp {
     /// panels go back to their share of the new width: a panel squeezed in a small window kept
     /// that narrow width after the window grew again.
     effects_page_sized_for: f32,
+    /// The share of the window each Effects page side panel (left, right) was dragged to, and
+    /// their widths last frame. A resize keeps a dragged panel at its share.
+    effects_page_shares: [Option<f32>; 2],
+    effects_page_widths: [f32; 2],
     /// How many times playback has come round to the move's start. The game spawns a move's
     /// effects anew each time it is played, each with its own random particles and offsets, so
     /// each time round the preview plays them with new numbers too.
@@ -4611,6 +4700,8 @@ impl VisionaryApp {
             effect_loop: EffectLoopClock::default(),
             effect_loop_for: None,
             effects_page_sized_for: 0.0,
+            effects_page_shares: [None; 2],
+            effects_page_widths: [0.0; 2],
             playthrough: 0,
             carrier_push_callers: Vec::new(),
             carrier_push_reports: false,
@@ -10039,9 +10130,16 @@ impl VisionaryApp {
         let left_default = 260.0_f32.min(left_max);
         let resized = (window_width - self.effects_page_sized_for).abs() > 0.5;
         self.effects_page_sized_for = window_width;
+        let dragging = ui.input(|i| i.pointer.any_down());
         let left = egui::Panel::left("effects_page_left");
         let left = if resized {
-            left.exact_size(left_default)
+            left.exact_size(effects_page_resized_width(
+                window_width,
+                self.effects_page_shares[0],
+                left_default,
+                160.0,
+                left_max,
+            ))
         } else {
             left.default_size(left_default)
                 .min_size(160.0)
@@ -10049,25 +10147,49 @@ impl VisionaryApp {
         };
         // Fixed contents: the panels keep their width whatever their rows need. Measured from
         // the contents, the right panel shrank to its minimum once its heading could wrap.
-        left.resizable(true).show(ui, |ui| {
-            show_fixed_panel_contents(ui, "effects_page_left_contents", |ui| {
-                self.eff_editor.page_left(ui, &self.game_link);
-            });
-        });
+        let left_width = left
+            .resizable(true)
+            .show(ui, |ui| {
+                show_fixed_panel_contents(ui, "effects_page_left_contents", |ui| {
+                    self.eff_editor.page_left(ui, &self.game_link);
+                });
+            })
+            .response
+            .rect
+            .width();
         let right = egui::Panel::right("effects_page_right");
         let right = if resized {
-            right.exact_size(right_default)
+            right.exact_size(effects_page_resized_width(
+                window_width,
+                self.effects_page_shares[1],
+                right_default,
+                280.0,
+                right_max,
+            ))
         } else {
             right
                 .default_size(right_default)
                 .min_size(280.0)
                 .max_size(right_max)
         };
-        right.resizable(true).show(ui, |ui| {
-            show_fixed_panel_contents(ui, "effects_page_right_contents", |ui| {
-                self.eff_editor.page_right(ui, &self.game_link);
-            });
-        });
+        let right_width = right
+            .resizable(true)
+            .show(ui, |ui| {
+                show_fixed_panel_contents(ui, "effects_page_right_contents", |ui| {
+                    self.eff_editor.page_right(ui, &self.game_link);
+                });
+            })
+            .response
+            .rect
+            .width();
+        // A width that changed while the pointer is held, with the window the same size, is a
+        // drag: remember it as a share of the window.
+        for (side, width) in [left_width, right_width].into_iter().enumerate() {
+            if !resized && dragging && (width - self.effects_page_widths[side]).abs() > 0.5 {
+                self.effects_page_shares[side] = Some(width / window_width.max(1.0));
+            }
+            self.effects_page_widths[side] = width;
+        }
         egui::CentralPanel::default().show(ui, |ui| self.draw_viewport(ui, frame));
     }
 
@@ -33621,18 +33743,18 @@ impl eframe::App for VisionaryApp {
         // History is captured only after background loading and playback have settled.  This
         // keeps navigation and animation state out of the edit stack while still covering every
         // main-window editor, the Visual effects tab included.
-        if !self.node_workspace
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z))
+        // The Effects page has its own history: a move edit is off screen there, and undoing
+        // one from that page would change something the user cannot see.
+        let effects_page = self.eff_editor.open && !self.roster.open;
+        if let Some(action) = (!self.node_workspace)
+            .then(|| history_shortcut(&ctx))
+            .flatten()
         {
-            self.apply_history_action(HistoryAction::Undo);
-            self.history_suppress_frame = true;
-        } else if !self.node_workspace
-            && ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
-                    || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
-            })
-        {
-            self.apply_history_action(HistoryAction::Redo);
+            match (effects_page, action) {
+                (true, HistoryAction::Undo) => self.eff_editor.undo(),
+                (true, HistoryAction::Redo) => self.eff_editor.redo(),
+                (false, action) => self.apply_history_action(action),
+            }
             self.history_suppress_frame = true;
         }
         // One current project holds every edit: they autosave to its file.
