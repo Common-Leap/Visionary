@@ -307,6 +307,8 @@ pub struct VfxPreview {
     /// until it lands, so an edit shows without waiting for the mouse to move.
     reloading: HashSet<PathBuf>,
     next_load: u64,
+    /// The last prepare's looping draw: its length and its period with the gap, in frames.
+    looped: Option<(usize, usize)>,
 }
 
 impl VfxPreview {
@@ -331,6 +333,7 @@ impl VfxPreview {
             lengths: HashMap::new(),
             reloading: HashSet::new(),
             next_load: 0,
+            looped: None,
         }
     }
 
@@ -343,6 +346,11 @@ impl VfxPreview {
     /// paint again shortly so it appears as soon as it is ready.
     pub fn waiting(&self) -> bool {
         self.waiting
+    }
+
+    /// The length and period, in frames, of the effect the last prepare played on a loop.
+    pub fn looped(&self) -> Option<(usize, usize)> {
+        self.looped
     }
 
     fn workers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &Workers {
@@ -558,6 +566,7 @@ impl VfxPreview {
         draws: &[EffectDraw],
     ) {
         self.prepared.clear();
+        self.looped = None;
         self.collect_loaded();
         self.waiting = !self.reloading.is_empty();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
@@ -612,6 +621,7 @@ impl VfxPreview {
                         .entry(key)
                         .or_insert_with(|| effect_loop(&file.emitters[set]));
                     let period = plan.length + 15;
+                    self.looped = Some((plan.length, period));
                     looped = vec![*at; clock % period + 1];
                     kill_at = plan.kill;
                     spawn = looped_spawn(draw.spawn, clock, period);
