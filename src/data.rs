@@ -8559,26 +8559,69 @@ pub struct SlotCharacter {
 ///
 /// A mod root counts when it ships `fighter` slots past c07 *and* names a character of its own
 /// in `ui/message/msg_name.xmsbt`. Slots with no name are a skin pack and stay with the fighter.
+///
+/// Roots are ordered lowest-to-highest priority (dump, then Mod Library, then project `romfs/`).
+/// A higher-priority root's claimed slots shadow overlapping slots from lower-priority roots so
+/// an active project mod does not show up alongside a stale/conflicting lower-priority copy on
+/// the same costume slots. Disjoint slots that resolve to the same character name are merged.
 pub fn slot_characters(roots: &[PathBuf], fighter: &str) -> Vec<SlotCharacter> {
-    roots
-        .iter()
-        .filter_map(|root| {
-            let slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(root), fighter)
-                .into_iter()
-                .filter(|slot| *slot >= VANILLA_SLOT_COUNT)
-                .collect();
-            if slots.is_empty() {
-                return None;
-            }
-            let text = std::fs::read(root.join("ui/message/msg_name.xmsbt")).ok()?;
-            let name = xmsbt_character_name(&decode_xmsbt(&text), fighter)?;
-            Some(SlotCharacter {
+    let mut claimed_slots: std::collections::HashSet<u8> = std::collections::HashSet::new();
+    let mut found: Vec<SlotCharacter> = Vec::new();
+    for root in roots.iter().rev() {
+        let slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(root), fighter)
+            .into_iter()
+            .filter(|slot| *slot >= VANILLA_SLOT_COUNT && !claimed_slots.contains(slot))
+            .collect();
+        if slots.is_empty() {
+            continue;
+        }
+        let Ok(text) = std::fs::read(root.join("ui/message/msg_name.xmsbt")) else {
+            continue;
+        };
+        let Some(name) = xmsbt_character_name(&decode_xmsbt(&text), fighter) else {
+            continue;
+        };
+        for &slot in &slots {
+            claimed_slots.insert(slot);
+        }
+        if let Some(existing) = found
+            .iter_mut()
+            .find(|c| c.name.eq_ignore_ascii_case(&name))
+        {
+            existing.slots.extend(slots);
+            existing.slots.sort_unstable();
+            existing.slots.dedup();
+        } else {
+            found.push(SlotCharacter {
                 name,
                 slots,
                 root: root.clone(),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    found.reverse();
+    found
+}
+
+/// Whether `id` in a `nam_chr*_<id>` label belongs to a *different* vanilla fighter (or system
+/// roster entry like `"random"`), so a merged/vanilla `msg_name.xmsbt` cannot mislabel `fighter`'s
+/// extra costume slots as an unrelated vanilla character (e.g. `"Wario"` on `pacman` slots).
+fn is_other_vanilla_fighter_id(id: &str, fighter: &str) -> bool {
+    if id.eq_ignore_ascii_case(fighter) {
+        return false;
+    }
+    let lower = id.to_ascii_lowercase();
+    VANILLA_FIGHTERS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "random"
+                | "fushigisou"
+                | "lizardon"
+                | "eflame_first"
+                | "elight_first"
+                | "eflame_only"
+                | "elight_only"
+        )
 }
 
 /// `.xmsbt` is UTF-16 (either byte order, BOM or not) in practice, and UTF-8 now and then.
@@ -8601,8 +8644,11 @@ fn decode_xmsbt(bytes: &[u8]) -> String {
 
 /// The character name an `.xmsbt` gives: the text of a `nam_chr1_NN_<id>` entry (`chr0` when
 /// there is no `chr1`), preferring an id other than `fighter`'s own, which is a rename of the
-/// vanilla character rather than a new one.
+/// vanilla character rather than a new one. Entries belonging to other vanilla fighters (from a
+/// vanilla dump or multi-character UI mod) and unmodified default names for `fighter` itself are
+/// ignored.
 fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
+    let default_display = fighter_display_name(fighter);
     let mut found: Vec<(u8, bool, String)> = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("label=\"nam_chr") {
@@ -8619,6 +8665,9 @@ fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
             "0" => 1,
             _ => continue,
         };
+        if is_other_vanilla_fighter_id(id, fighter) {
+            continue;
+        }
         let body = &rest[close..];
         let entry_end = body.find("</entry>").unwrap_or(body.len());
         let Some(start) = body[..entry_end].find("<text>") else { continue };
@@ -8630,8 +8679,12 @@ fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
             .replace("&quot;", "\"")
             .replace("&apos;", "'");
         let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        let own = id.eq_ignore_ascii_case(fighter);
+        if own && name.eq_ignore_ascii_case(&default_display) {
+            continue;
+        }
         if !name.is_empty() {
-            found.push((rank, id.eq_ignore_ascii_case(fighter), name));
+            found.push((rank, own, name));
         }
     }
     found.sort_by_key(|(rank, own, _)| (*own, *rank));
@@ -10809,6 +10862,61 @@ mod tests {
             super::xmsbt_character_name(r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>"#, "pacman")
                 .as_deref(),
             Some("Pac")
+        );
+    }
+
+    #[test]
+    fn other_vanilla_fighters_in_xmsbt_do_not_misname_extra_slots() {
+        // A vanilla or merged msg_name.xmsbt containing Wario and default Pac-Man must not label
+        // Pac-Man's extra slots as "Wario" or duplicate "Pac-Man".
+        let text = r#"<entry label="nam_chr1_00_wario"><text>Wario</text></entry>
+<entry label="nam_chr1_00_pacman"><text>PAC-MAN</text></entry>"#;
+        assert_eq!(super::xmsbt_character_name(text, "pacman"), None);
+
+        // If the same file also has a custom character entry, that custom character wins.
+        let with_custom = format!(
+            "{text}\n<entry label=\"nam_chr1_00_shyguy\"><text>Shy Guy</text></entry>"
+        );
+        assert_eq!(
+            super::xmsbt_character_name(&with_custom, "pacman").as_deref(),
+            Some("Shy Guy")
+        );
+    }
+
+    #[test]
+    fn higher_priority_root_shadows_overlapping_slot_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower_mod");
+        for slot in 40..=44 {
+            std::fs::create_dir_all(lower.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(lower.join("ui/message")).unwrap();
+        std::fs::write(
+            lower.join("ui/message/msg_name.xmsbt"),
+            r#"<entry label="nam_chr1_00_oldmod"><text>Old Mod</text></entry>"#,
+        )
+        .unwrap();
+
+        let project_romfs = tmp.path().join("project_romfs");
+        for slot in 40..=48 {
+            std::fs::create_dir_all(project_romfs.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+        }
+        std::fs::create_dir_all(project_romfs.join("ui/message")).unwrap();
+        std::fs::write(
+            project_romfs.join("ui/message/msg_name.xmsbt"),
+            r#"<entry label="nam_chr1_00_shyguy"><text>Shy Guy</text></entry>"#,
+        )
+        .unwrap();
+
+        // project_romfs is last (highest priority) and claims c40..=c48, shadowing lower_mod's c40..=c44.
+        let found = super::slot_characters(&[lower, project_romfs.clone()], "pacman");
+        assert_eq!(
+            found,
+            vec![super::SlotCharacter {
+                name: "Shy Guy".into(),
+                slots: (40..=48).collect(),
+                root: project_romfs,
+            }]
         );
     }
 

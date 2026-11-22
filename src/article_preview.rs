@@ -2900,6 +2900,22 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                     spec.fade
                 );
             }
+
+            // Shy Guy's frame.rs overrides Pac-Man's hurtboxes on entry/reset, elongating
+            // the Waist capsule upward ([0,0,0] -> [4.2,0,0], radius 4.7) and zeroing the legs.
+            let shyguy_hurtboxes = index
+                .hurtboxes
+                .get("pacman")
+                .expect("Shy Guy hurtbox overrides must be indexed on pacman");
+            assert_eq!(shyguy_hurtboxes.len(), 7, "{shyguy_hurtboxes:?}");
+            let waist = shyguy_hurtboxes
+                .iter()
+                .find(|h| h.bone_name.eq_ignore_ascii_case("waist"))
+                .expect("waist hurtbox override");
+            assert_eq!(waist.index, 4);
+            assert_eq!(waist.endpoint1, [0.0, 0.0, 0.0]);
+            assert_eq!(waist.endpoint2, [4.2, 0.0, 0.0]);
+            assert_eq!(waist.radius, 4.7);
         }
     }
 }

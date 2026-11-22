@@ -708,7 +708,7 @@ enum PendingLeave {
     Script(Option<String>, MoveEntry),
     /// Kept by name, not row: the list can be re-indexed while the prompt is open.
     Fighter(crate::mod_project::ProjectFighter),
-    ForgetFighter(String),
+    ForgetFighter(crate::mod_project::ProjectFighter),
     Hub(crate::project_hub::HubAction),
     LoadProject(PathBuf),
     NewProject(PathBuf),
@@ -830,7 +830,7 @@ mod object_leave_tests {
                 name: "samus".into(),
                 character: None,
             }),
-            PendingLeave::ForgetFighter("samus".into()),
+            PendingLeave::ForgetFighter(crate::mod_project::ProjectFighter::fighter("samus")),
             PendingLeave::Hub(crate::project_hub::HubAction::BrowseWithoutProject),
             PendingLeave::LoadProject(PathBuf::from("p.json")),
             PendingLeave::NewProject(PathBuf::from("w")),
@@ -2343,6 +2343,7 @@ fn effect_source_label(source_dir: &str) -> String {
 struct FighterRow {
     idx: usize,
     name: String,
+    character: Option<String>,
     label: String,
     modded: bool,
     slot_count: usize,
@@ -2353,7 +2354,7 @@ struct FighterRow {
 /// What a click in the fighter list asked for, applied after the list is drawn.
 enum FighterRowAction {
     Select(usize),
-    Forget(String),
+    Forget(crate::mod_project::ProjectFighter),
     Add(usize),
     Remove(usize),
 }
@@ -4255,9 +4256,16 @@ pub struct VisionaryApp {
     pending_project_script: Option<crate::acmd_src::ProjectScript>,
     // Cached bone names for dropdown
     bone_names: Vec<String>,
-    /// Session-only parameter-defined hurtboxes for the selected fighter. These never enter
-    /// AppState, project serialization, or edit history.
+    /// Session-only parameter-defined hurtboxes for the selected fighter (after any linked
+    /// moveset `set_hit_data` / `set_hurtboxes` overrides). These never enter AppState, project
+    /// serialization, or edit history.
     hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
+    /// Unmodified parameter-file hurtboxes for the selected fighter, kept so moveset reloads or
+    /// unlinks can cleanly recompute `hurtbox_volumes`.
+    base_hurtbox_volumes: Vec<crate::data::HurtboxVolume>,
+    /// Canonical bone names from the selected fighter's loaded skeleton(s), for resolving
+    /// source-defined hurtbox bone names.
+    loaded_skeleton_bones: Vec<String>,
     hurtbox_warnings: Vec<crate::data::HurtboxLoadWarning>,
     /// Persistent viewport preference; it remains true across fighters even when a fighter has
     /// no parameter data, while the checkbox itself is disabled for that fighter.
@@ -4941,6 +4949,8 @@ impl VisionaryApp {
             pending_project_script: None,
             bone_names: Vec::new(),
             hurtbox_volumes: Vec::new(),
+            base_hurtbox_volumes: Vec::new(),
+            loaded_skeleton_bones: Vec::new(),
             hurtbox_warnings: Vec::new(),
             show_hurtboxes: load_hurtbox_visibility(),
             helper_bones: load_helper_bones(),
@@ -5106,10 +5116,13 @@ impl VisionaryApp {
         };
 
         // Keep capture memory consistent with the persisted roster filter even if the user
-        // forgot a fighter in an earlier session and then starts the game before restoring it.
+        // forgot a base fighter in an earlier session and then starts the game before restoring it.
+        // Slot-character keys (`"pacman::shy guy"`) only hide that character row, not the base
+        // fighter's captures.
         let forgotten_kinds: Vec<i32> = app
             .forgotten_fighters
             .iter()
+            .filter(|key| !key.contains("::"))
             .filter_map(|name| fighter_kind_id(name))
             .collect();
         for kind in forgotten_kinds {
@@ -5323,6 +5336,63 @@ impl VisionaryApp {
                 }
             }
         }
+        self.refresh_hurtbox_volumes();
+    }
+
+    fn is_row_forgotten(&self, name: &str, character: Option<&str>) -> bool {
+        self.forgotten_fighters
+            .contains(&forgotten_row_key(name, character))
+    }
+
+    /// Recompute `self.hurtbox_volumes` from the selected fighter's parameter file plus any
+    /// runtime `FighterUtil::set_hit_data` / `set_hurtboxes` overrides in the linked moveset.
+    fn refresh_hurtbox_volumes(&mut self) {
+        self.hurtbox_volumes = self.base_hurtbox_volumes.clone();
+        let Some(fighter) = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(index) = self
+            .acmd_src
+            .as_ref()
+            .filter(|index| index.has_fighter(&fighter.name))
+        else {
+            return;
+        };
+        let owns_source_hurtboxes = if self.project_path.is_some()
+            && self
+                .acmd_src_costume_gated
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&fighter.name))
+        {
+            let key = crate::mod_project::ProjectFighter {
+                name: fighter.name.clone(),
+                character: fighter.custom_name.clone(),
+            };
+            self.script_owner_rows(&fighter.name).contains(&key)
+        } else {
+            true
+        };
+        if !owns_source_hurtboxes {
+            return;
+        }
+        let fighter_key = fighter.name.to_ascii_lowercase();
+        let Some(overrides) = index.hurtboxes.get(&fighter_key).or_else(|| {
+            (index.hurtboxes.len() == 1)
+                .then(|| index.hurtboxes.values().next())
+                .flatten()
+        }) else {
+            return;
+        };
+        apply_source_hurtbox_overrides(
+            &mut self.hurtbox_volumes,
+            overrides,
+            &self.loaded_skeleton_bones,
+        );
     }
 
     /// Link the moveset remembered in the app config, quietly, as startup does: a source that
@@ -5461,7 +5531,6 @@ impl VisionaryApp {
                     None => continue,
                 };
                 if editor_source_is_excluded(&name)
-                    || self.forgotten_fighters.contains(&name.to_ascii_lowercase())
                     || !seen.insert(name.clone())
                 {
                     continue;
@@ -5533,9 +5602,11 @@ impl VisionaryApp {
                 let mut slots = slots;
                 slots.retain(|slot| !characters.iter().any(|c| c.slots.contains(slot)));
                 // Every slot belongs to a character: there is no fighter left to list.
-                let keep_fighter = !slots.is_empty() || characters.is_empty();
+                let keep_fighter = (!slots.is_empty() || characters.is_empty())
+                    && !self.is_row_forgotten(&name, None);
                 let custom_entries: Vec<crate::data::FighterEntry> = characters
                     .into_iter()
+                    .filter(|character| !self.is_row_forgotten(&name, Some(&character.name)))
                     .map(|character| {
                         let costume = format!("c{:02}", character.slots[0]);
                         let own = character.root.join("fighter").join(&name);
@@ -5686,10 +5757,10 @@ impl VisionaryApp {
         if count == 0 {
             return;
         }
-        let restored_kinds: Vec<i32> = self
+        let restored_kinds: BTreeSet<i32> = self
             .forgotten_fighters
             .iter()
-            .filter_map(|name| fighter_kind_id(name))
+            .filter_map(|key| fighter_kind_id(forgotten_key_base_fighter(key)))
             .collect();
         self.forgotten_fighters.clear();
         for kind in restored_kinds {
@@ -5700,138 +5771,149 @@ impl VisionaryApp {
         self.state.status = format!("Restored {count} forgotten fighter(s).");
     }
 
-    /// Remove one fighter from Visionary's remembered roster and clear state owned by the app.
+    /// Remove one fighter row from Visionary's remembered roster and clear state owned by the app.
     /// The data/mod roots are never modified: forgetting is a reversible roster action, not a
     /// request to delete the user's dump or installed mod files.
-    fn forget_fighter(&mut self, requested: &str) {
-        if self.leave_gate(|| PendingLeave::ForgetFighter(requested.to_string())) {
+    fn forget_fighter(&mut self, requested: &crate::mod_project::ProjectFighter) {
+        if self.leave_gate(|| PendingLeave::ForgetFighter(requested.clone())) {
             return;
         }
-        let Some(index) = self
-            .state
-            .fighters
-            .iter()
-            .position(|fighter| fighter.name.eq_ignore_ascii_case(requested))
-        else {
+        let Some(index) = self.state.fighters.iter().position(|fighter| {
+            fighter.name.eq_ignore_ascii_case(&requested.name)
+                && fighter.custom_name == requested.character
+        }) else {
             return;
         };
         let fighter = self.state.fighters[index].name.clone();
+        let custom_name = self.state.fighters[index].custom_name.clone();
+        let display_label = self.state.fighters[index].display_name.clone();
         let was_selected = self.state.selected_fighter == Some(index);
+        let has_sibling = self.state.fighters.iter().enumerate().any(|(i, other)| {
+            i != index && other.name.eq_ignore_ascii_case(&fighter)
+        });
+        // A slot character shares the base fighter's internal id (`pacman`). Only wipe shared
+        // fighter-level edits, captures, and script caches when forgetting the base fighter row
+        // itself or when no sibling row for that fighter remains in the list.
+        let clear_shared_fighter_data = custom_name.is_none() || !has_sibling;
 
-        // Remove only app-owned merged previews and overlays. The source effect file remains the
-        // canonical file in the dump/mod root.
-        let source_rels: Vec<String> = self
-            .eff_mods
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(&fighter))
-            .map(|(_, eff)| eff.source_rel.clone())
-            .collect();
-        for source_rel in source_rels {
-            let base = self.resolve_eff_source(&source_rel);
-            self.eff_editor.set_merged_overlay(&base, None);
-            if let Some(dir) = base.parent() {
-                crate::scratch_dirs::remove_transplant_previews(dir);
-            }
-        }
-        let live_removed = self.remove_live_eff_for_fighter(&fighter);
-        if live_removed {
-            self.live_eff_probe_due = None;
-        }
-        self.eff_editor.forget_fighter(&fighter);
-        self.eff_mods
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.merged_build_failed
-            .retain(|name| !name.eq_ignore_ascii_case(&fighter));
-        self.effect_pool = None;
-        self.use_scan = self
-            .use_scan
-            .take()
-            .filter(|scan| !scan.fighter.eq_ignore_ascii_case(&fighter));
-        if self.redirect_prompt.as_ref().is_some_and(|prompt| {
-            prompt
-                .uses
+        let cache_result = if clear_shared_fighter_data {
+            // Remove only app-owned merged previews and overlays. The source effect file remains
+            // the canonical file in the dump/mod root.
+            let source_rels: Vec<String> = self
+                .eff_mods
                 .iter()
-                .any(|u| fighter_key_matches(&u.move_key, &fighter))
-        }) {
-            self.redirect_prompt = None;
-        }
-        if self
-            .transplant_target
-            .as_deref()
-            .is_some_and(|target| target.eq_ignore_ascii_case(&fighter))
-        {
-            self.transplant_target = None;
-        }
-        if self
-            .transplant_sel
-            .as_ref()
-            .is_some_and(|(path, _)| path_is_fighter_eff(Path::new(path), &fighter))
-        {
-            self.transplant_sel = None;
-        }
-        self.transplant_replace = None;
-        self.transplant_replace_search.clear();
-        self.current_eff_path = self
-            .current_eff_path
-            .take()
-            .filter(|path| !path_is_fighter_eff(path, &fighter));
-        self.recent_effs
-            .retain(|path| !path_is_fighter_eff(path, &fighter));
-        save_recent_effs(&self.recent_effs);
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&fighter))
+                .map(|(_, eff)| eff.source_rel.clone())
+                .collect();
+            for source_rel in source_rels {
+                let base = self.resolve_eff_source(&source_rel);
+                self.eff_editor.set_merged_overlay(&base, None);
+                if let Some(dir) = base.parent() {
+                    crate::scratch_dirs::remove_transplant_previews(dir);
+                }
+            }
+            let live_removed = self.remove_live_eff_for_fighter(&fighter);
+            if live_removed {
+                self.live_eff_probe_due = None;
+            }
+            self.eff_editor.forget_fighter(&fighter);
+            self.eff_mods
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.merged_build_failed
+                .retain(|name| !name.eq_ignore_ascii_case(&fighter));
+            self.effect_pool = None;
+            self.use_scan = self
+                .use_scan
+                .take()
+                .filter(|scan| !scan.fighter.eq_ignore_ascii_case(&fighter));
+            if self.redirect_prompt.as_ref().is_some_and(|prompt| {
+                prompt
+                    .uses
+                    .iter()
+                    .any(|u| fighter_key_matches(&u.move_key, &fighter))
+            }) {
+                self.redirect_prompt = None;
+            }
+            if self
+                .transplant_target
+                .as_deref()
+                .is_some_and(|target| target.eq_ignore_ascii_case(&fighter))
+            {
+                self.transplant_target = None;
+            }
+            if self
+                .transplant_sel
+                .as_ref()
+                .is_some_and(|(path, _)| path_is_fighter_eff(Path::new(path), &fighter))
+            {
+                self.transplant_sel = None;
+            }
+            self.transplant_replace = None;
+            self.transplant_replace_search.clear();
+            self.current_eff_path = self
+                .current_eff_path
+                .take()
+                .filter(|path| !path_is_fighter_eff(path, &fighter));
+            self.recent_effs
+                .retain(|path| !path_is_fighter_eff(path, &fighter));
+            save_recent_effs(&self.recent_effs);
 
-        // ACMD, effect-call, sound, expression, warning, and live-rule stores all use either a
-        // fighter key or a fighter-prefixed key. Remove only this fighter's entries so other
-        // projects and live previews remain intact.
-        self.state
-            .edit_log
-            .entries
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.state
-            .effect_call_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_call_full
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_dropped_lines
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .effect_frame_residue
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .sound_script_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .expression_script_edits
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.state
-            .capture_branch_warnings
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.move_source_cache
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.move_graphs
-            .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
-        self.node_effect_scripts
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.node_live_cache = None;
-        self.node_editor.invalidate();
-        if self
-            .source_mismatch_prompt
-            .as_ref()
-            .is_some_and(|prompt| prompt.fighter.eq_ignore_ascii_case(&fighter))
-        {
-            self.source_mismatch_prompt = None;
-        }
-        self.hitbox_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.effect_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        self.effect_control_rules_store
-            .retain(|key, _| !fighter_key_matches(key, &fighter));
-        if let Some(kind) = fighter_kind_id(&fighter) {
-            self.game_link.forget_captures_for_kind(kind);
-        }
-        let cache_result = crate::acmd::forget_fighter_cache(&fighter);
+            // ACMD, effect-call, sound, expression, warning, and live-rule stores all use either
+            // a fighter key or a fighter-prefixed key. Remove only this fighter's entries so
+            // other projects and live previews remain intact.
+            self.state
+                .edit_log
+                .entries
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.state
+                .effect_call_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_call_full
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_dropped_lines
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .effect_frame_residue
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .sound_script_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .expression_script_edits
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.state
+                .capture_branch_warnings
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.move_source_cache
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.move_graphs
+                .retain(|name, _| !name.eq_ignore_ascii_case(&fighter));
+            self.node_effect_scripts
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.node_live_cache = None;
+            self.node_editor.invalidate();
+            if self
+                .source_mismatch_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.fighter.eq_ignore_ascii_case(&fighter))
+            {
+                self.source_mismatch_prompt = None;
+            }
+            self.hitbox_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.effect_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            self.effect_control_rules_store
+                .retain(|key, _| !fighter_key_matches(key, &fighter));
+            if let Some(kind) = fighter_kind_id(&fighter) {
+                self.game_link.forget_captures_for_kind(kind);
+            }
+            Some(crate::acmd::forget_fighter_cache(&fighter))
+        } else {
+            None
+        };
 
         self.state.fighters.remove(index);
         if was_selected {
@@ -5842,22 +5924,31 @@ impl VisionaryApp {
             }
         }
 
-        // Replace the plugin's full rule lists so the forgotten fighter's rules disappear while
-        // every other fighter's rules remain live. The alias/carrier publication is coalesced
-        // and flushed later in the normal update loop.
-        self.publish_live_rule_union();
-        self.push_effect_aliases();
+        if clear_shared_fighter_data {
+            // Replace the plugin's full rule lists so the forgotten fighter's rules disappear
+            // while every other fighter's rules remain live. The alias/carrier publication is
+            // coalesced and flushed later in the normal update loop.
+            self.publish_live_rule_union();
+            self.push_effect_aliases();
+        }
 
-        self.forgotten_fighters.insert(fighter.to_ascii_lowercase());
+        self.forgotten_fighters
+            .insert(forgotten_row_key(&fighter, custom_name.as_deref()));
         save_forgotten_fighters(&self.forgotten_fighters);
-        let cache_note = match cache_result {
-            Ok(true) => "cached scripts removed",
-            Ok(false) => "no cached scripts found",
-            Err(_) => "cached scripts could not be removed",
+        self.state.status = match cache_result {
+            Some(Ok(true)) => format!(
+                "Forgot {display_label} — cached scripts removed; edits and live previews cleared. Source files were left untouched."
+            ),
+            Some(Ok(false)) => format!(
+                "Forgot {display_label} — no cached scripts found; edits and live previews cleared. Source files were left untouched."
+            ),
+            Some(Err(_)) => format!(
+                "Forgot {display_label} — cached scripts could not be removed; edits and live previews cleared. Source files were left untouched."
+            ),
+            None => format!(
+                "Forgot {display_label} — hidden from the roster. Source files were left untouched."
+            ),
         };
-        self.state.status = format!(
-            "Forgot {fighter} — {cache_note}; edits and live previews cleared. Source files were left untouched."
-        );
     }
 
     /// Re-scan costume slots for every indexed fighter — after a mod root is added/removed,
@@ -5900,6 +5991,8 @@ impl VisionaryApp {
         self.current_eff_path = None;
         self.bone_names.clear();
         self.hurtbox_volumes.clear();
+        self.base_hurtbox_volumes.clear();
+        self.loaded_skeleton_bones.clear();
         self.hurtbox_warnings.clear();
         self.selected_hitbox = None;
         self.selected_hurtbox = None;
@@ -5941,6 +6034,8 @@ impl VisionaryApp {
         // Clear the old fighter's parameter geometry before any new file or skeleton work. A
         // missing/malformed mod parameter file must never leave the previous fighter visible.
         self.hurtbox_volumes.clear();
+        self.base_hurtbox_volumes.clear();
+        self.loaded_skeleton_bones.clear();
         self.hurtbox_warnings.clear();
         self.selected_hurtbox = None;
         self.hurtbox_editor_selection = None;
@@ -6040,7 +6135,8 @@ impl VisionaryApp {
         );
         let hurtbox_result =
             crate::data::load_hurtbox_volumes(&fighter.param_path, &loaded_bone_names);
-        self.hurtbox_volumes = hurtbox_result.volumes;
+        self.base_hurtbox_volumes = hurtbox_result.volumes;
+        self.loaded_skeleton_bones = loaded_bone_names;
         self.hurtbox_warnings = hurtbox_result.warnings;
         self.add_bone = self.add_bone.to_ascii_lowercase();
         self.current_model_dir = Some(model_dir.clone());
@@ -6065,6 +6161,7 @@ impl VisionaryApp {
         let fighter_dir = fighter.fighter_dir.clone();
         let fighter_name = fighter.name.clone();
         let base_slot = fighter.base_slot();
+        self.refresh_hurtbox_volumes();
         // Where a moveset spells out the motion and script names it adds: its linked source and
         // the compiled plugins under the data/mod roots. Read on the worker thread.
         let source_files: Vec<PathBuf> = self
@@ -10317,7 +10414,12 @@ impl VisionaryApp {
                 .small(),
             );
             if ui.button("Forget fighter").clicked() {
-                actions.push(FighterRowAction::Forget(row.name.clone()));
+                actions.push(FighterRowAction::Forget(
+                    crate::mod_project::ProjectFighter {
+                        name: row.name.clone(),
+                        character: row.character.clone(),
+                    },
+                ));
                 ui.close();
             }
         });
@@ -10420,7 +10522,7 @@ impl VisionaryApp {
         let half = ((available - 80.0 - objects_height) / 2.0).max(1.0);
 
         let mut restore_forgotten = false;
-        let mut forget_fighter: Option<String> = None;
+        let mut forget_fighter: Option<crate::mod_project::ProjectFighter> = None;
         ui.horizontal_wrapped(|ui| {
             sidebar_section_heading(
                 ui,
@@ -10461,6 +10563,7 @@ impl VisionaryApp {
                     .map(|(i, f)| FighterRow {
                         idx: i,
                         name: f.name.clone(),
+                        character: f.custom_name.clone(),
                         label: f.display_name.clone(),
                         modded: f.is_modded() && f.custom_name.is_none(),
                         slot_count: f.slots.len(),
@@ -10548,13 +10651,13 @@ impl VisionaryApp {
                         self.perf.end("select_fighter", t);
                     }
                 }
-                FighterRowAction::Forget(name) => forget_fighter = Some(name),
+                FighterRowAction::Forget(target) => forget_fighter = Some(target),
                 FighterRowAction::Add(i) => self.add_to_project(i),
                 FighterRowAction::Remove(i) => self.remove_from_project(i),
             }
         }
-        if let Some(fighter) = forget_fighter {
-            self.forget_fighter(&fighter);
+        if let Some(target) = forget_fighter {
+            self.forget_fighter(&target);
         } else if restore_forgotten {
             self.restore_forgotten_fighters();
         }
@@ -21933,11 +22036,16 @@ impl VisionaryApp {
                     }
                 }
             }
-            PendingLeave::ForgetFighter(name) => {
-                if self.state.fighters.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
-                    self.forget_fighter(&name);
+            PendingLeave::ForgetFighter(target) => {
+                if self.state.fighters.iter().any(|f| {
+                    f.name.eq_ignore_ascii_case(&target.name) && f.custom_name == target.character
+                }) {
+                    self.forget_fighter(&target);
                 } else {
-                    self.state.status = format!("{name} is no longer in the list");
+                    self.state.status = format!(
+                        "{} is no longer in the list",
+                        parked_fighter_label(&target)
+                    );
                 }
             }
             PendingLeave::Hub(action) => self.execute_hub_action_now(action),
@@ -39431,6 +39539,37 @@ fn hurtbox_condition_palette(condition: &crate::data::HurtboxCondition) -> Optio
     }
 }
 
+fn apply_source_hurtbox_overrides(
+    volumes: &mut Vec<crate::data::HurtboxVolume>,
+    overrides: &[crate::fighter_hurtboxes::SourceHurtbox],
+    skeleton_bones: &[String],
+) {
+    for ov in overrides {
+        let bone_name = skeleton_bones
+            .iter()
+            .find(|b| b.eq_ignore_ascii_case(&ov.bone_name))
+            .cloned()
+            .unwrap_or_else(|| ov.bone_name.clone());
+        let bone_hash = hash40::hash40(&ov.bone_name.to_ascii_lowercase()).0;
+        let replacement = crate::data::HurtboxVolume {
+            index: ov.index,
+            bone_name,
+            bone_hash,
+            endpoint1: ov.endpoint1,
+            endpoint2: ov.endpoint2,
+            radius: ov.radius,
+            default_status: crate::data::HurtboxStatus::Normal,
+            shape: crate::data::HurtboxShape::Capsule,
+        };
+        if let Some(existing) = volumes.iter_mut().find(|v| v.index == ov.index) {
+            *existing = replacement;
+        } else {
+            volumes.push(replacement);
+        }
+    }
+    volumes.sort_by_key(|v| v.index);
+}
+
 fn hurtbox_render_descriptors(
     volumes: &[crate::data::HurtboxVolume],
     events: &[crate::data::HurtboxEvent],
@@ -39443,7 +39582,9 @@ fn hurtbox_render_descriptors(
     volumes
         .iter()
         .enumerate()
-        .filter(|(_, volume)| matches!(volume.shape, crate::data::HurtboxShape::Capsule))
+        .filter(|(_, volume)| {
+            matches!(volume.shape, crate::data::HurtboxShape::Capsule) && volume.radius > 0.0
+        })
         .filter_map(|(index, volume)| {
             let status = crate::data::effective_hurtbox_status(volume, events, frame);
             (status != crate::data::HurtboxStatus::Off).then_some((index, status))
@@ -39679,10 +39820,49 @@ mod hurtbox_viewport_tests {
                 default_status: crate::data::HurtboxStatus::Off,
                 shape: crate::data::HurtboxShape::Capsule,
             },
+            crate::data::HurtboxVolume {
+                index: 2,
+                bone_name: "legl".into(),
+                bone_hash: hash40::hash40("legl").0,
+                endpoint1: [0.0, -0.7, 0.0],
+                endpoint2: [0.0, 1.8, 0.0],
+                radius: 0.0,
+                default_status: crate::data::HurtboxStatus::Normal,
+                shape: crate::data::HurtboxShape::Capsule,
+            },
         ];
         assert!(hurtbox_render_descriptors(&volumes, &[], 1, false).is_empty());
         let descriptors = hurtbox_render_descriptors(&volumes, &[], 1, true);
         assert_eq!(descriptors, vec![(0, crate::data::HurtboxStatus::Normal)]);
+    }
+
+    #[test]
+    fn source_hurtbox_overrides_replace_waist_and_preserve_canonical_bone_casing() {
+        let mut volumes = vec![crate::data::HurtboxVolume {
+            index: 4,
+            bone_name: "Waist".into(),
+            bone_hash: hash40::hash40("waist").0,
+            endpoint1: [0.0; 3],
+            endpoint2: [0.0; 3],
+            radius: 4.5,
+            default_status: crate::data::HurtboxStatus::Normal,
+            shape: crate::data::HurtboxShape::Capsule,
+        }];
+        let overrides = vec![crate::fighter_hurtboxes::SourceHurtbox {
+            index: 4,
+            bone_name: "waist".into(),
+            endpoint1: [0.0, 0.0, 0.0],
+            endpoint2: [4.2, 0.0, 0.0],
+            radius: 4.7,
+            file: PathBuf::from("frame.rs"),
+            line: 209,
+        }];
+        apply_source_hurtbox_overrides(&mut volumes, &overrides, &["Waist".to_string()]);
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].bone_name, "Waist");
+        assert_eq!(volumes[0].endpoint1, [0.0, 0.0, 0.0]);
+        assert_eq!(volumes[0].endpoint2, [4.2, 0.0, 0.0]);
+        assert_eq!(volumes[0].radius, 4.7);
     }
 
     #[test]
@@ -39694,6 +39874,26 @@ mod hurtbox_viewport_tests {
         assert!(!parse_viewport_flag("v1,yes"));
         assert!(!parse_viewport_flag("v1,1,extra"));
         assert!(parse_viewport_flag("v1,1\n"));
+    }
+
+    #[test]
+    fn forgotten_row_keys_scope_slot_characters_independently_from_base_fighter() {
+        assert_eq!(forgotten_row_key("PacMan", None), "pacman");
+        assert_eq!(
+            forgotten_row_key("pacman", Some("Shy Guy")),
+            "pacman::shy guy"
+        );
+        assert_eq!(forgotten_row_key("pacman", Some("Wario")), "pacman::wario");
+        assert_ne!(
+            forgotten_row_key("pacman", Some("Shy Guy")),
+            forgotten_row_key("pacman", Some("Wario"))
+        );
+        assert_ne!(
+            forgotten_row_key("pacman", None),
+            forgotten_row_key("pacman", Some("Shy Guy"))
+        );
+        assert_eq!(forgotten_key_base_fighter("pacman"), "pacman");
+        assert_eq!(forgotten_key_base_fighter("pacman::shy guy"), "pacman");
     }
 }
 
@@ -42514,7 +42714,21 @@ fn load_mod_roots() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Fighters hidden from the sidebar, one canonical lowercase fighter name per line.
+/// Persistence key for one forgotten fighter row in `forgotten_fighters`.
+/// Base fighter rows keep the plain lowercase fighter name (`"pacman"`) for compatibility
+/// with existing saved files; slot-character rows are scoped (`"pacman::shy guy"`).
+fn forgotten_row_key(name: &str, character: Option<&str>) -> String {
+    match character {
+        Some(ch) => format!("{}::{}", name.to_ascii_lowercase(), ch.to_ascii_lowercase()),
+        None => name.to_ascii_lowercase(),
+    }
+}
+
+fn forgotten_key_base_fighter(key: &str) -> &str {
+    key.split("::").next().unwrap_or(key)
+}
+
+/// Fighters hidden from the sidebar, one canonical lowercase fighter/row key per line.
 fn load_forgotten_fighters() -> BTreeSet<String> {
     let Some(dest) = config_path("forgotten_fighters") else {
         return BTreeSet::new();

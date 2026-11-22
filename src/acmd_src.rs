@@ -712,6 +712,9 @@ pub struct SourceIndex {
     /// Scales each fighter's frame callback sets (`ModelModule::set_scale` and its siblings),
     /// by fighter. See [`crate::fighter_scale`].
     pub scales: HashMap<String, crate::fighter_scale::SourceScales>,
+    /// Hurtbox overrides each fighter's frame/init callback applies (`FighterUtil::set_hit_data`
+    /// or `set_hurtboxes`), by fighter. See [`crate::fighter_hurtboxes`].
+    pub hurtboxes: HashMap<String, Vec<crate::fighter_hurtboxes::SourceHurtbox>>,
     /// A `fighter_param` `scale` the moveset overrides through `param_config`.
     pub param_scale: Option<f32>,
     /// Fighters the crate installs only on chosen costume slots: every `Agent::new("falco")`
@@ -954,6 +957,11 @@ impl SourceIndex {
             sources.iter().map(|(_, text)| text.as_str()),
         );
         index.scales = crate::fighter_scale::scan(
+            &sources,
+            |file| fighter_for_file(file, &scope_root, &fighter_scopes),
+            &index.consts,
+        );
+        index.hurtboxes = crate::fighter_hurtboxes::scan(
             &sources,
             |file| fighter_for_file(file, &scope_root, &fighter_scopes),
             &index.consts,

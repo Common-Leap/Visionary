@@ -26,6 +26,7 @@ mod effect_colour;
 mod effect_pool;
 mod effect_uses;
 mod effects;
+mod fighter_hurtboxes;
 mod fighter_scale;
 mod frame_data;
 mod game_link;
