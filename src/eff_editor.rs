@@ -3595,15 +3595,12 @@ impl EffEditor {
     /// emitter here is therefore a copy of one the effect already had, which is also what makes
     /// the edit expressible as a roster the exporter can re-apply.
     fn draw_emitter_roster(&mut self, ui: &mut Ui, set_idx: usize) {
-        ui.label(egui::RichText::new("Parts").strong());
-        ui.label(
-            egui::RichText::new(
-                "Each part makes its own particles. Frames count from when the effect is \
-                 spawned.",
-            )
-            .small()
-            .color(egui::Color32::GRAY),
-        );
+        let edited: std::collections::HashSet<usize> =
+            self.edited_emitters(set_idx).into_iter().collect();
+        ui.label(egui::RichText::new("Parts").strong())
+            .on_hover_text(
+                "Each part makes its own particles. Frames count from when the effect is spawned.",
+            );
         let Some(set) = self
             .ptcl
             .as_mut()
@@ -3625,34 +3622,34 @@ impl EffEditor {
         const COLUMNS: &[(&str, &str, &str)] = &[
             (
                 "emission.start",
-                "Starts",
+                "Start\nframe",
                 "The frame the part starts making particles",
             ),
             (
                 "emission.rate",
-                "Per frame",
+                "Per\nframe",
                 "Particles it makes each frame while on. Fractions add up: 0.5 is one every \
                  other frame.",
             ),
             (
                 "emission.interval",
-                "Gap",
+                "Wait\nframes",
                 "Frames it waits after each burst before the next",
             ),
             (
                 "emission.is_one_time",
-                "Once",
+                "Stops",
                 "On: the part stops after its duration. Off: it keeps going until the effect \
                  is removed.",
             ),
             (
                 "emission.duration",
-                "For",
-                "How many frames a part played once keeps going",
+                "Runs\nframes",
+                "How many frames a part that stops keeps going",
             ),
             (
                 "particle_data.life",
-                "Life",
+                "Life\nframes",
                 "How many frames each particle stays on screen",
             ),
         ];
@@ -3663,9 +3660,9 @@ impl EffEditor {
             .striped(true)
             .spacing([6.0, 4.0])
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("Part").small().weak());
+                ui.label(egui::RichText::new("Part").strong());
                 for (_, title, doc) in COLUMNS {
-                    ui.label(egui::RichText::new(*title).small().weak())
+                    ui.label(egui::RichText::new(*title).strong())
                         .on_hover_text(*doc);
                 }
                 ui.label("");
@@ -3677,10 +3674,17 @@ impl EffEditor {
                 for (i, em) in set.emitters.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_space(em.depth as f32 * 12.0);
-                        let label = if em.name.is_empty() {
+                        let name = if em.name.is_empty() {
                             format!("part {}", i + 1)
                         } else {
                             em.name.clone()
+                        };
+                        // Marked as on the Look tab's part tabs.
+                        let label = if edited.contains(&i) {
+                            egui::RichText::new(format!("{name} •"))
+                                .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60))
+                        } else {
+                            egui::RichText::new(name)
                         };
                         let response = ui.selectable_label(selected == i, label);
                         if response.clicked() {
@@ -3702,6 +3706,12 @@ impl EffEditor {
                                         changed = true;
                                     }
                                 });
+                            }
+                            (Some(_), Some(_)) => {
+                                ui.weak("–").on_hover_text(
+                                    "This part keeps going until the effect is removed. Tick \
+                                     Stops to give it a length.",
+                                );
                             }
                             _ => {
                                 ui.weak("–");
@@ -3867,7 +3877,11 @@ impl EffEditor {
     /// before cloning, so a changed part list also determines which sets and external model are
     /// transferred.
     fn draw_entry_parts(&mut self, ui: &mut Ui, entry_name: &str) {
-        ui.label(egui::RichText::new("Linked effects & model").strong());
+        ui.label(egui::RichText::new("Linked effects & model").strong())
+            .on_hover_text(
+                "An effect can bring in more effects on later frames, and a model. Changes here \
+                 show in the game after Send edits, the next time the effect plays.",
+            );
         let Some(idx) = self
             .entry_info
             .iter()
@@ -3891,17 +3905,8 @@ impl EffEditor {
         };
         let mut changed = false;
 
-        ui.label(
-            egui::RichText::new(
-                "An effect can bring in more effects on later frames, and a model. Changes \
-                 here show in the game after Send edits, the next time the effect plays.",
-            )
-            .small()
-            .color(egui::Color32::GRAY),
-        );
-
         ui.horizontal(|ui| {
-            ui.label("main effect");
+            ui.label("Main effect");
             let current = entry
                 .set_idx
                 .and_then(|s| set_names.get(s).cloned())
@@ -4023,7 +4028,7 @@ impl EffEditor {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("model");
+            ui.label("Model");
             let mut has_model = entry.model.is_some();
             if ui
                 .checkbox(&mut has_model, "")
@@ -4336,26 +4341,23 @@ impl EffEditor {
         // One switch for the whole panel: preview, export, and import all follow it. Keeping
         // them together is deliberate — they are the same question, and letting them disagree is
         // how an image gets interpreted in the form it is not in.
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(
-                &mut self.show_raw_textures,
-                egui::RichText::new("Raw channels").small(),
-            )
-            .on_hover_text(
-                "Switches all three at once: what the preview shows, what 'Export PNG' writes, \
-                 and how an imported PNG is read.\n\nOff: as the game samples it — the channel \
-                 swizzle resolved, transparency against the checkerboard, and exports you can \
-                 paint on.\n\nOn: the stored channels as the file holds them. Leave it ticked \
-                 to import a raw PNG back.",
-            );
-            if !self.texture_form_note.is_empty() {
-                ui.label(
-                    egui::RichText::new(&self.texture_form_note)
-                        .small()
-                        .color(egui::Color32::GRAY),
-                );
-            }
-        });
+        // What the texture holds is said in the checkbox's hover, not as a line beside it.
+        let mut hover = String::new();
+        if !self.texture_form_note.is_empty() {
+            hover = format!("Showing {}.\n\n", self.texture_form_note);
+        }
+        hover.push_str(
+            "Switches all three at once: what the preview shows, what 'Export PNG' writes, and \
+             how an imported PNG is read.\n\nOff: as the game samples it, with the channel \
+             swizzle resolved, transparency against the checkerboard, and exports you can paint \
+             on.\n\nOn: the stored channels as the file holds them. Leave it ticked to import a \
+             raw PNG back.",
+        );
+        ui.checkbox(
+            &mut self.show_raw_textures,
+            egui::RichText::new("Raw channels").small(),
+        )
+        .on_hover_text(hover);
     }
 
     /// Pool-shape operations: give this emitter a texture of its own, or drop one.
@@ -4377,10 +4379,10 @@ impl EffEditor {
             if ui
                 .add_enabled(
                     pool.is_some() && has_emitter,
-                    egui::Button::new("Duplicate for this emitter").small(),
+                    egui::Button::new("Copy for this part").small(),
                 )
                 .on_hover_text(
-                    "Add a private copy of this texture and point THIS emitter at it. Edit the \
+                    "Add a private copy of this texture and point this part at it. Edit the \
                      copy freely — every other effect sampling the original is left alone. The \
                      copy is byte-identical, not re-encoded.",
                 )
@@ -4984,7 +4986,7 @@ fn layout_note(layout: crate::texture_import::Layout) -> &'static str {
         Layout::Mask => "a black-and-white mask: black is empty, white is solid",
         Layout::Matte { .. } => "a shape on a flat colour: black is empty, white is solid",
         Layout::Opaque => "a fully opaque image: every pixel draws",
-        Layout::ColorAlpha => "colour plus its own transparency — keep the alpha channel",
+        Layout::ColorAlpha => "colour plus its own transparency: keep the alpha channel",
     }
 }
 
