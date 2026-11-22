@@ -3428,7 +3428,11 @@ impl EffEditor {
                 // EffectResearch documents these separately from EmitterData. Keeping them in
                 // the same authored emitter panel makes Send/export semantics identical.
                 let pristine_def = pr.to_def(em.source_idx);
-                changed |= crate::eff_subsections::draw(ui, em, &pristine_def);
+                // One part's open sections are its own, not every part's at that position.
+                let part_id = (self.loaded_path.clone(), set_idx, em.source_idx);
+                ui.push_id(part_id, |ui| {
+                    changed |= crate::eff_subsections::draw(ui, em, &pristine_def);
+                });
             });
 
         self.selected_texture = texture_actions;

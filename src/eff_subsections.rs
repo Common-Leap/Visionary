@@ -12,7 +12,27 @@ enum Kind {
     U8,
     U32,
     F32,
+    /// An on/off byte. Shown as a box to tick while it holds 0 or 1, as a number otherwise.
+    Flag8,
+    /// An on/off word, shown as [`Kind::Flag8`].
+    Flag32,
+    /// A float the game's files only fill with whole numbers: a count.
+    Count,
+    /// A word choosing the X, Y or Z axis.
+    Axis,
 }
+
+impl Kind {
+    /// Bytes the field takes in the section.
+    fn width(self) -> usize {
+        match self {
+            Kind::U8 | Kind::Flag8 => 1,
+            Kind::U32 | Kind::F32 | Kind::Flag32 | Kind::Count | Kind::Axis => 4,
+        }
+    }
+}
+
+const AXES: [&str; 3] = ["X", "Y", "Z"];
 
 #[derive(Clone, Copy)]
 struct Field {
@@ -30,7 +50,8 @@ macro_rules! fields {
 fn documented_fields(magic: &str) -> &'static [Field] {
     match magic {
         "FMAG" => fields![
-            0x00,U8,"follow emitter"; 0x01,U8,"affect X"; 0x02,U8,"affect Y"; 0x03,U8,"affect Z";
+            0x00,Flag8,"follow emitter"; 0x01,Flag8,"affect X"; 0x02,Flag8,"affect Y";
+            0x03,Flag8,"affect Z";
             0x04,F32,"magnetic force"; 0x08,F32,"position X"; 0x0c,F32,"position Y";
             0x10,F32,"position Z"
         ],
@@ -39,21 +60,23 @@ fn documented_fields(magic: &str) -> &'static [Field] {
             0x0c,F32,"position Z"; 0x10,F32,"ratio"
         ],
         "FCOL" => fields![
-            0x00,U8,"collision type"; 0x01,U8,"process in world"; 0x02,U8,"common plane";
+            0x00,U8,"collision type"; 0x01,Flag8,"process in world"; 0x02,Flag8,"common plane";
             0x04,F32,"coordinates"; 0x08,F32,"bounce rate"; 0x0c,U32,"collision count";
             0x10,F32,"friction"
         ],
         "FCLN" => fields![
-            0x00,U8,"interpolation"; 0x01,U8,"random noise offset"; 0x02,U8,"world coordinates";
+            0x00,U8,"interpolation"; 0x01,Flag8,"random noise offset";
+            0x02,Flag8,"world coordinates";
             0x04,F32,"animation speed X"; 0x08,F32,"animation speed Y"; 0x0c,F32,"animation speed Z";
             0x14,F32,"influence X"; 0x18,F32,"influence Y"; 0x1c,F32,"influence Z";
             0x20,F32,"table scale"; 0x24,F32,"noise offset"
         ],
         "FSPN" => fields![
-            0x00,F32,"rotation force"; 0x04,U32,"axis"; 0x08,F32,"outer velocity"
+            0x00,F32,"rotation force"; 0x04,Axis,"axis"; 0x08,F32,"outer velocity"
         ],
         "FRND" => fields![
-            0x00,U8,"fixed random seed"; 0x01,U8,"detailed options"; 0x02,U8,"air resistance";
+            0x00,Flag8,"fixed random seed"; 0x01,Flag8,"detailed options";
+            0x02,Flag8,"air resistance";
             0x04,F32,"velocity X"; 0x08,F32,"velocity Y"; 0x0c,F32,"velocity Z";
             0x10,U32,"apply timing"; 0x14,F32,"phase speed"; 0x18,F32,"phase width";
             0x1c,F32,"wave weight 0"; 0x20,F32,"wave weight 1"; 0x24,F32,"wave weight 2";
@@ -65,7 +88,7 @@ fn documented_fields(magic: &str) -> &'static [Field] {
             0x0c,U32,"interval"
         ],
         "FPAD" => fields![
-            0x00,U8,"world coordinates"; 0x04,F32,"position X"; 0x08,F32,"position Y";
+            0x00,Flag8,"world coordinates"; 0x04,F32,"position X"; 0x08,F32,"position Y";
             0x0c,F32,"position Z"
         ],
         "FCSF" => fields![
@@ -76,21 +99,21 @@ fn documented_fields(magic: &str) -> &'static [Field] {
             0x3c,F32,"value 14"; 0x40,F32,"value 15"
         ],
         "EP01" => fields![
-            0x00,U32,"calculation type"; 0x04,U32,"follow emitter"; 0x08,U32,"option";
-            0x0c,U32,"texturing"; 0x10,U32,"divisions"; 0x14,U32,"connection type";
+            0x00,U32,"calculation type"; 0x04,Flag32,"follow emitter"; 0x08,Flag32,"option";
+            0x0c,Flag32,"texturing"; 0x10,U32,"divisions"; 0x14,U32,"connection type";
             0x18,F32,"head alpha"; 0x1c,F32,"tail alpha"; 0x20,F32,"history interpolation";
             0x24,F32,"direction interpolation"
         ],
         "EP02" => fields![
-            0x00,U32,"calculation type"; 0x04,U32,"follow emitter"; 0x08,U32,"option";
-            0x0c,U32,"texturing"; 0x10,F32,"partitions"; 0x14,F32,"histories";
+            0x00,U32,"calculation type"; 0x04,Flag32,"follow emitter"; 0x08,Flag32,"option";
+            0x0c,Flag32,"texturing"; 0x10,Count,"partitions"; 0x14,Count,"histories";
             0x18,F32,"sample interval"; 0x1c,F32,"head alpha"; 0x20,F32,"tail alpha";
             0x24,F32,"history interpolation"; 0x28,F32,"direction interpolation"
         ],
         "EP03" => fields![
-            0x00,U32,"calculation type"; 0x04,U32,"follow emitter"; 0x08,U32,"option";
-            0x0c,U32,"UV0 texturing"; 0x10,U32,"UV1 texturing"; 0x14,U32,"UV2 texturing";
-            0x18,F32,"history entries"; 0x1c,U32,"connection type"; 0x20,F32,"head alpha";
+            0x00,U32,"calculation type"; 0x04,Flag32,"follow emitter"; 0x08,Flag32,"option";
+            0x0c,Flag32,"UV0 texturing"; 0x10,Flag32,"UV1 texturing";
+            0x14,Flag32,"UV2 texturing"; 0x18,Count,"history entries"; 0x1c,U32,"connection type"; 0x20,F32,"head alpha";
             0x24,F32,"tail alpha"; 0x28,U32,"partitions"; 0x2c,F32,"history interpolation";
             0x30,F32,"direction interpolation"; 0x34,F32,"air resistance";
             0x38,F32,"acceleration X"; 0x3c,F32,"acceleration Y"; 0x40,F32,"acceleration Z";
@@ -106,6 +129,43 @@ fn documented_fields(magic: &str) -> &'static [Field] {
         ],
         _ => &[],
     }
+}
+
+/// The plain name a section is shown under; its four-letter code goes in the hover text.
+fn section_title(magic: &str) -> String {
+    let named = match magic {
+        "FMAG" => "Magnet",
+        "FCOV" => "Pull toward a point",
+        "FCOL" => "Bounce off a plane",
+        "FCLN" => "Swirl noise",
+        "FSPN" => "Spin field",
+        "FRND" => "Random drift",
+        "FRN1" => "Random jitter",
+        "FPAD" => "Steady move",
+        "FCSF" => "Custom field",
+        "EP01" => "Joined stripe",
+        "EP02" => "Stripe",
+        "EP03" => "Trail stripe",
+        "EP04" => "Repeating area",
+        "CADP" => "Custom action data",
+        "CSDP" => "Custom shader data",
+        "CUDP" => "Custom user data",
+        "EAA0" => "Opacity animation",
+        "EAA1" => "Second opacity animation",
+        "EAC0" => "Colour animation",
+        "EAC1" => "Second colour animation",
+        "EATR" => "Position animation",
+        "EARO" => "Rotation animation",
+        "EASL" => "Size animation",
+        "EAER" => "Spawn rate animation",
+        "EAPL" => "Particle life animation",
+        "EAOV" => "Outward speed animation",
+        "EADV" => "Direction speed animation",
+        "EAGV" => "Gravity animation",
+        _ if magic.starts_with("EA") => "Other animation",
+        _ => "Extra data",
+    };
+    named.to_owned()
 }
 
 /// A field value animated over each particle's life (ResAnim8KeyParamSet): enabled, loop and
@@ -207,7 +267,7 @@ fn draw_keyed_set(ui: &mut Ui, section: &mut EmitterSubsectionDef, set: KeyedSet
     }
     let mut changed = false;
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(set.label).strong());
+    ui.label(egui::RichText::new(sentence(set.label)).strong());
     let id = (section.magic.clone(), set.offset);
     egui::Grid::new(("field_keys_header", id.clone()))
         .num_columns(2)
@@ -215,13 +275,13 @@ fn draw_keyed_set(ui: &mut Ui, section: &mut EmitterSubsectionDef, set: KeyedSet
             for (offset, label, hover) in [
                 (
                     set.offset,
-                    "animated",
+                    "Animated",
                     "Use the keys below instead of the fixed value",
                 ),
-                (set.offset + 4, "loop", "Repeat the keys every loop length"),
+                (set.offset + 4, "Loop", "Repeat the keys every loop length"),
                 (
                     set.offset + 8,
-                    "random start",
+                    "Random start",
                     "Start each particle at a random point in the loop",
                 ),
             ] {
@@ -232,7 +292,7 @@ fn draw_keyed_set(ui: &mut Ui, section: &mut EmitterSubsectionDef, set: KeyedSet
                 }
                 ui.end_row();
             }
-            ui.label("loop length").on_hover_text("Frames in one loop");
+            ui.label("Loop length").on_hover_text("Frames in one loop");
             let mut frames = read_u32(&section.data, set.offset + 0x10).unwrap_or(0);
             if ui.add(egui::DragValue::new(&mut frames)).changed() {
                 changed |= write_u32(&mut section.data, set.offset + 0x10, frames);
@@ -245,11 +305,11 @@ fn draw_keyed_set(ui: &mut Ui, section: &mut EmitterSubsectionDef, set: KeyedSet
         egui::Grid::new(("field_keys", id))
             .striped(true)
             .show(ui, |ui| {
-                ui.label("key");
+                ui.label("Key");
                 ui.label("X");
                 ui.label("Y");
                 ui.label("Z");
-                ui.label("time").on_hover_text(
+                ui.label("Time").on_hover_text(
                     "0 is the particle's birth and 1 its end, or the start and end of the loop",
                 );
                 ui.end_row();
@@ -338,6 +398,104 @@ fn draw_field(ui: &mut Ui, section: &mut EmitterSubsectionDef, field: Field) -> 
                 .changed();
             changed && value.is_finite() && write_f32(&mut section.data, field.offset, value)
         }
+        Kind::Flag8 | Kind::Flag32 => {
+            let Some(value) = read_flag(&section.data, field) else {
+                return false;
+            };
+            // Only 0 and 1 are on and off; any other value stays a number, so ticking the box
+            // never rewrites a value nobody chose.
+            if value > 1 {
+                let raw = Field {
+                    kind: if field.kind.width() == 1 {
+                        Kind::U8
+                    } else {
+                        Kind::U32
+                    },
+                    ..field
+                };
+                return draw_field(ui, section, raw);
+            }
+            let mut on = value == 1;
+            let changed = ui.checkbox(&mut on, "").changed();
+            changed && write_flag(&mut section.data, field, u32::from(on))
+        }
+        Kind::Count => {
+            let Some(value) = read_f32(&section.data, field.offset) else {
+                return false;
+            };
+            if value.fract() != 0.0 || !(0.0..=1.0e6).contains(&value) {
+                return draw_field(
+                    ui,
+                    section,
+                    Field {
+                        kind: Kind::F32,
+                        ..field
+                    },
+                );
+            }
+            let mut count = value as u32;
+            let changed = ui
+                .add(egui::DragValue::new(&mut count).range(0..=1_000_000))
+                .changed();
+            changed && write_f32(&mut section.data, field.offset, count as f32)
+        }
+        Kind::Axis => {
+            let Some(value) = read_u32(&section.data, field.offset) else {
+                return false;
+            };
+            let Some(&shown) = AXES.get(value as usize) else {
+                return draw_field(
+                    ui,
+                    section,
+                    Field {
+                        kind: Kind::U32,
+                        ..field
+                    },
+                );
+            };
+            let mut picked = value;
+            egui::ComboBox::from_id_salt(("field_axis", &section.magic, field.offset))
+                .selected_text(shown)
+                .width(60.0)
+                .show_ui(ui, |ui| {
+                    for (i, axis) in AXES.iter().enumerate() {
+                        ui.selectable_value(&mut picked, i as u32, *axis);
+                    }
+                })
+                .response
+                .on_hover_text(format!("Stored as {value}"));
+            picked != value && write_u32(&mut section.data, field.offset, picked)
+        }
+    }
+}
+
+/// An on/off field's stored number, whatever its width.
+fn read_flag(data: &[u8], field: Field) -> Option<u32> {
+    match field.kind.width() {
+        1 => data.get(field.offset).map(|&b| u32::from(b)),
+        _ => read_u32(data, field.offset),
+    }
+}
+
+fn write_flag(data: &mut [u8], field: Field, value: u32) -> bool {
+    match field.kind.width() {
+        1 => match data.get_mut(field.offset) {
+            Some(byte) => {
+                *byte = value as u8;
+                true
+            }
+            None => false,
+        },
+        _ => write_u32(data, field.offset, value),
+    }
+}
+
+/// A row label as the rest of the page writes them: first letter capital.
+fn sentence(label: &str) -> String {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -349,7 +507,7 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
     egui::Grid::new(("ea_header", &section.magic))
         .num_columns(2)
         .show(ui, |ui| {
-            for (offset, label) in [(0, "enabled"), (1, "loop"), (2, "random start")] {
+            for (offset, label) in [(0, "Enabled"), (1, "Loop"), (2, "Random start")] {
                 let mut on = section.data[offset] != 0;
                 ui.label(label);
                 if ui.checkbox(&mut on, "").changed() {
@@ -358,7 +516,7 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
                 }
                 ui.end_row();
             }
-            ui.label("loop count");
+            ui.label("Loop count");
             let mut loops = read_u32(&section.data, 8).unwrap_or(0);
             if ui.add(egui::DragValue::new(&mut loops)).changed() {
                 changed |= write_u32(&mut section.data, 8, loops);
@@ -376,11 +534,11 @@ fn draw_animation(ui: &mut Ui, section: &mut EmitterSubsectionDef) -> bool {
     egui::Grid::new(("ea_keys", &section.magic))
         .striped(true)
         .show(ui, |ui| {
-            ui.label("key");
+            ui.label("Key");
             ui.label("X");
             ui.label("Y");
             ui.label("Z");
-            ui.label("frame");
+            ui.label("Frame");
             ui.end_row();
             for key in 0..count {
                 ui.label(key.to_string());
@@ -437,20 +595,23 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
     let mut changed = false;
     ui.add_space(10.0);
     ui.separator();
-    ui.label(egui::RichText::new("Emitter animations & fields").strong());
+    ui.label(egui::RichText::new("Animations & extra settings").strong());
     for index in 0..emitter.subsections.len() {
         let magic = emitter.subsections[index].magic.clone();
         let was_edited = pristine
             .subsections
             .get(index)
             .is_some_and(|p| p.magic == magic && p.data != emitter.subsections[index].data);
+        let title = section_title(&magic);
         let heading = if was_edited {
-            format!("{magic} •")
+            format!("{title} •")
         } else {
-            magic.clone()
+            title
         };
+        // Keyed by the part as well: the caller pushes the part's id, so one part's open
+        // sections do not open another part's section at the same position.
         egui::CollapsingHeader::new(heading)
-            .id_salt(("subsection", index))
+            .id_salt(("subsection", index, &magic))
             .default_open(was_edited)
             .show(ui, |ui| {
                 let section = &mut emitter.subsections[index];
@@ -465,7 +626,7 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
                             .show(ui, |ui| {
                                 for &field in fields {
                                     if field.offset < section.data.len() {
-                                        ui.label(field.label);
+                                        ui.label(sentence(field.label));
                                         changed |= draw_field(ui, section, field);
                                         ui.end_row();
                                     }
@@ -491,7 +652,9 @@ pub fn draw(ui: &mut Ui, emitter: &mut EmitterDef, pristine: &EmitterDef) -> boo
                         changed = true;
                     }
                 }
-            });
+            })
+            .header_response
+            .on_hover_text(format!("Stored in the file as {magic}"));
     }
     changed
 }
@@ -661,12 +824,127 @@ mod tests {
             "EP03", "EP04",
         ] {
             for field in documented_fields(magic) {
-                let width = match field.kind {
-                    Kind::U8 => 1,
-                    Kind::U32 | Kind::F32 => 4,
-                };
+                let width = field.kind.width();
                 assert!(field.offset + width <= 0x100, "{magic} {}", field.label);
             }
         }
+    }
+
+    /// Every documented section in the game's files gets a plain title rather than its code,
+    /// and every value fits the control drawn for it: on/off fields hold 0 or 1, axes 0 to 2,
+    /// counts whole numbers. Point `VISIONARY_EFF_ROOT` at the parent of an extracted `effect/`.
+    #[test]
+    fn game_sections_get_plain_titles_and_fitting_controls() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('_'))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root.join("effect"), &mut files);
+        assert!(files.len() > 300, "only {} corpus files", files.len());
+        let mut magics = std::collections::BTreeSet::new();
+        let (mut flags, mut axes, mut counts) = (0usize, 0usize, 0usize);
+        let mut bad = Vec::new();
+        // A count that is not whole is drawn as a plain number instead; it must stay rare, or
+        // the field is not a count.
+        let mut fractional_counts = 0usize;
+        for path in &files {
+            let Ok(effect) = crate::effects::load_effect(path) else {
+                continue;
+            };
+            for emitter in effect.ptcl.emitter_sets.iter().flat_map(|s| &s.emitters) {
+                for section in &emitter.subsections {
+                    magics.insert(section.magic.clone());
+                    for &field in documented_fields(&section.magic) {
+                        let fits = match field.kind {
+                            Kind::Flag8 | Kind::Flag32 => {
+                                read_flag(&section.data, field).map(|v| {
+                                    flags += 1;
+                                    v <= 1
+                                })
+                            }
+                            Kind::Axis => read_u32(&section.data, field.offset).map(|v| {
+                                axes += 1;
+                                (v as usize) < AXES.len()
+                            }),
+                            Kind::Count => {
+                                if let Some(v) = read_f32(&section.data, field.offset) {
+                                    counts += 1;
+                                    if v.fract() != 0.0 || v < 0.0 {
+                                        fractional_counts += 1;
+                                    }
+                                }
+                                None
+                            }
+                            Kind::U8 | Kind::U32 | Kind::F32 => None,
+                        };
+                        if fits == Some(false) {
+                            bad.push(format!(
+                                "{} {} {}",
+                                path.display(),
+                                section.magic,
+                                field.label
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{flags} on/off, {axes} axis, {counts} count values; sections {magics:?}");
+        assert!(
+            flags > 1000 && axes > 100 && counts > 100,
+            "the walk read too little"
+        );
+        assert!(bad.is_empty(), "{} misfits:\n{}", bad.len(), bad.join("\n"));
+        assert!(
+            fractional_counts * 100 < counts,
+            "{fractional_counts} of {counts} counts are not whole"
+        );
+        // No section is titled by its code, and every section that is not an animation has a
+        // name of its own rather than the catch-all.
+        for magic in &magics {
+            let title = section_title(magic);
+            assert_ne!(&title, magic);
+            if !magic.starts_with("EA") {
+                assert_ne!(title, "Extra data", "{magic} has no plain title");
+            }
+        }
+    }
+
+    #[test]
+    fn on_off_fields_tick_only_zero_and_one() {
+        let field = documented_fields("FMAG")[1];
+        assert!(matches!(field.kind, Kind::Flag8));
+        let mut data = vec![0u8; 0x100];
+        assert_eq!(read_flag(&data, field), Some(0));
+        assert!(write_flag(&mut data, field, 1));
+        assert_eq!(data[field.offset], 1);
+        // A word-wide flag writes all four bytes, and leaves the next field alone.
+        let word = documented_fields("EP03")[1];
+        assert!(matches!(word.kind, Kind::Flag32));
+        data[word.offset + 4] = 7;
+        assert!(write_flag(&mut data, word, 1));
+        assert_eq!(read_u32(&data, word.offset), Some(1));
+        assert_eq!(data[word.offset + 4], 7);
+        assert_eq!(sentence("follow emitter"), "Follow emitter");
+        assert_eq!(section_title("FSPN"), "Spin field");
+        assert_eq!(section_title("CADP"), "Custom action data");
+        assert_eq!(section_title("ZZZZ"), "Extra data");
     }
 }
