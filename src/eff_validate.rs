@@ -1808,4 +1808,34 @@ mod tests {
             problems(&raw)
         );
     }
+
+    /// Every effect file under `VISIONARY_VALIDATE_DIR` (an exported mod's folder) passes: the
+    /// check an export runs, for a folder written without the editor's file dialog.
+    #[test]
+    fn a_folders_effect_files_pass() {
+        let Some(root) = std::env::var_os("VISIONARY_VALIDATE_DIR").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_VALIDATE_DIR to an exported mod folder");
+            return;
+        };
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "eff") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(!files.is_empty(), "no effect files in {}", root.display());
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            let found = problems(&bytes);
+            assert!(found.is_empty(), "{}: {found:?}", path.display());
+            eprintln!("valid: {} ({} bytes)", path.display(), bytes.len());
+        }
+    }
 }
