@@ -500,7 +500,7 @@ pub fn refuse_uninstalled_controller_charts(project: &ModProjectFile) -> Result<
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "this export format cannot carry additional controller charts: {details}. Use Export Mod Folder with an explicitly selected compatible SLight source to include them"
+            "gimmick rules cannot go in a plain mod without Visionary's plugin: {details}. Export mod adds the plugin when Visionary's plugin folder is beside it"
         );
     }
     Ok(())

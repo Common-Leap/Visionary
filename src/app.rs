@@ -3176,7 +3176,23 @@ fn made_effect_lookup(
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
-    status.starts_with("Sent to the game:") || status.starts_with("Ready for the game:")
+    status.starts_with("Sending to the game:") || status.starts_with("Ready for the game:")
+}
+
+/// The status line once the game link drops: a send's line goes back to "Ready for the game",
+/// which is what the next connection will send. Any other line is left alone.
+fn status_after_disconnect(status: &str) -> Option<String> {
+    let rest = ["Sending to the game:", "In the game:"]
+        .iter()
+        .find_map(|prefix| status.strip_prefix(prefix))?;
+    Some(format!("Ready for the game:{rest}"))
+}
+
+/// The status line once a send has ended: the routine "Sending to the game: …" line keeps its
+/// count of what was sent and takes the outcome's opening words. Any other line is left alone.
+fn status_after_send(status: &str, outcome: crate::eff_editor::SendOutcome) -> Option<String> {
+    let rest = status.strip_prefix("Sending to the game:")?;
+    Some(format!("{}:{rest}", outcome.status_prefix()))
 }
 
 /// Values worked out from every edit, kept until the edit revision they were worked out at
@@ -3307,6 +3323,11 @@ fn timeline_effect_to_open(call: &crate::data::EffectCall, open: Option<&str>) -
     let opens = call.control.is_none() && !is_null_effect_sentinel(call);
     let already = open.is_some_and(|open| open.eq_ignore_ascii_case(&call.effect_name));
     (opens && !already).then(|| call.effect_name.clone())
+}
+
+/// Whether a picked bar names an effect other than the one now open on the Effects page.
+fn timeline_bar_left_behind(call: &crate::data::EffectCall, open: Option<&str>) -> bool {
+    open.is_some() && timeline_effect_to_open(call, open).is_some()
 }
 
 fn is_null_effect_sentinel(call: &crate::data::EffectCall) -> bool {
@@ -4213,6 +4234,14 @@ pub struct VisionaryApp {
     /// When set, send a `live_eff_probe` to the plugin at this time (a few seconds after
     /// a deploy, so the game's async re-loads have settled before the diagnosis runs).
     live_eff_probe_due: Option<std::time::Instant>,
+    /// Fingerprint of the carrier bytes last handed to the game. The game keeps the live
+    /// carrier when the same bytes arrive again, so such a send must not wait for a new read.
+    last_carrier_fingerprint: Option<u64>,
+    /// Set by Send edits; the carrier push later in the same frame decides whether that send
+    /// carries new bytes.
+    carrier_send_armed: bool,
+    /// The effect open on the Effects page last frame, to notice another one opening.
+    eff_open_seen: Option<String>,
     /// Background param-label download (ultimate-research/param-labels); None once done.
     param_labels_rx: Option<std::sync::mpsc::Receiver<crate::param_labels::Msg>>,
     /// Labels from the downloaded/cached ParamLabels.csv — re-merged after any
@@ -4723,6 +4752,9 @@ impl VisionaryApp {
             live_eff_deployed: std::collections::HashSet::new(),
             merged_build_failed: std::collections::HashSet::new(),
             live_eff_probe_due: None,
+            last_carrier_fingerprint: None,
+            carrier_send_armed: false,
+            eff_open_seen: None,
             param_labels_rx: Some(crate::param_labels::spawn_fetch()),
             downloaded_labels: HashMap::new(),
             use_scan: None,
@@ -21787,6 +21819,7 @@ impl VisionaryApp {
                     .join("export-source")
                     .join(&plugin_name)
             },
+            rule_pack,
         };
         let outcome = match run_export_preverified(
             &project,
@@ -30351,6 +30384,7 @@ impl VisionaryApp {
         let mut donor_bytes: Vec<crate::game_link::DonorBytesWire> = Vec::new();
         let mut dbg = String::new();
         let mut carrier_added = false;
+        let mut carrier_fingerprint: Option<u64> = None;
         // A refused carrier build (unsafe shader container, incompatible compute variation) drops
         // every live transplant. That must be visible, not just a line in the debug dump.
         let mut carrier_error: Option<String> = None;
@@ -30505,6 +30539,13 @@ impl VisionaryApp {
                                     carrier_ops.len(),
                                     bytes.len()
                                 ));
+                                carrier_fingerprint = Some({
+                                    use std::hash::{Hash, Hasher};
+                                    let mut hasher =
+                                        std::collections::hash_map::DefaultHasher::new();
+                                    bytes.hash(&mut hasher);
+                                    hasher.finish()
+                                });
                                 donor_bytes.push(self.donor_payload_wire(
                                     live_carrier_rel.into(),
                                     &bytes,
@@ -30636,8 +30677,10 @@ impl VisionaryApp {
                 carrier_dropped_textures.join(", ")
             );
         } else if carrier_added && !carrier_authored.is_empty() {
+            // "Sent" only once the game says it took them: the resolver in `update` rewrites
+            // this opening once the carrier report arrives.
             let sent = if self.game_link.status().is_connected() {
-                "Sent to the game"
+                "Sending to the game"
             } else {
                 "Ready for the game"
             };
@@ -30685,6 +30728,23 @@ impl VisionaryApp {
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
         // receives the new spec and creates its object. Empty is meaningful and clears old data.
         donor_bytes.sort_by(|a, b| a.path.cmp(&b.path));
+        let carrier_changed = carrier_fingerprint != self.last_carrier_fingerprint;
+        self.last_carrier_fingerprint = carrier_fingerprint;
+        if std::mem::take(&mut self.carrier_send_armed) {
+            self.eff_editor.carrier_needs_new_bytes = carrier_changed && carrier_added;
+        } else if carrier_changed {
+            self.eff_editor.carrier_needs_new_bytes = true;
+            // New edits reached the game without Send edits (on connect, or when another
+            // character opened): wait for them the same way, so the status line's "Sending to
+            // the game" gets its outcome too.
+            if carrier_added
+                && self.game_link.status().is_connected()
+                && self.eff_editor.awaiting_game.is_none()
+            {
+                self.eff_editor.carrier_expected = true;
+                self.arm_carrier_wait();
+            }
+        }
         self.log_donor_push(&caller, &carrier_ops, carrier_added, &donor_specs);
         self.game_link.send_donor_bytes(&donor_bytes);
         self.game_link.send_donor_effs(&donor_specs);
@@ -30853,6 +30913,24 @@ impl VisionaryApp {
     /// uses: fold the editor's diff into the project store, rebuild the fighter's eff with
     /// `rebuild_eff_bytes` (per-emitter exact), and hot-reload it in the running game.
     /// Returns the status note the editor shows in its own feedback line.
+    /// Start waiting for the game to take the carrier just sent. The send is complete when the
+    /// game reports a newer carrier generation, not merely "ready", which the previous carrier
+    /// already reports.
+    fn arm_carrier_wait(&mut self) {
+        self.eff_editor.gen_at_send = self.game_link.carrier_gen();
+        self.eff_editor.last_carrier_result = None;
+        self.eff_editor.last_carrier_detail = None;
+        self.eff_editor.carrier_reports_at_send = self.game_link.carrier_status().2;
+        // Discard any rejection left over from an earlier send, so it cannot immediately abort
+        // this one.
+        let _ = self.game_link.take_carrier_error();
+        // Start the stall clock fresh. Between sends the carrier sits in its live state for as
+        // long as the user is editing, so a timer left running from the PREVIOUS send is already
+        // past the threshold, and `live` is false on the first frame of a new send.
+        self.eff_editor.carrier_state_since = None;
+        self.eff_editor.awaiting_game = Some(std::time::Instant::now());
+    }
+
     fn apply_authored_eff_live(&mut self) -> String {
         let Some(rel) = self.eff_editor.loaded_rel() else {
             return "no eff loaded — nothing to apply".to_string();
@@ -34170,6 +34248,16 @@ impl eframe::App for VisionaryApp {
                 });
 
                 ui.separator();
+                // Before the game link, whose width changes with its state: a button after it
+                // moved under the cursor whenever the link dropped or retried.
+                if ui
+                    .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod"))
+                    .on_hover_text("A finished mod folder to put in ARCropolis's mods folder")
+                    .clicked()
+                {
+                    self.export_full_mod();
+                }
+                ui.separator();
                 // The live system: the running game, and what it holds.
                 let link_view = self.game_link.view();
                 let link_menu = egui::containers::menu::MenuButton::from_button(
@@ -34197,15 +34285,6 @@ impl eframe::App for VisionaryApp {
                 });
                 link_menu.0.on_hover_text(link_view.hover());
                 crate::game_link::link_problem_and_action(ui, &self.game_link, &link_view);
-                ui.separator();
-                if ui
-                    .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod"))
-                    .on_hover_text("A finished mod folder to put in ARCropolis's mods folder")
-                    .clicked()
-                {
-                    self.export_full_mod();
-                }
-                ui.separator();
             });
         });
         self.perf.end("menu_bar", t_menu);
@@ -34221,11 +34300,31 @@ impl eframe::App for VisionaryApp {
             .resizable(false)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(&self.state.status)
-                            .small()
-                            .color(Color32::LIGHT_GRAY),
-                    );
+                    // A long line (an export refusal names every character) is cut at the
+                    // window edge; the hover shows all of it and a click copies it.
+                    let room = (ui.available_width() * 0.6).max(240.0);
+                    let status = ui
+                        .scope(|ui| {
+                            ui.set_max_width(room);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&self.state.status)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            )
+                        })
+                        .inner
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(560.0);
+                            ui.label(&self.state.status);
+                            ui.weak("Click to copy");
+                        });
+                    if status.clicked() {
+                        ui.ctx().copy_text(self.state.status.clone());
+                    }
                     if !self.state.acmd_source.is_empty() {
                         ui.separator();
                         let source = match self.state.acmd_source.as_str() {
@@ -34501,6 +34600,22 @@ impl eframe::App for VisionaryApp {
         }
         self.carry_eff_edits_across_load();
         self.eff_editor.update(&ctx, &self.game_link);
+        // A bar picked on the timeline stays picked only while its effect is the open one:
+        // opening another from the list left the old bar outlined beside the new one.
+        let open_now = self.eff_editor.selected_entry_name().map(str::to_owned);
+        if open_now != self.eff_open_seen {
+            if let Some(i) = self.state.selected_effect_call {
+                let left_behind = self
+                    .state
+                    .effects
+                    .get(i)
+                    .is_some_and(|call| timeline_bar_left_behind(call, open_now.as_deref()));
+                if left_behind {
+                    self.state.selected_effect_call = None;
+                }
+            }
+            self.eff_open_seen = open_now;
+        }
         if std::mem::take(&mut self.eff_editor.use_in_move_requested) {
             if let Some(name) = self.eff_editor.selected_entry_name().map(str::to_owned) {
                 let frame = self.state.current_frame;
@@ -34564,28 +34679,22 @@ impl eframe::App for VisionaryApp {
             // The carrier snapshot is built and pushed by `flush_effect_aliases` below, in
             // this same frame, so the send is complete once that has run.
             self.eff_editor.sending = false;
-            // The bytes are away; the game has not necessarily taken them yet. Record which
-            // carrier generation is live RIGHT NOW — the send is complete when the game reports
-            // a newer one, not merely when it reports "ready", which the previous carrier
-            // already does.
-            self.eff_editor.gen_at_send = self.game_link.carrier_gen();
-            self.eff_editor.carrier_reports_at_send = self.game_link.carrier_status().2;
-            // Discard any rejection left over from an earlier send, so it cannot immediately
-            // abort this one.
-            let _ = self.game_link.take_carrier_error();
-            // Start the stall clock fresh. Between sends the carrier sits in its live state for
-            // as long as the user is editing, so a timer left running from the PREVIOUS send is
-            // already past the threshold — and `live` is false on the first frame of a new send
-            // (the game has not taken our bytes yet), so the stall check fired instantly and
-            // reported "the previous carrier is not releasing" after 0.0s.
-            self.eff_editor.carrier_state_since = None;
-            self.eff_editor.awaiting_game = Some(std::time::Instant::now());
+            self.carrier_send_armed = true;
+            self.arm_carrier_wait();
         } else if self.eff_editor.sending {
             // Deferred by one frame so the spinner paints before the (synchronous) rebuild
             // blocks the UI thread. Keep the frames coming so it actually animates.
             ctx.request_repaint();
         }
 
+        // A dropped link: what the game held is unknown now, and the next connection sends it
+        // all again, so forget the last bytes sent and stop saying they are in the game.
+        if !self.game_link.status().is_connected() {
+            self.last_carrier_fingerprint = None;
+            if let Some(status) = status_after_disconnect(&self.state.status) {
+                self.state.status = status;
+            }
+        }
         // Resolve "waiting for game": the plugin reports carrier readiness as it changes.
         if let Some(since) = self.eff_editor.awaiting_game {
             let (state, kinds, reports, spawned) = self.game_link.carrier_status();
@@ -34598,7 +34707,8 @@ impl eframe::App for VisionaryApp {
             // Both are required: state alone used to clear the spinner while nothing could
             // spawn yet.
             let generation = self.game_link.carrier_gen();
-            let took_our_bytes = generation > self.eff_editor.gen_at_send;
+            let took_our_bytes = !self.eff_editor.carrier_needs_new_bytes
+                || generation > self.eff_editor.gen_at_send;
             let fresh_report = reports > self.eff_editor.carrier_reports_at_send;
             let live = carrier_send_reached_goal(
                 self.eff_editor.carrier_expected,
@@ -34652,59 +34762,48 @@ impl eframe::App for VisionaryApp {
             // timeout and blaming the match for it.
             let rejected = self.game_link.take_carrier_error();
             if live || silent || stalled || rejected.is_some() {
+                use crate::eff_editor::SendOutcome;
                 self.eff_editor.awaiting_game = None;
-                // Keep the final reading visible. The indicator vanished too fast to read,
-                // which made the one signal that could settle this undiagnosable.
-                let why = if live {
-                    ""
+                let outcome = if live && self.eff_editor.carrier_expected {
+                    SendOutcome::InGame
+                } else if live {
+                    SendOutcome::Restored
                 } else if rejected.is_some() {
-                    " (the game could not read the payload)"
-                } else if stalled && state == 0 {
-                    // Bytes went out, plugin is alive, but no swap ever began. Name the two
-                    // things that actually produce this — neither is visible from the editor.
-                    " (plugin is reporting but never staged the carrier — is the carrier item \
-                     held, and is the .nro current?)"
-                } else if stalled {
-                    // Mid-swap and no longer advancing. The usual cause is the previous carrier
-                    // refusing to release, which a reload of the match clears.
-                    " (the swap stopped advancing in this state — the previous carrier is not \
-                     releasing; reload the match)"
+                    SendOutcome::Unreadable
+                } else if silent {
+                    SendOutcome::NoMatch
                 } else {
-                    // Reports are frame-driven, so silence means the per-frame driver never
-                    // ran — no match in progress, or an .nro too old to report at all.
-                    " (no reports — is a match running?)"
+                    SendOutcome::NextMatch
                 };
-                self.eff_editor.last_carrier_result = Some(format!(
-                    "carrier: state={state} kinds={kinds} object={} gen={generation} after \
-                     {:.1}s{why}",
-                    if spawned { "up" } else { "down" },
+                // One plain outcome on the Send row, in the In game panel and on the status
+                // line. The game's numbers and the likely cause go in the row's hover: they are
+                // what settles a stall, and they mean nothing to someone making an effect.
+                let why = if live {
+                    String::new()
+                } else if let Some(reason) = &rejected {
+                    format!(
+                        "\nThe game could not open the file it was sent ({reason}). Check that \
+                         Visionary writes to your emulator's SD folder, or set VISIONARY_SD_DIR."
+                    )
+                } else if silent {
+                    "\nNo match is reporting back: start one, then send again.".to_string()
+                } else if stalled && state == 0 {
+                    "\nThe game never started the swap.".to_string()
+                } else {
+                    "\nThe swap stopped while the game let go of the last edit. Reloading the \
+                     match loads the edit."
+                        .to_string()
+                };
+                self.eff_editor.last_carrier_result = Some(outcome.text().to_string());
+                self.eff_editor.last_carrier_detail = Some(format!(
+                    "{} after {:.1}s, edit {generation}{why}",
+                    crate::eff_editor::carrier_numbers(state, kinds, spawned),
                     since.elapsed().as_secs_f32(),
                 ));
-                self.eff_editor.carrier_ok = live;
-                if live {
-                    if self.eff_editor.carrier_expected {
-                        self.eff_editor.set_sent_note(
-                            "carrier live in game — re-trigger the move".to_string(),
-                        );
-                    } else {
-                        self.eff_editor.set_sent_note(
-                            "carrier cleared in game — original effects restored".to_string(),
-                        );
-                    }
-                } else if let Some(reason) = rejected {
-                    self.eff_editor.set_sent_note(format!(
-                        "the game could not read the payload ({reason}) — check that Visionary \
-                         is writing to your emulator's SD folder, or set VISIONARY_SD_DIR"
-                    ));
-                } else if silent {
-                    self.eff_editor.set_sent_note(
-                        "sent, but the game never reported back — start a match and send again"
-                            .to_string(),
-                    );
-                } else {
-                    self.eff_editor.set_sent_note(
-                        "sent, but the game has not brought the carrier up after 30s".to_string(),
-                    );
+                self.eff_editor.carrier_ok = outcome.ok();
+                self.eff_editor.set_sent_note(outcome.text());
+                if let Some(status) = status_after_send(&self.state.status, outcome) {
+                    self.state.status = status;
                 }
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
@@ -37939,6 +38038,9 @@ struct ExportInputs {
     /// Where the generated Rust project goes: inside `dest` for a developer export, a scratch
     /// directory otherwise, since a mod folder ships the built `.nro` rather than the source.
     source_root: std::path::PathBuf,
+    /// The mod carries the editor's live rules in a rule pack for the shipped plugin. The pack
+    /// holds the gimmick charts in the same bundle the editor sends live, so they ship.
+    rule_pack: bool,
 }
 
 /// What an export produced, for the caller to turn into a status line and a plugin build.
@@ -38009,6 +38111,7 @@ fn run_export_preverified(
             .validate_for_project(project)
             .map_err(|error| error.to_string())?,
         (true, None) => {}
+        (false, None) if inputs.rule_pack => {}
         (false, None) => crate::mod_export::refuse_uninstalled_controller_charts(project)
             .map_err(|error| error.to_string())?,
     }
@@ -38021,6 +38124,7 @@ fn run_export_preverified(
         eff_sources,
         eff_export_root,
         source_root,
+        rule_pack: _,
     } = inputs;
     let developer = *developer;
 
@@ -42424,6 +42528,67 @@ mod live_effect_capture_tests {
         assert!(edits.contains("self.push_effect_aliases_quietly();"));
     }
 
+    /// The plugin waits out only names a carrier of its own put in the game. A carrier built
+    /// for a fighter who is not in the match never loads; waiting for its names waited on a
+    /// fighter in the match that shares one (Bayonetta borrowing Mario's Fb shoot, with Mario
+    /// on stage), and every later send stalled. Plugin tests never run, so this reads its source.
+    #[test]
+    fn the_carrier_waits_only_for_names_it_put_in_the_game() {
+        let plugin =
+            include_str!("../plugins/slight_replica/src/slight/effect_viewer/effect_reload.rs");
+        let remember = plugin
+            .split("fn remember_retiring_carrier_kinds() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("remember_retiring_carrier_kinds");
+        assert!(remember.contains("if !AUTO_CARRIER_BUILT.swap(false, Ordering::AcqRel) {"));
+        // Built means the item was created: set right after `have_item`, nowhere else.
+        assert_eq!(
+            plugin
+                .matches("AUTO_CARRIER_BUILT.store(true, Ordering::Release);")
+                .count(),
+            1
+        );
+        let build = plugin
+            .split("let have_result = smash::app::lua_bind::ItemModule::have_item(")
+            .collect::<Vec<_>>();
+        assert_eq!(build.len(), 2);
+        assert!(build[1].contains("AUTO_CARRIER_BUILT.store(true, Ordering::Release);"));
+        // Names the match already answers to are dropped before the carrier is built.
+        assert!(build[0].contains("kinds.retain(|kind| kind_lookup(manager, *kind).is_none());"));
+    }
+
+    /// The status line says "Sending to the game" until the game answers, then the outcome,
+    /// keeping the count of what was sent. A drop puts it back to what the next connection
+    /// will send.
+    #[test]
+    fn the_status_line_follows_the_games_answer() {
+        use crate::eff_editor::SendOutcome;
+        let sending = "Sending to the game: 0 borrowed and 1 edited effect(s)";
+        assert_eq!(
+            status_after_send(sending, SendOutcome::InGame).as_deref(),
+            Some("In the game: 0 borrowed and 1 edited effect(s)")
+        );
+        assert_eq!(
+            status_after_send(sending, SendOutcome::NextMatch).as_deref(),
+            Some("Saved for the next match: 0 borrowed and 1 edited effect(s)")
+        );
+        // Another line, such as a refusal, is not rewritten.
+        assert_eq!(
+            status_after_send("Removed Vision.", SendOutcome::InGame),
+            None
+        );
+        for line in [sending, "In the game: 0 borrowed and 1 edited effect(s)"] {
+            assert_eq!(
+                status_after_disconnect(line).as_deref(),
+                Some("Ready for the game: 0 borrowed and 1 edited effect(s)")
+            );
+        }
+        assert_eq!(status_after_disconnect("Removed Vision."), None);
+        // The line a push writes while connected is one the outcome rewrites.
+        assert!(alias_status_is_routine(sending));
+    }
+
     /// The removal (or creation) keeps its own status line: the effect aliases' success line
     /// replaced "Removed Vision." in the real UI. Their warnings still show.
     #[test]
@@ -42432,7 +42597,7 @@ mod live_effect_capture_tests {
             "Ready for the game: 1 borrowed and 1 edited effect(s)"
         ));
         assert!(alias_status_is_routine(
-            "Sent to the game: 0 borrowed and 2 edited effect(s)"
+            "Sending to the game: 0 borrowed and 2 edited effect(s)"
         ));
         assert!(!alias_status_is_routine(
             "NOT sent — the live carrier cannot take ef_mario. Export the eff to use these."
@@ -42455,7 +42620,7 @@ mod live_effect_capture_tests {
         assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
         for line in [
             "\"Ready for the game\"",
-            "\"Sent to the game\"",
+            "\"Sending to the game\"",
             "\"{sent}: {} borrowed and {} edited effect(s)\"",
         ] {
             assert!(push.contains(line), "{line}");
@@ -47697,6 +47862,33 @@ mod blocked_export_writes_nothing_tests {
             eff_sources: Default::default(),
             eff_export_root: dest.join("_no_dump_root"),
             source_root: source_root.to_path_buf(),
+            rule_pack: false,
+        }
+    }
+
+    /// The same chart that refuses a plain mod export ships in a rule pack: the pack carries
+    /// the charts in the bundle the editor sends live.
+    #[test]
+    fn a_rule_pack_export_carries_charts_the_plain_export_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = ModProjectFile::default();
+        project
+            .fighters
+            .entry("mario".into())
+            .or_default()
+            .controller_charts
+            .insert(
+                "extra".into(),
+                crate::mod_project::ControllerChart::default(),
+            );
+        let dest = dir.path().join("mod");
+        let mut input = inputs(&dest, &dir.path().join("missing-source"));
+        let refused = run_export_preverified(&project, &input, None, false, None, Vec::new());
+        assert!(refused.unwrap_err().contains("mario/extra"));
+        input.rule_pack = true;
+        if let Err(error) = run_export_preverified(&project, &input, None, false, None, Vec::new())
+        {
+            assert!(!error.contains("mario/extra"), "{error}");
         }
     }
 
@@ -48830,6 +49022,19 @@ mod spawn_random_range_tests {
         assert_eq!(super::timeline_effect_to_open(&null, None), None);
         assert!(crate::eff_editor::is_shared_effect(&flame.effect_name));
         assert!(!crate::eff_editor::is_shared_effect("mario_fb_shoot"));
+    }
+
+    /// Opening another effect from the list un-picks the bar of the one before; the bar of the
+    /// effect now open, and a control line, stay as they are.
+    #[test]
+    fn a_picked_bar_is_dropped_when_another_effect_opens() {
+        let flame = call(None);
+        assert!(super::timeline_bar_left_behind(
+            &flame,
+            Some("sys_atk_smoke")
+        ));
+        assert!(!super::timeline_bar_left_behind(&flame, Some("SYS_FLAME")));
+        assert!(!super::timeline_bar_left_behind(&flame, None));
     }
 
     fn call(extra: Option<&[&str]>) -> crate::data::EffectCall {

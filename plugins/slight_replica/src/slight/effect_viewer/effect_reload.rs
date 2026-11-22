@@ -1265,6 +1265,11 @@ static AUTO_CARRIER_KINDS: LazyLock<Mutex<std::collections::HashSet<u64>>> =
 /// unregister then erases every newly registered kind about 30 frames later.
 static AUTO_CARRIER_RETIRING_KINDS: LazyLock<Mutex<std::collections::HashSet<u64>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+/// True once a carrier object was created for the current [`AUTO_CARRIER_KINDS`]. Only then did
+/// those names reach the game, so only then is there anything for a swap to wait out. A carrier
+/// built for a fighter who is not in the match never loads, and waiting for its names to leave
+/// waited on whatever else in the match shares one of them, forever.
+static AUTO_CARRIER_BUILT: AtomicBool = AtomicBool::new(false);
 /// Reserve slot keeps the carrier out of the holder's normal usable-item slot.
 const AUTO_CARRIER_SLOT: i32 = 1;
 /// Battle-object id of the fighter currently HOLDING the carrier item, or 0 for unclaimed.
@@ -1400,6 +1405,9 @@ static ASSET_CARRIER_RELEASE_STALLED: AtomicBool = AtomicBool::new(false);
 /// mapping. A remove followed immediately by an add produces two snapshots; do not overwrite
 /// the first snapshot with the second one's not-yet-loaded kinds.
 fn remember_retiring_carrier_kinds() {
+    if !AUTO_CARRIER_BUILT.swap(false, Ordering::AcqRel) {
+        return;
+    }
     let current = AUTO_CARRIER_KINDS.lock();
     if current.is_empty() {
         return;
@@ -2276,6 +2284,24 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     let dir_state = crate::slight::effect_viewer::resource_reload::resident_directory_state(
         smash::hash40(eff_dir(&ef_file)),
     );
+    // A name the match already answers to is not the carrier's: a fighter in the match owns
+    // it (a copy of Mario's effect borrowed by another fighter, with Mario on stage). Keeping it
+    // made the handle lookup, the eviction and the next swap's retire wait act on that
+    // fighter's own effect set, and the wait never ended. Spawns of that name reach the
+    // resident effect either way.
+    let manager = effect_manager();
+    if !manager.is_null() {
+        let mut kinds = AUTO_CARRIER_KINDS.lock();
+        let before = kinds.len();
+        kinds.retain(|kind| kind_lookup(manager, *kind).is_none());
+        if kinds.len() != before {
+            dlog(&format!(
+                "AUTO_CARRIER_RESIDENT_NAMES dropped={} kept={}",
+                before - kinds.len(),
+                kinds.len()
+            ));
+        }
+    }
     let evicted = evict_carrier_effect_handle(&ef_file);
     mark(&format!(
         "auto_carrier_pre_reserve path={ef_file} item_kind={item_kind:#x} gen={generation} disk_gen={disk_generation} file={file_state:?} directory={dir_state:?} handle_evicted={evicted}"
@@ -2292,6 +2318,7 @@ pub unsafe fn pump_auto_carrier(boma: *mut smash::app::BattleObjectModuleAccesso
     let held_id = smash::app::lua_bind::ItemModule::get_have_item_id(boma, AUTO_CARRIER_SLOT);
     AUTO_CARRIER_ID.store(held_id, Ordering::Relaxed);
     AUTO_CARRIER_ITEM_KIND.store(item_kind as i64, Ordering::Relaxed);
+    AUTO_CARRIER_BUILT.store(true, Ordering::Release);
     mark(&format!(
         "auto_carrier_after_reserve result={have_result:#x} held_kind={held_kind:#x} held_id={held_id:#x}"
     ));

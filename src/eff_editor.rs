@@ -646,6 +646,11 @@ pub struct EffEditor {
     pub carrier_gen_now: u64,
     /// Final carrier reading from the last send, kept on screen after the spinner clears.
     pub last_carrier_result: Option<String>,
+    /// The game's own numbers behind that reading, for its hover.
+    pub last_carrier_detail: Option<String>,
+    /// Whether the send in flight must wait for the game to read new bytes. A send of the
+    /// same bytes leaves the live edit in place, and the game never reads them again.
+    pub carrier_needs_new_bytes: bool,
     /// Whether that final reading was a success — colours the persisted readout so a failed
     /// send is not a grey line that reads like a status message.
     pub carrier_ok: bool,
@@ -745,6 +750,8 @@ impl Default for EffEditor {
             carrier_state_since: None,
             carrier_gen_now: 0,
             last_carrier_result: None,
+            last_carrier_detail: None,
+            carrier_needs_new_bytes: true,
             carrier_ok: false,
             deploy_defer: false,
             last_sent_note: None,
@@ -2985,6 +2992,15 @@ impl EffEditor {
         self.last_sent_note = Some(note.into());
     }
 
+    /// Drop the outcome of the last send and stop waiting on it.
+    pub fn forget_send_result(&mut self) {
+        self.awaiting_game = None;
+        self.last_carrier_result = None;
+        self.last_carrier_detail = None;
+        self.last_sent_note = None;
+        self.carrier_ok = false;
+    }
+
     // ── Edit scope ────────────────────────────────────────────────────────────
 
     /// Indices of the emitters in this set that differ from pristine. Purely informational
@@ -3624,6 +3640,7 @@ impl EffEditor {
         self.sending = false;
         self.awaiting_game = None;
         self.last_carrier_result = None;
+        self.last_carrier_detail = None;
         self.carrier_ok = false;
         self.deploy_defer = false;
         self.last_sent_note = None;
@@ -3699,6 +3716,11 @@ impl EffEditor {
     /// Per-frame work while the Effects page is open: scan the files, and apply a queued load
     /// and the project's edits to it. Drawing is done by the `page_*` parts the app lays out.
     pub fn update(&mut self, ctx: &egui::Context, link: &GameLink) {
+        // A result belongs to the connection it came from: after a drop it describes a match
+        // the editor can no longer see, and a reconnect sends everything again.
+        if !link.status().is_connected() {
+            self.forget_send_result();
+        }
         // A project load queues its edits here; they apply even while the page is closed, so
         // the project store and the preview see them without the page having been opened.
         let pending = self.pending_load.is_some()
@@ -3776,16 +3798,23 @@ impl EffEditor {
             egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
             return;
         }
-        let (min, default, max) = game_split_sizes(ui.available_height());
-        egui::Panel::bottom("eff_game_panel_split")
-            .resizable(true)
-            .default_size(default)
-            .min_size(min)
-            .max_size(max)
+        // One line while closed, so connecting does not take the settings' room away; open, it
+        // holds the game's view of the effect in at most half the panel.
+        let (_, _, max) = game_split_sizes(ui.available_height());
+        let summary = self.game_panel_summary(link);
+        egui::Panel::bottom("eff_game_panel_line")
+            .resizable(false)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("eff_game_panel")
-                    .show(ui, |ui| self.draw_game_panel(ui, link));
+                let header = egui::CollapsingHeader::new(summary.0)
+                    .id_salt("eff_game_panel_open")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("eff_game_panel")
+                            .max_height(max)
+                            .show(ui, |ui| self.draw_game_panel(ui, link));
+                    });
+                header.header_response.on_hover_text(summary.1);
             });
         egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
     }
@@ -3815,9 +3844,8 @@ impl EffEditor {
             if ui
                 .add_enabled(connected && !self.sending, btn)
                 .on_hover_text(
-                    "Rebuild the live carrier and hand it to the running game — emitter edits, \
-                     transplants, texture swaps and imported PNGs all ride this one send. \
-                     Re-trigger the move to see it on a fresh spawn.",
+                    "Send every effect edit, borrowed effect and texture to the running game. \
+                     Do the move again to see it.",
                 )
                 .on_disabled_hover_text(if self.sending {
                     "Sending…".to_owned()
@@ -3831,46 +3859,37 @@ impl EffEditor {
             // The connection state and its Connect button are the top bar's, shown once.
             if self.sending || self.awaiting_game.is_some() {
                 ui.add(egui::Spinner::new().size(14.0));
-                let (text, tint) = if self.sending {
-                    (
-                        "building…".to_string(),
-                        egui::Color32::from_rgb(0x90, 0xC0, 0xF0),
-                    )
+                // The phase in words; the game's own numbers go in the hover.
+                let (text, hover) = if self.sending {
+                    ("Sending to the game…".to_string(), None)
                 } else {
-                    // The long half: the game is taking the carrier and bringing its object
-                    // up. Name the PHASE rather than dumping raw numbers — "object=down" told
-                    // the user nothing about which of several very different stalls they were
-                    // in. The payload itself now moves by disk, so the old "waiting for the
-                    // game to take the bytes" phase is a file read and passes in a frame; what
-                    // remains is the swap: retiring the previous carrier and spawning ours.
                     let secs = self
                         .awaiting_game
                         .map(|t| t.elapsed().as_secs())
                         .unwrap_or(0);
                     let (st, kinds, spawned) = self.carrier_report;
-                    // `took_ours` is the difference between "a carrier is up" and "MY carrier
-                    // is up". Without it the previous send's carrier answers for this one.
-                    let took_ours = self.carrier_gen_now > self.gen_at_send;
-                    let phase = match (st, spawned) {
-                        _ if secs < 2 => "waiting for game",
-                        (2, true) if took_ours => "carrier up",
-                        (2, true) => "game still serving the previous carrier",
-                        (0, _) => "handing the carrier over",
-                        (2, false) => "carrier staged — waiting for its object",
-                        (3, _) | (4, _) => "retiring the previous carrier",
-                        (5, _) => "waiting for the old resources to release",
-                        _ => "loading the carrier",
-                    };
+                    // `took_ours` is the difference between "an edit is up" and "THIS edit is
+                    // up". Without it the previous send answers for this one.
+                    let took_ours =
+                        !self.carrier_needs_new_bytes || self.carrier_gen_now > self.gen_at_send;
+                    let phase = send_phase(st, spawned, took_ours, secs);
                     (
                         if secs >= 2 {
-                            format!("{phase}… {secs}s (state={st} kinds={kinds})")
+                            format!("{phase}… {secs}s")
                         } else {
-                            phase.to_string()
+                            format!("{phase}…")
                         },
-                        egui::Color32::from_rgb(0xE0, 0xC0, 0x60),
+                        Some(carrier_numbers(st, kinds, spawned)),
                     )
                 };
-                ui.label(egui::RichText::new(text).small().color(tint));
+                let label = ui.label(
+                    egui::RichText::new(text)
+                        .small()
+                        .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
+                );
+                if let Some(hover) = hover {
+                    label.on_hover_text(hover);
+                }
             } else if unsent {
                 ui.label(
                     egui::RichText::new("unsent")
@@ -3878,11 +3897,14 @@ impl EffEditor {
                         .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30)),
                 );
             } else if let Some(r) = &self.last_carrier_result {
-                ui.label(egui::RichText::new(r).small().color(if self.carrier_ok {
+                let label = ui.label(egui::RichText::new(r).small().color(if self.carrier_ok {
                     egui::Color32::from_rgb(0x70, 0xB0, 0x70)
                 } else {
                     egui::Color32::from_rgb(0xD0, 0x80, 0x60)
                 }));
+                if let Some(detail) = &self.last_carrier_detail {
+                    label.on_hover_text(detail);
+                }
             }
         });
 
@@ -6060,7 +6082,7 @@ impl EffEditor {
                 .and_then(|o| labels.get(o as usize).cloned())
                 .unwrap_or_else(|| "nothing".to_string());
             ui.label(
-                egui::RichText::new(format!("swapped — was {was}"))
+                egui::RichText::new(format!("swapped, was {was}"))
                     .small()
                     .color(egui::Color32::from_rgb(0xE0, 0xC0, 0x60)),
             );
@@ -6186,7 +6208,7 @@ impl EffEditor {
                     egui::RichText::new(if texture.convertible {
                         "preview unavailable"
                     } else {
-                        "no preview — Visionary cannot read this format"
+                        "no preview: Visionary cannot read this format"
                     })
                     .small()
                     .color(egui::Color32::DARK_GRAY),
@@ -6276,7 +6298,7 @@ impl EffEditor {
                                 raw: false,
                             });
                         self.texture_note =
-                            Some((format!("added {new_name} — this part now uses it"), true));
+                            Some((format!("added {new_name}: this part now uses it"), true));
                     }
                     Err(e) => self.texture_note = Some((format!("duplicate failed: {e}"), false)),
                 }
@@ -6341,7 +6363,7 @@ impl EffEditor {
                             );
                             self.texture_note = Some((
                                 format!(
-                                    "added {new_name}: {}×{} {} — this part now uses it",
+                                    "added {new_name}: {}×{} {}, this part now uses it",
                                     report.width, report.height, report.format
                                 ),
                                 true,
@@ -6562,12 +6584,12 @@ impl EffEditor {
                                     raw: form == crate::texture_import::Form::Raw,
                                 });
                             let shape = match report.layout {
-                                Some(layout) => format!(" — {}", layout_note(layout)),
+                                Some(layout) => format!(": {}", layout_note(layout)),
                                 None => String::new(),
                             };
                             let note = match &report.format_substituted_from {
                                 Some(original) => format!(
-                                    "{name}: {}×{} — {original} cannot be written, saved as {}{shape}",
+                                    "{name}: {}×{}, {original} cannot be written, saved as {}{shape}",
                                     report.width, report.height, report.format
                                 ),
                                 None => format!(
@@ -6621,23 +6643,37 @@ impl EffEditor {
         }
     }
 
+    /// The In game fold's one line and its hover: whether the game has played the open effect,
+    /// and how many of this fighter's effects it has played since connecting.
+    fn game_panel_summary(&self, link: &GameLink) -> (String, String) {
+        let seen = link.kinds().len();
+        let entry = self.selected_entry.and_then(|i| self.entries.get(i));
+        let line = match entry {
+            Some(entry) => {
+                let name = crate::app::effect_words(&entry.name);
+                match game_sighting(seen, link.kind(entry.hash).is_some()) {
+                    Some(true) => format!("In game: {name} played"),
+                    Some(false) => format!("In game: {name} not played yet"),
+                    None => "In game".to_string(),
+                }
+            }
+            None => "In game".to_string(),
+        };
+        (
+            line,
+            format!(
+                "{seen} of this fighter's effects played since connecting. Send edits, then do \
+                 the move again in game to see them there."
+            ),
+        )
+    }
+
     fn draw_game_panel(&mut self, ui: &mut Ui, link: &GameLink) {
         // About the running game: what it has spawned and what has been sent to it. Without a
         // connection none of it says anything.
         if !link.status().is_connected() {
             return;
         }
-        ui.label("In game")
-            .on_hover_text("Send edits, then do the move again in game to see them there.");
-        ui.label(
-            egui::RichText::new(format!(
-                "{} of this fighter's effects seen so far",
-                link.kinds().len()
-            ))
-            .small()
-            .color(egui::Color32::LIGHT_GRAY),
-        );
-        ui.separator();
 
         let Some(entry_idx) = self.selected_entry else {
             ui.colored_label(egui::Color32::GRAY, "Select an entry.");
@@ -6650,15 +6686,24 @@ impl EffEditor {
         let transplant = self.current_transplant_for_entry(&entry_name);
 
         let kind = link.kind(hash);
+        let sighting = game_sighting(link.kinds().len(), kind.is_some());
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&entry_name).monospace());
+            ui.label(crate::app::effect_words(&entry_name))
+                .on_hover_text(&entry_name);
             if transplant.is_some() {
                 ui.colored_label(egui::Color32::from_rgb(190, 140, 255), "BORROWED");
             }
-            match &kind {
-                Some(_) => ui.colored_label(egui::Color32::from_rgb(90, 220, 90), "live"),
-                None => ui.colored_label(egui::Color32::GRAY, "not seen in game yet"),
-            };
+            // Nothing is said before the game has reported any effect: "not played" then
+            // means only that nothing has come back yet.
+            match sighting {
+                Some(true) => {
+                    ui.colored_label(egui::Color32::from_rgb(90, 220, 90), "played");
+                }
+                Some(false) => {
+                    ui.colored_label(egui::Color32::GRAY, "not played yet");
+                }
+                None => {}
+            }
         });
         if let Some((fighter, item)) = transplant {
             let scope = if item.one_slot_slots.len() == 1 {
@@ -6747,7 +6792,7 @@ impl EffEditor {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "{} replaced texture(s) — applies to the whole eff",
+                    "{} replaced texture(s) in the whole file",
                     self.texture_imports.len()
                 ))
                 .small()
@@ -6779,13 +6824,6 @@ impl EffEditor {
         }
 
         let Some(kind) = kind else {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("Not seen in the game yet")
-                    .small()
-                    .color(egui::Color32::DARK_GRAY),
-            )
-            .on_hover_text("Trigger the effect in game (training mode) to open its kind tab.");
             ui.separator();
             self.draw_transplant_section(ui, &entry_name);
             return;
@@ -6847,6 +6885,71 @@ impl EffEditor {
     }
 }
 
+/// Whether the game has played an effect, once it has reported any: `None` before the first
+/// report, when "not played" would only mean nothing has come back yet.
+pub(crate) fn game_sighting(reported: usize, this_one: bool) -> Option<bool> {
+    (reported > 0 || this_one).then_some(this_one)
+}
+
+/// What a send is waiting on, in words, from the game's carrier report.
+pub(crate) fn send_phase(state: u8, spawned: bool, took_ours: bool, secs: u64) -> &'static str {
+    match (state, spawned) {
+        _ if secs < 2 => "Sending to the game",
+        (2, true) if took_ours => "In the game",
+        (2, true) | (3, _) | (4, _) | (5, _) => "Waiting for the game to let go of the last edit",
+        (2, false) => "Starting in the game",
+        _ => "Sending to the game",
+    }
+}
+
+/// The carrier report behind a phase or an outcome, for its hover.
+pub(crate) fn carrier_numbers(state: u8, kinds: usize, spawned: bool) -> String {
+    format!(
+        "Game report: state {state}, {kinds} effect names, object {}",
+        if spawned { "up" } else { "down" }
+    )
+}
+
+/// How a send ended, in the words the Send row, the In game panel and the status line share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// The game took the edit and it plays now.
+    InGame,
+    /// The game dropped the last edit and plays its own effects.
+    Restored,
+    /// The game could not read the file it was pointed at.
+    Unreadable,
+    /// No match is reporting; the staged files load when one starts.
+    NoMatch,
+    /// The match did not take it; the staged files load at the next match.
+    NextMatch,
+}
+
+impl SendOutcome {
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Self::InGame => "In the game",
+            Self::Restored => "The game plays its own effects again",
+            Self::Unreadable => "The game could not read the edit",
+            Self::NoMatch => "Saved for the next match",
+            Self::NextMatch => "Not in this match: it loads at the next match",
+        }
+    }
+
+    /// The status line's opening words, before the count of what was sent.
+    pub(crate) fn status_prefix(self) -> &'static str {
+        match self {
+            Self::InGame | Self::Restored => "In the game",
+            Self::Unreadable => "Not sent",
+            Self::NoMatch | Self::NextMatch => "Saved for the next match",
+        }
+    }
+
+    pub(crate) fn ok(self) -> bool {
+        matches!(self, Self::InGame | Self::Restored)
+    }
+}
+
 /// Plain-English name for what a texture carries, for the panel and the import note.
 fn layout_note(layout: crate::texture_import::Layout) -> &'static str {
     use crate::texture_import::Layout;
@@ -6887,6 +6990,76 @@ mod tests {
     use crate::effects::{EmitterSet, PtclFile};
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
+
+    /// The send row names the phase in words. The game's numbers are kept for the hover.
+    #[test]
+    fn a_send_names_its_phase_in_plain_words() {
+        assert_eq!(send_phase(4, false, false, 1), "Sending to the game");
+        assert_eq!(send_phase(2, true, true, 9), "In the game");
+        assert_eq!(
+            send_phase(2, true, false, 9),
+            "Waiting for the game to let go of the last edit"
+        );
+        assert_eq!(
+            send_phase(4, false, false, 9),
+            "Waiting for the game to let go of the last edit"
+        );
+        assert_eq!(send_phase(2, false, true, 9), "Starting in the game");
+        assert_eq!(send_phase(1, false, false, 9), "Sending to the game");
+        assert!(carrier_numbers(4, 5, false).contains("state 4"));
+        let outcomes = [
+            SendOutcome::InGame,
+            SendOutcome::Restored,
+            SendOutcome::Unreadable,
+            SendOutcome::NoMatch,
+            SendOutcome::NextMatch,
+        ];
+        for phase in [
+            send_phase(0, false, false, 0),
+            send_phase(2, true, true, 9),
+            send_phase(2, true, false, 9),
+            send_phase(2, false, true, 9),
+        ]
+        .into_iter()
+        .chain(outcomes.iter().map(|o| o.text()))
+        {
+            for word in ["carrier", "state=", "kinds", ".nro", "gen=", "object="] {
+                assert!(!phase.contains(word), "{phase:?} says {word}");
+            }
+        }
+        assert!(SendOutcome::InGame.ok() && SendOutcome::Restored.ok());
+        assert!(!SendOutcome::NextMatch.ok() && !SendOutcome::NoMatch.ok());
+    }
+
+    /// "Not played yet" waits for the game's first report: before it, nothing has come back,
+    /// which says nothing about the effect.
+    #[test]
+    fn an_effect_is_called_unplayed_only_after_the_game_reports() {
+        assert_eq!(game_sighting(0, false), None);
+        assert_eq!(game_sighting(5, false), Some(false));
+        assert_eq!(game_sighting(5, true), Some(true));
+        assert_eq!(game_sighting(0, true), Some(true));
+    }
+
+    /// A send's result describes one connection. Once the link is down it is cleared, and the
+    /// wait for the game stops: the next connection sends everything again.
+    #[test]
+    fn a_dropped_link_clears_the_last_send_result() {
+        let link = GameLink::default();
+        assert!(!link.status().is_connected());
+        let mut editor = EffEditor {
+            last_carrier_result: Some(SendOutcome::NextMatch.text().to_string()),
+            last_carrier_detail: Some("Game report: state 4".to_string()),
+            awaiting_game: Some(Instant::now()),
+            ..EffEditor::default()
+        };
+        editor.set_sent_note(SendOutcome::NextMatch.text());
+        editor.update(&egui::Context::default(), &link);
+        assert_eq!(editor.last_carrier_result, None);
+        assert_eq!(editor.last_carrier_detail, None);
+        assert_eq!(editor.awaiting_game, None);
+        assert_eq!(editor.last_sent_note, None);
+    }
 
     #[test]
     fn texture_slots_with_no_texture_fold_and_used_ones_stay() {
