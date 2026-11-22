@@ -212,8 +212,16 @@ fn effect_loop(emitters: &[Emitter]) -> Loop {
             }
         }
     }
+    // Every particle is gone one particle life after the kill, so the loop ends there. Measured
+    // without a kill, some parts keep particles until one comes (Sephiroth's Fire1 bullet), which
+    // held the loop at the cap with an empty view for 200 frames.
+    let longest_life = emitters
+        .iter()
+        .map(|e| e.data.particle_data.life.max(1) as usize)
+        .max()
+        .unwrap_or(0);
     Loop {
-        length: length.min(kill + CAP),
+        length: length.min(kill + CAP).min(kill + longest_life + 1),
         kill: Some(kill),
     }
 }
@@ -1143,6 +1151,44 @@ mod tests {
         let rays = named("light2");
         assert!(alive(rays, 60) > 0, "{plan:?}");
         assert_eq!(alive(rays, period), 0, "{plan:?}");
+    }
+
+    /// Sephiroth's Fire1 bullet played on its own was empty for about 200 of its 256 frames:
+    /// a never-stopping part kept invisible particles alive after the kill, so the loop ran to
+    /// the cap. It ends one particle life after the kill; the charge, timed throughout, keeps
+    /// its length.
+    #[test]
+    fn a_loop_ends_one_particle_life_after_the_kill() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let sets = set_emitters(ptcl_file);
+        let named = |name: &str| {
+            let at = ptcl_file
+                .emitter_list
+                .emitter_sets
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            effect_loop(&sets[at])
+        };
+        let bullet = named("P_EdgeFire1Bullet");
+        assert!(bullet.kill.is_some(), "{bullet:?}");
+        assert!(bullet.length < 80, "{bullet:?}");
+        // Only timed parts: the loop is as long as their particles last, as before.
+        let timed = (0..sets.len())
+            .find(|&at| {
+                !sets[at].is_empty()
+                    && sets[at].iter().all(|e| e.data.emission.is_one_time)
+                    && effect_loop(&sets[at]).length > 1
+            })
+            .expect("a set with only timed parts");
+        assert_eq!(effect_loop(&sets[timed]).kill, None);
     }
 
     /// Sephiroth's charge sparks (edge_fire2_hold sparks4) trail red and gold dots from two
