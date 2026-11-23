@@ -1,5 +1,87 @@
 # Visionary Changelog
 
+## 0.4.0
+
+Full support for articles and projectiles in linked movesets, a redesigned Project page with
+per-character cards and custom part folders, independent edit stores for Visionary-made
+characters, major VFX and weapon-trail preview upgrades, byte-preserving `.eff` exports with
+validation, and bounded game-link reconnection. Built on upstream Common-Leap/Visionary through
+`47cfbe4`.
+
+### Changed from 0.3.2
+
+- **Project files are now version 9.** 0.4.0 opens and migrates projects from every earlier
+  version (including both fork v8 and upstream v8 projects), reconciling `project_fighters` with
+  per-character made-character stores. Older builds refuse v9 files rather than dropping data.
+- **Game connection retries are bounded.** Visionary dials for a short window on startup, after
+  a drop, or when you click Connect, then waits instead of polling forever. A new editor can
+  now take over the in-game plugin from a dead session, and every status surface uses the same
+  wording.
+
+### Articles and projectiles (Objects)
+
+- **End-to-end article cataloging and editing.** Lists a fighter's vanilla, rewritten, and
+  cloned articles (including `clone_weapon` registrations and helper-wrapped clones), their
+  origins, status scripts, and parameter blocks.
+- **Article settings and flight preview.** Reads article size, speed, gravity, life, and power
+  from status code and param blocks (including `param_config` overrides and per-file consts),
+  flies projectiles along their real parabolic arcs in the viewport, and shows open article
+  models and hitboxes.
+- **Typed `ArticleModule` calls and safe saving.** Edits to article calls and settings write
+  back to the moveset's own source files without polluting the project file, and prompt before
+  leaving unsynced object script edits.
+- **Live article scripts in game.** Sends the selected fighter's article script rules live to
+  the plugin separately from fighter rules.
+
+### Projects, characters, and select screen
+
+- **Redesigned Project page (`parts.json`).** One card per character with a button and custom
+  folder link for each part (Moves, Effects, Sounds, Model, Animations, Gimmicks, Fighter
+  values, Select screen). Linked model and effect files auto-reload when modified on disk.
+- **Made characters own their own edits.** Characters created in Visionary (`mario#c08`) keep
+  their own moves, node graphs, sounds, expressions, effect files, gimmicks, and meters under
+  their own key, gated to their costumes on export and live in game (including projectiles
+  checked against their thrower's costume).
+- **New Character & Select Screen overhaul.** New Character wizard with fighter grid and full
+  base-fighter copy; Select Screen laid out as in game with echoes stacked or separate and
+  CSK Collection–compatible costume ranges; redesigned Fighter Values layout.
+- **Slot-character fixes and runtime hurtbox overrides.** Fixes slot-character roster edge
+  cases, resolves slot-character viewport spawns and `.eff` files, and applies runtime hurtbox
+  overrides in the plugin.
+
+### VFX preview, trails, and `.eff` export
+
+- **Much closer-to-game VFX preview.** Runs effects at 60 fps in game time and game world
+  space (fixing world gravity and velocity direction), draws child emitters on their own
+  matrices (e.g. Sephiroth's Scintilla wall), runs field sections, respects
+  `LAST_EFFECT_SET_RATE`, culls emitter display sides, turns effects with root bones while
+  keeping `EFFECT_FLW_POS` orientation, loops effects by real kill timing instead of a
+  240-frame cap, and seeds each spawn anew (`eff_wgpu` `95e42939`).
+- **Standalone effect timeline.** Play, pause, and scrub through an effect's loop when viewing
+  an effect on its own (even with no character open).
+- **EP01–EP03 stripe VFX and smoother weapon trails.** Renders `nn::vfx` stripe emitters
+  (`EP01`/`EP02`/`EP03`) in the viewport, smooths weapon trails with Catmull-Rom curves and
+  brighter texture blending, adds a trail-preview overlay, and resolves slot-scoped
+  `trail_cNN` textures and helper bones.
+- **Byte-preserving `.eff` export and validator.** Untouched texture, model, and shader pools
+  are copied byte-for-byte from the source file (no-edit exports are byte-identical), empty
+  texture/model table tags are preserved (fixing stage hangs like *The Sand Bird*), and every
+  exported `.eff` is validated before shipping.
+- **Emitter field animation keyframes.** View, add, and remove keyframes of emitter field
+  animations in the effect editor.
+
+### Move nodes, Classic editor, gimmicks, and plugin
+
+- **Left/right facing effects editable.** Effects inside facing checks appear in the effect
+  list, timeline, and redirect picker, go live guarded by facing, and export back into their
+  facing branch.
+- **Classic hitboxes in node-edited moves** and hitbox IDs 4–7 on finish camera / force
+  reaction; move starters squeeze to fit short moves; Steve's jab points at Forward tilt.
+- **Steve body-part attacks & frame-0 rearming.** Added blocks fire on moves played on upper
+  body part animations (`frame_partial`) and rearm every time a move restarts.
+- **Extra jump no longer stacks** on live re-sends; plainer labels and hover tooltips across
+  editors; pre-v0.2.0 `legacy_move_triggers` loader removed.
+
 ## 0.3.2
 
 Frame data for every move, a Motion List editor, game version 13.0.5 and the Ozone loader,
