@@ -1577,7 +1577,6 @@ mod tests {
         let (steps, kill) = rated_steps(&placements, Some(6), 1.0);
         assert_eq!((steps.len(), kill), (10, Some(6)));
     }
-}
 
     /// Kazuya's ground crack (Heaven's Impact) draws only where the scene's depth lies close
     /// behind it. The preview handed it no depth, "nothing behind", and it drew nothing over
@@ -1748,3 +1747,4 @@ mod tests {
         assert!(with_copy > 300, "the crack covers only {with_copy} pixels");
         assert_eq!(without, 0);
     }
+}
