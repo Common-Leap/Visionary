@@ -1209,7 +1209,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let vfx = &state.vfx;
             let scene_copy = &state.scene_copy;
             let trails = &state.trails;
-            let floor = (self.floor && !state.shows_stage()).then_some(&state.floor);
+            // An effect alone has no floor, except one with floor decals to show on it.
+            let floor = ((self.floor || vfx.looped_on_floor()) && !state.shows_stage())
+                .then_some(&state.floor);
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }

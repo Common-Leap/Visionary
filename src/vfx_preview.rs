@@ -300,6 +300,8 @@ pub struct VfxPreview {
     next_load: u64,
     /// The last prepare's looping draw: its length and its period with the gap, in frames.
     looped: Option<(usize, usize)>,
+    /// Whether that draw has a floor decal, which shows only on a floor close behind it.
+    looped_on_floor: bool,
 }
 
 impl VfxPreview {
@@ -325,6 +327,7 @@ impl VfxPreview {
             reloading: HashSet::new(),
             next_load: 0,
             looped: None,
+            looped_on_floor: false,
         }
     }
 
@@ -342,6 +345,11 @@ impl VfxPreview {
     /// The length and period, in frames, of the effect the last prepare played on a loop.
     pub fn looped(&self) -> Option<(usize, usize)> {
         self.looped
+    }
+
+    /// Whether the effect the last prepare played on a loop has a floor decal to show.
+    pub fn looped_on_floor(&self) -> bool {
+        self.looped_on_floor
     }
 
     fn workers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &Workers {
@@ -558,6 +566,7 @@ impl VfxPreview {
     ) {
         self.prepared.clear();
         self.looped = None;
+        self.looped_on_floor = false;
         self.collect_loaded();
         self.waiting = !self.reloading.is_empty();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
@@ -613,6 +622,7 @@ impl VfxPreview {
                         .or_insert_with(|| effect_loop(&file.emitters[set]));
                     let period = plan.length + 15;
                     self.looped = Some((plan.length, period));
+                    self.looped_on_floor = file.emitters[set].iter().any(has_decal);
                     looped = vec![*at; clock % period + 1];
                     kill_at = plan.kill;
                     spawn = looped_spawn(draw.spawn, clock, period);
@@ -968,6 +978,11 @@ fn load_file(
         meshes: eff_wgpu::mesh::meshes(ptcl_file),
         ptcl: ptcl_file.clone(),
     })
+}
+
+/// Whether an emitter or a child of it draws as a floor decal (Kazuya's ground cracks).
+fn has_decal(emitter: &Emitter) -> bool {
+    emitter.data.particle_color.is_decal != 0 || emitter.children.iter().any(has_decal)
 }
 
 /// An emitter and its child emitters as they draw, each with its matrix (with scale and
@@ -1576,6 +1591,27 @@ mod tests {
         assert_eq!(steps.last().unwrap().w_axis.x, 8.0);
         let (steps, kill) = rated_steps(&placements, Some(6), 1.0);
         assert_eq!((steps.len(), kill), (10, Some(6)));
+    }
+
+    /// Played alone with no stage, an effect gets the plain floor only when it has a floor decal
+    /// to show on it: Kazuya's Heaven's Impact does, Sephiroth's Scintilla wall does not.
+    #[test]
+    fn only_an_effect_with_a_floor_decal_asks_for_a_floor() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let decal = |file: &str, entry: &str| {
+            let bytes = std::fs::read(root.join("effect/fighter").join(file)).unwrap();
+            let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+            let set = crate::effects::entry_set_handles(&file)[entry];
+            set_emitters(file.ptcl_file.as_ref().unwrap())[set as usize]
+                .iter()
+                .any(has_decal)
+        };
+        assert!(decal("demon/ef_demon.eff", "demon_heavens_impact"));
+        assert!(!decal("edge/ef_edge.eff", "edge_senkou_shield"));
     }
 
     /// Kazuya's ground crack (Heaven's Impact) draws only where the scene's depth lies close
