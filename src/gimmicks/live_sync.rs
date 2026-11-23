@@ -95,10 +95,7 @@ impl LiveSync {
         }
         match behavior {
             Ok(body) => self.send("behavior", body, link),
-            Err(error) => self.set_error(
-                "behavior",
-                format!("Behavior snapshot not sent: {error}; active preview unchanged"),
-            ),
+            Err(error) => self.set_error("behavior", format!("Gimmicks not sent: {error}")),
         }
         self.send(
             "parameters",
@@ -165,7 +162,7 @@ impl LiveSync {
         {
             owners.insert(fighter.as_str());
             if owners.len() > super::controller_protocol::MAX_FIGHTER_OWNERS {
-                return Err("Live controller snapshot exceeds 96 fighter owners".into());
+                return Err("more than 96 characters have gimmicks".into());
             }
         }
         let count = owners.iter().fold(0usize, |count, fighter| {
@@ -176,7 +173,7 @@ impl LiveSync {
                 ))
         });
         if count > super::controller_protocol::MAX_CHARTS {
-            return Err("Live controller snapshot exceeds 256 charts".into());
+            return Err("there are more than 256 gimmicks".into());
         }
         let empty_graph = BehaviorGraph::default();
         let empty_charts = BTreeMap::new();
@@ -189,7 +186,7 @@ impl LiveSync {
                 self.warnings
                     .entry(key.into())
                     .or_default()
-                    .push("Controller preview refused: no exact engine fighter".into());
+                    .push("Not live: the game has no fighter of this name".into());
                 continue;
             }
             self.managed.insert(fighter.into());
@@ -201,7 +198,7 @@ impl LiveSync {
                 self.warnings
                     .entry(key.into())
                     .or_default()
-                    .push(format!("Controller preview refused: {error}"));
+                    .push(format!("Not live: {error}"));
                 continue;
             }
             let extra = charts.get(key).unwrap_or(&empty_charts);
@@ -216,7 +213,7 @@ impl LiveSync {
                     .warnings
                     .entry(key.into())
                     .or_default()
-                    .push(format!("Complete controller owner refused: {error}")),
+                    .push(format!("Not live: {error}")),
             }
         }
         let disabled: Vec<_> = self.managed.difference(&active).cloned().collect();
@@ -253,7 +250,7 @@ impl LiveSync {
             return;
         }
         let Some(revision) = self.revision.checked_add(1) else {
-            self.set_error(family, format!("{family}: live revision space exhausted"));
+            self.set_error(family, "Not sent: restart Visionary to send again".into());
             return;
         };
         self.revision = revision;
@@ -305,7 +302,7 @@ pub fn parameter(
 ) -> Result<super::live_params::LiveParameter, String> {
     use super::live_params::{LiveParamValue, LiveParameter};
     if super::registry::fighter_kind_symbol(fighter).is_none() {
-        return Err("No exact engine fighter; this value requires export".into());
+        return Err("not live, the game has no fighter of this name".into());
     }
     let value = match value {
         ParamValue::Float(value) if value.is_finite() => LiveParamValue::Float(value),
@@ -317,9 +314,9 @@ pub fn parameter(
         ParamValue::U32(value) => LiveParamValue::Int(
             value
                 .try_into()
-                .map_err(|_| "Unsigned value exceeds the live getter range")?,
+                .map_err(|_| "not live, the number is too large")?,
         ),
-        _ => return Err("This scalar type requires export".into()),
+        _ => return Err("not live, the game reads this kind of value once".into()),
     };
     let edit = LiveParameter {
         fighter: fighter.into(),
@@ -510,7 +507,7 @@ mod tests {
         assert!(LiveSync::default()
             .prepare_controller_snapshot(&BTreeMap::new(), &charts, &RosterMod::default())
             .unwrap_err()
-            .contains("256 charts"));
+            .contains("256 gimmicks"));
     }
 
     fn request_parts(body: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -572,7 +569,7 @@ mod tests {
         assert!(parameter("cloud", "limit_max", ParamValue::Hash(0x1234)).is_err());
         let overflow =
             parameter("cloud", "limit_max", ParamValue::U32(i32::MAX as u32 + 1)).unwrap_err();
-        assert!(overflow.contains("Unsigned value exceeds"), "{overflow}");
+        assert!(overflow.contains("the number is too large"), "{overflow}");
         assert!(parameter("cloud", "limit_max", ParamValue::Float(f32::INFINITY)).is_err());
         assert!(parameter("cloud", "limit_max", ParamValue::Float(1_000_001.0)).is_err());
         assert!(parameter("cloud", "limit_max", ParamValue::I32(1_000_001)).is_err());
