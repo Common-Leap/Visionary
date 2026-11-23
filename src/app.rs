@@ -14028,7 +14028,8 @@ impl VisionaryApp {
                             };
                             let [world_start, world_end] =
                                 hurtbox_world_endpoints(volume, bone_mat);
-                            let world_radius = hurtbox_world_radius(volume, bone_mat);
+                            let world_radius =
+                                hurtbox_world_radius(volume, bone_mat, rs.model_scale());
                             let selected = self.selected_hurtbox == Some(volume_index);
                             if selected {
                                 let _ = draw_projected_capsule(
@@ -14480,7 +14481,7 @@ impl VisionaryApp {
                                 let radius = rs
                                     .world_radius_to_screen(
                                         center,
-                                        hurtbox_world_radius(volume, bone_mat),
+                                        hurtbox_world_radius(volume, bone_mat, rs.model_scale()),
                                         rect,
                                     )
                                     .unwrap_or(volume.radius * 4.0)
@@ -41976,12 +41977,18 @@ fn hurtbox_world_endpoints(
     ]
 }
 
-fn hurtbox_world_radius(volume: &crate::data::HurtboxVolume, bone_matrix: glam::Mat4) -> f32 {
+/// A hurtbox's radius on its scaled bone, less the fighter's own scale: the game keeps the
+/// radius as the fighter's parameters have it while its ends follow the scaled bone.
+fn hurtbox_world_radius(
+    volume: &crate::data::HurtboxVolume,
+    bone_matrix: glam::Mat4,
+    model_scale: f32,
+) -> f32 {
     let scale = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z]
         .into_iter()
         .map(|axis| bone_matrix.transform_vector3(axis).length())
         .fold(0.0, f32::max);
-    (volume.radius * scale).max(0.0)
+    (volume.radius * scale / model_scale).max(0.0)
 }
 
 fn projected_capsule_direction(delta: egui::Vec2) -> Option<egui::Vec2> {
@@ -42102,7 +42109,32 @@ mod hurtbox_viewport_tests {
         let [start, end] = hurtbox_world_endpoints(&volume, matrix);
         assert!((start - glam::Vec3::new(10.0, 3.0, -2.0)).length() < 1e-5);
         assert!((end - glam::Vec3::new(10.0, 5.0, -2.0)).length() < 1e-5);
-        assert!((hurtbox_world_radius(&volume, matrix) - 2.0).abs() < 1e-5);
+        assert!((hurtbox_world_radius(&volume, matrix, 1.0) - 2.0).abs() < 1e-5);
+    }
+
+    /// Wolf's hip hurtbox as a match held it (fighter scale 1.18): its end follows the scaled
+    /// hip, its radius is the parameter's 1.7.
+    #[test]
+    fn hurtbox_ends_take_the_fighters_scale_and_the_radius_does_not() {
+        let volume = crate::data::HurtboxVolume {
+            index: 0,
+            bone_name: "hip".into(),
+            bone_hash: hash40::hash40("hip").0,
+            endpoint1: [0.0, 0.0, 0.6],
+            endpoint2: [0.0, 0.0, -0.6],
+            radius: 1.7,
+            default_status: crate::data::HurtboxStatus::Normal,
+            shape: crate::data::HurtboxShape::Capsule,
+        };
+        let hip = glam::Mat4::from_cols_array_2d(&[
+            [-0.1342, 1.1627, 0.1503, 0.0],
+            [-0.7495, -0.2014, 0.8889, 0.0],
+            [0.9015, 0.0056, 0.7614, 0.0],
+            [-30.1580, 7.9275, -0.5121, 1.0],
+        ]);
+        let [end, _] = hurtbox_world_endpoints(&volume, hip);
+        assert!(end.abs_diff_eq(glam::vec3(-29.6171, 7.9309, -0.0553), 1e-3));
+        assert!((hurtbox_world_radius(&volume, hip, 1.18) - 1.7).abs() < 1e-3);
     }
 
     #[test]
