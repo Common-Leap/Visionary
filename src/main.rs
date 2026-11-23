@@ -68,6 +68,7 @@ mod sources;
 mod texture_import;
 mod trail_preview;
 mod ui;
+mod user_files;
 mod vfx_preview;
 mod viewport_navigation;
 mod viewport_target;

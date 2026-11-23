@@ -795,6 +795,14 @@ impl SourceIndex {
             root: root.to_path_buf(),
             ..Default::default()
         };
+        // Cargo names files by where links lead, so a folder that is a link is read there too.
+        let real = crate::user_files::real_path(root);
+        let root = if crate::cargo_project::path_key(&real) == crate::cargo_project::path_key(root)
+        {
+            root
+        } else {
+            &real
+        };
         let mut files = Vec::new();
         collect_rust_files(root, &mut files, 0)?;
         files.sort();
@@ -2141,6 +2149,8 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
         return None;
     }
     let mut reached: HashSet<PathBuf> = HashSet::new();
+    // A crate's root file finds its modules beside it, whatever `[lib] path` names it.
+    let roots: HashSet<PathBuf> = crate_roots.iter().cloned().collect();
     let mut queue = crate_roots;
     while let Some(file) = queue.pop() {
         if !reached.insert(file.clone()) {
@@ -2156,6 +2166,7 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
         };
         let stem_dir = match file.file_name().and_then(|n| n.to_str()) {
             Some("mod.rs" | "lib.rs" | "main.rs") => file.parent().map(Path::to_path_buf),
+            _ if roots.contains(&file) => file.parent().map(Path::to_path_buf),
             _ => file
                 .parent()
                 .zip(file.file_stem())

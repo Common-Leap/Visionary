@@ -5372,6 +5372,8 @@ pub struct VisionaryApp {
     /// The open project's moveset crate (absolute). `None` means not linked. Kept even when the
     /// crate could not be re-opened, so a missing folder is reported rather than forgotten.
     project_moveset: Option<PathBuf>,
+    /// A folder to link once cargo has said what it compiles; nothing in it was found without.
+    link_after_cargo: Option<PathBuf>,
     /// Costume slots the open project's `romfs/` has files for, by lowercased fighter name.
     /// Recomputed in `reindex_fighters`.
     project_romfs_slots: BTreeMap<String, BTreeSet<u8>>,
@@ -5925,6 +5927,7 @@ impl VisionaryApp {
             project_path: None,
             project_fighters: BTreeSet::new(),
             project_moveset: None,
+            link_after_cargo: None,
             project_romfs_slots: BTreeMap::new(),
             acmd_src_fighters: BTreeSet::new(),
             article_catalog: None,
@@ -7639,6 +7642,11 @@ impl VisionaryApp {
                     )
                 };
                 if !index.has_scripts() {
+                    if crate::cargo_project::is_pending(&root) {
+                        self.state.status = format!("Reading {}", root.display());
+                        self.link_after_cargo = Some(root);
+                        return;
+                    }
                     self.state.status = format!(
                         "No ACMD scripts found under {} — expected a smashline project with \
                          `unsafe extern \"C\" fn game_*` functions",
@@ -7683,6 +7691,9 @@ impl VisionaryApp {
     fn rescan_acmd_source(&mut self) {
         if self.leave_gate(|| PendingLeave::RescanSource) {
             return;
+        }
+        if let Some(index) = &self.acmd_src {
+            crate::cargo_project::ask_again(&index.root);
         }
         if self.refresh_linked_acmd_source_index() {
             if let Some(index) = self.acmd_src.as_ref() {
@@ -8611,9 +8622,44 @@ impl VisionaryApp {
         }
     }
 
+    /// Whether cargo is still saying which files the linked moveset compiles, which the status
+    /// then says: until it has, a write could go into a backup beside the code.
+    fn source_layout_pending(&mut self) -> bool {
+        let pending = self
+            .acmd_src
+            .as_ref()
+            .is_some_and(|index| crate::cargo_project::is_pending(&index.root));
+        if pending {
+            self.state.status = "Cargo is still reading the linked moveset; try again".into();
+        }
+        pending
+    }
+
+    /// Cargo has said how a moveset is laid out: index the linked one again with that, and
+    /// re-read the open move from it when it has no edits.
+    fn adopt_cargo_answer(&mut self) {
+        if let Some(root) = self.link_after_cargo.take() {
+            self.link_acmd_source(root);
+            return;
+        }
+        let files = self.acmd_src.as_ref().map(|index| index.files.clone());
+        if !self.refresh_linked_acmd_source_index()
+            || self.acmd_src.as_ref().map(|index| &index.files) == files.as_ref()
+        {
+            return;
+        }
+        let edited = self.object_script_dirty()
+            || self
+                .current_move_key()
+                .is_some_and(|key| self.move_has_edits(&key));
+        if !edited {
+            self.reload_move_scripts();
+        }
+    }
+
     fn sync_edits_to_source_for_row(&mut self) {
         self.last_sync_clean = false;
-        if self.acmd_src.is_none() {
+        if self.acmd_src.is_none() || self.source_layout_pending() {
             return;
         }
         // An open object script saves under its own agent, which the index keys it by.
@@ -22274,6 +22320,10 @@ impl VisionaryApp {
             card.message = Some(format!("`{}` is not a number", text.trim()));
             return;
         };
+        if self.source_layout_pending() {
+            card.message = Some(self.state.status.clone());
+            return;
+        }
         let plan =
             crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
         let result: anyhow::Result<String> = match plan {
@@ -25970,6 +26020,7 @@ impl VisionaryApp {
         self.edited_fighters.clear();
         self.authored_characters.clear();
         self.project_moveset = None;
+        self.link_after_cargo = None;
         self.acmd_src = None;
         self.acmd_src_problem = None;
         self.acmd_src_buffer = None;
@@ -27974,6 +28025,7 @@ impl VisionaryApp {
         let (moveset, index, problem) =
             crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
         self.project_moveset = moveset;
+        self.link_after_cargo = None;
         self.acmd_src = index;
         self.acmd_src_problem = problem;
         self.acmd_src_buffer = None;
@@ -41003,6 +41055,13 @@ Click to see the code, or link your own project"
 
         // Project autosave: every edit lands on disk without a keybind or button.
         self.poll_project_autosave(&ctx);
+        let asking = crate::cargo_project::is_asking();
+        if crate::cargo_project::take_finished() {
+            self.adopt_cargo_answer();
+        }
+        if asking {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // Delayed serving-chain probe after a live-eff deploy.
         if let Some(due) = self.live_eff_probe_due {
