@@ -5184,9 +5184,6 @@ pub struct VisionaryApp {
     /// Background cargo-skyline build for a normal export or explicit gimmick package.
     /// Only one build owns this slot at a time; status is polled in `update`.
     export_build: Option<std::sync::Arc<std::sync::Mutex<ExportBuildState>>>,
-    /// The linked moveset's own plugin build (`None` inside while it runs). See
-    /// [`crate::moveset_build`].
-    moveset_build: Option<std::sync::Arc<std::sync::Mutex<Option<crate::moveset_build::Outcome>>>>,
     /// Connection the pin-sync check last ran for (plugin client id).
     pin_sync_client: Option<u64>,
     /// Set on new connection; when the settle window elapses, untracked game pins prompt.
@@ -5860,7 +5857,6 @@ impl VisionaryApp {
             current_eff_path: None,
             recent_effs: load_recent_effs(),
             export_build: None,
-            moveset_build: None,
             pin_sync_client: None,
             pin_sync_wait: None,
             pin_sync_prompt: None,
@@ -9702,107 +9698,6 @@ impl VisionaryApp {
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
     /// that script in place, and push editor edits back into it.
-    /// Config key for the deploy destination chosen for the linked project.
-    fn moveset_deploy_key(&self) -> Option<String> {
-        let root = self
-            .acmd_src
-            .as_ref()?
-            .root
-            .to_string_lossy()
-            .to_lowercase();
-        Some(format!("moveset_deploy_{:010x}", hash40::hash40(&root).0))
-    }
-
-    /// Everything a build plan needs, read off `self` so the plan itself — which reads source
-    /// files and scans deployed plugins — can run on a worker thread.
-    fn moveset_build_inputs(&self) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
-        let index = self.acmd_src.as_ref()?;
-        let remembered = self
-            .moveset_deploy_key()
-            .and_then(|key| load_config_path(&key));
-        Some((index.files.clone(), remembered))
-    }
-
-    fn moveset_build_plan(
-        files: &[PathBuf],
-        remembered: Option<&std::path::Path>,
-    ) -> anyhow::Result<crate::moveset_build::Plan> {
-        let sources: Vec<String> = files
-            .iter()
-            .filter_map(|file| std::fs::read_to_string(file).ok())
-            .collect();
-        crate::moveset_build::plan(
-            files,
-            &sources,
-            crate::scratch_dirs::emulator_sd_root().as_deref(),
-            remembered,
-        )
-    }
-
-    fn spawn_moveset_build(&mut self) {
-        let Some((files, remembered)) = self.moveset_build_inputs() else {
-            self.state.status = "Build & Deploy: no source project is linked".into();
-            return;
-        };
-        self.state.status = "Building the linked moveset…".into();
-        let state = std::sync::Arc::new(std::sync::Mutex::new(None));
-        self.moveset_build = Some(state.clone());
-        std::thread::spawn(move || {
-            let outcome = match Self::moveset_build_plan(&files, remembered.as_deref()) {
-                Ok(plan) => crate::moveset_build::run(&plan),
-                Err(error) => crate::moveset_build::Outcome {
-                    ok: false,
-                    message: error.to_string(),
-                    log: None,
-                },
-            };
-            if let Ok(mut slot) = state.lock() {
-                *slot = Some(outcome);
-            }
-        });
-    }
-
-    /// Report a finished build once, on the status line.
-    fn poll_moveset_build(&mut self) {
-        let Some(state) = self.moveset_build.as_ref() else {
-            return;
-        };
-        let finished = state.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(outcome) = finished {
-            let log = outcome
-                .log
-                .as_ref()
-                .map(|log| format!(" (full output: {})", log.display()))
-                .unwrap_or_default();
-            self.state.status = format!("Build & Deploy: {}{log}", outcome.message);
-            self.moveset_build = None;
-        }
-    }
-
-    fn choose_moveset_deploy_target(&mut self) {
-        let plan = self.moveset_build_inputs().and_then(|(files, remembered)| {
-            Self::moveset_build_plan(&files, remembered.as_deref()).ok()
-        });
-        let (Some(plan), Some(key)) = (plan, self.moveset_deploy_key()) else {
-            self.state.status = "Deploy to…: link the moveset's source project first".into();
-            return;
-        };
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Where should the built plugin go?")
-            .set_file_name(&plan.nro_name);
-        if let Some(sd) = crate::scratch_dirs::emulator_sd_root() {
-            dialog = dialog.set_directory(sd.join("ultimate").join("mods"));
-        }
-        if let Some(path) = dialog.save_file() {
-            save_config_path(&key, &path);
-            self.state.status = format!(
-                "Build & Deploy will also copy {} to {}",
-                plan.nro_name,
-                path.display()
-            );
-        }
-    }
-
     fn draw_acmd_source_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_acmd_src;
         let saved = self.window_geometry.get("acmd_source").copied();
@@ -9818,8 +9713,6 @@ impl VisionaryApp {
         // which the borrow of `self.acmd_src` for display rules out inside it.
         let mut open_moveset_sources = false;
         let mut rescan = false;
-        let mut build_plugin = false;
-        let mut choose_deploy = false;
         let mut unlink = false;
         let mut checkout: Option<&'static str> = None;
         let mut save = false;
@@ -9831,54 +9724,54 @@ impl VisionaryApp {
         let mut view = self.acmd_src_view;
         let generated = (view != SourceView::Source).then(|| self.generated_source_for_move());
 
-        let response =
-            window.show(ctx, |ui| {
-                // The linked project is a HEADER, not a gate. It used to return early when
-                // nothing was linked, when the fighter was not in the project, or when no script
-                // was open — which meant a live-captured move, the one case with no source file
-                // anywhere, showed an empty window instead of the code it would export.
-                //
-                // Two layers feed a move, and they are named apart here because they are easy to
-                // confuse: the base game (the dump vanilla fighters are read from) and the moveset
-                // source (the Rust project whose scripts replace vanilla's).
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Game dump").small().strong())
-                        .on_hover_text(
+        let response = window.show(ctx, |ui| {
+            // The linked project is a HEADER, not a gate. It used to return early when
+            // nothing was linked, when the fighter was not in the project, or when no script
+            // was open — which meant a live-captured move, the one case with no source file
+            // anywhere, showed an empty window instead of the code it would export.
+            //
+            // Two layers feed a move, and they are named apart here because they are easy to
+            // confuse: the base game (the dump vanilla fighters are read from) and the moveset
+            // source (the Rust project whose scripts replace vanilla's).
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Game dump").small().strong())
+                    .on_hover_text(
                         "The ArcExplorer game dump vanilla fighters, models and motions are read \
                      from (File → Sources…). Vanilla ACMD itself comes from the \
                      dumped-script mirror on GitHub.",
                     );
-                    match &self.state.data_root {
-                        Some(root) => ui.label(
-                            egui::RichText::new(root.display().to_string())
-                                .small()
-                                .monospace(),
-                        ),
-                        None => ui.label(
-                            egui::RichText::new("not set")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        ),
-                    };
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Moveset source").small().strong()).on_hover_text(
-                    "Your Rust moveset project. Every script it defines replaces vanilla's; \
+                match &self.state.data_root {
+                    Some(root) => ui.label(
+                        egui::RichText::new(root.display().to_string())
+                            .small()
+                            .monospace(),
+                    ),
+                    None => ui.label(
+                        egui::RichText::new("not set")
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    ),
+                };
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Moveset source").small().strong())
+                    .on_hover_text(
+                        "Your Rust moveset project. Every script it defines replaces vanilla's; \
                      vanilla fills in the rest.",
-                );
-                    match self.acmd_src.as_ref() {
-                        None => {
-                            let (text, color) = match &self.acmd_src_problem {
-                                Some(problem) => {
-                                    (problem.clone(), egui::Color32::from_rgb(220, 180, 90))
-                                }
-                                None => (
-                                    "not linked — moves show vanilla".to_string(),
-                                    egui::Color32::GRAY,
-                                ),
-                            };
-                            ui.label(egui::RichText::new(text).small().color(color));
-                            if ui
+                    );
+                match self.acmd_src.as_ref() {
+                    None => {
+                        let (text, color) = match &self.acmd_src_problem {
+                            Some(problem) => {
+                                (problem.clone(), egui::Color32::from_rgb(220, 180, 90))
+                            }
+                            None => (
+                                "not linked — moves show vanilla".to_string(),
+                                egui::Color32::GRAY,
+                            ),
+                        };
+                        ui.label(egui::RichText::new(text).small().color(color));
+                        if ui
                             .small_button("Link…")
                             .on_hover_text(
                                 "Pick any folder of the Rust project that builds your plugin: its \
@@ -9888,40 +9781,40 @@ impl VisionaryApp {
                         {
                             open_moveset_sources = true;
                         }
-                        }
-                        Some(index) => {
-                            ui.label(
-                                egui::RichText::new(index.root.display().to_string())
-                                    .small()
-                                    .monospace(),
-                            );
-                            let conflict_summary = if index.conflict_count() == 0 {
-                                String::new()
-                            } else {
-                                format!(" · {} ambiguous", index.conflict_count())
-                            };
-                            let mut agents: Vec<&str> = index
-                                .fighters
-                                .keys()
-                                .map(String::as_str)
-                                .filter(|name| !name.is_empty())
-                                .collect();
-                            agents.sort_unstable();
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "· {} usable scripts · {} agents{conflict_summary}",
-                                    index.script_count(),
-                                    index.fighters.len()
-                                ))
+                    }
+                    Some(index) => {
+                        ui.label(
+                            egui::RichText::new(index.root.display().to_string())
                                 .small()
-                                .color(egui::Color32::GRAY),
-                            )
-                            .on_hover_text(if agents.is_empty() {
-                                "No script is attributed to a named agent.".to_string()
-                            } else {
-                                format!("Scripts for: {}", agents.join(", "))
-                            });
-                            if ui
+                                .monospace(),
+                        );
+                        let conflict_summary = if index.conflict_count() == 0 {
+                            String::new()
+                        } else {
+                            format!(" · {} ambiguous", index.conflict_count())
+                        };
+                        let mut agents: Vec<&str> = index
+                            .fighters
+                            .keys()
+                            .map(String::as_str)
+                            .filter(|name| !name.is_empty())
+                            .collect();
+                        agents.sort_unstable();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "· {} usable scripts · {} agents{conflict_summary}",
+                                index.script_count(),
+                                index.fighters.len()
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        )
+                        .on_hover_text(if agents.is_empty() {
+                            "No script is attributed to a named agent.".to_string()
+                        } else {
+                            format!("Scripts for: {}", agents.join(", "))
+                        });
+                        if ui
                             .small_button("Rescan")
                             .on_hover_text(
                                 "Re-read the project from disk, picking up edits made elsewhere",
@@ -9930,254 +9823,222 @@ impl VisionaryApp {
                         {
                             rescan = true;
                         }
-                            let building = self
-                                .moveset_build
-                                .as_ref()
-                                .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
-                            if ui
-                            .add_enabled(!building, egui::Button::new(if building {
-                                "Building…"
-                            } else {
-                                "Build & Deploy"
-                            }).small())
-                            .on_hover_text(
-                                "Run `cargo skyline build --release` on this project and replace \
-                                 every deployed copy of its plugin on the emulator SD (and any \
-                                 destination chosen with Deploy to…). If the plugin exports \
-                                 `smashline_install`, it is also written as smashline's \
-                                 development.nro: press L + R + D-pad Up in the game's menus to \
-                                 reload it without restarting.",
-                            )
-                            .clicked()
-                        {
-                            build_plugin = true;
+                        if ui.small_button("Unlink").clicked() {
+                            unlink = true;
                         }
-                            if ui
-                            .small_button("Deploy to…")
-                            .on_hover_text(
-                                "Choose where this project's built plugin should be copied, for a \
-                                 mod folder Build & Deploy cannot find on its own",
-                            )
-                            .clicked()
-                        {
-                            choose_deploy = true;
-                        }
-                            if ui.small_button("Unlink").clicked() {
-                                unlink = true;
-                            }
-                        }
-                    }
-                });
-                ui.separator();
-
-                let selection = self
-                    .state
-                    .selected_fighter
-                    .and_then(|i| self.state.fighters.get(i))
-                    .zip(self.state.selected_move.as_ref())
-                    .map(|(f, m)| (f.name.clone(), m.name.clone()));
-                let Some((fighter, move_name)) = selection else {
-                    ui.label(
-                        egui::RichText::new("Select a fighter and a move to see its script.")
-                            .color(egui::Color32::GRAY),
-                    );
-                    return;
-                };
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
-                    if !self.state.acmd_source.is_none() {
-                        ui.label(
-                            egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                    if let Some(note) = &self.acmd_source_note {
-                        ui.label(
-                            egui::RichText::new(format!("— {note}"))
-                                .small()
-                                .color(egui::Color32::from_rgb(220, 180, 90)),
-                        );
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Show:");
-                    ui.selectable_value(&mut view, SourceView::Source, "Your source")
-                        .on_hover_text("The move's own code in your linked project");
-                    ui.selectable_value(&mut view, SourceView::Generated, "Generated")
-                        .on_hover_text(
-                            "The code Visionary would write into acmd_source/ if you exported \
-                         right now, from the move as it stands in the editor. Works for any \
-                         move the editor has loaded, including live captures.",
-                        );
-                    ui.selectable_value(&mut view, SourceView::Split, "Side by side");
-                });
-                ui.separator();
-
-                // The fighter's own row is open, but the moveset installs these scripts only on a
-                // slot character's costumes: say whose they are before anyone edits them as Falco's.
-                let gated_characters = self
-                    .state
-                    .selected_fighter
-                    .and_then(|i| self.state.fighters.get(i))
-                    .filter(|entry| entry.custom_name.is_none())
-                    .map(|entry| {
-                        self.script_owner_rows(&entry.name)
-                            .into_iter()
-                            .filter_map(|row| row.character)
-                            .collect::<Vec<_>>()
-                    })
-                    .filter(|characters| !characters.is_empty());
-                if let Some(characters) = gated_characters {
-                    let base = fighter_display_name(&fighter);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "This moveset installs {fighter}'s scripts only on {}'s costume slots \
-                         (set_costume); {base}'s own slots play the game's. Edits made here \
-                         change {}.",
-                            characters.join(", "),
-                            characters.join(", "),
-                        ))
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 190, 90)),
-                    );
-                }
-
-                // Everything that needs `&self` is resolved before the buffer is borrowed
-                // mutably below — closures capturing both would not borrow-check.
-                // Show the spelling the game runs (`game_attacks3` for `attack_s3_s`).
-                let script_move = crate::acmd::resolve_script_move_name(&fighter, &move_name);
-                let scripts: Vec<(&str, String, bool, bool, bool)> = [
-                    ("game", "Hitboxes"),
-                    ("effect", "Effects"),
-                    ("sound", "Sounds"),
-                    ("expression", "Expression"),
-                ]
-                .into_iter()
-                .map(|(prefix, label)| {
-                    let name = crate::acmd::acmd_script_name(prefix, &script_move);
-                    let present = self
-                        .acmd_src
-                        .as_ref()
-                        .is_some_and(|index| index.script(&fighter, &name).is_some());
-                    let ambiguous = self
-                        .acmd_src
-                        .as_ref()
-                        .is_some_and(|index| index.conflict(&fighter, &name).is_some());
-                    let showing = self
-                        .acmd_src_buffer
-                        .as_ref()
-                        .is_some_and(|b| b.script == name);
-                    (label, name, present, ambiguous, showing)
-                })
-                .collect();
-                let any_script = scripts.iter().any(|(_, _, present, _, _)| *present);
-                let any_ambiguous = scripts.iter().any(|(_, _, _, ambiguous, _)| *ambiguous);
-                let reason = match self.acmd_src.as_ref() {
-                    None => NoSource::NotLinked,
-                    Some(index) if !index.has_fighter(&fighter) => NoSource::FighterAbsent,
-                    Some(_) if !any_script && any_ambiguous => NoSource::Ambiguous,
-                    Some(_) if !any_script => NoSource::MoveAbsent,
-                    Some(_) => NoSource::NothingOpen,
-                };
-
-                if any_ambiguous {
-                    ui.label(
-                        egui::RichText::new(
-                            "One or more source functions are duplicated; those categories are \
-                         blocked until the project has one owner for each script.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 190, 90)),
-                    );
-                }
-
-                if view != SourceView::Generated {
-                    ui.horizontal_wrapped(|ui| {
-                        for (prefix, (label, name, present, ambiguous, showing)) in
-                            scripts.iter().enumerate()
-                        {
-                            if ui
-                                .add_enabled(
-                                    *present && !*showing,
-                                    egui::Button::new(format!("{label}  {name}")),
-                                )
-                                .on_hover_text(if *present {
-                                    format!("Open {name} from the project")
-                                } else if *ambiguous {
-                                    format!("{name} has more than one source owner")
-                                } else {
-                                    format!("{name} is not in the linked project")
-                                })
-                                .clicked()
-                            {
-                                checkout = Some(match prefix {
-                                    0 => "game",
-                                    1 => "effect",
-                                    2 => "sound",
-                                    _ => "expression",
-                                });
-                            }
-                        }
-                        if ui
-                            .add_enabled(
-                                any_script,
-                                egui::Button::new("Write edits into your source"),
-                            )
-                            .on_hover_text(
-                                "Write this move's edited hitbox and spawn VALUES back into your \
-                             source. The macros you called, your comments, and your formatting \
-                             are left exactly as written; anything that would need the code \
-                             restructured is reported instead of guessed at.",
-                            )
-                            .clicked()
-                        {
-                            sync = true;
-                        }
-                    });
-                }
-
-                if let Some((text, report)) = generated.as_ref() {
-                    draw_verification(ui, report, !text.is_empty());
-                }
-
-                let mut generated_text = generated.map(|(text, _)| text).unwrap_or_default();
-                let buffer = self.acmd_src_buffer.as_mut();
-                match view {
-                    SourceView::Source => draw_source_pane(
-                        ui,
-                        buffer,
-                        &fighter,
-                        &move_name,
-                        reason,
-                        &mut save,
-                        &mut revert,
-                    ),
-                    SourceView::Generated => draw_generated_pane(ui, &mut generated_text),
-                    SourceView::Split => {
-                        let (mut save_split, mut revert_split) = (false, false);
-                        ui.columns(2, |columns| {
-                            columns[0].label(egui::RichText::new("Your source").small().strong());
-                            draw_source_pane(
-                                &mut columns[0],
-                                buffer,
-                                &fighter,
-                                &move_name,
-                                reason,
-                                &mut save_split,
-                                &mut revert_split,
-                            );
-                            columns[1]
-                                .label(egui::RichText::new("Generated by export").small().strong());
-                            draw_generated_pane(&mut columns[1], &mut generated_text);
-                        });
-                        save |= save_split;
-                        revert |= revert_split;
                     }
                 }
             });
+            ui.separator();
+
+            let selection = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .zip(self.state.selected_move.as_ref())
+                .map(|(f, m)| (f.name.clone(), m.name.clone()));
+            let Some((fighter, move_name)) = selection else {
+                ui.label(
+                    egui::RichText::new("Select a fighter and a move to see its script.")
+                        .color(egui::Color32::GRAY),
+                );
+                return;
+            };
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
+                if !self.state.acmd_source.is_none() {
+                    ui.label(
+                        egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                if let Some(note) = &self.acmd_source_note {
+                    ui.label(
+                        egui::RichText::new(format!("— {note}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 180, 90)),
+                    );
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Show:");
+                ui.selectable_value(&mut view, SourceView::Source, "Your source")
+                    .on_hover_text("The move's own code in your linked project");
+                ui.selectable_value(&mut view, SourceView::Generated, "Generated")
+                    .on_hover_text(
+                        "The code Visionary would write into acmd_source/ if you exported \
+                         right now, from the move as it stands in the editor. Works for any \
+                         move the editor has loaded, including live captures.",
+                    );
+                ui.selectable_value(&mut view, SourceView::Split, "Side by side");
+            });
+            ui.separator();
+
+            // The fighter's own row is open, but the moveset installs these scripts only on a
+            // slot character's costumes: say whose they are before anyone edits them as Falco's.
+            let gated_characters = self
+                .state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i))
+                .filter(|entry| entry.custom_name.is_none())
+                .map(|entry| {
+                    self.script_owner_rows(&entry.name)
+                        .into_iter()
+                        .filter_map(|row| row.character)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|characters| !characters.is_empty());
+            if let Some(characters) = gated_characters {
+                let base = fighter_display_name(&fighter);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This moveset installs {fighter}'s scripts only on {}'s costume slots \
+                         (set_costume); {base}'s own slots play the game's. Edits made here \
+                         change {}.",
+                        characters.join(", "),
+                        characters.join(", "),
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 190, 90)),
+                );
+            }
+
+            // Everything that needs `&self` is resolved before the buffer is borrowed
+            // mutably below — closures capturing both would not borrow-check.
+            // Show the spelling the game runs (`game_attacks3` for `attack_s3_s`).
+            let script_move = crate::acmd::resolve_script_move_name(&fighter, &move_name);
+            let scripts: Vec<(&str, String, bool, bool, bool)> = [
+                ("game", "Hitboxes"),
+                ("effect", "Effects"),
+                ("sound", "Sounds"),
+                ("expression", "Expression"),
+            ]
+            .into_iter()
+            .map(|(prefix, label)| {
+                let name = crate::acmd::acmd_script_name(prefix, &script_move);
+                let present = self
+                    .acmd_src
+                    .as_ref()
+                    .is_some_and(|index| index.script(&fighter, &name).is_some());
+                let ambiguous = self
+                    .acmd_src
+                    .as_ref()
+                    .is_some_and(|index| index.conflict(&fighter, &name).is_some());
+                let showing = self
+                    .acmd_src_buffer
+                    .as_ref()
+                    .is_some_and(|b| b.script == name);
+                (label, name, present, ambiguous, showing)
+            })
+            .collect();
+            let any_script = scripts.iter().any(|(_, _, present, _, _)| *present);
+            let any_ambiguous = scripts.iter().any(|(_, _, _, ambiguous, _)| *ambiguous);
+            let reason = match self.acmd_src.as_ref() {
+                None => NoSource::NotLinked,
+                Some(index) if !index.has_fighter(&fighter) => NoSource::FighterAbsent,
+                Some(_) if !any_script && any_ambiguous => NoSource::Ambiguous,
+                Some(_) if !any_script => NoSource::MoveAbsent,
+                Some(_) => NoSource::NothingOpen,
+            };
+
+            if any_ambiguous {
+                ui.label(
+                    egui::RichText::new(
+                        "One or more source functions are duplicated; those categories are \
+                         blocked until the project has one owner for each script.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 190, 90)),
+                );
+            }
+
+            if view != SourceView::Generated {
+                ui.horizontal_wrapped(|ui| {
+                    for (prefix, (label, name, present, ambiguous, showing)) in
+                        scripts.iter().enumerate()
+                    {
+                        if ui
+                            .add_enabled(
+                                *present && !*showing,
+                                egui::Button::new(format!("{label}  {name}")),
+                            )
+                            .on_hover_text(if *present {
+                                format!("Open {name} from the project")
+                            } else if *ambiguous {
+                                format!("{name} has more than one source owner")
+                            } else {
+                                format!("{name} is not in the linked project")
+                            })
+                            .clicked()
+                        {
+                            checkout = Some(match prefix {
+                                0 => "game",
+                                1 => "effect",
+                                2 => "sound",
+                                _ => "expression",
+                            });
+                        }
+                    }
+                    if ui
+                        .add_enabled(
+                            any_script,
+                            egui::Button::new("Write edits into your source"),
+                        )
+                        .on_hover_text(
+                            "Write this move's edited hitbox and spawn VALUES back into your \
+                             source. The macros you called, your comments, and your formatting \
+                             are left exactly as written; anything that would need the code \
+                             restructured is reported instead of guessed at.",
+                        )
+                        .clicked()
+                    {
+                        sync = true;
+                    }
+                });
+            }
+
+            if let Some((text, report)) = generated.as_ref() {
+                draw_verification(ui, report, !text.is_empty());
+            }
+
+            let mut generated_text = generated.map(|(text, _)| text).unwrap_or_default();
+            let buffer = self.acmd_src_buffer.as_mut();
+            match view {
+                SourceView::Source => draw_source_pane(
+                    ui,
+                    buffer,
+                    &fighter,
+                    &move_name,
+                    reason,
+                    &mut save,
+                    &mut revert,
+                ),
+                SourceView::Generated => draw_generated_pane(ui, &mut generated_text),
+                SourceView::Split => {
+                    let (mut save_split, mut revert_split) = (false, false);
+                    ui.columns(2, |columns| {
+                        columns[0].label(egui::RichText::new("Your source").small().strong());
+                        draw_source_pane(
+                            &mut columns[0],
+                            buffer,
+                            &fighter,
+                            &move_name,
+                            reason,
+                            &mut save_split,
+                            &mut revert_split,
+                        );
+                        columns[1]
+                            .label(egui::RichText::new("Generated by export").small().strong());
+                        draw_generated_pane(&mut columns[1], &mut generated_text);
+                    });
+                    save |= save_split;
+                    revert |= revert_split;
+                }
+            }
+        });
 
         if let Some(response) = response {
             let rect = response.response.rect;
@@ -10197,13 +10058,6 @@ impl VisionaryApp {
         if open_moveset_sources {
             self.open_sources(SourceRow::MovesetCode);
         }
-        if build_plugin {
-            self.spawn_moveset_build();
-        }
-        if choose_deploy {
-            self.choose_moveset_deploy_target();
-        }
-        self.poll_moveset_build();
         if rescan {
             self.rescan_acmd_source();
         }

@@ -165,24 +165,6 @@ fn moveset_survey() {
             notes,
             raw_total
         );
-        if std::env::var_os("VISIONARY_SURVEY_PLAN").is_some() {
-            let sources: Vec<String> = index
-                .files
-                .iter()
-                .filter_map(|f| std::fs::read_to_string(f).ok())
-                .collect();
-            let sd = crate::scratch_dirs::emulator_sd_root();
-            match crate::moveset_build::plan(&index.files, &sources, sd.as_deref(), None) {
-                Ok(plan) => println!(
-                    "    PLAN crate={} nro={} targets={:?} dev_reload={}",
-                    plan.crate_dir.display(),
-                    plan.nro_name,
-                    plan.targets,
-                    plan.dev_reload.is_some()
-                ),
-                Err(e) => println!("    PLAN error: {e}"),
-            }
-        }
         for conflict in index.conflicts.iter().take(3) {
             println!("    CONFLICT {}", conflict.description());
         }
