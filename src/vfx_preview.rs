@@ -278,8 +278,9 @@ pub struct VfxPreview {
     target: wgpu::TextureFormat,
     depth: Option<wgpu::TextureFormat>,
     samples: u32,
-    /// What refraction shaders see behind them: the scene's backdrop, as stored in the scene.
-    backdrop: [u8; 4],
+    /// What refraction and floor-decal shaders read behind them: copies of the scene's colour
+    /// and depth taken before the effects draw.
+    scene: Option<(wgpu::TextureView, wgpu::TextureView)>,
     files: HashMap<PathBuf, Slot>,
     prepared: Vec<(Arc<EffectFile>, render::PreparedDraw)>,
     workers: Option<Workers>,
@@ -312,7 +313,7 @@ impl VfxPreview {
             target,
             depth,
             samples,
-            backdrop: [0, 0, 0, 255],
+            scene: None,
             files: HashMap::new(),
             prepared: Vec::new(),
             workers: None,
@@ -327,9 +328,9 @@ impl VfxPreview {
         }
     }
 
-    /// The scene's backdrop colour as stored in the scene (before post processing).
-    pub fn set_backdrop(&mut self, rgba: [u8; 4]) {
-        self.backdrop = rgba;
+    /// The scene copy the next prepare's draws read (see `eff_wgpu::scene::SceneCopy`).
+    pub fn set_scene(&mut self, scene: &eff_wgpu::scene::SceneCopy) {
+        self.scene = Some((scene.colour_view().clone(), scene.depth_view().clone()));
     }
 
     /// Whether the last prepare left out an effect that is still loading. The viewport should
@@ -630,8 +631,10 @@ impl VfxPreview {
                 &rated
             };
             file.renderer.set_view(queue, &camera);
-            // Refraction shaders read the frame behind them; the preview has only its backdrop.
-            file.renderer.set_background(queue, self.backdrop);
+            if let Some((colour, depth)) = &self.scene {
+                file.renderer
+                    .set_scene(Some(colour.clone()), Some(depth.clone()));
+            }
             let Some(placement) = placements.last().copied() else {
                 continue;
             };
@@ -1484,3 +1487,173 @@ mod tests {
         assert_eq!((steps.len(), kill), (10, Some(6)));
     }
 }
+
+    /// Kazuya's ground crack (Heaven's Impact) draws only where the scene's depth lies close
+    /// behind it. The preview handed it no depth, "nothing behind", and it drew nothing over
+    /// any floor. Drawn as the viewport draws it (floor, scene copy, effects), it shows on the
+    /// floor; with no scene copy handed over it still draws nothing.
+    #[test]
+    fn ground_cracks_draw_on_the_preview_floor() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        // wgpu's native requests are ready on their first polls.
+        fn ready<T>(f: impl std::future::Future<Output = T>) -> T {
+            let mut f = std::pin::pin!(f);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            loop {
+                if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                    return v;
+                }
+                std::thread::yield_now();
+            }
+        }
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = ready(instance.request_adapter(&Default::default())) else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let (device, queue) = ready(adapter.request_device(&Default::default())).unwrap();
+        let (format, depth_format, samples) = (
+            ssbh_wgpu::RGBA_COLOR_FORMAT,
+            ssbh_wgpu::DEPTH_FORMAT,
+            ssbh_wgpu::MSAA_SAMPLE_COUNT,
+        );
+        let size = 128u32;
+        let texture = |format, samples, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | usage,
+                view_formats: &[],
+            })
+        };
+        let eye = glam::Vec3::new(0.0, 40.0, 60.0);
+        let view = glam::camera::rh::view::look_at_mat4(eye, glam::Vec3::ZERO, glam::Vec3::Y);
+        let projection =
+            glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 1.0, 1000.0);
+        let draw = EffectDraw {
+            file: root.join("effect/fighter/demon/ef_demon.eff"),
+            name: "demon_heavens_impact".into(),
+            placements: vec![Mat4::IDENTITY; 10],
+            kill_at: None,
+            colour: [1.0; 4],
+            particle_colour: [1.0; 4],
+            ink: None,
+            // groundCrack2, the third part, alone: the set's flashes and rings draw anywhere.
+            solo: Some(2),
+            looping: None,
+            rate: 1.0,
+            spawn: 0,
+        };
+        let floor = crate::preview_floor::PreviewFloor::new(&device, format, depth_format, samples);
+        floor.update(&queue, projection * view, [0.0, 0.0, 0.0, 1.0]);
+        let mut copy = eff_wgpu::scene::SceneCopy::new(&device, format, samples);
+        copy.resize(&device, size, size);
+        // Lit pixels (any colour over the black floor) with and without the scene copy.
+        let lit = |hand_over_scene: bool| {
+            let mut vfx = VfxPreview::new(format, Some(depth_format), samples);
+            if hand_over_scene {
+                vfx.set_scene(&copy);
+            }
+            for _ in 0..400 {
+                vfx.prepare(
+                    &device,
+                    &queue,
+                    view,
+                    projection,
+                    eye.into(),
+                    1.0,
+                    1000.0,
+                    std::slice::from_ref(&draw),
+                );
+                if !vfx.waiting() && !vfx.prepared.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            assert!(!vfx.prepared.is_empty(), "the effect never prepared");
+            let colour = texture(format, samples, wgpu::TextureUsages::empty());
+            let resolve = texture(format, 1, wgpu::TextureUsages::COPY_SRC);
+            let depth = texture(depth_format, samples, wgpu::TextureUsages::empty());
+            let views = [&colour, &resolve, &depth].map(|t| t.create_view(&Default::default()));
+            let scene = ssbh_wgpu::SceneTarget {
+                color: &views[0],
+                resolve: &views[1],
+                depth: &views[2],
+                sample_count: samples,
+                format,
+            };
+            let mut encoder = device.create_command_encoder(&Default::default());
+            // The models' pass leaves the depth cleared to "far" where it drew nothing.
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: scene.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            {
+                let mut pass = crate::renderer::scene_pass(&mut encoder, &scene, "floor");
+                floor.draw(&mut pass);
+            }
+            copy.copy(&device, &mut encoder, scene.resolve, scene.depth);
+            vfx.paint(&mut crate::renderer::scene_pass(
+                &mut encoder,
+                &scene,
+                "effects",
+            ));
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (size * size * 8) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                resolve.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(size * 8),
+                        rows_per_image: None,
+                    },
+                },
+                resolve.size(),
+            );
+            queue.submit([encoder.finish()]);
+            buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let bytes = buffer.slice(..).get_mapped_range().unwrap().to_vec();
+            // Red, green and blue as half floats: any above zero is lit.
+            bytes
+                .chunks_exact(8)
+                .filter(|p| {
+                    p[..6]
+                        .chunks_exact(2)
+                        .any(|h| h[1] & 0x7f != 0 || h[0] != 0)
+                })
+                .count()
+        };
+        let with_copy = lit(true);
+        let without = lit(false);
+        eprintln!("crack pixels: with the scene copy {with_copy}, without {without}");
+        assert!(with_copy > 300, "the crack covers only {with_copy} pixels");
+        assert_eq!(without, 0);
+    }

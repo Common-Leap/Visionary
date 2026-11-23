@@ -123,6 +123,8 @@ pub struct HitboxRenderState {
     object_dirs: Vec<std::path::PathBuf>,
     /// Effects drawn with the game's shaders, after the models.
     pub vfx: crate::vfx_preview::VfxPreview,
+    /// The scene's colour and depth as the effects find it, for refraction and floor decals.
+    scene_copy: eff_wgpu::scene::SceneCopy,
     /// Weapon swing trails.
     trails: crate::preview_trail::PreviewTrails,
     /// The data folder and stage (`None`: no stage, training lighting) the preview shows.
@@ -209,16 +211,16 @@ impl HitboxRenderState {
             last_default_anim_path: None,
             last_skel_path: None,
             object_dirs: Vec::new(),
-            vfx: {
-                let mut vfx = crate::vfx_preview::VfxPreview::new(
-                    ssbh_wgpu::RGBA_COLOR_FORMAT,
-                    Some(ssbh_wgpu::DEPTH_FORMAT),
-                    ssbh_wgpu::MSAA_SAMPLE_COUNT,
-                );
-                let [r, g, b] = scene_backdrop.map(|c| (c * 255.0).round() as u8);
-                vfx.set_backdrop([r, g, b, 255]);
-                vfx
-            },
+            vfx: crate::vfx_preview::VfxPreview::new(
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                Some(ssbh_wgpu::DEPTH_FORMAT),
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
+            scene_copy: eff_wgpu::scene::SceneCopy::new(
+                device,
+                ssbh_wgpu::RGBA_COLOR_FORMAT,
+                ssbh_wgpu::MSAA_SAMPLE_COUNT,
+            ),
             stage_root: None,
             stage_models: Vec::new(),
             stage_parts: Vec::new(),
@@ -256,6 +258,7 @@ impl HitboxRenderState {
         }
         self.renderer.resize(device, queue, width, height, 1.0);
         self.target.resize(device, width, height);
+        self.scene_copy.resize(device, width, height);
         self.current_width = width;
         self.current_height = height;
     }
@@ -1170,6 +1173,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             let timing = std::env::var_os("VFX_TIMING")
                 .is_some()
                 .then(std::time::Instant::now);
+            state.vfx.set_scene(&state.scene_copy);
             state.vfx.prepare(
                 device,
                 queue,
@@ -1196,12 +1200,14 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 eprintln!("[vfx] effect preview skipped a shader: {failure}");
             }
             // Always re-render (camera may have changed, or egui needs a fresh frame). Effects
-            // draw into the scene right after the models, with the models' depth, so bloom and
-            // colour grading treat them as the game's post pass does.
+            // draw into the scene right after the models and the floor, with their depth, so
+            // bloom and colour grading treat them as the game's post pass does. Before they
+            // draw, the scene is copied for the shaders that read what is behind them.
             state
                 .trails
                 .prepare(device, queue, t.mvp_matrix, &self.trails);
             let vfx = &state.vfx;
+            let scene_copy = &state.scene_copy;
             let trails = &state.trails;
             let floor = (self.floor && !state.shows_stage()).then_some(&state.floor);
             if let Some(floor) = floor {
@@ -1217,30 +1223,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.shared_data.database(),
                 &state.model_render_options,
                 &mut |encoder, scene| {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("viewport effects"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: scene.color,
-                            resolve_target: Some(scene.resolve),
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                            view: scene.depth,
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }),
-                        ..Default::default()
-                    });
                     if let Some(floor) = floor {
-                        floor.draw(&mut pass);
+                        floor.draw(&mut scene_pass(encoder, &scene, "viewport floor"));
                     }
+                    scene_copy.copy(device, encoder, scene.resolve, scene.depth);
+                    let mut pass = scene_pass(encoder, &scene, "viewport effects");
                     vfx.paint(&mut pass);
                     trails.draw(&mut pass);
                 },
@@ -1289,6 +1276,35 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }
     }
+}
+
+/// A pass that draws on into the scene the models left, colour and depth.
+pub(crate) fn scene_pass<'e>(
+    encoder: &'e mut wgpu::CommandEncoder,
+    scene: &ssbh_wgpu::SceneTarget<'_>,
+    label: &'static str,
+) -> wgpu::RenderPass<'e> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: scene.color,
+            resolve_target: Some(scene.resolve),
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: scene.depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        ..Default::default()
+    })
 }
 
 /// One stage model folder read off the GUI thread, with the animation that places it.
