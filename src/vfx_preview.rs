@@ -974,15 +974,20 @@ fn load_file(
 /// without) for a set at `placement` (`rt` without scale). A child draws on its own matrix,
 /// its parent's times its own (Smash 0x8090), not its parent's: Sephiroth's Scintilla wall is
 /// seven child rows of hexagons placed by their own translations, and on the parent's matrix
-/// all seven drew on one line.
+/// all seven drew on one line. Children marked to draw first (res+0x7e1) draw before their
+/// parent and the rest after it, as EmitterSet::Draw orders them (Smash 0x48e0).
 fn draw_parts<'a>(
     emitter: &'a Emitter,
     s: &'a sim::EmitterSim<'a>,
     placement: &Mat4,
     rt: &Mat4,
 ) -> Vec<(&'a Emitter, &'a sim::EmitterSim<'a>, (Mat4, Mat4))> {
-    std::iter::once((emitter, s))
-        .chain(emitter.children.iter().zip(s.children()))
+    let children = || emitter.children.iter().zip(s.children());
+    let first = |e: &Emitter| e.fixed.get(0x7e1) == Some(&1);
+    children()
+        .filter(|(e, _)| first(e))
+        .chain(std::iter::once((emitter, s)))
+        .chain(children().filter(|(e, _)| !first(e)))
         .map(|(e, s)| (e, s, (s.emitter_srt(placement), s.emitter_rt(rt))))
         .collect()
 }
@@ -1175,6 +1180,92 @@ mod tests {
             })
             .expect("a set with only timed parts");
         assert_eq!(effect_loop(&sets[timed]).kill, None);
+    }
+
+    /// The tester's case: Bayonetta's Witch Time clock hand (clock1) and the trail it leaves
+    /// (trace1, a child whose own scale is 1). Scale ticked on trace1 makes the trail the
+    /// hand's size (5.4 by 30.3 by 5.4); unticked it is its own size; the scale rate
+    /// multiplies. Pre-draw puts the trail's draw before the hand's. Each edit goes the way
+    /// the preview takes it: the editor's rebuild, then the preview's loader.
+    #[test]
+    fn a_ticked_inherit_row_changes_what_the_preview_draws() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("effect/fighter/bayonetta/ef_bayonetta.eff")).unwrap();
+        let find = |file: &effect_library::NamcoEffectFile| {
+            crate::effects::entry_set_handles(file)
+                .into_iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("bayonetta_witchtime_clock"))
+                .map(|(_, set)| set as usize)
+                .unwrap()
+        };
+        let set = find(&effect_library::NamcoEffectFile::load(&bytes).unwrap());
+        let run = |edits: &[(&str, crate::eff_attrs::AttrValue)]| {
+            let edit = crate::mod_project::AuthoredEdit {
+                set_name: effect_library::NamcoEffectFile::load(&bytes)
+                    .unwrap()
+                    .ptcl_file
+                    .as_ref()
+                    .unwrap()
+                    .emitter_list
+                    .emitter_sets[set]
+                    .name
+                    .clone(),
+                entry_name: String::new(),
+                set_idx: set,
+                emitter_name: "trace1".into(),
+                emitter_idx: 1,
+                fields: crate::mod_project::EmitterFieldEdits {
+                    attrs: edits.iter().map(|(id, v)| (id.to_string(), *v)).collect(),
+                    ..Default::default()
+                },
+            };
+            let eff = crate::mod_project::EffMod {
+                source_rel: "effect/fighter/bayonetta/ef_bayonetta.eff".into(),
+                authored: vec![edit],
+                ..Default::default()
+            };
+            let rebuilt = crate::eff_export::rebuild_eff_bytes(&bytes, &eff, None).unwrap();
+            let file = effect_library::NamcoEffectFile::load(&rebuilt).unwrap();
+            let set = find(&file);
+            let emitters = set_emitters(file.ptcl_file.as_ref().unwrap());
+            let clock = &emitters[set][0];
+            assert_eq!(clock.children[0].data.name.as_deref(), Some("trace1"));
+            let seeds = set_seeds(&emitters[set], 0);
+            let mut s = emitter_sim(clock, &seeds[0]);
+            for _ in 0..8 {
+                s.step();
+            }
+            let trail = s.children()[0].streams()["sysScaleAttr"][0];
+            let order: Vec<String> = draw_parts(clock, &s, &Mat4::IDENTITY, &Mat4::IDENTITY)
+                .iter()
+                .map(|(e, ..)| e.data.name.clone().unwrap_or_default())
+                .collect();
+            (trail, order)
+        };
+        use crate::eff_attrs::AttrValue;
+        let hand = [5.4, 30.28696, 5.4];
+        let close = |scale: [f32; 4], by: f32| {
+            (0..3).all(|axis| (scale[axis] - hand[axis] * by).abs() < 1e-3)
+        };
+        // The game's own file: Scale on, Pre-draw on.
+        let (scale, order) = run(&[]);
+        assert!(close(scale, 1.0), "{scale:?}");
+        assert_eq!(order, ["trace1", "clock1"]);
+        // Unticked: its own size.
+        let (scale, _) = run(&[("child_inheritance.scale", AttrValue::Int(0))]);
+        assert_eq!(scale[..3], [1.0; 3]);
+        // Ticked again with half the rate, and Pre-draw off.
+        let (scale, order) = run(&[
+            ("child_inheritance.scale", AttrValue::Int(1)),
+            ("child_inheritance.scale_rate", AttrValue::Float(0.5)),
+            ("child_inheritance.pre_draw", AttrValue::Int(0)),
+        ]);
+        assert!(close(scale, 0.5), "{scale:?}");
+        assert_eq!(order, ["clock1", "trace1"]);
     }
 
     /// Sephiroth's charge sparks (edge_fire2_hold sparks4) trail red and gold dots from two

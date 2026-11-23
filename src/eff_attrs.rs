@@ -2488,21 +2488,21 @@ fn render_and_combiner() -> Vec<Attr> {
 
 fn inheritance_and_shader() -> Vec<Attr> {
     vec![
-        fg!(G_INHERIT, "child_inheritance.velocity", "Velocity", "Inherited speed", child_inheritance.velocity),
-        fg!(G_INHERIT, "child_inheritance.scale", "Scale", "Inherited scale", child_inheritance.scale),
-        fg!(G_INHERIT, "child_inheritance.rotate", "Rotation", "Inherited rotation", child_inheritance.rotate),
-        fg!(G_INHERIT, "child_inheritance.color_scale", "Colour scale", "Inherited colour scale", child_inheritance.color_scale),
-        fg!(G_INHERIT, "child_inheritance.color0", "Colour 0", "Inherited colour 0", child_inheritance.color0),
-        fg!(G_INHERIT, "child_inheritance.color1", "Colour 1", "Inherited colour 1", child_inheritance.color1),
-        fg!(G_INHERIT, "child_inheritance.alpha0", "Alpha 0", "Inherited alpha 0", child_inheritance.alpha0),
-        fg!(G_INHERIT, "child_inheritance.alpha1", "Alpha 1", "Inherited alpha 1", child_inheritance.alpha1),
-        fg!(G_INHERIT, "child_inheritance.draw_path", "Draw path", "Inherited draw path", child_inheritance.draw_path),
-        fg!(G_INHERIT, "child_inheritance.pre_draw", "Pre-draw", "Draw before the inherited class", child_inheritance.pre_draw),
-        fg!(G_INHERIT, "child_inheritance.alpha0_each_frame", "Alpha 0 each frame", "Whether to inherit alpha0 every frame", child_inheritance.alpha0_each_frame),
-        fg!(G_INHERIT, "child_inheritance.alpha1_each_frame", "Alpha 1 each frame", "Whether to inherit alpha1 every frame", child_inheritance.alpha1_each_frame),
-        fg!(G_INHERIT, "child_inheritance.enable_emitter_particle", "Emitter per particle", "Whether to generate an emitter for each particle", child_inheritance.enable_emitter_particle),
-        fl!(G_INHERIT, "child_inheritance.velocity_rate", "Velocity rate", "Inherited velocity ratio", 0.01, child_inheritance.velocity_rate),
-        fl!(G_INHERIT, "child_inheritance.scale_rate", "Scale rate", "Inherited scale ratio", 0.01, child_inheritance.scale_rate),
+        fg!(G_INHERIT, "child_inheritance.velocity", "Velocity", "New particles add their parent particle's speed, times Velocity rate", child_inheritance.velocity),
+        fg!(G_INHERIT, "child_inheritance.scale", "Scale", "New particles start at their parent particle's size at that moment, times Scale rate", child_inheritance.scale),
+        fg!(G_INHERIT, "child_inheritance.rotate", "Rotation", "New particles start at their parent particle's angle at that moment", child_inheritance.rotate),
+        fg!(G_INHERIT, "child_inheritance.color_scale", "Colour scale", "Kept in the file; the game does not read it", child_inheritance.color_scale),
+        fg!(G_INHERIT, "child_inheritance.color0", "Colour 0", "New particles take their parent particle's colour 0 at that moment", child_inheritance.color0),
+        fg!(G_INHERIT, "child_inheritance.color1", "Colour 1", "New particles take their parent particle's colour 1 at that moment", child_inheritance.color1),
+        fg!(G_INHERIT, "child_inheritance.alpha0", "Alpha 0", "New particles take their parent particle's opacity 0 at that moment", child_inheritance.alpha0),
+        fg!(G_INHERIT, "child_inheritance.alpha1", "Alpha 1", "New particles take their parent particle's opacity 1 at that moment", child_inheritance.alpha1),
+        fg!(G_INHERIT, "child_inheritance.draw_path", "Draw path", "Kept in the file; the game does not read it", child_inheritance.draw_path),
+        fg!(G_INHERIT, "child_inheritance.pre_draw", "Pre-draw", "Drawn before its parent part, so the parent draws over it", child_inheritance.pre_draw),
+        fg!(G_INHERIT, "child_inheritance.alpha0_each_frame", "Alpha 0 each frame", "With Alpha 0 on: every frame, opacity 0 is multiplied by the parent part's, and this part fades out with its parent", child_inheritance.alpha0_each_frame),
+        fg!(G_INHERIT, "child_inheritance.alpha1_each_frame", "Alpha 1 each frame", "With Alpha 1 on: every frame, opacity 1 is multiplied by the parent part's, and this part fades out with its parent", child_inheritance.alpha1_each_frame),
+        fg!(G_INHERIT, "child_inheritance.enable_emitter_particle", "Emitter per particle", "Each parent particle gets its own copy of this part, which moves with that particle", child_inheritance.enable_emitter_particle),
+        fl!(G_INHERIT, "child_inheritance.velocity_rate", "Velocity rate", "How much of the parent particle's speed is taken: 1 all of it, 0 none", 0.01, child_inheritance.velocity_rate),
+        fl!(G_INHERIT, "child_inheritance.scale_rate", "Scale rate", "How much of the parent particle's size is taken: 1 all of it", 0.01, child_inheritance.scale_rate),
         it!(G_SHADER, "action.action_index", "Custom action index", "Selected custom action index", action.action_index),
         it!(G_SHADER, "shader_references.type_", "Shader type", "The kind of shader that draws the part", shader_references.type_),
         it!(G_SHADER, "shader_references.shader_index", "Shader index", "Shader index to use. Pointing this outside the variations this eff ships is what makes a file fail to load.", shader_references.shader_index),
@@ -3258,6 +3258,49 @@ mod tests {
                 "writing '{}' also changed {spilled:?}",
                 attr.id
             );
+        }
+    }
+
+    /// Each "What child parts inherit" row lands on the byte the game reads it from: Smash
+    /// 0x9ab0 reads res+0x7d8..0x7df, +0x7e8 and +0x7ec; 0x9770 reads +0x7e2/0x7e3; 0x8d70
+    /// reads +0x7e4; the draw code reads +0x7e1. The preview's simulation reads the same bytes.
+    #[test]
+    fn inherit_rows_land_where_the_game_reads_them() {
+        let flags = [
+            ("child_inheritance.velocity", 0x7d8),
+            ("child_inheritance.scale", 0x7d9),
+            ("child_inheritance.rotate", 0x7da),
+            ("child_inheritance.color_scale", 0x7db),
+            ("child_inheritance.color0", 0x7dc),
+            ("child_inheritance.color1", 0x7dd),
+            ("child_inheritance.alpha0", 0x7de),
+            ("child_inheritance.alpha1", 0x7df),
+            ("child_inheritance.draw_path", 0x7e0),
+            ("child_inheritance.pre_draw", 0x7e1),
+            ("child_inheritance.alpha0_each_frame", 0x7e2),
+            ("child_inheritance.alpha1_each_frame", 0x7e3),
+            ("child_inheritance.enable_emitter_particle", 0x7e4),
+        ];
+        let base = blank_emitter_data(SSBU_VFX_VERSION);
+        let before = base.write(SSBU_VFX_VERSION).unwrap();
+        for (id, at) in flags {
+            let mut data = base.clone();
+            assert!(write(&mut data, id, AttrValue::Int(1)), "{id}");
+            let after = data.write(SSBU_VFX_VERSION).unwrap();
+            let changed: Vec<usize> = (0..after.len())
+                .filter(|&i| after[i] != before[i])
+                .collect();
+            assert_eq!(changed, vec![at], "{id}");
+            assert_eq!(after[at], 1, "{id}");
+        }
+        for (id, at) in [
+            ("child_inheritance.velocity_rate", 0x7e8),
+            ("child_inheritance.scale_rate", 0x7ec),
+        ] {
+            let mut data = base.clone();
+            assert!(write(&mut data, id, AttrValue::Float(0.75)), "{id}");
+            let after = data.write(SSBU_VFX_VERSION).unwrap();
+            assert_eq!(after[at..at + 4], 0.75f32.to_le_bytes(), "{id}");
         }
     }
 
