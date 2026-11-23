@@ -11216,14 +11216,14 @@ impl VisionaryApp {
         });
     }
 
-    /// Close the "Add fighter…" popup and forget its search. It belongs to one project, so
+    /// Close the "Add fighter" popup and forget its search. It belongs to one project, so
     /// leaving or switching the project closes it.
     fn close_add_fighter_popup(&mut self) {
         self.add_fighter_popup = None;
         self.add_fighter_search.clear();
     }
 
-    /// The "Add fighter…" popup: a search field over the fighters not yet in the project.
+    /// The "Add fighter" popup: a search field over the fighters not yet in the project.
     /// Clicking one adds it and the list keeps going, so several can be added in a row; closing
     /// the window skips the rest. New Project opens it with a title that asks the question.
     fn draw_add_fighter_popup(&mut self, ctx: &egui::Context) {
@@ -11462,12 +11462,10 @@ impl VisionaryApp {
                             }
                             if n == 0 {
                                 if group.is_empty() && !fighter_searching {
-                                    ui.weak(
-                                        "No fighters yet — use Add fighter… or right-click one below.",
-                                    );
+                                    ui.weak("No fighters");
                                 }
                                 if ui
-                                    .small_button("Add fighter…")
+                                    .small_button("Add fighter")
                                     .on_hover_text("Pick fighters that belong to this project")
                                     .clicked()
                                 {
@@ -27992,7 +27990,7 @@ impl VisionaryApp {
             return;
         }
 
-        // An "Add fighter…" popup left open adds to whichever project is open: close it.
+        // An "Add fighter" popup left open adds to whichever project is open: close it.
         self.close_add_fighter_popup();
         let stored_move_graphs = project
             .fighters
