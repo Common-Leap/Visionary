@@ -1131,6 +1131,7 @@ impl<'ast> syn::visit::Visit<'ast> for BindingFinder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn run(src: &str) -> (Vec<CloneDecl>, Vec<UnresolvedClone>) {
         run_many(&[("lib.rs", src)])
@@ -1662,7 +1663,7 @@ pub fn make(name: &str) {
         // Local `make` was never called, so it stays reported as an unfollowed helper rather than
         // being silently inlined in place of `other::make`.
         assert!(
-            u.iter().any(|x| x.file == PathBuf::from("a.rs")),
+            u.iter().any(|x| x.file.as_path() == Path::new("a.rs")),
             "uncalled local helper should be reported: {u:?}"
         );
     }
@@ -1687,7 +1688,7 @@ pub fn reg_c() { make("ambig_ball"); }
         let (d, u) = run_many(&[("a.rs", a), ("b.rs", b), ("c.rs", c)]);
         assert_eq!(d.len(), 2, "{d:#?}");
         assert!(
-            u.iter().any(|x| x.file == PathBuf::from("c.rs") && x.reason.contains("ambiguous")),
+            u.iter().any(|x| x.file.as_path() == Path::new("c.rs") && x.reason.contains("ambiguous")),
             "ambiguous call in c.rs must be reported even when both helpers were inlined elsewhere: {u:?}"
         );
     }

@@ -162,7 +162,7 @@ pub fn param_config_scale<'a>(sources: impl IntoIterator<Item = &'a str>) -> Opt
             let Some(value) = tuple
                 .split(',')
                 .filter_map(|part| part.trim().trim_end_matches("f32").parse::<f32>().ok())
-                .last()
+                .next_back()
             else {
                 continue;
             };
@@ -424,7 +424,7 @@ impl<'a> Walker<'a> {
             syn::Expr::Block(block) => self.walk_block(file, &block.block, env, depth),
             syn::Expr::Unsafe(block) => self.walk_block(file, &block.block, env, depth),
             syn::Expr::Paren(paren) => self.walk_expr(file, &paren.expr, env, depth),
-            syn::Expr::If(expr_if) => match self.condition(&expr_if.cond, env) {
+            syn::Expr::If(expr_if) => match Self::condition(&expr_if.cond) {
                 Some(false) => match &expr_if.else_branch {
                     Some((_, other)) => self.walk_expr(file, other, env, depth),
                     None => Flow::Next,
@@ -566,26 +566,26 @@ impl<'a> Walker<'a> {
     }
 
     /// Whether `cond` holds during an ordinary move; `None` when this reader can't tell.
-    fn condition(&self, cond: &syn::Expr, env: &Env) -> Option<bool> {
+    fn condition(cond: &syn::Expr) -> Option<bool> {
         match cond {
-            syn::Expr::Paren(paren) => self.condition(&paren.expr, env),
+            syn::Expr::Paren(paren) => Self::condition(&paren.expr),
             syn::Expr::Unary(syn::ExprUnary {
                 op: syn::UnOp::Not(_),
                 expr,
                 ..
-            }) => self.condition(expr, env).map(|v| !v),
+            }) => Self::condition(expr).map(|v| !v),
             syn::Expr::Binary(binary) => match binary.op {
                 syn::BinOp::And(_) => match (
-                    self.condition(&binary.left, env),
-                    self.condition(&binary.right, env),
+                    Self::condition(&binary.left),
+                    Self::condition(&binary.right),
                 ) {
                     (Some(false), _) | (_, Some(false)) => Some(false),
                     (Some(true), Some(true)) => Some(true),
                     _ => None,
                 },
                 syn::BinOp::Or(_) => match (
-                    self.condition(&binary.left, env),
-                    self.condition(&binary.right, env),
+                    Self::condition(&binary.left),
+                    Self::condition(&binary.right),
                 ) {
                     (Some(true), _) | (_, Some(true)) => Some(true),
                     (Some(false), Some(false)) => Some(false),

@@ -1449,6 +1449,7 @@ impl SourceIndex {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_file(
         &mut self,
         file: &Path,
@@ -1933,11 +1934,9 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
                     s => dir = dir.join(s),
                 }
             }
-            if ok && dir != module_dir {
-                if dir.is_dir() || dir.with_extension("rs").is_file() {
-                    routes.push((dir.with_extension("rs"), fighter.clone()));
-                    routes.push((dir, fighter));
-                }
+            if ok && dir != module_dir && (dir.is_dir() || dir.with_extension("rs").is_file()) {
+                routes.push((dir.with_extension("rs"), fighter.clone()));
+                routes.push((dir, fighter));
             }
         }
         i = close + 1;
@@ -5677,7 +5676,8 @@ pub fn rewrite_effect_calls(
             .map(|&index| {
                 let ordinal = *ordinals.get(index)?;
                 let spawn = sites.get(ordinal)?;
-                let mut calls = vec![map(spawn.span.start)..map(spawn.span.end)];
+                let call = map(spawn.span.start)..map(spawn.span.end);
+                let mut calls = vec![call];
                 if let Some(modifiers) = modifier_sites.get(ordinal) {
                     let mut extra: Vec<&MacroSite> = [
                         &modifiers.rate,

@@ -720,7 +720,7 @@ struct ArticleCache {
 
 /// What the background object reader sends back.
 enum ArticleJobResult {
-    Cache(ArticleCache),
+    Cache(Box<ArticleCache>),
     Dump(HashMap<String, Vec<String>>, Option<String>),
     /// The read stopped (it panicked); the reason is shown instead of retrying every frame.
     Failed(String),
@@ -999,7 +999,7 @@ mod own_param_files_tests {
         put(&moveset.join("romfs/fighter/samus/param/vl.prc"));
         let shared = [dump.clone(), library.clone()];
         assert!(own_param_files("samus", &[under_dump], &shared).is_empty());
-        assert!(own_param_files("samus", &[library.clone()], &shared).is_empty());
+        assert!(own_param_files("samus", std::slice::from_ref(&library), &shared).is_empty());
         let own = moveset.join("romfs");
         // The same root named twice (another spelling of it) gives the file once.
         let again = moveset.join(".").join("romfs");
@@ -5308,6 +5308,7 @@ pub struct VisionaryApp {
     eff_mods: HashMap<String, crate::mod_project::EffMod>,
     /// Entry names read from each `.eff` file, keyed by path and checked against its modified
     /// time. See [`VisionaryApp::fighter_effect_names`].
+    #[allow(clippy::type_complexity)]
     eff_name_cache:
         std::cell::RefCell<HashMap<PathBuf, (Option<std::time::SystemTime>, Vec<String>)>>,
     /// The fighter's effect file rebuilt with the project's effect edits, for the 3D preview.
@@ -21947,7 +21948,7 @@ impl VisionaryApp {
                     Ok(ArticleJobResult::Cache(cache)) => {
                         if cache.fighter == fighter {
                             self.invalidate_object_kinds(&cache.fighter);
-                            self.article_catalog = Some(cache);
+                            self.article_catalog = Some(*cache);
                             self.article_catalog_generation = job_generation;
                         }
                     }
@@ -22138,7 +22139,7 @@ impl VisionaryApp {
                 .filter(|a| !matches!(a.origin, crate::articles::ArticleOrigin::Clone(_)))
                 .map(|a| (a.owner.clone(), a.agent.clone()))
                 .collect();
-            let _ = tx.send(ArticleJobResult::Cache(ArticleCache {
+            let _ = tx.send(ArticleJobResult::Cache(Box::new(ArticleCache {
                 fighter,
                 fingerprint,
                 catalog,
@@ -22149,7 +22150,7 @@ impl VisionaryApp {
                 unread_overrides,
                 dump_scripts: HashMap::new(),
                 dump_note: None,
-            }));
+            })));
             ctx.request_repaint();
             // The game's own scripts per object, from the script dump (cached after the first
             // listing). An object the dump has no folder for simply has none.
@@ -44971,7 +44972,7 @@ fn save_helper_bones(enabled: bool) {
 fn load_helper_bones() -> bool {
     config_path("editor_viewport_helper_bones")
         .and_then(|dest| std::fs::read_to_string(dest).ok())
-        .map_or(true, |body| parse_viewport_flag(&body))
+        .is_none_or(|body| parse_viewport_flag(&body))
 }
 
 fn encode_viewport_flag(visible: bool) -> String {
@@ -53838,7 +53839,8 @@ mod live_effect_capture_tests {
     #[test]
     fn an_unchanged_grab_end_sends_no_clear_rules() {
         let grab = grab_spanning(7, 8);
-        let (rules, _) = VisionaryApp::grab_clear_rules(0x1234, &[grab.clone()], &[grab]);
+        let grabs = std::slice::from_ref(&grab);
+        let (rules, _) = VisionaryApp::grab_clear_rules(0x1234, grabs, grabs);
         assert!(rules.is_empty(), "{rules:?}");
     }
 

@@ -2548,6 +2548,7 @@ struct MissingPart {
 ///
 /// Every source is resolved before any roster is applied, so a part copied from an effect whose
 /// own list is also being edited is the file's part, as the editor showed it.
+#[allow(clippy::type_complexity)]
 fn graft_foreign_parts(
     namco: &mut effect_library::NamcoEffectFile,
     own_rel: &str,

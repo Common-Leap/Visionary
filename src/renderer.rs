@@ -1021,7 +1021,7 @@ fn exact_visibility_tracks(anim: &mut ssbh_data::anim_data::AnimData, meshes: &[
             let overreaches = meshes.iter().any(|mesh| {
                 mesh.starts_with(&node.name) && !mesh.starts_with(&exact) && *mesh != node.name
             });
-            let named_bare = meshes.iter().any(|mesh| *mesh == node.name);
+            let named_bare = meshes.contains(&node.name);
             if has_exact && overreaches && !named_bare {
                 node.name = exact;
             }

@@ -250,7 +250,7 @@ impl ProjectConsts {
                 continue;
             }
             let replacement = match cast {
-                Some(ty) if matches!(ty, "f32" | "f64") => float_text(&def.value),
+                Some("f32" | "f64") => float_text(&def.value),
                 Some(_) => integer_text(&def.value),
                 None => strip_suffix(&def.value).to_string(),
             };

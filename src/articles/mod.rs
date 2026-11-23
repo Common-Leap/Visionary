@@ -19,6 +19,7 @@ use crate::acmd_src::SourceIndex;
 use clones::{CloneDecl, UnresolvedClone};
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ArticleOrigin {
     /// Ships with the game (a folder under the fighter's `model` or `motion`).
     Vanilla,
@@ -572,7 +573,7 @@ pub fn install() {
             &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"],
             None,
         );
-        let c = ArticleCatalog::build("samus", None, &[d.clone()], vec![], tmp.path());
+        let c = ArticleCatalog::build("samus", None, std::slice::from_ref(&d), vec![], tmp.path());
         let agents: Vec<&str> = c.articles.iter().map(|a| a.agent.as_str()).collect();
         assert_eq!(agents, ["samus_cshot", "samus_lativolt"]);
         assert_eq!(c.get("lativolt").unwrap().origin, ArticleOrigin::Clone(d));

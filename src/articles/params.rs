@@ -320,11 +320,13 @@ fn unescape(text: &str) -> String {
 /// text with surrounding whitespace excluded.
 type Leaf = (String, String, std::ops::Range<usize>);
 
-/// A block of a prcxml: leaves per variant, nested entries as (field, child count) per variant,
-/// and list entries that are not structs.
+/// One variant's leaves, and its nested entries as (field, child count).
+type XmlVariant = (Vec<Leaf>, Vec<(String, usize)>);
+
+/// A block of a prcxml: its variants, and list entries that are not structs.
 struct XmlBlock {
     is_list: bool,
-    variants: Vec<(Vec<Leaf>, Vec<(String, usize)>)>,
+    variants: Vec<XmlVariant>,
     bad_entries: Vec<usize>,
 }
 
@@ -350,7 +352,7 @@ fn children(tags: &[Tag], n: usize) -> (Vec<usize>, usize) {
     (found, m)
 }
 
-fn xml_variant(src: &str, tags: &[Tag], n: usize) -> (Vec<Leaf>, Vec<(String, usize)>) {
+fn xml_variant(src: &str, tags: &[Tag], n: usize) -> XmlVariant {
     let (mut leaves, mut nested) = (Vec::new(), Vec::new());
     for child in children(tags, n).0 {
         let tag = &tags[child];
@@ -1154,7 +1156,7 @@ mod tests {
         let file = dir.path().join("vl.prcxml");
         let before = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<struct>\r\n  <!-- keep <me> -->\r\n  <struct hash=\"param_other\">\r\n    <float hash=\"speed\">9</float>\r\n  </struct>\r\n  <struct hash=\"param_lativolt\">\r\n    <float hash=\"speed\">1.6</float>\r\n    <int hash=\"life\">60</int>\r\n  </struct>\r\n</struct>\r\n";
         std::fs::write(&file, before).unwrap();
-        let block = param_block(&[file.clone()], &[], "lativolt", &labels());
+        let block = param_block(std::slice::from_ref(&file), &[], "lativolt", &labels());
         assert_eq!(block.fields["speed"].0, ParamValue::Float(1.6));
         assert_eq!(block.fields["life"].0, ParamValue::Int(60));
 
@@ -1174,7 +1176,7 @@ mod tests {
         let before = "<struct><struct hash=\"param_x\"><float hash=\"speed\"> \r\n 1.6\t </float></struct></struct>";
         std::fs::write(&file, before).unwrap();
         assert_eq!(
-            param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0,
+            param_block(std::slice::from_ref(&file), &[], "x", &labels()).fields["speed"].0,
             ParamValue::Float(1.6)
         );
         write_param_field(&file, "param_x", "speed", 0, 2.5, &labels()).unwrap();

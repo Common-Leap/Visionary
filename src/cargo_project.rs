@@ -41,9 +41,8 @@ impl CargoProject {
         if !tests::enabled() {
             return None;
         }
-        static CACHE: Mutex<
-            Option<HashMap<PathBuf, (Vec<(PathBuf, Option<SystemTime>)>, CargoProject)>>,
-        > = Mutex::new(None);
+        type Stamps = Vec<(PathBuf, Option<SystemTime>)>;
+        static CACHE: Mutex<Option<HashMap<PathBuf, (Stamps, CargoProject)>>> = Mutex::new(None);
         let key = dir.to_path_buf();
         if let Some((stamps, project)) = CACHE
             .lock()

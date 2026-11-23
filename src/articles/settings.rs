@@ -103,14 +103,17 @@ pub struct Setting {
     pub referenced_params: Vec<(String, String)>,
 }
 
+/// A project function: its file, its byte span in that file, and its source text.
+type HelperSource = (PathBuf, Range<usize>, String);
+
 /// The settings `statuses` write, each status's body read along with the project functions it
 /// calls (one level deep, through `helpers`, which maps the calling function's file and a function
-/// name to that function's file, its byte span in that file, and its source text). The caller's
-/// file is passed because per-module names (`main_loop`, `init`) repeat across a project.
+/// name to that function). The caller's file is passed because per-module names (`main_loop`,
+/// `init`) repeat across a project.
 pub fn read_settings(
     statuses: &[(&StatusSite, String)],
     consts: &ProjectConsts,
-    helpers: &dyn Fn(&Path, &str) -> Option<(PathBuf, Range<usize>, String)>,
+    helpers: &dyn Fn(&Path, &str) -> Option<HelperSource>,
 ) -> Vec<Setting> {
     let mut out = Vec::new();
     let mut file_consts_cache: std::collections::HashMap<PathBuf, Option<ProjectConsts>> =
@@ -173,6 +176,7 @@ struct Status<'a> {
 
 /// Records the settings `text` (the function `name`, at byte `base` of `file`) writes, and returns
 /// the names it references that may be project functions.
+#[allow(clippy::too_many_arguments)]
 fn scan(
     text: &str,
     name: &str,
@@ -999,7 +1003,7 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
     fn read_with(
         text: &str,
         name: &str,
-        helpers: &dyn Fn(&Path, &str) -> Option<(PathBuf, Range<usize>, String)>,
+        helpers: &dyn Fn(&Path, &str) -> Option<HelperSource>,
     ) -> Vec<Setting> {
         let consts = ProjectConsts::scan(&[(PathBuf::from("f.rs"), text.to_string())]);
         let site = site("f.rs", text, name);
@@ -1251,7 +1255,7 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         assert_eq!(from_loop.status, "*KIND_FIREBALL_MAIN");
         // Only one level: `deeper_helper`'s scale is not read.
         assert!(
-            s.iter().all(|s| s.file != PathBuf::from("deeper.rs")),
+            s.iter().all(|s| s.file.as_path() != Path::new("deeper.rs")),
             "{s:#?}"
         );
     }

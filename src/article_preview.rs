@@ -617,7 +617,7 @@ fn flight_from_listed(listed: &[(&str, f32)]) -> Flight {
         .map(|(label, number)| ((*label).to_owned(), *number))
         .collect();
     if !SPEED_NAMES.iter().any(|name| values.contains_key(*name)) {
-        values.extend(first_variant(&listed));
+        values.extend(first_variant(listed));
     }
     let first = |names: &[&str]| names.iter().find_map(|name| values.get(*name).copied());
     if let Some(life) = first(&["life", "life_frame", "max_life"]).filter(|life| *life > 0.0) {

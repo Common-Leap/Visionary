@@ -23,7 +23,7 @@ pub enum Source {
     /// A param in the game's (or a mod's) `.prc` files.
     Param(String),
     /// A param override written in the linked moveset's source (`param_config` and similar).
-    SourceOverride(String),
+    Override(String),
     /// The game's default, used because the param file was not found.
     Default,
 }
@@ -36,7 +36,7 @@ impl Source {
                 "the end of the animation (the motion list sets no cancel_frame)".into()
             }
             Source::Param(name) => format!("the {name} param"),
-            Source::SourceOverride(name) => format!("{name}, overridden in your linked source"),
+            Source::Override(name) => format!("{name}, overridden in your linked source"),
             Source::Default => "the game's default value (param file not found)".into(),
         }
     }
@@ -257,7 +257,7 @@ pub fn load_params(
     }
     if let Some(key) = kind.landing_param() {
         if let Some(value) = overrides.get(&key) {
-            params.landing_lag = Some((*value as f32, Source::SourceOverride(key)));
+            params.landing_lag = Some((*value as f32, Source::Override(key)));
         } else if let Some(root) = winning("fighter_param.prc") {
             if let Some(row) = fighter_row(&root, fighter) {
                 if let Some(value) = field_number(row, &key) {
@@ -494,10 +494,7 @@ mod tests {
         let script = crate::data::AcmdScript::default();
         let hitboxes = [hitbox(3, 20, 8.0)];
         let params = FrameParams {
-            landing_lag: Some((
-                8.0,
-                Source::SourceOverride("landing_attack_air_frame_n".into()),
-            )),
+            landing_lag: Some((8.0, Source::Override("landing_attack_air_frame_n".into()))),
             ..FrameParams::default()
         };
         let data = compute(&Inputs {

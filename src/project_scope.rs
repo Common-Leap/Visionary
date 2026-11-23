@@ -209,7 +209,7 @@ pub fn script_owners(
         }
     }
     vec![ProjectFighter::fighter(
-        &all_rows
+        all_rows
             .iter()
             .find(|row| row.custom_name.is_none() && row.name.eq_ignore_ascii_case(name))
             .map_or(name, |row| row.name.as_str()),
