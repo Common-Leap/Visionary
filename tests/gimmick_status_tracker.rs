@@ -19,6 +19,10 @@ impl<T> Mutex<T> {
     pub fn lock(&self) -> std::sync::MutexGuard<'_, T> {
         self.0.lock().unwrap()
     }
+
+    pub fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, T>> {
+        self.0.try_lock().ok()
+    }
 }
 
 pub mod app {

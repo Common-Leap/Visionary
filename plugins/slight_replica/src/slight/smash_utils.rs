@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub const DEBUG_LOGGERS: &str = "sd:/slight/debug/loggers/";
 pub const ERROR_LOGS: &str = "sd:/slight/user/error_logs/";
 pub const DEBUGGABLES_DIR: &str = "sd:/slight/user/debuggables/";
+/// The running game's version, when this plugin does not support it.
+pub const UNSUPPORTED_GAME: &str = "sd:/slight/unsupported_game.txt";
 pub const GATEWAY_FILE: &str = "sd:/slight/user/gateway.txt";
 pub const CLIENT_ID_FILE: &str = "sd:/slight/user/client_id.txt";
 pub const DEBUG_ACTIVATE: &str = "sd:/slight/debug/activate.txt";

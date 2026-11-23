@@ -15,7 +15,9 @@ pub mod frame_tick;
 pub mod kinds;
 pub mod live_eff;
 pub mod native_shared;
+pub mod playings;
 pub mod resource_reload;
+pub mod script_frames;
 pub mod show;
 pub mod spawn_rules;
 pub mod tracker;
@@ -25,6 +27,17 @@ use smash::app::utility;
 use smash::phx::{self, Vector3f};
 
 use effect_data::Point3D;
+
+/// Drop everything kept per object for one that is gone.
+pub fn forget_object(boid: u32) {
+    forget_dead_objects(|object| object != boid);
+}
+
+/// Drop everything kept per object for the objects that are gone.
+pub fn forget_dead_objects(alive: impl Fn(u32) -> bool) {
+    acmd_hooks::forget_dead_objects(&alive);
+    crate::slight::hitbox_viewer::forget_dead_objects(&alive);
+}
 
 /// Pseudo-handle range for synthetic (handle-less) effects — top bit set so they can never
 /// collide with real EffectModule handles.

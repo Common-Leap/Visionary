@@ -80,27 +80,6 @@ pub fn weapon_kind(fighter: &str, group: &str) -> Option<&'static WeaponKindEntr
         .find(|entry| entry.fighter == fighter && entry.group == group)
 }
 
-/// Canonical `<fighter>_<group>` agent name for a vanilla weapon kind, or `None`
-/// for runtime-allocated clone weapon kinds whose kind smashline does not export.
-pub fn weapon_agent_by_kind(kind: i32) -> Option<String> {
-    let kind = u32::try_from(kind).ok()?;
-    generated::WEAPON_KINDS
-        .iter()
-        .find(|entry| entry.value == kind)
-        .map(|entry| format!("{}_{}", entry.fighter, entry.group))
-}
-
-/// Vanilla weapon kind for a `<fighter>_<group>` agent name, or `None` for
-/// cloned articles whose runtime weapon kind cannot be read safely from smashline.
-pub fn weapon_kind_by_agent(agent: &str) -> Option<i32> {
-    generated::WEAPON_KINDS.iter().find_map(|entry| {
-        let rest = agent.strip_prefix(entry.fighter)?.strip_prefix('_')?;
-        (rest == entry.group)
-            .then(|| i32::try_from(entry.value).ok())
-            .flatten()
-    })
-}
-
 /// Internal fighter name for an exact kind value from the pinned constants.
 pub fn fighter_name(kind: i32) -> Option<&'static str> {
     let kind = u32::try_from(kind).ok()?;

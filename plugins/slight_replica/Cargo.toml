@@ -16,8 +16,8 @@ crate-type = ["cdylib"]
 skyline = { version = "0.6", features = ["std"] }
 skyline_smash = { git = "https://github.com/ultimate-research/skyline-smash.git" }
 smash-arc = { git = "https://github.com/jam1garner/smash-arc", features = ["smash-runtime", "rust-zstd"] }
-# HDR PR 87 merged with 13.0.4/13.0.5 support; must match the installed libsmashline_plugin.
-smashline = { git = "https://github.com/joobert/smashline", branch = "sync/pr87" }
+# The revision generated mods pin (src/acmd.rs); must match the installed libsmashline_plugin.
+smashline = { git = "https://github.com/HDR-Development/smashline", rev = "df194a03b918116adb7bda1c2b4565dcd82a4756" }
 smash_script = { git = "https://github.com/WuBoytH/smash-script", rev = "24c5b69b79c7d7b041c3993ecd766ceccf950c2b" }
 nnsdk = { git = "https://github.com/ultimate-research/nnsdk-rs" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }

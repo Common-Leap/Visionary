@@ -525,13 +525,14 @@ fn frame_driver_boid<'a>(
         .map(|rec| rec.boid)
 }
 
-/// Jorge FUN_71000db2b4 — lookup live fighter by founder entry id.
+/// Jorge FUN_71000db2b4 — lookup live fighter by founder entry id. Asked from game workers,
+/// which must never park on the registry.
 pub fn lookup_by_founder(founder_id: i32) -> Option<AgentRecord> {
     if founder_id < 0 {
         return None;
     }
     AGENTS
-        .lock()
+        .try_lock()?
         .by_boid
         .values()
         .find(|rec| {

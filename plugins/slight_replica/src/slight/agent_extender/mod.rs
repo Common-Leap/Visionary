@@ -126,12 +126,10 @@ unsafe extern "C" fn fighter_line_main(agent: &mut L2CFighterBase) {
 unsafe extern "C" fn weapon_line_main(agent: &mut L2CFighterBase) {
     let lua_state = agent.agent.lua_state_agent;
     handle_init(lua_state);
-    // Article/weapon hitbox and effect injection/capture run strictly against the separate
-    // article tables and only for the selected fighter's own articles.
     #[cfg(not(feature = "mod_plugin"))]
     {
-        crate::slight::hitbox_viewer::inject_tick_article(lua_state);
-        crate::slight::effect_viewer::acmd_hooks::inject_tick_article(lua_state);
+        crate::slight::hitbox_viewer::inject_tick(lua_state);
+        crate::slight::effect_viewer::acmd_hooks::inject_tick(lua_state);
         crate::slight::hitbox_viewer::article_capture_tick(lua_state);
     }
     crate::slight::gimmicks::deflect_volume::on_weapon_main(agent);

@@ -79,14 +79,18 @@ pub fn smashline_install() {
     std::panic::set_hook(Box::new(|info| {
         let _ = std::fs::write("sd:/slight/panic.txt", format!("{info}\n"));
     }));
-    let game_version = match offsets::initialize() {
-        Some(offsets::GameVersion::V13_0_4) => "13.0.4",
-        Some(offsets::GameVersion::V13_0_5) => "13.0.5",
-        None => {
-            skyline::println!("[SLight] Unsupported SSBU version. Expected 13.0.4 or 13.0.5.");
-            return;
-        }
+    let Some(game_version) = offsets::initialize().map(offsets::GameVersion::name) else {
+        let version = skyline::nn::oe::get_display_version();
+        // Nothing listens on this version, so this file is how the editor learns why.
+        let _ = std::fs::create_dir_all("sd:/slight");
+        let _ = std::fs::write(slight::smash_utils::UNSUPPORTED_GAME, version.as_str());
+        skyline::println!(
+            "[SLight] Unsupported SSBU version {}. Expected 13.0.4 or 13.0.5.",
+            version.as_str()
+        );
+        return;
     };
+    let _ = std::fs::remove_file(slight::smash_utils::UNSUPPORTED_GAME);
     skyline::println!("[SLight] Start preinstall on SSBU {game_version}");
     skyline::println!("[SLight] plugin loader: {}", slight::loader::current().name());
     slight::smash_utils::ensure_slight_dirs();

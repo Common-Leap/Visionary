@@ -240,9 +240,10 @@ pub fn install() -> bool {
     if native_supported {
         skyline::install_hooks!(hook_native_param_float, hook_native_param_int);
         GETTER_BACKEND.store(1, Ordering::Release);
-        crate::slight::diag::note(
-            "live personal-parameter native ParamData getters installed for verified 13.0.4; hooks are original-first and only overlay uniquely mapped active fighter ParamData objects",
-        );
+        crate::slight::diag::note(format!(
+            "live personal-parameter native ParamData getters installed, signatures verified on game {}; hooks are original-first and only overlay uniquely mapped active fighter ParamData objects",
+            crate::offsets::version_name()
+        ));
     } else {
         skyline::install_hooks!(hook_get_param_float, hook_get_param_int);
         GETTER_BACKEND.store(2, Ordering::Release);
@@ -339,9 +340,10 @@ fn cache_native_layout_guard() -> bool {
     NATIVE_LAYOUT_SUPPORTED.store(supported, Ordering::Relaxed);
     NATIVE_LAYOUT_CHECKED.store(true, Ordering::Release);
     if !supported {
-        crate::slight::diag::note(
-            "native personal-parameter hooks disabled: main executable C exports or ParamData getter prologues do not match verified 13.0.4 signatures",
-        );
+        crate::slight::diag::note(format!(
+            "native personal-parameter hooks disabled: main executable C exports or ParamData getter prologues do not match the verified signatures on game {}",
+            crate::offsets::version_name()
+        ));
     }
     supported
 }
@@ -646,7 +648,7 @@ struct NativeMemoryRegion {
 /// This keeps chain validation to a few QueryMemory calls per refresh, never
 /// one SVC per field or per getter invocation.
 #[derive(Default)]
-pub(super) struct NativeReadCache {
+pub(crate) struct NativeReadCache {
     regions: [Option<NativeMemoryRegion>; 8],
     next: usize,
 }
@@ -682,7 +684,7 @@ impl NativeReadCache {
         true
     }
 
-    pub(super) fn read<T: Copy>(&mut self, address: usize) -> Option<T> {
+    pub(crate) fn read<T: Copy>(&mut self, address: usize) -> Option<T> {
         if address % std::mem::align_of::<T>() != 0
             || !self.readable_span(address, std::mem::size_of::<T>())
         {

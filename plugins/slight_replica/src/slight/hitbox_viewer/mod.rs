@@ -34,7 +34,9 @@ use smash::lib::{L2CValue, L2CValueType};
 
 mod capture_archive;
 pub use super::costume_scope;
-pub use costume_scope::{costume_is, prefer_specific_costumes, rule_color, CostumeScoped};
+pub use costume_scope::{
+    name_objects, prefer_specific_costumes, runs_on, Acting, CostumeScoped, MoveScope, RuleScope,
+};
 mod drop_hooks;
 mod node_steps;
 pub use node_steps::{passes as guard_passes, LiveGuard};
@@ -343,12 +345,12 @@ pub struct CaptureEnd {
     pub run: u32,
 }
 
-/// One captured ACMD call from an article owned by the selected fighter.
+/// One captured ACMD call from an object a fighter made.
 /// Kept strictly separate from [`CaptureLine`] so category-local article kinds
 /// can never collide with fighter kinds.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ArticleCaptureLine {
-    pub agent: String,
+    pub agent: &'static str,
     pub owner_kind: i32,
     pub article_kind: i32,
     pub motion: u64,
@@ -362,7 +364,7 @@ pub struct ArticleCaptureLine {
 /// One completed motion playback for an article script.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ArticleCaptureEnd {
-    pub agent: String,
+    pub agent: &'static str,
     pub owner_kind: i32,
     pub article_kind: i32,
     pub motion: u64,
@@ -371,19 +373,17 @@ pub struct ArticleCaptureEnd {
 
 #[derive(Clone)]
 struct ArticleMotionWatch {
-    agent: String,
+    agent: &'static str,
     owner_kind: i32,
     article_kind: i32,
     motion: u64,
     frame: f32,
-    captured: bool,
-    ended: bool,
     run: u32,
 }
 
 const MAX_ARTICLE_CAPTURE_HISTORY: usize = 4096;
 
-/// Separate capture store for the selected fighter's articles, keyed by `(agent, motion)`.
+/// Separate capture store for fighters' objects, keyed by `(agent, owner kind, motion)`.
 #[derive(Default)]
 struct ArticleCaptureState {
     seen: HashMap<u32, HashSet<u64>>,
@@ -391,7 +391,7 @@ struct ArticleCaptureState {
     ends: Vec<ArticleCaptureEnd>,
     history: Vec<ArticleCaptureLine>,
     history_ends: Vec<ArticleCaptureEnd>,
-    claims: HashMap<(String, u64), CaptureClaim>,
+    claims: HashMap<(&'static str, i32, u64), CaptureClaim>,
     watch: HashMap<u32, ArticleMotionWatch>,
 }
 
@@ -1129,8 +1129,9 @@ pub fn requeue_all() {
     }
 }
 
-/// Record one pristine ACMD line from an article owned by the selected fighter into
-/// the separate `ARTICLE_CAPTURE_STATE` table keyed by `(agent, motion)`.
+/// Record one pristine ACMD line from an object a fighter made into the separate
+/// `ARTICLE_CAPTURE_STATE` table. The owner is part of its key: a clone of Mario's fireball has
+/// the fireball's kind and another fighter's script.
 unsafe fn record_article_for_boma(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     func: &'static str,
@@ -1138,16 +1139,21 @@ unsafe fn record_article_for_boma(
     common: bool,
 ) {
     let boid = (*boma).battle_object_id;
-    let Some(article_key) =
-        crate::slight::systems::article_notifier::selected_owner_article(boid)
+    let article_kind = smash::app::utility::get_kind(&mut *boma);
+    let Some(owner) = crate::slight::systems::article_notifier::founder_fighter(boid) else {
+        return;
+    };
+    let owner_kind = smash::app::sv_battle_object::kind(owner);
+    let Some(agent) =
+        crate::slight::slight_consts::fighters::weapon_agent(article_kind, owner_kind)
     else {
         return;
     };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let frame = rule_frame(boma);
 
     let mut key = fnv(0xcbf29ce484222325, motion);
-    for b in article_key.agent.bytes() {
+    for b in agent.bytes() {
         key = fnv(key, b as u64);
     }
     key = fnv(key, frame.to_bits() as u64);
@@ -1166,37 +1172,22 @@ unsafe fn record_article_for_boma(
 
     // Close out a previous watched motion on this same article boid if it switched.
     if let Some(prev) = state.watch.get(&boid).cloned() {
-        if prev.motion != motion || prev.agent != article_key.agent {
-            if prev.captured && !prev.ended {
-                let end = ArticleCaptureEnd {
-                    agent: prev.agent.clone(),
-                    owner_kind: prev.owner_kind,
-                    article_kind: prev.article_kind,
-                    motion: prev.motion,
-                    run: prev.run,
-                };
-                if let Some(claim) = state.claims.get_mut(&(prev.agent.clone(), prev.motion)) {
-                    if claim.run == prev.run && !claim.end_sent {
-                        claim.end_sent = true;
-                        if capture_stream_wanted() {
-                            state.ends.push(end.clone());
-                        }
-                        if state.history_ends.len() < 512 {
-                            state.history_ends.push(end);
-                        }
-                    }
-                }
-            }
+        if prev.motion != motion || prev.agent != agent {
+            end_article_run(&mut state, &prev);
             state.watch.remove(&boid);
         }
     }
 
-    let claim_key = (article_key.agent.clone(), motion);
+    let claim_key = (agent, owner_kind, motion);
     let run = match state.claims.get(&claim_key).copied() {
         Some(existing) if existing.boid == boid && !existing.ended => existing.run,
         Some(_) => return,
         None => {
             let run = next_run();
+            // What an object that died early left behind is replaced, not added to.
+            state
+                .history
+                .retain(|line| (line.agent, line.owner_kind, line.motion) != claim_key);
             state.claims.insert(
                 claim_key,
                 CaptureClaim {
@@ -1213,13 +1204,11 @@ unsafe fn record_article_for_boma(
     state.watch.insert(
         boid,
         ArticleMotionWatch {
-            agent: article_key.agent.clone(),
-            owner_kind: article_key.owner_kind,
-            article_kind: article_key.article_kind,
+            agent,
+            owner_kind,
+            article_kind,
             motion,
-            frame,
-            captured: true,
-            ended: false,
+            frame: smash::app::lua_bind::MotionModule::frame(boma),
             run,
         },
     );
@@ -1227,9 +1216,9 @@ unsafe fn record_article_for_boma(
 
     if state.seen.entry(run).or_default().insert(key) {
         let line = ArticleCaptureLine {
-            agent: article_key.agent,
-            owner_kind: article_key.owner_kind,
-            article_kind: article_key.article_kind,
+            agent,
+            owner_kind,
+            article_kind,
             motion,
             frame,
             func,
@@ -1244,6 +1233,52 @@ unsafe fn record_article_for_boma(
             state.history.push(line);
         }
     }
+}
+
+/// Say once that a captured object script has finished.
+fn end_article_run(state: &mut ArticleCaptureState, watch: &ArticleMotionWatch) {
+    let Some(claim) = state
+        .claims
+        .get_mut(&(watch.agent, watch.owner_kind, watch.motion))
+        .filter(|claim| claim.run == watch.run && !claim.end_sent)
+    else {
+        return;
+    };
+    claim.end_sent = true;
+    let end = ArticleCaptureEnd {
+        agent: watch.agent,
+        owner_kind: watch.owner_kind,
+        article_kind: watch.article_kind,
+        motion: watch.motion,
+        run: watch.run,
+    };
+    if capture_stream_wanted() {
+        state.ends.push(end.clone());
+    }
+    if state.history_ends.len() < 512 {
+        state.history_ends.push(end);
+    }
+}
+
+/// An object that died before its script finished frees the script for the next one made.
+fn forget_dead_article_captures(alive: &impl Fn(u32) -> bool) {
+    let Some(mut guard) = ARTICLE_CAPTURE_STATE.try_lock() else {
+        return;
+    };
+    let state = &mut *guard;
+    state.watch.retain(|object, _| alive(*object));
+    let seen = &mut state.seen;
+    state.claims.retain(|_, claim| {
+        let keep = claim.end_sent || alive(claim.boid);
+        if !keep {
+            seen.remove(&claim.run);
+        }
+        keep
+    });
+    ARTICLE_WATCH_ACTIVE.store(
+        !state.watch.is_empty(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Per-weapon end-of-motion watch for captured article scripts.
@@ -1268,7 +1303,6 @@ pub unsafe fn article_capture_tick(lua_state: u64) {
     };
     let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
     let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let end_frame = smash::app::lua_bind::MotionModule::end_frame(boma);
 
     let Some(mut state) = ARTICLE_CAPTURE_STATE.try_lock() else {
         return;
@@ -1279,52 +1313,20 @@ pub unsafe fn article_capture_tick(lua_state: u64) {
     if current.run != watched.run || current.motion != watched.motion {
         return;
     }
-    let mut finished = false;
-    let mut ended_naturally = false;
-    if current.motion != motion || frame + 0.5 < current.frame {
-        if current.captured && !current.ended {
-            finished = true;
-        }
+    // Only a motion that changes or goes back ends the run: an object's motion counts on past its
+    // last frame, and its script with it.
+    let finished = current.motion != motion || frame + 0.5 < current.frame;
+    if finished {
         state.watch.remove(&boid);
     } else if let Some(w) = state.watch.get_mut(&boid) {
         w.frame = frame;
-        if w.captured && !w.ended && end_frame > 0.0 && frame >= end_frame {
-            w.ended = true;
-            finished = true;
-            ended_naturally = true;
-        }
     }
     ARTICLE_WATCH_ACTIVE.store(
         !state.watch.is_empty(),
         std::sync::atomic::Ordering::Relaxed,
     );
-    if ended_naturally {
-        if let Some(claim) = state.claims.get_mut(&(current.agent.clone(), current.motion)) {
-            if claim.run == current.run {
-                claim.ended = true;
-            }
-        }
-        state.seen.remove(&current.run);
-    }
     if finished {
-        if let Some(claim) = state.claims.get_mut(&(current.agent.clone(), current.motion)) {
-            if claim.run == current.run && !claim.end_sent {
-                claim.end_sent = true;
-                let end = ArticleCaptureEnd {
-                    agent: current.agent,
-                    owner_kind: current.owner_kind,
-                    article_kind: current.article_kind,
-                    motion: current.motion,
-                    run: current.run,
-                };
-                if capture_stream_wanted() {
-                    state.ends.push(end.clone());
-                }
-                if state.history_ends.len() < 512 {
-                    state.history_ends.push(end);
-                }
-            }
-        }
+        end_article_run(&mut state, &current);
     }
 }
 
@@ -1789,6 +1791,13 @@ pub struct HitboxRule {
     /// The fighter this rule was made for; `None` fires for anyone playing the motion.
     #[serde(default)]
     pub fighter_kind: Option<i32>,
+    /// The object ("mario_fireball") whose script this rule is for; `None` for the fighter's
+    /// own move.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The kind `agent` names in the running game.
+    #[serde(skip)]
+    pub weapon: Option<i32>,
     /// The only costumes this rule runs on; empty = every costume. See [`acting_is`].
     #[serde(default)]
     pub costumes: Vec<u8>,
@@ -1830,22 +1839,58 @@ pub struct HitboxRule {
     pub func: Option<String>,
 }
 
-/// One article hitbox rule tagged with its `<owner>_<article>` agent name (e.g. `mario_fireball`).
-#[derive(Clone, Debug, serde::Deserialize)]
-pub struct ArticleHitboxRule {
-    pub agent: String,
-    #[serde(flatten)]
-    pub rule: HitboxRule,
+/// Who is making the call one game worker is in. Scripts of several objects run on different
+/// workers at once, so each has its own. `kind` and `color` are a fighter's and its costume's;
+/// `weapon` is the kind of an object a fighter made, and `founder_*` that fighter's kind and
+/// costume. -1 for what does not apply.
+struct ActingSlot {
+    /// The worker's thread; 0 while free.
+    thread: std::sync::atomic::AtomicU64,
+    kind: std::sync::atomic::AtomicI32,
+    color: std::sync::atomic::AtomicI32,
+    weapon: std::sync::atomic::AtomicI32,
+    founder_kind: std::sync::atomic::AtomicI32,
+    founder_color: std::sync::atomic::AtomicI32,
+    /// The Lua state of the object script the worker is in; 0 outside one.
+    script: std::sync::atomic::AtomicU64,
 }
 
-/// The fighter whose hook is reading rules right now; -1 for anything that isn't a fighter.
-static ACTING_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-/// That fighter's costume (colour slot); -1 for anything that isn't a fighter.
-static ACTING_COLOR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-/// For a projectile or other object: the kind and costume of the fighter that made it; -1 when
-/// that is not a fighter, or the one acting is a fighter itself.
-static FOUNDER_KIND: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static FOUNDER_COLOR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+impl ActingSlot {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicI32;
+        Self {
+            thread: std::sync::atomic::AtomicU64::new(0),
+            kind: AtomicI32::new(-1),
+            color: AtomicI32::new(-1),
+            weapon: AtomicI32::new(-1),
+            founder_kind: AtomicI32::new(-1),
+            founder_color: AtomicI32::new(-1),
+            script: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+static ACTING: [ActingSlot; HOOK_SCOPE_SLOT_COUNT] =
+    [const { ActingSlot::new() }; HOOK_SCOPE_SLOT_COUNT];
+
+fn acting_slot() -> &'static ActingSlot {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let thread = unsafe { nnsdk::nn::os::GetCurrentThread() } as usize as u64;
+    for slot in &ACTING {
+        let current = slot.thread.load(Acquire);
+        if current == thread
+            || (current == 0
+                && slot
+                    .thread
+                    .compare_exchange(0, thread, AcqRel, Acquire)
+                    .is_ok())
+        {
+            return slot;
+        }
+    }
+    // More workers than slots: the rest share one.
+    &ACTING[0]
+}
 
 /// A fighter's kind and costume.
 unsafe fn kind_and_color(boma: *mut smash::app::BattleObjectModuleAccessor) -> (i32, i32) {
@@ -1859,33 +1904,69 @@ unsafe fn kind_and_color(boma: *mut smash::app::BattleObjectModuleAccessor) -> (
 }
 
 /// Every rule lookup follows a hook reading this boma's motion, so that read names the fighter
-/// and the costume it wears, or for anything else the fighter that made it.
+/// and the costume it wears, or for an object its kind and the fighter that made it.
 pub unsafe fn note_acting(boma: *mut smash::app::BattleObjectModuleAccessor) {
     let fighter = *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER;
-    let (kind, color) = if smash::app::utility::get_category(&mut *boma) == fighter {
+    let category = smash::app::utility::get_category(&mut *boma);
+    let (kind, color) = if category == fighter {
         kind_and_color(boma)
     } else {
         (-1, -1)
     };
+    let weapon = if category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON {
+        smash::app::utility::get_kind(&mut *boma)
+    } else {
+        -1
+    };
     let (founder_kind, founder_color) = if kind != -1 {
         (-1, -1)
     } else {
-        let founder = smash::app::sv_battle_object::get_founder_id((*boma).battle_object_id);
-        let owner = if founder >= 0 && smash::app::sv_battle_object::is_active(founder as u32) {
-            smash::app::sv_battle_object::module_accessor(founder as u32)
-        } else {
-            std::ptr::null_mut()
-        };
+        // An object made by an object (a hydrant's water) leads to the fighter behind both.
+        let owner =
+            crate::slight::systems::article_notifier::founder_fighter((*boma).battle_object_id)
+                .map_or(std::ptr::null_mut(), |owner| {
+                    smash::app::sv_battle_object::module_accessor(owner)
+                });
         if !owner.is_null() && smash::app::utility::get_category(&mut *owner) == fighter {
             kind_and_color(owner)
         } else {
             (-1, -1)
         }
     };
-    ACTING_KIND.store(kind, std::sync::atomic::Ordering::Relaxed);
-    ACTING_COLOR.store(color, std::sync::atomic::Ordering::Relaxed);
-    FOUNDER_KIND.store(founder_kind, std::sync::atomic::Ordering::Relaxed);
-    FOUNDER_COLOR.store(founder_color, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering::Relaxed;
+    let slot = acting_slot();
+    slot.kind.store(kind, Relaxed);
+    slot.color.store(color, Relaxed);
+    slot.weapon.store(weapon, Relaxed);
+    slot.founder_kind.store(founder_kind, Relaxed);
+    slot.founder_color.store(founder_color, Relaxed);
+}
+
+/// An object a fighter made.
+pub unsafe fn is_object(boma: *mut smash::app::BattleObjectModuleAccessor) -> bool {
+    smash::app::utility::get_category(&mut *boma)
+        == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
+}
+
+/// The object script in `lua_state` is what this worker runs now.
+pub fn set_running_script(lua_state: u64) {
+    acting_slot()
+        .script
+        .store(lua_state, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The frame a call made now is matched to rules by: a fighter's motion frame, or for an object
+/// the frame its script is on (see `script_frames`).
+pub unsafe fn rule_frame(boma: *mut smash::app::BattleObjectModuleAccessor) -> f32 {
+    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    if !is_object(boma) {
+        return frame;
+    }
+    let script = acting_slot()
+        .script
+        .load(std::sync::atomic::Ordering::Relaxed);
+    crate::slight::effect_viewer::acmd_hooks::script_rule_frame(script, (*boma).battle_object_id)
+        .unwrap_or(frame)
 }
 
 pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -> u64 {
@@ -1893,43 +1974,55 @@ pub unsafe fn acting_motion(boma: *mut smash::app::BattleObjectModuleAccessor) -
     smash::app::lua_bind::MotionModule::motion_kind(boma)
 }
 
-/// Moves share names across fighters, so a rule only fires for the fighter it was made for.
-/// Projectiles run under their owner's rules, and Nana uses Popo's moves.
+/// Moves share names across fighters, so a rule only fires for the fighter it was made for, or
+/// for one of that fighter's objects. Nana uses Popo's moves, and Kirby makes the objects of the
+/// fighters he copies.
 ///
 /// A character made in the editor shares its donor's fighter kind and owns some of its
 /// costumes, so a rule also names costumes: `costumes` lists the only ones it runs on (empty =
 /// all), `except_costumes` the ones it never runs on. Anything whose costume is unknown (-1, not
 /// a fighter) passes the costume test, as it passes the fighter test.
-pub fn acting_is(fighter_kind: Option<i32>, costumes: &[u8], except_costumes: &[u8]) -> bool {
-    let acting = ACTING_KIND.load(std::sync::atomic::Ordering::Relaxed);
-    let fighter = fighter_kind.is_none_or(|wanted| {
-        acting == -1
-            || acting == wanted
-            || (wanted == *smash::lib::lua_const::FIGHTER_KIND_POPO
-                && acting == *smash::lib::lua_const::FIGHTER_KIND_NANA)
-    });
-    let founder_kind = FOUNDER_KIND.load(std::sync::atomic::Ordering::Relaxed);
-    let founder = (founder_kind != -1).then(|| {
-        (
-            founder_kind,
-            FOUNDER_COLOR.load(std::sync::atomic::Ordering::Relaxed),
-        )
-    });
-    fighter
-        && costume_is(
-            rule_color(
-                ACTING_COLOR.load(std::sync::atomic::Ordering::Relaxed),
-                fighter_kind,
-                founder,
-            ),
+pub fn acting_is(
+    fighter_kind: Option<i32>,
+    weapon: Option<i32>,
+    costumes: &[u8],
+    except_costumes: &[u8],
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let slot = acting_slot();
+    let founder_kind = slot.founder_kind.load(Relaxed);
+    runs_on(
+        Acting {
+            fighter: slot.kind.load(Relaxed),
+            color: slot.color.load(Relaxed),
+            weapon: slot.weapon.load(Relaxed),
+            founder: (founder_kind != -1).then(|| (founder_kind, slot.founder_color.load(Relaxed))),
+        },
+        RuleScope {
+            fighter: fighter_kind,
+            weapon,
             costumes,
             except_costumes,
-        )
+        },
+        |wanted, kind| {
+            kind == wanted
+                || (wanted == *smash::lib::lua_const::FIGHTER_KIND_POPO
+                    && kind == *smash::lib::lua_const::FIGHTER_KIND_NANA)
+                || (weapon.is_some() && kind == *smash::lib::lua_const::FIGHTER_KIND_KIRBY)
+        },
+    )
 }
 
 impl CostumeScoped for HitboxRule {
-    fn scope(&self) -> (Option<i32>, Option<u64>) {
-        (self.fighter_kind, Some(self.motion))
+    fn scope(&self) -> MoveScope {
+        (self.fighter_kind, self.weapon, Some(self.motion))
+    }
+    fn object(&mut self) -> Option<(&str, &mut Option<i32>, &mut Option<i32>)> {
+        Some((
+            self.agent.as_deref()?,
+            &mut self.weapon,
+            &mut self.fighter_kind,
+        ))
     }
     fn costumes(&self) -> &[u8] {
         &self.costumes
@@ -1943,15 +2036,12 @@ impl HitboxRule {
     fn matches(&self, category: u8, motion: u64, id: u64, frame: f32) -> bool {
         self.category == category
             && self.motion == motion
-            && acting_is(self.fighter_kind, &self.costumes, &self.except_costumes)
-            && self.hitbox_id.map(|h| h == id).unwrap_or(true)
-            && self.frame_start.map(|s| frame >= s).unwrap_or(true)
-            && self.frame_end.map(|e| frame <= e).unwrap_or(true)
-    }
-
-    fn matches_article(&self, category: u8, motion: u64, id: u64, frame: f32) -> bool {
-        self.category == category
-            && self.motion == motion
+            && acting_is(
+                self.fighter_kind,
+                self.weapon,
+                &self.costumes,
+                &self.except_costumes,
+            )
             && self.hitbox_id.map(|h| h == id).unwrap_or(true)
             && self.frame_start.map(|s| frame >= s).unwrap_or(true)
             && self.frame_end.map(|e| frame <= e).unwrap_or(true)
@@ -1963,43 +2053,39 @@ static HAVE_RULES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// Separate from [`HAVE_RULES`]: some dropped calls run every frame for every fighter.
 static HAVE_DROPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Separate rule table for the selected fighter's articles, keyed by `(agent, motion)`.
-static ARTICLE_RULES: LazyLock<Mutex<HashMap<(String, u64), Vec<HitboxRule>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static HAVE_ARTICLE_RULES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static HAVE_ARTICLE_DROPS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// The rules, for a hook to read. Game workers must never park on a lock, so this waits a bounded
+/// moment for another reader or a push to let go, and does without when none does.
+fn rules_now() -> Option<parking_lot::MutexGuard<'static, Vec<HitboxRule>>> {
+    for _ in 0..4096 {
+        if let Some(rules) = RULES.try_lock() {
+            return Some(rules);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
 
 /// The editor's key for a call name. **Must match the editor's `drop_key`.**
 fn drop_key(name: &str) -> u64 {
     smash::hash40(&name.to_ascii_lowercase())
 }
 
-/// True when the user removed this game call from the move the fighter or article is doing now.
+/// True when the user removed this game call from the move the fighter or object is doing now.
 pub(crate) unsafe fn dropped(
     boma: *mut smash::app::BattleObjectModuleAccessor,
     names: &[&str],
 ) -> bool {
-    if boma.is_null() || is_injecting() {
+    if !HAVE_DROPS.load(std::sync::atomic::Ordering::Acquire) || boma.is_null() || is_injecting() {
         return false;
     }
-    let category = smash::app::utility::get_category(&mut *boma);
-    let active = if category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER {
-        HAVE_DROPS.load(std::sync::atomic::Ordering::Acquire)
-    } else if category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON {
-        HAVE_ARTICLE_DROPS.load(std::sync::atomic::Ordering::Acquire)
-    } else {
-        false
-    };
-    if !active {
+    if !is_fighter_or_object(boma) {
         return false;
     }
     let motion = acting_motion(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let frame = rule_frame(boma);
     let hit = names.iter().find(|name| {
         matches!(
-            action_for_boma(boma, CAT_DROP, motion, drop_key(name), frame),
+            action_for(CAT_DROP, motion, drop_key(name), frame),
             Some((true, _))
         )
     });
@@ -2011,52 +2097,20 @@ pub(crate) unsafe fn dropped(
     hit.is_some()
 }
 
-/// Replace the complete article hitbox-rule table. Returns `(agent, supported)` for every
-/// distinct agent present in `rules` so the server can notify `Unsupported` for clones whose
-/// runtime weapon kind cannot be read safely from smashline.
-pub fn set_article_rules(rules: Vec<ArticleHitboxRule>) -> Vec<(String, bool)> {
-    let mut statuses: HashMap<String, bool> = HashMap::new();
-    let mut table: HashMap<(String, u64), Vec<HitboxRule>> = HashMap::new();
-    let mut has_drops = false;
-    let mut accepted = 0usize;
-
-    for entry in rules {
-        let supported = *statuses
-            .entry(entry.agent.clone())
-            .or_insert_with(|| {
-                crate::slight::systems::article_notifier::resolve_article_agent(&entry.agent)
-                    .is_some()
-            });
-        if !supported {
-            continue;
-        }
-        if entry.rule.category == CAT_DROP {
-            has_drops = true;
-        }
-        table
-            .entry((entry.agent, entry.rule.motion))
-            .or_default()
-            .push(entry.rule);
-        accepted += 1;
-    }
-
-    {
-        let mut guard = ARTICLE_RULES.lock();
-        *guard = table;
-    }
-    HAVE_ARTICLE_RULES.store(accepted != 0, std::sync::atomic::Ordering::Release);
-    HAVE_ARTICLE_DROPS.store(has_drops, std::sync::atomic::Ordering::Release);
-    crate::slight::diag::note(format!(
-        "article_hitbox_rules set: {accepted} rule(s) across {} agent(s)",
-        statuses.len()
-    ));
-    let mut out: Vec<(String, bool)> = statuses.into_iter().collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+/// Rules are written for fighters and the objects they make; nothing else is tested.
+unsafe fn is_fighter_or_object(boma: *mut smash::app::BattleObjectModuleAccessor) -> bool {
+    let category = smash::app::utility::get_category(&mut *boma);
+    category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+        || category == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
 }
 
-/// Full-list replace (same semantics as effect spawn rules).
-pub fn set_rules(mut rules: Vec<HitboxRule>) {
+/// Full-list replace (same semantics as effect spawn rules). Returns the objects whose rules the
+/// running game cannot take.
+pub fn set_rules(mut rules: Vec<HitboxRule>) -> Vec<String> {
+    let unknown = name_objects(
+        &mut rules,
+        crate::slight::slight_consts::fighters::weapon_object,
+    );
     prefer_specific_costumes(&mut rules);
     let n = rules.len();
     {
@@ -2064,10 +2118,9 @@ pub fn set_rules(mut rules: Vec<HitboxRule>) {
         *guard = rules;
     }
     HAVE_RULES.store(n != 0, std::sync::atomic::Ordering::Release);
-    HAVE_DROPS.store(
-        RULES.lock().iter().any(|rule| rule.category == CAT_DROP),
-        std::sync::atomic::Ordering::Release,
-    );
+    let have = |category| RULES.lock().iter().any(|rule| rule.category == category);
+    HAVE_DROPS.store(have(CAT_DROP), std::sync::atomic::Ordering::Release);
+    HAVE_GRAB_CLEARS.store(have(CAT_GRAB_CLEAR), std::sync::atomic::Ordering::Release);
     // Categories, not just a count. "2 rule(s)" is true whether they are two hitbox rules or a
     // hitbox rule and a sound rule, and those need different answers when a live edit does
     // nothing — one says the editor never sent the family, the other says it sent it and the
@@ -2147,23 +2200,16 @@ pub fn set_rules(mut rules: Vec<HitboxRule>) {
         })
         .collect();
     crate::slight::diag::note(format!(
-        "hitbox_rules set: {n} rule(s) [{}] costume-scoped [{}]",
+        "hitbox_rules set: {n} rule(s) [{}] costume-scoped [{}] objects refused [{}]",
         by_cat.join(" "),
-        scoped.join("; ")
+        scoped.join("; "),
+        unknown.join(", ")
     ));
+    unknown
 }
 
 fn any_rules() -> bool {
     HAVE_RULES.load(std::sync::atomic::Ordering::Acquire)
-        || HAVE_ARTICLE_RULES.load(std::sync::atomic::Ordering::Acquire)
-}
-
-fn any_fighter_rules() -> bool {
-    HAVE_RULES.load(std::sync::atomic::Ordering::Acquire)
-}
-
-fn any_article_rules() -> bool {
-    HAVE_ARTICLE_RULES.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// The suppress/override action matching (motion, id, frame), if any. Frame-scoped so one
@@ -2174,47 +2220,11 @@ fn action_for(
     id: u64,
     frame: f32,
 ) -> Option<(bool, Option<HbOverrides>)> {
-    if !any_fighter_rules() {
-        return None;
-    }
-    let rules = RULES.lock();
+    let rules = rules_now()?;
     rules
         .iter()
         .find(|r| r.inject.is_none() && r.matches(category, motion, id, frame))
         .map(|r| (r.suppress, r.overrides.clone()))
-}
-
-/// Route a rule lookup strictly by object category: fighters read only `RULES`, and
-/// weapons owned by the selected fighter read only `ARTICLE_RULES` keyed by `(agent, motion)`.
-unsafe fn action_for_boma(
-    boma: *mut smash::app::BattleObjectModuleAccessor,
-    category: u8,
-    motion: u64,
-    id: u64,
-    frame: f32,
-) -> Option<(bool, Option<HbOverrides>)> {
-    if boma.is_null() {
-        return None;
-    }
-    let obj_cat = smash::app::utility::get_category(&mut *boma);
-    if obj_cat == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER {
-        return action_for(category, motion, id, frame);
-    }
-    if obj_cat == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON {
-        if !any_article_rules() {
-            return None;
-        }
-        let key = crate::slight::systems::article_notifier::selected_owner_article(
-            (*boma).battle_object_id,
-        )?;
-        let table = ARTICLE_RULES.try_lock()?;
-        return table
-            .get(&(key.agent, motion))?
-            .iter()
-            .find(|r| r.inject.is_none() && r.matches_article(category, motion, id, frame))
-            .map(|r| (r.suppress, r.overrides.clone()));
-    }
-    None
 }
 
 /// As [`action_for`], but with the exact direct-call name as a second discriminator. Shared
@@ -2227,10 +2237,7 @@ fn action_for_func(
     frame: f32,
     func: &str,
 ) -> Option<(bool, Option<HbOverrides>)> {
-    if !any_fighter_rules() {
-        return None;
-    }
-    let rules = RULES.lock();
+    let rules = rules_now()?;
     rules
         .iter()
         .find(|r| {
@@ -2239,62 +2246,6 @@ fn action_for_func(
                 && r.func.as_deref().is_none_or(|candidate| candidate == func)
         })
         .map(|r| (r.suppress, r.overrides.clone()))
-}
-
-unsafe fn action_for_boma_func(
-    boma: *mut smash::app::BattleObjectModuleAccessor,
-    category: u8,
-    motion: u64,
-    id: u64,
-    frame: f32,
-    func: &str,
-) -> Option<(bool, Option<HbOverrides>)> {
-    if boma.is_null() {
-        return None;
-    }
-    let obj_cat = smash::app::utility::get_category(&mut *boma);
-    if obj_cat == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER {
-        return action_for_func(category, motion, id, frame, func);
-    }
-    if obj_cat == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON {
-        if !any_article_rules() {
-            return None;
-        }
-        let key = crate::slight::systems::article_notifier::selected_owner_article(
-            (*boma).battle_object_id,
-        )?;
-        let table = ARTICLE_RULES.try_lock()?;
-        return table
-            .get(&(key.agent, motion))?
-            .iter()
-            .find(|r| {
-                r.inject.is_none()
-                    && r.matches_article(category, motion, id, frame)
-                    && r.func.as_deref().is_none_or(|candidate| candidate == func)
-            })
-            .map(|r| (r.suppress, r.overrides.clone()));
-    }
-    None
-}
-
-fn article_injections_for(agent: &str, motion: u64) -> Vec<(u64, u8, InjectRule)> {
-    let Some(table) = ARTICLE_RULES.try_lock() else {
-        return Vec::new();
-    };
-    let Some(rules) = table.get(&(agent.to_string(), motion)) else {
-        return Vec::new();
-    };
-    rules
-        .iter()
-        .filter_map(|rule| {
-            let injection = rule.inject.clone()?;
-            Some((
-                injection_fingerprint(rule.motion, rule.category, rule.hitbox_id, &injection),
-                rule.category,
-                injection,
-            ))
-        })
-        .collect()
 }
 
 /// Stable key for one pristine expression call. Keep in lockstep with
@@ -2367,7 +2318,7 @@ fn expression_action(
     args: &[LuaArg],
 ) -> Option<(bool, Option<HbOverrides>)> {
     let key = expression_key(func, args);
-    let rules = RULES.lock();
+    let rules = rules_now()?;
     rules
         .iter()
         .find(|rule| {
@@ -2412,7 +2363,7 @@ macro_rules! expression_hook {
                     as *mut smash::app::BattleObjectModuleAccessor;
                 if !boma.is_null() {
                     let motion = acting_motion(boma);
-                    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                    let frame = rule_frame(boma);
                     if let Some((suppress, overrides)) =
                         expression_action(motion, frame, $func, &args)
                     {
@@ -2445,7 +2396,7 @@ unsafe fn hook_reverse_lr(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             if let Some((suppress, _)) = action_for(CAT_REVERSE_LR, motion, 0, frame) {
                 if suppress {
                     return;
@@ -2476,7 +2427,7 @@ unsafe fn hook_clr_speed(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             let Some(kind) = args.first().and_then(|arg| match arg {
                 LuaArg::Int(value) => Some(*value as f32),
                 LuaArg::Num(value) => Some(*value),
@@ -2514,7 +2465,7 @@ unsafe fn hook_set_air(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             if let Some((suppress, _)) = action_for(CAT_SET_AIR, motion, KINETIC_KEY_SET_AIR, frame)
             {
                 if suppress {
@@ -2535,13 +2486,9 @@ unsafe fn hook_generate_article(
     arg3: bool,
     arg4: i32,
 ) -> u32 {
-    if any_rules()
-        && !is_injecting()
-        && smash::app::utility::get_category(&mut *boma)
-            == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
-    {
+    if any_rules() && !is_injecting() && is_fighter_or_object(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         if let Some((true, _)) = action_for(
             node_steps::CAT_ARTICLE_GENERATE,
             motion,
@@ -2562,7 +2509,7 @@ unsafe fn hook_kinetic_clear_speed_all(boma: *mut smash::app::BattleObjectModule
     record_for_boma(boma, "KineticModule::clear_speed_all", &[]);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         if let Some((suppress, _)) = action_for(
             CAT_KINETIC_CLEAR_SPEED_ALL,
             motion,
@@ -2596,7 +2543,7 @@ unsafe fn hook_kinetic_set_consider_ground_friction(
     record_for_boma(boma, "KineticModule::set_consider_ground_friction", &args);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = numeric_point_key(
             "KineticModule::set_consider_ground_friction",
             &[
@@ -2650,7 +2597,7 @@ unsafe fn hook_change_kinetic(
     );
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = numeric_point_key("KineticModule::change_kinetic", &[kinetic_type as f32]);
         if let Some((suppress, overrides)) = action_for(CAT_CHANGE_KINETIC, motion, key, frame) {
             if suppress {
@@ -2679,7 +2626,7 @@ macro_rules! kinetic_energy_hook {
             record_for_boma(boma, $func, &[LuaArg::Int(kinetic_energy_id as i64)]);
             if any_direct_rules(boma) {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 let key = numeric_point_key($func, &[kinetic_energy_id as f32]);
                 if let Some((suppress, overrides)) = action_for($category, motion, key, frame) {
                     if suppress {
@@ -2746,7 +2693,7 @@ unsafe fn hook_kinetic_add_speed(
     record_for_boma(boma, "KineticModule::add_speed", &args);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = numeric_point_key("KineticModule::add_speed", &[vector.x, vector.y, vector.z]);
         if let Some((suppress, overrides)) = action_for(CAT_KINETIC_ADD_SPEED, motion, key, frame) {
             if suppress {
@@ -2784,7 +2731,7 @@ macro_rules! work_flag_hook {
             record_for_boma(boma, $func, &[LuaArg::Int(flag as i64)]);
             if any_direct_rules(boma) {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 let key = numeric_point_key($func, &[flag as f32]);
                 if let Some((suppress, overrides)) =
                     action_for_func(CAT_WORK_FLAG, motion, key, frame, $func)
@@ -2830,7 +2777,7 @@ macro_rules! work_transition_term_hook {
             record_for_boma(boma, $func, &[LuaArg::Int(transition_term as i64)]);
             if any_direct_rules(boma) {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 let key = numeric_point_key($func, &[transition_term as f32]);
                 if let Some((suppress, overrides)) =
                     action_for_func(CAT_WORK_TRANSITION_TERM, motion, key, frame, $func)
@@ -2883,7 +2830,7 @@ unsafe fn hook_work_module_inc_int(boma: *mut smash::app::BattleObjectModuleAcce
     record_for_boma(boma, "WorkModule::inc_int", &[LuaArg::Int(slot as i64)]);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = integer_point_key("WorkModule::inc_int", &[slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
             CAT_WORK_MODULE_INC_INT,
@@ -2926,7 +2873,7 @@ unsafe fn hook_work_module_set_int(
     record_for_boma(boma, "WorkModule::set_int", &args);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = numeric_point_key("WorkModule::set_int", &[value as f32, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
             CAT_WORK_MODULE_SET,
@@ -2973,7 +2920,7 @@ unsafe fn hook_work_module_set_int64(
     record_for_boma(boma, "WorkModule::set_int64", &args);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = integer_point_key("WorkModule::set_int64", &[value, slot as i64]);
         if let Some((suppress, overrides)) = action_for_func(
             CAT_WORK_MODULE_SET,
@@ -3014,7 +2961,7 @@ unsafe fn hook_work_module_set_float(
     record_for_boma(boma, "WorkModule::set_float", &args);
     if any_direct_rules(boma) {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         let key = numeric_point_key("WorkModule::set_float", &[value, slot as f32]);
         if let Some((suppress, overrides)) = action_for_func(
             CAT_WORK_MODULE_SET,
@@ -3066,7 +3013,7 @@ unsafe fn hook_set_speed_ex(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             let kind = match args.get(2) {
                 Some(LuaArg::Int(value)) => *value as u64,
                 Some(LuaArg::Num(value)) => *value as u64,
@@ -3109,7 +3056,7 @@ unsafe fn hook_set_speed(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             if let Some((suppress, overrides)) = action_for(CAT_SPEED, motion, 0, frame) {
                 if suppress {
                     return;
@@ -3147,7 +3094,7 @@ unsafe fn hook_add_speed_no_limit(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             if let Some((suppress, overrides)) =
                 action_for(CAT_ADD_SPEED_NO_LIMIT, motion, 0, frame)
             {
@@ -3195,7 +3142,7 @@ unsafe fn hook_correct(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             let kind = match args.first() {
                 Some(LuaArg::Int(value)) => *value as u64,
                 Some(LuaArg::Num(value)) => *value as u64,
@@ -3243,7 +3190,7 @@ unsafe fn hook_ft_catch_stop(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             let numeric = args
                 .iter()
                 .map(|arg| match arg {
@@ -3299,7 +3246,7 @@ unsafe fn hook_ft_start_adjust_motion_frame(lua_state: u64) {
             as *mut smash::app::BattleObjectModuleAccessor;
         if !boma.is_null() {
             let motion = acting_motion(boma);
-            let frame = smash::app::lua_bind::MotionModule::frame(boma);
+            let frame = rule_frame(boma);
             let Some(value) = args.first().and_then(|arg| match arg {
                 LuaArg::Int(value) => Some(*value as f32),
                 LuaArg::Num(value) => Some(*value),
@@ -3395,7 +3342,7 @@ unsafe fn hook_control_set_rumble(
     // replacement that happens to share a frame and payload with another call.
     if any_direct_rules(boma) && !is_injecting() {
         let motion = acting_motion(boma);
-        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+        let frame = rule_frame(boma);
         if let Some((suppress, overrides)) =
             expression_action(motion, frame, "ControlModule::set_rumble", &args)
         {
@@ -3460,13 +3407,15 @@ fn injection_fingerprint(
 }
 
 fn injections_for(motion: u64) -> Vec<(u64, u8, InjectRule)> {
-    let rules = RULES.lock();
+    let Some(rules) = rules_now() else {
+        return Vec::new();
+    };
     rules
         .iter()
         .filter(|r| {
             r.motion == motion
                 && r.inject.is_some()
-                && acting_is(r.fighter_kind, &r.costumes, &r.except_costumes)
+                && acting_is(r.fighter_kind, r.weapon, &r.costumes, &r.except_costumes)
         })
         .map(|rule| {
             let injection = rule.inject.clone().unwrap();
@@ -3680,13 +3629,13 @@ macro_rules! attack_hook {
                         as *mut smash::app::BattleObjectModuleAccessor;
                     if !boma.is_null() {
                         let motion = acting_motion(boma);
-                        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                        let frame = rule_frame(boma);
                         let id = match args.first() {
                             Some(LuaArg::Int(i)) => *i as u64,
                             _ => u64::MAX,
                         };
                         if let Some((suppress, overrides)) =
-                            action_for_boma(boma, CAT_ATTACK, motion, id, frame)
+                            action_for(CAT_ATTACK, motion, id, frame)
                         {
                             if suppress {
                                 return; // hitbox never comes out
@@ -3736,15 +3685,13 @@ unsafe fn hook_attack_fp(lua_state: u64) {
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 let id = match args.first() {
                     Some(LuaArg::Int(value)) => *value as u64,
                     Some(LuaArg::Num(value)) => *value as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) =
-                    action_for_boma(boma, CAT_ATTACK_FP, motion, id, frame)
-                {
+                if let Some((suppress, overrides)) = action_for(CAT_ATTACK_FP, motion, id, frame) {
                     if suppress {
                         return;
                     }
@@ -3829,7 +3776,7 @@ unsafe fn hook_catch(lua_state: u64) {
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 // CATCH's id may arrive as Int OR Num depending on how the script pushed it —
                 // accept both so grab rules actually match (Int-only missed float ids).
                 let id = match args.first() {
@@ -3837,9 +3784,7 @@ unsafe fn hook_catch(lua_state: u64) {
                     Some(LuaArg::Num(n)) => *n as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) =
-                    action_for_boma(boma, CAT_GRAB, motion, id, frame)
-                {
+                if let Some((suppress, overrides)) = action_for(CAT_GRAB, motion, id, frame) {
                     crate::slight::diag::note(format!(
                         "grab rule hit (motion {motion:#x} id {id} frame {frame:.1} suppress {suppress})"
                     ));
@@ -3856,21 +3801,16 @@ unsafe fn hook_catch(lua_state: u64) {
     original!()(lua_state);
 }
 
-/// Whether a grab clear on this fighter's current frame is one the editor moved away.
+/// Whether a grab clear on this object's current frame is one the editor moved away.
 ///
 /// The editor's own replacement clear runs under an [`InjectGuard`] and is never suppressed, so
 /// a box that still ends on the suppressed frame can be ended there by the editor.
 unsafe fn grab_clear_suppressed(boma: *mut smash::app::BattleObjectModuleAccessor) -> bool {
-    if boma.is_null() || !any_rules() || is_injecting() {
+    if boma.is_null() || !any_rules() || is_injecting() || !is_fighter_or_object(boma) {
         return false;
     }
-    if smash::app::utility::get_category(&mut *boma)
-        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
-    {
-        return false;
-    }
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let motion = acting_motion(boma);
+    let frame = rule_frame(boma);
     let hit = action_for(CAT_GRAB_CLEAR, motion, 0, frame).is_some_and(|(suppress, _)| suppress);
     if hit {
         crate::slight::diag::note(format!(
@@ -3878,6 +3818,47 @@ unsafe fn grab_clear_suppressed(boma: *mut smash::app::BattleObjectModuleAccesso
         ));
     }
     hit
+}
+
+/// Whether any rule moves a grab's end; the scripts are followed only then.
+static HAVE_GRAB_CLEARS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Objects one of whose scripts is inside a block of calls: battle object id + 1, 0 when free.
+static IN_SCRIPT: [std::sync::atomic::AtomicU64; 64] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+fn in_script(boid: u32) -> bool {
+    IN_SCRIPT
+        .iter()
+        .any(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == boid as u64 + 1)
+}
+
+/// A script of this object starts a block of calls.
+pub unsafe fn script_runs(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    if !HAVE_GRAB_CLEARS.load(Acquire)
+        || boma.is_null()
+        || !is_fighter_or_object(boma)
+        || in_script((*boma).battle_object_id)
+    {
+        return;
+    }
+    let key = (*boma).battle_object_id as u64 + 1;
+    let _ = IN_SCRIPT
+        .iter()
+        .find(|slot| slot.compare_exchange(0, key, AcqRel, Relaxed).is_ok());
+}
+
+/// The script waits for a frame, or the object's status code has its turn.
+pub unsafe fn script_waits(boma: *mut smash::app::BattleObjectModuleAccessor) {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    set_running_script(0);
+    if !HAVE_GRAB_CLEARS.load(Acquire) || boma.is_null() {
+        return;
+    }
+    let key = (*boma).battle_object_id as u64 + 1;
+    for slot in &IN_SCRIPT {
+        let _ = slot.compare_exchange(key, 0, AcqRel, Relaxed);
+    }
 }
 
 /// `sv_module_access::grab` — the msc command `grab!` sends. Only `MA_MSC_CMD_GRAB_CLEAR_ALL`
@@ -3901,12 +3882,17 @@ unsafe fn hook_grab(lua_state: u64) {
     original!()(lua_state);
 }
 
-/// `GrabModule::clear_all` as a moveset writes it directly. The engine also calls this from
-/// status code, so it is not recorded; a suppress rule is narrowed to the move's motion and the
-/// one frame the script's clear ran on.
+/// `GrabModule::clear_all` as a moveset writes it directly. The engine's status code calls this
+/// too, to end the grab when the status ends, and that call must always go through; so only one
+/// made from inside a script's block, with no status change going on, can be the script's own.
+/// For the same reason it is not recorded.
 #[skyline::hook(replace = smash::app::lua_bind::GrabModule::clear_all)]
 unsafe fn hook_grab_clear_all(boma: *mut smash::app::BattleObjectModuleAccessor) {
-    if grab_clear_suppressed(boma) {
+    if !boma.is_null()
+        && in_script((*boma).battle_object_id)
+        && !smash::app::lua_bind::StatusModule::is_changing(boma)
+        && grab_clear_suppressed(boma)
+    {
         return;
     }
     original!()(boma)
@@ -3970,7 +3956,7 @@ unsafe fn hook_search(lua_state: u64) {
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 // Same Int-or-Num tolerance `CATCH` needs: how the id arrives depends on how
                 // the script pushed it, and an Int-only read misses float ids entirely.
                 let id = match args.first() {
@@ -3978,9 +3964,7 @@ unsafe fn hook_search(lua_state: u64) {
                     Some(LuaArg::Num(n)) => *n as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) =
-                    action_for_boma(boma, CAT_SEARCH, motion, id, frame)
-                {
+                if let Some((suppress, overrides)) = action_for(CAT_SEARCH, motion, id, frame) {
                     crate::slight::diag::note(format!(
                         "search rule hit (motion {motion:#x} id {id} frame {frame:.1} suppress {suppress})"
                     ));
@@ -4022,14 +4006,13 @@ macro_rules! wind_hook {
                         as *mut smash::app::BattleObjectModuleAccessor;
                     if !boma.is_null() {
                         let motion = acting_motion(boma);
-                        let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                        let frame = rule_frame(boma);
                         let id = match args.first() {
                             Some(LuaArg::Int(id)) => *id as u64,
                             Some(LuaArg::Num(id)) => *id as u64,
                             _ => u64::MAX,
                         };
-                        if let Some((suppress, overrides)) =
-                            action_for_boma(boma, CAT_WIND, motion, id, frame)
+                        if let Some((suppress, overrides)) = action_for(CAT_WIND, motion, id, frame)
                         {
                             if suppress {
                                 return;
@@ -4099,15 +4082,13 @@ unsafe fn hook_attack_abs(lua_state: u64) {
                 as *mut smash::app::BattleObjectModuleAccessor;
             if !boma.is_null() {
                 let motion = acting_motion(boma);
-                let frame = smash::app::lua_bind::MotionModule::frame(boma);
+                let frame = rule_frame(boma);
                 let kind = match args.first() {
                     Some(LuaArg::Int(k)) => *k as u64,
                     Some(LuaArg::Num(k)) => *k as u64,
                     _ => u64::MAX,
                 };
-                if let Some((suppress, overrides)) =
-                    action_for_boma(boma, CAT_ABS, motion, kind, frame)
-                {
+                if let Some((suppress, overrides)) = action_for(CAT_ABS, motion, kind, frame) {
                     if suppress {
                         return;
                     }
@@ -4221,22 +4202,16 @@ unsafe fn hurt_action(
     if boma.is_null() {
         return false;
     }
-    // A module accessor can reach this hook for articles, weapons, and other agents as well as
-    // fighters. Fighter rules apply only to fighters; selected-owner articles read only from
-    // the separate `ARTICLE_RULES` table via `action_for_boma_func`.
-    let obj_cat = smash::app::utility::get_category(&mut *boma);
-    if obj_cat != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
-        && obj_cat != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
-    {
+    // A module accessor can reach this hook for items and other agents as well.
+    if !is_fighter_or_object(boma) {
         return false;
     }
     let motion = acting_motion(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
+    let frame = rule_frame(boma);
     // Hurtbox targets share one category, and `WHOLE_HIT`/`HIT_NODE`/`HIT_NO` do not
     // have interchangeable argument layouts.  Match the command as well as the target
     // sentinel so a same-frame COL_PRI or WHOLE_HIT rule can never rewrite a status slot.
-    let Some((suppress, overrides)) =
-        action_for_boma_func(boma, CAT_HURT, motion, target_key, frame, func)
+    let Some((suppress, overrides)) = action_for_func(CAT_HURT, motion, target_key, frame, func)
     else {
         return false;
     };
@@ -4422,8 +4397,8 @@ unsafe fn attack_mod_action(
         _ => return false,
     };
     let motion = acting_motion(boma);
-    let frame = smash::app::lua_bind::MotionModule::frame(boma);
-    let Some((suppress, overrides)) = action_for_boma(boma, category, motion, id, frame) else {
+    let frame = rule_frame(boma);
+    let Some((suppress, overrides)) = action_for(category, motion, id, frame) else {
         return false;
     };
     if suppress {
@@ -4504,20 +4479,23 @@ unsafe fn hook_hit_reset_all(lua_state: u64) {
 /// it a new fingerprint and applies it immediately; unchanged injections remain one-shot.
 static FIRED: LazyLock<Mutex<HashMap<(u32, u64), (u64, f32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Separate injection latch map for articles so article injections never share state with fighters.
-static ARTICLE_FIRED: LazyLock<Mutex<HashMap<(u32, u64), (u64, f32)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// boid → the motion with added blocks it played last frame, and that frame.
+/// boid → the motion it played last frame, and that frame.
 static LAST_PLAYED: LazyLock<Mutex<HashMap<u32, (u64, f32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Separate last-played map for articles so article rearming never shares state with fighters.
-static ARTICLE_LAST_PLAYED: LazyLock<Mutex<HashMap<u32, (u64, f32)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub fn forget_dead_objects(alive: &impl Fn(u32) -> bool) {
+    if let Some(mut fired) = FIRED.try_lock() {
+        fired.retain(|(object, _), _| alive(*object));
+    }
+    if let Some(mut played) = LAST_PLAYED.try_lock() {
+        played.retain(|object, _| alive(*object));
+    }
+    forget_dead_article_captures(alive);
+}
 
-/// Called every frame per fighter agent (agent_extender line callback) with the AGENT'S lua state.
+/// Called every frame per fighter and fighter-made object (agent_extender line callback) with the
+/// AGENT'S lua state.
 pub unsafe fn inject_tick(lua_state: u64) {
-    if !any_fighter_rules() {
+    if !any_rules() {
         return;
     }
     let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
@@ -4525,19 +4503,20 @@ pub unsafe fn inject_tick(lua_state: u64) {
     if boma.is_null() {
         return;
     }
-    // Rules describe the selected fighter's move. Article/weapon motion hashes are not a safe
-    // namespace and can collide with fighter motions, so never inject fighter rules into them.
-    if smash::app::utility::get_category(&mut *boma)
-        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
-    {
+    if !is_fighter_or_object(boma) {
         return;
     }
+    // The object's status code has its turn.
+    script_waits(boma);
     let mut motion = acting_motion(boma);
     let mut injections = injections_for(motion);
     // Some moves play over the body as a part animation (Steve swings his tool on the upper
     // body while the whole-body motion stays "wait"); blocks added to them follow that part.
     let mut part: Option<i32> = None;
-    if injections.is_empty() {
+    if injections.is_empty()
+        && smash::app::utility::get_category(&mut *boma)
+            == *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_FIGHTER
+    {
         // Only the upper-body set: every fighter has it, and other indices run past the end of
         // the part list on fighters with fewer sets.
         for index in [*smash::lib::lua_const::FIGHTER_MOTION_PART_SET_KIND_UPPER_BODY] {
@@ -4554,82 +4533,40 @@ pub unsafe fn inject_tick(lua_state: u64) {
         }
     }
     let boid = (*boma).battle_object_id;
-    if injections.is_empty() {
-        // Leaving the move rearms its blocks for the next time it plays.
-        LAST_PLAYED.lock().remove(&boid);
-        return;
-    }
-    run_injections_for_agent(lua_state, boma, motion, part, injections, &FIRED, &LAST_PLAYED);
-}
-
-/// Called every frame per weapon agent (agent_extender `weapon_line_main`) for the selected
-/// fighter's own articles only, reading strictly from the separate `ARTICLE_RULES` table.
-pub unsafe fn inject_tick_article(lua_state: u64) {
-    if !any_article_rules() {
-        return;
-    }
-    let boma = smash::app::sv_system::battle_object_module_accessor(lua_state)
-        as *mut smash::app::BattleObjectModuleAccessor;
-    if boma.is_null() {
-        return;
-    }
-    if smash::app::utility::get_category(&mut *boma)
-        != *smash::lib::lua_const::BATTLE_OBJECT_CATEGORY_WEAPON
-    {
-        return;
-    }
-    let boid = (*boma).battle_object_id;
-    let Some(article_key) =
-        crate::slight::systems::article_notifier::selected_owner_article(boid)
-    else {
-        return;
-    };
-    let motion = smash::app::lua_bind::MotionModule::motion_kind(boma);
-    let injections = article_injections_for(&article_key.agent, motion);
-    if injections.is_empty() {
-        ARTICLE_LAST_PLAYED.lock().remove(&boid);
-        return;
-    }
-    run_injections_for_agent(
-        lua_state,
-        boma,
-        motion,
-        None,
-        injections,
-        &ARTICLE_FIRED,
-        &ARTICLE_LAST_PLAYED,
-    );
-}
-
-unsafe fn run_injections_for_agent(
-    lua_state: u64,
-    boma: *mut smash::app::BattleObjectModuleAccessor,
-    motion: u64,
-    part: Option<i32>,
-    injections: Vec<(u64, u8, InjectRule)>,
-    fired_table: &Mutex<HashMap<(u32, u64), (u64, f32)>>,
-    last_played_table: &Mutex<HashMap<u32, (u64, f32)>>,
-) {
     let frame = match part {
         Some(index) => smash::app::lua_bind::MotionModule::frame_partial(boma, index),
+        None if is_object(boma) => crate::slight::effect_viewer::script_frames::object_frame(
+            smash::app::lua_bind::MotionModule::frame(boma),
+        ),
         None => smash::app::lua_bind::MotionModule::frame(boma),
     };
-    let boid = (*boma).battle_object_id;
+    let last = LAST_PLAYED.lock().insert(boid, (motion, frame));
+    if injections.is_empty() {
+        return;
+    }
     // A move that starts again (or a different one) rearms every block, including frame 0 ones.
-    let restarted = last_played_table
-        .lock()
-        .insert(boid, (motion, frame))
-        .is_none_or(|(last_motion, last_frame)| last_motion != motion || frame < last_frame);
+    let restarted =
+        last.is_none_or(|(last_motion, last_frame)| last_motion != motion || frame < last_frame);
     if restarted {
-        fired_table
-            .lock()
-            .retain(|(fired_boid, _), _| *fired_boid != boid);
+        let mut fired = FIRED.lock();
+        fired.retain(|(fired_boid, _), _| *fired_boid != boid);
+        // A motion that carries on from another's frame (a grounded special leaving the ground)
+        // plays from there, as in the game's own scripts: the blocks behind it stay behind.
+        let step = smash::app::lua_bind::MotionModule::whole_rate(boma).max(1.0);
+        if last.is_some() && frame > step {
+            fired.extend(
+                injections
+                    .iter()
+                    .filter(|(_, _, inj)| inj.frame <= frame - step)
+                    .map(|(fingerprint, _, _)| ((boid, *fingerprint), (motion, frame))),
+            );
+        }
     }
     let live_fingerprints: HashSet<u64> = injections
         .iter()
         .map(|(fingerprint, _, _)| *fingerprint)
         .collect();
-    fired_table
+    FIRED
         .lock()
         .retain(|(fired_boid, fingerprint), (fired_motion, _)| {
             *fired_boid != boid
@@ -4658,7 +4595,7 @@ unsafe fn run_injections_for_agent(
         let key = (boid, fingerprint);
         let due = frame >= inj.frame;
         let already = {
-            let fired = fired_table.lock();
+            let fired = FIRED.lock();
             fired
                 .get(&key)
                 .map(|(m, f)| *m == motion && frame >= *f)
@@ -4671,7 +4608,7 @@ unsafe fn run_injections_for_agent(
                 .as_ref()
                 .is_some_and(|guard| !node_steps::passes(boma, guard))
             {
-                fired_table.lock().insert(key, (motion, frame));
+                FIRED.lock().insert(key, (motion, frame));
                 continue;
             }
             if category == node_steps::CAT_NODE_STEP {
@@ -4682,7 +4619,7 @@ unsafe fn run_injections_for_agent(
                     node_steps::run(agent.lua_state_agent, boma, command, &inj.args)
                 };
                 agent.clear_lua_stack();
-                fired_table.lock().insert(key, (motion, frame));
+                FIRED.lock().insert(key, (motion, frame));
                 crate::slight::diag::note(format!(
                     "node step {command} done={done} (motion {motion:#x} frame {frame:.1})"
                 ));
@@ -4709,7 +4646,7 @@ unsafe fn run_injections_for_agent(
                 _ => false,
             };
             if lifecycle_command {
-                fired_table.lock().insert(key, (motion, frame));
+                FIRED.lock().insert(key, (motion, frame));
                 crate::slight::diag::note(format!(
                     "ended collision cat {category} (motion {motion:#x} frame {frame:.1})"
                 ));
@@ -5040,14 +4977,14 @@ unsafe fn run_injections_for_agent(
                 }
             }
             agent.clear_lua_stack();
-            fired_table.lock().insert(key, (motion, frame));
+            FIRED.lock().insert(key, (motion, frame));
             crate::slight::diag::note(format!(
                 "injected collision cat {category} (motion {motion:#x} frame {frame:.1})"
             ));
         }
         // Reset the latch when the motion restarts (frame went backwards) or changed.
         if !due {
-            let mut fired = fired_table.lock();
+            let mut fired = FIRED.lock();
             if let Some((m, f)) = fired.get(&key).copied() {
                 if m != motion || frame < f {
                     fired.remove(&key);

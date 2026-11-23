@@ -4,41 +4,16 @@ use parking_lot::Mutex;
 use smash::app::lua_bind::WorkModule;
 use smash::app::sv_battle_object;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
 #[path = "article_lifetime.rs"]
 mod article_lifetime;
-#[path = "article_live.rs"]
-mod article_live;
 
 use article_lifetime::{commit_lifetimes, lifetime_delta};
-pub use article_live::ArticleKey;
 
 const WORK_OWNER_VAR: i32 = 0x10000000;
 const MAX_NESTED_OWNER_HOPS: usize = 8;
-
-/// Fast atomic mirror of the selected fighter kind (-1 = none selected).
-/// Lets per-frame weapon hooks bail with one relaxed load when nothing is selected.
-static SELECTED_FIGHTER_KIND: AtomicI32 = AtomicI32::new(-1);
-static SELECTED_FIGHTER: LazyLock<Mutex<Option<article_live::SelectedFighter>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-/// Record which fighter (and optional costume slot scope) is currently selected in Visionary.
-pub fn set_selected_fighter(fighter_kind: Option<i32>, costumes: Vec<i32>) {
-    let kind = fighter_kind.unwrap_or(-1);
-    {
-        let mut guard = SELECTED_FIGHTER.lock();
-        *guard = fighter_kind.map(|kind| article_live::SelectedFighter { kind, costumes });
-    }
-    SELECTED_FIGHTER_KIND.store(kind, Ordering::Release);
-}
-
-/// Resolve a `<owner>_<article>` agent name to its runtime weapon kind if known safely.
-/// Clones return `None` because smashline does not expose a runtime agent->kind query.
-pub fn resolve_article_agent(agent: &str) -> Option<i32> {
-    crate::slight::gimmicks::registry::weapon_kind_by_agent(agent)
-}
 
 /// Weapons are keyed by both battle-object id and module accessor.  The game can
 /// recycle a battle-object id, so the id alone is not a lifetime token.
@@ -150,52 +125,30 @@ pub fn weapon_owner_boid(boid: u32) -> u32 {
     crate::slight::frame_context::resolve_work_boid(boid)
 }
 
-unsafe fn live_object_snapshot(boid: u32) -> Option<article_live::ObjectSnapshot> {
-    if sv_battle_object::is_null(boid) || !sv_battle_object::is_active(boid) {
-        return None;
+/// The fighter behind an object, through any objects in between. Takes no lock, so ACMD workers
+/// may ask.
+pub unsafe fn founder_fighter(boid: u32) -> Option<u32> {
+    let mut current = boid;
+    for _ in 0..MAX_NESTED_OWNER_HOPS {
+        let founder = sv_battle_object::get_founder_id(current);
+        let mut maker = founder as u32;
+        if founder < 0 || maker == current || !sv_battle_object::is_active(maker) {
+            // Only a weapon keeps its maker itself.
+            let accessor = sv_battle_object::module_accessor(current);
+            if sv_battle_object::category(current) != 1 || accessor.is_null() {
+                return None;
+            }
+            maker = WorkModule::get_int(accessor, WORK_OWNER_VAR) as u32;
+            if maker == current || !sv_battle_object::is_active(maker) {
+                return None;
+            }
+        }
+        if sv_battle_object::category(maker) == 0 {
+            return Some(maker);
+        }
+        current = maker;
     }
-    let ptr = sv_battle_object::module_accessor(boid);
-    if ptr.is_null() {
-        return None;
-    }
-    let category = sv_battle_object::category(boid);
-    let kind = sv_battle_object::kind(boid);
-    let costume = if category == 0 {
-        WorkModule::get_int(
-            ptr,
-            *smash::lib::lua_const::FIGHTER_INSTANCE_WORK_ID_INT_COLOR,
-        )
-    } else {
-        -1
-    };
-    let parent_boid = if category == 1 {
-        immediate_parent_boid(boid)
-    } else {
-        None
-    };
-    Some(article_live::ObjectSnapshot {
-        boid,
-        category,
-        kind,
-        costume,
-        parent_boid,
-    })
-}
-
-/// Return the [`ArticleKey`] for `boid` if and only if it is a live weapon
-/// owned (directly or through nested weapons) by the fighter currently selected
-/// in Visionary and its weapon kind maps to a known agent name.
-pub fn selected_owner_article(boid: u32) -> Option<ArticleKey> {
-    if SELECTED_FIGHTER_KIND.load(Ordering::Acquire) < 0 {
-        return None;
-    }
-    let selected = SELECTED_FIGHTER.try_lock()?.clone()?;
-    article_live::resolve_selected_owner_article(
-        boid,
-        Some(&selected),
-        |id| unsafe { live_object_snapshot(id) },
-        crate::slight::gimmicks::registry::weapon_agent_by_kind,
-    )
+    None
 }
 
 /// Return whether a resolved owner is the exact live fighter record that can
@@ -269,10 +222,18 @@ pub fn on_weapon_frame() {
         }
         crate::slight::systems::main_module::on_reset_weapon(gone);
         crate::slight::systems::init_frame::clear_boid(gone);
+        #[cfg(not(feature = "mod_plugin"))]
+        crate::slight::effect_viewer::forget_object(gone);
         if crate::slight::smash_utils::debug_logging_enabled() {
             skyline::println!("[SLight] Article notifier: weapon {gone} despawned");
         }
     }
+
+    // Objects that died before an owner was known for them are in no delta.
+    #[cfg(not(feature = "mod_plugin"))]
+    crate::slight::effect_viewer::forget_dead_objects(|boid| unsafe {
+        sv_battle_object::is_active(boid)
+    });
 
     let mut accepted = Vec::new();
     for &(boid, accessor) in &delta.candidates {
