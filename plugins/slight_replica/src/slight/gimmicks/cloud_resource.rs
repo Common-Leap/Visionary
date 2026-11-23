@@ -147,9 +147,10 @@ pub(crate) fn on_frame() {
     let mut memory = NativeReadCache::default();
     if !matches::<0x234>(&mut memory, text, end, FRAME_OFFSET, &FRAME_DIGEST) {
         INSTALL_STATE.store(REJECTED, Ordering::Release);
-        crate::slight::diag::note(
-            "native Limit resource rejected: complete 13.0.4 frame signature mismatch",
-        );
+        crate::slight::diag::note(format!(
+            "native Limit resource rejected: complete frame signature mismatch on game {}",
+            crate::offsets::version_name()
+        ));
         return;
     }
     unsafe {

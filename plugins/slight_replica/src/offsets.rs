@@ -8,17 +8,33 @@ pub(crate) enum GameVersion {
     V13_0_5,
 }
 
+impl GameVersion {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::V13_0_4 => "13.0.4",
+            Self::V13_0_5 => "13.0.5",
+        }
+    }
+}
+
 static VERSION: OnceLock<Option<GameVersion>> = OnceLock::new();
+
+/// The running game's version, for messages about it.
+pub(crate) fn version_name() -> &'static str {
+    VERSION
+        .get()
+        .copied()
+        .flatten()
+        .map_or("unknown", GameVersion::name)
+}
 
 /// Detect the game build before any offset-backed hooks are installed.
 pub(crate) fn initialize() -> Option<GameVersion> {
     *VERSION.get_or_init(|| {
         let display = skyline::nn::oe::get_display_version();
-        match display.as_str() {
-            "13.0.4" => Some(GameVersion::V13_0_4),
-            "13.0.5" => Some(GameVersion::V13_0_5),
-            _ => None,
-        }
+        [GameVersion::V13_0_4, GameVersion::V13_0_5]
+            .into_iter()
+            .find(|version| version.name() == display.as_str())
     })
 }
 
@@ -87,3 +103,5 @@ pub(crate) const REFRESH_VISIBILITY_GROUPS: GameOffset = GameOffset(0x4e3960, 0x
 pub(crate) const BIND_VISIBILITY_OUTPUT: GameOffset = GameOffset(0x3680960, 0x3680f10);
 pub(crate) const QUEUE_DIRECTORY_RELEASE: GameOffset = GameOffset(0x353eff0, 0x353f5a0);
 pub(crate) const FIGHTER_NAMES: GameOffset = GameOffset(0x4f80e20, 0x4f81e20);
+pub(crate) const WEAPON_NAMES: GameOffset = GameOffset(0x5185bd0, 0x5186bd0);
+pub(crate) const WEAPON_OWNER_NAMES: GameOffset = GameOffset(0x5188240, 0x5189240);

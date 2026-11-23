@@ -55,9 +55,10 @@ pub(super) fn install_hook() {
     }
     if !signatures_match(text) {
         INSTALL_STATE.store(3, Ordering::Release);
-        crate::slight::diag::note(
-            "DAMAGE_COMMIT rejected: exact 13.0.4 fighter percent-add/clamp signature mismatch",
-        );
+        crate::slight::diag::note(format!(
+            "DAMAGE_COMMIT rejected: exact fighter percent-add/clamp signature mismatch on game {}",
+            crate::offsets::version_name()
+        ));
         return;
     }
     unsafe {

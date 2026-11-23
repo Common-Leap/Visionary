@@ -163,9 +163,10 @@ fn install_for_active_match() {
             )
             .is_ok()
         {
-            crate::slight::diag::note(
-                "DAMAGE_PROBE rejected: exact 13.0.4 collision/shield-result or required percent-add/clamp signature mismatch",
-            );
+            crate::slight::diag::note(format!(
+                "DAMAGE_PROBE rejected: exact collision/shield-result or required percent-add/clamp signature mismatch on game {}",
+                crate::offsets::version_name()
+            ));
         }
         return;
     }
