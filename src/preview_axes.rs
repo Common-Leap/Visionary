@@ -1,13 +1,14 @@
-//! World axes on the ground in the 3D preview: a red X line and a blue Z line through the
-//! origin, as SSBH Studio draws them on its floor grid.
+//! Lines on the ground in the 3D preview: a grid, and a red X line and a blue Z line through
+//! the origin, as SSBH Studio draws them.
 //!
 //! Each pixel's view ray is intersected with the plane y = 0, so the lines reach the horizon
-//! and stay about 1.5 pixels wide at any zoom. They are depth tested against the scene, so the
-//! fighter, the stage and the floor under grounded moves hide them as solid things would, and
-//! fade with distance like the grid does.
+//! and stay about 1.5 pixels wide at any zoom. They are drawn into the scene before the effects
+//! and depth tested against it, so the fighter and the stage hide them as solid things would
+//! and effects show over them. (ssbh_wgpu's own floor grid is drawn after the effects, which
+//! write no depth, and covered them.)
 
 const SHADER: &str = "
-struct Axes { mvp: mat4x4<f32>, inverse: mat4x4<f32>, eye: vec4<f32> };
+struct Axes { mvp: mat4x4<f32>, inverse: mat4x4<f32>, eye: vec4<f32>, lines: vec4<f32> };
 @group(0) @binding(0) var<uniform> axes: Axes;
 
 struct VertexOut {
@@ -42,6 +43,8 @@ struct FragmentOut {
     let position = in.near + t * (in.far - in.near);
     // Derivatives before any discard, so every pixel of a quad takes them.
     let width = fwidth(position.xz) * 1.5;
+    // A line every ten units.
+    let cell = abs(fract(position.xz / 10.0 - 0.5) - 0.5) * 10.0;
     if (t <= 0.0) {
         discard;
     }
@@ -50,10 +53,11 @@ struct FragmentOut {
     let height = max(abs(axes.eye.y), 20.0);
     let distance = length(position - axes.eye.xyz);
     let fade = (1.0 - smoothstep(height * 8.0, height * 40.0, distance)) * (1.0 - abs(t));
-    let on_x = 1.0 - min(abs(position.z) / max(width.y, 1e-6), 1.0);
-    let on_z = 1.0 - min(abs(position.x) / max(width.x, 1e-6), 1.0);
-    var color = vec3(0.0);
-    var alpha = 0.0;
+    let on_x = (1.0 - min(abs(position.z) / max(width.y, 1e-6), 1.0)) * axes.lines.y;
+    let on_z = (1.0 - min(abs(position.x) / max(width.x, 1e-6), 1.0)) * axes.lines.y;
+    let on_grid = 1.0 - min(min(cell.x / max(width.x, 1e-6), cell.y / max(width.y, 1e-6)), 1.0);
+    var color = vec3(1.0);
+    var alpha = on_grid * 0.5 * fade * axes.lines.x;
     if (on_x > 0.0) {
         color = vec3(0.91, 0.30, 0.30);
         alpha = on_x * 0.9 * fade;
@@ -76,8 +80,21 @@ struct FragmentOut {
 }
 ";
 
-/// Bytes in the uniform block: two matrices and the eye position.
-const UNIFORM_SIZE: u64 = 64 + 64 + 16;
+/// Bytes in the uniform block: two matrices, the eye position and which lines show.
+const UNIFORM_SIZE: u64 = 64 + 64 + 16 + 16;
+
+/// Which lines show.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lines {
+    pub grid: bool,
+    pub axes: bool,
+}
+
+impl Lines {
+    pub fn any(self) -> bool {
+        self.grid || self.axes
+    }
+}
 
 pub struct PreviewAxes {
     pipeline: wgpu::RenderPipeline,
@@ -169,14 +186,16 @@ impl PreviewAxes {
         }
     }
 
-    /// Place the axes for this frame's camera.
-    pub fn update(&self, queue: &wgpu::Queue, mvp: glam::Mat4, eye: glam::Vec4) {
+    /// Place the lines for this frame's camera.
+    pub fn update(&self, queue: &wgpu::Queue, mvp: glam::Mat4, eye: glam::Vec4, lines: Lines) {
         let mut bytes = Vec::with_capacity(UNIFORM_SIZE as usize);
+        let shown = [lines.grid, lines.axes, false, false].map(|on| if on { 1.0f32 } else { 0.0 });
         for value in mvp
             .to_cols_array()
             .iter()
             .chain(mvp.inverse().to_cols_array().iter())
             .chain(eye.to_array().iter())
+            .chain(shown.iter())
         {
             bytes.extend(value.to_le_bytes());
         }

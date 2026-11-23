@@ -76,7 +76,7 @@ impl Camera {
             near: view.near,
             far: view.far,
         };
-        camera.target = camera.centred_point();
+        camera.target_centre();
         camera
     }
 
@@ -105,6 +105,15 @@ impl Camera {
         self.translation = view - camera_rotation(rotation).transform_vector3(self.target);
     }
 
+    /// Turn the camera around the fighter: sideways drags turn it around, vertical drags tilt
+    /// it up or down, short of looking straight down. A view already past that, such as the
+    /// top view, is not pulled back to it.
+    pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
+        let limit = self.rotation.x.abs().max(1.4);
+        self.rotation.y += delta_x * 0.01;
+        self.rotation.x = (self.rotation.x + delta_y * 0.01).clamp(-limit, limit);
+    }
+
     /// Orbit like dragging the scene: right turns right, up tilts up.
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
         self.turn_to(self.rotation + Vec3::new(delta_y * 0.01, delta_x * 0.01, 0.0));
@@ -116,6 +125,19 @@ impl Camera {
         self.target -= camera_rotation(self.rotation)
             .inverse()
             .transform_vector3(shift);
+    }
+
+    /// Pan in the camera plane (left/right and up/down) while keeping rotation fixed.
+    /// Moves in world X (left/right) and world Y (up/down) regardless of camera rotation.
+    pub fn pan_camera(&mut self, delta_x: f32, delta_y: f32) {
+        let speed = self.translation.z.abs() * 0.001;
+        self.translation.x -= delta_x * speed;
+        self.translation.y += delta_y * speed;
+    }
+
+    /// Make whatever is straight ahead what orbiting and view snaps turn about.
+    pub fn target_centre(&mut self) {
+        self.target = self.centred_point();
     }
 
     /// Pan in the view plane so the model follows the pointer. The viewport height and
@@ -169,7 +191,7 @@ impl Camera {
         self.near = values.near_clip;
         self.far = values.far_clip;
         self.follow = Vec3::ZERO;
-        self.target = self.centred_point();
+        self.target_centre();
     }
 
     pub fn transforms(&self, width: f32, height: f32) -> CameraTransforms {
@@ -254,9 +276,9 @@ pub struct HitboxRenderState {
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
-    /// The X and Z lines through the origin on the ground, while Settings shows them.
+    /// The lines on the ground, and which of them Settings shows.
     axes: crate::preview_axes::PreviewAxes,
-    world_axes: bool,
+    axis_lines: crate::preview_axes::Lines,
     /// Body meshes hidden for a visibility set, to show again when the set switches back.
     set_hidden: std::collections::HashSet<usize>,
     /// Where the models and effects are drawn before going on screen.
@@ -264,6 +286,8 @@ pub struct HitboxRenderState {
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
+    /// What [`Self::apply_preferences`] last applied.
+    preferences: Option<crate::preferences::Preferences>,
 }
 
 impl HitboxRenderState {
@@ -272,37 +296,20 @@ impl HitboxRenderState {
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        /// The viewport's backdrop, linear, as it appears on screen.
-        const VIEWPORT_BACKDROP_LINEAR: [f32; 3] = [0.05, 0.05, 0.1];
-        /// The floor under grounded moves, a shade darker than the backdrop.
-        const FLOOR_LINEAR: [f32; 3] = [0.028, 0.028, 0.055];
         let mut renderer = SsbhRenderer::new(
             device,
             queue,
             1,
             1,
             1.0,
-            [
-                VIEWPORT_BACKDROP_LINEAR[0] as f64,
-                VIEWPORT_BACKDROP_LINEAR[1] as f64,
-                VIEWPORT_BACKDROP_LINEAR[2] as f64,
-                1.0,
-            ],
+            [0.0, 0.0, 0.0, 1.0],
             surface_format,
         );
         let shared_data = SharedRenderData::new(device, queue);
         // The game's post pass: bloom, then the stage's colour grading. Effects draw into the
         // scene before it (see `prepare`), so they glow as they do in game. The backdrop is
-        // part of the scene, as a stage is, so it is cleared opaque at the value the post pass
-        // turns into the backdrop colour.
+        // part of the scene, as a stage is.
         renderer.update_color_lut_rgba(device, queue, &crate::post_grading::training_lut());
-        let scene_backdrop = crate::post_grading::scene_value_for(VIEWPORT_BACKDROP_LINEAR);
-        renderer.set_scene_clear_color(wgpu::Color {
-            r: scene_backdrop[0] as f64,
-            g: scene_backdrop[1] as f64,
-            b: scene_backdrop[2] as f64,
-            a: 1.0,
-        });
         // Use Shaded mode for full PBR rendering with textures
         let render_settings = RenderSettings {
             render_bloom: true,
@@ -310,7 +317,7 @@ impl HitboxRenderState {
             ..RenderSettings::default()
         };
         renderer.update_render_settings(queue, &render_settings);
-        Self {
+        let mut state = Self {
             renderer,
             render_settings,
             shared_data,
@@ -366,38 +373,51 @@ impl HitboxRenderState {
                 ssbh_wgpu::DEPTH_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
-            world_axes: true,
+            axis_lines: Default::default(),
             set_hidden: std::collections::HashSet::new(),
-            floor_color: {
-                let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
-                [r, g, b, 1.0]
-            },
+            floor_color: [0.0; 4],
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
-        }
+            preferences: None,
+        };
+        state.apply_preferences(queue, &crate::preferences::Preferences::default());
+        state
     }
 
     /// Viewport preferences from the Settings window: background, floor grid, world axes and
-    /// bloom.
+    /// bloom. Called every paint; only a change does anything.
     pub fn apply_preferences(
         &mut self,
         queue: &wgpu::Queue,
         preferences: &crate::preferences::Preferences,
     ) {
-        let [r, g, b, a] = preferences.viewport_clear_color();
-        self.renderer.set_clear_color([r, g, b, a]);
-        // The backdrop is part of the scene and goes through the post pass, so clear it at the
-        // value that comes out as the chosen colour (see `new`).
-        let scene = crate::post_grading::scene_value_for([r as f32, g as f32, b as f32]);
+        if self.preferences.as_ref() == Some(preferences) {
+            return;
+        }
+        self.preferences = Some(preferences.clone());
+        let (backdrop, floor) = preferences.viewport_colors();
+        self.renderer.set_clear_color([
+            backdrop[0] as f64,
+            backdrop[1] as f64,
+            backdrop[2] as f64,
+            1.0,
+        ]);
+        // The backdrop and the floor are part of the scene and go through the post pass, so
+        // each is stored as the value that comes out as its colour.
+        let scene = crate::post_grading::scene_value_for(backdrop);
         self.renderer.set_scene_clear_color(wgpu::Color {
             r: scene[0] as f64,
             g: scene[1] as f64,
             b: scene[2] as f64,
-            a,
+            a: 1.0,
         });
-        self.model_render_options.draw_floor_grid = preferences.floor_grid;
-        self.world_axes = preferences.world_axes;
+        let [r, g, b] = crate::post_grading::scene_value_for(floor);
+        self.floor_color = [r, g, b, 1.0];
+        self.axis_lines = crate::preview_axes::Lines {
+            grid: preferences.floor_grid,
+            axes: preferences.world_axes,
+        };
         if self.render_settings.render_bloom != preferences.bloom {
             self.render_settings.render_bloom = preferences.bloom;
             self.renderer
@@ -1238,6 +1258,38 @@ mod tests {
         }
     }
 
+    /// Settings' floor grid is drawn with the ground lines, before the effects. ssbh_wgpu's own
+    /// grid is drawn after them, over particles, so it stays off whatever is picked; and with
+    /// nothing picked the view draws no lines and keeps its bloom, backdrop and floor.
+    #[test]
+    fn the_floor_grid_is_never_drawn_over_the_effects() {
+        let Some((device, queue)) = crate::preview_trail::tests::gpu() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let mut state =
+            super::HitboxRenderState::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert!(!state.axis_lines.any());
+        assert!(state.render_settings.render_bloom);
+        let [r, g, b] = crate::post_grading::scene_value_for([0.028, 0.028, 0.055]);
+        assert_eq!(state.floor_color, [r, g, b, 1.0]);
+        let all = crate::preferences::Preferences {
+            floor_grid: true,
+            world_axes: true,
+            bloom: false,
+            viewport_color: Some([200, 40, 90]),
+            ..Default::default()
+        };
+        state.apply_preferences(&queue, &all);
+        assert!(state.axis_lines.grid && state.axis_lines.axes);
+        assert!(!state.model_render_options.draw_floor_grid);
+        assert!(!state.render_settings.render_bloom);
+        assert_ne!(state.floor_color, [r, g, b, 1.0]);
+        state.apply_preferences(&queue, &Default::default());
+        assert!(!state.axis_lines.any());
+        assert_eq!(state.floor_color, [r, g, b, 1.0]);
+    }
+
     /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists
     /// bones in, and a helper bone file without constraints moves nothing.
     #[test]
@@ -1785,9 +1837,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }
-            let axes = state.world_axes.then_some(&state.axes);
+            let axes = state.axis_lines.any().then_some(&state.axes);
             if let Some(axes) = axes {
-                axes.update(queue, t.mvp_matrix, t.camera_pos);
+                axes.update(queue, t.mvp_matrix, t.camera_pos, state.axis_lines);
             }
             // The stage's models are drawn with the fighter's, in one list for the renderer;
             // they go back to their own list afterwards.

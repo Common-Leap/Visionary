@@ -1627,16 +1627,6 @@ mod picker_state_tests {
         assert!(right <= right_max);
         // A wide window keeps the old 460 px start.
         assert_eq!(effects_page_side_widths(1800.0).1, 460.0);
-        // The view switch never sits on the stage picker: beside it, or under it.
-        for width in [240.0, 400.0, 900.0] {
-            let at = effect_view_switch_offset(width);
-            assert!(
-                at.x >= 8.0 + STAGE_PICKER_WIDTH || at.y >= 36.0,
-                "{width}: {at:?}"
-            );
-        }
-        assert_eq!(effect_view_switch_offset(240.0).y, 40.0);
-        assert_eq!(effect_view_switch_offset(900.0).y, 8.0);
     }
 
     #[test]
@@ -2522,19 +2512,7 @@ fn scrubber_chart_height(row_count: usize) -> f32 {
 }
 
 /// Width of the stage picker over the view's top-left corner.
-const STAGE_PICKER_WIDTH: f32 = 150.0;
-
-/// Where the Effects page's Alone / In a move switch sits from the view's top-left corner: beside
-/// the stage picker, or under it when the view is too narrow for both on one line.
-fn effect_view_switch_offset(view_width: f32) -> egui::Vec2 {
-    let beside = 8.0 + STAGE_PICKER_WIDTH + 30.0;
-    let switch_width = 280.0;
-    if view_width >= beside + switch_width {
-        egui::vec2(beside, 8.0)
-    } else {
-        egui::vec2(8.0, 40.0)
-    }
-}
+pub(crate) const STAGE_PICKER_WIDTH: f32 = 150.0;
 
 /// The Effects page's side panels for a window this wide: the left list's largest width, then
 /// the right panel's starting and largest widths. Both stay at least as wide as their minimums.
@@ -4153,6 +4131,9 @@ fn bounding_sphere(points: impl Iterator<Item = glam::Vec3>) -> Option<(glam::Ve
 /// How the mouse moves the camera in `scheme`, for hover text.
 fn navigation_hint(preferences: &crate::preferences::Preferences) -> &'static str {
     match preferences.navigation_scheme {
+        crate::preferences::NavigationScheme::Visionary => {
+            "Left drag pans, right or middle drag turns, scroll zooms"
+        }
         crate::preferences::NavigationScheme::Ssbh => {
             "Left drag orbits, right or middle drag pans, scroll zooms"
         }
@@ -5153,6 +5134,8 @@ pub struct VisionaryApp {
     /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
     /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
     viewport_toolbar_rect: Option<egui::Rect>,
+    /// What the preview's overlays were drawn at last, to place them clear of one another.
+    viewport_overlays: crate::viewport_overlays::Sizes,
     /// A Blender-style camera drag in progress, decided when it started.
     nav_drag: Option<crate::viewport_navigation::NavDrag>,
     /// The fighter's bounding sphere and the selected hitbox's, in world space, from the last
@@ -5905,6 +5888,7 @@ impl VisionaryApp {
             preferences,
             settings_open: false,
             viewport_toolbar_rect: None,
+            viewport_overlays: Default::default(),
             nav_drag: None,
             fighter_sphere: None,
             selection_sphere: None,
@@ -13618,20 +13602,24 @@ impl VisionaryApp {
 
     /// The Effects page's switch between the selected effect alone and a move that plays it,
     /// over the top of the view.
-    fn draw_effect_view_switch(&mut self, ui: &mut Ui, rect: egui::Rect, alone: bool) {
-        // Beside or under the stage picker, which sits under the viewport toolbar.
-        let under_toolbar = self
-            .viewport_toolbar_rect
-            .map_or(0.0, |toolbar| toolbar.bottom() + 6.0 - (rect.top() + 8.0));
-        let at = effect_view_switch_offset(rect.width()) + egui::vec2(0.0, under_toolbar);
-        egui::Area::new(egui::Id::unique("effect_view_switch"))
-            .fixed_pos(rect.left_top() + at)
+    fn draw_effect_view_switch(
+        &mut self,
+        ui: &mut Ui,
+        rect: egui::Rect,
+        at: egui::Pos2,
+        alone: bool,
+    ) {
+        let drawn = egui::Area::new(egui::Id::unique("effect_view_switch"))
+            .fixed_pos(at)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    self.eff_editor.draw_view_switch(ui, !alone);
-                });
+                let frame = egui::Frame::popup(ui.style());
+                // A long move name is cut short rather than running off a narrow view.
+                let room = rect.width() - 2.0 * crate::viewport_overlays::MARGIN;
+                ui.set_max_width(room);
+                frame.show(ui, |ui| self.eff_editor.draw_view_switch(ui, !alone));
             });
+        self.viewport_overlays.switch = Some(drawn.response.rect.size());
     }
 
     /// How far the stage moves under the fighter so the open move is done where the game does
@@ -13654,8 +13642,8 @@ impl VisionaryApp {
         crate::preview_stage::stage_shift(spot, &self.preview_ledges.1)
     }
 
-    /// The stage picker at the preview's top-left, under the viewport toolbar.
-    fn draw_stage_picker(&mut self, ui: &mut Ui, rect: egui::Rect) {
+    /// The stage picker over the preview's top-left corner.
+    fn draw_stage_picker(&mut self, ui: &mut Ui, at: egui::Pos2) {
         let root = self.state.data_root.clone();
         if self.preview_stages.0 != root {
             let stages = root
@@ -13679,12 +13667,8 @@ impl VisionaryApp {
             .map(crate::preview_stage::label)
             .unwrap_or_else(|| "No stage".to_owned());
         let before = self.preview_stage.clone();
-        // Under the viewport toolbar (last frame's rect), which holds the same corner.
-        let top = self
-            .viewport_toolbar_rect
-            .map_or(rect.top() + 8.0, |toolbar| toolbar.bottom() + 6.0);
-        egui::Area::new(egui::Id::unique("preview_stage_picker"))
-            .fixed_pos(egui::pos2(rect.left() + 8.0, top))
+        let drawn = egui::Area::new(egui::Id::unique("preview_stage_picker"))
+            .fixed_pos(at)
             .order(egui::Order::Foreground)
             .show(ui.ctx(), |ui| {
                 egui::ComboBox::from_id_salt("preview_stage_combo")
@@ -13717,6 +13701,7 @@ impl VisionaryApp {
                     .response
                     .on_hover_text("The stage the fighter stands on in the view");
             });
+        self.viewport_overlays.stage = Some(drawn.response.rect.size());
         if self.preview_stage != before {
             if let Some(path) = config_path("preview_stage") {
                 let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
@@ -13730,7 +13715,12 @@ impl VisionaryApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         let rect = ui.available_rect_before_wrap();
-        self.draw_stage_picker(ui, rect);
+        let overlays = crate::viewport_overlays::place(
+            rect,
+            self.viewport_overlays,
+            crate::orientation_widget::widget_size(self.preferences.navigation_widget),
+        );
+        self.draw_stage_picker(ui, overlays.stage);
         // With no character open the view still renders: the stage, and an effect on its own.
         let no_fighter = self.current_model_dir.is_none();
         {
@@ -13785,12 +13775,11 @@ impl VisionaryApp {
                     } else {
                         glam::Vec3::new(root.x, -lift, root.z)
                     };
-                    // SSBH Studio's controls, in the scheme picked in Settings.
                     let controls = crate::viewport_navigation::Controls {
                         scheme: self.preferences.navigation_scheme,
                         emulate_three_button_mouse: self.preferences.emulate_three_button_mouse,
                     };
-                    let keyboard = response.hovered() && !ctx.egui_wants_keyboard_input();
+                    let keyboard = crate::viewport_navigation::takes_keys(ctx, &response);
                     let nav_drag = &mut self.nav_drag;
                     // A copy, not a closure: the drag checks on `response` read the input
                     // themselves, and doing that inside `ui.input` can deadlock.
@@ -13930,7 +13919,9 @@ impl VisionaryApp {
             );
             ui.painter().add(callback);
             if self.eff_editor.open && self.eff_editor.selected_entry_name().is_some() {
-                self.draw_effect_view_switch(ui, rect, alone);
+                self.draw_effect_view_switch(ui, rect, overlays.switch, alone);
+            } else {
+                self.viewport_overlays.switch = None;
             }
 
             // Draw hitbox spheres as projected 2D circles. Not on the Effects page, which
@@ -14638,8 +14629,10 @@ impl VisionaryApp {
                     }
                 }
             }
-            self.draw_viewport_toolbar(ui, rect, frame);
-            self.draw_orientation_widget(ui, rect, frame);
+            self.draw_viewport_toolbar(ui, rect, overlays.toolbar, frame);
+            if let Some(widget) = overlays.widget {
+                self.draw_orientation_widget(ui, rect, widget, frame);
+            }
         }
     }
 
@@ -19110,10 +19103,7 @@ impl VisionaryApp {
     fn draw_thrown_victim_controls(&mut self, ui: &mut Ui) {
         let mut changed = ui
             .checkbox(&mut self.thrown_victim.enabled, "Thrown fighter")
-            .on_hover_text(
-                "Show a second fighter carried by this one's throw bone, playing its own thrown \
-                 animation, the way the game positions a thrown opponent.",
-            )
+            .on_hover_text("Show the opponent this throw holds")
             .changed();
         if self.thrown_victim.enabled {
             let fighters: Vec<(String, String)> = self
@@ -19201,10 +19191,8 @@ impl VisionaryApp {
                 })
                 .response
                 .on_hover_text(
-                    "The victim's own thrown animation. Auto matches the throw's direction \
-                     (throw_f → thrown_f) or this fighter's own thrown set when the victim has \
-                     one. The game also picks a _dx, _big or _girl variant depending on the \
-                     thrower, which Visionary doesn't detect yet; choose it here.",
+                    "The opponent's animation. Auto picks the one for this throw; the game has \
+                     _dx, _big and _girl variants for some throwers.",
                 );
         }
         if changed {
@@ -19213,8 +19201,8 @@ impl VisionaryApp {
         }
     }
 
-    /// The Settings window the viewport toolbar's gear opens: application preferences, the
-    /// viewport's look, and the camera.
+    /// The Settings window the menu bar's gear opens: application preferences, the view's look,
+    /// and the camera.
     fn draw_settings_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         // Ctrl +/- zooms the interface too; keep the saved scale in step with it.
         let zoom = ctx.zoom_factor();
@@ -19252,15 +19240,12 @@ impl VisionaryApp {
                 }
                 console
                     .on_hover_text(
-                        "A console window with Visionary's log output: model loading, plugin \
-                     deploys, builds and the game link. Turn it off here rather than closing \
-                     the console, which would close Visionary with it.",
+                        "A window with Visionary's log. Turn it off here: closing it closes \
+                         Visionary too.",
                     )
-                    .on_disabled_hover_text(if crate::console::SUPPORTED {
-                        "Visionary was started from a terminal, which already shows its log output."
-                    } else {
-                        "Log output goes to the terminal that started Visionary."
-                    });
+                    .on_disabled_hover_text(
+                        "The terminal Visionary was started from shows its log",
+                    );
                 ui.horizontal(|ui| {
                     ui.label("Interface scale");
                     let mut scale = self.preferences.ui_scale;
@@ -19291,54 +19276,49 @@ impl VisionaryApp {
                 .on_hover_text("Size of all text and controls. Ctrl + and Ctrl - also change it.");
 
                 ui.separator();
-                ui.label(RichText::new("Viewport").strong());
+                ui.label(RichText::new("View").strong());
                 ui.horizontal(|ui| {
-                    ui.color_edit_button_srgb(&mut self.preferences.viewport_color);
+                    let mut color = self.preferences.shown_viewport_color();
+                    if ui.color_edit_button_srgb(&mut color).changed() {
+                        self.preferences.viewport_color = Some(color);
+                    }
                     ui.label("Background");
                     if ui
                         .add_enabled(
-                            self.preferences.viewport_color != defaults.viewport_color,
+                            self.preferences.viewport_color.is_some(),
                             egui::Button::new("Reset").small(),
                         )
-                        .on_hover_text("SSBH Editor's dark grey")
                         .clicked()
                     {
-                        self.preferences.viewport_color = defaults.viewport_color;
+                        self.preferences.viewport_color = None;
                     }
                 });
                 ui.checkbox(&mut self.preferences.floor_grid, "Floor grid")
-                    .on_hover_text("A grid on the ground plane (y = 0) under the fighter.");
+                    .on_hover_text("A grid on the ground under the fighter");
                 ui.checkbox(&mut self.preferences.world_axes, "World axes")
                     .on_hover_text(
-                        "A red X line and a blue Z line through the origin on the ground, \
-                         where the fighter starts.",
+                        "A red X line and a blue Z line on the ground through the spot the \
+                         fighter starts on",
                     );
                 ui.checkbox(&mut self.preferences.bloom, "Bloom")
-                    .on_hover_text("The game's glow around bright and emissive materials.");
+                    .on_hover_text("The game's glow around bright parts");
                 let response = ui.add_enabled(
                     has_helper_bones,
-                    egui::Checkbox::new(&mut self.helper_bones, "Enable helper bones"),
+                    egui::Checkbox::new(&mut self.helper_bones, "Helper bones"),
                 );
                 if response.changed() {
                     save_helper_bones(self.helper_bones);
                 }
-                response.on_hover_text(if has_helper_bones {
-                    "Apply the model's helper bone constraints (model.nuhlpb), as the game does. \
-                     They move H_ bones such as elbow and knee helpers, which changes the mesh \
-                     and any hitbox, hurtbox or effect placed on those bones."
-                } else {
-                    "This model has no model.nuhlpb. The saved preference is kept for models \
-                     that do."
-                });
+                response
+                    .on_hover_text(
+                        "Bend the model's helper bones (elbows, knees) as the game does. Moves \
+                         the mesh and whatever sits on those bones (model.nuhlpb).",
+                    )
+                    .on_disabled_hover_text("This model has no helper bones (model.nuhlpb)");
 
                 ui.separator();
                 ui.label(RichText::new("Camera").strong());
-                self.draw_navigation_settings(ui);
-                ui.label(
-                    RichText::new(navigation_hint(&self.preferences))
-                        .small()
-                        .weak(),
-                );
+                self.draw_navigation_settings(ui, frame);
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
@@ -19347,7 +19327,7 @@ impl VisionaryApp {
                         egui::Grid::new("settings_camera")
                             .num_columns(4)
                             .show(ui, |ui| {
-                                ui.label("Translation");
+                                ui.label("Position");
                                 for value in [
                                     &mut camera.translation.x,
                                     &mut camera.translation.y,
@@ -19358,7 +19338,7 @@ impl VisionaryApp {
                                     );
                                 }
                                 ui.end_row();
-                                ui.label("Rotation (°)");
+                                ui.label("Angle (°)");
                                 for value in [
                                     &mut camera.rotation.x,
                                     &mut camera.rotation.y,
@@ -19391,8 +19371,7 @@ impl VisionaryApp {
                                     camera.fov_y = degrees.to_radians();
                                 }
                                 ui.end_row();
-                                ui.label("Near clip")
-                                    .on_hover_text("The nearest distance drawn.");
+                                ui.label("Nearest drawn");
                                 let far = camera.far;
                                 ui.add(
                                     egui::DragValue::new(&mut camera.near)
@@ -19400,8 +19379,7 @@ impl VisionaryApp {
                                         .speed(0.05),
                                 );
                                 ui.end_row();
-                                ui.label("Far clip")
-                                    .on_hover_text("The farthest distance drawn.");
+                                ui.label("Farthest drawn");
                                 let near = camera.near;
                                 ui.add(
                                     egui::DragValue::new(&mut camera.far)
@@ -19413,10 +19391,7 @@ impl VisionaryApp {
                         camera.translation.z = camera.translation.z.min(-1.0);
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(
-                                    !camera.is_at(&home),
-                                    egui::Button::new("⟲ Reset view"),
-                                )
+                                .add_enabled(!camera.is_at(&home), egui::Button::new("Reset view"))
                                 .on_hover_text("Back to the default view")
                                 .clicked()
                             {
@@ -19428,8 +19403,8 @@ impl VisionaryApp {
                                     egui::Button::new("Save as default"),
                                 )
                                 .on_hover_text(
-                                    "Start at this view, and come back to it with ⟲ and a \
-                                     double-click",
+                                    "Start at this view, and come back to it with Reset view \
+                                     and a double-click",
                                 )
                                 .clicked()
                             {
@@ -19447,8 +19422,6 @@ impl VisionaryApp {
                                 *camera = crate::renderer::Camera::default();
                             }
                         });
-                    } else {
-                        ui.weak("Load a fighter to adjust the camera.");
                     }
                 }
                 self.draw_camera_animation_settings(ui);
@@ -19461,60 +19434,61 @@ impl VisionaryApp {
     }
 
     /// Settings: which mouse buttons move the camera, and the orientation widget's style.
-    fn draw_navigation_settings(&mut self, ui: &mut Ui) {
+    fn draw_navigation_settings(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
         use crate::preferences::{NavigationScheme, NavigationWidget};
         let preferences = &mut self.preferences;
+        let scheme_before = preferences.navigation_scheme;
         egui::Grid::new("settings_navigation")
             .num_columns(2)
             .show(ui, |ui| {
-                ui.label("Mouse navigation").on_hover_text(
-                    "SSBH: left drag orbits, right or middle drag pans.\nBlender: middle drag \
-                 orbits, Shift + middle pans, Ctrl + middle zooms.",
-                );
+                let hint = navigation_hint(preferences);
+                ui.label("Mouse").on_hover_text(hint);
+                let schemes = [
+                    (NavigationScheme::Visionary, "Visionary"),
+                    (NavigationScheme::Ssbh, "SSBH Studio"),
+                    (NavigationScheme::Blender, "Blender"),
+                ];
+                let name = |scheme| {
+                    schemes
+                        .iter()
+                        .find(|(known, _)| *known == scheme)
+                        .map_or("", |(_, name)| name)
+                };
                 egui::ComboBox::from_id_salt("settings_navigation_scheme")
-                    .selected_text(match preferences.navigation_scheme {
-                        NavigationScheme::Ssbh => "SSBH",
-                        NavigationScheme::Blender => "Blender",
-                    })
+                    .selected_text(name(preferences.navigation_scheme))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut preferences.navigation_scheme,
-                            NavigationScheme::Ssbh,
-                            "SSBH",
-                        );
-                        ui.selectable_value(
-                            &mut preferences.navigation_scheme,
-                            NavigationScheme::Blender,
-                            "Blender",
-                        );
-                    });
+                        for (scheme, name) in schemes {
+                            let shown = crate::preferences::Preferences {
+                                navigation_scheme: scheme,
+                                ..preferences.clone()
+                            };
+                            ui.selectable_value(&mut preferences.navigation_scheme, scheme, name)
+                                .on_hover_text(navigation_hint(&shown));
+                        }
+                    })
+                    .response
+                    .on_hover_text(hint);
                 ui.end_row();
-                ui.label("Orientation widget").on_hover_text(
-                    "The gizmo in the viewport's top right corner. Click an axis or face to look \
-                 along it, drag it to orbit.",
+                ui.label("Direction widget").on_hover_text(
+                    "In the view's top right corner: click an axis or face to look along it, \
+                     drag to turn",
                 );
+                let styles = [
+                    (NavigationWidget::Axes, "Axes"),
+                    (NavigationWidget::Cube, "Cube"),
+                    (NavigationWidget::Hidden, "Hidden"),
+                ];
                 egui::ComboBox::from_id_salt("settings_navigation_widget")
-                    .selected_text(match preferences.navigation_widget {
-                        NavigationWidget::Axes => "Axes",
-                        NavigationWidget::Cube => "Cube",
-                        NavigationWidget::Hidden => "Hidden",
-                    })
+                    .selected_text(
+                        styles
+                            .iter()
+                            .find(|(style, _)| *style == preferences.navigation_widget)
+                            .map_or("", |(_, name)| name),
+                    )
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut preferences.navigation_widget,
-                            NavigationWidget::Axes,
-                            "Axes (Blender)",
-                        );
-                        ui.selectable_value(
-                            &mut preferences.navigation_widget,
-                            NavigationWidget::Cube,
-                            "Cube",
-                        );
-                        ui.selectable_value(
-                            &mut preferences.navigation_widget,
-                            NavigationWidget::Hidden,
-                            "Hidden",
-                        );
+                        for (style, name) in styles {
+                            ui.selectable_value(&mut preferences.navigation_widget, style, name);
+                        }
                     });
                 ui.end_row();
             });
@@ -19522,13 +19496,20 @@ impl VisionaryApp {
             preferences.navigation_scheme == NavigationScheme::Blender,
             egui::Checkbox::new(
                 &mut preferences.emulate_three_button_mouse,
-                "Emulate 3 button mouse",
+                "Alt + left drag as middle drag",
             ),
         )
-        .on_hover_text(
-            "Use Alt + left drag in place of the middle button, for trackpads and two-button mice.",
-        )
-        .on_disabled_hover_text("Available with Blender mouse navigation.");
+        .on_hover_text("For trackpads and two-button mice")
+        .on_disabled_hover_text("Only with Blender's mouse controls");
+        if preferences.navigation_scheme != scheme_before {
+            // The schemes turn about different points: the new one starts from the view's centre.
+            if let Some(wgpu_state) = frame.wgpu_render_state() {
+                let mut renderer = wgpu_state.renderer.write();
+                if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
+                    rs.camera.target_centre();
+                }
+            }
+        }
     }
 
     /// Settings: a camera animation (`.nuanmb`, such as a Final Smash camera) for the viewport
@@ -19549,7 +19530,7 @@ impl VisionaryApp {
                     ui.weak("none");
                 }
             }
-            if ui.button("Choose…").clicked() {
+            if ui.button("Choose").clicked() {
                 let mut dialog = rfd::FileDialog::new()
                     .add_filter("Camera animation", &["nuanmb"])
                     .set_title("Choose a camera animation");
@@ -19579,10 +19560,7 @@ impl VisionaryApp {
             self.camera_anim.is_some(),
             egui::Checkbox::new(&mut self.camera_anim_on, "Play camera animation"),
         )
-        .on_hover_text(
-            "The viewport camera follows the animation along the timeline. Turn it off to move \
-             the camera freely again without clearing the file.",
-        );
+        .on_hover_text("The camera follows the animation along the timeline");
         if let Some(error) = &self.camera_anim_error {
             ui.colored_label(Color32::from_rgb(220, 120, 90), error);
         }
@@ -19599,10 +19577,7 @@ impl VisionaryApp {
                     self.camera_anim_on = true;
                     self.camera_anim_error = None;
                 } else {
-                    self.camera_anim_error = Some(format!(
-                        "{} has no camera (a gya_camera or camera_stage transform).",
-                        path.display()
-                    ));
+                    self.camera_anim_error = Some(format!("{} moves no camera", path.display()));
                 }
             }
             Err(error) => {
@@ -19617,12 +19592,9 @@ impl VisionaryApp {
         &mut self,
         ui: &mut Ui,
         viewport: egui::Rect,
+        rect: egui::Rect,
         frame: &eframe::Frame,
     ) {
-        let style = self.preferences.navigation_widget;
-        if style == crate::preferences::NavigationWidget::Hidden {
-            return;
-        }
         let Some(wgpu_state) = frame.wgpu_render_state() else {
             return;
         };
@@ -19633,22 +19605,52 @@ impl VisionaryApp {
         if crate::orientation_widget::orientation_widget(
             ui,
             viewport,
-            self.viewport_toolbar_rect,
-            style,
+            rect,
+            self.preferences.navigation_widget,
+            self.preferences.navigation_scheme,
             &mut rs.camera,
         ) {
             ui.ctx().request_repaint();
         }
     }
 
-    /// Viewport display options, drawn over the model's top-left corner.
-    fn draw_viewport_toolbar(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
-        let area = egui::Rect::from_min_size(
-            viewport.left_top() + egui::vec2(8.0, 8.0),
-            egui::vec2(
-                (viewport.width() - 16.0).max(0.0),
-                (viewport.height() - 16.0).max(0.0),
-            ),
+    /// The viewport toolbar: what the open move or costume adds to the view, and the way back
+    /// to the default view once the camera has moved. Not drawn with nothing to show.
+    fn draw_viewport_toolbar(
+        &mut self,
+        ui: &mut Ui,
+        viewport: egui::Rect,
+        at: egui::Pos2,
+        frame: &eframe::Frame,
+    ) {
+        let home = self.preferences.home_camera();
+        let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
+            wgpu_state
+                .renderer
+                .read()
+                .callback_resources
+                .get::<HitboxRenderState>()
+                .is_some_and(|rs| !rs.camera.is_at(&home))
+        });
+        let scales = self.viewport_scales();
+        let scaled: Vec<(&str, &ScaleValue, &String)> = [
+            ("Scale", &scales.model),
+            ("hit", &scales.attack),
+            ("grab", &scales.grab),
+        ]
+        .into_iter()
+        .filter(|(_, scale)| (scale.value - 1.0).abs() > 1e-4)
+        .map(|(name, scale)| (name, scale, &scale.source))
+        .collect();
+        let throw = self.selected_move_is_throw();
+        if !camera_moved && scaled.is_empty() && !throw && self.viewport_file_sources.is_empty() {
+            self.viewport_toolbar_rect = None;
+            self.viewport_overlays.toolbar = None;
+            return;
+        }
+        let area = egui::Rect::from_min_max(
+            at,
+            viewport.max - egui::Vec2::splat(crate::viewport_overlays::MARGIN),
         );
         let mut toolbar = ui.new_child(
             egui::UiBuilder::new()
@@ -19659,85 +19661,55 @@ impl VisionaryApp {
             .inner_margin(egui::Margin::symmetric(6, 2))
             .show(&mut toolbar, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    let home = self.preferences.home_camera();
-                    let camera_moved = frame.wgpu_render_state().is_some_and(|wgpu_state| {
-                        wgpu_state
-                            .renderer
-                            .read()
-                            .callback_resources
-                            .get::<HitboxRenderState>()
-                            .is_some_and(|rs| !rs.camera.is_at(&home))
-                    });
-                    let hint = navigation_hint(&self.preferences);
-                    if ui
-                        .add_enabled(camera_moved, egui::Button::new("⟲"))
-                        .on_hover_text(format!(
-                            "Reset view: back to the default view. {hint}. Numpad 1, 3 and 7 \
-                             look from the front, right and top; Home frames the fighter and \
-                             Period the selected hitbox."
-                        ))
-                        .on_disabled_hover_text(format!(
-                            "{hint}. This button returns to the default view."
-                        ))
-                        .clicked()
-                    {
-                        reset_viewport_camera(frame, &home);
-                        ui.ctx().request_repaint();
-                    }
-                    let scales = self.viewport_scales();
-                    if [&scales.model, &scales.attack, &scales.grab]
-                        .iter()
-                        .any(|scale| (scale.value - 1.0).abs() > 1e-4)
-                    {
-                        ui.separator();
-                        let uniform = scales.attack.value == scales.model.value
-                            && scales.grab.value == scales.model.value;
-                        let text = if uniform {
-                            format!("Scale {:.2}", scales.model.value)
-                        } else {
-                            format!(
-                                "Scale {:.2} · hit {:.2} · grab {:.2}",
-                                scales.model.value, scales.attack.value, scales.grab.value
-                            )
+                    // Between two items, never before the first or after the last.
+                    let mut drawn = false;
+                    let mut separate = |ui: &mut Ui| {
+                        if std::mem::replace(&mut drawn, true) {
+                            ui.separator();
+                        }
+                    };
+                    if !scaled.is_empty() {
+                        separate(ui);
+                        let line = |each: &dyn Fn(&(&str, &ScaleValue, &String)) -> String| {
+                            scaled.iter().map(each).collect::<Vec<_>>()
                         };
-                        ui.label(RichText::new(text).small().weak())
-                            .on_hover_text(format!(
-                                "The fighter is drawn at the scales the game would give it:\n\n\
-                             Model (ModelModule::set_scale): {:.3}, from {}\n\
-                             Hitboxes (AttackModule::set_attack_scale): {:.3}, from {}\n\
-                             Grab boxes (GrabModule::set_size_mul): {:.3}, from {}\n\n\
-                             A call in the fighter's frame callback (on_line) wins over the \
-                             fighter_param scale. Branches that only run on the results screen \
-                             or on entry are skipped.",
-                                scales.model.value,
-                                scales.model.source,
-                                scales.attack.value,
-                                scales.attack.source,
-                                scales.grab.value,
-                                scales.grab.source,
-                            ));
+                        let text = line(&|(name, scale, _)| format!("{name} {:.2}", scale.value));
+                        let from = line(&|(name, scale, set_by)| {
+                            format!("{name} {:.3} from {set_by}", scale.value)
+                        });
+                        ui.label(RichText::new(text.join(" · ")).small().weak())
+                            .on_hover_text(from.join("\n"));
                     }
-                    if self.selected_move_is_throw() {
-                        ui.separator();
+                    if throw {
+                        separate(ui);
                         self.draw_thrown_victim_controls(ui);
                     }
                     for source in &self.viewport_file_sources {
-                        ui.separator();
+                        separate(ui);
                         ui.label(
                             RichText::new(format!("{}: {}", source.label, source.summary))
                                 .small()
                                 .weak(),
                         )
-                        .on_hover_text(format!(
-                            "Files this costume's {} folder doesn't hold itself, loaded from where \
-                             ARCropolis would load them:\n\n{}",
-                            source.label.to_lowercase(),
-                            source.detail
+                        .on_hover_text(source.detail.as_str());
+                    }
+                    // Last, so the rest of the row stays put when the camera moves.
+                    if camera_moved {
+                        separate(ui);
+                        let reset = ui.button("⟲").on_hover_text(format!(
+                            "Reset view\n\n{}.\n1, 3 and 7 look from the front, right and top. \
+                             Home frames the fighter and Period the selected hitbox.",
+                            navigation_hint(&self.preferences)
                         ));
+                        if reset.clicked() {
+                            reset_viewport_camera(frame, &home);
+                            ui.ctx().request_repaint();
+                        }
                     }
                 });
             });
         self.viewport_toolbar_rect = Some(inner.response.rect);
+        self.viewport_overlays.toolbar = Some(inner.response.rect.size());
     }
 
     fn draw_hurtbox_toggle(&mut self, ui: &mut Ui) {
