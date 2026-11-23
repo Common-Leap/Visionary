@@ -85,7 +85,8 @@ fn is_yaml(path: &Path) -> bool {
 }
 
 pub fn load(path: &Path) -> anyhow::Result<MList> {
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if is_yaml(path) {
         from_yaml(&String::from_utf8_lossy(&bytes))
     } else {
@@ -348,7 +349,10 @@ mod tests {
                 name: Hash40::new(anim),
                 unk: 0,
             }],
-            scripts: vec![Hash40::new("effect_attack11"), Hash40::new("sound_attack11")],
+            scripts: vec![
+                Hash40::new("effect_attack11"),
+                Hash40::new("sound_attack11"),
+            ],
             extra: Some(Extra {
                 xlu_start: 1,
                 xlu_end: 2,
@@ -363,8 +367,12 @@ mod tests {
             motion_path: Hash40::new("fighter/mario/motion/body"),
             ..Default::default()
         };
-        mlist.list.insert(Hash40::new("attack_11"), motion("a00attack11.nuanmb"));
-        mlist.list.insert(Hash40::new("wait"), motion("a00wait1.nuanmb"));
+        mlist
+            .list
+            .insert(Hash40::new("attack_11"), motion("a00attack11.nuanmb"));
+        mlist
+            .list
+            .insert(Hash40::new("wait"), motion("a00wait1.nuanmb"));
         mlist
     }
 
@@ -387,7 +395,12 @@ mod tests {
     #[test]
     fn rename_preserves_order_and_rejects_existing() {
         let mut list = mlist();
-        rename_motion(&mut list, Hash40::new("attack_11"), Hash40::new("attack_12")).unwrap();
+        rename_motion(
+            &mut list,
+            Hash40::new("attack_11"),
+            Hash40::new("attack_12"),
+        )
+        .unwrap();
         let keys: Vec<_> = list.list.keys().copied().collect();
         assert_eq!(vec![Hash40::new("attack_12"), Hash40::new("wait")], keys);
         assert!(rename_motion(&mut list, Hash40::new("attack_12"), Hash40::new("wait")).is_err());
@@ -397,10 +410,18 @@ mod tests {
     fn insert_after_selected() {
         let mut mlist = mlist();
         let key = Hash40::new("attack_12");
-        insert_motion_after(&mut mlist, Some(Hash40::new("attack_11")), key, Motion::default())
-            .unwrap();
+        insert_motion_after(
+            &mut mlist,
+            Some(Hash40::new("attack_11")),
+            key,
+            Motion::default(),
+        )
+        .unwrap();
         let keys: Vec<_> = mlist.list.keys().copied().collect();
-        assert_eq!(vec![Hash40::new("attack_11"), key, Hash40::new("wait")], keys);
+        assert_eq!(
+            vec![Hash40::new("attack_11"), key, Hash40::new("wait")],
+            keys
+        );
     }
 
     #[test]
@@ -434,6 +455,9 @@ mod tests {
         save(&tmp.path().join("motion_list.yml"), &mlist()).unwrap();
         let loaded = load_current_in(tmp.path()).unwrap();
         assert_eq!(loaded.list[0].extra.as_ref().unwrap().cancel_frame, 20);
-        assert_eq!(editable_in(tmp.path()), Some(tmp.path().join("motion_list.yml")));
+        assert_eq!(
+            editable_in(tmp.path()),
+            Some(tmp.path().join("motion_list.yml"))
+        );
     }
 }

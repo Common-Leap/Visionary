@@ -367,9 +367,21 @@ mod tests {
             format!("macros::EFFECT_FOLLOW(agent, Hash40::new(\"{name}\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, true);")
         };
         let scripts = vec![
-            ("pacman".to_owned(), "effect_attacklw3".to_owned(), spawn("carrot_pull")),
-            ("pacman".to_owned(), "game_attacklw3".to_owned(), spawn("carrot_pull")),
-            ("pacman_bigpacman".to_owned(), "effect_specialnhop".to_owned(), spawn("fryguy_fire")),
+            (
+                "pacman".to_owned(),
+                "effect_attacklw3".to_owned(),
+                spawn("carrot_pull"),
+            ),
+            (
+                "pacman".to_owned(),
+                "game_attacklw3".to_owned(),
+                spawn("carrot_pull"),
+            ),
+            (
+                "pacman_bigpacman".to_owned(),
+                "effect_specialnhop".to_owned(),
+                spawn("fryguy_fire"),
+            ),
         ];
         let uses = project_uses("pacman", &scripts);
         let carrot = &uses[&crate::app::effect_name_hash("carrot_pull")];
@@ -382,7 +394,10 @@ mod tests {
             }],
             "one use however many of the move's scripts spawn it"
         );
-        assert!(script_is_for_motion(carrot[0].script.as_deref().unwrap(), "attack_lw3"));
+        assert!(script_is_for_motion(
+            carrot[0].script.as_deref().unwrap(),
+            "attack_lw3"
+        ));
         assert_eq!(
             uses[&crate::app::effect_name_hash("fryguy_fire")],
             vec![EffectUse {

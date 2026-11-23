@@ -112,8 +112,14 @@ pub fn read_clones(
             out.unresolved.push(UnresolvedClone {
                 file: helper.file.clone(),
                 line,
-                text: lines.get(line - 1).map(|l| l.trim().to_string()).unwrap_or_default(),
-                reason: format!("made inside helper `{}`, whose callers Visionary couldn't follow", helper.name),
+                text: lines
+                    .get(line - 1)
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default(),
+                reason: format!(
+                    "made inside helper `{}`, whose callers Visionary couldn't follow",
+                    helper.name
+                ),
             });
         }
     }
@@ -182,7 +188,10 @@ impl<'ast> syn::visit::Visit<'ast> for NamedConsts {
     fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
         let name = item.ident.to_string();
         match strip(&item.expr) {
-            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => {
                 Self::note(&mut self.strings, name, s.value());
             }
             syn::Expr::Path(p) => {
@@ -353,7 +362,11 @@ fn clone_reads_any(block: &syn::Block, params: &[String]) -> bool {
             }
         }
     }
-    let mut probe = Probe { params, in_clone: false, found: false };
+    let mut probe = Probe {
+        params,
+        in_clone: false,
+        found: false,
+    };
     syn::visit::Visit::visit_block(&mut probe, block);
     probe.found
 }
@@ -455,17 +468,34 @@ impl Reader<'_> {
     /// file path ends with that module trail and never falls back to a local helper. A path
     /// through a type (`Arc::clone(..)`) is never a helper.
     fn helper_for(&self, call: &syn::ExprCall) -> HelperLookup {
-        let syn::Expr::Path(p) = call.func.as_ref() else { return HelperLookup::None };
-        let segments: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
-        let Some((name, modules)) = segments.split_last() else { return HelperLookup::None };
-        if modules.iter().any(|m| m.starts_with(|c: char| c.is_ascii_uppercase())) {
+        let syn::Expr::Path(p) = call.func.as_ref() else {
+            return HelperLookup::None;
+        };
+        let segments: Vec<String> = p
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        let Some((name, modules)) = segments.split_last() else {
+            return HelperLookup::None;
+        };
+        if modules
+            .iter()
+            .any(|m| m.starts_with(|c: char| c.is_ascii_uppercase()))
+        {
             return HelperLookup::None;
         }
         let fits: Vec<&CloneHelper> = self
             .helpers
             .iter()
             .filter(|h| h.name == *name && h.params.len() == call.args.len())
-            .filter(|h| !self.inlining.iter().any(|((file, line), _, _)| *file == h.file && *line == h.line))
+            .filter(|h| {
+                !self
+                    .inlining
+                    .iter()
+                    .any(|((file, line), _, _)| *file == h.file && *line == h.line)
+            })
             .collect();
         if fits.is_empty() {
             return HelperLookup::None;
@@ -495,10 +525,15 @@ impl Reader<'_> {
             return pick(matched);
         }
         if modules.iter().any(|m| m == "super") {
-            let external: Vec<&CloneHelper> = fits.into_iter().filter(|h| h.file != self.file).collect();
+            let external: Vec<&CloneHelper> =
+                fits.into_iter().filter(|h| h.file != self.file).collect();
             return pick(external);
         }
-        let local: Vec<&CloneHelper> = fits.iter().copied().filter(|h| h.file == self.file).collect();
+        let local: Vec<&CloneHelper> = fits
+            .iter()
+            .copied()
+            .filter(|h| h.file == self.file)
+            .collect();
         if modules.iter().any(|m| m == "self") {
             return pick(local);
         }
@@ -526,9 +561,19 @@ impl Reader<'_> {
         let (line, text, reason) = match self.inlining.first() {
             Some((_, line, text)) => {
                 let helper = self.inlining.last().and_then(|((file, at), _, _)| {
-                    self.helpers.iter().find(|h| h.file == *file && h.line == *at).map(|h| h.name.clone())
+                    self.helpers
+                        .iter()
+                        .find(|h| h.file == *file && h.line == *at)
+                        .map(|h| h.name.clone())
                 });
-                (*line, text.clone(), format!("{reason} (made inside helper `{}`)", helper.unwrap_or_default()))
+                (
+                    *line,
+                    text.clone(),
+                    format!(
+                        "{reason} (made inside helper `{}`)",
+                        helper.unwrap_or_default()
+                    ),
+                )
             }
             None => (Self::line_of(span), self.text_of(span), reason),
         };
@@ -567,12 +612,23 @@ impl Reader<'_> {
         self.string_arg_in(expr, what, self.env.len(), 0)
     }
 
-    fn string_arg_in(&self, expr: &syn::Expr, what: &str, scope: usize, depth: usize) -> Result<String, String> {
+    fn string_arg_in(
+        &self,
+        expr: &syn::Expr,
+        what: &str,
+        scope: usize,
+        depth: usize,
+    ) -> Result<String, String> {
         if depth > MAX_BINDING_DEPTH {
-            return Err(format!("the {what} goes through more bindings than Visionary follows"));
+            return Err(format!(
+                "the {what} goes through more bindings than Visionary follows"
+            ));
         }
         match strip(expr) {
-            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Ok(s.value()),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Ok(s.value()),
             syn::Expr::Path(p) if p.path.segments.len() == 1 => {
                 let name = p.path.segments[0].ident.to_string();
                 if let Some((at, bound)) = self.lookup_env(&name, scope) {
@@ -582,7 +638,9 @@ impl Reader<'_> {
                     format!("the {what} is `{name}`, which is not a string literal or a `const &str` in the project")
                 })
             }
-            _ => Err(format!("the {what} is computed, not a string literal or a `const &str`")),
+            _ => Err(format!(
+                "the {what} is computed, not a string literal or a `const &str`"
+            )),
         }
     }
 
@@ -593,10 +651,14 @@ impl Reader<'_> {
 
     fn kind_arg_in(&self, expr: &syn::Expr, scope: usize, depth: usize) -> Result<String, String> {
         if depth > MAX_BINDING_DEPTH {
-            return Err("the source weapon kind goes through more bindings than Visionary follows".into());
+            return Err(
+                "the source weapon kind goes through more bindings than Visionary follows".into(),
+            );
         }
         let Some(name) = path_name(expr) else {
-            return Err("the source weapon kind is computed, not a `WEAPON_KIND_…` constant".into());
+            return Err(
+                "the source weapon kind is computed, not a `WEAPON_KIND_…` constant".into(),
+            );
         };
         if let Some((at, bound)) = self.lookup_env(&name, scope) {
             return self.kind_arg_in(bound, at, depth + 1);
@@ -612,7 +674,10 @@ impl Reader<'_> {
 
     fn bool_arg(expr: &syn::Expr) -> Result<bool, String> {
         match strip(expr) {
-            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) => Ok(b.value),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Bool(b),
+                ..
+            }) => Ok(b.value),
             _ => Err("use_original_code is not a literal `true` or `false`".into()),
         }
     }
@@ -637,12 +702,17 @@ impl Reader<'_> {
         let built = match args.len() {
             5 => self.resolve_old(&args, discarded),
             4 => self.resolve_new(&args),
-            n => Err(format!("clone_weapon takes 4 or 5 arguments, this call has {n}")),
+            n => Err(format!(
+                "clone_weapon takes 4 or 5 arguments, this call has {n}"
+            )),
         };
         match built {
             Ok(mut decl) => {
                 decl.file = self.file.clone();
-                decl.line = self.inlining.first().map_or_else(|| Self::line_of(call.span()), |(_, line, _)| *line);
+                decl.line = self
+                    .inlining
+                    .first()
+                    .map_or_else(|| Self::line_of(call.span()), |(_, line, _)| *line);
                 self.decls.push(decl);
                 Some(self.decls.len() - 1)
             }
@@ -705,7 +775,9 @@ impl Reader<'_> {
         if self.inline_store(target, value) {
             return true;
         }
-        let Some(call) = find_clone_call(value) else { return false };
+        let Some(call) = find_clone_call(value) else {
+            return false;
+        };
         let id = self.resolve(call, false);
         if let (Some(index), Some(name)) = (id, target_name(target)) {
             self.decls[index].id_bindings.push(name);
@@ -716,7 +788,9 @@ impl Reader<'_> {
 
     /// `A.get_or_init(|| clone_weapon(..).generate_id)` / `A = clone_weapon(..).weapon_id`.
     fn inline_store(&mut self, target: &syn::Expr, value: &syn::Expr) -> bool {
-        let Some((call, field)) = inline_field(value) else { return false };
+        let Some((call, field)) = inline_field(value) else {
+            return false;
+        };
         if let Some(index) = self.resolve(call, false) {
             if let Some(name) = target_name(target) {
                 if field == "id" {
@@ -733,18 +807,35 @@ impl Reader<'_> {
     /// The decl indices a statement list's `let v = clone_weapon(..)` produced, with their binding
     /// names taken from the statements that follow it in the same block.
     fn let_binding(&mut self, local: &syn::Local, rest: &[syn::Stmt]) -> bool {
-        let Some(init) = &local.init else { return false };
-        let Some(call) = find_clone_call(&init.expr) else { return false };
+        let Some(init) = &local.init else {
+            return false;
+        };
+        let Some(call) = find_clone_call(&init.expr) else {
+            return false;
+        };
         let var = match &local.pat {
             syn::Pat::Ident(p) => Some(p.ident.to_string()),
             _ => None,
         };
-        let Some(index) = self.resolve(call, false) else { return true };
+        let Some(index) = self.resolve(call, false) else {
+            return true;
+        };
         if let Some(var) = var {
             // The old signature returns the id itself, so the variable is the id.
             let direct = call.args.len() == 5;
-            let pointers = self.env.iter().filter_map(|(name, arg)| Some((name.clone(), pointee(arg)?))).collect();
-            let mut finder = BindingFinder { var, direct, aliases: Vec::new(), pointers, ids: Vec::new(), kinds: Vec::new() };
+            let pointers = self
+                .env
+                .iter()
+                .filter_map(|(name, arg)| Some((name.clone(), pointee(arg)?)))
+                .collect();
+            let mut finder = BindingFinder {
+                var,
+                direct,
+                aliases: Vec::new(),
+                pointers,
+                ids: Vec::new(),
+                kinds: Vec::new(),
+            };
             for stmt in rest {
                 syn::visit::Visit::visit_stmt(&mut finder, stmt);
             }
@@ -839,7 +930,10 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
                     .map(|h| format!("{}:{}", h.file.display(), h.line))
                     .collect();
                 where_list.sort();
-                let name = candidates.first().map(|h| h.name.as_str()).unwrap_or("helper");
+                let name = candidates
+                    .first()
+                    .map(|h| h.name.as_str())
+                    .unwrap_or("helper");
                 self.report(
                     call,
                     format!(
@@ -859,7 +953,11 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
         // A helper's own body is read at each of its calls, where its arguments are known. Only
         // that function: another of the same name is read as usual.
         let line = item.sig.fn_token.span().start().line;
-        if self.helpers.iter().any(|h| h.file == self.file && h.line == line) {
+        if self
+            .helpers
+            .iter()
+            .any(|h| h.file == self.file && h.line == line)
+        {
             return;
         }
         syn::visit::visit_item_fn(self, item);
@@ -874,7 +972,9 @@ impl<'ast> syn::visit::Visit<'ast> for Reader<'_> {
         collect_pat_names(&node.pat, &mut names);
         let unrollable = elements.as_ref().is_some_and(|els| {
             els.iter().all(|e| match (&names, strip(e)) {
-                (n, syn::Expr::Tuple(t)) if matches!(*node.pat, syn::Pat::Tuple(_)) => t.elems.len() == n.len(),
+                (n, syn::Expr::Tuple(t)) if matches!(*node.pat, syn::Pat::Tuple(_)) => {
+                    t.elems.len() == n.len()
+                }
                 (n, _) => n.len() == 1 && matches!(*node.pat, syn::Pat::Ident(_)),
             })
         });
@@ -958,7 +1058,12 @@ impl BindingFinder {
                 syn::visit::visit_expr_field(self, f);
             }
         }
-        let mut probe = Probe { var: &self.var, direct: self.direct, aliases: &self.aliases, found: None };
+        let mut probe = Probe {
+            var: &self.var,
+            direct: self.direct,
+            aliases: &self.aliases,
+            found: None,
+        };
         syn::visit::Visit::visit_expr(&mut probe, expr);
         probe.found
     }
@@ -966,13 +1071,25 @@ impl BindingFinder {
     fn store(&mut self, target: &syn::Expr, value: &syn::Expr) {
         let through_pointer = match target {
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => path_name(&u.expr)
-                .and_then(|param| self.pointers.iter().find(|(p, _)| *p == param).map(|(_, to)| to.clone())),
+                .and_then(|param| {
+                    self.pointers
+                        .iter()
+                        .find(|(p, _)| *p == param)
+                        .map(|(_, to)| to.clone())
+                }),
             _ => None,
         };
-        let (Some(name), Some(field)) = (through_pointer.or_else(|| target_name(target)), self.field_of(value)) else {
+        let (Some(name), Some(field)) = (
+            through_pointer.or_else(|| target_name(target)),
+            self.field_of(value),
+        ) else {
             return;
         };
-        let list = if field == "id" { &mut self.ids } else { &mut self.kinds };
+        let list = if field == "id" {
+            &mut self.ids
+        } else {
+            &mut self.kinds
+        };
         if !list.contains(&name) {
             list.push(name);
         }
@@ -1020,7 +1137,17 @@ mod tests {
     }
 
     fn run_many(files: &[(&str, &str)]) -> (Vec<CloneDecl>, Vec<UnresolvedClone>) {
-        run_dirs(files, &["mario", "miiswordsman", "link", "kingteresa", "mii", "buddy"])
+        run_dirs(
+            files,
+            &[
+                "mario",
+                "miiswordsman",
+                "link",
+                "kingteresa",
+                "mii",
+                "buddy",
+            ],
+        )
     }
 
     fn run_dirs(files: &[(&str, &str)], dirs: &[&str]) -> (Vec<CloneDecl>, Vec<UnresolvedClone>) {
@@ -1050,7 +1177,10 @@ pub fn install() {
         assert_eq!(d[0].src_owner.as_deref(), Some("mario"));
         assert_eq!(d[0].src_kind, "WEAPON_KIND_MARIO_FIREBALL");
         assert!(!d[0].use_original_code);
-        assert_eq!(d[0].id_bindings, ["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"]);
+        assert_eq!(
+            d[0].id_bindings,
+            ["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"]
+        );
         assert!(d[0].kind_bindings.is_empty());
         assert_eq!(d[0].line, 4);
     }
@@ -1092,10 +1222,16 @@ pub fn smashline_install() {
         assert_eq!(d[0].new_name, "fireball");
         assert_eq!(d[0].src_owner.as_deref(), Some("miiswordsman"));
         assert_eq!(d[0].src_kind, "WEAPON_KIND_MIISWORDSMAN_WAVE");
-        assert_eq!(d[0].id_bindings, ["FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL"]);
+        assert_eq!(
+            d[0].id_bindings,
+            ["FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL"]
+        );
         assert_eq!(d[0].kind_bindings, ["WEAPON_KIND_KINGTERESA_FIREBALL"]);
         // Bindings never leak to the next clone; `.set(..)` counts like get_or_init.
-        assert_eq!(d[1].id_bindings, ["FIGHTER_KINGTERESA_GENERATE_ARTICLE_PORTRAIT"]);
+        assert_eq!(
+            d[1].id_bindings,
+            ["FIGHTER_KINGTERESA_GENERATE_ARTICLE_PORTRAIT"]
+        );
         assert!(d[1].kind_bindings.is_empty());
         // No fighter named dolly in the list, so the owner is unknown, not guessed.
         assert_eq!(d[1].src_owner, None);
@@ -1106,7 +1242,10 @@ pub fn smashline_install() {
     #[test]
     fn new_api_source_owner_prefers_longest() {
         let (d, _) = run_dirs(
-            &[("lib.rs", r#"fn f() { let a = clone_weapon("x", "y", *WEAPON_KIND_PTRAINER_LOW_BALL, false); }"#)],
+            &[(
+                "lib.rs",
+                r#"fn f() { let a = clone_weapon("x", "y", *WEAPON_KIND_PTRAINER_LOW_BALL, false); }"#,
+            )],
             &["ptrainer", "ptrainer_low", "mario"],
         );
         assert_eq!(d[0].src_owner.as_deref(), Some("ptrainer_low"));
@@ -1197,7 +1336,10 @@ unsafe fn f(slot: *mut i32) {
         assert_eq!(d.len(), 2);
         for decl in &d {
             assert!(decl.id_bindings.is_empty());
-            assert!(decl.id_note.as_deref().is_some_and(|n| n.contains("does not follow")));
+            assert!(decl
+                .id_note
+                .as_deref()
+                .is_some_and(|n| n.contains("does not follow")));
         }
     }
 
@@ -1245,7 +1387,10 @@ fn install_hook() {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].src_owner.as_deref(), Some("buddy"));
         assert_eq!(d[0].src_kind, "WEAPON_KIND_BUDDY_PAD");
-        assert_eq!(d[0].id_bindings, ["FIGHTER_GOOMBA_GENERATE_ARTICLE_REDSHELL"]);
+        assert_eq!(
+            d[0].id_bindings,
+            ["FIGHTER_GOOMBA_GENERATE_ARTICLE_REDSHELL"]
+        );
         assert_eq!(d[0].file, PathBuf::from("redshell.rs"));
     }
 
@@ -1320,19 +1465,30 @@ fn f() {
     #[test]
     fn bare_call_binds_the_conventional_const() {
         let (d, u) = run_many(&[
-            ("weapons.rs", r#"pub fn install() {
+            (
+                "weapons.rs",
+                r#"pub fn install() {
     clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false);
-}"#),
-            ("consts.rs", "pub mod weapon_kind_ex {
+}"#,
+            ),
+            (
+                "consts.rs",
+                "pub mod weapon_kind_ex {
     pub const FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT:i32 = 0x9;
 }
-"),
+",
+            ),
         ]);
         assert!(u.is_empty(), "{u:?}");
-        assert_eq!(d[0].id_bindings, ["FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT"]);
+        assert_eq!(
+            d[0].id_bindings,
+            ["FIGHTER_MASTER_GENERATE_ARTICLE_PLASMASHOT"]
+        );
         assert_eq!(d[0].id_note, None);
         // Without the const, a bare call still has no id and no note (its id is discarded).
-        let (d, _) = run(r#"fn f() { clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false); }"#);
+        let (d, _) = run(
+            r#"fn f() { clone_weapon("koopa", *WEAPON_KIND_KOOPA_BREATH, "master", "plasmashot", false); }"#,
+        );
         assert!(d[0].id_bindings.is_empty());
         assert_eq!(d[0].id_note, None);
     }
@@ -1365,9 +1521,15 @@ pub(in crate::sceptile) fn register_clones() {
 "#);
         assert!(u.is_empty(), "{u:?}");
         assert_eq!(d.len(), 2, "{d:#?}");
-        assert_eq!((d[0].new_owner.as_str(), d[0].new_name.as_str()), ("mario", "leafstorm"));
+        assert_eq!(
+            (d[0].new_owner.as_str(), d[0].new_name.as_str()),
+            ("mario", "leafstorm")
+        );
         assert_eq!(d[0].src_kind, "WEAPON_KIND_RIDLEY_BREATH");
-        assert_eq!(d[0].id_bindings, ["FIGHTER_MARIO_GENERATE_ARTICLE_LEAF_STORM"]);
+        assert_eq!(
+            d[0].id_bindings,
+            ["FIGHTER_MARIO_GENERATE_ARTICLE_LEAF_STORM"]
+        );
         assert_eq!(d[0].kind_bindings, ["WEAPON_KIND_MARIO_LEAF_STORM"]);
         assert_eq!(d[0].id_note, None);
         assert_eq!(d[0].line, 14, "placed at the call");
@@ -1396,7 +1558,11 @@ fn reg(name: &str) { clone(name, *WEAPON_KIND_MARIO_FIREBALL); }
 "#);
         assert!(d.is_empty(), "{d:#?}");
         assert_eq!(u.len(), 1, "{u:?}");
-        assert!(u[0].reason.contains("name") && u[0].reason.contains("helper `clone`"), "{}", u[0].reason);
+        assert!(
+            u[0].reason.contains("name") && u[0].reason.contains("helper `clone`"),
+            "{}",
+            u[0].reason
+        );
         assert_eq!(u[0].line, 3, "reported at the call");
 
         let (d, u) = run(r#"
@@ -1413,7 +1579,10 @@ fn b(y: &str) { for x in [y] { smashline::clone_weapon("mario", x, *WEAPON_KIND_
 fn reg(y: &str) { a(y); }
 "#);
         assert!(d.is_empty(), "{d:#?}");
-        assert!(!u.is_empty() && u.iter().all(|u| !u.reason.is_empty()), "{u:?}");
+        assert!(
+            !u.is_empty() && u.iter().all(|u| !u.reason.is_empty()),
+            "{u:?}"
+        );
     }
 
     /// I-2: a helper in `util.rs` called from a fighter's module, by a path, and a `self::` call.
@@ -1447,8 +1616,16 @@ fn reg() { self::clone("ball"); }
         let (d, u) = run_many(&[("util.rs", util)]);
         assert!(d.is_empty());
         assert_eq!(u.len(), 1, "{u:?}");
-        assert!(u[0].reason.contains("made inside helper `clone_article`, whose callers Visionary couldn't follow"), "{u:?}");
-        assert_eq!((u[0].file.clone(), u[0].line), (PathBuf::from("util.rs"), 2));
+        assert!(
+            u[0].reason.contains(
+                "made inside helper `clone_article`, whose callers Visionary couldn't follow"
+            ),
+            "{u:?}"
+        );
+        assert_eq!(
+            (u[0].file.clone(), u[0].line),
+            (PathBuf::from("util.rs"), 2)
+        );
 
         // A function sharing the helper's name in another file is still read.
         let other = r#"fn clone_article() { let _ = smashline::clone_weapon("mario", "orb", *WEAPON_KIND_MARIO_FIREBALL, false); }"#;

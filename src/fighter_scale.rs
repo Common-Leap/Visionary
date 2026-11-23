@@ -242,8 +242,12 @@ fn agent_new(expr: &syn::Expr) -> Option<String> {
             let syn::Expr::Path(func) = &*call.func else {
                 return None;
             };
-            let segments: Vec<String> =
-                func.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let segments: Vec<String> = func
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
             if !segments.ends_with(&["Agent".to_string(), "new".to_string()]) {
                 return None;
             }
@@ -265,9 +269,9 @@ fn agent_new(expr: &syn::Expr) -> Option<String> {
 fn chain_agent(expr: &syn::Expr, bindings: &HashMap<String, String>) -> Option<String> {
     match expr {
         syn::Expr::MethodCall(call) => chain_agent(&call.receiver, bindings),
-        syn::Expr::Path(path) if path.path.segments.len() == 1 => {
-            bindings.get(&path.path.segments[0].ident.to_string()).cloned()
-        }
+        syn::Expr::Path(path) if path.path.segments.len() == 1 => bindings
+            .get(&path.path.segments[0].ident.to_string())
+            .cloned(),
         syn::Expr::Reference(reference) => chain_agent(&reference.expr, bindings),
         syn::Expr::Paren(paren) => chain_agent(&paren.expr, bindings),
         _ => agent_new(expr),
@@ -343,7 +347,13 @@ enum Flow {
 }
 
 impl<'a> Walker<'a> {
-    fn walk_fn(&mut self, file: &'a Path, item: &'a syn::ItemFn, args: Vec<Option<f32>>, depth: usize) {
+    fn walk_fn(
+        &mut self,
+        file: &'a Path,
+        item: &'a syn::ItemFn,
+        args: Vec<Option<f32>>,
+        depth: usize,
+    ) {
         let name = item.sig.ident.to_string();
         if depth > MAX_DEPTH || !self.stack.insert(name.clone()) {
             return;
@@ -360,12 +370,21 @@ impl<'a> Walker<'a> {
         self.stack.remove(&name);
     }
 
-    fn walk_block(&mut self, file: &'a Path, block: &'a syn::Block, env: &mut Env, depth: usize) -> Flow {
+    fn walk_block(
+        &mut self,
+        file: &'a Path,
+        block: &'a syn::Block,
+        env: &mut Env,
+        depth: usize,
+    ) -> Flow {
         let scope = env.len();
         for stmt in &block.stmts {
             let flow = match stmt {
                 syn::Stmt::Local(local) => {
-                    let value = local.init.as_ref().and_then(|init| self.value(&init.expr, env));
+                    let value = local
+                        .init
+                        .as_ref()
+                        .and_then(|init| self.value(&init.expr, env));
                     if let Some(init) = &local.init {
                         if self.walk_expr(file, &init.expr, env, depth) == Flow::Return {
                             env.truncate(scope);
@@ -393,7 +412,13 @@ impl<'a> Walker<'a> {
         Flow::Next
     }
 
-    fn walk_expr(&mut self, file: &'a Path, expr: &'a syn::Expr, env: &mut Env, depth: usize) -> Flow {
+    fn walk_expr(
+        &mut self,
+        file: &'a Path,
+        expr: &'a syn::Expr,
+        env: &mut Env,
+        depth: usize,
+    ) -> Flow {
         match expr {
             syn::Expr::Return(_) => Flow::Return,
             syn::Expr::Block(block) => self.walk_block(file, &block.block, env, depth),
@@ -413,9 +438,19 @@ impl<'a> Walker<'a> {
                 let syn::Expr::Path(func) = &*call.func else {
                     return Flow::Next;
                 };
-                let segments: Vec<String> =
-                    func.path.segments.iter().map(|s| s.ident.to_string()).collect();
-                let tail: Vec<&str> = segments.iter().rev().take(2).rev().map(String::as_str).collect();
+                let segments: Vec<String> = func
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let tail: Vec<&str> = segments
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .rev()
+                    .map(String::as_str)
+                    .collect();
                 let kind = match tail.as_slice() {
                     ["ModelModule", "set_scale"] => Some(Kind::Model),
                     ["AttackModule", "set_attack_scale"] => Some(Kind::Attack),
@@ -423,7 +458,9 @@ impl<'a> Walker<'a> {
                     _ => None,
                 };
                 if let Some(kind) = kind {
-                    if let Some(value) = call.args.iter().nth(1).and_then(|arg| self.value(arg, env)) {
+                    if let Some(value) =
+                        call.args.iter().nth(1).and_then(|arg| self.value(arg, env))
+                    {
                         self.record(kind, value, file, call.span().start().line);
                     }
                     return Flow::Next;
@@ -503,7 +540,10 @@ impl<'a> Walker<'a> {
                 ..
             }) => self.value(expr, env).map(|v| -v),
             syn::Expr::Binary(binary) => {
-                let (left, right) = (self.value(&binary.left, env)?, self.value(&binary.right, env)?);
+                let (left, right) = (
+                    self.value(&binary.left, env)?,
+                    self.value(&binary.right, env)?,
+                );
                 match binary.op {
                     syn::BinOp::Add(_) => Some(left + right),
                     syn::BinOp::Sub(_) => Some(left - right),
@@ -687,12 +727,18 @@ pub(super) fn install(agent: &mut Agent) {
     agent.on_line(Main, shyguy_frame).on_start(on_start);
 }
 "#;
-        let found = scan_texts(&[("util.rs", SHYGUY_UTIL), ("frame.rs", frame)], Some("pacman"));
+        let found = scan_texts(
+            &[("util.rs", SHYGUY_UTIL), ("frame.rs", frame)],
+            Some("pacman"),
+        );
         let scales = &found["pacman"];
         assert_eq!(scales.model.as_ref().map(|c| c.value), Some(0.8));
         assert_eq!(scales.attack.as_ref().map(|c| c.value), Some(0.8));
         assert_eq!(scales.grab.as_ref().map(|c| c.value), Some(0.8));
-        assert_eq!(scales.model.as_ref().unwrap().file, PathBuf::from("util.rs"));
+        assert_eq!(
+            scales.model.as_ref().unwrap().file,
+            PathBuf::from("util.rs")
+        );
     }
 
     #[test]
@@ -777,6 +823,9 @@ fn install(agent: &mut Agent) { agent.on_line(Main, frame); }
     fn param_config_override() {
         let text = "param_config::update_float_2(-(*FIGHTER_KIND_PACMAN), slots.clone(), (hash40(\"scale\"), 0, 0.8));";
         assert_eq!(param_config_scale([text]), Some(0.8));
-        assert_eq!(param_config_scale(["// update_float_2(x, (hash40(\"scale\"), 0, 0.8));"]), None);
+        assert_eq!(
+            param_config_scale(["// update_float_2(x, (hash40(\"scale\"), 0, 0.8));"]),
+            None
+        );
     }
 }

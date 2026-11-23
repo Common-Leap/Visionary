@@ -79,7 +79,9 @@ impl ArticleCatalog {
         let fighter = fighter.to_lowercase();
         // (every script the source registers for the agent, those registered twice)
         let scripts_of = |agent: &str| -> (Vec<String>, Vec<String>) {
-            let Some(index) = index else { return (Vec::new(), Vec::new()) };
+            let Some(index) = index else {
+                return (Vec::new(), Vec::new());
+            };
             let mut scripts: Vec<String> = index
                 .fighters
                 .get(agent)
@@ -99,7 +101,10 @@ impl ArticleCatalog {
             (scripts, conflicts)
         };
 
-        let clones: Vec<&CloneDecl> = clones.iter().filter(|d| d.new_owner.eq_ignore_ascii_case(&fighter)).collect();
+        let clones: Vec<&CloneDecl> = clones
+            .iter()
+            .filter(|d| d.new_owner.eq_ignore_ascii_case(&fighter))
+            .collect();
         // A folder a clone of this fighter adds is that clone's, not a vanilla article: the
         // moveset ships the clone's model under its new owner (Latios's `samus/model/lativolt`).
         let cloned: BTreeSet<String> = clones.iter().map(|d| d.new_name.to_lowercase()).collect();
@@ -153,7 +158,11 @@ impl ArticleCatalog {
                         "{}/{}{}",
                         d.src_owner.as_deref().unwrap_or("?"),
                         d.src_kind,
-                        if d.use_original_code { " with its original code" } else { "" }
+                        if d.use_original_code {
+                            " with its original code"
+                        } else {
+                            ""
+                        }
                     )
                 };
                 if (&kept.src_owner, &kept.src_kind, kept.use_original_code)
@@ -204,7 +213,10 @@ impl ArticleCatalog {
                 clone_conflicts: Vec::new(),
             });
         }
-        Self { articles, unresolved_clones: unresolved }
+        Self {
+            articles,
+            unresolved_clones: unresolved,
+        }
     }
 
     /// The article an id expression names. `locals` maps a local binding to its initializer text.
@@ -212,7 +224,12 @@ impl ArticleCatalog {
         self.resolve_depth(expr, locals, 0)
     }
 
-    fn resolve_depth(&self, expr: &str, locals: &HashMap<String, String>, depth: usize) -> Option<&Article> {
+    fn resolve_depth(
+        &self,
+        expr: &str,
+        locals: &HashMap<String, String>,
+        depth: usize,
+    ) -> Option<&Article> {
         if depth > 8 {
             return None;
         }
@@ -240,7 +257,11 @@ impl ArticleCatalog {
         if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return None;
         }
-        if let Some(found) = self.articles.iter().find(|a| a.id_symbols.iter().any(|s| s == ident)) {
+        if let Some(found) = self
+            .articles
+            .iter()
+            .find(|a| a.id_symbols.iter().any(|s| s == ident))
+        {
             return Some(found);
         }
         if let Some(found) = self.by_vanilla_spelling(ident) {
@@ -263,7 +284,9 @@ impl ArticleCatalog {
         let mut found = self.articles.iter().filter(|a| {
             let owner = a.owner.to_uppercase();
             let owned = head == format!("FIGHTER_{owner}")
-                || head.strip_prefix(&format!("WEAPON_{owner}_")).is_some_and(|rest| !rest.is_empty());
+                || head
+                    .strip_prefix(&format!("WEAPON_{owner}_"))
+                    .is_some_and(|rest| !rest.is_empty());
             // The folder may also carry the owner's name: `peach/motion/peachdaikon`.
             let folder = squash(&a.name);
             owned
@@ -275,7 +298,9 @@ impl ArticleCatalog {
     }
 
     pub fn get(&self, name: &str) -> Option<&Article> {
-        self.articles.iter().find(|a| a.name == name || a.agent == name)
+        self.articles
+            .iter()
+            .find(|a| a.name == name || a.agent == name)
     }
 }
 
@@ -321,7 +346,12 @@ pub fn param_overrides_for(
         .filter(|(_, text)| text.contains("param_config"))
         .collect();
     let (all, unread) = params::param_config_overrides(&sources, fighter_dirs);
-    (all.into_iter().filter(|o| o.is_for_fighter(fighter)).collect(), unread)
+    (
+        all.into_iter()
+            .filter(|o| o.is_for_fighter(fighter))
+            .collect(),
+        unread,
+    )
 }
 
 /// The settings an article's status scripts write, following the project functions they call
@@ -332,11 +362,18 @@ pub fn settings_for(index: &SourceIndex, agent: &str) -> Vec<settings::Setting> 
         return Vec::new();
     }
     let sources = rust_sources(index);
-    let helpers = |caller: &Path, name: &str| -> Option<(std::path::PathBuf, std::ops::Range<usize>, String)> {
+    let helpers = |caller: &Path,
+                   name: &str|
+     -> Option<(std::path::PathBuf, std::ops::Range<usize>, String)> {
         let in_file = |(file, text): &(std::path::PathBuf, String)| {
-            crate::acmd_src::function_item(text, name).map(|span| (file.clone(), span.clone(), text[span].to_string()))
+            crate::acmd_src::function_item(text, name)
+                .map(|span| (file.clone(), span.clone(), text[span].to_string()))
         };
-        if let Some(found) = sources.iter().filter(|(file, _)| file == caller).find_map(in_file) {
+        if let Some(found) = sources
+            .iter()
+            .filter(|(file, _)| file == caller)
+            .find_map(in_file)
+        {
             return Some(found);
         }
         let mut all = sources.iter().filter_map(in_file);
@@ -393,14 +430,21 @@ pub fn install() {
         assert_eq!(c.articles.len(), 1);
         assert_eq!(c.articles[0].name, "fireball");
         assert_eq!(c.articles[0].origin, ArticleOrigin::Vanilla);
-        assert_eq!(c.articles[0].id_symbols, ["FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL"]);
+        assert_eq!(
+            c.articles[0].id_symbols,
+            ["FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL"]
+        );
     }
 
     #[test]
     fn rewritten_when_source_registers_it() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        put(root, "Cargo.toml", "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        put(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        );
         put(root, "src/lib.rs", FLY);
         let index = SourceIndex::build(root).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -411,14 +455,21 @@ pub fn install() {
         assert_eq!(cannon.origin, ArticleOrigin::Rewritten);
         assert_eq!(cannon.agent, "falco_cannon");
         assert_eq!(cannon.source_scripts, ["game_fly"]);
-        assert_eq!(c.get("blaster_bullet").unwrap().origin, ArticleOrigin::Vanilla);
+        assert_eq!(
+            c.get("blaster_bullet").unwrap().origin,
+            ArticleOrigin::Vanilla
+        );
     }
 
     #[test]
     fn duplicate_registration_is_a_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        put(root, "Cargo.toml", "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        put(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        );
         put(root, "src/lib.rs", "mod a;\nmod b;\n");
         put(root, "src/a.rs", FLY);
         put(root, "src/b.rs", FLY);
@@ -433,7 +484,12 @@ pub fn install() {
 
     #[test]
     fn clone_listed_for_new_owner() {
-        let d = decl("samus", "lativolt", &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"], None);
+        let d = decl(
+            "samus",
+            "lativolt",
+            &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"],
+            None,
+        );
         let other = decl("mario", "thing", &["T"], None);
         let tmp = tempfile::tempdir().unwrap();
         let c = ArticleCatalog::build("samus", None, &[d.clone(), other], vec![], tmp.path());
@@ -445,7 +501,10 @@ pub fn install() {
         let unbound = decl("samus", "lativolt", &[], Some("stored in a struct field"));
         let c = ArticleCatalog::build("samus", None, &[unbound], vec![], tmp.path());
         assert_eq!(c.articles.len(), 1, "an unbound clone is still listed");
-        assert_eq!(c.articles[0].id_note.as_deref(), Some("stored in a struct field"));
+        assert_eq!(
+            c.articles[0].id_note.as_deref(),
+            Some("stored in a struct field")
+        );
     }
 
     #[test]
@@ -458,7 +517,12 @@ pub fn install() {
     #[test]
     fn resolves_plain_static() {
         let tmp = tempfile::tempdir().unwrap();
-        let d = decl("samus", "lativolt", &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"], None);
+        let d = decl(
+            "samus",
+            "lativolt",
+            &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"],
+            None,
+        );
         let c = ArticleCatalog::build("samus", None, &[d], vec![], tmp.path());
         let a = c.resolve_id("FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT", &HashMap::new());
         assert_eq!(a.unwrap().name, "lativolt");
@@ -473,7 +537,11 @@ pub fn install() {
             "(*FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL.get().copied().unwrap_or(0)) as i32",
             "FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL.load(Ordering::Relaxed)",
         ] {
-            assert_eq!(c.resolve_id(e, &none).map(|a| a.name.as_str()), Some("fireball"), "{e}");
+            assert_eq!(
+                c.resolve_id(e, &none).map(|a| a.name.as_str()),
+                Some("fireball"),
+                "{e}"
+            );
         }
     }
 
@@ -484,7 +552,10 @@ pub fn install() {
             "generate_id".to_string(),
             "*FIGHTER_PACMAN_GENERATE_ARTICLE_TRAMPOLINE".to_string(),
         )]);
-        assert_eq!(c.resolve_id("generate_id", &locals).unwrap().name, "trampoline");
+        assert_eq!(
+            c.resolve_id("generate_id", &locals).unwrap().name,
+            "trampoline"
+        );
     }
 
     /// Latios-Moveset · src/lib.rs:559 clones `lativolt` onto samus and ships its model as
@@ -495,7 +566,12 @@ pub fn install() {
         let tmp = tempfile::tempdir().unwrap();
         put(tmp.path(), "model/lativolt/c00/a.txt", "");
         put(tmp.path(), "model/cshot/c00/a.txt", "");
-        let d = decl("samus", "lativolt", &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"], None);
+        let d = decl(
+            "samus",
+            "lativolt",
+            &["FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT"],
+            None,
+        );
         let c = ArticleCatalog::build("samus", None, &[d.clone()], vec![], tmp.path());
         let agents: Vec<&str> = c.articles.iter().map(|a| a.agent.as_str()).collect();
         assert_eq!(agents, ["samus_cshot", "samus_lativolt"]);
@@ -510,11 +586,18 @@ pub fn install() {
     fn the_same_clone_declared_twice_is_one_article() {
         let tmp = tempfile::tempdir().unwrap();
         let a = decl("packun", "firebreath", &[], None);
-        let b = CloneDecl { file: PathBuf::from("vendor/lib.rs"), line: 101, ..a.clone() };
+        let b = CloneDecl {
+            file: PathBuf::from("vendor/lib.rs"),
+            line: 101,
+            ..a.clone()
+        };
         let c = ArticleCatalog::build("packun", None, &[a.clone(), b], vec![], tmp.path());
         assert_eq!(c.articles.len(), 1);
         assert_eq!(c.articles[0].origin, ArticleOrigin::Clone(a));
-        assert_eq!(c.articles[0].also_declared, [(PathBuf::from("vendor/lib.rs"), 101)]);
+        assert_eq!(
+            c.articles[0].also_declared,
+            [(PathBuf::from("vendor/lib.rs"), 101)]
+        );
     }
 
     /// R20: two declarations of one clone from different sources are a conflict, kept with both;
@@ -535,11 +618,23 @@ pub fn install() {
         let article = &c.articles[0];
         assert_eq!(article.origin, ArticleOrigin::Clone(a.clone()));
         assert_eq!(article.clone_conflicts.len(), 1);
-        assert!(article.also_declared.is_empty(), "conflict should not duplicate into also_declared");
+        assert!(
+            article.also_declared.is_empty(),
+            "conflict should not duplicate into also_declared"
+        );
         let note = &article.clone_conflicts[0];
-        assert!(note.contains("mario/WEAPON_KIND_MARIO_FIREBALL") && note.contains("koopa/WEAPON_KIND_KOOPA_BREATH"), "{note}");
-        assert!(note.contains("lib.rs:1") && note.contains("vendor/lib.rs:101"), "{note}");
-        assert!(crate::articles::view::clone_notes(article).iter().any(|n| n == note));
+        assert!(
+            note.contains("mario/WEAPON_KIND_MARIO_FIREBALL")
+                && note.contains("koopa/WEAPON_KIND_KOOPA_BREATH"),
+            "{note}"
+        );
+        assert!(
+            note.contains("lib.rs:1") && note.contains("vendor/lib.rs:101"),
+            "{note}"
+        );
+        assert!(crate::articles::view::clone_notes(article)
+            .iter()
+            .any(|n| n == note));
 
         let same = CloneDecl {
             id_bindings: vec!["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH".into()],
@@ -552,12 +647,23 @@ pub fn install() {
         let c = ArticleCatalog::build("packun", None, &[a, same], vec![], tmp.path());
         let article = &c.articles[0];
         assert!(article.clone_conflicts.is_empty());
-        assert_eq!(article.also_declared, [(PathBuf::from("vendor/lib.rs"), 101)]);
-        assert_eq!(article.id_symbols, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
+        assert_eq!(
+            article.also_declared,
+            [(PathBuf::from("vendor/lib.rs"), 101)]
+        );
+        assert_eq!(
+            article.id_symbols,
+            ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]
+        );
         assert_eq!(article.id_note, None);
-        let ArticleOrigin::Clone(kept) = &article.origin else { panic!() };
+        let ArticleOrigin::Clone(kept) = &article.origin else {
+            panic!()
+        };
         assert_eq!(kept.kind_bindings, ["WEAPON_KIND_PACKUN_FIREBREATH"]);
-        assert_eq!(kept.id_bindings, ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]);
+        assert_eq!(
+            kept.id_bindings,
+            ["FIGHTER_PACKUN_GENERATE_ARTICLE_FIREBREATH"]
+        );
     }
 
     /// Iron-Man · src/stark/status/final_proton.rs:64 spawns
@@ -569,17 +675,36 @@ pub fn install() {
     fn resolves_the_games_own_spellings() {
         let c = named("mario", "hugeflame");
         let none = HashMap::new();
-        assert_eq!(c.resolve_id("*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", &none).unwrap().name, "hugeflame");
+        assert_eq!(
+            c.resolve_id("*FIGHTER_MARIO_GENERATE_ARTICLE_HUGE_FLAME", &none)
+                .unwrap()
+                .name,
+            "hugeflame"
+        );
         let c = named("murabito", "bullet");
-        assert_eq!(c.resolve_id("*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).unwrap().name, "bullet");
+        assert_eq!(
+            c.resolve_id("*WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none)
+                .unwrap()
+                .name,
+            "bullet"
+        );
         // HDR-Standalone-Movesets · vendor/hdr/fighters/peach/src/acmd/specials.rs:379 spawns
         // `*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON` (0x3); the dump's folder is `peachdaikon`.
         let c = named("peach", "peachdaikon");
-        assert_eq!(c.resolve_id("*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON", &none).unwrap().name, "peachdaikon");
+        assert_eq!(
+            c.resolve_id("*FIGHTER_PEACH_GENERATE_ARTICLE_DAIKON", &none)
+                .unwrap()
+                .name,
+            "peachdaikon"
+        );
         let c = named("murabito", "bullet");
         // Another fighter's id is not this fighter's article.
-        assert!(c.resolve_id("*FIGHTER_SHIZUE_GENERATE_ARTICLE_BULLET", &none).is_none());
-        assert!(c.resolve_id("*WEAPON_SHIZUE_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none).is_none());
+        assert!(c
+            .resolve_id("*FIGHTER_SHIZUE_GENERATE_ARTICLE_BULLET", &none)
+            .is_none());
+        assert!(c
+            .resolve_id("*WEAPON_SHIZUE_SLINGSHOT_GENERATE_ARTICLE_BULLET", &none)
+            .is_none());
     }
 
     #[test]

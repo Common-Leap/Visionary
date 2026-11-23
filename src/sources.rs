@@ -99,7 +99,10 @@ fn has_romfs_wrapper(dir: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("romfs"));
     own || std::fs::read_dir(dir).is_ok_and(|rd| {
         rd.flatten().any(|e| {
-            e.path().is_dir() && e.file_name().to_string_lossy().eq_ignore_ascii_case("romfs")
+            e.path().is_dir()
+                && e.file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("romfs")
         })
     })
 }

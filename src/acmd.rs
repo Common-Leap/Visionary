@@ -6727,9 +6727,7 @@ fn parse_change_kinetic_call(line: &str) -> Option<ExcuteStmt> {
     let [module_accessor, kinetic_type] = tokens.as_slice() else {
         return None;
     };
-    if !crate::acmd::is_module_accessor(module_accessor.trim())
-        || kinetic_type.trim().is_empty()
-    {
+    if !crate::acmd::is_module_accessor(module_accessor.trim()) || kinetic_type.trim().is_empty() {
         return None;
     }
     Some(ExcuteStmt::ChangeKinetic(crate::data::ChangeKineticCall {
@@ -13891,8 +13889,14 @@ pub(crate) mod tests {
         assert_eq!(excutes[0].len(), 3, "{:#?}", excutes[0]);
         // Commented lines go back out verbatim.
         let emitted = emit_stmts(&script.stmts, "    ").join("\n");
-        assert!(emitted.contains("// frame(agent.lua_state_agent, 5.0);"), "{emitted}");
-        assert!(emitted.contains("// if macros::is_excute(agent) {"), "{emitted}");
+        assert!(
+            emitted.contains("// frame(agent.lua_state_agent, 5.0);"),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("// if macros::is_excute(agent) {"),
+            "{emitted}"
+        );
 
         // The sound and expression parsers share the block walker: only the live call is typed.
         let typed = |stmts: &[AcmdStmt]| {
@@ -13910,7 +13914,10 @@ pub(crate) mod tests {
             }
             counts
         };
-        assert_eq!(typed(&parse_sound_script(&source.replace("game_", "sound_")).stmts), (1, 0));
+        assert_eq!(
+            typed(&parse_sound_script(&source.replace("game_", "sound_")).stmts),
+            (1, 0)
+        );
         assert_eq!(
             typed(&parse_expression_script(&source.replace("game_", "expression_")).stmts),
             (1, 0)
@@ -21911,7 +21918,10 @@ mod article_call_tests {
         }
         // Inside a script every one reaches the walk's article calls, whichever statement
         // form the parser keeps it as, and none is lost or doubled.
-        let body: Vec<String> = CORPUS.iter().map(|(line, ..)| format!("        {line}")).collect();
+        let body: Vec<String> = CORPUS
+            .iter()
+            .map(|(line, ..)| format!("        {line}"))
+            .collect();
         let source = game(&body.iter().map(String::as_str).collect::<Vec<_>>());
         let walked = parse_acmd_script(&source).to_article_calls();
         let ops: Vec<_> = walked.iter().map(|(_, call)| call.op.clone()).collect();
@@ -21961,8 +21971,14 @@ mod article_call_tests {
             ("ArticleOperationTarget(-1)", ArticleTarget::None),
             ("0xFFFFFFFF", ArticleTarget::None),
             ("*ARTICLE_OPE_TARGET_LAST", ArticleTarget::Last),
-            ("app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_FIRST)", ArticleTarget::First),
-            ("ArticleOperationTarget(*ARTICLE_OPE_TARGET_OTHER)", ArticleTarget::Unspecified),
+            (
+                "app::ArticleOperationTarget(*ARTICLE_OPE_TARGET_FIRST)",
+                ArticleTarget::First,
+            ),
+            (
+                "ArticleOperationTarget(*ARTICLE_OPE_TARGET_OTHER)",
+                ArticleTarget::Unspecified,
+            ),
         ] {
             assert_eq!(ArticleTarget::read(written), target, "{written}");
         }
@@ -22037,7 +22053,10 @@ mod article_call_tests {
             .filter(|stmt| matches!(stmt, ExcuteStmt::Article(_)))
             .count();
         assert_eq!(typed, 6, "{:#?}", parsed.stmts);
-        assert_eq!(emit_stmts(&parsed.stmts, "    ").join("\r\n"), body.join("\r\n"));
+        assert_eq!(
+            emit_stmts(&parsed.stmts, "    ").join("\r\n"),
+            body.join("\r\n")
+        );
     }
 
     #[test]
@@ -22047,7 +22066,11 @@ mod article_call_tests {
         ]));
         assert_eq!(
             parsed.to_article_spawns(),
-            vec![(1, "FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT".to_owned(), true)]
+            vec![(
+                1,
+                "FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT".to_owned(),
+                true
+            )]
         );
     }
 
@@ -22063,7 +22086,9 @@ mod article_call_tests {
     }
 
     /// The article calls a script of these statements gives, through the walk.
-    fn walked(stmts: Vec<ExcuteStmt>) -> Vec<(ArticleOp, String, Vec<String>, ArticleTarget, String)> {
+    fn walked(
+        stmts: Vec<ExcuteStmt>,
+    ) -> Vec<(ArticleOp, String, Vec<String>, ArticleTarget, String)> {
         AcmdScript {
             stmts: vec![AcmdStmt::Excute(stmts)],
         }

@@ -59,7 +59,10 @@ fn family(category: u8) -> Family {
 enum Kind {
     Frame,
     Wait,
-    Excute { open: usize, close: usize },
+    Excute {
+        open: usize,
+        close: usize,
+    },
     Other,
     /// Control flow with timing inside: the cursor after it is not known statically.
     Timed,
@@ -149,7 +152,9 @@ fn has_timing(text: &str) -> bool {
     let bytes = code.as_bytes();
     ["frame(", "wait(", "wait_loop"].iter().any(|word| {
         code.match_indices(word).any(|(at, _)| {
-            at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || matches!(bytes[at - 1], b'_' | b':' | b'.'))
+            at == 0
+                || !(bytes[at - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[at - 1], b'_' | b':' | b'.'))
         })
     })
 }
@@ -186,9 +191,12 @@ fn parse(text: &str) -> Result<Timeline, String> {
             continue;
         }
         let start = i;
-        let block_led = ["if ", "if(", "for ", "while ", "loop ", "loop{", "match ", "unsafe ", "unsafe{", "{", "fn ", "pub fn "]
-            .iter()
-            .any(|keyword| rest.starts_with(keyword));
+        let block_led = [
+            "if ", "if(", "for ", "while ", "loop ", "loop{", "match ", "unsafe ", "unsafe{", "{",
+            "fn ", "pub fn ",
+        ]
+        .iter()
+        .any(|keyword| rest.starts_with(keyword));
         let (end, kind) = if block_led {
             let (first_open, end) =
                 block_statement_end(text, start, close).ok_or("an unbalanced block")?;
@@ -198,7 +206,10 @@ fn parse(text: &str) -> Result<Timeline, String> {
             } else if opens_is_excute(&text[start..line_end(text, start)])
                 && matching_brace(text, first_open) == Some(end - 1)
             {
-                Kind::Excute { open: first_open, close: end - 1 }
+                Kind::Excute {
+                    open: first_open,
+                    close: end - 1,
+                }
             } else {
                 Kind::Other
             };
@@ -228,7 +239,11 @@ fn parse(text: &str) -> Result<Timeline, String> {
             match timing_arg(text, start, end) {
                 Some((arg, value)) => {
                     item.arg = arg;
-                    item.after = if kind == Kind::Frame { value } else { cursor + value };
+                    item.after = if kind == Kind::Frame {
+                        value
+                    } else {
+                        cursor + value
+                    };
                 }
                 None => item.kind = Kind::Timed,
             }
@@ -260,17 +275,25 @@ impl Style {
             line[..line.len() - line.trim_start().len()].to_string()
         };
         let first = timeline.items.iter().find_map(|item| item.lines.clone());
-        let indent = first.as_ref().map_or_else(|| "    ".to_string(), |lines| indent_of(lines.start));
+        let indent = first
+            .as_ref()
+            .map_or_else(|| "    ".to_string(), |lines| indent_of(lines.start));
         let unit = timeline
             .items
             .iter()
             .find_map(|item| match item.kind {
                 Kind::Excute { open, close } => {
                     let body_start = line_end(text, open);
-                    text[body_start..close].lines().find(|l| !l.trim().is_empty()).map(|l| {
-                        let inner = &l[..l.len() - l.trim_start().len()];
-                        inner.strip_prefix(indent.as_str()).unwrap_or("    ").to_string()
-                    })
+                    text[body_start..close]
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            let inner = &l[..l.len() - l.trim_start().len()];
+                            inner
+                                .strip_prefix(indent.as_str())
+                                .unwrap_or("    ")
+                                .to_string()
+                        })
                 }
                 _ => None,
             })
@@ -281,7 +304,9 @@ impl Style {
             .and_then(|at| text[at..].find('(').map(|open| at + open + 1))
             .map(|start| {
                 let rest = text[start..].trim_start();
-                rest[..rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(0)]
+                rest[..rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(0)]
                     .to_string()
             })
             .filter(|name| !name.is_empty())
@@ -299,7 +324,9 @@ impl Style {
             .items
             .iter()
             .find_map(|item| match item.kind {
-                Kind::Excute { open, .. } => Some(text[line_start(text, open)..=open].trim().to_string()),
+                Kind::Excute { open, .. } => {
+                    Some(text[line_start(text, open)..=open].trim().to_string())
+                }
                 _ => None,
             })
             .unwrap_or_else(|| format!("if macros::is_excute({agent}) {{"));
@@ -312,7 +339,15 @@ impl Style {
                 (line.trim_start().to_string(), arg)
             })
         });
-        Style { newline, indent, unit, agent, attack_module, excute_open, frame_line }
+        Style {
+            newline,
+            indent,
+            unit,
+            agent,
+            attack_module,
+            excute_open,
+            frame_line,
+        }
     }
 
     fn frame(&self, frame: u32) -> String {
@@ -326,7 +361,10 @@ impl Style {
     }
 
     fn clear(&self, id: u32) -> String {
-        format!("{}clear({}.module_accessor, {id}, false);", self.attack_module, self.agent)
+        format!(
+            "{}clear({}.module_accessor, {id}, false);",
+            self.attack_module, self.agent
+        )
     }
 
     /// An execute block holding `lines`, at statement indentation.
@@ -380,19 +418,31 @@ fn resolve(timeline: &Timeline, request: &Request) -> Option<Anchor> {
     let frame = request.frame;
     let items = &timeline.items;
     let blocks: Vec<usize> = (0..items.len())
-        .filter(|&i| matches!(items[i].kind, Kind::Excute { .. }) && script_frame(items[i].before) == frame)
+        .filter(|&i| {
+            matches!(items[i].kind, Kind::Excute { .. }) && script_frame(items[i].before) == frame
+        })
         .collect();
-    if let Some(&chosen) = if request.clear { blocks.first() } else { blocks.last() } {
+    if let Some(&chosen) = if request.clear {
+        blocks.first()
+    } else {
+        blocks.last()
+    } {
         return Some(Anchor::InBlock(chosen));
     }
-    if let Some(first) = items.iter().position(|item| script_frame(item.after) == frame) {
+    if let Some(first) = items
+        .iter()
+        .position(|item| script_frame(item.after) == frame)
+    {
         let mut last = first;
         while last + 1 < items.len() && script_frame(items[last + 1].after) == frame {
             last += 1;
         }
         return Some(Anchor::After(last));
     }
-    if items.first().is_none_or(|item| script_frame(item.before) == frame) {
+    if items
+        .first()
+        .is_none_or(|item| script_frame(item.before) == frame)
+    {
         return Some(Anchor::AtStart);
     }
     for (i, item) in items.iter().enumerate() {
@@ -418,7 +468,9 @@ fn clear_line(
     family: Family,
     id: Option<u32>,
 ) -> Option<(Range<usize>, String)> {
-    clear_lines(text, timeline, frame, family, id).into_iter().next()
+    clear_lines(text, timeline, frame, family, id)
+        .into_iter()
+        .next()
 }
 
 /// Every line `clear_line` could return, in order. A script may end its grab boxes twice on one
@@ -433,7 +485,9 @@ fn clear_lines(
 ) -> Vec<(Range<usize>, String)> {
     let mut found = Vec::new();
     for item in &timeline.items {
-        let Kind::Excute { open, close } = item.kind else { continue };
+        let Kind::Excute { open, close } = item.kind else {
+            continue;
+        };
         if script_frame(item.before) != frame {
             continue;
         }
@@ -443,7 +497,9 @@ fn clear_lines(
             let line = text[at..end].trim();
             let matches = match (family, id) {
                 (Family::Attack, Some(id)) => crate::acmd::parse_attack_clear(line) == Some(id),
-                (Family::Attack, None) => line.contains("clear_all") && !line.contains("GrabModule"),
+                (Family::Attack, None) => {
+                    line.contains("clear_all") && !line.contains("GrabModule")
+                }
                 (Family::Grab, None) => crate::acmd::is_grab_clear_all(line),
                 _ => false,
             };
@@ -510,7 +566,13 @@ fn body_lines(text: &str, open: usize, close: usize) -> Vec<(Range<usize>, Vec<R
                 let block_end = line_end(text, inner_close);
                 let inner = body_lines(text, brace, inner_close)
                     .into_iter()
-                    .flat_map(|(range, nested)| if nested.is_empty() { vec![range] } else { nested })
+                    .flat_map(|(range, nested)| {
+                        if nested.is_empty() {
+                            vec![range]
+                        } else {
+                            nested
+                        }
+                    })
                     .collect::<Vec<_>>();
                 out.push((at..block_end, inner));
                 at = block_end;
@@ -523,14 +585,17 @@ fn body_lines(text: &str, open: usize, close: usize) -> Vec<(Range<usize>, Vec<R
     out
 }
 
-
 type Timing = (u8, String, u32, u32, u32, u32);
 
 /// What a retime must preserve about a hitbox. A throw or search box is compared without its
 /// end: no ACMD call ends one, and the parser lets a same-id `ATTACK` close it, which a moved
 /// attack would otherwise seem to retime.
 fn timing(hitbox: &Hitbox) -> Timing {
-    let end = if family(hitbox.category) == Family::Fixed { 0 } else { hitbox.active_end };
+    let end = if family(hitbox.category) == Family::Fixed {
+        0
+    } else {
+        hitbox.active_end
+    };
     (
         hitbox.category,
         hitbox.func.clone(),
@@ -561,16 +626,27 @@ fn place(
     let mut anchored: BTreeMap<Anchor, BTreeMap<u32, Vec<&Request>>> = BTreeMap::new();
     for request in requests {
         let Some(anchor) = resolve(timeline, request) else {
-            return Err(format!("frame {} has no place in the move's timing", request.frame));
+            return Err(format!(
+                "frame {} has no place in the move's timing",
+                request.frame
+            ));
         };
-        anchored.entry(anchor).or_default().entry(request.frame).or_default().push(request);
+        anchored
+            .entry(anchor)
+            .or_default()
+            .entry(request.frame)
+            .or_default()
+            .push(request);
     }
     // Clears first on a frame, then calls (`Request` orders `clear: false` first, so sort).
     // A request may be several lines (a spawn and its modifiers), kept together.
     let lines_for = |requests: &[&Request]| -> Vec<String> {
         let mut ordered: Vec<&&Request> = requests.iter().collect();
         ordered.sort_by_key(|r| !r.clear);
-        ordered.iter().flat_map(|r| r.line.split('\n').map(str::to_string)).collect()
+        ordered
+            .iter()
+            .flat_map(|r| r.line.split('\n').map(str::to_string))
+            .collect()
     };
 
     let nl = style.newline;
@@ -580,7 +656,9 @@ fn place(
         match *anchor {
             Anchor::InBlock(item) => {
                 targeted.insert(item);
-                let Kind::Excute { open, close } = timeline.items[item].kind else { unreachable!() };
+                let Kind::Excute { open, close } = timeline.items[item].kind else {
+                    unreachable!()
+                };
                 let close_line = line_start(text, close);
                 if !text[close_line..close].trim().is_empty() {
                     return Err("an execute block closes on a line with code".into());
@@ -611,20 +689,29 @@ fn place(
                 let Some(lines) = timeline.items[item].lines.clone() else {
                     return Err("a statement shares its line with other code".into());
                 };
-                let block: String = by_frame.values().map(|r| style.block(&lines_for(r))).collect();
+                let block: String = by_frame
+                    .values()
+                    .map(|r| style.block(&lines_for(r)))
+                    .collect();
                 edits.push((lines.end..lines.end, block));
             }
             Anchor::AtStart => {
-                let at = timeline.items.first().and_then(|item| item.lines.clone()).map_or_else(
-                    || line_start(text, timeline.close),
-                    |lines| lines.start,
-                );
-                let block: String = by_frame.values().map(|r| style.block(&lines_for(r))).collect();
+                let at = timeline
+                    .items
+                    .first()
+                    .and_then(|item| item.lines.clone())
+                    .map_or_else(|| line_start(text, timeline.close), |lines| lines.start);
+                let block: String = by_frame
+                    .values()
+                    .map(|r| style.block(&lines_for(r)))
+                    .collect();
                 edits.push((at..at, block));
             }
             Anchor::BeforeFrame(_) | Anchor::AtEnd => {
                 let at = match *anchor {
-                    Anchor::BeforeFrame(item) => timeline.items[item].lines.clone().map(|l| l.start),
+                    Anchor::BeforeFrame(item) => {
+                        timeline.items[item].lines.clone().map(|l| l.start)
+                    }
                     _ => Some(line_start(text, timeline.close)),
                 };
                 let Some(at) = at else {
@@ -647,7 +734,13 @@ fn place(
                 let arg = wait.arg.start - lines.start - lead..wait.arg.end - lines.start - lead;
                 let wait_line = |step: f32| {
                     let value = number_like(&template[arg.clone()], step);
-                    format!("{}{}{}{}{nl}", style.indent, &template[..arg.start], value, &template[arg.end..])
+                    format!(
+                        "{}{}{}{}{nl}",
+                        style.indent,
+                        &template[..arg.start],
+                        value,
+                        &template[arg.end..]
+                    )
                 };
                 let mut out = String::new();
                 let mut cursor = wait.before;
@@ -665,7 +758,9 @@ fn place(
     // A block whose every line moved out goes with them, unless something moves in — and so
     // does a nested execute block whose lines all moved.
     for (i, item) in timeline.items.iter().enumerate() {
-        let Kind::Excute { open, close } = item.kind else { continue };
+        let Kind::Excute { open, close } = item.kind else {
+            continue;
+        };
         let gone_line = |range: &Range<usize>| removed.contains(&(range.start, range.end));
         let mut emptied_nested: Vec<Range<usize>> = Vec::new();
         let mut code = false;
@@ -685,7 +780,10 @@ fn place(
                 emptied |= nested.iter().any(gone_line);
             }
         }
-        let whole = item.lines.clone().filter(|_| emptied && !code && !targeted.contains(&i));
+        let whole = item
+            .lines
+            .clone()
+            .filter(|_| emptied && !code && !targeted.contains(&i));
         let drop: Vec<Range<usize>> = match whole {
             Some(lines) => vec![lines],
             None => emptied_nested,
@@ -697,19 +795,30 @@ fn place(
     }
     // A `frame`/`wait` left at the very end with nothing after it any more times nothing:
     // it goes too, but only when this edit is what emptied the tail.
-    let gone = |item: &Item| item.lines.as_ref().is_some_and(|l| removed.contains(&(l.start, l.end)));
+    let gone = |item: &Item| {
+        item.lines
+            .as_ref()
+            .is_some_and(|l| removed.contains(&(l.start, l.end)))
+    };
     let tail_inserts = anchored.contains_key(&Anchor::AtEnd);
-    if let Some(last_kept) = timeline.items.iter().rposition(|item| {
-        !gone(item) && !matches!(item.kind, Kind::Frame | Kind::Wait)
-    }) {
+    if let Some(last_kept) = timeline
+        .items
+        .iter()
+        .rposition(|item| !gone(item) && !matches!(item.kind, Kind::Frame | Kind::Wait))
+    {
         let tail = &timeline.items[last_kept + 1..];
         if !tail_inserts && tail.iter().any(gone) {
             let mut dangling: Vec<(usize, usize)> = Vec::new();
             for item in tail {
                 if matches!(item.kind, Kind::Frame | Kind::Wait) {
-                    let Some(lines) = item.lines.clone() else { break };
+                    let Some(lines) = item.lines.clone() else {
+                        break;
+                    };
                     // A wait split by this edit is rewritten, not removed.
-                    if edits.iter().any(|(span, _)| !span.is_empty() && span.start == lines.start) {
+                    if edits
+                        .iter()
+                        .any(|(span, _)| !span.is_empty() && span.start == lines.start)
+                    {
                         dangling.clear();
                         break;
                     }
@@ -719,7 +828,11 @@ fn place(
             removed.extend(dangling);
         }
     }
-    edits.extend(removed.into_iter().map(|(start, end)| (start..end, String::new())));
+    edits.extend(
+        removed
+            .into_iter()
+            .map(|(start, end)| (start..end, String::new())),
+    );
 
     // Inserts before removals at one offset; nothing may overlap.
     edits.sort_by_key(|(span, _)| (span.start, !span.is_empty()));
@@ -742,20 +855,25 @@ fn place(
 fn checked_timeline(text: &str) -> Result<Timeline, String> {
     let timeline = parse(text)?;
     if timeline.items.iter().any(|item| item.kind == Kind::Timed) {
-        return Err("the move's frames run through a loop or a branch, which source syncing \
+        return Err(
+            "the move's frames run through a loop or a branch, which source syncing \
                     does not restructure"
-            .into());
+                .into(),
+        );
     }
-    if timeline
-        .items
-        .iter()
-        .any(|item| matches!(item.kind, Kind::Frame | Kind::Wait) && (item.after.fract() != 0.0 || item.before.fract() != 0.0))
-    {
+    if timeline.items.iter().any(|item| {
+        matches!(item.kind, Kind::Frame | Kind::Wait)
+            && (item.after.fract() != 0.0 || item.before.fract() != 0.0)
+    }) {
         return Err("the move steps through fractional frames".into());
     }
     // `wait`s that already passed a later `frame(…)`: the game skips it, the editor's frames do
     // not, and no placement satisfies both.
-    if let Some(item) = timeline.items.iter().find(|item| item.kind == Kind::Frame && item.after < item.before) {
+    if let Some(item) = timeline
+        .items
+        .iter()
+        .find(|item| item.kind == Kind::Frame && item.after < item.before)
+    {
         return Err(format!(
             "its `frame({})` comes after `wait`s that already reached frame {}",
             item.after, item.before
@@ -786,7 +904,8 @@ pub(crate) fn retime_hitboxes(
     // One id is one hitbox at a time in the game: a second call with it replaces the first.
     for (i, a) in expected.iter().enumerate() {
         for b in &expected[i + 1..] {
-            let out = |h: &Hitbox| family(h.category) != Family::Fixed && h.active_start <= h.active_end;
+            let out =
+                |h: &Hitbox| family(h.category) != Family::Fixed && h.active_start <= h.active_end;
             if out(a)
                 && out(b)
                 && family(a.category) == family(b.category)
@@ -828,13 +947,18 @@ pub(crate) fn retime_hitboxes(
         let fail = |why: &str| format!("hitbox {id}: {why}");
         if m.before.active_start != m.after.active_start {
             let Some(item) = item_of(m.call.start) else {
-                return Err(fail("its call is not in an execute block at the top of the move"));
+                return Err(fail(
+                    "its call is not in an execute block at the top of the move",
+                ));
             };
-            let Kind::Excute { open, .. } = timeline.items[item].kind else { unreachable!() };
+            let Kind::Excute { open, .. } = timeline.items[item].kind else {
+                unreachable!()
+            };
             if !only_transparent_blocks(text, open, m.call.start) {
                 return Err(fail("its call sits inside a condition or a loop"));
             }
-            let statement = m.call.start..statement_end(text, m.call.start).map_or(m.call.end, |semi| semi + 1);
+            let statement =
+                m.call.start..statement_end(text, m.call.start).map_or(m.call.end, |semi| semi + 1);
             let Some(lines) = own_lines(text, &statement) else {
                 return Err(fail("its call shares a line with other code"));
             };
@@ -872,7 +996,11 @@ pub(crate) fn retime_hitboxes(
         }
         let shorten = |requests: &mut BTreeSet<Request>| {
             if new_end != NO_END && !starts_same_id(id, new_end + 1) {
-                requests.insert(Request { frame: new_end + 1, clear: true, line: style.clear(id) });
+                requests.insert(Request {
+                    frame: new_end + 1,
+                    clear: true,
+                    line: style.clear(id),
+                });
             }
         };
         if old_end == NO_END {
@@ -883,9 +1011,14 @@ pub(crate) fn retime_hitboxes(
         if let Some((lines, line)) = clear_line(text, &timeline, ender, Family::Attack, Some(id)) {
             removed.insert((lines.start, lines.end));
             if new_end != NO_END && !starts_same_id(id, new_end + 1) {
-                requests.insert(Request { frame: new_end + 1, clear: true, line });
+                requests.insert(Request {
+                    frame: new_end + 1,
+                    clear: true,
+                    line,
+                });
             }
-        } else if let Some((lines, line)) = clear_line(text, &timeline, ender, Family::Attack, None) {
+        } else if let Some((lines, line)) = clear_line(text, &timeline, ender, Family::Attack, None)
+        {
             clear_alls.insert((lines.start, lines.end), (ender, line));
         } else if new_end < old_end {
             // Replaced by the next call with its id: end it earlier with a clear of its own.
@@ -903,10 +1036,16 @@ pub(crate) fn retime_hitboxes(
             .iter()
             .enumerate()
             .filter(|(_, h)| is_attack_category(h.category) && h.active_end + 1 == frame)
-            .filter(|(_, h)| clear_line(text, &timeline, frame, Family::Attack, Some(h.id)).is_none())
+            .filter(|(_, h)| {
+                clear_line(text, &timeline, frame, Family::Attack, Some(h.id)).is_none()
+            })
             .map(|(position, _)| position)
             .collect();
-        let latest = members.iter().map(|&p| expected[p].active_end).max().unwrap_or(frame - 1);
+        let latest = members
+            .iter()
+            .map(|&p| expected[p].active_end)
+            .max()
+            .unwrap_or(frame - 1);
         let mut closes_at = frame;
         if latest != frame - 1 {
             removed.insert((start, end));
@@ -921,13 +1060,24 @@ pub(crate) fn retime_hitboxes(
                 // Every member is then ended by its own clear below.
                 closes_at = u32::MAX;
             } else {
-                requests.insert(Request { frame: closes_at, clear: true, line });
+                requests.insert(Request {
+                    frame: closes_at,
+                    clear: true,
+                    line,
+                });
             }
         }
         for &p in &members {
             let h = expected[p];
-            if h.active_end != NO_END && h.active_end + 1 < closes_at && !starts_same_id(h.id, h.active_end + 1) {
-                requests.insert(Request { frame: h.active_end + 1, clear: true, line: style.clear(h.id) });
+            if h.active_end != NO_END
+                && h.active_end + 1 < closes_at
+                && !starts_same_id(h.id, h.active_end + 1)
+            {
+                requests.insert(Request {
+                    frame: h.active_end + 1,
+                    clear: true,
+                    line: style.clear(h.id),
+                });
             }
         }
     }
@@ -945,7 +1095,8 @@ pub(crate) fn retime_hitboxes(
             found.is_some_and(|(lines, _)| !removed.contains(&(lines.start, lines.end)))
         };
         let replaced_in = |list: &[&Hitbox]| {
-            list.iter().any(|o| family(o.category) == fam && o.id == h.id && o.active_start == end + 1)
+            list.iter()
+                .any(|o| family(o.category) == fam && o.id == h.id && o.active_start == end + 1)
         };
         if !replaced_in(&pristine_refs) || replaced_in(&expected) {
             continue;
@@ -954,7 +1105,11 @@ pub(crate) fn retime_hitboxes(
             if !kept(clear_line(text, &timeline, end + 1, fam, Some(h.id)))
                 && !kept(clear_line(text, &timeline, end + 1, fam, None))
             {
-                requests.insert(Request { frame: end + 1, clear: true, line: style.clear(h.id) });
+                requests.insert(Request {
+                    frame: end + 1,
+                    clear: true,
+                    line: style.clear(h.id),
+                });
             }
         } else if !kept(clear_line(text, &timeline, end + 1, fam, None)) {
             grab_clears.insert(end + 1);
@@ -986,7 +1141,9 @@ pub(crate) fn retime_hitboxes(
     let grab_line = text
         .lines()
         .map(str::trim)
-        .find(|line| crate::acmd::is_grab_clear_all(line) && !line.starts_with("//") && line.ends_with(';'))
+        .find(|line| {
+            crate::acmd::is_grab_clear_all(line) && !line.starts_with("//") && line.ends_with(';')
+        })
         .map(str::to_string)
         .unwrap_or_else(|| format!("GrabModule::clear_all({}.module_accessor);", style.agent));
     for frame in grab_clears {
@@ -1000,13 +1157,21 @@ pub(crate) fn retime_hitboxes(
                 h.id
             ));
         }
-        requests.insert(Request { frame, clear: true, line: grab_line.clone() });
+        requests.insert(Request {
+            frame,
+            clear: true,
+            line: grab_line.clone(),
+        });
     }
 
     let out = place(text, &timeline, &style, removed, &requests)?;
 
     let mut want: Vec<Timing> = expected.iter().map(|h| timing(h)).collect();
-    let mut got: Vec<Timing> = crate::acmd::parse_acmd_script(&out).to_hitboxes().iter().map(timing).collect();
+    let mut got: Vec<Timing> = crate::acmd::parse_acmd_script(&out)
+        .to_hitboxes()
+        .iter()
+        .map(timing)
+        .collect();
     want.sort();
     got.sort();
     if want != got {
@@ -1015,11 +1180,16 @@ pub(crate) fn retime_hitboxes(
             Some((category, func, id, part, start, end)) => {
                 let instead = got
                     .iter()
-                    .filter(|g| (&g.0, &g.1, g.2, g.3) == (category, func, *id, *part) && !want.contains(g))
+                    .filter(|g| {
+                        (&g.0, &g.1, g.2, g.3) == (category, func, *id, *part) && !want.contains(g)
+                    })
                     .map(|g| span_label(g.4, g.5))
                     .next();
                 let blocker = expected.iter().find(|h| {
-                    is_attack_category(h.category) && h.id == *id && h.active_start > *start && h.active_start <= *end
+                    is_attack_category(h.category)
+                        && h.id == *id
+                        && h.active_start > *start
+                        && h.active_start <= *end
                 });
                 match blocker {
                     Some(next) => format!(
@@ -1065,7 +1235,9 @@ fn enclosing_chain(text: &str, timeline: &Timeline, at: usize) -> Result<Option<
         .iter()
         .find(|item| matches!(item.kind, Kind::Excute { open, close } if open < at && at < close))
         .ok_or("its call is not in an execute block at the top of the move")?;
-    let Kind::Excute { open, close } = item.kind else { unreachable!() };
+    let Kind::Excute { open, close } = item.kind else {
+        unreachable!()
+    };
     if only_transparent_blocks(text, open, at) {
         return Ok(None);
     }
@@ -1085,9 +1257,14 @@ fn enclosing_chain(text: &str, timeline: &Timeline, at: usize) -> Result<Option<
         }
         let start = i;
         let line = &text[line_start(text, start)..line_end(text, start)];
-        let block_led = rest.starts_with("if ") || rest.starts_with("if(") || rest.starts_with('{') || rest.starts_with("unsafe");
+        let block_led = rest.starts_with("if ")
+            || rest.starts_with("if(")
+            || rest.starts_with('{')
+            || rest.starts_with("unsafe");
         let end = if block_led {
-            block_statement_end(text, start, limit).ok_or("an unbalanced block")?.1
+            block_statement_end(text, start, limit)
+                .ok_or("an unbalanced block")?
+                .1
         } else {
             statement_end(text, start).map_or(limit, |semi| semi + 1)
         };
@@ -1105,17 +1282,28 @@ fn enclosing_chain(text: &str, timeline: &Timeline, at: usize) -> Result<Option<
         if !(rest.starts_with("if ") || rest.starts_with("if(")) {
             return Err("its call sits inside a block that is not a plain condition".into());
         }
-        let (first_open, _) = block_statement_end(text, start, limit).ok_or("an unbalanced block")?;
+        let (first_open, _) =
+            block_statement_end(text, start, limit).ok_or("an unbalanced block")?;
         let first_close = matching_brace(text, first_open).ok_or("an unbalanced block")?;
         let mut arms = vec![(first_open, first_close)];
         let after = text[first_close + 1..end].trim_start();
         if let Some(rest) = after.strip_prefix("else") {
             let rest = rest.trim_start();
             if !rest.starts_with('{') {
-                return Err("its call sits in an `else if` chain, which source syncing does not split".into());
+                return Err(
+                    "its call sits in an `else if` chain, which source syncing does not split"
+                        .into(),
+                );
             }
-            let else_open = first_close + 1 + text[first_close + 1..end].find('{').ok_or("an unbalanced block")?;
-            arms.push((else_open, matching_brace(text, else_open).ok_or("an unbalanced block")?));
+            let else_open = first_close
+                + 1
+                + text[first_close + 1..end]
+                    .find('{')
+                    .ok_or("an unbalanced block")?;
+            arms.push((
+                else_open,
+                matching_brace(text, else_open).ok_or("an unbalanced block")?,
+            ));
         }
         let Some(&(arm_open, _)) = arms.iter().find(|(o, c)| *o < at && at < *c) else {
             return Err("its call sits in a condition's header".into());
@@ -1123,7 +1311,8 @@ fn enclosing_chain(text: &str, timeline: &Timeline, at: usize) -> Result<Option<
         if !only_transparent_blocks(text, arm_open, at) {
             return Err("its call sits inside a condition or a loop".into());
         }
-        let lines = own_lines(text, &(start..end)).ok_or("its condition shares a line with other code")?;
+        let lines =
+            own_lines(text, &(start..end)).ok_or("its condition shares a line with other code")?;
         return Ok(Some(Chain { lines, arms }));
     }
     Err("its call is not in an execute block at the top of the move".into())
@@ -1145,19 +1334,36 @@ fn is_trail(call: &crate::data::EffectCall) -> bool {
 type EffectTiming = (String, String, u32, u32);
 
 fn effect_timing(call: &crate::data::EffectCall) -> EffectTiming {
-    let end = if call.follows_bone || is_trail(call) { call.active_end } else { 0 };
-    (call.spawn_func.clone(), call.effect_name.to_ascii_lowercase(), call.active_start, end)
+    let end = if call.follows_bone || is_trail(call) {
+        call.active_end
+    } else {
+        0
+    };
+    (
+        call.spawn_func.clone(),
+        call.effect_name.to_ascii_lowercase(),
+        call.active_start,
+        end,
+    )
 }
 
 /// The statement lines `span`'s call owns, after checking it can be moved.
-fn movable_lines(text: &str, timeline: &Timeline, span: &Range<usize>) -> Result<Range<usize>, String> {
+fn movable_lines(
+    text: &str,
+    timeline: &Timeline,
+    span: &Range<usize>,
+) -> Result<Range<usize>, String> {
     let item = timeline
         .items
         .iter()
         .find(|item| matches!(item.kind, Kind::Excute { open, close } if open < span.start && span.start < close))
         .ok_or("its call is not in an execute block at the top of the move")?;
-    let Kind::Excute { open, .. } = item.kind else { unreachable!() };
-    if !only_transparent_blocks(text, open, span.start) && enclosing_chain(text, timeline, span.start)?.is_none() {
+    let Kind::Excute { open, .. } = item.kind else {
+        unreachable!()
+    };
+    if !only_transparent_blocks(text, open, span.start)
+        && enclosing_chain(text, timeline, span.start)?.is_none()
+    {
         return Err("its call sits inside a condition or a loop".into());
     }
     let statement = span.start..statement_end(text, span.start).map_or(span.end, |semi| semi + 1);
@@ -1175,7 +1381,9 @@ fn stop_line(
     let quoted = format!("\"{}\"", call.effect_name.to_ascii_lowercase());
     let mut found = Vec::new();
     for item in &timeline.items {
-        let Kind::Excute { open, close } = item.kind else { continue };
+        let Kind::Excute { open, close } = item.kind else {
+            continue;
+        };
         if script_frame(item.before) != frame {
             continue;
         }
@@ -1196,8 +1404,12 @@ fn stop_line(
     }
     match found.as_slice() {
         [one] => Ok(one.clone()),
-        [] => Err(format!("no stop for it on frame {frame} — source syncing does not add or remove stops")),
-        _ => Err(format!("more than one stop on frame {frame} could be its own")),
+        [] => Err(format!(
+            "no stop for it on frame {frame} — source syncing does not add or remove stops"
+        )),
+        _ => Err(format!(
+            "more than one stop on frame {frame} could be its own"
+        )),
     }
 }
 
@@ -1213,7 +1425,9 @@ fn modified_after(text: &str, _timeline: &Timeline, spawns: &[Range<usize>], fro
         .filter(|&start| start >= from)
         .min()
         .unwrap_or(text.len());
-    touches_last_effect(&crate::acmd_src::without_comments(&text[from..stop.max(from)]))
+    touches_last_effect(&crate::acmd_src::without_comments(
+        &text[from..stop.max(from)],
+    ))
 }
 
 /// The whole lines a retimed spawn takes with it: its own call, its typed modifiers, and every
@@ -1243,7 +1457,12 @@ fn effect_group(
         })
         .ok_or("its call is not in an execute block at the top of the move")?;
     let next_spawn = |from: usize| {
-        spawns.iter().map(|s| s.start).filter(|&start| start >= from).min().unwrap_or(text.len())
+        spawns
+            .iter()
+            .map(|s| s.start)
+            .filter(|&start| start >= from)
+            .min()
+            .unwrap_or(text.len())
     };
     let mut at = first;
     let mut out = Vec::new();
@@ -1258,7 +1477,9 @@ fn effect_group(
             out.push(range);
         } else if trimmed.is_empty() {
             // Blank or comment: stays where it is.
-        } else if at >= last_typed && (at >= next_spawn(last_typed) || !touches_last_effect(trimmed)) {
+        } else if at >= last_typed
+            && (at >= next_spawn(last_typed) || !touches_last_effect(trimmed))
+        {
             // Past its own lines: the next spawn's, or code of its own.
             break;
         } else if touches_last_effect(trimmed)
@@ -1301,7 +1522,10 @@ pub(crate) fn retime_effects(
         let name = &m.before.effect_name;
         let fail = |why: String| format!("`{name}`: {why}");
         if m.before.active_start != m.after.active_start {
-            let spawn = m.calls.first().ok_or_else(|| fail("no source call".into()))?;
+            let spawn = m
+                .calls
+                .first()
+                .ok_or_else(|| fail("no source call".into()))?;
             let chain = enclosing_chain(text, &timeline, spawn.start).map_err(fail)?;
             match chain {
                 None => {
@@ -1319,14 +1543,21 @@ pub(crate) fn retime_effects(
                                 .into(),
                         ));
                     }
-                    requests.insert(Request { frame: m.after.active_start, clear: false, line: lines.join("\n") });
+                    requests.insert(Request {
+                        frame: m.after.active_start,
+                        clear: false,
+                        line: lines.join("\n"),
+                    });
                 }
                 Some(chain) => {
-                    let inside = |span: &Range<usize>| chain.lines.start <= span.start && span.start < chain.lines.end;
+                    let inside = |span: &Range<usize>| {
+                        chain.lines.start <= span.start && span.start < chain.lines.end
+                    };
                     // Every spawn in the conditional moving to one frame moves the conditional.
                     let whole = spawns.iter().filter(|s| inside(s)).all(|s| {
                         moved.iter().any(|o| {
-                            o.calls.first() == Some(s) && o.after.active_start == m.after.active_start
+                            o.calls.first() == Some(s)
+                                && o.after.active_start == m.after.active_start
                         })
                     });
                     if whole && modified_after(text, &timeline, spawns, chain.lines.end) {
@@ -1342,17 +1573,30 @@ pub(crate) fn retime_effects(
                             let lead = body.first().map_or(0, |l| l.len() - l.trim_start().len());
                             let line = body
                                 .iter()
-                                .map(|l| if l.len() >= lead && l[..lead].trim().is_empty() { &l[lead..] } else { l.trim_start() })
+                                .map(|l| {
+                                    if l.len() >= lead && l[..lead].trim().is_empty() {
+                                        &l[lead..]
+                                    } else {
+                                        l.trim_start()
+                                    }
+                                })
                                 .map(|l| l.trim_end_matches('\r'))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            requests.insert(Request { frame: m.after.active_start, clear: false, line });
+                            requests.insert(Request {
+                                frame: m.after.active_start,
+                                clear: false,
+                                line,
+                            });
                         }
                     } else {
                         // Only this arm's spawn moves: it keeps its condition at the new frame,
                         // written with the arm's own header lines so the spawn keeps the guard
                         // the editor knows it by. An `else` arm keeps its `if` too, emptied.
-                        let is_else = chain.arms.get(1).is_some_and(|&(o, c)| o < spawn.start && spawn.start < c);
+                        let is_else = chain
+                            .arms
+                            .get(1)
+                            .is_some_and(|&(o, c)| o < spawn.start && spawn.start < c);
                         let (if_open, if_close) = chain.arms[0];
                         let header_lines = |from: usize, to: usize| -> Vec<String> {
                             text[line_start(text, from)..line_end(text, to)]
@@ -1377,7 +1621,8 @@ pub(crate) fn retime_effects(
                                     .into(),
                             ));
                         }
-                        let group = effect_group(text, &timeline, spawns, &m.calls).map_err(fail)?;
+                        let group =
+                            effect_group(text, &timeline, spawns, &m.calls).map_err(fail)?;
                         let last_call = group.iter().map(|r| r.end).max().unwrap_or(spawn.end);
                         if modified_after(text, &timeline, spawns, last_call) {
                             return Err(fail(
@@ -1390,24 +1635,37 @@ pub(crate) fn retime_effects(
                             lines.push(format!("{}{}", style.unit, text[range.clone()].trim()));
                         }
                         lines.push("}".into());
-                        requests.insert(Request { frame: m.after.active_start, clear: false, line: lines.join("\n") });
+                        requests.insert(Request {
+                            frame: m.after.active_start,
+                            clear: false,
+                            line: lines.join("\n"),
+                        });
                     }
                 }
             }
         }
         let ends = m.before.follows_bone || is_trail(m.before);
         if ends && m.before.active_end != m.after.active_end {
-            if m.before.active_end == OPEN_ENDED_EFFECT_FRAME || m.after.active_end == OPEN_ENDED_EFFECT_FRAME {
-                return Err(fail("it would need a stop added or removed, which source syncing does not do".into()));
+            if m.before.active_end == OPEN_ENDED_EFFECT_FRAME
+                || m.after.active_end == OPEN_ENDED_EFFECT_FRAME
+            {
+                return Err(fail(
+                    "it would need a stop added or removed, which source syncing does not do"
+                        .into(),
+                ));
             }
             let range = stop_line(text, &timeline, m.before, m.before.active_end).map_err(fail)?;
             // One `EFFECT_OFF_KIND` ends every effect of its kind that is out.
             let sharing = edited
                 .iter()
                 .filter(|c| !std::ptr::eq(*c, m.after))
-                .filter(|c| (c.follows_bone || is_trail(c)) == (m.before.follows_bone || is_trail(m.before)))
+                .filter(|c| {
+                    (c.follows_bone || is_trail(c)) == (m.before.follows_bone || is_trail(m.before))
+                })
                 .filter(|c| is_trail(m.before) || c.effect_name.eq_ignore_ascii_case(name))
-                .filter(|c| c.active_start <= m.before.active_end && c.active_end == m.before.active_end)
+                .filter(|c| {
+                    c.active_start <= m.before.active_end && c.active_end == m.before.active_end
+                })
                 .count();
             if sharing > 0 {
                 return Err(fail(format!(
@@ -1424,7 +1682,11 @@ pub(crate) fn retime_effects(
         }
     }
     let out = place(text, &timeline, &style, removed, &requests)?;
-    let mut want: Vec<EffectTiming> = edited.iter().filter(|c| !c.disabled).map(effect_timing).collect();
+    let mut want: Vec<EffectTiming> = edited
+        .iter()
+        .filter(|c| !c.disabled)
+        .map(effect_timing)
+        .collect();
     let mut got: Vec<EffectTiming> = crate::acmd::parse_effect_script(&out)
         .to_effect_calls()
         .into_iter()
@@ -1469,13 +1731,27 @@ pub(crate) fn add_effects(text: &str, additions: &[EffectAddition]) -> Result<St
         let line = match &addition.guard {
             Some(header) => {
                 let mut lines = vec![header.trim().to_string()];
-                lines.extend(addition.lines.iter().map(|l| format!("{}{}", style.unit, l.trim())));
+                lines.extend(
+                    addition
+                        .lines
+                        .iter()
+                        .map(|l| format!("{}{}", style.unit, l.trim())),
+                );
                 lines.push("}".into());
                 lines.join("\n")
             }
-            None => addition.lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join("\n"),
+            None => addition
+                .lines
+                .iter()
+                .map(|l| l.trim())
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
-        requests.insert(Request { frame: addition.frame.max(1), clear: false, line });
+        requests.insert(Request {
+            frame: addition.frame.max(1),
+            clear: false,
+            line,
+        });
     }
     place(text, &timeline, &style, BTreeSet::new(), &requests)
 }
@@ -1533,7 +1809,12 @@ mod tests {
             .collect();
         let moved: Vec<Retimed> = (0..pristine.len())
             .filter(|&p| timing(&pristine[p]) != timing(&edited[p]))
-            .map(|p| Retimed { position: p, call: sites[p].clone(), before: &pristine[p], after: &edited[p] })
+            .map(|p| Retimed {
+                position: p,
+                call: sites[p].clone(),
+                before: &pristine[p],
+                after: &edited[p],
+            })
             .collect();
         let out = retime_hitboxes(source, &pristine, &moved)?;
         let mut got: Vec<Timing> = hitboxes(&out).iter().map(timing).collect();
@@ -1546,7 +1827,10 @@ mod tests {
 
     #[test]
     fn utilt_parses_as_the_editor_shows_it() {
-        let spans: Vec<(u32, u32)> = hitboxes(&utilt()).iter().map(|h| (h.active_start, h.active_end)).collect();
+        let spans: Vec<(u32, u32)> = hitboxes(&utilt())
+            .iter()
+            .map(|h| (h.active_start, h.active_end))
+            .collect();
         assert_eq!(spans, vec![(11, 12), (11, 12), (13, 21), (13, 21)]);
     }
 
@@ -1559,7 +1843,10 @@ mod tests {
         .unwrap();
         assert!(out.contains("frame(agent.lua_state_agent, 9.0);"), "{out}");
         // The emptied frame-11 block is gone; frame 11 still anchors the wait to 13.
-        assert!(out.contains("frame(agent.lua_state_agent, 11.0);\n    wait("), "{out}");
+        assert!(
+            out.contains("frame(agent.lua_state_agent, 11.0);\n    wait("),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1570,15 +1857,25 @@ mod tests {
         })
         .unwrap();
         assert!(out.contains("wait(agent.lua_state_agent, 1.0);"), "{out}");
-        assert_eq!(out.matches("wait(agent.lua_state_agent, 1.0);").count(), 2, "{out}");
+        assert_eq!(
+            out.matches("wait(agent.lua_state_agent, 1.0);").count(),
+            2,
+            "{out}"
+        );
     }
 
     #[test]
     fn a_shorter_hit_gets_its_own_clear() {
         let out = retime(&utilt(), |h| h[2].active_end = 17).unwrap();
         assert!(out.contains("frame(agent.lua_state_agent, 18.0);"), "{out}");
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 0, false);"), "{out}");
-        assert!(out.contains("frame(agent.lua_state_agent, 22.0);"), "id 1 still ends on 22: {out}");
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 0, false);"),
+            "{out}"
+        );
+        assert!(
+            out.contains("frame(agent.lua_state_agent, 22.0);"),
+            "id 1 still ends on 22: {out}"
+        );
     }
 
     /// Every hitbox a `clear_all` ends ends sooner: the `clear_all` itself moves, and the
@@ -1600,7 +1897,10 @@ mod tests {
     fn a_longer_hit_moves_the_clear_all_and_clears_the_rest_where_they_ended() {
         let out = retime(&utilt(), |h| h[2].active_end = 25).unwrap();
         assert!(out.contains("frame(agent.lua_state_agent, 26.0);"), "{out}");
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 1, false);"), "{out}");
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 1, false);"),
+            "{out}"
+        );
         assert_eq!(out.matches("clear_all").count(), 1, "{out}");
     }
 
@@ -1622,8 +1922,14 @@ mod tests {
             h[3].active_start = 14;
         })
         .unwrap();
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 0, false);"), "{out}");
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 1, false);"), "{out}");
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 0, false);"),
+            "{out}"
+        );
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 1, false);"),
+            "{out}"
+        );
     }
 
     /// Falco's dsmash shape: a `clear_all` on 15 between two hits. Lengthening the first hit
@@ -1657,8 +1963,14 @@ mod tests {
         );
         // id 1 now runs to 17, through the id-2 hit that starts on 16.
         let out = retime(&source, |h| h[1].active_end = 17).unwrap();
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 0, false);"), "{out}");
-        assert!(out.contains("AttackModule::clear(agent.module_accessor, 1, false);"), "{out}");
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 0, false);"),
+            "{out}"
+        );
+        assert!(
+            out.contains("AttackModule::clear(agent.module_accessor, 1, false);"),
+            "{out}"
+        );
         assert_eq!(out.matches("clear_all").count(), 1, "{out}");
     }
 
@@ -1711,7 +2023,10 @@ mod tests {
     #[test]
     fn lengthening_into_the_next_same_id_call_says_why_not() {
         let error = retime(&utilt(), |h| h[0].active_end = 15).unwrap_err();
-        assert!(error.contains("out on frame 13 together with the other id-0 hitbox"), "{error}");
+        assert!(
+            error.contains("out on frame 13 together with the other id-0 hitbox"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1733,11 +2048,15 @@ mod tests {
     }
 
     /// Through the real writer, so every family is matched to its own call.
-    fn sync(source: &str, change: impl Fn(&mut Vec<Hitbox>)) -> (String, crate::acmd_src::SyncReport) {
+    fn sync(
+        source: &str,
+        change: impl Fn(&mut Vec<Hitbox>),
+    ) -> (String, crate::acmd_src::SyncReport) {
         let pristine = hitboxes(source);
         let mut edited = pristine.clone();
         change(&mut edited);
-        let (out, report) = crate::acmd_src::rewrite_hitboxes(source, "t", &pristine, &edited).unwrap();
+        let (out, report) =
+            crate::acmd_src::rewrite_hitboxes(source, "t", &pristine, &edited).unwrap();
         if report.skipped.is_empty() {
             let mut got: Vec<Timing> = hitboxes(&out).iter().map(timing).collect();
             let mut want: Vec<Timing> = edited.iter().map(timing).collect();
@@ -1867,7 +2186,13 @@ mod tests {
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         assert!(out.contains("frame(agent.lua_state_agent, 8.0);"), "{out}");
         let (_, report) = sync(source, |h| h[0].active_end = 20);
-        assert!(report.skipped.iter().any(|s| s.contains("ended by the status code")), "{report:?}");
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.contains("ended by the status code")),
+            "{report:?}"
+        );
     }
 
     fn effect_sync(
@@ -1911,12 +2236,22 @@ mod tests {
         });
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         let got = starts(&out);
-        assert!(got.contains(&("sys_attack_arc".into(), 12, 18)), "{got:?}\n{out}");
-        assert!(got.iter().any(|(name, start, _)| name == "sys_run_smoke" && *start == 10), "{out}");
+        assert!(
+            got.contains(&("sys_attack_arc".into(), 12, 18)),
+            "{got:?}\n{out}"
+        );
+        assert!(
+            got.iter()
+                .any(|(name, start, _)| name == "sys_run_smoke" && *start == 10),
+            "{out}"
+        );
         // The rate still follows the spawn it modifies.
         let rate = out.find("LAST_EFFECT_SET_RATE").unwrap();
         let spawn = out.find("sys_attack_arc").unwrap();
-        assert!(spawn < rate && !out[spawn..rate].contains("FOOT_EFFECT"), "{out}");
+        assert!(
+            spawn < rate && !out[spawn..rate].contains("FOOT_EFFECT"),
+            "{out}"
+        );
     }
 
     /// Conquest's directional effects: one spawn per facing, in `if lr < 0 { … } else { … }`.
@@ -1948,7 +2283,10 @@ mod tests {
             }
         });
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
-        assert!(starts(&out).iter().all(|(_, start, _)| *start == 14), "{out}");
+        assert!(
+            starts(&out).iter().all(|(_, start, _)| *start == 14),
+            "{out}"
+        );
         assert_eq!(out.matches("PostureModule::lr").count(), 1, "{out}");
     }
 
@@ -1958,7 +2296,11 @@ mod tests {
         let (out, report) = effect_sync(&source, |calls| calls[1].active_start = 14);
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         let got = starts(&out);
-        assert!(got.iter().any(|(_, start, _)| *start == 12) && got.iter().any(|(_, start, _)| *start == 14), "{out}");
+        assert!(
+            got.iter().any(|(_, start, _)| *start == 12)
+                && got.iter().any(|(_, start, _)| *start == 14),
+            "{out}"
+        );
         // The right-facing spawn still runs only when facing right.
         let moved = out.rfind("frame(agent.lua_state_agent, 14.0);").unwrap();
         assert!(out[moved..].contains("else { //right"), "{out}");
@@ -2011,11 +2353,22 @@ mod tests {
         });
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         let got = starts(&out);
-        assert!(got.contains(&("empoleon_beam".into(), 35, 50)), "{got:?}\n{out}");
-        assert!(got.contains(&("empoleon_blizzard".into(), 34, 49)), "{got:?}\n{out}");
-        let beam = out.find("empoleon_beam\"), Hash40::new(\"empoleon_beam").unwrap();
+        assert!(
+            got.contains(&("empoleon_beam".into(), 35, 50)),
+            "{got:?}\n{out}"
+        );
+        assert!(
+            got.contains(&("empoleon_blizzard".into(), 34, 49)),
+            "{got:?}\n{out}"
+        );
+        let beam = out
+            .find("empoleon_beam\"), Hash40::new(\"empoleon_beam")
+            .unwrap();
         let scale = out.find("set_scale_last").unwrap();
-        assert!(beam < scale && !out[beam..scale].contains("blizzard"), "{out}");
+        assert!(
+            beam < scale && !out[beam..scale].contains("blizzard"),
+            "{out}"
+        );
     }
 
     /// The dash attack shape: hits on 15 and 34, reached by `wait`. An effect added in Visionary
@@ -2045,12 +2398,22 @@ mod tests {
         added.active_start = 20;
         added.active_end = 26;
         edited.push(added);
-        let (out, report) = crate::acmd_src::rewrite_effect_calls(source, "t", &pristine, &edited).unwrap();
+        let (out, report) =
+            crate::acmd_src::rewrite_effect_calls(source, "t", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         let got = starts(&out);
-        assert!(got.contains(&("sys_attack_line".into(), 20, 26)), "{got:?}\n{out}");
-        assert!(got.contains(&("sys_dash_smoke".into(), 15, 15)), "{got:?}\n{out}");
-        assert!(got.contains(&("sys_landing_smoke".into(), 34, 34)), "{got:?}\n{out}");
+        assert!(
+            got.contains(&("sys_attack_line".into(), 20, 26)),
+            "{got:?}\n{out}"
+        );
+        assert!(
+            got.contains(&("sys_dash_smoke".into(), 15, 15)),
+            "{got:?}\n{out}"
+        );
+        assert!(
+            got.contains(&("sys_landing_smoke".into(), 34, 34)),
+            "{got:?}\n{out}"
+        );
         // The wait was split around both new frames, not replaced by absolute frames.
         assert!(out.contains("wait(agent.lua_state_agent, 5.0);"), "{out}");
         assert!(out.contains("EFFECT_OFF_KIND"), "{out}");
@@ -2082,9 +2445,13 @@ mod tests {
         added.active_start = 20;
         added.active_end = 26;
         edited.push(added);
-        let (out, report) = crate::acmd_src::rewrite_effect_calls(source, "t", &pristine, &edited).unwrap();
+        let (out, report) =
+            crate::acmd_src::rewrite_effect_calls(source, "t", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
-        assert!(starts(&out).contains(&("sys_attack_line".into(), 20, 26)), "{out}");
+        assert!(
+            starts(&out).contains(&("sys_attack_line".into(), 20, 26)),
+            "{out}"
+        );
     }
 
     #[test]

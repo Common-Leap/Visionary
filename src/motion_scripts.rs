@@ -426,14 +426,17 @@ mod tests {
             walk(Path::new(&src), &mut sources);
         }
         let mut names = moveset_names(&sources, &[romfs.clone()]);
-        let labels = std::fs::read_to_string(
-            dirs::cache_dir().unwrap().join("visionary/ParamLabels.csv"),
-        )
-        .map(|csv| crate::param_labels::parse_csv(&csv))
-        .unwrap_or_default();
+        let labels =
+            std::fs::read_to_string(dirs::cache_dir().unwrap().join("visionary/ParamLabels.csv"))
+                .map(|csv| crate::param_labels::parse_csv(&csv))
+                .unwrap_or_default();
         names.extend(labels);
         // Animation file names on disk, as the app's own index supplies them.
-        let mut motion_dirs = vec![romfs.join("fighter").join(name).join("motion/body").join(slot)];
+        let mut motion_dirs = vec![romfs
+            .join("fighter")
+            .join(name)
+            .join("motion/body")
+            .join(slot)];
         if let Some(vanilla) = std::env::var_os("VISIONARY_VANILLA_ROOT").map(PathBuf::from) {
             motion_dirs.push(vanilla.join("fighter").join(name).join("motion/body/c00"));
         }
@@ -491,7 +494,9 @@ mod tests {
         let yml = "motion_path: fighter/pacman/motion/body/c00\nlist:\n  attack_s4_s_reverse:\n    game_script: game_attacks4reverse\n    flags:\n      turn: true\n    blend_frames: 0\n    animations:\n      - name: c04attacks4sreverse.nuanmb\n        unk: 0\n    scripts:\n      - expression_attacks4reverse\n      - sound_attacks4reverse\n      - effect_attacks4reverse\n";
         let names = names_from_motion_list_yml(yml);
         assert_eq!(
-            names.get(&hash40("attack_s4_s_reverse")).map(String::as_str),
+            names
+                .get(&hash40("attack_s4_s_reverse"))
+                .map(String::as_str),
             Some("attack_s4_s_reverse")
         );
         assert!(names.contains_key(&hash40("effect_attacks4reverse")));
@@ -520,7 +525,10 @@ mod tests {
         );
         // A wrong hash yields nothing rather than a guess.
         assert_eq!(name_from_animation(hash40("walk_fall_l"), &names), None);
-        assert_eq!(animation_stem("a04walkfallr.nuanmb").as_deref(), Some("walkfallr"));
+        assert_eq!(
+            animation_stem("a04walkfallr.nuanmb").as_deref(),
+            Some("walkfallr")
+        );
     }
 
     /// A compiled plugin carries the registration strings even with no source linked.
@@ -532,7 +540,9 @@ mod tests {
         std::fs::write(dir.path().join("plugin.nro"), &blob).unwrap();
         let names = moveset_names(&[], &[dir.path().to_path_buf()]);
         assert_eq!(
-            names.get(&hash40("attack_s4_s_reverse")).map(String::as_str),
+            names
+                .get(&hash40("attack_s4_s_reverse"))
+                .map(String::as_str),
             Some("attack_s4_s_reverse")
         );
         assert!(names.contains_key(&hash40("game_attacks4reverse")));

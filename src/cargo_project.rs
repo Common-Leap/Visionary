@@ -54,10 +54,16 @@ impl CargoProject {
         if !tests::enabled() {
             return None;
         }
-        static CACHE: Mutex<Option<HashMap<PathBuf, (Vec<(PathBuf, Option<SystemTime>)>, CargoProject)>>> =
-            Mutex::new(None);
+        static CACHE: Mutex<
+            Option<HashMap<PathBuf, (Vec<(PathBuf, Option<SystemTime>)>, CargoProject)>>,
+        > = Mutex::new(None);
         let key = dir.to_path_buf();
-        if let Some((stamps, project)) = CACHE.lock().ok()?.get_or_insert_with(HashMap::new).get(&key) {
+        if let Some((stamps, project)) = CACHE
+            .lock()
+            .ok()?
+            .get_or_insert_with(HashMap::new)
+            .get(&key)
+        {
             if stamps.iter().all(|(path, stamp)| modified(path) == *stamp) {
                 return Some(project.clone());
             }
@@ -73,14 +79,21 @@ impl CargoProject {
         }
         let project = Self::from_metadata(&output.stdout)?;
         let stamps = std::iter::once(project.workspace_root.join("Cargo.toml"))
-            .chain(project.packages.iter().map(|package| package.manifest.clone()))
+            .chain(
+                project
+                    .packages
+                    .iter()
+                    .map(|package| package.manifest.clone()),
+            )
             .map(|path| {
                 let stamp = modified(&path);
                 (path, stamp)
             })
             .collect();
         if let Ok(mut cache) = CACHE.lock() {
-            cache.get_or_insert_with(HashMap::new).insert(key, (stamps, project.clone()));
+            cache
+                .get_or_insert_with(HashMap::new)
+                .insert(key, (stamps, project.clone()));
         }
         Some(project)
     }
@@ -119,10 +132,12 @@ impl CargoProject {
                     .targets
                     .iter()
                     .filter(|target| {
-                        target
-                            .kind
-                            .iter()
-                            .any(|kind| matches!(kind.as_str(), "lib" | "cdylib" | "rlib" | "dylib" | "staticlib" | "bin"))
+                        target.kind.iter().any(|kind| {
+                            matches!(
+                                kind.as_str(),
+                                "lib" | "cdylib" | "rlib" | "dylib" | "staticlib" | "bin"
+                            )
+                        })
                     })
                     .map(|target| target.src_path.clone())
                     .collect();
@@ -148,20 +163,34 @@ impl CargoProject {
 
     /// Every crate root the workspace compiles.
     pub fn crate_roots(&self) -> impl Iterator<Item = &PathBuf> {
-        self.packages.iter().flat_map(|package| package.crate_roots.iter())
+        self.packages
+            .iter()
+            .flat_map(|package| package.crate_roots.iter())
     }
 
     /// The plugin package: the workspace's only `cdylib`, or, when there are several, the one
     /// most of `files` belong to. `None` when no package builds a `cdylib`, or the tie between
     /// several cannot be broken.
     pub fn plugin_for(&self, files: &[PathBuf]) -> Option<&CargoPackage> {
-        let plugins: Vec<&CargoPackage> = self.packages.iter().filter(|p| p.cdylib.is_some()).collect();
+        let plugins: Vec<&CargoPackage> = self
+            .packages
+            .iter()
+            .filter(|p| p.cdylib.is_some())
+            .collect();
         if plugins.len() <= 1 {
             return plugins.first().copied();
         }
         let mut counts: Vec<(usize, &CargoPackage)> = plugins
             .iter()
-            .map(|package| (files.iter().filter(|file| file.starts_with(package.dir())).count(), *package))
+            .map(|package| {
+                (
+                    files
+                        .iter()
+                        .filter(|file| file.starts_with(package.dir()))
+                        .count(),
+                    *package,
+                )
+            })
             .collect();
         counts.sort_by(|a, b| b.0.cmp(&a.0));
         (counts[0].0 > 0 && counts[0].0 > counts[1].0).then_some(counts[0].1)
@@ -231,7 +260,13 @@ pub(crate) mod tests {
     fn metadata_gives_crate_roots_and_the_plugin() {
         let project = CargoProject::from_metadata(WORKSPACE.as_bytes()).unwrap();
         let roots: Vec<_> = project.crate_roots().cloned().collect();
-        assert_eq!(roots, [PathBuf::from("/ws/plugin/src/main_lib.rs"), PathBuf::from("/ws/crates/helper/src/lib.rs")]);
+        assert_eq!(
+            roots,
+            [
+                PathBuf::from("/ws/plugin/src/main_lib.rs"),
+                PathBuf::from("/ws/crates/helper/src/lib.rs")
+            ]
+        );
         let plugin = project.plugin_for(&[]).unwrap();
         assert_eq!(plugin.name, "my-mod");
         assert_eq!(plugin.dir(), Path::new("/ws/plugin"));
@@ -249,7 +284,10 @@ pub(crate) mod tests {
         second.manifest = PathBuf::from("/ws/other/Cargo.toml");
         project.packages.push(second);
         assert!(project.plugin_for(&[]).is_none(), "no evidence, no guess");
-        let files = [PathBuf::from("/ws/other/src/lib.rs"), PathBuf::from("/ws/other/src/acmd.rs")];
+        let files = [
+            PathBuf::from("/ws/other/src/lib.rs"),
+            PathBuf::from("/ws/other/src/acmd.rs"),
+        ];
         assert_eq!(project.plugin_for(&files).unwrap().name, "other");
     }
 
@@ -258,7 +296,11 @@ pub(crate) mod tests {
         enable();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"code/mod\"]\nresolver = \"2\"\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"code/mod\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("code/mod/src")).unwrap();
         std::fs::write(
             root.join("code/mod/Cargo.toml"),
@@ -272,6 +314,10 @@ pub(crate) mod tests {
         };
         let plugin = project.plugin_for(&[]).unwrap();
         assert_eq!(plugin.cdylib.as_deref(), Some("deep_mod"));
-        assert!(plugin.crate_roots[0].ends_with("entry.rs"), "{:?}", plugin.crate_roots);
+        assert!(
+            plugin.crate_roots[0].ends_with("entry.rs"),
+            "{:?}",
+            plugin.crate_roots
+        );
     }
 }

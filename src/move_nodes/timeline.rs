@@ -2542,7 +2542,15 @@ fn validate_command(fighter: Option<&str>, command: &ExcuteStmt) -> Result<(), S
                 .split_once('(')
                 .and_then(|(_, rest)| rest.split(',').next())
                 .map(str::trim);
-            if !matches!(receiver, Some("agent.module_accessor" | "boma" | "fighter.module_accessor" | "weapon.module_accessor")) {
+            if !matches!(
+                receiver,
+                Some(
+                    "agent.module_accessor"
+                        | "boma"
+                        | "fighter.module_accessor"
+                        | "weapon.module_accessor"
+                )
+            ) {
                 return Err("object call receiver must be the agent's module_accessor".into());
             }
             let line = call.emit();
@@ -2552,9 +2560,9 @@ fn validate_command(fighter: Option<&str>, command: &ExcuteStmt) -> Result<(), S
                         && read.article == call.article
                         && read.target == call.target
                         && read.args.len() == call.args.len()
-                        && read.args.iter().zip(&call.args).enumerate().all(|(slot, (a, b))| {
-                            Some(slot) == call.op.target_index() || a == b
-                        }) =>
+                        && read.args.iter().zip(&call.args).enumerate().all(
+                            |(slot, (a, b))| Some(slot) == call.op.target_index() || a == b,
+                        ) =>
                 {
                     Ok(())
                 }
@@ -7999,14 +8007,18 @@ mod tests {
                 for stmt in stmts {
                     match stmt {
                         AcmdStmt::Excute(commands) => {
-                            *count += commands.iter().filter(|command| match command {
-                                ExcuteStmt::Raw(raw) => raw.contains("ArticleModule::shoot("),
-                                // Typed but kept as written, like the raw line it replaced.
-                                ExcuteStmt::Article(call) => {
-                                    !call.edited && call.source.contains("ArticleModule::shoot(")
-                                }
-                                _ => false,
-                            }).count();
+                            *count += commands
+                                .iter()
+                                .filter(|command| match command {
+                                    ExcuteStmt::Raw(raw) => raw.contains("ArticleModule::shoot("),
+                                    // Typed but kept as written, like the raw line it replaced.
+                                    ExcuteStmt::Article(call) => {
+                                        !call.edited
+                                            && call.source.contains("ArticleModule::shoot(")
+                                    }
+                                    _ => false,
+                                })
+                                .count();
                         }
                         AcmdStmt::RawBlock { body, .. } | AcmdStmt::Loop { body, .. } => {
                             count_raw_shoot(body, count);

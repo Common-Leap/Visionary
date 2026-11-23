@@ -32,7 +32,9 @@ impl Source {
     pub fn describe(&self) -> String {
         match self {
             Source::CancelFrame => "the motion list's cancel_frame for this motion".into(),
-            Source::AnimationEnd => "the end of the animation (the motion list sets no cancel_frame)".into(),
+            Source::AnimationEnd => {
+                "the end of the animation (the motion list sets no cancel_frame)".into()
+            }
             Source::Param(name) => format!("the {name} param"),
             Source::SourceOverride(name) => format!("{name}, overridden in your linked source"),
             Source::Default => "the game's default value (param file not found)".into(),
@@ -52,13 +54,22 @@ impl MoveKind {
     pub fn of(motion: &str) -> Self {
         let motion = motion.to_ascii_lowercase();
         if let Some(rest) = motion.strip_prefix("attack_air_") {
-            for (prefix, key) in [("hi", "hi"), ("lw", "lw"), ("n", "n"), ("f", "f"), ("b", "b")] {
+            for (prefix, key) in [
+                ("hi", "hi"),
+                ("lw", "lw"),
+                ("n", "n"),
+                ("f", "f"),
+                ("b", "b"),
+            ] {
                 if rest.starts_with(prefix) {
                     return MoveKind::Aerial(key);
                 }
             }
         }
-        if ["attack_s4", "attack_hi4", "attack_lw4"].iter().any(|p| motion.starts_with(p)) {
+        if ["attack_s4", "attack_hi4", "attack_lw4"]
+            .iter()
+            .any(|p| motion.starts_with(p))
+        {
             return MoveKind::Smash;
         }
         MoveKind::Other
@@ -125,7 +136,8 @@ const OPEN_ENDED: u32 = 9999;
 
 pub fn compute(inputs: &Inputs) -> FrameData {
     let kind = MoveKind::of(inputs.motion);
-    let game = |motion: u32| -> u32 { inputs.script.game_frame(motion as f32).ceil().max(1.0) as u32 };
+    let game =
+        |motion: u32| -> u32 { inputs.script.game_frame(motion as f32).ceil().max(1.0) as u32 };
     // Damaging collisions only: grabs, wind, ATTACK_ABS and detection boxes are not "active".
     let attacks: Vec<&crate::data::Hitbox> = inputs
         .hitboxes
@@ -180,7 +192,9 @@ pub fn compute(inputs: &Inputs) -> FrameData {
             .iter()
             .filter(|hb| game(hb.active_start) == first)
             .map(|hb| hb.damage)
-            .fold(None, |best: Option<f32>, d| Some(best.map_or(d, |b| b.max(d))))?;
+            .fold(None, |best: Option<f32>, d| {
+                Some(best.map_or(d, |b| b.max(d)))
+            })?;
         let mul = match kind {
             MoveKind::Smash => inputs.params.shield_mul_smash.0,
             MoveKind::Aerial(_) => inputs.params.shield_mul_air.0,
@@ -189,7 +203,9 @@ pub fn compute(inputs: &Inputs) -> FrameData {
         Some(shieldstun(damage, mul))
     });
     let shield_advantage = match (kind, shieldstun) {
-        (MoveKind::Aerial(_), Some(stun)) => landing_lag.as_ref().map(|(lag, _)| stun as i32 - *lag as i32),
+        (MoveKind::Aerial(_), Some(stun)) => landing_lag
+            .as_ref()
+            .map(|(lag, _)| stun as i32 - *lag as i32),
         (_, Some(stun)) => match (&faf, startup) {
             (Some((faf, _)), Some(first)) => Some(stun as i32 - (*faf as i32 - first as i32)),
             _ => None,
@@ -256,9 +272,10 @@ pub fn load_params(
 /// `fighter`'s `scale` in `fighter_param.prc`, from the last of `fighter_roots` that has the file
 /// (see [`load_params`]).
 pub fn fighter_param_scale(fighter_roots: &[std::path::PathBuf], fighter: &str) -> Option<f32> {
-    let root = fighter_roots.iter().rev().find_map(|root| {
-        read_prc(&root.join("common").join("param").join("fighter_param.prc"))
-    })?;
+    let root = fighter_roots
+        .iter()
+        .rev()
+        .find_map(|root| read_prc(&root.join("common").join("param").join("fighter_param.prc")))?;
     field_number(fighter_row(&root, fighter)?, "scale").filter(|scale| *scale > 0.0)
 }
 
@@ -335,15 +352,22 @@ pub fn source_param_overrides<'a>(
         "landing_attack_air_frame_hi",
         "landing_attack_air_frame_lw",
     ];
-    let mut found: std::collections::HashMap<String, Option<f64>> = std::collections::HashMap::new();
+    let mut found: std::collections::HashMap<String, Option<f64>> =
+        std::collections::HashMap::new();
     for text in sources {
         for line in text.lines() {
             let code = line.split("//").next().unwrap_or("").trim();
             for key in KEYS {
-                let Some(rest) = code.strip_prefix(key) else { continue };
-                let Some(value) = rest.trim_start().strip_prefix(':') else { continue };
+                let Some(rest) = code.strip_prefix(key) else {
+                    continue;
+                };
+                let Some(value) = rest.trim_start().strip_prefix(':') else {
+                    continue;
+                };
                 let value = value.trim().trim_end_matches(',').trim();
-                let Ok(number) = value.trim_end_matches("f32").parse::<f64>() else { continue };
+                let Ok(number) = value.trim_end_matches("f32").parse::<f64>() else {
+                    continue;
+                };
                 found
                     .entry(key.to_string())
                     .and_modify(|known| {
@@ -440,8 +464,14 @@ mod tests {
     #[test]
     fn every_rate_form_moves_frame_data() {
         // smash_script's helpers: both call FT_MOTION_RATE with game_frames / motion_frames.
-        assert_eq!(startup_and_faf("    FT_MOTION_RATE_RANGE(agent, 0.0, 10.0, 5.0);"), (Some(5), Some(10)));
-        assert_eq!(startup_and_faf("    macros::FT_DESIRED_RATE(agent, 10.0, 20.0);"), (Some(20), Some(40)));
+        assert_eq!(
+            startup_and_faf("    FT_MOTION_RATE_RANGE(agent, 0.0, 10.0, 5.0);"),
+            (Some(5), Some(10))
+        );
+        assert_eq!(
+            startup_and_faf("    macros::FT_DESIRED_RATE(agent, 10.0, 20.0);"),
+            (Some(20), Some(40))
+        );
         // set_rate is playback speed: 2.0 plays twice as fast, so half the game frames.
         assert_eq!(
             startup_and_faf("    if macros::is_excute(agent) {\n        MotionModule::set_rate(agent.module_accessor, 2.0);\n    }"),
@@ -464,7 +494,10 @@ mod tests {
         let script = crate::data::AcmdScript::default();
         let hitboxes = [hitbox(3, 20, 8.0)];
         let params = FrameParams {
-            landing_lag: Some((8.0, Source::SourceOverride("landing_attack_air_frame_n".into()))),
+            landing_lag: Some((
+                8.0,
+                Source::SourceOverride("landing_attack_air_frame_n".into()),
+            )),
             ..FrameParams::default()
         };
         let data = compute(&Inputs {

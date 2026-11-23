@@ -488,7 +488,10 @@ mod tests {
     #[test]
     fn slot_from_eff_path_reads_costume_suffix() {
         assert_eq!(slot_from_eff_path(Path::new("ef_pacman_c40.eff")), Some(40));
-        assert_eq!(slot_from_eff_path(Path::new("/a/b/ef_mario_c08.eff")), Some(8));
+        assert_eq!(
+            slot_from_eff_path(Path::new("/a/b/ef_mario_c08.eff")),
+            Some(8)
+        );
         assert_eq!(slot_from_eff_path(Path::new("ef_pacman.eff")), None);
         assert_eq!(slot_from_eff_path(Path::new("ef_common.eff")), None);
     }

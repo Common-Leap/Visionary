@@ -109,11 +109,7 @@ impl SourceStyle {
                 if !state.is_empty() && !state.contains(['(', ')', '\n']) {
                     style.lua_state = state.to_string();
                 }
-                let number = args[comma + 1..]
-                    .split(')')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
+                let number = args[comma + 1..].split(')').next().unwrap_or("").trim();
                 if number.parse::<f32>().is_ok() {
                     style.float_frames = number.contains('.');
                 }
@@ -192,7 +188,10 @@ impl SourceStyle {
             text = integer_frames(&text);
         }
         if self.excute_path != "macros::" {
-            text = text.replace("macros::is_excute(", &format!("{}is_excute(", self.excute_path));
+            text = text.replace(
+                "macros::is_excute(",
+                &format!("{}is_excute(", self.excute_path),
+            );
         }
         if self.macro_path != "macros::" {
             text = replace_macro_path(&text, &self.macro_path);
@@ -212,8 +211,12 @@ fn integer_frames(text: &str) -> String {
         while let Some(rel) = out[search..].find(head) {
             let at = search + rel + head.len();
             search = at;
-            let Some(comma) = out[at..].find(',').map(|n| at + n) else { break };
-            let Some(close) = out[comma..].find(')').map(|n| comma + n) else { break };
+            let Some(comma) = out[at..].find(',').map(|n| at + n) else {
+                break;
+            };
+            let Some(close) = out[comma..].find(')').map(|n| comma + n) else {
+                break;
+            };
             let number = out[comma + 1..close].trim();
             if let Some(whole) = number.strip_suffix(".0") {
                 if whole.parse::<i64>().is_ok() {

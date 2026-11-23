@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::data::FighterEntry;
 use crate::acmd_src::SourceIndex;
+use crate::data::FighterEntry;
 use crate::mod_project::{ModProjectFile, ProjectFighter};
 
 /// How a project records its linked moveset crate: relative to the project folder (with `/`
@@ -334,8 +334,11 @@ pub fn reassign_seeded_fighters(
     set: &mut BTreeSet<ProjectFighter>,
     owners: impl Fn(&str) -> Vec<ProjectFighter>,
 ) {
-    let seeded: Vec<ProjectFighter> =
-        set.iter().filter(|row| row.character.is_none()).cloned().collect();
+    let seeded: Vec<ProjectFighter> = set
+        .iter()
+        .filter(|row| row.character.is_none())
+        .cloned()
+        .collect();
     for row in seeded {
         let rows = owners(&row.name);
         if !rows.contains(&row) {
@@ -440,7 +443,10 @@ mod tests {
     fn resolve_round_trips() {
         let proj = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        for crate_root in [proj.path().join("a").join("moveset"), other.path().join("moveset")] {
+        for crate_root in [
+            proj.path().join("a").join("moveset"),
+            other.path().join("moveset"),
+        ] {
             let stored = store_moveset_path(&crate_root, proj.path());
             assert_eq!(resolve_moveset_path(&stored, proj.path()), crate_root);
         }
@@ -637,7 +643,10 @@ mod tests {
     fn reasons_join_into_one_phrase() {
         use MembershipReason::*;
         assert_eq!(join_reasons(&[]), "");
-        assert_eq!(join_reasons(&[MovesetScripts]), "has scripts in the moveset");
+        assert_eq!(
+            join_reasons(&[MovesetScripts]),
+            "has scripts in the moveset"
+        );
         assert_eq!(
             join_reasons(&[RomfsFiles, HasEdits]),
             "has files in romfs/ and has edits"
@@ -654,7 +663,10 @@ mod tests {
         index.fighters.insert(String::new(), Default::default());
         assert!(moveset_fighters(&index).is_empty());
         index.fighters.insert("mario".into(), Default::default());
-        assert_eq!(moveset_fighters(&index), BTreeSet::from(["mario".to_string()]));
+        assert_eq!(
+            moveset_fighters(&index),
+            BTreeSet::from(["mario".to_string()])
+        );
     }
 
     #[test]
@@ -696,7 +708,13 @@ mod tests {
     /// the fighter's own row is not in the project for them.
     #[test]
     fn costume_gated_moveset_belongs_to_the_slot_character() {
-        let got = run_gated(&[], &[("pacman", &[40, 41])], &["pacman"], &["pacman"], &["pacman"]);
+        let got = run_gated(
+            &[],
+            &[("pacman", &[40, 41])],
+            &["pacman"],
+            &["pacman"],
+            &["pacman"],
+        );
         assert!(got[1].is_empty(), "own row: {:?}", got[1]);
         assert_eq!(
             got[2],
@@ -715,7 +733,10 @@ mod tests {
             &["pacman"],
         );
         assert!(got[1].is_empty());
-        assert_eq!(got[2], vec![MembershipReason::Added, MembershipReason::MovesetScripts]);
+        assert_eq!(
+            got[2],
+            vec![MembershipReason::Added, MembershipReason::MovesetScripts]
+        );
     }
 
     /// Gated, but the project names no character on that fighter (its slots are not split off,
@@ -732,7 +753,10 @@ mod tests {
         let got = run_gated(&[], &[("pacman", &[3])], &["pacman"], &[], &["pacman"]);
         assert_eq!(
             got[1],
-            vec![MembershipReason::RomfsFiles, MembershipReason::MovesetScripts]
+            vec![
+                MembershipReason::RomfsFiles,
+                MembershipReason::MovesetScripts
+            ]
         );
         assert!(got[2].is_empty());
     }
@@ -757,10 +781,16 @@ mod tests {
         absorb_edited_fighters(&mut set, &BTreeSet::new(), &project, |name| {
             script_owners(name, &rows, &inputs)
         });
-        assert_eq!(set, BTreeSet::from([ProjectFighter::character("pacman", "Shy Guy")]));
+        assert_eq!(
+            set,
+            BTreeSet::from([ProjectFighter::character("pacman", "Shy Guy")])
+        );
 
         // A v3 file seeded the fighter's own row from the same edits.
-        let mut seeded = BTreeSet::from([ProjectFighter::fighter("pacman"), ProjectFighter::fighter("mario")]);
+        let mut seeded = BTreeSet::from([
+            ProjectFighter::fighter("pacman"),
+            ProjectFighter::fighter("mario"),
+        ]);
         reassign_seeded_fighters(&mut seeded, |name| script_owners(name, &rows, &inputs));
         assert_eq!(
             seeded,
@@ -792,16 +822,19 @@ mod tests {
     fn authored_character_joins_once() {
         let mut set = BTreeSet::new();
         let mut project = crate::mod_project::ModProjectFile::default();
-        project.roster.authored.push(crate::mod_project::AuthoredEntry {
-            key: crate::roster::RosterKey::slot("pacman", 8),
-            donor: "pacman".into(),
-            slot: 8,
-            slots: Vec::new(),
-            display_name: "Shy Guy".into(),
-            name_id: "shy_guy".into(),
-            moveset_scaffolded: false,
-            files_root: None,
-        });
+        project
+            .roster
+            .authored
+            .push(crate::mod_project::AuthoredEntry {
+                key: crate::roster::RosterKey::slot("pacman", 8),
+                donor: "pacman".into(),
+                slot: 8,
+                slots: Vec::new(),
+                display_name: "Shy Guy".into(),
+                name_id: "shy_guy".into(),
+                moveset_scaffolded: false,
+                files_root: None,
+            });
         let shy_guy = ProjectFighter::character("pacman", "Shy Guy");
         let authored = absorb_authored_characters(&mut set, &BTreeSet::new(), &project.roster);
         assert_eq!(set, BTreeSet::from([shy_guy.clone()]));
@@ -853,25 +886,39 @@ mod tests {
     #[test]
     fn a_project_inside_its_moveset_crate_finds_it() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("src/emperte")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "mod emperte;\npub fn main() { let a = &mut Agent::new(\"falco\"); emperte::install(a); }\n").unwrap();
-        assert_eq!(workspace_moveset(dir.path()), None, "a crate with no scripts is not a moveset");
+        assert_eq!(
+            workspace_moveset(dir.path()),
+            None,
+            "a crate with no scripts is not a moveset"
+        );
         std::fs::write(
             dir.path().join("src/emperte/mod.rs"),
             "unsafe extern \"C\" fn game_attackhi3(agent: &mut L2CAgentBase) {}\npub fn install(agent: &mut Agent) { agent.acmd(\"game_attackhi3\", game_attackhi3, Priority::Low); }\n",
         )
         .unwrap();
-        assert_eq!(workspace_moveset(dir.path()), Some(dir.path().to_path_buf()));
-        assert_eq!(workspace_moveset(&dir.path().join("src")), None, "no Cargo.toml there");
+        assert_eq!(
+            workspace_moveset(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            workspace_moveset(&dir.path().join("src")),
+            None,
+            "no Cargo.toml there"
+        );
     }
 
     #[test]
     fn stale_moveset_path_is_kept() {
         let gone = PathBuf::from("Z:/no/such/moveset");
-        let (kept, index, problem) = moveset_on_load(Some(gone.clone()), |_| {
-            Err(anyhow::anyhow!("not found"))
-        });
+        let (kept, index, problem) =
+            moveset_on_load(Some(gone.clone()), |_| Err(anyhow::anyhow!("not found")));
         assert_eq!(kept, Some(gone.clone()));
         assert!(index.is_none());
         assert_eq!(
@@ -879,8 +926,9 @@ mod tests {
             Some(format!("could not re-open {}: not found", gone.display()).as_str())
         );
 
-        let (kept, index, problem) =
-            moveset_on_load(Some(gone.clone()), |_| Ok(crate::acmd_src::SourceIndex::default()));
+        let (kept, index, problem) = moveset_on_load(Some(gone.clone()), |_| {
+            Ok(crate::acmd_src::SourceIndex::default())
+        });
         assert_eq!(kept, Some(gone));
         assert!(index.is_some());
         assert!(problem.is_none());

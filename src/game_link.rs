@@ -3438,9 +3438,9 @@ impl GameLink {
         if self.sends_suppressed() {
             return;
         }
-        let Ok(payload) = serde_json::to_string(
-            &serde_json::json!({ "article_effect_control_rules": rules }),
-        ) else {
+        let Ok(payload) =
+            serde_json::to_string(&serde_json::json!({ "article_effect_control_rules": rules }))
+        else {
             return;
         };
         let frame = format!("<TCP_MESSAGE>{payload}</TCP_MESSAGE>");
@@ -5941,10 +5941,8 @@ mod tests {
 
     #[test]
     fn capture_debug_window_uses_only_character_kinds_present_in_the_cache() {
-        let app = read_source(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
-        )
-        .expect("read the desktop app");
+        let app = read_source(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"))
+            .expect("read the desktop app");
         let window = app
             .split_once("fn draw_capture_debug_window")
             .expect("capture debug window exists")
@@ -6719,8 +6717,7 @@ mod tests {
     fn the_plugin_does_not_patch_collision_dispatch() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/systems/skyline_hook.rs");
-        let source = read_source(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let source = read_source(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         for needle in [
             "COLLISION_HOOK mode=disabled reason=unused-and-unsafe",
             "collision detours disabled",
@@ -6746,8 +6743,8 @@ mod tests {
 
         let diag_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/diag.rs");
-        let diag_source = read_source(&diag_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", diag_path.display()));
+        let diag_source =
+            read_source(&diag_path).unwrap_or_else(|e| panic!("read {}: {e}", diag_path.display()));
         for needle in [
             "static COLLISION_HITS: AtomicU64",
             "pub fn note_collision()",
@@ -6783,8 +6780,7 @@ mod tests {
     fn the_plugin_effect_kill_hook_preserves_the_native_return() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer/mod.rs");
-        let source = read_source(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let source = read_source(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let start = source
             .find("fn hook_kill(")
             .expect("EffectModule::kill hook must exist");
@@ -6954,8 +6950,8 @@ mod tests {
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/effect_viewer");
-        let rules = read_source(root.join("spawn_rules.rs"))
-            .expect("read the plugin's spawn rules");
+        let rules =
+            read_source(root.join("spawn_rules.rs")).expect("read the plugin's spawn rules");
         assert!(
             rules.contains("pub camera_offset: Option<f32>,")
                 && rules.contains("pub fn camera_offset_for")
@@ -6965,8 +6961,7 @@ mod tests {
                 && rules.contains("pub fn scale_w_for"),
             "the plugin no longer exposes the camera-flat rule field and lookup"
         );
-        let hooks = read_source(root.join("acmd_hooks.rs"))
-            .expect("read the plugin's ACMD hooks");
+        let hooks = read_source(root.join("acmd_hooks.rs")).expect("read the plugin's ACMD hooks");
         assert!(
             hooks.contains(
                 "replace = smash::app::sv_animcmd::LAST_EFFECT_SET_OFFSET_TO_CAMERA_FLAT"
@@ -7203,13 +7198,11 @@ mod tests {
         // here for the CPU-match regression: every agent receives a Main callback, but only one
         // stable fighter is allowed to run the complete global fighter/weapon dispatch.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let extender = read_source(
-            root.join("plugins/slight_replica/src/slight/agent_extender/mod.rs"),
-        )
-        .expect("read plugin agent extender");
-        let agents =
-            read_source(root.join("plugins/slight_replica/src/slight/agents.rs"))
-                .expect("read plugin agent registry");
+        let extender =
+            read_source(root.join("plugins/slight_replica/src/slight/agent_extender/mod.rs"))
+                .expect("read plugin agent extender");
+        let agents = read_source(root.join("plugins/slight_replica/src/slight/agents.rs"))
+            .expect("read plugin agent registry");
 
         assert!(agents.contains("pub fn is_frame_driver(boid: u32) -> bool"));
         assert!(agents.contains("min_by_key(|rec| (rec.entry_id, rec.boid))"));
@@ -7320,8 +7313,7 @@ mod tests {
             .join("plugins/slight_replica/src/slight/effect_viewer");
         let rules = read_source(root.join("control_rules.rs"))
             .expect("read the plugin's effect control rules");
-        let hooks = read_source(root.join("acmd_hooks.rs"))
-            .expect("read the plugin's ACMD hooks");
+        let hooks = read_source(root.join("acmd_hooks.rs")).expect("read the plugin's ACMD hooks");
         assert!(
             rules.contains("pub struct ControlRule")
                 && rules.contains("pub struct ControlInject")
@@ -7573,8 +7565,20 @@ mod tests {
         assert!(module.contains("replace = smash::app::lua_bind::GrabModule::clear_all)"));
         // Installed, not just declared.
         assert!(module.contains("hook_grab,") && module.contains("hook_grab_clear_all,"));
-        for other in [0, 1, 2, 3, 4, CAT_SEARCH, CAT_ATTACK_FP, CAT_MOTION_MODULE_SET_FRAME_PARTIAL] {
-            assert_ne!(CAT_GRAB_CLEAR, other, "CAT_GRAB_CLEAR collides with {other}");
+        for other in [
+            0,
+            1,
+            2,
+            3,
+            4,
+            CAT_SEARCH,
+            CAT_ATTACK_FP,
+            CAT_MOTION_MODULE_SET_FRAME_PARTIAL,
+        ] {
+            assert_ne!(
+                CAT_GRAB_CLEAR, other,
+                "CAT_GRAB_CLEAR collides with {other}"
+            );
         }
     }
 
@@ -7620,8 +7624,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("plugins/slight_replica/src/slight/hitbox_viewer");
         let module = read_source(root.join("mod.rs")).expect("read hitbox_viewer");
-        let rate_hooks =
-            read_source(root.join("rate_hooks.rs")).expect("read rate hooks");
+        let rate_hooks = read_source(root.join("rate_hooks.rs")).expect("read rate hooks");
         assert!(module.contains(&format!("pub const CAT_CLR_SPEED: u8 = {CAT_CLR_SPEED};")));
         assert!(module.contains(&format!("pub const CAT_SET_AIR: u8 = {CAT_SET_AIR};")));
         assert!(module.contains(&format!(

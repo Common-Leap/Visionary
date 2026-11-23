@@ -3,7 +3,7 @@
 //!
 //! Ported from SSBH Studio (MIT), with its numpad view keys.
 use crate::preferences::NavigationWidget;
-use crate::renderer::{Camera, camera_rotation};
+use crate::renderer::{camera_rotation, Camera};
 use egui::{Color32, Id, Order, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use glam::{Mat4, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -193,7 +193,10 @@ fn label_strokes(letter: &str, negative: bool) -> Vec<Vec<Vec2>> {
         .collect();
     if negative {
         let left = -total * 0.5;
-        strokes.push(vec![Vec2::new(left, 0.0), Vec2::new(left + MINUS_WIDTH, 0.0)]);
+        strokes.push(vec![
+            Vec2::new(left, 0.0),
+            Vec2::new(left + MINUS_WIDTH, 0.0),
+        ]);
     }
     strokes
 }
@@ -724,7 +727,11 @@ mod tests {
         let before = on_screen(&camera);
         for view in &VIEWS {
             camera.turn_to(view.rotation);
-            assert!(on_screen(&camera).abs_diff_eq(before, 1e-3), "{}", view.name);
+            assert!(
+                on_screen(&camera).abs_diff_eq(before, 1e-3),
+                "{}",
+                view.name
+            );
         }
     }
 }

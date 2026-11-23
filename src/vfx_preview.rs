@@ -586,14 +586,7 @@ impl VfxPreview {
             .transform_point3(glam::Vec3::from(eye))
             .to_array();
         let game_eye_vec = Vec3::from(eye);
-        let camera = view_block::view_block(
-            &rows(game_v),
-            &rows(projection),
-            eye,
-            near,
-            far,
-            1.0,
-        );
+        let camera = view_block::view_block(&rows(game_v), &rows(projection), eye, near, far, 1.0);
         // Effects draw into the scene before bloom and colour grading, so they take the game's
         // half scale, which the post pass doubles back.
         let custom2 = render::game_custom2();
@@ -711,16 +704,23 @@ impl VfxPreview {
                     if !vertices.is_empty() {
                         let sampler_defs = samplers(emitter);
                         let textures = file.textures.lock().unwrap_or_else(|e| e.into_inner());
-                        let views: [Option<Arc<render::GpuTexture>>; 2] = std::array::from_fn(|i| {
-                            let idx = file.texture_index(sampler_defs[i]?)?;
-                            textures.get(&idx)?.clone()
-                        });
+                        let views: [Option<Arc<render::GpuTexture>>; 2] =
+                            std::array::from_fn(|i| {
+                                let idx = file.texture_index(sampler_defs[i]?)?;
+                                textures.get(&idx)?.clone()
+                            });
                         drop(textures);
                         let smp_refs: [Option<&wgpu::Sampler>; 2] = std::array::from_fn(|i| {
                             file.samplers.get(&sampler_key(sampler_defs[i]?))
                         });
                         let renderer = self.stripes.get_or_insert_with(|| {
-                            StripeRenderer::new(device, queue, self.target, self.depth, self.samples)
+                            StripeRenderer::new(
+                                device,
+                                queue,
+                                self.target,
+                                self.depth,
+                                self.samples,
+                            )
                         });
                         renderer.prepare(
                             device,
@@ -1218,7 +1218,10 @@ impl StripeConfig {
                     1.0,
                 ),
                 "EP02" => (
-                    read_f32_le(d, 0x14).unwrap_or(16.0).round().clamp(2.0, 128.0) as usize,
+                    read_f32_le(d, 0x14)
+                        .unwrap_or(16.0)
+                        .round()
+                        .clamp(2.0, 128.0) as usize,
                     read_f32_le(d, 0x10).unwrap_or(2.0).round().clamp(1.0, 8.0) as usize,
                     read_f32_le(d, 0x1c).unwrap_or(1.0).clamp(0.0, 1.0),
                     read_f32_le(d, 0x20).unwrap_or(0.0).clamp(0.0, 1.0),
@@ -1227,7 +1230,10 @@ impl StripeConfig {
                 ),
                 _ => (
                     // EP03 (SuperStripe / Stripe2)
-                    read_f32_le(d, 0x18).unwrap_or(16.0).round().clamp(2.0, 128.0) as usize,
+                    read_f32_le(d, 0x18)
+                        .unwrap_or(16.0)
+                        .round()
+                        .clamp(2.0, 128.0) as usize,
                     read_u32_le(d, 0x28).unwrap_or(2).clamp(1, 8) as usize,
                     read_f32_le(d, 0x20).unwrap_or(1.0).clamp(0.0, 1.0),
                     read_f32_le(d, 0x24).unwrap_or(0.0).clamp(0.0, 1.0),
@@ -1236,10 +1242,18 @@ impl StripeConfig {
                 ),
             };
         // Particle scale: base scale (0x130) * emitter particle scale (0x9c0).
-        let base_x = read_f32_le(fixed, 0x130).filter(|v| *v > 0.001).unwrap_or(1.0);
-        let base_y = read_f32_le(fixed, 0x134).filter(|v| *v > 0.001).unwrap_or(base_x);
-        let em_x = read_f32_le(fixed, 0x9c0).filter(|v| *v > 0.001).unwrap_or(1.0);
-        let em_y = read_f32_le(fixed, 0x9c4).filter(|v| *v > 0.001).unwrap_or(em_x);
+        let base_x = read_f32_le(fixed, 0x130)
+            .filter(|v| *v > 0.001)
+            .unwrap_or(1.0);
+        let base_y = read_f32_le(fixed, 0x134)
+            .filter(|v| *v > 0.001)
+            .unwrap_or(base_x);
+        let em_x = read_f32_le(fixed, 0x9c0)
+            .filter(|v| *v > 0.001)
+            .unwrap_or(1.0);
+        let em_y = read_f32_le(fixed, 0x9c4)
+            .filter(|v| *v > 0.001)
+            .unwrap_or(em_x);
         let width = (base_x * em_x).max(base_y * em_y).max(0.5);
         // Stripe ribbons in Smash are sized in particle units (often ~2–4 units wide when
         // base_scale is 1.0 on a projectile). Clamp to a visible minimum.
@@ -1375,8 +1389,7 @@ pub(crate) fn build_stripe_vertices(
 
     // Subdivide with Catmull-Rom so curved arcs (like thrown projectiles) stay smooth.
     let partitions = cfg.partitions.max(1);
-    let mut samples: Vec<(Vec3, f32)> =
-        Vec::with_capacity((raw_points.len() - 1) * partitions + 1);
+    let mut samples: Vec<(Vec3, f32)> = Vec::with_capacity((raw_points.len() - 1) * partitions + 1);
     let n = raw_points.len();
     for i in 0..n - 1 {
         let p0 = raw_points[i.saturating_sub(1)].0;
@@ -1442,12 +1455,36 @@ pub(crate) fn build_stripe_vertices(
     for pair in edges.windows(2) {
         let (l0, r0, v0, c0) = pair[0];
         let (l1, r1, v1, c1) = pair[1];
-        out.push(StripeVertex { pos: l0, uv: [0.0, v0], color: c0 });
-        out.push(StripeVertex { pos: r0, uv: [1.0, v0], color: c0 });
-        out.push(StripeVertex { pos: r1, uv: [1.0, v1], color: c1 });
-        out.push(StripeVertex { pos: l0, uv: [0.0, v0], color: c0 });
-        out.push(StripeVertex { pos: r1, uv: [1.0, v1], color: c1 });
-        out.push(StripeVertex { pos: l1, uv: [0.0, v1], color: c1 });
+        out.push(StripeVertex {
+            pos: l0,
+            uv: [0.0, v0],
+            color: c0,
+        });
+        out.push(StripeVertex {
+            pos: r0,
+            uv: [1.0, v0],
+            color: c0,
+        });
+        out.push(StripeVertex {
+            pos: r1,
+            uv: [1.0, v1],
+            color: c1,
+        });
+        out.push(StripeVertex {
+            pos: l0,
+            uv: [0.0, v0],
+            color: c0,
+        });
+        out.push(StripeVertex {
+            pos: r1,
+            uv: [1.0, v1],
+            color: c1,
+        });
+        out.push(StripeVertex {
+            pos: l1,
+            uv: [0.0, v1],
+            color: c1,
+        });
     }
     out
 }

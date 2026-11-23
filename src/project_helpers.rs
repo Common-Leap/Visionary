@@ -186,16 +186,29 @@ fn helper_definitions(text: &str) -> Vec<(String, Helper)> {
             .unwrap_or(0);
         let name = &text[name_start..name_start + name_len];
         // ACMD helpers mirror the macros they wrap: upper-case names only.
-        if name.len() < 3 || !name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
+        if name.len() < 3
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
             continue;
         }
-        let Some(open) = text[name_start + name_len..].find('(').map(|n| name_start + name_len + n) else {
+        let Some(open) = text[name_start + name_len..]
+            .find('(')
+            .map(|n| name_start + name_len + n)
+        else {
             continue;
         };
-        let Some(close) = close_of(text, open) else { continue };
+        let Some(close) = close_of(text, open) else {
+            continue;
+        };
         let params: Vec<String> = split_top(&text[open + 1..close])
             .into_iter()
-            .filter_map(|param| param.split_once(':').map(|(name, _)| name.trim().to_string()))
+            .filter_map(|param| {
+                param
+                    .split_once(':')
+                    .map(|(name, _)| name.trim().to_string())
+            })
             .collect();
         let first_is_agent = split_top(&text[open + 1..close])
             .first()
@@ -203,21 +216,30 @@ fn helper_definitions(text: &str) -> Vec<(String, Helper)> {
         if !first_is_agent || params.is_empty() {
             continue;
         }
-        let Some(body_open) = text[close..].find('{').map(|n| close + n) else { continue };
+        let Some(body_open) = text[close..].find('{').map(|n| close + n) else {
+            continue;
+        };
         // Nothing but a return type between the parameters and the body.
         let between = text[close + 1..body_open].trim();
         if !(between.is_empty() || between.starts_with("->")) {
             continue;
         }
-        let Some(body_close) = close_of(text, body_open) else { continue };
+        let Some(body_close) = close_of(text, body_open) else {
+            continue;
+        };
         let body = text[body_open + 1..body_close].trim();
         let body = body.strip_suffix(';').unwrap_or(body).trim();
         if body.contains(';') || body.contains('{') {
             continue;
         }
-        let Some(call_open) = body.find('(') else { continue };
+        let Some(call_open) = body.find('(') else {
+            continue;
+        };
         let path = &body[..call_open];
-        if !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
             continue;
         }
         let module_target = MODULE_TARGETS
@@ -229,11 +251,15 @@ fn helper_definitions(text: &str) -> Vec<(String, Helper)> {
         };
         if module_target.is_none()
             && (target.len() < 3
-                || !target.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                || !target
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
         {
             continue;
         }
-        let Some(call_close) = close_of(body, call_open) else { continue };
+        let Some(call_close) = close_of(body, call_open) else {
+            continue;
+        };
         if call_close + 1 != body.len() {
             continue;
         }
@@ -411,12 +437,21 @@ pub unsafe fn PLAY_RANDOM_SE(agent: &mut L2CAgentBase, outcomes: impl RandomSePo
             })
         );
         assert_eq!(
-            helpers.helpers.get(&("RUMBLE_HIT_FOR".into(), 3)).map(|h| &h.slots),
+            helpers
+                .helpers
+                .get(&("RUMBLE_HIT_FOR".into(), 3))
+                .map(|h| &h.slots),
             Some(&vec![Slot::Param(0), Slot::Param(1), Slot::Param(2)])
         );
-        assert!(!helpers.helpers.keys().any(|(name, _)| name == "PLAY_RANDOM_SE"));
+        assert!(!helpers
+            .helpers
+            .keys()
+            .any(|(name, _)| name == "PLAY_RANDOM_SE"));
         assert_eq!(
-            helpers.helpers.get(&("RUMBLE".into(), 3)).map(|h| (&h.target, &h.slots)),
+            helpers
+                .helpers
+                .get(&("RUMBLE".into(), 3))
+                .map(|h| (&h.target, &h.slots)),
             Some((
                 &"ControlModule::set_rumble".to_string(),
                 &vec![

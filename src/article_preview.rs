@@ -852,9 +852,9 @@ pub fn load_kind_resolved(
         .chain(std::iter::once(fighter_dir))
         .collect();
     let model_name = model_folder(name);
-    let skel_path = search_dirs.iter().find_map(|dir| {
-        crate::data::find_part_skel(&dir.join("model").join(model_name), slot)
-    });
+    let skel_path = search_dirs
+        .iter()
+        .find_map(|dir| crate::data::find_part_skel(&dir.join("model").join(model_name), slot));
     let model_dir = skel_path
         .as_ref()
         .and_then(|path| path.parent())
@@ -904,7 +904,8 @@ pub fn load_kind_resolved(
     }
     // Always include "regular" and any caller-supplied source script names as fallback candidates
     // so clones or articles without a local motion_list.bin still load their source hitboxes.
-    for fallback in std::iter::once("regular").chain(inputs.extra_scripts.iter().map(String::as_str))
+    for fallback in
+        std::iter::once("regular").chain(inputs.extra_scripts.iter().map(String::as_str))
     {
         if !fallback.is_empty() && !motions.iter().any(|(label, _)| label == fallback) {
             motions.push((fallback.to_owned(), None));
@@ -1196,7 +1197,9 @@ fn target_live_indices(
     let live: Vec<usize> = plans
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.name == name && p.spawned <= frame && p.removed.is_none_or(|r| frame < r))
+        .filter(|(_, p)| {
+            p.name == name && p.spawned <= frame && p.removed.is_none_or(|r| frame < r)
+        })
         .map(|(i, _)| i)
         .collect();
     match target {
@@ -1340,23 +1343,17 @@ fn collect_wrapper_spawns(
             }
             AcmdStmt::Bare(inner) => {
                 if let ExcuteStmt::Raw(line) = inner.as_ref() {
-                    if let Some(plan) = wrapper_spawn_from_line(
-                        line,
-                        frame.max(1.0).round() as u32,
-                        catalog,
-                        index,
-                    ) {
+                    if let Some(plan) =
+                        wrapper_spawn_from_line(line, frame.max(1.0).round() as u32, catalog, index)
+                    {
                         out.push(plan);
                     }
                 }
             }
             AcmdStmt::RawBlock { header, body, .. } => {
-                if let Some(plan) = wrapper_spawn_from_line(
-                    header,
-                    frame.max(1.0).round() as u32,
-                    catalog,
-                    index,
-                ) {
+                if let Some(plan) =
+                    wrapper_spawn_from_line(header, frame.max(1.0).round() as u32, catalog, index)
+                {
                     out.push(plan);
                 }
                 frame = collect_wrapper_spawns(body, frame, catalog, index, out);
@@ -1541,7 +1538,15 @@ fn same_file_callees(body: &str, file_text: &str) -> Vec<String> {
                 && !matches!(prev, Some(b'.' | b':'))
                 && !matches!(
                     ident,
-                    "if" | "while" | "for" | "match" | "return" | "let" | "unsafe" | "fn" | "Some" | "None"
+                    "if" | "while"
+                        | "for"
+                        | "match"
+                        | "return"
+                        | "let"
+                        | "unsafe"
+                        | "fn"
+                        | "Some"
+                        | "None"
                 )
                 && !out.iter().any(|s| s == ident)
                 && crate::acmd_src::function_item(file_text, ident).is_some()
@@ -1753,7 +1758,8 @@ pub fn plays_in_fighter_space(skel: &SkelData, anim: &AnimData) -> bool {
         .collect();
     let last = anim.final_frame_index.max(0.0);
     [0.0, last * 0.5, last].iter().any(|&frame| {
-        let bones = crate::renderer::compute_bone_world_matrices(skel, Some(anim), None, &[], frame);
+        let bones =
+            crate::renderer::compute_bone_world_matrices(skel, Some(anim), None, &[], frame);
         top.iter().any(|name| {
             bones
                 .get(*name)
@@ -1767,10 +1773,16 @@ pub fn object_bones(object: &PlacedObject) -> HashMap<String, glam::Mat4> {
     let Some(skel) = &object.kind.skel else {
         return HashMap::from([("top".to_owned(), object.placement)]);
     };
-    crate::renderer::compute_bone_world_matrices(skel, object.kind.anim.as_deref(), None, &[], object.age)
-        .into_iter()
-        .map(|(name, matrix)| (name, object.placement * matrix))
-        .collect()
+    crate::renderer::compute_bone_world_matrices(
+        skel,
+        object.kind.anim.as_deref(),
+        None,
+        &[],
+        object.age,
+    )
+    .into_iter()
+    .map(|(name, matrix)| (name, object.placement * matrix))
+    .collect()
 }
 
 /// A one-key animation that puts the object's root bone where `placement` says, on top of
@@ -2314,9 +2326,10 @@ mod resolved_settings_preview_tests {
             present: true,
             ..Default::default()
         };
-        params
-            .fields
-            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        params.fields.insert(
+            "speed".into(),
+            (ParamValue::Float(1.0), PathBuf::from("vl.prc")),
+        );
         let base = flight_from_param_block(&params);
         assert_eq!(base.speed, 1.0);
 
@@ -2344,9 +2357,10 @@ mod resolved_settings_preview_tests {
             present: true,
             ..Default::default()
         };
-        params
-            .fields
-            .insert("speed".into(), (ParamValue::Float(1.0), PathBuf::from("vl.prc")));
+        params.fields.insert(
+            "speed".into(),
+            (ParamValue::Float(1.0), PathBuf::from("vl.prc")),
+        );
         let base = flight_from_param_block(&params);
         let settings = vec![make_setting(
             SettingField::SpeedX,
@@ -2391,9 +2405,18 @@ mod resolved_settings_preview_tests {
         let bx = placed[0].placement.x_axis.truncate().length();
         let by = placed[0].placement.y_axis.truncate().length();
         let bz = placed[0].placement.z_axis.truncate().length();
-        assert!((bx - 2.0).abs() < 1e-5, "expected x basis length 2.0, got {bx}");
-        assert!((by - 2.0).abs() < 1e-5, "expected y basis length 2.0, got {by}");
-        assert!((bz - 2.0).abs() < 1e-5, "expected z basis length 2.0, got {bz}");
+        assert!(
+            (bx - 2.0).abs() < 1e-5,
+            "expected x basis length 2.0, got {bx}"
+        );
+        assert!(
+            (by - 2.0).abs() < 1e-5,
+            "expected y basis length 2.0, got {by}"
+        );
+        assert!(
+            (bz - 2.0).abs() < 1e-5,
+            "expected z basis length 2.0, got {bz}"
+        );
     }
 
     #[test]
@@ -2437,15 +2460,10 @@ pub fn install() {
             "lativolt",
             &HashMap::new(),
             &|script_name| {
-                script_from_index_or_dump(
-                    Some(&index),
-                    "samus_lativolt",
-                    script_name,
-                    &|_| {
-                        dump_called.set(true);
-                        Some(dump_body.to_string())
-                    },
-                )
+                script_from_index_or_dump(Some(&index), "samus_lativolt", script_name, &|_| {
+                    dump_called.set(true);
+                    Some(dump_body.to_string())
+                })
             },
         )
         .expect("load_kind should build from source index script");
@@ -2471,10 +2489,9 @@ pub fn install() {
         let c1 = mk(ArticleOp::Generate, ArticleTarget::None);
         let c2 = mk(ArticleOp::Generate, ArticleTarget::None);
         let rm = mk(ArticleOp::Remove, ArticleTarget::All);
-        let plans = plan_spawns_from_calls(
-            &[(5, &c1), (12, &c2), (20, &rm)],
-            &|call| article_name(&call.article),
-        );
+        let plans = plan_spawns_from_calls(&[(5, &c1), (12, &c2), (20, &rm)], &|call| {
+            article_name(&call.article)
+        });
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].spawned, 5);
         assert_eq!(plans[0].removed, Some(20));
@@ -2483,18 +2500,17 @@ pub fn install() {
 
         // Also check Last vs First targeting.
         let rm_last = mk(ArticleOp::Remove, ArticleTarget::Last);
-        let last_plans = plan_spawns_from_calls(
-            &[(5, &c1), (12, &c2), (20, &rm_last)],
-            &|call| article_name(&call.article),
-        );
+        let last_plans = plan_spawns_from_calls(&[(5, &c1), (12, &c2), (20, &rm_last)], &|call| {
+            article_name(&call.article)
+        });
         assert_eq!(last_plans[0].removed, None);
         assert_eq!(last_plans[1].removed, Some(20));
 
         let rm_first = mk(ArticleOp::Remove, ArticleTarget::First);
-        let first_plans = plan_spawns_from_calls(
-            &[(5, &c1), (12, &c2), (20, &rm_first)],
-            &|call| article_name(&call.article),
-        );
+        let first_plans =
+            plan_spawns_from_calls(&[(5, &c1), (12, &c2), (20, &rm_first)], &|call| {
+                article_name(&call.article)
+            });
         assert_eq!(first_plans[0].removed, Some(20));
         assert_eq!(first_plans[1].removed, None);
     }
@@ -2620,10 +2636,20 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
             let extra: Vec<String> = lativolt
                 .source_scripts
                 .iter()
-                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .map(|s| {
+                    s.strip_prefix("game_")
+                        .or_else(|| s.strip_prefix("effect_"))
+                        .unwrap_or(s)
+                        .to_owned()
+                })
                 .collect();
             let settings = crate::articles::settings_for(&index, "samus_lativolt");
-            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "lativolt", &labels);
+            let params = crate::articles::params::param_block(
+                &[param_path.clone()],
+                &[],
+                "lativolt",
+                &labels,
+            );
             let kind = load_kind_resolved(
                 &fighter_dir,
                 &param_path,
@@ -2641,26 +2667,45 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
             )
             .expect("lativolt must load");
             assert!(kind.skel.is_some(), "lativolt c32 skel should load");
-            assert!(!kind.hitboxes.is_empty(), "lativolt hitboxes should load from source");
-            assert!(!kind.effects.is_empty(), "lativolt effects should load from source");
+            assert!(
+                !kind.hitboxes.is_empty(),
+                "lativolt hitboxes should load from source"
+            );
+            assert!(
+                !kind.effects.is_empty(),
+                "lativolt effects should load from source"
+            );
         }
 
         // 2. Sceptile (mario c40, nested plugin/ crate with ../romfs)
         let sceptile = base.join("Sceptile-Moveset");
         let sceptile_plugin = sceptile.join("plugin");
         if std::fs::read_dir(sceptile_plugin.join("src")).is_ok() {
-            let index = crate::acmd_src::SourceIndex::build(&sceptile_plugin).expect("sceptile index");
+            let index =
+                crate::acmd_src::SourceIndex::build(&sceptile_plugin).expect("sceptile index");
             let fighter_dir = sceptile.join("romfs/fighter/mario");
             let param_path = fighter_dir.join("param/vl.prc");
             let catalog = crate::articles::catalog_for("mario", &index, &names, &fighter_dir);
-            let bulletseed = catalog.get("mario_bulletseed").expect("bulletseed in catalog");
+            let bulletseed = catalog
+                .get("mario_bulletseed")
+                .expect("bulletseed in catalog");
             let extra: Vec<String> = bulletseed
                 .source_scripts
                 .iter()
-                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .map(|s| {
+                    s.strip_prefix("game_")
+                        .or_else(|| s.strip_prefix("effect_"))
+                        .unwrap_or(s)
+                        .to_owned()
+                })
                 .collect();
             let settings = crate::articles::settings_for(&index, "mario_bulletseed");
-            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "bulletseed", &labels);
+            let params = crate::articles::params::param_block(
+                &[param_path.clone()],
+                &[],
+                "bulletseed",
+                &labels,
+            );
             let kind = load_kind_resolved(
                 &fighter_dir,
                 &param_path,
@@ -2677,13 +2722,21 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 &|s| script_from_index_or_dump(Some(&index), "mario_bulletseed", s, &|_| None),
             )
             .expect("bulletseed must load");
-            assert!(kind.model_dir.is_some() && kind.skel.is_some(), "bulletseed c40 model must load");
+            assert!(
+                kind.model_dir.is_some() && kind.skel.is_some(),
+                "bulletseed c40 model must load"
+            );
             // Sceptile's stick has an ACMD game_throw hitbox + c40 model.
             let stick = catalog.get("mario_stick").expect("stick in catalog");
             let stick_extra: Vec<String> = stick
                 .source_scripts
                 .iter()
-                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .map(|s| {
+                    s.strip_prefix("game_")
+                        .or_else(|| s.strip_prefix("effect_"))
+                        .unwrap_or(s)
+                        .to_owned()
+                })
                 .collect();
             let stick_kind = load_kind_resolved(
                 &fighter_dir,
@@ -2701,10 +2754,18 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 &|s| script_from_index_or_dump(Some(&index), "mario_stick", s, &|_| None),
             )
             .expect("stick must load");
-            assert!(stick_kind.model_dir.is_some() && stick_kind.skel.is_some(), "stick c40 model must load");
-            assert!(!stick_kind.hitboxes.is_empty(), "stick game_throw hitboxes should load");
+            assert!(
+                stick_kind.model_dir.is_some() && stick_kind.skel.is_some(),
+                "stick c40 model must load"
+            );
+            assert!(
+                !stick_kind.hitboxes.is_empty(),
+                "stick game_throw hitboxes should load"
+            );
             // Check wrapper spawn in special_n_shoot
-            let special_n_shoot = index.script_source("mario", "special_n_shoot").expect("special_n_shoot");
+            let special_n_shoot = index
+                .script_source("mario", "special_n_shoot")
+                .expect("special_n_shoot");
             let parsed = crate::acmd::parse_acmd_script(&special_n_shoot.body);
             let plans = plan_wrapper_spawns_from_script(&parsed, &catalog, Some(&index));
             assert!(
@@ -2717,7 +2778,12 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 .into_iter()
                 .flat_map(|(site, body)| {
                     let file_text = std::fs::read_to_string(&site.file).ok();
-                    plan_spawns_from_status_body(&body, file_text.as_deref(), &catalog, Some(&index))
+                    plan_spawns_from_status_body(
+                        &body,
+                        file_text.as_deref(),
+                        &catalog,
+                        Some(&index),
+                    )
                 })
                 .collect();
             assert!(
@@ -2736,14 +2802,26 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
             let fighter_dir = shyguy.join("romfs/fighter/pacman");
             let param_path = fighter_dir.join("param/vl.prcxml");
             let catalog = crate::articles::catalog_for("pacman", &index, &names, &fighter_dir);
-            let trampoline = catalog.get("pacman_trampoline").expect("trampoline in catalog");
+            let trampoline = catalog
+                .get("pacman_trampoline")
+                .expect("trampoline in catalog");
             let extra: Vec<String> = trampoline
                 .source_scripts
                 .iter()
-                .map(|s| s.strip_prefix("game_").or_else(|| s.strip_prefix("effect_")).unwrap_or(s).to_owned())
+                .map(|s| {
+                    s.strip_prefix("game_")
+                        .or_else(|| s.strip_prefix("effect_"))
+                        .unwrap_or(s)
+                        .to_owned()
+                })
                 .collect();
             let settings = crate::articles::settings_for(&index, "pacman_trampoline");
-            let params = crate::articles::params::param_block(&[param_path.clone()], &[], "trampoline", &labels);
+            let params = crate::articles::params::param_block(
+                &[param_path.clone()],
+                &[],
+                "trampoline",
+                &labels,
+            );
             let kind = load_kind_resolved(
                 &fighter_dir,
                 &param_path,
@@ -2760,7 +2838,10 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 &|s| script_from_index_or_dump(Some(&index), "pacman_trampoline", s, &|_| None),
             )
             .expect("trampoline must load");
-            assert!(kind.model_dir.is_some() && kind.skel.is_some(), "trampoline c40 model must load");
+            assert!(
+                kind.model_dir.is_some() && kind.skel.is_some(),
+                "trampoline c40 model must load"
+            );
             assert!(!kind.hitboxes.is_empty(), "trampoline hitboxes should load");
             // Check status spawn for fireball on special_n (via main_shift_status / fastshift)
             let status_spawns: Vec<(String, SpawnPlan)> = index
@@ -2769,21 +2850,30 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 .flat_map(|(site, body)| {
                     let s = site.kind_expr.clone();
                     let file_text = std::fs::read_to_string(&site.file).ok();
-                    plan_spawns_from_status_body(&body, file_text.as_deref(), &catalog, Some(&index))
-                        .into_iter()
-                        .map(move |p| (s.clone(), p))
+                    plan_spawns_from_status_body(
+                        &body,
+                        file_text.as_deref(),
+                        &catalog,
+                        Some(&index),
+                    )
+                    .into_iter()
+                    .map(move |p| (s.clone(), p))
                 })
                 .collect();
             assert!(
                 status_spawns
                     .iter()
-                    .any(|(s, p)| crate::articles::view::status_matches_move(s, "special_n")
-                        && p.name == "trampoline"),
+                    .any(
+                        |(s, p)| crate::articles::view::status_matches_move(s, "special_n")
+                            && p.name == "trampoline"
+                    ),
                 "shyguy special_n status should spawn trampoline fireball: {status_spawns:?}"
             );
             // Check Shy Guy down tilt spawns carrot (bigpacman) with its real parabolic arc
             // (LAUNCH_VX = 0.5, LAUNCH_VY = 3.1, ARC_GRAVITY = 0.12, LIFETIME_FRAMES = 250).
-            let dtilt = index.script_source("pacman", "attack_lw3").expect("shyguy attack_lw3");
+            let dtilt = index
+                .script_source("pacman", "attack_lw3")
+                .expect("shyguy attack_lw3");
             let dtilt_plans = plan_wrapper_spawns_from_script(
                 &crate::acmd::parse_acmd_script(&dtilt.body),
                 &catalog,
@@ -2796,9 +2886,14 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
                 "shyguy attack_lw3 should spawn bigpacman@carrot: {dtilt_plans:?}"
             );
             let bigpac_settings = crate::articles::settings_for(&index, "pacman_bigpacman");
-            let carrot_settings = settings_for_motion(&bigpac_settings, "carrot", Some("game_carrot"));
-            assert!(!carrot_settings.is_empty(), "carrot status settings must be found");
-            let carrot_flight = Flight::default().with_settings(&carrot_settings, &ParamBlock::default());
+            let carrot_settings =
+                settings_for_motion(&bigpac_settings, "carrot", Some("game_carrot"));
+            assert!(
+                !carrot_settings.is_empty(),
+                "carrot status settings must be found"
+            );
+            let carrot_flight =
+                Flight::default().with_settings(&carrot_settings, &ParamBlock::default());
             assert!(
                 (carrot_flight.gravity - 0.12).abs() < 1e-4,
                 "carrot gravity should be 0.12, got {:?}",
@@ -2829,8 +2924,9 @@ unsafe extern "C" fn game_attack11(agent: &mut L2CAgentBase) {
             let eff_bytes = std::fs::read(eff_dir.join("ef_pacman_c40.eff")).unwrap();
             let eff_file = effect_library::NamcoEffectFile::load(&eff_bytes).unwrap();
             let handles = crate::effects::entry_set_handles(&eff_file);
-            let set_idx = *handles.get("carrot_trail").expect("CARROT_TRAIL in ef_pacman_c40.eff")
-                as usize;
+            let set_idx = *handles
+                .get("carrot_trail")
+                .expect("CARROT_TRAIL in ef_pacman_c40.eff") as usize;
             let ptcl_file = eff_file.ptcl_file.as_ref().expect("ptcl");
             let raw_sets = eff_wgpu::ptcl::emitter_sets(&ptcl_file.base_bytes);
             let tail_em = &ptcl_file.emitter_list.emitter_sets[set_idx].emitters[0];

@@ -184,7 +184,8 @@ fn hitboxes_in_source_order(
         let candidates: Vec<usize> = (0..pristine.len())
             .filter(|&i| !used[i] && identity(&edited[i]) == identity(from_source))
             .filter(|&i| {
-                frames(&pristine[i]) == frames(from_source) || frames(&edited[i]) == frames(from_source)
+                frames(&pristine[i]) == frames(from_source)
+                    || frames(&edited[i]) == frames(from_source)
             })
             .collect();
         // Several candidates are fine when they are interchangeable: the first unused one.
@@ -194,7 +195,8 @@ fn hitboxes_in_source_order(
         used[index] = true;
         let mut paired = edited[index].clone();
         // An untouched throw or search box takes the source's end, which moved only on paper.
-        let fixed = paired.category == crate::data::CAT_ABS || paired.category == crate::data::CAT_SEARCH;
+        let fixed =
+            paired.category == crate::data::CAT_ABS || paired.category == crate::data::CAT_SEARCH;
         if fixed && paired.active_end == pristine[index].active_end {
             paired.active_end = from_source.active_end;
         }
@@ -363,14 +365,16 @@ mod source_sync_status_tests {
         edited[3].active_start = 12;
         edited[0].active_end = 11;
         edited[1].active_end = 11;
-        let (first, report) = crate::acmd_src::rewrite_hitboxes(&source, "t", &pristine, &edited).unwrap();
+        let (first, report) =
+            crate::acmd_src::rewrite_hitboxes(&source, "t", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}\n{first}");
 
         // Now a damage tweak on the late hit's id-1 box, against the rewritten file.
         edited[3].damage = 10.0;
         let baseline = crate::acmd::parse_acmd_script(&first).to_hitboxes();
         let ordered = super::hitboxes_in_source_order(&baseline, &pristine, &edited);
-        let (second, report) = crate::acmd_src::rewrite_hitboxes(&first, "t", &baseline, &ordered).unwrap();
+        let (second, report) =
+            crate::acmd_src::rewrite_hitboxes(&first, "t", &baseline, &ordered).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}\n{second}");
         assert_eq!(report.changed, 1, "only the damage: {second}");
         let late = crate::acmd::parse_acmd_script(&second)
@@ -381,7 +385,10 @@ mod source_sync_status_tests {
         assert_eq!(late.damage, 10.0, "{second}");
 
         // An untouched source keeps the plain positional pairing.
-        assert_eq!(super::hitboxes_in_source_order(&pristine, &pristine, &edited), edited);
+        assert_eq!(
+            super::hitboxes_in_source_order(&pristine, &pristine, &edited),
+            edited
+        );
     }
 
     /// A hitbox read from the moveset needs no capture to be injected live after a retime: the
@@ -389,10 +396,14 @@ mod source_sync_status_tests {
     #[test]
     fn a_source_hitbox_injects_live_without_a_capture() {
         let pristine = crate::acmd::parse_acmd_script(&utilt()).to_hitboxes();
-        let args = super::VisionaryApp::build_attack_args(&pristine[2], None).expect("built from source");
+        let args =
+            super::VisionaryApp::build_attack_args(&pristine[2], None).expect("built from source");
         assert_eq!(args.len(), 36);
         assert!(matches!(args[3], crate::game_link::LuaArgWire::Num(d) if (d - 7.4).abs() < 1e-4));
-        assert!(matches!(args[12], crate::game_link::LuaArgWire::Nil), "no capsule end");
+        assert!(
+            matches!(args[12], crate::game_link::LuaArgWire::Nil),
+            "no capsule end"
+        );
         // An unresolvable constant still needs a capture rather than sending a zero.
         let mut unknown = pristine[2].clone();
         unknown.sound_attr = "*SOME_PROJECT_CONSTANT".into();
@@ -410,11 +421,16 @@ mod source_sync_status_tests {
     }
 }
 ";
-        let mut call = crate::acmd::parse_effect_script(source).to_effect_calls().remove(0);
+        let mut call = crate::acmd::parse_effect_script(source)
+            .to_effect_calls()
+            .remove(0);
         assert!(call.extra_args.is_some());
         call.active_start = 12;
         let hash = hash40::hash40("sys_attack_arc").0;
-        assert!(super::VisionaryApp::build_effect_inject_from_captures(&call, &[], Some(hash), 0).is_some());
+        assert!(
+            super::VisionaryApp::build_effect_inject_from_captures(&call, &[], Some(hash), 0)
+                .is_some()
+        );
     }
 
     #[test]
@@ -647,9 +663,14 @@ mod object_edit_tests {
             moveset_source: None,
         };
         project.fighters.insert("samus".into(), Default::default());
-        project.fighters.insert("samus_lativolt".into(), Default::default());
+        project
+            .fighters
+            .insert("samus_lativolt".into(), Default::default());
         let agents = BTreeSet::from(["samus_lativolt".to_string()]);
-        assert_eq!(strip_object_agents(&mut project, &agents), ["samus_lativolt"]);
+        assert_eq!(
+            strip_object_agents(&mut project, &agents),
+            ["samus_lativolt"]
+        );
         assert!(project.fighters.contains_key("samus"));
         assert!(!project.fighters.contains_key("samus_lativolt"));
     }
@@ -854,18 +875,33 @@ mod object_leave_tests {
 
     #[test]
     fn an_automatic_refresh_keeps_unsynced_object_edits() {
-        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, false), VanishedFighter::KeepEdits);
-        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), false, false), VanishedFighter::Clear);
-        assert_eq!(on_fighter_vanished(None, true, false), VanishedFighter::Clear);
+        assert_eq!(
+            on_fighter_vanished(Some("samus_lativolt"), true, false),
+            VanishedFighter::KeepEdits
+        );
+        assert_eq!(
+            on_fighter_vanished(Some("samus_lativolt"), false, false),
+            VanishedFighter::Clear
+        );
+        assert_eq!(
+            on_fighter_vanished(None, true, false),
+            VanishedFighter::Clear
+        );
         // The user chose Discard (e.g. on changing the game dump): the edits go with the fighter.
-        assert_eq!(on_fighter_vanished(Some("samus_lativolt"), true, true), VanishedFighter::Clear);
+        assert_eq!(
+            on_fighter_vanished(Some("samus_lativolt"), true, true),
+            VanishedFighter::Clear
+        );
     }
 
     /// A fighter parked behind the prompt is found again by name after the list is rebuilt, so a
     /// re-index while the prompt is open can't open another fighter or a row that's gone.
     #[test]
     fn a_parked_fighter_target_follows_its_name() {
-        let samus = crate::mod_project::ProjectFighter { name: "samus".into(), character: None };
+        let samus = crate::mod_project::ProjectFighter {
+            name: "samus".into(),
+            character: None,
+        };
         let toad = crate::mod_project::ProjectFighter {
             name: "samus".into(),
             character: Some("Toad".into()),
@@ -873,7 +909,12 @@ mod object_leave_tests {
         let before = [("mario", None), ("samus", None)];
         assert_eq!(resolve_parked_fighter(before, &samus), Some(1));
         // A mod root came in: the list grew and re-sorted around the parked fighter.
-        let shifted = [("bayonetta", None), ("mario", None), ("samus", Some("Toad")), ("samus", None)];
+        let shifted = [
+            ("bayonetta", None),
+            ("mario", None),
+            ("samus", Some("Toad")),
+            ("samus", None),
+        ];
         assert_eq!(resolve_parked_fighter(shifted, &samus), Some(3));
         assert_eq!(resolve_parked_fighter(shifted, &toad), Some(2));
         // The root went away: the fighter is gone, not some other row.
@@ -892,17 +933,20 @@ mod object_leave_tests {
 }
 
 /// The files and modification times an object catalog was read from (`None` index: none).
-fn source_fingerprint(index: Option<&crate::acmd_src::SourceIndex>) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+fn source_fingerprint(
+    index: Option<&crate::acmd_src::SourceIndex>,
+) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
     let Some(index) = index else {
         return Vec::new();
     };
-    let mut out: Vec<(PathBuf, Option<std::time::SystemTime>)> = std::iter::once(index.root.clone())
-        .chain(index.files.iter().cloned())
-        .map(|file| {
-            let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
-            (file, modified)
-        })
-        .collect();
+    let mut out: Vec<(PathBuf, Option<std::time::SystemTime>)> =
+        std::iter::once(index.root.clone())
+            .chain(index.files.iter().cloned())
+            .map(|file| {
+                let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+                (file, modified)
+            })
+            .collect();
     out.sort();
     out
 }
@@ -911,7 +955,8 @@ fn source_fingerprint(index: Option<&crate::acmd_src::SourceIndex>) -> Vec<(Path
 /// (its `romfs/`, the open project's `romfs/`) that exist, never one inside the dump or a Mod
 /// Library root (`shared`), each once however it is spelled.
 fn own_param_files(owner: &str, own_roots: &[PathBuf], shared: &[PathBuf]) -> Vec<PathBuf> {
-    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let shared: Vec<PathBuf> = shared.iter().map(|root| canonical(root)).collect();
     let mut seen: Vec<PathBuf> = Vec::new();
     let mut out = Vec::new();
@@ -4007,9 +4052,7 @@ fn navigation_hint(preferences: &crate::preferences::Preferences) -> &'static st
         crate::preferences::NavigationScheme::Ssbh => {
             "Left drag orbits, right or middle drag pans, scroll zooms"
         }
-        crate::preferences::NavigationScheme::Blender
-            if preferences.emulate_three_button_mouse =>
-        {
+        crate::preferences::NavigationScheme::Blender if preferences.emulate_three_button_mouse => {
             "Middle (or Alt + left) drag orbits, add Shift to pan or Ctrl to zoom; scroll zooms"
         }
         crate::preferences::NavigationScheme::Blender => {
@@ -4180,9 +4223,7 @@ fn draw_trail_preview(
                     if f == frame_num as f32 {
                         edges_at(current_matrices)
                     } else {
-                        edges_at(
-                            &rs.bone_world_matrices_at(crate::trail_preview::motion_frame(f)),
-                        )
+                        edges_at(&rs.bone_world_matrices_at(crate::trail_preview::motion_frame(f)))
                     }
                 })
                 .collect();
@@ -6124,7 +6165,8 @@ impl VisionaryApp {
     }
 
     fn project_romfs(&self) -> Option<PathBuf> {
-        self.project_workspace().map(|workspace| workspace.join("romfs"))
+        self.project_workspace()
+            .map(|workspace| workspace.join("romfs"))
     }
 
     /// Why fighter row `idx` belongs to the open project; empty when it does not, and always
@@ -6409,9 +6451,7 @@ impl VisionaryApp {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                if editor_source_is_excluded(&name)
-                    || !seen.insert(name.clone())
-                {
+                if editor_source_is_excluded(&name) || !seen.insert(name.clone()) {
                     continue;
                 }
 
@@ -6490,17 +6530,29 @@ impl VisionaryApp {
                         let costume = format!("c{:02}", character.slots[0]);
                         let own = character.root.join("fighter").join(&name);
                         let or_base = |dir: PathBuf, base: &PathBuf| {
-                            if dir.is_dir() { dir } else { base.clone() }
+                            if dir.is_dir() {
+                                dir
+                            } else {
+                                base.clone()
+                            }
                         };
                         crate::data::FighterEntry {
                             name: name.clone(),
                             display_name: character.name.clone(),
                             param_path: param_path.clone(),
-                            motion_dir: or_base(own.join("motion").join("body").join(&costume), &motion_dir),
-                            model_dir: or_base(own.join("model").join("body").join(&costume), &model_dir),
-                            effect_dir: Some(character.root.join("effect").join("fighter").join(&name))
-                                .filter(|dir| shared_roots.contains(&character.root) && dir.is_dir())
-                                .or_else(|| effect_dir.clone()),
+                            motion_dir: or_base(
+                                own.join("motion").join("body").join(&costume),
+                                &motion_dir,
+                            ),
+                            model_dir: or_base(
+                                own.join("model").join("body").join(&costume),
+                                &model_dir,
+                            ),
+                            effect_dir: Some(
+                                character.root.join("effect").join("fighter").join(&name),
+                            )
+                            .filter(|dir| shared_roots.contains(&character.root) && dir.is_dir())
+                            .or_else(|| effect_dir.clone()),
                             slots: character.slots,
                             fighter_dir: own,
                             source: crate::data::FighterSource::ModRoot,
@@ -6595,9 +6647,16 @@ impl VisionaryApp {
         }
         // A fighter parked behind the prompt is kept by name; drop it if it's no longer listed.
         if let Some((PendingLeave::Fighter(key), _)) = &self.pending_leave {
-            let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+            let rows = self
+                .state
+                .fighters
+                .iter()
+                .map(|f| (f.name.as_str(), f.custom_name.as_deref()));
             if resolve_parked_fighter(rows, key).is_none() {
-                notes.push(format!("{} is no longer in the list, so it won't be opened", parked_fighter_label(key)));
+                notes.push(format!(
+                    "{} is no longer in the list, so it won't be opened",
+                    parked_fighter_label(key)
+                ));
                 self.pending_leave = None;
             }
         }
@@ -6667,9 +6726,12 @@ impl VisionaryApp {
         let custom_name = self.state.fighters[index].custom_name.clone();
         let display_label = self.state.fighters[index].display_name.clone();
         let was_selected = self.state.selected_fighter == Some(index);
-        let has_sibling = self.state.fighters.iter().enumerate().any(|(i, other)| {
-            i != index && other.name.eq_ignore_ascii_case(&fighter)
-        });
+        let has_sibling = self
+            .state
+            .fighters
+            .iter()
+            .enumerate()
+            .any(|(i, other)| i != index && other.name.eq_ignore_ascii_case(&fighter));
         // A slot character shares the base fighter's internal id (`pacman`). Only wipe shared
         // fighter-level edits, captures, and script caches when forgetting the base fighter row
         // itself or when no sibling row for that fighter remains in the list.
@@ -6976,8 +7038,7 @@ impl VisionaryApp {
             }
             // The weapon's slot set can differ from the body's, so fall back to any slot
             // it does have rather than giving up when the base slot is missing.
-            let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
-            else {
+            let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot) else {
                 continue;
             };
             if let Ok(wskel) = ssbh_data::skel_data::SkelData::from_file(&weapon_skel_path) {
@@ -7267,7 +7328,8 @@ impl VisionaryApp {
             self.refresh_linked_acmd_source_index();
             let key = Self::move_key(&self.owner_spelling(&fighter_name), &move_entry.name);
             if let Some(saved) = self.move_source_cache.get(&key).cloned() {
-                if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name) {
+                if let Some((body, origin)) = self.warm_source_body(&fighter_name, &move_entry.name)
+                {
                     if body != saved.body {
                         let captures = self.captures_for_move(&fighter_name, move_entry.hash);
                         let captures = if captures.is_empty() {
@@ -7745,7 +7807,8 @@ impl VisionaryApp {
         let Some(index) = self.acmd_src.as_ref() else {
             return;
         };
-        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        let (Some(fighter), Some(move_entry)) =
+            (self.script_agent(), self.state.selected_move.as_ref())
         else {
             return;
         };
@@ -8566,7 +8629,12 @@ impl VisionaryApp {
             .state
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
-            .and_then(|entry| entry.custom_name.clone().map(|name| (entry.name.clone(), name)));
+            .and_then(|entry| {
+                entry
+                    .custom_name
+                    .clone()
+                    .map(|name| (entry.name.clone(), name))
+            });
         if let Some((agent, character)) = row {
             self.state.status = self
                 .state
@@ -8581,7 +8649,8 @@ impl VisionaryApp {
             return;
         }
         // An open object script saves under its own agent, which the index keys it by.
-        let (Some(fighter), Some(move_entry)) = (self.script_agent(), self.state.selected_move.as_ref())
+        let (Some(fighter), Some(move_entry)) =
+            (self.script_agent(), self.state.selected_move.as_ref())
         else {
             return;
         };
@@ -8594,7 +8663,10 @@ impl VisionaryApp {
         {
             // Creating an object's first script would need its own agent registration, which
             // the category writer doesn't make; refusing keeps the fighter's files untouched.
-            self.state.status = format!("{fighter}/{move_name} wasn't synced. {}", self.unsaveable_object_script_words());
+            self.state.status = format!(
+                "{fighter}/{move_name} wasn't synced. {}",
+                self.unsaveable_object_script_words()
+            );
             return;
         }
 
@@ -9172,7 +9244,9 @@ impl VisionaryApp {
 
         // The user can switch fighter or move while a fetch is in flight; applying a stale
         // result would silently overwrite the new selection's hitboxes.
-        let still_current = self.script_agent().is_some_and(|agent| agent == fighter_name)
+        let still_current = self
+            .script_agent()
+            .is_some_and(|agent| agent == fighter_name)
             && self
                 .state
                 .selected_move
@@ -9638,7 +9712,12 @@ impl VisionaryApp {
     /// that script in place, and push editor edits back into it.
     /// Config key for the deploy destination chosen for the linked project.
     fn moveset_deploy_key(&self) -> Option<String> {
-        let root = self.acmd_src.as_ref()?.root.to_string_lossy().to_lowercase();
+        let root = self
+            .acmd_src
+            .as_ref()?
+            .root
+            .to_string_lossy()
+            .to_lowercase();
         Some(format!("moveset_deploy_{:010x}", hash40::hash40(&root).0))
     }
 
@@ -9646,7 +9725,9 @@ impl VisionaryApp {
     /// files and scans deployed plugins — can run on a worker thread.
     fn moveset_build_inputs(&self) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
         let index = self.acmd_src.as_ref()?;
-        let remembered = self.moveset_deploy_key().and_then(|key| load_config_path(&key));
+        let remembered = self
+            .moveset_deploy_key()
+            .and_then(|key| load_config_path(&key));
         Some((index.files.clone(), remembered))
     }
 
@@ -9707,9 +9788,9 @@ impl VisionaryApp {
     }
 
     fn choose_moveset_deploy_target(&mut self) {
-        let plan = self
-            .moveset_build_inputs()
-            .and_then(|(files, remembered)| Self::moveset_build_plan(&files, remembered.as_deref()).ok());
+        let plan = self.moveset_build_inputs().and_then(|(files, remembered)| {
+            Self::moveset_build_plan(&files, remembered.as_deref()).ok()
+        });
         let (Some(plan), Some(key)) = (plan, self.moveset_deploy_key()) else {
             self.state.status = "Deploy to…: link the moveset's source project first".into();
             return;
@@ -9738,7 +9819,9 @@ impl VisionaryApp {
             .selected_fighter
             .and_then(|i| self.state.fighters.get(i))
             .map(|fighter| fighter.motion_dir.clone());
-        let wanted = motion_dir.as_deref().and_then(crate::motion_list::editable_in);
+        let wanted = motion_dir
+            .as_deref()
+            .and_then(crate::motion_list::editable_in);
         let stale = match (&self.motion_list_editor, &wanted) {
             (None, Some(_)) => true,
             (Some(editor), Some(path)) => editor.file.path != *path && !editor.file.changed,
@@ -9755,7 +9838,9 @@ impl VisionaryApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.label(match motion_dir {
-                        Some(dir) => format!("No motion_list.yml or motion_list.bin in {}", dir.display()),
+                        Some(dir) => {
+                            format!("No motion_list.yml or motion_list.bin in {}", dir.display())
+                        }
                         None => "Select a fighter to edit its motion list.".to_string(),
                     });
                 });
@@ -9784,7 +9869,10 @@ impl VisionaryApp {
                     .filter(|name| name.to_ascii_lowercase().ends_with(".nuanmb"))
                     .collect();
                 anims.sort_unstable_by_key(|name| name.to_ascii_lowercase());
-                crate::motion_list::add_derived_labels(&file.mlist, anims.iter().map(String::as_str));
+                crate::motion_list::add_derived_labels(
+                    &file.mlist,
+                    anims.iter().map(String::as_str),
+                );
                 let mut editor = crate::motion_list_editor::MotionListEditor::new(file);
                 let selected = self
                     .state
@@ -9825,7 +9913,12 @@ impl VisionaryApp {
                 .mlist
                 .list
                 .get(&crate::motion_list::Hash40(hash))
-                .map(|motion| motion.extra.as_ref().map_or(0, |extra| u32::from(extra.cancel_frame)))
+                .map(|motion| {
+                    motion
+                        .extra
+                        .as_ref()
+                        .map_or(0, |extra| u32::from(extra.cancel_frame))
+                })
         };
         for entry in &mut self.move_list {
             if let Some(cancel) = cancel_of(entry.hash) {
@@ -9867,43 +9960,54 @@ impl VisionaryApp {
         let mut view = self.acmd_src_view;
         let generated = (view != SourceView::Source).then(|| self.generated_source_for_move());
 
-        let response = window.show(ctx, |ui| {
-            // The linked project is a HEADER, not a gate. It used to return early when
-            // nothing was linked, when the fighter was not in the project, or when no script
-            // was open — which meant a live-captured move, the one case with no source file
-            // anywhere, showed an empty window instead of the code it would export.
-            //
-            // Two layers feed a move, and they are named apart here because they are easy to
-            // confuse: the base game (the dump vanilla fighters are read from) and the moveset
-            // source (the Rust project whose scripts replace vanilla's).
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Game dump").small().strong()).on_hover_text(
-                    "The ArcExplorer game dump vanilla fighters, models and motions are read \
+        let response =
+            window.show(ctx, |ui| {
+                // The linked project is a HEADER, not a gate. It used to return early when
+                // nothing was linked, when the fighter was not in the project, or when no script
+                // was open — which meant a live-captured move, the one case with no source file
+                // anywhere, showed an empty window instead of the code it would export.
+                //
+                // Two layers feed a move, and they are named apart here because they are easy to
+                // confuse: the base game (the dump vanilla fighters are read from) and the moveset
+                // source (the Rust project whose scripts replace vanilla's).
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Game dump").small().strong())
+                        .on_hover_text(
+                        "The ArcExplorer game dump vanilla fighters, models and motions are read \
                      from (File → Sources…). Vanilla ACMD itself comes from the \
                      dumped-script mirror on GitHub.",
-                );
-                match &self.state.data_root {
-                    Some(root) => ui.label(
-                        egui::RichText::new(root.display().to_string()).small().monospace(),
-                    ),
-                    None => ui.label(
-                        egui::RichText::new("not set").small().color(egui::Color32::GRAY),
-                    ),
-                };
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Moveset source").small().strong()).on_hover_text(
+                    );
+                    match &self.state.data_root {
+                        Some(root) => ui.label(
+                            egui::RichText::new(root.display().to_string())
+                                .small()
+                                .monospace(),
+                        ),
+                        None => ui.label(
+                            egui::RichText::new("not set")
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        ),
+                    };
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Moveset source").small().strong()).on_hover_text(
                     "Your Rust moveset project. Every script it defines replaces vanilla's; \
                      vanilla fills in the rest.",
                 );
-                match self.acmd_src.as_ref() {
-                    None => {
-                        let (text, color) = match &self.acmd_src_problem {
-                            Some(problem) => (problem.clone(), egui::Color32::from_rgb(220, 180, 90)),
-                            None => ("not linked — moves show vanilla".to_string(), egui::Color32::GRAY),
-                        };
-                        ui.label(egui::RichText::new(text).small().color(color));
-                        if ui
+                    match self.acmd_src.as_ref() {
+                        None => {
+                            let (text, color) = match &self.acmd_src_problem {
+                                Some(problem) => {
+                                    (problem.clone(), egui::Color32::from_rgb(220, 180, 90))
+                                }
+                                None => (
+                                    "not linked — moves show vanilla".to_string(),
+                                    egui::Color32::GRAY,
+                                ),
+                            };
+                            ui.label(egui::RichText::new(text).small().color(color));
+                            if ui
                             .small_button("Link…")
                             .on_hover_text(
                                 "Pick any folder of the Rust project that builds your plugin: its \
@@ -9913,40 +10017,40 @@ impl VisionaryApp {
                         {
                             open_moveset_sources = true;
                         }
-                    }
-                    Some(index) => {
-                        ui.label(
-                            egui::RichText::new(index.root.display().to_string())
+                        }
+                        Some(index) => {
+                            ui.label(
+                                egui::RichText::new(index.root.display().to_string())
+                                    .small()
+                                    .monospace(),
+                            );
+                            let conflict_summary = if index.conflict_count() == 0 {
+                                String::new()
+                            } else {
+                                format!(" · {} ambiguous", index.conflict_count())
+                            };
+                            let mut agents: Vec<&str> = index
+                                .fighters
+                                .keys()
+                                .map(String::as_str)
+                                .filter(|name| !name.is_empty())
+                                .collect();
+                            agents.sort_unstable();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "· {} usable scripts · {} agents{conflict_summary}",
+                                    index.script_count(),
+                                    index.fighters.len()
+                                ))
                                 .small()
-                                .monospace(),
-                        );
-                        let conflict_summary = if index.conflict_count() == 0 {
-                            String::new()
-                        } else {
-                            format!(" · {} ambiguous", index.conflict_count())
-                        };
-                        let mut agents: Vec<&str> = index
-                            .fighters
-                            .keys()
-                            .map(String::as_str)
-                            .filter(|name| !name.is_empty())
-                            .collect();
-                        agents.sort_unstable();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "· {} usable scripts · {} agents{conflict_summary}",
-                                index.script_count(),
-                                index.fighters.len()
-                            ))
-                            .small()
-                            .color(egui::Color32::GRAY),
-                        )
-                        .on_hover_text(if agents.is_empty() {
-                            "No script is attributed to a named agent.".to_string()
-                        } else {
-                            format!("Scripts for: {}", agents.join(", "))
-                        });
-                        if ui
+                                .color(egui::Color32::GRAY),
+                            )
+                            .on_hover_text(if agents.is_empty() {
+                                "No script is attributed to a named agent.".to_string()
+                            } else {
+                                format!("Scripts for: {}", agents.join(", "))
+                            });
+                            if ui
                             .small_button("Rescan")
                             .on_hover_text(
                                 "Re-read the project from disk, picking up edits made elsewhere",
@@ -9955,11 +10059,11 @@ impl VisionaryApp {
                         {
                             rescan = true;
                         }
-                        let building = self
-                            .moveset_build
-                            .as_ref()
-                            .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
-                        if ui
+                            let building = self
+                                .moveset_build
+                                .as_ref()
+                                .is_some_and(|state| state.lock().map_or(false, |s| s.is_none()));
+                            if ui
                             .add_enabled(!building, egui::Button::new(if building {
                                 "Building…"
                             } else {
@@ -9977,7 +10081,7 @@ impl VisionaryApp {
                         {
                             build_plugin = true;
                         }
-                        if ui
+                            if ui
                             .small_button("Deploy to…")
                             .on_hover_text(
                                 "Choose where this project's built plugin should be copied, for a \
@@ -9987,222 +10091,222 @@ impl VisionaryApp {
                         {
                             choose_deploy = true;
                         }
-                        if ui.small_button("Unlink").clicked() {
-                            unlink = true;
+                            if ui.small_button("Unlink").clicked() {
+                                unlink = true;
+                            }
                         }
                     }
-                }
-            });
-            ui.separator();
+                });
+                ui.separator();
 
-            let selection = self
-                .state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i))
-                .zip(self.state.selected_move.as_ref())
-                .map(|(f, m)| (f.name.clone(), m.name.clone()));
-            let Some((fighter, move_name)) = selection else {
-                ui.label(
-                    egui::RichText::new("Select a fighter and a move to see its script.")
-                        .color(egui::Color32::GRAY),
-                );
-                return;
-            };
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
-                if !self.state.acmd_source.is_none() {
+                let selection = self
+                    .state
+                    .selected_fighter
+                    .and_then(|i| self.state.fighters.get(i))
+                    .zip(self.state.selected_move.as_ref())
+                    .map(|(f, m)| (f.name.clone(), m.name.clone()));
+                let Some((fighter, move_name)) = selection else {
                     ui.label(
-                        egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
-                            .small()
+                        egui::RichText::new("Select a fighter and a move to see its script.")
                             .color(egui::Color32::GRAY),
                     );
-                }
-                if let Some(note) = &self.acmd_source_note {
-                    ui.label(
-                        egui::RichText::new(format!("— {note}"))
-                            .small()
-                            .color(egui::Color32::from_rgb(220, 180, 90)),
-                    );
-                }
-            });
+                    return;
+                };
 
-            ui.horizontal(|ui| {
-                ui.label("Show:");
-                ui.selectable_value(&mut view, SourceView::Source, "Your source")
-                    .on_hover_text("The move's own code in your linked project");
-                ui.selectable_value(&mut view, SourceView::Generated, "Generated")
-                    .on_hover_text(
-                        "The code Visionary would write into acmd_source/ if you exported \
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("{fighter} / {move_name}")).strong());
+                    if !self.state.acmd_source.is_none() {
+                        ui.label(
+                            egui::RichText::new(format!("from {}", self.state.acmd_source.label()))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    if let Some(note) = &self.acmd_source_note {
+                        ui.label(
+                            egui::RichText::new(format!("— {note}"))
+                                .small()
+                                .color(egui::Color32::from_rgb(220, 180, 90)),
+                        );
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Show:");
+                    ui.selectable_value(&mut view, SourceView::Source, "Your source")
+                        .on_hover_text("The move's own code in your linked project");
+                    ui.selectable_value(&mut view, SourceView::Generated, "Generated")
+                        .on_hover_text(
+                            "The code Visionary would write into acmd_source/ if you exported \
                          right now, from the move as it stands in the editor. Works for any \
                          move the editor has loaded, including live captures.",
-                    );
-                ui.selectable_value(&mut view, SourceView::Split, "Side by side");
-            });
-            ui.separator();
+                        );
+                    ui.selectable_value(&mut view, SourceView::Split, "Side by side");
+                });
+                ui.separator();
 
-            // The fighter's own row is open, but the moveset installs these scripts only on a
-            // slot character's costumes: say whose they are before anyone edits them as Falco's.
-            let gated_characters = self
-                .state
-                .selected_fighter
-                .and_then(|i| self.state.fighters.get(i))
-                .filter(|entry| entry.custom_name.is_none())
-                .map(|entry| {
-                    self.script_owner_rows(&entry.name)
-                        .into_iter()
-                        .filter_map(|row| row.character)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|characters| !characters.is_empty());
-            if let Some(characters) = gated_characters {
-                let base = fighter_display_name(&fighter);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "This moveset installs {fighter}'s scripts only on {}'s costume slots \
+                // The fighter's own row is open, but the moveset installs these scripts only on a
+                // slot character's costumes: say whose they are before anyone edits them as Falco's.
+                let gated_characters = self
+                    .state
+                    .selected_fighter
+                    .and_then(|i| self.state.fighters.get(i))
+                    .filter(|entry| entry.custom_name.is_none())
+                    .map(|entry| {
+                        self.script_owner_rows(&entry.name)
+                            .into_iter()
+                            .filter_map(|row| row.character)
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|characters| !characters.is_empty());
+                if let Some(characters) = gated_characters {
+                    let base = fighter_display_name(&fighter);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "This moveset installs {fighter}'s scripts only on {}'s costume slots \
                          (set_costume); {base}'s own slots play the game's. Edits made here \
                          change {}.",
-                        characters.join(", "),
-                        characters.join(", "),
-                    ))
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 190, 90)),
-                );
-            }
+                            characters.join(", "),
+                            characters.join(", "),
+                        ))
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 190, 90)),
+                    );
+                }
 
-            // Everything that needs `&self` is resolved before the buffer is borrowed
-            // mutably below — closures capturing both would not borrow-check.
-            // Show the spelling the game runs (`game_attacks3` for `attack_s3_s`).
-            let script_move = crate::acmd::resolve_script_move_name(&fighter, &move_name);
-            let scripts: Vec<(&str, String, bool, bool, bool)> = [
-                ("game", "Hitboxes"),
-                ("effect", "Effects"),
-                ("sound", "Sounds"),
-                ("expression", "Expression"),
-            ]
-            .into_iter()
-            .map(|(prefix, label)| {
-                let name = crate::acmd::acmd_script_name(prefix, &script_move);
-                let present = self
-                    .acmd_src
-                    .as_ref()
-                    .is_some_and(|index| index.script(&fighter, &name).is_some());
-                let ambiguous = self
-                    .acmd_src
-                    .as_ref()
-                    .is_some_and(|index| index.conflict(&fighter, &name).is_some());
-                let showing = self
-                    .acmd_src_buffer
-                    .as_ref()
-                    .is_some_and(|b| b.script == name);
-                (label, name, present, ambiguous, showing)
-            })
-            .collect();
-            let any_script = scripts.iter().any(|(_, _, present, _, _)| *present);
-            let any_ambiguous = scripts.iter().any(|(_, _, _, ambiguous, _)| *ambiguous);
-            let reason = match self.acmd_src.as_ref() {
-                None => NoSource::NotLinked,
-                Some(index) if !index.has_fighter(&fighter) => NoSource::FighterAbsent,
-                Some(_) if !any_script && any_ambiguous => NoSource::Ambiguous,
-                Some(_) if !any_script => NoSource::MoveAbsent,
-                Some(_) => NoSource::NothingOpen,
-            };
+                // Everything that needs `&self` is resolved before the buffer is borrowed
+                // mutably below — closures capturing both would not borrow-check.
+                // Show the spelling the game runs (`game_attacks3` for `attack_s3_s`).
+                let script_move = crate::acmd::resolve_script_move_name(&fighter, &move_name);
+                let scripts: Vec<(&str, String, bool, bool, bool)> = [
+                    ("game", "Hitboxes"),
+                    ("effect", "Effects"),
+                    ("sound", "Sounds"),
+                    ("expression", "Expression"),
+                ]
+                .into_iter()
+                .map(|(prefix, label)| {
+                    let name = crate::acmd::acmd_script_name(prefix, &script_move);
+                    let present = self
+                        .acmd_src
+                        .as_ref()
+                        .is_some_and(|index| index.script(&fighter, &name).is_some());
+                    let ambiguous = self
+                        .acmd_src
+                        .as_ref()
+                        .is_some_and(|index| index.conflict(&fighter, &name).is_some());
+                    let showing = self
+                        .acmd_src_buffer
+                        .as_ref()
+                        .is_some_and(|b| b.script == name);
+                    (label, name, present, ambiguous, showing)
+                })
+                .collect();
+                let any_script = scripts.iter().any(|(_, _, present, _, _)| *present);
+                let any_ambiguous = scripts.iter().any(|(_, _, _, ambiguous, _)| *ambiguous);
+                let reason = match self.acmd_src.as_ref() {
+                    None => NoSource::NotLinked,
+                    Some(index) if !index.has_fighter(&fighter) => NoSource::FighterAbsent,
+                    Some(_) if !any_script && any_ambiguous => NoSource::Ambiguous,
+                    Some(_) if !any_script => NoSource::MoveAbsent,
+                    Some(_) => NoSource::NothingOpen,
+                };
 
-            if any_ambiguous {
-                ui.label(
-                    egui::RichText::new(
-                        "One or more source functions are duplicated; those categories are \
+                if any_ambiguous {
+                    ui.label(
+                        egui::RichText::new(
+                            "One or more source functions are duplicated; those categories are \
                          blocked until the project has one owner for each script.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 190, 90)),
-                );
-            }
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 190, 90)),
+                    );
+                }
 
-            if view != SourceView::Generated {
-                ui.horizontal_wrapped(|ui| {
-                    for (prefix, (label, name, present, ambiguous, showing)) in
-                        scripts.iter().enumerate()
-                    {
+                if view != SourceView::Generated {
+                    ui.horizontal_wrapped(|ui| {
+                        for (prefix, (label, name, present, ambiguous, showing)) in
+                            scripts.iter().enumerate()
+                        {
+                            if ui
+                                .add_enabled(
+                                    *present && !*showing,
+                                    egui::Button::new(format!("{label}  {name}")),
+                                )
+                                .on_hover_text(if *present {
+                                    format!("Open {name} from the project")
+                                } else if *ambiguous {
+                                    format!("{name} has more than one source owner")
+                                } else {
+                                    format!("{name} is not in the linked project")
+                                })
+                                .clicked()
+                            {
+                                checkout = Some(match prefix {
+                                    0 => "game",
+                                    1 => "effect",
+                                    2 => "sound",
+                                    _ => "expression",
+                                });
+                            }
+                        }
                         if ui
                             .add_enabled(
-                                *present && !*showing,
-                                egui::Button::new(format!("{label}  {name}")),
+                                any_script,
+                                egui::Button::new("Write edits into your source"),
                             )
-                            .on_hover_text(if *present {
-                                format!("Open {name} from the project")
-                            } else if *ambiguous {
-                                format!("{name} has more than one source owner")
-                            } else {
-                                format!("{name} is not in the linked project")
-                            })
-                            .clicked()
-                        {
-                            checkout = Some(match prefix {
-                                0 => "game",
-                                1 => "effect",
-                                2 => "sound",
-                                _ => "expression",
-                            });
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            any_script,
-                            egui::Button::new("Write edits into your source"),
-                        )
-                        .on_hover_text(
-                            "Write this move's edited hitbox and spawn VALUES back into your \
+                            .on_hover_text(
+                                "Write this move's edited hitbox and spawn VALUES back into your \
                              source. The macros you called, your comments, and your formatting \
                              are left exactly as written; anything that would need the code \
                              restructured is reported instead of guessed at.",
-                        )
-                        .clicked()
-                    {
-                        sync = true;
-                    }
-                });
-            }
-
-            if let Some((text, report)) = generated.as_ref() {
-                draw_verification(ui, report, !text.is_empty());
-            }
-
-            let mut generated_text = generated.map(|(text, _)| text).unwrap_or_default();
-            let buffer = self.acmd_src_buffer.as_mut();
-            match view {
-                SourceView::Source => draw_source_pane(
-                    ui,
-                    buffer,
-                    &fighter,
-                    &move_name,
-                    reason,
-                    &mut save,
-                    &mut revert,
-                ),
-                SourceView::Generated => draw_generated_pane(ui, &mut generated_text),
-                SourceView::Split => {
-                    let (mut save_split, mut revert_split) = (false, false);
-                    ui.columns(2, |columns| {
-                        columns[0].label(egui::RichText::new("Your source").small().strong());
-                        draw_source_pane(
-                            &mut columns[0],
-                            buffer,
-                            &fighter,
-                            &move_name,
-                            reason,
-                            &mut save_split,
-                            &mut revert_split,
-                        );
-                        columns[1]
-                            .label(egui::RichText::new("Generated by export").small().strong());
-                        draw_generated_pane(&mut columns[1], &mut generated_text);
+                            )
+                            .clicked()
+                        {
+                            sync = true;
+                        }
                     });
-                    save |= save_split;
-                    revert |= revert_split;
                 }
-            }
-        });
+
+                if let Some((text, report)) = generated.as_ref() {
+                    draw_verification(ui, report, !text.is_empty());
+                }
+
+                let mut generated_text = generated.map(|(text, _)| text).unwrap_or_default();
+                let buffer = self.acmd_src_buffer.as_mut();
+                match view {
+                    SourceView::Source => draw_source_pane(
+                        ui,
+                        buffer,
+                        &fighter,
+                        &move_name,
+                        reason,
+                        &mut save,
+                        &mut revert,
+                    ),
+                    SourceView::Generated => draw_generated_pane(ui, &mut generated_text),
+                    SourceView::Split => {
+                        let (mut save_split, mut revert_split) = (false, false);
+                        ui.columns(2, |columns| {
+                            columns[0].label(egui::RichText::new("Your source").small().strong());
+                            draw_source_pane(
+                                &mut columns[0],
+                                buffer,
+                                &fighter,
+                                &move_name,
+                                reason,
+                                &mut save_split,
+                                &mut revert_split,
+                            );
+                            columns[1]
+                                .label(egui::RichText::new("Generated by export").small().strong());
+                            draw_generated_pane(&mut columns[1], &mut generated_text);
+                        });
+                        save |= save_split;
+                        revert |= revert_split;
+                    }
+                }
+            });
 
         if let Some(response) = response {
             let rect = response.response.rect;
@@ -11772,7 +11876,11 @@ impl VisionaryApp {
             .name
             .clone();
         let kind = crate::frame_data::MoveKind::of(&move_entry.name);
-        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
+        let roots: Vec<PathBuf> = self
+            .all_roots()
+            .iter()
+            .map(|root| root.join("fighter"))
+            .collect();
         let overrides = self
             .acmd_src
             .as_ref()
@@ -11815,14 +11923,25 @@ impl VisionaryApp {
         else {
             return ViewportScales::default();
         };
-        let roots: Vec<PathBuf> = self.all_roots().iter().map(|root| root.join("fighter")).collect();
-        let index = self.acmd_src.as_ref().filter(|index| index.has_fighter(&fighter));
+        let roots: Vec<PathBuf> = self
+            .all_roots()
+            .iter()
+            .map(|root| root.join("fighter"))
+            .collect();
+        let index = self
+            .acmd_src
+            .as_ref()
+            .filter(|index| index.has_fighter(&fighter));
         let source = index.and_then(|index| {
             let scales = index
                 .scales
                 .get(&fighter)
                 // A project that never names its fighter keeps its scripts under "".
-                .or_else(|| (index.scales.len() == 1).then(|| index.scales.values().next()).flatten())?;
+                .or_else(|| {
+                    (index.scales.len() == 1)
+                        .then(|| index.scales.values().next())
+                        .flatten()
+                })?;
             Some((index.root.clone(), scales.clone()))
         });
         let override_scale = index.and_then(|index| index.param_scale);
@@ -12038,10 +12157,8 @@ impl VisionaryApp {
         let mut owned_calls = self.state.script.to_article_calls();
         owned_calls.extend(self.state.expression_script.to_article_calls());
         owned_calls.extend(self.state.sound_script.to_article_calls());
-        let call_refs: Vec<(u32, &crate::data::ArticleCall)> = owned_calls
-            .iter()
-            .map(|(f, call)| (*f, call))
-            .collect();
+        let call_refs: Vec<(u32, &crate::data::ArticleCall)> =
+            owned_calls.iter().map(|(f, call)| (*f, call)).collect();
         let empty_locals: HashMap<String, String> = HashMap::new();
         let mut plans = crate::article_preview::plan_spawns_from_calls(&call_refs, &|call| {
             self.article_catalog
@@ -12437,10 +12554,7 @@ impl VisionaryApp {
                             .or_else(|| bones.get(&bone.to_lowercase()))
                             .map(|m| m.transform_point3(p))
                     };
-                    Some([
-                        point(bone_a, spec.point_a)?,
-                        point(bone_b, spec.point_b)?,
-                    ])
+                    Some([point(bone_a, spec.point_a)?, point(bone_b, spec.point_b)?])
                 })
                 .collect();
             out.push(crate::preview_trail::TrailDraw {
@@ -12548,9 +12662,7 @@ impl VisionaryApp {
                             cache
                                 .catalog
                                 .get(&direct)
-                                .or_else(|| {
-                                    cache.catalog.articles.iter().find(|a| a.name == name)
-                                })
+                                .or_else(|| cache.catalog.articles.iter().find(|a| a.name == name))
                                 .cloned()
                         });
                     let agent = catalog_article
@@ -12737,8 +12849,16 @@ impl VisionaryApp {
                 let hbs = crate::acmd::parse_acmd_script(&body).to_hitboxes();
                 let effs = crate::article_preview::object_effects(&body);
                 (
-                    if hbs.is_empty() { kind.hitboxes.clone() } else { hbs },
-                    if effs.is_empty() { kind.effects.clone() } else { effs },
+                    if hbs.is_empty() {
+                        kind.hitboxes.clone()
+                    } else {
+                        hbs
+                    },
+                    if effs.is_empty() {
+                        kind.effects.clone()
+                    } else {
+                        effs
+                    },
                 )
             }
             None => (kind.hitboxes.clone(), kind.effects.clone()),
@@ -13329,10 +13449,7 @@ impl VisionaryApp {
             .filter(|(fighter, _)| Some(fighter.as_str()) == selected)
             .map(|(_, path)| path)
             .or_else(|| self.current_eff_path.clone());
-        [own, common]
-            .into_iter()
-            .flatten()
-            .collect()
+        [own, common].into_iter().flatten().collect()
     }
 
     fn preview_effect_draws(
@@ -13804,10 +13921,8 @@ impl VisionaryApp {
                             }
                             crate::viewport_navigation::FrameRequest::All => self.fighter_sphere,
                         };
-                        let (center, radius) = sphere.unwrap_or((
-                            rs.camera.follow + glam::Vec3::new(0.0, 8.0, 0.0),
-                            12.0,
-                        ));
+                        let (center, radius) = sphere
+                            .unwrap_or((rs.camera.follow + glam::Vec3::new(0.0, 8.0, 0.0), 12.0));
                         rs.camera.frame(center, radius);
                         moved = true;
                     }
@@ -18989,10 +19104,16 @@ impl VisionaryApp {
                     if fighters.iter().any(|f| f.name == name) {
                         continue;
                     }
-                    let slots: Vec<u8> = crate::data::part_costume_slots(&dir.join("model").join("body"))
-                        .into_iter()
-                        .filter(|slot| dir.join("model").join("body").join(format!("c{slot:02}")).is_dir())
-                        .collect();
+                    let slots: Vec<u8> =
+                        crate::data::part_costume_slots(&dir.join("model").join("body"))
+                            .into_iter()
+                            .filter(|slot| {
+                                dir.join("model")
+                                    .join("body")
+                                    .join(format!("c{slot:02}"))
+                                    .is_dir()
+                            })
+                            .collect();
                     if slots.is_empty() {
                         continue;
                     }
@@ -19007,7 +19128,9 @@ impl VisionaryApp {
             fighters.sort_by(|a, b| a.display.cmp(&b.display));
             self.victim_fighters = Some((key, fighters));
         }
-        self.victim_fighters.as_ref().map_or(&[], |(_, list)| list.as_slice())
+        self.victim_fighters
+            .as_ref()
+            .map_or(&[], |(_, list)| list.as_slice())
     }
 
     fn victim_fighter(&mut self) -> Option<VictimFighter> {
@@ -19029,23 +19152,24 @@ impl VisionaryApp {
             let model = crate::costume_files::CostumeFolder::resolve(&model_dir);
             let motion_dir = fighter_dir.join("motion").join("body").join(&costume);
             let animation_files = index_fighter_nuanmb(&fighter_dir, slot);
-            let mut motions: Vec<(String, PathBuf)> = crate::motion_list::load_current_in(&motion_dir)
-                .map(|mlist| {
-                    mlist
-                        .list
-                        .iter()
-                        .filter_map(|(hash, motion)| {
-                            let name = self.state.labels.get(&hash.0)?;
-                            if !name.contains("thrown") {
-                                return None;
-                            }
-                            let animation = motion.animations.first()?;
-                            let path = animation_files.get(&animation.name.0)?;
-                            Some((name.clone(), path.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let mut motions: Vec<(String, PathBuf)> =
+                crate::motion_list::load_current_in(&motion_dir)
+                    .map(|mlist| {
+                        mlist
+                            .list
+                            .iter()
+                            .filter_map(|(hash, motion)| {
+                                let name = self.state.labels.get(&hash.0)?;
+                                if !name.contains("thrown") {
+                                    return None;
+                                }
+                                let animation = motion.animations.first()?;
+                                let path = animation_files.get(&animation.name.0)?;
+                                Some((name.clone(), path.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
             motions.sort();
             self.victim_cache = Some(VictimCache {
                 key,
@@ -19113,7 +19237,11 @@ impl VisionaryApp {
                 .show_ui(ui, |ui| {
                     for (name, display) in &fighters {
                         changed |= ui
-                            .selectable_value(&mut self.thrown_victim.fighter, name.clone(), display)
+                            .selectable_value(
+                                &mut self.thrown_victim.fighter,
+                                name.clone(),
+                                display,
+                            )
                             .changed();
                     }
                 });
@@ -19131,7 +19259,11 @@ impl VisionaryApp {
                 .show_ui(ui, |ui| {
                     for slot in &slots {
                         changed |= ui
-                            .selectable_value(&mut self.thrown_victim.slot, *slot, format!("c{slot:02}"))
+                            .selectable_value(
+                                &mut self.thrown_victim.slot,
+                                *slot,
+                                format!("c{slot:02}"),
+                            )
                             .changed();
                     }
                 });
@@ -19155,14 +19287,21 @@ impl VisionaryApp {
             let auto = auto_thrown_motion(&attacker, &move_name, &motions)
                 .map(|index| motions[index].0.clone());
             let auto_label = format!("Auto ({})", auto.as_deref().unwrap_or("none found"));
-            let selected = self.victim_motion_override.clone().unwrap_or(auto_label.clone());
+            let selected = self
+                .victim_motion_override
+                .clone()
+                .unwrap_or(auto_label.clone());
             egui::ComboBox::from_id_salt("thrown_victim_motion")
                 .selected_text(selected)
                 .width(150.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.victim_motion_override, None, auto_label);
                     for (name, _) in &motions {
-                        ui.selectable_value(&mut self.victim_motion_override, Some(name.clone()), name);
+                        ui.selectable_value(
+                            &mut self.victim_motion_override,
+                            Some(name.clone()),
+                            name,
+                        );
                     }
                 })
                 .response
@@ -19211,38 +19350,42 @@ impl VisionaryApp {
                 ui.label(RichText::new("General").strong());
                 let console = ui.add_enabled(
                     crate::console::SUPPORTED && !crate::console::from_terminal(),
-                    egui::Checkbox::new(
-                        &mut self.preferences.show_console,
-                        "Show console window",
-                    ),
+                    egui::Checkbox::new(&mut self.preferences.show_console, "Show console window"),
                 );
                 if console.changed() {
                     crate::console::set_visible(self.preferences.show_console);
                 }
-                console.on_hover_text(
-                    "A console window with Visionary's log output: model loading, plugin \
+                console
+                    .on_hover_text(
+                        "A console window with Visionary's log output: model loading, plugin \
                      deploys, builds and the game link. Turn it off here rather than closing \
                      the console, which would close Visionary with it.",
-                )
-                .on_disabled_hover_text(if crate::console::SUPPORTED {
-                    "Visionary was started from a terminal, which already shows its log output."
-                } else {
-                    "Log output goes to the terminal that started Visionary."
-                });
+                    )
+                    .on_disabled_hover_text(if crate::console::SUPPORTED {
+                        "Visionary was started from a terminal, which already shows its log output."
+                    } else {
+                        "Log output goes to the terminal that started Visionary."
+                    });
                 ui.horizontal(|ui| {
                     ui.label("Interface scale");
                     let mut scale = self.preferences.ui_scale;
                     let response = ui.add(
-                        egui::Slider::new(&mut scale, crate::preferences::Preferences::UI_SCALE_RANGE)
-                            .step_by(0.05)
-                            .fixed_decimals(2),
+                        egui::Slider::new(
+                            &mut scale,
+                            crate::preferences::Preferences::UI_SCALE_RANGE,
+                        )
+                        .step_by(0.05)
+                        .fixed_decimals(2),
                     );
                     if response.changed() {
                         self.preferences.ui_scale = scale;
                         ctx.set_zoom_factor(scale);
                     }
                     if ui
-                        .add_enabled(scale != defaults.ui_scale, egui::Button::new("Reset").small())
+                        .add_enabled(
+                            scale != defaults.ui_scale,
+                            egui::Button::new("Reset").small(),
+                        )
                         .clicked()
                     {
                         self.preferences.ui_scale = defaults.ui_scale;
@@ -19296,72 +19439,89 @@ impl VisionaryApp {
                 ui.separator();
                 ui.label(RichText::new("Camera").strong());
                 self.draw_navigation_settings(ui);
-                ui.label(RichText::new(navigation_hint(&self.preferences)).small().weak());
+                ui.label(
+                    RichText::new(navigation_hint(&self.preferences))
+                        .small()
+                        .weak(),
+                );
                 if let Some(wgpu_state) = frame.wgpu_render_state() {
                     let mut renderer = wgpu_state.renderer.write();
                     if let Some(rs) = renderer.callback_resources.get_mut::<HitboxRenderState>() {
                         let camera = &mut rs.camera;
                         let home = self.preferences.home_camera();
-                        egui::Grid::new("settings_camera").num_columns(4).show(ui, |ui| {
-                            ui.label("Translation");
-                            for value in [
-                                &mut camera.translation.x,
-                                &mut camera.translation.y,
-                                &mut camera.translation.z,
-                            ] {
-                                ui.add(egui::DragValue::new(value).speed(0.1).fixed_decimals(2));
-                            }
-                            ui.end_row();
-                            ui.label("Rotation (°)");
-                            for value in [
-                                &mut camera.rotation.x,
-                                &mut camera.rotation.y,
-                                &mut camera.rotation.z,
-                            ] {
-                                let mut degrees = value.to_degrees();
+                        egui::Grid::new("settings_camera")
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                ui.label("Translation");
+                                for value in [
+                                    &mut camera.translation.x,
+                                    &mut camera.translation.y,
+                                    &mut camera.translation.z,
+                                ] {
+                                    ui.add(
+                                        egui::DragValue::new(value).speed(0.1).fixed_decimals(2),
+                                    );
+                                }
+                                ui.end_row();
+                                ui.label("Rotation (°)");
+                                for value in [
+                                    &mut camera.rotation.x,
+                                    &mut camera.rotation.y,
+                                    &mut camera.rotation.z,
+                                ] {
+                                    let mut degrees = value.to_degrees();
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut degrees)
+                                                .speed(0.5)
+                                                .fixed_decimals(1),
+                                        )
+                                        .changed()
+                                    {
+                                        *value = degrees.to_radians();
+                                    }
+                                }
+                                ui.end_row();
+                                ui.label("Field of view (°)");
+                                let mut degrees = camera.fov_y.to_degrees();
                                 if ui
-                                    .add(egui::DragValue::new(&mut degrees).speed(0.5).fixed_decimals(1))
+                                    .add(
+                                        egui::DragValue::new(&mut degrees)
+                                            .range(1.0..=120.0)
+                                            .speed(0.25)
+                                            .fixed_decimals(1),
+                                    )
                                     .changed()
                                 {
-                                    *value = degrees.to_radians();
+                                    camera.fov_y = degrees.to_radians();
                                 }
-                            }
-                            ui.end_row();
-                            ui.label("Field of view (°)");
-                            let mut degrees = camera.fov_y.to_degrees();
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut degrees)
-                                        .range(1.0..=120.0)
-                                        .speed(0.25)
-                                        .fixed_decimals(1),
-                                )
-                                .changed()
-                            {
-                                camera.fov_y = degrees.to_radians();
-                            }
-                            ui.end_row();
-                            ui.label("Near clip").on_hover_text("The nearest distance drawn.");
-                            let far = camera.far;
-                            ui.add(
-                                egui::DragValue::new(&mut camera.near)
-                                    .range(0.001..=far)
-                                    .speed(0.05),
-                            );
-                            ui.end_row();
-                            ui.label("Far clip").on_hover_text("The farthest distance drawn.");
-                            let near = camera.near;
-                            ui.add(
-                                egui::DragValue::new(&mut camera.far)
-                                    .range(near..=f32::MAX)
-                                    .speed(100.0),
-                            );
-                            ui.end_row();
-                        });
+                                ui.end_row();
+                                ui.label("Near clip")
+                                    .on_hover_text("The nearest distance drawn.");
+                                let far = camera.far;
+                                ui.add(
+                                    egui::DragValue::new(&mut camera.near)
+                                        .range(0.001..=far)
+                                        .speed(0.05),
+                                );
+                                ui.end_row();
+                                ui.label("Far clip")
+                                    .on_hover_text("The farthest distance drawn.");
+                                let near = camera.near;
+                                ui.add(
+                                    egui::DragValue::new(&mut camera.far)
+                                        .range(near..=f32::MAX)
+                                        .speed(100.0),
+                                );
+                                ui.end_row();
+                            });
                         camera.translation.z = camera.translation.z.min(-1.0);
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!camera.is_at(&home), egui::Button::new("⟲ Reset view"))
+                                .add_enabled(
+                                    !camera.is_at(&home),
+                                    egui::Button::new("⟲ Reset view"),
+                                )
                                 .on_hover_text("Back to the default view")
                                 .clicked()
                             {
@@ -19409,58 +19569,60 @@ impl VisionaryApp {
     fn draw_navigation_settings(&mut self, ui: &mut Ui) {
         use crate::preferences::{NavigationScheme, NavigationWidget};
         let preferences = &mut self.preferences;
-        egui::Grid::new("settings_navigation").num_columns(2).show(ui, |ui| {
-            ui.label("Mouse navigation").on_hover_text(
-                "SSBH: left drag orbits, right or middle drag pans.\nBlender: middle drag \
+        egui::Grid::new("settings_navigation")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Mouse navigation").on_hover_text(
+                    "SSBH: left drag orbits, right or middle drag pans.\nBlender: middle drag \
                  orbits, Shift + middle pans, Ctrl + middle zooms.",
-            );
-            egui::ComboBox::from_id_salt("settings_navigation_scheme")
-                .selected_text(match preferences.navigation_scheme {
-                    NavigationScheme::Ssbh => "SSBH",
-                    NavigationScheme::Blender => "Blender",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut preferences.navigation_scheme,
-                        NavigationScheme::Ssbh,
-                        "SSBH",
-                    );
-                    ui.selectable_value(
-                        &mut preferences.navigation_scheme,
-                        NavigationScheme::Blender,
-                        "Blender",
-                    );
-                });
-            ui.end_row();
-            ui.label("Orientation widget").on_hover_text(
-                "The gizmo in the viewport's top right corner. Click an axis or face to look \
+                );
+                egui::ComboBox::from_id_salt("settings_navigation_scheme")
+                    .selected_text(match preferences.navigation_scheme {
+                        NavigationScheme::Ssbh => "SSBH",
+                        NavigationScheme::Blender => "Blender",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut preferences.navigation_scheme,
+                            NavigationScheme::Ssbh,
+                            "SSBH",
+                        );
+                        ui.selectable_value(
+                            &mut preferences.navigation_scheme,
+                            NavigationScheme::Blender,
+                            "Blender",
+                        );
+                    });
+                ui.end_row();
+                ui.label("Orientation widget").on_hover_text(
+                    "The gizmo in the viewport's top right corner. Click an axis or face to look \
                  along it, drag it to orbit.",
-            );
-            egui::ComboBox::from_id_salt("settings_navigation_widget")
-                .selected_text(match preferences.navigation_widget {
-                    NavigationWidget::Axes => "Axes",
-                    NavigationWidget::Cube => "Cube",
-                    NavigationWidget::Hidden => "Hidden",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut preferences.navigation_widget,
-                        NavigationWidget::Axes,
-                        "Axes (Blender)",
-                    );
-                    ui.selectable_value(
-                        &mut preferences.navigation_widget,
-                        NavigationWidget::Cube,
-                        "Cube",
-                    );
-                    ui.selectable_value(
-                        &mut preferences.navigation_widget,
-                        NavigationWidget::Hidden,
-                        "Hidden",
-                    );
-                });
-            ui.end_row();
-        });
+                );
+                egui::ComboBox::from_id_salt("settings_navigation_widget")
+                    .selected_text(match preferences.navigation_widget {
+                        NavigationWidget::Axes => "Axes",
+                        NavigationWidget::Cube => "Cube",
+                        NavigationWidget::Hidden => "Hidden",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut preferences.navigation_widget,
+                            NavigationWidget::Axes,
+                            "Axes (Blender)",
+                        );
+                        ui.selectable_value(
+                            &mut preferences.navigation_widget,
+                            NavigationWidget::Cube,
+                            "Cube",
+                        );
+                        ui.selectable_value(
+                            &mut preferences.navigation_widget,
+                            NavigationWidget::Hidden,
+                            "Hidden",
+                        );
+                    });
+                ui.end_row();
+            });
         ui.add_enabled(
             preferences.navigation_scheme == NavigationScheme::Blender,
             egui::Checkbox::new(
@@ -19468,7 +19630,9 @@ impl VisionaryApp {
                 "Emulate 3 button mouse",
             ),
         )
-        .on_hover_text("Use Alt + left drag in place of the middle button, for trackpads and two-button mice.")
+        .on_hover_text(
+            "Use Alt + left drag in place of the middle button, for trackpads and two-button mice.",
+        )
         .on_disabled_hover_text("Available with Blender mouse navigation.");
     }
 
@@ -19532,10 +19696,9 @@ impl VisionaryApp {
     fn load_camera_animation(&mut self, path: PathBuf) {
         match ssbh_data::anim_data::AnimData::from_file(&path) {
             Ok(anim) => {
-                let has_camera = ssbh_wgpu::animation::camera::animate_camera(
-                    &anim, 0.0, 0.5, 1.0, 400_000.0,
-                )
-                .is_some();
+                let has_camera =
+                    ssbh_wgpu::animation::camera::animate_camera(&anim, 0.0, 0.5, 1.0, 400_000.0)
+                        .is_some();
                 if has_camera {
                     self.camera_anim = Some((path, std::sync::Arc::new(anim)));
                     self.camera_anim_on = true;
@@ -19548,13 +19711,19 @@ impl VisionaryApp {
                 }
             }
             Err(error) => {
-                self.camera_anim_error = Some(format!("Could not read {}: {error}", path.display()));
+                self.camera_anim_error =
+                    Some(format!("Could not read {}: {error}", path.display()));
             }
         }
     }
 
     /// The axis balls or cube in the viewport's top right corner (Settings picks which).
-    fn draw_orientation_widget(&mut self, ui: &mut Ui, viewport: egui::Rect, frame: &eframe::Frame) {
+    fn draw_orientation_widget(
+        &mut self,
+        ui: &mut Ui,
+        viewport: egui::Rect,
+        frame: &eframe::Frame,
+    ) {
         let style = self.preferences.navigation_widget;
         if style == crate::preferences::NavigationWidget::Hidden {
             return;
@@ -19636,21 +19805,22 @@ impl VisionaryApp {
                                 scales.model.value, scales.attack.value, scales.grab.value
                             )
                         };
-                        ui.label(RichText::new(text).small().weak()).on_hover_text(format!(
-                            "The fighter is drawn at the scales the game would give it:\n\n\
+                        ui.label(RichText::new(text).small().weak())
+                            .on_hover_text(format!(
+                                "The fighter is drawn at the scales the game would give it:\n\n\
                              Model (ModelModule::set_scale): {:.3}, from {}\n\
                              Hitboxes (AttackModule::set_attack_scale): {:.3}, from {}\n\
                              Grab boxes (GrabModule::set_size_mul): {:.3}, from {}\n\n\
                              A call in the fighter's frame callback (on_line) wins over the \
                              fighter_param scale. Branches that only run on the results screen \
                              or on entry are skipped.",
-                            scales.model.value,
-                            scales.model.source,
-                            scales.attack.value,
-                            scales.attack.source,
-                            scales.grab.value,
-                            scales.grab.source,
-                        ));
+                                scales.model.value,
+                                scales.model.source,
+                                scales.attack.value,
+                                scales.attack.source,
+                                scales.grab.value,
+                                scales.grab.source,
+                            ));
                     }
                     if self.selected_move_is_throw() {
                         ui.separator();
@@ -22004,7 +22174,11 @@ impl VisionaryApp {
             .entries
             .get(fighter)
             .is_some_and(|moves| moves.contains_key(move_name))
-            || self.state.effect_call_edits.get(key).is_some_and(|edits| !edits.is_empty())
+            || self
+                .state
+                .effect_call_edits
+                .get(key)
+                .is_some_and(|edits| !edits.is_empty())
             || self.state.effect_call_full.contains_key(key)
             || self.state.sound_script_edits.contains_key(key)
             || self.state.expression_script_edits.contains_key(key)
@@ -22074,19 +22248,27 @@ impl VisionaryApp {
                         }
                     }
                     Ok(ArticleJobResult::Dump(scripts, note)) => {
-                        if let Some(cache) = self.article_catalog.as_mut().filter(|c| c.fighter == job_fighter) {
+                        if let Some(cache) = self
+                            .article_catalog
+                            .as_mut()
+                            .filter(|c| c.fighter == job_fighter)
+                        {
                             cache.dump_scripts = scripts;
                             cache.dump_note = note;
                         }
                     }
                     Ok(ArticleJobResult::Failed(reason)) => {
-                        self.article_catalog_failed = Some((job_fighter.clone(), job_generation, reason));
+                        self.article_catalog_failed =
+                            Some((job_fighter.clone(), job_generation, reason));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         keep = false;
                         let delivered = self.article_catalog_generation == job_generation
-                            && self.article_catalog.as_ref().is_some_and(|c| c.fighter == job_fighter);
+                            && self
+                                .article_catalog
+                                .as_ref()
+                                .is_some_and(|c| c.fighter == job_fighter);
                         if !delivered && self.article_catalog_failed.is_none() {
                             self.article_catalog_failed = Some((
                                 job_fighter.clone(),
@@ -22103,7 +22285,10 @@ impl VisionaryApp {
             }
         }
         let generation = self.acmd_src_generation;
-        let have = self.article_catalog.as_ref().is_some_and(|c| c.fighter == fighter);
+        let have = self
+            .article_catalog
+            .as_ref()
+            .is_some_and(|c| c.fighter == fighter);
         if have && self.article_catalog_generation == generation {
             return;
         }
@@ -22122,7 +22307,12 @@ impl VisionaryApp {
             return;
         }
         let fingerprint = source_fingerprint(self.acmd_src.as_ref());
-        if have && self.article_catalog.as_ref().is_some_and(|c| c.fingerprint == fingerprint) {
+        if have
+            && self
+                .article_catalog
+                .as_ref()
+                .is_some_and(|c| c.fingerprint == fingerprint)
+        {
             self.article_catalog_generation = generation;
             return;
         }
@@ -22145,54 +22335,79 @@ impl VisionaryApp {
         self.article_catalog_failed = None;
         std::thread::spawn(move || {
             let fighter = job_fighter;
-            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match index.as_ref() {
-                Some(index) => {
-                    let catalog = crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
-                    let bodies = index.status_bodies(&fighter);
-                    let rows = crate::articles::view::status_call_rows(&bodies, &catalog, Some(&index.root));
-                    let mut status_spawns: Vec<(String, crate::article_preview::SpawnPlan)> =
-                        Vec::new();
-                    let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
-                    for (site, body) in &bodies {
-                        let file_text = file_cache
-                            .entry(site.file.clone())
-                            .or_insert_with(|| std::fs::read_to_string(&site.file).unwrap_or_default());
-                        for plan in crate::article_preview::plan_spawns_from_status_body(
-                            body,
-                            Some(file_text.as_str()),
+            let read =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match index.as_ref() {
+                    Some(index) => {
+                        let catalog =
+                            crate::articles::catalog_for(&fighter, index, &names, &fighter_dir);
+                        let bodies = index.status_bodies(&fighter);
+                        let rows = crate::articles::view::status_call_rows(
+                            &bodies,
                             &catalog,
-                            Some(index),
-                        ) {
-                            if !status_spawns
-                                .iter()
-                                .any(|(s, p)| s == &site.kind_expr && p.name == plan.name && p.motion == plan.motion)
-                            {
-                                status_spawns.push((site.kind_expr.clone(), plan));
+                            Some(&index.root),
+                        );
+                        let mut status_spawns: Vec<(String, crate::article_preview::SpawnPlan)> =
+                            Vec::new();
+                        let mut file_cache: HashMap<PathBuf, String> = HashMap::new();
+                        for (site, body) in &bodies {
+                            let file_text =
+                                file_cache.entry(site.file.clone()).or_insert_with(|| {
+                                    std::fs::read_to_string(&site.file).unwrap_or_default()
+                                });
+                            for plan in crate::article_preview::plan_spawns_from_status_body(
+                                body,
+                                Some(file_text.as_str()),
+                                &catalog,
+                                Some(index),
+                            ) {
+                                if !status_spawns.iter().any(|(s, p)| {
+                                    s == &site.kind_expr
+                                        && p.name == plan.name
+                                        && p.motion == plan.motion
+                                }) {
+                                    status_spawns.push((site.kind_expr.clone(), plan));
+                                }
                             }
                         }
+                        let agents: Vec<&str> = std::iter::once(fighter.as_str())
+                            .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
+                            .collect();
+                        let unresolved = index
+                            .unresolved_statuses
+                            .iter()
+                            .filter(|u| {
+                                u.agent_hint
+                                    .as_deref()
+                                    .is_none_or(|hint| agents.contains(&hint))
+                            })
+                            .cloned()
+                            .collect();
+                        let (overrides, unread_overrides) =
+                            crate::articles::param_overrides_for(index, &fighter, &names);
+                        (
+                            catalog,
+                            rows,
+                            status_spawns,
+                            unresolved,
+                            overrides,
+                            unread_overrides,
+                        )
                     }
-                    let agents: Vec<&str> = std::iter::once(fighter.as_str())
-                        .chain(catalog.articles.iter().map(|a| a.agent.as_str()))
-                        .collect();
-                    let unresolved = index
-                        .unresolved_statuses
-                        .iter()
-                        .filter(|u| u.agent_hint.as_deref().is_none_or(|hint| agents.contains(&hint)))
-                        .cloned()
-                        .collect();
-                    let (overrides, unread_overrides) =
-                        crate::articles::param_overrides_for(index, &fighter, &names);
-                    (catalog, rows, status_spawns, unresolved, overrides, unread_overrides)
-                }
-                None => (
-                    crate::articles::ArticleCatalog::build(&fighter, None, &[], Vec::new(), &fighter_dir),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                ),
-            }));
+                    None => (
+                        crate::articles::ArticleCatalog::build(
+                            &fighter,
+                            None,
+                            &[],
+                            Vec::new(),
+                            &fighter_dir,
+                        ),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                }));
             let (
                 catalog,
                 status_rows,
@@ -22321,7 +22536,9 @@ impl VisionaryApp {
             .settings
             .iter()
             .filter_map(|s| match &s.value {
-                crate::articles::settings::SettingValue::Param { block, .. } if *block != own_block => {
+                crate::articles::settings::SettingValue::Param { block, .. }
+                    if *block != own_block =>
+                {
                     Some(block.clone())
                 }
                 _ => None,
@@ -22352,12 +22569,15 @@ impl VisionaryApp {
             card.message = Some(format!("`{}` is not a number", text.trim()));
             return;
         };
-        let plan = crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
+        let plan =
+            crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
         let result: anyhow::Result<String> = match plan {
             Err(error) => Err(error),
-            Ok(crate::articles::settings::SettingWrite::Source { file, text }) => std::fs::write(&file, text)
-                .map(|_| format!("Saved {} in {}", setting.field.label(), file.display()))
-                .map_err(Into::into),
+            Ok(crate::articles::settings::SettingWrite::Source { file, text }) => {
+                std::fs::write(&file, text)
+                    .map(|_| format!("Saved {} in {}", setting.field.label(), file.display()))
+                    .map_err(Into::into)
+            }
             Ok(crate::articles::settings::SettingWrite::Const(edit)) => {
                 let Some(index) = self.acmd_src.as_ref() else {
                     return;
@@ -22366,17 +22586,28 @@ impl VisionaryApp {
                 if files.is_empty() {
                     Err(anyhow::anyhow!("nothing was written: {}", notes.join("; ")))
                 } else {
-                    let mut said = format!("Saved {} in {}", setting.field.label(), files[0].display());
+                    let mut said =
+                        format!("Saved {} in {}", setting.field.label(), files[0].display());
                     if !notes.is_empty() {
                         said.push_str(&format!(" — {}", notes.join("; ")));
                     }
                     Ok(said)
                 }
             }
-            Ok(crate::articles::settings::SettingWrite::Param { file, block, field, variant }) => {
-                crate::articles::params::write_param_field(&file, &block, &field, variant, value, &self.state.labels)
-                    .map(|_| format!("Saved {block} › {field} in {}", file.display()))
-            }
+            Ok(crate::articles::settings::SettingWrite::Param {
+                file,
+                block,
+                field,
+                variant,
+            }) => crate::articles::params::write_param_field(
+                &file,
+                &block,
+                &field,
+                variant,
+                value,
+                &self.state.labels,
+            )
+            .map(|_| format!("Saved {block} › {field} in {}", file.display())),
         };
         match result {
             Ok(said) => {
@@ -22409,7 +22640,11 @@ impl VisionaryApp {
                 .and_then(|i| self.state.fighters.get(i))
                 .map(|f| f.name.clone())
                 .unwrap_or_default();
-            if let Some((_, _, reason)) = self.article_catalog_failed.as_ref().filter(|(f, _, _)| *f == fighter) {
+            if let Some((_, _, reason)) = self
+                .article_catalog_failed
+                .as_ref()
+                .filter(|(f, _, _)| *f == fighter)
+            {
                 ui.separator();
                 ui.colored_label(
                     egui::Color32::from_rgb(235, 170, 90),
@@ -22423,7 +22658,12 @@ impl VisionaryApp {
         };
         let rows = crate::articles::view::object_rows_with(&cache.catalog, &cache.dump_scripts);
         let dump_note = cache.dump_note.clone();
-        let agents: Vec<String> = cache.catalog.articles.iter().map(|a| a.agent.clone()).collect();
+        let agents: Vec<String> = cache
+            .catalog
+            .articles
+            .iter()
+            .map(|a| a.agent.clone())
+            .collect();
         let unresolved_clones = cache.catalog.unresolved_clones.clone();
         let unresolved_statuses = cache.unresolved_statuses.clone();
         let unread_overrides = cache.unread_overrides.clone();
@@ -22606,7 +22846,8 @@ impl VisionaryApp {
                     .is_some_and(|c| Some(&c.fighter) == fighter_now.as_ref());
             if current {
                 // The source no longer has this object: the card has nothing left to show.
-                self.state.status = format!("{} is no longer one of this fighter's objects", card.agent);
+                self.state.status =
+                    format!("{} is no longer one of this fighter's objects", card.agent);
             } else {
                 // Still being read (or re-read): keep the card for the next frame.
                 self.article_settings = Some(card);
@@ -22787,11 +23028,17 @@ impl VisionaryApp {
     fn draw_article_calls_section(&mut self, ui: &mut Ui) {
         self.ensure_article_catalog();
         let calls = self.state.script.to_article_calls();
-        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let move_name = self
+            .state
+            .selected_move
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
         let Some(cache) = self.article_catalog.as_ref() else {
             return;
         };
-        let status_rows: Vec<crate::articles::view::StatusCallRow> = if self.open_article.is_some() {
+        let status_rows: Vec<crate::articles::view::StatusCallRow> = if self.open_article.is_some()
+        {
             Vec::new()
         } else {
             cache
@@ -22836,11 +23083,14 @@ impl VisionaryApp {
                 ui.label(format!("f{frame}"));
                 ui.label(label).on_hover_text(&call.source);
                 if !(is_script && addressable) {
-                    ui.weak(RichText::new(match call.origin {
-                        crate::data::ArticleOrigin::Script => "inside a loop, kept as written",
-                        crate::data::ArticleOrigin::Native => "edited as a native call",
-                        crate::data::ArticleOrigin::Timeline => "edited in its timeline form",
-                    }).small());
+                    ui.weak(
+                        RichText::new(match call.origin {
+                            crate::data::ArticleOrigin::Script => "inside a loop, kept as written",
+                            crate::data::ArticleOrigin::Native => "edited as a native call",
+                            crate::data::ArticleOrigin::Timeline => "edited in its timeline form",
+                        })
+                        .small(),
+                    );
                     return;
                 }
                 if let Some(slot) = call.op.target_index() {
@@ -22874,7 +23124,9 @@ impl VisionaryApp {
                     }
                     // The text being typed lives across frames, keyed by statement and argument,
                     // and is applied when the box loses focus.
-                    let text = arg_edits.entry((this_site, n)).or_insert_with(|| arg.clone());
+                    let text = arg_edits
+                        .entry((this_site, n))
+                        .or_insert_with(|| arg.clone());
                     let width = (text.len() as f32 * 7.0).clamp(30.0, 200.0);
                     let response = ui.add(egui::TextEdit::singleline(text).desired_width(width));
                     if response.lost_focus() {
@@ -22899,7 +23151,11 @@ impl VisionaryApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&row.label);
                 ui.weak(RichText::new(&row.origin).small());
-                if ui.small_button("Open").on_hover_text(row.file.display().to_string()).clicked() {
+                if ui
+                    .small_button("Open")
+                    .on_hover_text(row.file.display().to_string())
+                    .clicked()
+                {
                     reveal = Some(row.file.clone());
                 }
             });
@@ -22911,7 +23167,8 @@ impl VisionaryApp {
                 self.state.status = if self.open_article.is_some() {
                     "Object call edit staged — sync it into the linked source.".into()
                 } else {
-                    "Object call edit staged — export or sync it into the linked source project.".into()
+                    "Object call edit staged — export or sync it into the linked source project."
+                        .into()
                 };
             }
         }
@@ -22984,7 +23241,12 @@ impl VisionaryApp {
             return;
         };
         let agent = self.open_article.clone().unwrap_or_default();
-        let move_name = self.state.selected_move.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+        let move_name = self
+            .state
+            .selected_move
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
         let can_sync = self.open_article_in_source && self.acmd_src.is_some();
         let mut choice: Option<LeaveChoice> = None;
         egui::Window::new("Unsynced changes")
@@ -23011,7 +23273,11 @@ impl VisionaryApp {
                     if sync.clicked() {
                         choice = Some(LeaveChoice::SyncNow);
                     }
-                    if ui.button("Discard").on_hover_text("Go on without the changes").clicked() {
+                    if ui
+                        .button("Discard")
+                        .on_hover_text("Go on without the changes")
+                        .clicked()
+                    {
                         choice = Some(LeaveChoice::Discard);
                     }
                     if ui.button("Stay").clicked() {
@@ -23039,12 +23305,18 @@ impl VisionaryApp {
         match pending {
             PendingLeave::Script(article, entry) => self.select_script(article, entry),
             PendingLeave::Fighter(key) => {
-                let rows = self.state.fighters.iter().map(|f| (f.name.as_str(), f.custom_name.as_deref()));
+                let rows = self
+                    .state
+                    .fighters
+                    .iter()
+                    .map(|f| (f.name.as_str(), f.custom_name.as_deref()));
                 match resolve_parked_fighter(rows, &key) {
                     Some(index) => self.select_fighter(index),
                     None => {
-                        self.state.status =
-                            format!("{} is no longer in the list, so it wasn't opened", parked_fighter_label(&key));
+                        self.state.status = format!(
+                            "{} is no longer in the list, so it wasn't opened",
+                            parked_fighter_label(&key)
+                        );
                     }
                 }
             }
@@ -23054,10 +23326,8 @@ impl VisionaryApp {
                 }) {
                     self.forget_fighter(&target);
                 } else {
-                    self.state.status = format!(
-                        "{} is no longer in the list",
-                        parked_fighter_label(&target)
-                    );
+                    self.state.status =
+                        format!("{} is no longer in the list", parked_fighter_label(&target));
                 }
             }
             PendingLeave::Hub(action) => self.execute_hub_action_now(action),
@@ -24532,10 +24802,13 @@ impl VisionaryApp {
                 Some((agent, rules))
             })
             .flat_map(|(agent, rules)| {
-                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
-                    agent: agent.clone(),
-                    rule,
-                })
+                rules
+                    .iter()
+                    .cloned()
+                    .map(move |rule| crate::game_link::ForArticle {
+                        agent: agent.clone(),
+                        rule,
+                    })
             })
             .collect()
     }
@@ -24617,10 +24890,13 @@ impl VisionaryApp {
                 Some((agent, rules))
             })
             .flat_map(|(agent, rules)| {
-                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
-                    agent: agent.clone(),
-                    rule,
-                })
+                rules
+                    .iter()
+                    .cloned()
+                    .map(move |rule| crate::game_link::ForArticle {
+                        agent: agent.clone(),
+                        rule,
+                    })
             })
             .collect()
     }
@@ -24654,10 +24930,13 @@ impl VisionaryApp {
                 Some((agent, rules))
             })
             .flat_map(|(agent, rules)| {
-                rules.iter().cloned().map(move |rule| crate::game_link::ForArticle {
-                    agent: agent.clone(),
-                    rule,
-                })
+                rules
+                    .iter()
+                    .cloned()
+                    .map(move |rule| crate::game_link::ForArticle {
+                        agent: agent.clone(),
+                        rule,
+                    })
             })
             .collect()
     }
@@ -25254,8 +25533,8 @@ impl VisionaryApp {
             self.state.status = format!("{mv}: {}.", parts.join("; "));
         } else if let Some(edits) = self.state.effect_call_edits.get_mut(&mv) {
             for edit in edits.iter_mut() {
-                if let crate::data::EffectCallOp::Modify(call) | crate::data::EffectCallOp::Add(call) =
-                    &mut edit.op
+                if let crate::data::EffectCallOp::Modify(call)
+                | crate::data::EffectCallOp::Add(call) = &mut edit.op
                 {
                     resolve_raw_effect_names(std::slice::from_mut(call), &names);
                 }
@@ -26273,13 +26552,15 @@ impl VisionaryApp {
             } else {
                 ui.visuals().widgets.noninteractive.bg_stroke
             };
-            let framed = egui::Frame::group(ui.style()).stroke(stroke).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(title).strong());
-                ui.label(RichText::new(description).small().color(weak));
-                ui.add_space(2.0);
-                body(ui);
-            });
+            let framed = egui::Frame::group(ui.style())
+                .stroke(stroke)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(title).strong());
+                    ui.label(RichText::new(description).small().color(weak));
+                    ui.add_space(2.0);
+                    body(ui);
+                });
             if scroll && focus == Some(which) {
                 framed.response.scroll_to_me(Some(egui::Align::Center));
             }
@@ -26869,8 +27150,12 @@ impl VisionaryApp {
         // Compare against the game's own model, never the data root's: when the data root is
         // this project's romfs, that is the model being checked and would hide every issue.
         // An added slot has no vanilla model, so it is compared with the fighter's c00.
-        let vanilla_body = load_config_path(VANILLA_ROOT_CONFIG_KEY)
-            .map(|root| root.join("fighter").join(fighter).join("model").join("body"));
+        let vanilla_body = load_config_path(VANILLA_ROOT_CONFIG_KEY).map(|root| {
+            root.join("fighter")
+                .join(fighter)
+                .join("model")
+                .join("body")
+        });
         let baseline = vanilla_body.and_then(|body| {
             [slot, 0]
                 .into_iter()
@@ -27708,9 +27993,7 @@ impl VisionaryApp {
                         .check_workspace_model(&workspace, &fighter, slot)
                         .and_then(crate::model_checks::ModelReport::summary)
                     {
-                        report.push(format!(
-                            "Model check {fighter} c{slot:02}: {summary}"
-                        ));
+                        report.push(format!("Model check {fighter} c{slot:02}: {summary}"));
                     }
                 }
             }
@@ -27975,9 +28258,14 @@ impl VisionaryApp {
         self.authored_characters = crate::project_scope::authored_characters(&project.roster);
         // A project saved before projects recorded their moveset, or one never linked, that lives
         // in the moveset's own crate (`Empoleon-Moveset/modproject.json`) is about that crate.
-        let stored = project.moveset_source.take().map(PathBuf::from).or_else(|| {
-            path.parent().and_then(crate::project_scope::workspace_moveset)
-        });
+        let stored = project
+            .moveset_source
+            .take()
+            .map(PathBuf::from)
+            .or_else(|| {
+                path.parent()
+                    .and_then(crate::project_scope::workspace_moveset)
+            });
         let (moveset, index, problem) =
             crate::project_scope::moveset_on_load(stored, crate::acmd_src::SourceIndex::build);
         self.project_moveset = moveset;
@@ -28060,7 +28348,10 @@ impl VisionaryApp {
                 // A snapshot of a move with no edit is browsing provenance, possibly from
                 // another moveset linked at the time; it is not a baseline for anything.
                 let edited = fm.acmd.contains_key(move_name)
-                    || fm.effect_calls.get(move_name).is_some_and(|edits| !edits.is_empty())
+                    || fm
+                        .effect_calls
+                        .get(move_name)
+                        .is_some_and(|edits| !edits.is_empty())
                     || fm.effect_calls_full.contains_key(move_name)
                     || fm.sound_scripts.contains_key(move_name)
                     || fm.expression_scripts.contains_key(move_name);
@@ -34610,7 +34901,8 @@ impl VisionaryApp {
             });
         }
         let cut_short = current.iter().filter(|h| h.category == 1).any(|h| {
-            now.iter().any(|&frame| h.active_start < frame && frame <= h.active_end)
+            now.iter()
+                .any(|&frame| h.active_start < frame && frame <= h.active_end)
         });
         (rules, cut_short)
     }
@@ -34668,12 +34960,19 @@ impl VisionaryApp {
             .filter(|slots| !slots.is_empty());
         let rows: Vec<&crate::data::FighterEntry> = target
             .as_ref()
-            .map(|name| self.state.fighters.iter().filter(|f| f.name == *name).collect())
+            .map(|name| {
+                self.state
+                    .fighters
+                    .iter()
+                    .filter(|f| f.name == *name)
+                    .collect()
+            })
             .unwrap_or_default();
         let avail_slots: Vec<u8> = match rows.first() {
             _ if made_slots.is_some() => made_slots.unwrap_or_default(),
             Some(_) => {
-                let mut slots: Vec<u8> = rows.iter().flat_map(|f| f.slots.iter().copied()).collect();
+                let mut slots: Vec<u8> =
+                    rows.iter().flat_map(|f| f.slots.iter().copied()).collect();
                 slots.sort_unstable();
                 slots.dedup();
                 slots
@@ -36545,7 +36844,11 @@ impl VisionaryApp {
             } else {
                 dbg.push_str(&format!(
                     "CARRIER ROOT MISS: carrier={} missing=[{}] roots={roots:?}\n",
-                    if carrier_path.is_some() { "found" } else { "missing" },
+                    if carrier_path.is_some() {
+                        "found"
+                    } else {
+                        "missing"
+                    },
                     missing.join(", ")
                 ));
             }
@@ -36705,13 +37008,14 @@ impl VisionaryApp {
             }
             // Tell the editor's send indicator directly. Without this it waited on a game that
             // was never sent a carrier, then reported "never staged the carrier" after 25s.
-            self.eff_editor.carrier_build_error = Some(carrier_error.clone().unwrap_or_else(|| {
-                if carrier_target.is_none() {
-                    "no fighter is selected to hold the carrier".to_string()
-                } else {
-                    "the carrier was not built (see donor_send_debug.txt)".to_string()
-                }
-            }));
+            self.eff_editor.carrier_build_error =
+                Some(carrier_error.clone().unwrap_or_else(|| {
+                    if carrier_target.is_none() {
+                        "no fighter is selected to hold the carrier".to_string()
+                    } else {
+                        "the carrier was not built (see donor_send_debug.txt)".to_string()
+                    }
+                }));
         }
         // Bytes first: a same-path carrier replacement must be staged before the game-thread
         // receives the new spec and creates its object. Empty is meaningful and clears old data.
@@ -37285,7 +37589,10 @@ impl VisionaryApp {
             .map(str::to_ascii_lowercase)
             .is_some_and(|file| file.starts_with(&format!("ef_{}_c", index.fighter)));
         let project = self.acmd_src.as_ref().filter(|source| {
-            slot_file || !source.costume_gated.contains(&index.fighter.to_ascii_lowercase())
+            slot_file
+                || !source
+                    .costume_gated
+                    .contains(&index.fighter.to_ascii_lowercase())
         });
         // Each rebuild of the index makes new `consts`, so its address tells one build from
         // the next without reading the scripts again on every frame.
@@ -40421,9 +40728,11 @@ impl eframe::App for VisionaryApp {
                     if !self.state.acmd_source.is_none() {
                         ui.separator();
                         let hover = match &self.acmd_source_note {
-                            Some(note) => format!("{note}
+                            Some(note) => format!(
+                                "{note}
 
-Click to see the code, or link your own project"),
+Click to see the code, or link your own project"
+                            ),
                             None => "Click to see the code, or link your own project".to_string(),
                         };
                         if ui
@@ -44837,7 +45146,12 @@ struct VictimCache {
 }
 
 fn encode_thrown_victim(pref: &ThrownVictimPref) -> String {
-    format!("v1,{},{},{}", u8::from(pref.enabled), pref.fighter, pref.slot)
+    format!(
+        "v1,{},{},{}",
+        u8::from(pref.enabled),
+        pref.fighter,
+        pref.slot
+    )
 }
 
 fn parse_thrown_victim(body: &str) -> Option<ThrownVictimPref> {
@@ -44881,7 +45195,11 @@ fn load_thrown_victim() -> ThrownVictimPref {
 /// otherwise the generic one for the throw's direction (`throw_f` → `thrown_f`). Only the
 /// plain variant: the `_dx`, `_big` and `_girl` sets depend on the thrower in ways not read
 /// here.
-fn auto_thrown_motion(attacker: &str, move_name: &str, motions: &[(String, PathBuf)]) -> Option<usize> {
+fn auto_thrown_motion(
+    attacker: &str,
+    move_name: &str,
+    motions: &[(String, PathBuf)],
+) -> Option<usize> {
     let is_variant = |name: &str| {
         ["_dx", "_big", "_girl"]
             .iter()
@@ -49727,7 +50045,11 @@ mod live_effect_capture_tests {
             &ScriptOrigin::Vanilla,
             effect_only
         ));
-        assert!(VisionaryApp::live_capture_can_replace_script(false, &ScriptOrigin::None, ""));
+        assert!(VisionaryApp::live_capture_can_replace_script(
+            false,
+            &ScriptOrigin::None,
+            ""
+        ));
         assert!(!VisionaryApp::live_capture_can_replace_script(
             false,
             &ScriptOrigin::LiveCapture,
@@ -53795,16 +54117,18 @@ mod live_effect_capture_tests {
     }
 
     fn grab_spanning(start: u32, end: u32) -> Hitbox {
-        Hitbox { category: 1, active_start: start, active_end: end, ..Default::default() }
+        Hitbox {
+            category: 1,
+            active_start: start,
+            active_end: end,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn lengthening_a_grab_moves_the_scripts_clear_in_game() {
-        let (rules, cut_short) = VisionaryApp::grab_clear_rules(
-            0x1234,
-            &[grab_spanning(7, 8)],
-            &[grab_spanning(7, 12)],
-        );
+        let (rules, cut_short) =
+            VisionaryApp::grab_clear_rules(0x1234, &[grab_spanning(7, 8)], &[grab_spanning(7, 12)]);
         assert!(!cut_short);
         assert_eq!(rules.len(), 2, "{rules:?}");
         let suppress = rules.iter().find(|r| r.suppress).unwrap();
@@ -53820,8 +54144,7 @@ mod live_effect_capture_tests {
     #[test]
     fn an_unchanged_grab_end_sends_no_clear_rules() {
         let grab = grab_spanning(7, 8);
-        let (rules, _) =
-            VisionaryApp::grab_clear_rules(0x1234, &[grab.clone()], &[grab]);
+        let (rules, _) = VisionaryApp::grab_clear_rules(0x1234, &[grab.clone()], &[grab]);
         assert!(rules.is_empty(), "{rules:?}");
     }
 
@@ -55796,7 +56119,10 @@ mod saved_effect_tests {
         let (calls, kept, report) = reconcile_saved_effects(&pristine, Some(&stale), Some(&edits));
         assert!(report.stale_full);
         assert_eq!(calls.len(), 3, "the script's effects come back");
-        assert!(calls[0].disabled, "the removal still applies to the call it was made for");
+        assert!(
+            calls[0].disabled,
+            "the removal still applies to the call it was made for"
+        );
         assert_eq!(calls[1].effect_name, "shyguy_mace_arc_wind");
         assert_eq!(kept.len(), 1);
     }
@@ -55817,8 +56143,16 @@ mod saved_effect_tests {
             call("added", 9),
         ];
         let edits = vec![
-            EffectCallEdit { index: 1, op: EffectCallOp::Modify(moved), pristine: Some(call("b", 5)) },
-            EffectCallEdit { index: 2, op: EffectCallOp::Add(call("added", 9)), pristine: None },
+            EffectCallEdit {
+                index: 1,
+                op: EffectCallOp::Modify(moved),
+                pristine: Some(call("b", 5)),
+            },
+            EffectCallEdit {
+                index: 2,
+                op: EffectCallOp::Add(call("added", 9)),
+                pristine: None,
+            },
         ];
         let (calls, _, report) = reconcile_saved_effects(&pristine, Some(&full), Some(&edits));
         assert_eq!(report, SavedEffectsReconcile::default());
@@ -55832,8 +56166,16 @@ mod saved_effect_tests {
         let mut tuned = call("a", 3);
         tuned.scale = 2.0;
         let edits = vec![
-            EffectCallEdit { index: 0, op: EffectCallOp::Modify(tuned), pristine: Some(call("a", 3)) },
-            EffectCallEdit { index: 1, op: EffectCallOp::Remove, pristine: Some(call("gone", 8)) },
+            EffectCallEdit {
+                index: 0,
+                op: EffectCallOp::Modify(tuned),
+                pristine: Some(call("a", 3)),
+            },
+            EffectCallEdit {
+                index: 1,
+                op: EffectCallOp::Remove,
+                pristine: Some(call("gone", 8)),
+            },
         ];
         let (calls, kept, report) = reconcile_saved_effects(&pristine, None, Some(&edits));
         assert_eq!((report.reanchored_edits, report.dropped_edits), (1, 1));
@@ -55848,11 +56190,17 @@ mod saved_effect_tests {
         let mut calls = vec![call("x", 1), call("y", 1)];
         calls[0].effect_name = format!("{:#x}", hash40::hash40("sys_smash_flash").0);
         calls[1].effect_name = "0xdeadbeef".into();
-        let names: HashMap<u64, String> =
-            [(hash40::hash40("sys_smash_flash").0, "sys_smash_flash".to_string())].into();
+        let names: HashMap<u64, String> = [(
+            hash40::hash40("sys_smash_flash").0,
+            "sys_smash_flash".to_string(),
+        )]
+        .into();
         resolve_raw_effect_names(&mut calls, &names);
         assert_eq!(calls[0].effect_name, "sys_smash_flash");
-        assert_eq!(calls[1].effect_name, "0xdeadbeef", "an unknown hash stays a hash");
+        assert_eq!(
+            calls[1].effect_name, "0xdeadbeef",
+            "an unknown hash stays a hash"
+        );
     }
 }
 
@@ -55997,7 +56345,13 @@ mod thrown_victim_tests {
 
     #[test]
     fn a_throw_picks_the_victims_motion_for_its_direction() {
-        let list = motions(&["thrown_b", "thrown_f", "thrown_f_dx", "thrown_hi", "thrown_lw"]);
+        let list = motions(&[
+            "thrown_b",
+            "thrown_f",
+            "thrown_f_dx",
+            "thrown_hi",
+            "thrown_lw",
+        ]);
         assert_eq!(pick(&list, "mario", "throw_f"), Some("thrown_f"));
         assert_eq!(pick(&list, "mario", "throw_lw"), Some("thrown_lw"));
         assert_eq!(pick(&motions(&["thrown_f_dx"]), "mario", "throw_f"), None);
@@ -56012,8 +56366,14 @@ mod thrown_victim_tests {
             "gaogaen_thrown_01",
             "thrown_f",
         ]);
-        assert_eq!(pick(&list, "shizue", "special_s_throw"), Some("shizue_special_s_thrown_f"));
-        assert_eq!(pick(&list, "gaogaen", "special_lw_throw"), Some("gaogaen_thrown_01"));
+        assert_eq!(
+            pick(&list, "shizue", "special_s_throw"),
+            Some("shizue_special_s_thrown_f")
+        );
+        assert_eq!(
+            pick(&list, "gaogaen", "special_lw_throw"),
+            Some("gaogaen_thrown_01")
+        );
         assert_eq!(pick(&list, "mario", "special_s_throw"), None);
     }
 
@@ -56024,7 +56384,10 @@ mod thrown_victim_tests {
             fighter: "pikachu".to_string(),
             slot: 3,
         };
-        assert_eq!(parse_thrown_victim(&encode_thrown_victim(&pref)), Some(pref));
+        assert_eq!(
+            parse_thrown_victim(&encode_thrown_victim(&pref)),
+            Some(pref)
+        );
         assert_eq!(parse_thrown_victim("v2,1,mario,0"), None);
         assert_eq!(parse_thrown_victim("v1,1,,0"), None);
         assert_eq!(parse_thrown_victim("v1,1,mario,0,extra"), None);

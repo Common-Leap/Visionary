@@ -2253,7 +2253,8 @@ pub struct ArticleCall {
 }
 
 /// The two path spellings of the module a call may be written with.
-const ARTICLE_MODULE_PATHS: [&str; 2] = ["smash::app::lua_bind::ArticleModule::", "ArticleModule::"];
+const ARTICLE_MODULE_PATHS: [&str; 2] =
+    ["smash::app::lua_bind::ArticleModule::", "ArticleModule::"];
 
 /// One complete `[let x = ][path]ArticleModule::f(args);` statement, split into its parts.
 struct ArticleStatement<'a> {
@@ -5992,10 +5993,13 @@ impl AcmdScript {
             stmts
                 .iter()
                 .map(|stmt| match stmt {
-                    AcmdStmt::Excute(inner) => {
-                        inner.iter().filter(|s| matches!(s, ExcuteStmt::Article(_))).count()
+                    AcmdStmt::Excute(inner) => inner
+                        .iter()
+                        .filter(|s| matches!(s, ExcuteStmt::Article(_)))
+                        .count(),
+                    AcmdStmt::Bare(inner) => {
+                        usize::from(matches!(inner.as_ref(), ExcuteStmt::Article(_)))
                     }
-                    AcmdStmt::Bare(inner) => usize::from(matches!(inner.as_ref(), ExcuteStmt::Article(_))),
                     AcmdStmt::Loop { body, .. } | AcmdStmt::RawBlock { body, .. } => count(body),
                     _ => 0,
                 })
@@ -7789,11 +7793,15 @@ fn raw_rate_call(line: &str) -> Option<f32> {
             .collect()
     };
     if let Some(args) = args("FT_MOTION_RATE_RANGE(") {
-        let [start, end, game] = args[..] else { return None };
+        let [start, end, game] = args[..] else {
+            return None;
+        };
         return (end > start).then(|| game / (end - start));
     }
     if let Some(args) = args("FT_DESIRED_RATE(") {
-        let [motion, game] = args[..] else { return None };
+        let [motion, game] = args[..] else {
+            return None;
+        };
         return (motion > 0.0).then(|| game / motion);
     }
     match args("FT_MOTION_RATE(")?[..] {
@@ -8047,7 +8055,9 @@ impl ScriptOrigin {
 
     /// The same body read again, chosen over the saved baseline.
     pub fn refreshed(&self) -> Self {
-        Self::Refreshed { moveset: *self == Self::MovesetSource }
+        Self::Refreshed {
+            moveset: *self == Self::MovesetSource,
+        }
     }
 
     /// A freshly read source, which replaces anything a live snapshot said about the move.
@@ -8481,11 +8491,7 @@ pub fn find_part_skel(part_dir: &std::path::Path, preferred_slot: u8) -> Option<
             .get("model.nusktb")
             .map(std::path::Path::to_path_buf)
     };
-    skel_in(preferred_slot).or_else(|| {
-        part_costume_slots(part_dir)
-            .into_iter()
-            .find_map(skel_in)
-    })
+    skel_in(preferred_slot).or_else(|| part_costume_slots(part_dir).into_iter().find_map(skel_in))
 }
 
 /// Slot index encoded in an eff file name, e.g. `("ef_mario_c08", "mario") → 8`.
@@ -8644,7 +8650,13 @@ fn decode_xmsbt(bytes: &[u8]) -> String {
     let utf16 = |big: bool, body: &[u8]| {
         let units: Vec<u16> = body
             .chunks_exact(2)
-            .map(|pair| if big { u16::from_be_bytes([pair[0], pair[1]]) } else { u16::from_le_bytes([pair[0], pair[1]]) })
+            .map(|pair| {
+                if big {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                }
+            })
             .collect();
         String::from_utf16_lossy(&units)
     };
@@ -8672,7 +8684,8 @@ fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
         let label = &rest[..close];
         // `1_00_shyguy` → variant 1, id `shyguy`.
         let mut parts = label.splitn(3, '_');
-        let (Some(variant), Some(_slot), Some(id)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(variant), Some(_slot), Some(id)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let rank = match variant {
@@ -8685,8 +8698,12 @@ fn xmsbt_character_name(text: &str, fighter: &str) -> Option<String> {
         }
         let body = &rest[close..];
         let entry_end = body.find("</entry>").unwrap_or(body.len());
-        let Some(start) = body[..entry_end].find("<text>") else { continue };
-        let Some(len) = body[start + 6..entry_end].find("</text>") else { continue };
+        let Some(start) = body[..entry_end].find("<text>") else {
+            continue;
+        };
+        let Some(len) = body[start + 6..entry_end].find("</text>") else {
+            continue;
+        };
         let name = body[start + 6..start + 6 + len]
             .replace("&amp;", "&")
             .replace("&lt;", "<")
@@ -10850,7 +10867,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let shyguy = tmp.path().join("shyguy");
         for slot in [40, 41] {
-            std::fs::create_dir_all(shyguy.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+            std::fs::create_dir_all(shyguy.join(format!("fighter/pacman/model/body/c{slot}")))
+                .unwrap();
         }
         std::fs::create_dir_all(shyguy.join("ui/message")).unwrap();
         let xml = "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n<xmsbt>\n  <entry label=\"nam_chr2_00_shyguy\">\n    <text>SHY GUY</text>\n  </entry>\n  <entry label=\"nam_chr1_00_shyguy\">\n    <text>Shy Guy</text>\n  </entry>\n</xmsbt>\n";
@@ -10864,7 +10882,11 @@ mod tests {
         let found = super::slot_characters(&[shyguy.clone(), skins], "pacman");
         assert_eq!(
             found,
-            [super::SlotCharacter { name: "Shy Guy".into(), slots: vec![40, 41], root: shyguy }]
+            [super::SlotCharacter {
+                name: "Shy Guy".into(),
+                slots: vec![40, 41],
+                root: shyguy
+            }]
         );
     }
 
@@ -10872,10 +10894,16 @@ mod tests {
     fn a_rename_of_the_fighter_itself_is_the_last_resort_name() {
         let text = r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>
 <entry label="nam_chr0_00_ghost"><text>Inky &amp; Co</text></entry>"#;
-        assert_eq!(super::xmsbt_character_name(text, "pacman").as_deref(), Some("Inky & Co"));
         assert_eq!(
-            super::xmsbt_character_name(r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>"#, "pacman")
-                .as_deref(),
+            super::xmsbt_character_name(text, "pacman").as_deref(),
+            Some("Inky & Co")
+        );
+        assert_eq!(
+            super::xmsbt_character_name(
+                r#"<entry label="nam_chr1_00_pacman"><text>Pac</text></entry>"#,
+                "pacman"
+            )
+            .as_deref(),
             Some("Pac")
         );
     }
@@ -10889,9 +10917,8 @@ mod tests {
         assert_eq!(super::xmsbt_character_name(text, "pacman"), None);
 
         // If the same file also has a custom character entry, that custom character wins.
-        let with_custom = format!(
-            "{text}\n<entry label=\"nam_chr1_00_shyguy\"><text>Shy Guy</text></entry>"
-        );
+        let with_custom =
+            format!("{text}\n<entry label=\"nam_chr1_00_shyguy\"><text>Shy Guy</text></entry>");
         assert_eq!(
             super::xmsbt_character_name(&with_custom, "pacman").as_deref(),
             Some("Shy Guy")
@@ -10903,7 +10930,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lower = tmp.path().join("lower_mod");
         for slot in 40..=44 {
-            std::fs::create_dir_all(lower.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+            std::fs::create_dir_all(lower.join(format!("fighter/pacman/model/body/c{slot}")))
+                .unwrap();
         }
         std::fs::create_dir_all(lower.join("ui/message")).unwrap();
         std::fs::write(
@@ -10914,7 +10942,10 @@ mod tests {
 
         let project_romfs = tmp.path().join("project_romfs");
         for slot in 40..=48 {
-            std::fs::create_dir_all(project_romfs.join(format!("fighter/pacman/model/body/c{slot}"))).unwrap();
+            std::fs::create_dir_all(
+                project_romfs.join(format!("fighter/pacman/model/body/c{slot}")),
+            )
+            .unwrap();
         }
         std::fs::create_dir_all(project_romfs.join("ui/message")).unwrap();
         std::fs::write(

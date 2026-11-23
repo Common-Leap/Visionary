@@ -15,7 +15,9 @@ use crate::data::{AcmdStmt, EffectMacro, EffectStmt, ExcuteStmt};
 fn raw_key(line: &str) -> String {
     let line = line.trim();
     let end = line
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '!' || c == '.'))
+        .find(|c: char| {
+            !(c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '!' || c == '.')
+        })
         .unwrap_or(line.len());
     let key = &line[..end];
     if key.is_empty() {
@@ -128,7 +130,10 @@ fn moveset_survey() {
                 } else if script.starts_with("sound_") {
                     walk_acmd(&crate::acmd::parse_sound_script(&body).stmts, &mut raws);
                 } else if script.starts_with("expression_") {
-                    walk_acmd(&crate::acmd::parse_expression_script(&body).stmts, &mut raws);
+                    walk_acmd(
+                        &crate::acmd::parse_expression_script(&body).stmts,
+                        &mut raws,
+                    );
                 }
                 typed += 1;
                 raw_total += raws.len();

@@ -4956,7 +4956,8 @@ impl EffEditor {
                 Some(dir) => format!("Vanilla game files: {}", dir.display()),
                 None => "Vanilla game files: not set".to_string(),
             };
-            ui.label(egui::RichText::new(vanilla_label).small()).on_hover_text(
+            ui.label(egui::RichText::new(vanilla_label).small())
+                .on_hover_text(
                 "The unmodded ArcExplorer export. Live edits ride a carrier built on a vanilla \
                  assist effect file, which a mod's romfs does not contain, so this stays set even \
                  when the folder above points at your mod.",

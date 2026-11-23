@@ -1611,10 +1611,7 @@ mod tests {
         let mut portable = make_portable_project(&project, temp.path(), "assets").unwrap();
         assert_eq!(portable.moveset_source.as_deref(), Some("moveset"));
         resolve_project_assets(&mut portable, &temp.path().join("modproject.json")).unwrap();
-        assert_eq!(
-            PathBuf::from(portable.moveset_source.unwrap()),
-            abs
-        );
+        assert_eq!(PathBuf::from(portable.moveset_source.unwrap()), abs);
     }
 
     #[test]

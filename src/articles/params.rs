@@ -33,7 +33,8 @@ pub struct ParamBlock {
 }
 
 fn is_xml(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("prcxml"))
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("prcxml"))
 }
 
 /// The hash of a label, or of a `0x…` hex name as written for unlabelled hashes.
@@ -45,7 +46,10 @@ fn hash_of(name: &str) -> u64 {
 }
 
 fn name_of(hash: u64, labels: &HashMap<u64, String>) -> String {
-    labels.get(&hash).cloned().unwrap_or_else(|| format!("{hash:#x}"))
+    labels
+        .get(&hash)
+        .cloned()
+        .unwrap_or_else(|| format!("{hash:#x}"))
 }
 
 /// One layer's view of a block.
@@ -165,7 +169,11 @@ fn read_prc_block(
     labels: &HashMap<u64, String>,
 ) -> std::result::Result<Option<LayerBlock>, String> {
     let root = prc::open(path).map_err(|e| e.to_string())?;
-    let Some(block) = root.0.iter().find_map(|(key, value)| (key.0 == target).then_some(value)) else {
+    let Some(block) = root
+        .0
+        .iter()
+        .find_map(|(key, value)| (key.0 == target).then_some(value))
+    else {
         return Ok(None);
     };
     let (is_list, structs): (bool, Vec<Option<&prc::ParamStruct>>) = match block {
@@ -182,11 +190,18 @@ fn read_prc_block(
         ),
         _ => return Ok(None),
     };
-    let mut out = LayerBlock { is_list, variants: Vec::new(), skipped: Vec::new() };
+    let mut out = LayerBlock {
+        is_list,
+        variants: Vec::new(),
+        skipped: Vec::new(),
+    };
     for (index, inner) in structs.into_iter().enumerate() {
         let mut fields = Vec::new();
         match inner {
-            None => out.skipped.push((format!("variant {index}"), "this list entry is not a struct".into())),
+            None => out.skipped.push((
+                format!("variant {index}"),
+                "this list entry is not a struct".into(),
+            )),
             Some(inner) => {
                 for (key, value) in &inner.0 {
                     let field = name_of(key.0, labels);
@@ -199,7 +214,8 @@ fn read_prc_block(
                         prc::ParamKind::List(l) => nested_reason(l.0.len()),
                         _ => "a value type Visionary doesn't edit".to_string(),
                     };
-                    out.skipped.push((skip_path(is_list, index, &field), reason));
+                    out.skipped
+                        .push((skip_path(is_list, index, &field), reason));
                 }
             }
         }
@@ -226,7 +242,9 @@ fn scan_tags(src: &str) -> Vec<Tag> {
     while let Some(off) = src[i..].find('<') {
         let start = i + off;
         if src[start..].starts_with("<!--") {
-            i = src[start..].find("-->").map_or(src.len(), |e| start + e + 3);
+            i = src[start..]
+                .find("-->")
+                .map_or(src.len(), |e| start + e + 3);
             continue;
         }
         // The end of the tag is the first `>` outside quotes.
@@ -254,7 +272,9 @@ fn scan_tags(src: &str) -> Vec<Tag> {
             Some(rest) => (false, rest),
             None => (true, inner),
         };
-        let name_len = body.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(body.len());
+        let name_len = body
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(body.len());
         tags.push(Tag {
             name: body[..name_len].to_string(),
             hash: hash_attr(&body[name_len..]),
@@ -271,7 +291,11 @@ fn hash_attr(text: &str) -> Option<String> {
     let mut rest = text;
     while let Some(pos) = rest.find("hash") {
         let after = &rest[pos + 4..];
-        if rest[..pos].chars().next_back().is_none_or(char::is_whitespace) {
+        if rest[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        {
             if let Some(value) = after.trim_start().strip_prefix('=') {
                 let value = value.trim_start();
                 let quote = value.chars().next().filter(|c| *c == '"' || *c == '\'')?;
@@ -330,7 +354,10 @@ fn xml_variant(src: &str, tags: &[Tag], n: usize) -> (Vec<Leaf>, Vec<(String, us
     let (mut leaves, mut nested) = (Vec::new(), Vec::new());
     for child in children(tags, n).0 {
         let tag = &tags[child];
-        let leaf = !tag.self_closing && tags.get(child + 1).is_some_and(|c| !c.open && c.name == tag.name);
+        let leaf = !tag.self_closing
+            && tags
+                .get(child + 1)
+                .is_some_and(|c| !c.open && c.name == tag.name);
         let label = tag.hash.clone().unwrap_or_else(|| tag.name.clone());
         if leaf {
             if let Some(h) = &tag.hash {
@@ -376,7 +403,11 @@ fn xml_block(src: &str, target: u64) -> Option<XmlBlock> {
             bad_entries: Vec::new(),
         });
     }
-    let mut block = XmlBlock { is_list: true, variants: Vec::new(), bad_entries: Vec::new() };
+    let mut block = XmlBlock {
+        is_list: true,
+        variants: Vec::new(),
+        bad_entries: Vec::new(),
+    };
     for (index, child) in children(&tags, idx).0.into_iter().enumerate() {
         if tags[child].name == "struct" {
             block.variants.push(xml_variant(src, &tags, child));
@@ -390,14 +421,26 @@ fn xml_block(src: &str, target: u64) -> Option<XmlBlock> {
 
 fn read_xml_block(path: &Path, target: u64) -> std::result::Result<Option<LayerBlock>, String> {
     let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let Some(block) = xml_block(&src, target) else { return Ok(None) };
-    let mut out = LayerBlock { is_list: block.is_list, variants: Vec::new(), skipped: Vec::new() };
+    let Some(block) = xml_block(&src, target) else {
+        return Ok(None);
+    };
+    let mut out = LayerBlock {
+        is_list: block.is_list,
+        variants: Vec::new(),
+        skipped: Vec::new(),
+    };
     for (index, (leaves, nested)) in block.variants.into_iter().enumerate() {
         if block.bad_entries.contains(&index) {
-            out.skipped.push((format!("variant {index}"), "this list entry is not a struct".into()));
+            out.skipped.push((
+                format!("variant {index}"),
+                "this list entry is not a struct".into(),
+            ));
         }
         for (field, count) in nested {
-            out.skipped.push((skip_path(block.is_list, index, &field), nested_reason(count)));
+            out.skipped.push((
+                skip_path(block.is_list, index, &field),
+                nested_reason(count),
+            ));
         }
         out.variants.push(
             leaves
@@ -405,7 +448,10 @@ fn read_xml_block(path: &Path, target: u64) -> std::result::Result<Option<LayerB
                 .map(|(field, element, range)| {
                     let text = unescape(&src[range]);
                     let value = match element.as_str() {
-                        "float" => text.parse().map(ParamValue::Float).unwrap_or(ParamValue::Other(text)),
+                        "float" => text
+                            .parse()
+                            .map(ParamValue::Float)
+                            .unwrap_or(ParamValue::Other(text)),
                         "sbyte" | "byte" | "short" | "ushort" | "int" | "uint" => text
                             .parse::<i64>()
                             .map(|v| ParamValue::Int(v as i32))
@@ -435,8 +481,10 @@ pub fn write_param_field(
 ) -> Result<()> {
     let (block_h, field_h) = (hash_of(block), hash_of(field));
     if is_xml(file) {
-        let src = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let found = xml_block(&src, block_h).ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
+        let src =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let found = xml_block(&src, block_h)
+            .ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
         let (leaves, _) = found
             .variants
             .into_iter()
@@ -464,7 +512,9 @@ pub fn write_param_field(
         .ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
     let inner = match value_of_block {
         prc::ParamKind::Struct(s) if variant == 0 => s,
-        prc::ParamKind::Struct(_) => bail!("{block} is a plain struct and has no variant {variant}"),
+        prc::ParamKind::Struct(_) => {
+            bail!("{block} is a plain struct and has no variant {variant}")
+        }
         prc::ParamKind::List(list) => match list.0.get_mut(variant) {
             Some(prc::ParamKind::Struct(s)) => s,
             Some(_) => bail!("{block} variant {variant} is not a struct"),
@@ -505,7 +555,8 @@ pub fn layer_has_field(file: &Path, block: &str, field: &str, variant: usize) ->
     } else {
         read_prc_block(file, hash_of(block), &HashMap::new())
     };
-    let found = read.map_err(|error| anyhow!("Visionary could not read {}: {error}", file.display()))?;
+    let found =
+        read.map_err(|error| anyhow!("Visionary could not read {}: {error}", file.display()))?;
     let field = hash_of(field);
     Ok(found
         .and_then(|found| found.variants.into_iter().nth(variant))
@@ -527,7 +578,11 @@ fn float_text(field: &str, value: f64) -> Result<String> {
 fn whole_number(field: &str, kind: &str, value: f64) -> Result<i64> {
     let (min, max, words) = match kind {
         "sbyte" => (i8::MIN as i64, i8::MAX as i64, "a small whole number"),
-        "byte" => (0, u8::MAX as i64, "a small whole number that can't be negative"),
+        "byte" => (
+            0,
+            u8::MAX as i64,
+            "a small whole number that can't be negative",
+        ),
         "short" => (i16::MIN as i64, i16::MAX as i64, "a whole number"),
         "ushort" => (0, u16::MAX as i64, "a whole number that can't be negative"),
         "int" => (i32::MIN as i64, i32::MAX as i64, "a whole number"),
@@ -597,9 +652,19 @@ fn is_zero_hash(text: &str) -> bool {
 
 fn number_arg(expr: &syn::Expr) -> Option<f64> {
     match expr {
-        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(i), .. }) => i.base10_parse::<i64>().ok().map(|v| v as f64),
-        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Float(f), .. }) => f.base10_parse::<f64>().ok(),
-        syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => number_arg(expr).map(|v| -v),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(i),
+            ..
+        }) => i.base10_parse::<i64>().ok().map(|v| v as f64),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Float(f),
+            ..
+        }) => f.base10_parse::<f64>().ok(),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => number_arg(expr).map(|v| -v),
         syn::Expr::Paren(p) => number_arg(&p.expr),
         syn::Expr::Cast(c) => number_arg(&c.expr),
         _ => None,
@@ -612,7 +677,10 @@ fn number_arg(expr: &syn::Expr) -> Option<f64> {
 pub fn kind_owner(kind: &str, fighter_dirs: &[String]) -> Result<String, String> {
     let compact: String = kind.chars().filter(|c| !c.is_whitespace()).collect();
     let negated = compact.starts_with('-');
-    let mut name: String = compact.chars().filter(|c| !matches!(c, '-' | '*' | '&' | '(' | ')')).collect();
+    let mut name: String = compact
+        .chars()
+        .filter(|c| !matches!(c, '-' | '*' | '&' | '(' | ')'))
+        .collect();
     for suffix in ["asi32", "asu32", "asi64"] {
         if let Some(rest) = name.strip_suffix(suffix) {
             name = rest.to_string();
@@ -621,13 +689,17 @@ pub fn kind_owner(kind: &str, fighter_dirs: &[String]) -> Result<String, String>
     let name = name.rsplit("::").next().unwrap_or(&name).to_string();
     if let Some(fighter) = name.strip_prefix("FIGHTER_KIND_") {
         if negated {
-            return Err(format!("`{kind}` negates a fighter kind, which names no weapon"));
+            return Err(format!(
+                "`{kind}` negates a fighter kind, which names no weapon"
+            ));
         }
         return Ok(fighter.to_lowercase());
     }
     if let Some(rest) = name.strip_prefix("WEAPON_KIND_") {
         if !negated {
-            return Err(format!("`{kind}` is a weapon kind without the `-` lib_paramconfig expects"));
+            return Err(format!(
+                "`{kind}` is a weapon kind without the `-` lib_paramconfig expects"
+            ));
         }
         return fighter_dirs
             .iter()
@@ -636,7 +708,9 @@ pub fn kind_owner(kind: &str, fighter_dirs: &[String]) -> Result<String, String>
             .cloned()
             .ok_or_else(|| format!("no fighter folder names the owner of `{name}`"));
     }
-    Err(format!("the kind `{kind}` isn't a fighter or weapon kind Visionary can name"))
+    Err(format!(
+        "the kind `{kind}` isn't a fighter or weapon kind Visionary can name"
+    ))
 }
 
 struct OverrideReader<'a> {
@@ -650,9 +724,17 @@ struct OverrideReader<'a> {
 
 impl OverrideReader<'_> {
     fn offset(&self, at: proc_macro2::LineColumn) -> usize {
-        let start = self.line_starts.get(at.line.saturating_sub(1)).copied().unwrap_or(self.text.len());
+        let start = self
+            .line_starts
+            .get(at.line.saturating_sub(1))
+            .copied()
+            .unwrap_or(self.text.len());
         let line = &self.text[start..];
-        start + line.char_indices().nth(at.column).map_or(line.len(), |(i, _)| i)
+        start
+            + line
+                .char_indices()
+                .nth(at.column)
+                .map_or(line.len(), |(i, _)| i)
     }
 
     fn source(&self, node: &impl syn::spanned::Spanned) -> String {
@@ -687,19 +769,30 @@ impl OverrideReader<'_> {
         if !path.path.segments.iter().any(|s| s.ident == "param_config") {
             return;
         }
-        let name = path.path.segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        let name = path
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
         if !name.starts_with("update_") {
             return;
         }
         if name.contains("_mul") {
-            self.skip(call, "it multiplies the value instead of setting it, which the card doesn't show");
+            self.skip(
+                call,
+                "it multiplies the value instead of setting it, which the card doesn't show",
+            );
             return;
         }
         let paired = match name.as_str() {
             "update_int_2" | "update_float_2" => false,
             "update_int" | "update_float" => true,
             _ => {
-                self.skip(call, format!("`param_config::{name}` is not a call Visionary reads"));
+                self.skip(
+                    call,
+                    format!("`param_config::{name}` is not a call Visionary reads"),
+                );
                 return;
             }
         };
@@ -719,7 +812,11 @@ impl OverrideReader<'_> {
                 return;
             }
         };
-        let kind_text: String = self.source(kind).chars().filter(|c| !c.is_whitespace()).collect();
+        let kind_text: String = self
+            .source(kind)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let owner = match kind_owner(&kind_text, self.fighter_dirs) {
             Ok(owner) => owner,
             Err(reason) => {
@@ -768,7 +865,8 @@ pub fn param_config_overrides(
                 file: file.clone(),
                 line: 1,
                 text: String::new(),
-                reason: "the file doesn't parse as Rust, so its param_config calls weren't read".into(),
+                reason: "the file doesn't parse as Rust, so its param_config calls weren't read"
+                    .into(),
             });
             continue;
         };
@@ -791,7 +889,11 @@ pub fn param_config_overrides(
 }
 
 /// The overrides for `fighter`'s `param_<name>` block, as [`param_block`] takes them.
-pub fn block_overrides(overrides: &[ParamOverride], fighter: &str, block: &str) -> Vec<(String, String, f64)> {
+pub fn block_overrides(
+    overrides: &[ParamOverride],
+    fighter: &str,
+    block: &str,
+) -> Vec<(String, String, f64)> {
     overrides
         .iter()
         .filter(|o| o.is_for_fighter(fighter) && o.block == block)
@@ -815,7 +917,10 @@ mod tests {
     }
 
     fn labels() -> HashMap<u64, String> {
-        ["speed", "life"].iter().map(|n| (hash40::hash40(n).0, n.to_string())).collect()
+        ["speed", "life"]
+            .iter()
+            .map(|n| (hash40::hash40(n).0, n.to_string()))
+            .collect()
     }
 
     fn speed_variant(speed: f32) -> prc::ParamKind {
@@ -828,7 +933,9 @@ mod tests {
     fn list_root(speeds: &[f32]) -> prc::ParamStruct {
         prc::ParamStruct(vec![(
             hash40::hash40("param_x"),
-            prc::ParamKind::List(prc::ParamList(speeds.iter().map(|s| speed_variant(*s)).collect())),
+            prc::ParamKind::List(prc::ParamList(
+                speeds.iter().map(|s| speed_variant(*s)).collect(),
+            )),
         )])
     }
 
@@ -912,7 +1019,10 @@ mod tests {
         let before = "<struct>\n<list size=\"3\" hash=\"param_x\">\n<struct index=\"0\"><float hash=\"speed\">2.8</float></struct>\n<struct index=\"1\"><float hash=\"speed\">0.5</float></struct>\n<struct index=\"2\"><float hash=\"speed\">7</float></struct>\n</list>\n</struct>";
         std::fs::write(&xml, before).unwrap();
         write_param_field(&xml, "param_x", "speed", 2, 1.25, &labels()).unwrap();
-        assert_eq!(std::fs::read_to_string(&xml).unwrap(), before.replace(">7<", ">1.25<"));
+        assert_eq!(
+            std::fs::read_to_string(&xml).unwrap(),
+            before.replace(">7<", ">1.25<")
+        );
         assert!(write_param_field(&xml, "param_x", "speed", 3, 1.0, &labels()).is_err());
     }
 
@@ -930,7 +1040,14 @@ mod tests {
             ),
         ]);
         let file = dir.path().join("vl.prc");
-        prc::save(&file, &prc::ParamStruct(vec![(hash40::hash40("param_x"), prc::ParamKind::Struct(inner))])).unwrap();
+        prc::save(
+            &file,
+            &prc::ParamStruct(vec![(
+                hash40::hash40("param_x"),
+                prc::ParamKind::Struct(inner),
+            )]),
+        )
+        .unwrap();
         let xml = dir.path().join("vl.prcxml");
         std::fs::write(&xml, "<struct><struct hash=\"param_y\"><float hash=\"speed\">1</float><struct hash=\"group\"><float hash=\"a\">1</float></struct></struct></struct>").unwrap();
 
@@ -940,10 +1057,19 @@ mod tests {
         assert_eq!(block.fields.len(), 1);
         assert_eq!(
             block.skipped,
-            vec![("group".to_string(), "a nested group of 2 values Visionary doesn't edit".to_string())]
+            vec![(
+                "group".to_string(),
+                "a nested group of 2 values Visionary doesn't edit".to_string()
+            )]
         );
         let block = param_block(&[xml], &[], "y", &names);
-        assert_eq!(block.skipped[0], ("group".to_string(), "a nested group of 1 values Visionary doesn't edit".to_string()));
+        assert_eq!(
+            block.skipped[0],
+            (
+                "group".to_string(),
+                "a nested group of 1 values Visionary doesn't edit".to_string()
+            )
+        );
     }
 
     #[test]
@@ -959,7 +1085,9 @@ mod tests {
         assert_eq!(block.fields["speed"].0, ParamValue::Float(2.0));
         assert_eq!(block.skipped.len(), 2);
         assert_eq!(block.skipped[0].0, corrupt.display().to_string());
-        assert!(block.skipped[0].1.starts_with("Visionary could not read this param file: "));
+        assert!(block.skipped[0]
+            .1
+            .starts_with("Visionary could not read this param file: "));
     }
 
     #[test]
@@ -1014,7 +1142,10 @@ mod tests {
         let (first, second) = (dir.path().join("a.prc"), dir.path().join("b.prc"));
         prc::save(&first, &mixed_root(1.0)).unwrap();
         prc::save(&second, &prc::open(&first).unwrap()).unwrap();
-        assert_eq!(std::fs::read(&first).unwrap(), std::fs::read(&second).unwrap());
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
     }
 
     #[test]
@@ -1029,7 +1160,10 @@ mod tests {
 
         write_param_field(&file, "param_lativolt", "speed", 0, 2.5, &labels()).unwrap();
         let after = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(after, before.replace("<float hash=\"speed\">1.6<", "<float hash=\"speed\">2.5<"));
+        assert_eq!(
+            after,
+            before.replace("<float hash=\"speed\">1.6<", "<float hash=\"speed\">2.5<")
+        );
         assert!(!dir.path().join("vl.prc").exists());
     }
 
@@ -1039,9 +1173,15 @@ mod tests {
         let file = dir.path().join("vl.prcxml");
         let before = "<struct><struct hash=\"param_x\"><float hash=\"speed\"> \r\n 1.6\t </float></struct></struct>";
         std::fs::write(&file, before).unwrap();
-        assert_eq!(param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0, ParamValue::Float(1.6));
+        assert_eq!(
+            param_block(&[file.clone()], &[], "x", &labels()).fields["speed"].0,
+            ParamValue::Float(1.6)
+        );
         write_param_field(&file, "param_x", "speed", 0, 2.5, &labels()).unwrap();
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), before.replace("1.6", "2.5"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before.replace("1.6", "2.5")
+        );
     }
 
     /// R8: an integer param refuses a value its type cannot hold instead of clamping it
@@ -1052,22 +1192,34 @@ mod tests {
         let file = dir.path().join("vl.prc");
         prc::save(&file, &mixed_root(1.0)).unwrap();
         for value in [300.0, -1.0, f64::NAN] {
-            let error = write_param_field(&file, "param_x", "tiny", 0, value, &labels()).unwrap_err();
+            let error =
+                write_param_field(&file, "param_x", "tiny", 0, value, &labels()).unwrap_err();
             assert!(error.to_string().contains("can't be set to"), "{error}");
         }
-        assert_eq!(prc::open(&file).unwrap(), mixed_root(1.0), "a refused write changes nothing");
+        assert_eq!(
+            prc::open(&file).unwrap(),
+            mixed_root(1.0),
+            "a refused write changes nothing"
+        );
         write_param_field(&file, "param_x", "tiny", 0, 255.0, &labels()).unwrap();
         let error = write_param_field(&file, "param_x", "life", 0, 3e9, &labels()).unwrap_err();
-        assert!(error.to_string().contains("from -2147483648 to 2147483647"), "{error}");
+        assert!(
+            error.to_string().contains("from -2147483648 to 2147483647"),
+            "{error}"
+        );
 
         let xml = dir.path().join("vl.prcxml");
-        let before = "<struct><struct hash=\"param_x\"><byte hash=\"tiny\">7</byte></struct></struct>";
+        let before =
+            "<struct><struct hash=\"param_x\"><byte hash=\"tiny\">7</byte></struct></struct>";
         std::fs::write(&xml, before).unwrap();
         let error = write_param_field(&xml, "param_x", "tiny", 0, 300.0, &labels()).unwrap_err();
         assert!(error.to_string().contains("can't be set to 300"), "{error}");
         assert_eq!(std::fs::read_to_string(&xml).unwrap(), before);
         write_param_field(&xml, "param_x", "tiny", 0, 200.0, &labels()).unwrap();
-        assert_eq!(std::fs::read_to_string(&xml).unwrap(), before.replace(">7<", ">200<"));
+        assert_eq!(
+            std::fs::read_to_string(&xml).unwrap(),
+            before.replace(">7<", ">200<")
+        );
     }
 
     /// Whether prc-rs's open+save reproduces a real, game/mod-written `vl.prc` byte for byte.
@@ -1079,7 +1231,10 @@ mod tests {
         let (copy, saved) = (dir.path().join("vl.prc"), dir.path().join("saved.prc"));
         std::fs::copy(&real, &copy).unwrap();
         prc::save(&saved, &prc::open(&copy).unwrap()).unwrap();
-        let (before, after) = (std::fs::read(&copy).unwrap(), std::fs::read(&saved).unwrap());
+        let (before, after) = (
+            std::fs::read(&copy).unwrap(),
+            std::fs::read(&saved).unwrap(),
+        );
         assert_eq!(before.len(), after.len(), "saved file length differs");
         assert!(before == after, "saved bytes differ from the original");
     }
@@ -1099,16 +1254,28 @@ mod tests {
         let dirs: Vec<String> = ["samus", "murabito", "pacman"].map(String::from).to_vec();
         // Latios's shape: fighter kind, 3-tuple.
         let latios = "fn f(marked_slots: Vec<i32>) {\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(),(smash::hash40(\"air_lasso_type\"), 0, 0));\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));\n    param_config::update_float_2(*FIGHTER_KIND_SAMUS, marked_slots.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"speed\"), -1.5));\n}\n";
-        let (found, unread) = param_config_overrides(&[(PathBuf::from("lib.rs"), latios.to_string())], &dirs);
+        let (found, unread) =
+            param_config_overrides(&[(PathBuf::from("lib.rs"), latios.to_string())], &dirs);
         assert!(unread.is_empty(), "{unread:#?}");
         assert_eq!(found.len(), 3, "{found:#?}");
         assert_eq!(found[0].field, None);
-        assert_eq!((found[1].block.as_str(), found[1].field.as_deref(), found[1].value, found[1].line), ("param_cshot", Some("life"), 60.0, 3));
+        assert_eq!(
+            (
+                found[1].block.as_str(),
+                found[1].field.as_deref(),
+                found[1].value,
+                found[1].line
+            ),
+            ("param_cshot", Some("life"), 60.0, 3)
+        );
         assert_eq!(found[2].value, -1.5);
         assert!(found.iter().all(|o| o.is_for_fighter("samus")));
         assert_eq!(
             block_overrides(&found, "samus", "param_cshot"),
-            [("param_cshot".to_string(), "life".to_string(), 60.0), ("param_cshot".to_string(), "speed".to_string(), -1.5)]
+            [
+                ("param_cshot".to_string(), "life".to_string(), 60.0),
+                ("param_cshot".to_string(), "speed".to_string(), -1.5)
+            ]
         );
     }
 
@@ -1118,14 +1285,21 @@ mod tests {
     fn negated_weapon_kind_goes_to_its_owner() {
         let dirs: Vec<String> = ["murabito", "mario"].map(String::from).to_vec();
         let toad = "pub(crate) fn configure_params(slots: Vec<i32>) {\n    param_config::update_float_2(*FIGHTER_KIND_MURABITO, slots.clone(), (smash::hash40(\"weight\"), 0, 92.0));\n    param_config::update_int_2(-*WEAPON_KIND_MURABITO_BULLET, slots.clone(), (smash::hash40(\"param_bullet\"), smash::hash40(\"life\"), 21));\n    param_config::update_float_2(-*WEAPON_KIND_MURABITO_BULLET, slots.clone(), (smash::hash40(\"param_bullet\"), smash::hash40(\"gravity\"), -0.1));\n    param_config::update_int_2(-*WEAPON_KIND_MURABITO_BOWLING_BALL, slots.clone(), (smash::hash40(\"param_bowlingball\"), smash::hash40(\"is_penetration\"), 0));\n}\n";
-        let (found, unread) = param_config_overrides(&[(PathBuf::from("params.rs"), toad.to_string())], &dirs);
+        let (found, unread) =
+            param_config_overrides(&[(PathBuf::from("params.rs"), toad.to_string())], &dirs);
         assert!(unread.is_empty(), "{unread:#?}");
         assert!(found.iter().all(|o| o.owner == "murabito"), "{found:#?}");
         assert_eq!(
             block_overrides(&found, "murabito", "param_bullet"),
-            [("param_bullet".to_string(), "life".to_string(), 21.0), ("param_bullet".to_string(), "gravity".to_string(), -0.1)]
+            [
+                ("param_bullet".to_string(), "life".to_string(), 21.0),
+                ("param_bullet".to_string(), "gravity".to_string(), -0.1)
+            ]
         );
-        assert_eq!(kind_owner("-(*WEAPON_KIND_MURABITO_BULLET)", &dirs).unwrap(), "murabito");
+        assert_eq!(
+            kind_owner("-(*WEAPON_KIND_MURABITO_BULLET)", &dirs).unwrap(),
+            "murabito"
+        );
         assert!(kind_owner("*WEAPON_KIND_MURABITO_BULLET", &dirs).is_err());
     }
 
@@ -1135,14 +1309,37 @@ mod tests {
     fn four_argument_form_and_unattributed_calls() {
         let dirs: Vec<String> = ["pacman"].map(String::from).to_vec();
         let text = "fn apply(kind: i32, slots: Vec<i32>, index: (u64, u64)) {\n    param_config::update_int(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"air_lasso_type\"), 0), 1);\n    param_config::update_float(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"air_lasso_data\"), hash40(\"lasso_speed\")), 2.5);\n    param_config::update_int(kind, slots.clone(), (hash40(\"air_lasso_type\"), 0), 1);\n    param_config::update_float(*FIGHTER_KIND_PACMAN, slots.clone(), index, 1.0);\n    param_config::update_int_mul_2(*FIGHTER_KIND_PACMAN, slots.clone(), (hash40(\"jump_y\"), 0, 1.5));\n}\n";
-        let (found, unread) = param_config_overrides(&[(PathBuf::from("tether.rs"), text.to_string())], &dirs);
+        let (found, unread) =
+            param_config_overrides(&[(PathBuf::from("tether.rs"), text.to_string())], &dirs);
         assert_eq!(found.len(), 2, "{found:#?}");
-        assert_eq!((found[0].block.as_str(), found[0].field.as_deref(), found[0].value), ("air_lasso_type", None, 1.0));
-        assert_eq!((found[1].block.as_str(), found[1].field.as_deref(), found[1].value), ("air_lasso_data", Some("lasso_speed"), 2.5));
+        assert_eq!(
+            (
+                found[0].block.as_str(),
+                found[0].field.as_deref(),
+                found[0].value
+            ),
+            ("air_lasso_type", None, 1.0)
+        );
+        assert_eq!(
+            (
+                found[1].block.as_str(),
+                found[1].field.as_deref(),
+                found[1].value
+            ),
+            ("air_lasso_data", Some("lasso_speed"), 2.5)
+        );
         let lines: Vec<usize> = unread.iter().map(|u| u.line).collect();
         assert_eq!(lines, [4, 5, 6], "{unread:#?}");
         assert!(unread[0].reason.contains("`kind`"), "{}", unread[0].reason);
-        assert!(unread[1].reason.contains("variable"), "{}", unread[1].reason);
-        assert!(unread[2].reason.contains("multiplies"), "{}", unread[2].reason);
+        assert!(
+            unread[1].reason.contains("variable"),
+            "{}",
+            unread[1].reason
+        );
+        assert!(
+            unread[2].reason.contains("multiplies"),
+            "{}",
+            unread[2].reason
+        );
     }
 }

@@ -72,9 +72,15 @@ impl SettingField {
 pub enum SettingValue {
     Literal(f64),
     /// A const by name; `value` is its number when the project defines it.
-    Const { name: String, value: Option<f64> },
+    Const {
+        name: String,
+        value: Option<f64>,
+    },
     /// `WorkModule::get_param_*(acc, hash40(block), hash40(field))`, directly or through a `let`.
-    Param { block: String, field: String },
+    Param {
+        block: String,
+        field: String,
+    },
     /// Anything else, as written. When it reads params through `let`s, the text ends with
     /// `(reads block.field, ...)` so the origin is always shown.
     Computed(String),
@@ -119,7 +125,10 @@ pub fn read_settings(
             .clone()
     };
     for (site, body) in statuses {
-        let status = Status { kind: &site.kind_expr, phase: &site.phase };
+        let status = Status {
+            kind: &site.kind_expr,
+            phase: &site.phase,
+        };
         let file_consts = local_consts_for(&site.file);
         let called = scan(
             body,
@@ -191,10 +200,19 @@ fn scan(
     let lines = LineIndex::new(text);
     let mut called = Vec::new();
     for function in &functions {
-        let mut lets = LetCollector { lines: &lines, lets: Vec::new() };
+        let mut lets = LetCollector {
+            lines: &lines,
+            lets: Vec::new(),
+        };
         syn::visit::Visit::visit_item_fn(&mut lets, function);
         let mut scanner = Scanner {
-            ctx: Ctx { text, lines: &lines, lets: &lets.lets, consts, file_consts },
+            ctx: Ctx {
+                text,
+                lines: &lines,
+                lets: &lets.lets,
+                consts,
+                file_consts,
+            },
             file,
             base,
             status,
@@ -288,7 +306,8 @@ impl<'ast> syn::visit::Visit<'ast> for LetCollector<'_> {
         }
         if let (syn::Pat::Ident(ident), Some(init)) = (pat, &local.init) {
             let at = self.lines.offset(syn::spanned::Spanned::span(local).end());
-            self.lets.push((ident.ident.to_string(), at, (*init.expr).clone()));
+            self.lets
+                .push((ident.ident.to_string(), at, (*init.expr).clone()));
         }
         syn::visit::visit_local(self, local);
     }
@@ -334,12 +353,15 @@ impl Ctx<'_> {
     /// A local name used as `expr`, with the expression it is bound to.
     fn local(&self, expr: &syn::Expr) -> Option<&syn::Expr> {
         let name = single_ident(expr)?;
-        self.binding(&name, self.range(expr).start).map(|(_, init)| init)
+        self.binding(&name, self.range(expr).start)
+            .map(|(_, init)| init)
     }
 
     fn is_facing(&self, expr: &syn::Expr) -> bool {
         let expr = strip(expr);
-        if single_ident(expr).is_some_and(|name| name == "lr" || name == "facing") || is_lr_call(expr) {
+        if single_ident(expr).is_some_and(|name| name == "lr" || name == "facing")
+            || is_lr_call(expr)
+        {
             return true;
         }
         self.local(expr).is_some_and(|init| is_lr_call(strip(init)))
@@ -374,7 +396,12 @@ impl Ctx<'_> {
         } else {
             SettingValue::Computed(computed_text(self.source(expr), &referenced_params))
         };
-        Classified { value, span, facing_factor, referenced_params }
+        Classified {
+            value,
+            span,
+            facing_factor,
+            referenced_params,
+        }
     }
 
     /// True when `expr` reads the current vertical velocity (`KineticModule::get_sum_speed_y`,
@@ -383,7 +410,12 @@ impl Ctx<'_> {
         let expr = strip(expr);
         if let syn::Expr::Call(call) = expr {
             if let Some(path) = call_path(call) {
-                match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                match path
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
                     ["KineticModule", "get_sum_speed_y" | "get_speed_y"] => return true,
                     ["WorkModule", "get_float"] if call.args.len() == 2 => {
                         if let Some(name) = const_name(&call.args[1]) {
@@ -438,7 +470,12 @@ impl Ctx<'_> {
     }
 
     /// Every `get_param_*` `expr` reads, following local names to the `let`s that bind them.
-    fn collect_params(&self, expr: &syn::Expr, found: &mut Vec<(String, String)>, followed: &mut Vec<usize>) {
+    fn collect_params(
+        &self,
+        expr: &syn::Expr,
+        found: &mut Vec<(String, String)>,
+        followed: &mut Vec<usize>,
+    ) {
         struct Reads<'c, 'a> {
             ctx: &'c Ctx<'a>,
             found: &'c mut Vec<(String, String)>,
@@ -465,7 +502,14 @@ impl Ctx<'_> {
                 syn::visit::visit_expr(self, expr);
             }
         }
-        syn::visit::Visit::visit_expr(&mut Reads { ctx: self, found, followed }, expr);
+        syn::visit::Visit::visit_expr(
+            &mut Reads {
+                ctx: self,
+                found,
+                followed,
+            },
+            expr,
+        );
     }
 }
 
@@ -489,7 +533,9 @@ fn strip(mut expr: &syn::Expr) -> &syn::Expr {
 }
 
 fn single_ident(expr: &syn::Expr) -> Option<String> {
-    let syn::Expr::Path(path) = expr else { return None };
+    let syn::Expr::Path(path) = expr else {
+        return None;
+    };
     if path.qself.is_some() {
         return None;
     }
@@ -502,7 +548,9 @@ fn segments(path: &syn::Path) -> Vec<String> {
 
 /// The last two path segments of a call's function, `["Module", "fn"]` or `["fn"]`.
 fn call_path(call: &syn::ExprCall) -> Option<Vec<String>> {
-    let syn::Expr::Path(path) = strip(&call.func) else { return None };
+    let syn::Expr::Path(path) = strip(&call.func) else {
+        return None;
+    };
     let mut segments = segments(&path.path);
     let keep = segments.len().saturating_sub(2);
     Some(segments.split_off(keep))
@@ -523,14 +571,18 @@ fn number(expr: &syn::Expr) -> Option<f64> {
             syn::Lit::Int(i) => i.base10_digits().parse().ok(),
             _ => None,
         },
-        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => number(&unary.expr).map(|n| -n),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            number(&unary.expr).map(|n| -n)
+        }
         _ => None,
     }
 }
 
 fn is_const_case(name: &str) -> bool {
     name.chars().any(|c| c.is_ascii_uppercase())
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// `NAME`, `path::NAME`, `*NAME` (a lua const) or any of them cast with `as`.
@@ -540,7 +592,9 @@ fn const_name(expr: &syn::Expr) -> Option<String> {
             let name = path.path.segments.last()?.ident.to_string();
             is_const_case(&name).then_some(name)
         }
-        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => const_name(&unary.expr),
+        syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Deref(_)) => {
+            const_name(&unary.expr)
+        }
         syn::Expr::Cast(cast) => const_name(&cast.expr),
         _ => None,
     }
@@ -548,18 +602,26 @@ fn const_name(expr: &syn::Expr) -> Option<String> {
 
 /// `(block, field)` of `WorkModule::get_param_float|int(acc, hash40("block"), hash40("field"))`.
 fn param_call(expr: &syn::Expr) -> Option<(String, String)> {
-    let syn::Expr::Call(call) = strip(expr) else { return None };
-    let is_param = is_call_to(call, "WorkModule", "get_param_float") || is_call_to(call, "WorkModule", "get_param_int");
+    let syn::Expr::Call(call) = strip(expr) else {
+        return None;
+    };
+    let is_param = is_call_to(call, "WorkModule", "get_param_float")
+        || is_call_to(call, "WorkModule", "get_param_int");
     if !is_param || call.args.len() != 3 {
         return None;
     }
     let hash = |expr: &syn::Expr| -> Option<String> {
-        let syn::Expr::Call(call) = strip(expr) else { return None };
+        let syn::Expr::Call(call) = strip(expr) else {
+            return None;
+        };
         if call_path(call)? != ["hash40"] || call.args.len() != 1 {
             return None;
         }
         match strip(&call.args[0]) {
-            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some(s.value()),
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(s),
+                ..
+            }) => Some(s.value()),
             _ => None,
         }
     };
@@ -573,7 +635,9 @@ fn pushed_value(expr: &syn::Expr) -> &syn::Expr {
         expr = strip(&reference.expr);
     }
     if let syn::Expr::Call(call) = expr {
-        let constructor = call_path(call).and_then(|p| p.last().cloned()).unwrap_or_default();
+        let constructor = call_path(call)
+            .and_then(|p| p.last().cloned())
+            .unwrap_or_default();
         if constructor.starts_with("new_") && call.args.len() == 1 {
             return strip(&call.args[0]);
         }
@@ -634,10 +698,14 @@ impl Scanner<'_, '_> {
     fn other(&mut self, whole: &impl syn::spanned::Spanned, args: &[syn::Expr]) {
         let mut referenced_params = Vec::new();
         for arg in args {
-            self.ctx.collect_params(arg, &mut referenced_params, &mut Vec::new());
+            self.ctx
+                .collect_params(arg, &mut referenced_params, &mut Vec::new());
         }
         let classified = Classified {
-            value: SettingValue::Computed(computed_text(self.ctx.source(whole), &referenced_params)),
+            value: SettingValue::Computed(computed_text(
+                self.ctx.source(whole),
+                &referenced_params,
+            )),
             span: self.ctx.range(whole),
             facing_factor: false,
             referenced_params,
@@ -662,7 +730,9 @@ impl Scanner<'_, '_> {
             let expr = strip(&after_reserve[index]);
             match expr {
                 // A negated y acceleration pulls the article down: gravity, by its magnitude.
-                syn::Expr::Unary(unary) if field == SettingField::AccelY && matches!(unary.op, syn::UnOp::Neg(_)) => {
+                syn::Expr::Unary(unary)
+                    if field == SettingField::AccelY && matches!(unary.op, syn::UnOp::Neg(_)) =>
+                {
                     self.value(SettingField::Gravity, &unary.expr)
                 }
                 // A per-frame status loop integrating gravity manually:
@@ -690,13 +760,25 @@ impl<'ast> syn::visit::Visit<'ast> for Scanner<'_, '_> {
             let args: Vec<&syn::Expr> = call.args.iter().collect();
             let is_life = |expr: &syn::Expr| {
                 const_name(expr).is_some_and(|name| {
-                    name == "WEAPON_INSTANCE_WORK_ID_INT_LIFE" || name == "WEAPON_INSTANCE_WORK_ID_INT_INIT_LIFE"
+                    name == "WEAPON_INSTANCE_WORK_ID_INT_LIFE"
+                        || name == "WEAPON_INSTANCE_WORK_ID_INT_INIT_LIFE"
                 })
             };
-            match path.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                ["ModelModule", "set_scale"] if args.len() == 2 => self.value(SettingField::Scale, args[1]),
-                ["PostureModule", "set_scale"] if args.len() == 3 => self.value(SettingField::Scale, args[1]),
-                ["AttackModule", "set_power_mul"] if args.len() == 2 => self.value(SettingField::PowerMul, args[1]),
+            match path
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                ["ModelModule", "set_scale"] if args.len() == 2 => {
+                    self.value(SettingField::Scale, args[1])
+                }
+                ["PostureModule", "set_scale"] if args.len() == 3 => {
+                    self.value(SettingField::Scale, args[1])
+                }
+                ["AttackModule", "set_power_mul"] if args.len() == 2 => {
+                    self.value(SettingField::PowerMul, args[1])
+                }
                 ["WorkModule", "set_int"] if args.len() == 3 && is_life(args[2]) => {
                     self.value(SettingField::Life, args[1])
                 }
@@ -727,7 +809,12 @@ impl<'ast> syn::visit::Visit<'ast> for Scanner<'_, '_> {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if mac.path.segments.last().is_some_and(|s| s.ident == "lua_args") {
+        if mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "lua_args")
+        {
             // `lua_args!(agent, a, b, ..)` pushes `a, b, ..` like `push_lua_stack` does.
             use syn::parse::Parser;
             let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
@@ -735,7 +822,12 @@ impl<'ast> syn::visit::Visit<'ast> for Scanner<'_, '_> {
                 self.lua_stack.extend(args.into_iter().skip(1));
             }
         }
-        if mac.path.segments.last().is_some_and(|s| s.ident == "sv_kinetic_energy") {
+        if mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "sv_kinetic_energy")
+        {
             use syn::parse::Parser;
             let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
             match parser.parse2(mac.tokens.clone()) {
@@ -881,7 +973,9 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
 
     /// The function in `text` named `name`, from its line start through its closing brace.
     fn fn_span(text: &str, name: &str) -> Range<usize> {
-        let at = text.find(&format!("fn {name}(")).expect("fixture names the function");
+        let at = text
+            .find(&format!("fn {name}("))
+            .expect("fixture names the function");
         let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
         let close = text[start..].find("\n}").expect("closing brace") + start + 2;
         start..close
@@ -926,7 +1020,10 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         let scale = only(&s, SettingField::Scale);
         assert_eq!(
             scale.value,
-            SettingValue::Const { name: "FIREBALL_SCALE".into(), value: Some(1.4) }
+            SettingValue::Const {
+                name: "FIREBALL_SCALE".into(),
+                value: Some(1.4)
+            }
         );
         assert!(!scale.facing_factor);
         assert_eq!(scale.status, "*KIND_FIREBALL_MAIN");
@@ -940,7 +1037,10 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         let x = only(&s, SettingField::SpeedX);
         assert_eq!(
             x.value,
-            SettingValue::Const { name: "FIREBALL_TRAVEL_SPEED".into(), value: Some(2.6) }
+            SettingValue::Const {
+                name: "FIREBALL_TRAVEL_SPEED".into(),
+                value: Some(2.6)
+            }
         );
         assert!(x.facing_factor);
         assert_eq!(&SHYGUY_FIREBALL[x.span.clone()], "FIREBALL_TRAVEL_SPEED");
@@ -956,7 +1056,10 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         let life = only(&s, SettingField::Life);
         assert_eq!(
             life.value,
-            SettingValue::Const { name: "FIREBALL_MAX_LIFETIME".into(), value: Some(180.0) }
+            SettingValue::Const {
+                name: "FIREBALL_MAX_LIFETIME".into(),
+                value: Some(180.0)
+            }
         );
     }
 
@@ -973,8 +1076,12 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
             };
             assert!(text.contains("param_swordbeam.min_life"), "{text}");
             assert!(text.contains("param_swordbeam.max_life"), "{text}");
-            assert!(life.referenced_params.contains(&("param_swordbeam".into(), "min_life".into())));
-            assert!(life.referenced_params.contains(&("param_swordbeam".into(), "max_life".into())));
+            assert!(life
+                .referenced_params
+                .contains(&("param_swordbeam".into(), "min_life".into())));
+            assert!(life
+                .referenced_params
+                .contains(&("param_swordbeam".into(), "max_life".into())));
             assert_eq!(&LATIOS_SWORDBEAM[life.span.clone()], "lerp");
         }
     }
@@ -993,13 +1100,22 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         let life = only(&s, SettingField::Life);
         assert_eq!(
             life.value,
-            SettingValue::Param { block: "param_fireball".into(), field: "life".into() }
+            SettingValue::Param {
+                block: "param_fireball".into(),
+                field: "life".into()
+            }
         );
-        assert_eq!(life.referenced_params, [("param_fireball".to_string(), "life".to_string())]);
+        assert_eq!(
+            life.referenced_params,
+            [("param_fireball".to_string(), "life".to_string())]
+        );
         let power = only(&s, SettingField::PowerMul);
         assert_eq!(
             power.value,
-            SettingValue::Param { block: "param_fireball".into(), field: "power_mul".into() }
+            SettingValue::Param {
+                block: "param_fireball".into(),
+                field: "power_mul".into()
+            }
         );
     }
 
@@ -1023,13 +1139,19 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         assert_eq!(g.value, SettingValue::Computed("accel_y".into()));
         assert_eq!(&KINGBOO_SHOOT[g.span.clone()], "accel_y");
         assert!(g.referenced_params.is_empty());
-        assert_eq!(only(&s, SettingField::AccelX).value, SettingValue::Literal(0.0));
+        assert_eq!(
+            only(&s, SettingField::AccelX).value,
+            SettingValue::Literal(0.0)
+        );
         assert!(s.iter().all(|s| s.field != SettingField::AccelY));
 
         let x = only(&s, SettingField::SpeedX);
         assert_eq!(x.value, SettingValue::Computed("speed_x".into()));
         assert!(x.facing_factor, "`* lr` is the facing");
-        assert_eq!(only(&s, SettingField::SpeedY).value, SettingValue::Computed("speed_y".into()));
+        assert_eq!(
+            only(&s, SettingField::SpeedY).value,
+            SettingValue::Computed("speed_y".into())
+        );
     }
 
     /// King-Boo-Moveset · src/kingteresa/weapon/fireball/status.rs:31
@@ -1045,16 +1167,23 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
     fn lua_stack_speed_latios() {
         let s = read(LATIOS_SWORDBEAM, "link_swordbeam_fly_main");
         let x = only(&s, SettingField::SpeedX);
-        let SettingValue::Computed(text) = &x.value else { panic!("{x:?}") };
+        let SettingValue::Computed(text) = &x.value else {
+            panic!("{x:?}")
+        };
         assert!(text.starts_with("speed_x_final"), "{text}");
-        assert!(x.referenced_params.contains(&("param_swordbeam".into(), "min_speed_x".into())));
+        assert!(x
+            .referenced_params
+            .contains(&("param_swordbeam".into(), "min_speed_x".into())));
         assert_eq!(&LATIOS_SWORDBEAM[x.span.clone()], "speed_x_final");
         let y = only(&s, SettingField::SpeedY);
         assert_eq!(y.value, SettingValue::Literal(0.0));
 
         let ax = only(&s, SettingField::AccelX);
         assert!(matches!(ax.value, SettingValue::Computed(_)), "{ax:?}");
-        assert_eq!(only(&s, SettingField::AccelY).value, SettingValue::Literal(0.0));
+        assert_eq!(
+            only(&s, SettingField::AccelY).value,
+            SettingValue::Literal(0.0)
+        );
     }
 
     #[test]
@@ -1105,14 +1234,26 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
             _ => None,
         };
         let s = read_with(SHYGUY_FIREBALL, "fireball_main", &helpers);
-        let xs: Vec<&Setting> = s.iter().filter(|s| s.field == SettingField::SpeedX).collect();
+        let xs: Vec<&Setting> = s
+            .iter()
+            .filter(|s| s.field == SettingField::SpeedX)
+            .collect();
         assert_eq!(xs.len(), 2, "{s:#?}");
-        let from_loop = xs.iter().find(|s| s.file == loop_file).expect("helper read");
-        assert_eq!(&SHYGUY_MAIN_LOOP[from_loop.span.clone()], "FIREBALL_TRAVEL_SPEED");
+        let from_loop = xs
+            .iter()
+            .find(|s| s.file == loop_file)
+            .expect("helper read");
+        assert_eq!(
+            &SHYGUY_MAIN_LOOP[from_loop.span.clone()],
+            "FIREBALL_TRAVEL_SPEED"
+        );
         assert!(from_loop.facing_factor);
         assert_eq!(from_loop.status, "*KIND_FIREBALL_MAIN");
         // Only one level: `deeper_helper`'s scale is not read.
-        assert!(s.iter().all(|s| s.file != PathBuf::from("deeper.rs")), "{s:#?}");
+        assert!(
+            s.iter().all(|s| s.file != PathBuf::from("deeper.rs")),
+            "{s:#?}"
+        );
     }
 
     /// Ops the reader does not model are kept, under "Other movement", never dropped.
@@ -1128,14 +1269,31 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
 "#;
         let s = read(text, "main");
         let other = only(&s, SettingField::OtherMovement);
-        let SettingValue::Computed(t) = &other.value else { panic!("{other:?}") };
+        let SettingValue::Computed(t) = &other.value else {
+            panic!("{other:?}")
+        };
         assert!(t.contains("controller_set_accel_x_mul"), "{t}");
         assert_eq!(&text[other.span.clone()], t.as_str());
-        assert_eq!(only(&s, SettingField::SpeedMul).value, SettingValue::Literal(0.8));
-        assert_eq!(only(&s, SettingField::SpeedX).value, SettingValue::Literal(1.5));
-        assert_eq!(only(&s, SettingField::SpeedY).value, SettingValue::Literal(2.5));
-        assert_eq!(only(&s, SettingField::MaxSpeedX).value, SettingValue::Literal(3.0));
-        assert_eq!(only(&s, SettingField::MaxSpeedY).value, SettingValue::Literal(4.0));
+        assert_eq!(
+            only(&s, SettingField::SpeedMul).value,
+            SettingValue::Literal(0.8)
+        );
+        assert_eq!(
+            only(&s, SettingField::SpeedX).value,
+            SettingValue::Literal(1.5)
+        );
+        assert_eq!(
+            only(&s, SettingField::SpeedY).value,
+            SettingValue::Literal(2.5)
+        );
+        assert_eq!(
+            only(&s, SettingField::MaxSpeedX).value,
+            SettingValue::Literal(3.0)
+        );
+        assert_eq!(
+            only(&s, SettingField::MaxSpeedY).value,
+            SettingValue::Literal(4.0)
+        );
     }
 
     /// A negative literal y accel is a gravity of its magnitude; a negative literal elsewhere stays
@@ -1155,7 +1313,10 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         let ax = only(&s, SettingField::AccelX);
         assert_eq!(ax.value, SettingValue::Literal(-0.01));
         assert_eq!(&text[ax.span.clone()], "-0.01");
-        assert_eq!(only(&s, SettingField::Scale).value, SettingValue::Literal(1.2));
+        assert_eq!(
+            only(&s, SettingField::Scale).value,
+            SettingValue::Literal(1.2)
+        );
     }
 
     /// A shadowing `let` reads the binding before it, so the param origin survives.
@@ -1170,8 +1331,13 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
 "#;
         let s = read(text, "main");
         let speed = only(&s, SettingField::SpeedX);
-        assert_eq!(speed.referenced_params, [("b".to_string(), "f".to_string())]);
-        let SettingValue::Computed(t) = &speed.value else { panic!("{speed:?}") };
+        assert_eq!(
+            speed.referenced_params,
+            [("b".to_string(), "f".to_string())]
+        );
+        let SettingValue::Computed(t) = &speed.value else {
+            panic!("{speed:?}")
+        };
         assert!(t.contains("b.f"), "{t}");
     }
 
@@ -1187,7 +1353,11 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
             file: PathBuf::from("f.rs"),
             span: start..text.len(),
         };
-        let s = read_settings(&[(&site, text[site.span.clone()].to_string())], &ProjectConsts::default(), &|_, _| None);
+        let s = read_settings(
+            &[(&site, text[site.span.clone()].to_string())],
+            &ProjectConsts::default(),
+            &|_, _| None,
+        );
         let scale = only(&s, SettingField::Scale);
         assert_eq!(scale.value, SettingValue::Literal(1.5));
         assert_eq!(&text[scale.span.clone()], "1.5");
@@ -1204,7 +1374,11 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
             file: PathBuf::from("f.rs"),
             span: 0..text.len(),
         };
-        let s = read_settings(&[(&site, text.to_string())], &ProjectConsts::default(), &|_, _| None);
+        let s = read_settings(
+            &[(&site, text.to_string())],
+            &ProjectConsts::default(),
+            &|_, _| None,
+        );
         let other = only(&s, SettingField::OtherMovement);
         assert_eq!(
             other.value,
@@ -1227,8 +1401,14 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
         };
         let (a, b) = (caller("1.0"), caller("2.0"));
         let (loop_a, loop_b) = (loop_body("1.1"), loop_body("2.2"));
-        let site_a = StatusSite { file: PathBuf::from("a/status.rs"), ..site("x", &a, "main") };
-        let site_b = StatusSite { file: PathBuf::from("b/status.rs"), ..site("x", &b, "main") };
+        let site_a = StatusSite {
+            file: PathBuf::from("a/status.rs"),
+            ..site("x", &a, "main")
+        };
+        let site_b = StatusSite {
+            file: PathBuf::from("b/status.rs"),
+            ..site("x", &b, "main")
+        };
         let helpers = |from: &Path, name: &str| {
             if name != "main_loop" {
                 return None;
@@ -1273,7 +1453,10 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
 }
 "#;
         let s = read(text, "fly_main");
-        assert!(s.iter().all(|s| s.field != SettingField::OtherMovement), "{s:#?}");
+        assert!(
+            s.iter().all(|s| s.field != SettingField::OtherMovement),
+            "{s:#?}"
+        );
         let x = only(&s, SettingField::SpeedX);
         assert_eq!(x.value, SettingValue::Literal(2.0));
         assert!(x.facing_factor, "`posture` is bound to `PostureModule::lr`");
@@ -1297,7 +1480,11 @@ unsafe extern "C" fn kingteresa_fireball_shoot_status_main(weapon: &mut L2CWeapo
             file: PathBuf::from("f.rs"),
             span: 0..text.len(),
         };
-        let s = read_settings(&[(&site, text.to_string())], &ProjectConsts::default(), &|_, _| None);
+        let s = read_settings(
+            &[(&site, text.to_string())],
+            &ProjectConsts::default(),
+            &|_, _| None,
+        );
         assert_eq!(s.len(), 1, "{s:#?}");
         assert_eq!(s[0].field, SettingField::OtherMovement);
         assert_eq!(
@@ -1328,7 +1515,12 @@ pub mod write {
         Const(ConstEdit),
         /// Write `variant` of `block.field` in `file`, one of the moveset's own param files
         /// (through [`crate::articles::params::write_param_field`]).
-        Param { file: PathBuf, block: String, field: String, variant: usize },
+        Param {
+            file: PathBuf,
+            block: String,
+            field: String,
+            variant: usize,
+        },
     }
 
     /// Plan saving `new` for `setting`. `variant` is the list entry a `Param` value is read from (0
@@ -1344,7 +1536,12 @@ pub mod write {
     /// - A `Computed` value, and anything this cannot write, is an error saying why.
     ///
     /// Nothing is written here: the caller applies the plan.
-    pub fn plan_setting_write(setting: &Setting, new: f64, variant: usize, own: &[PathBuf]) -> Result<SettingWrite> {
+    pub fn plan_setting_write(
+        setting: &Setting,
+        new: f64,
+        variant: usize,
+        own: &[PathBuf],
+    ) -> Result<SettingWrite> {
         if !new.is_finite() {
             bail!("{new} is not a number Visionary can write");
         }
@@ -1361,10 +1558,13 @@ pub mod write {
             ),
             SettingValue::Literal(old) => {
                 let file = &setting.file;
-                let mut text =
-                    std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+                let mut text = std::fs::read_to_string(file)
+                    .with_context(|| format!("reading {}", file.display()))?;
                 let Some(written) = text.get(setting.span.clone()).map(str::to_string) else {
-                    bail!("{} changed since it was read — rescan and try again", file.display());
+                    bail!(
+                        "{} changed since it was read — rescan and try again",
+                        file.display()
+                    );
                 };
                 if literal_value(&written).is_none_or(|value| (value - old).abs() > 1e-9) {
                     bail!(
@@ -1380,7 +1580,10 @@ pub mod write {
                     );
                 };
                 text.replace_range(setting.span.clone(), &value);
-                Ok(SettingWrite::Source { file: file.clone(), text })
+                Ok(SettingWrite::Source {
+                    file: file.clone(),
+                    text,
+                })
             }
             SettingValue::Const { name, value } => {
                 if value.is_none() {
@@ -1390,16 +1593,22 @@ pub mod write {
                     );
                 }
                 // Plain digits: `apply_edits` spells them the way the definition is written.
-                Ok(SettingWrite::Const(ConstEdit { name: name.clone(), value: new.to_string() }))
+                Ok(SettingWrite::Const(ConstEdit {
+                    name: name.clone(),
+                    value: new.to_string(),
+                }))
             }
             SettingValue::Param { block, field } => {
                 for layer in own.iter().rev() {
                     // An own file that cannot be read may be the one the game reads, so choosing one
                     // below it could write a value the game never sees.
-                    let has = crate::articles::params::layer_has_field(layer, block, field, variant)
-                        .map_err(|error| {
-                            anyhow::anyhow!("{error}, so Visionary can't tell which file holds {block}.{field}")
-                        })?;
+                    let has =
+                        crate::articles::params::layer_has_field(layer, block, field, variant)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                            "{error}, so Visionary can't tell which file holds {block}.{field}"
+                        )
+                            })?;
                     if has {
                         return Ok(SettingWrite::Param {
                             file: layer.clone(),
@@ -1409,12 +1618,19 @@ pub mod write {
                         });
                     }
                 }
-                let entry = if variant == 0 { String::new() } else { format!(" (list entry {variant})") };
+                let entry = if variant == 0 {
+                    String::new()
+                } else {
+                    format!(" (list entry {variant})")
+                };
                 // The file to add it to: the moveset's prcxml when it has one.
                 let file = own
                     .iter()
                     .rev()
-                    .find(|file| file.extension().is_some_and(|e| e.eq_ignore_ascii_case("prcxml")))
+                    .find(|file| {
+                        file.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("prcxml"))
+                    })
                     .or(own.last());
                 match file {
                     Some(file) => bail!(
@@ -1445,7 +1661,13 @@ pub mod write {
 
         const STATUS: &str = "unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\r\n    weapon.set_life(30);\r\n    ModelModule::set_scale(weapon.module_accessor, 1.6f32);\r\n    AttackModule::set_power_mul(weapon.module_accessor, 30.0);\r\n    sv_kinetic_energy!(set_accel, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 0.0, -0.08);\r\n    0.into()\r\n}\r\n";
 
-        fn setting(file: &Path, text: &str, field: SettingField, value: SettingValue, written: &str) -> Setting {
+        fn setting(
+            file: &Path,
+            text: &str,
+            field: SettingField,
+            value: SettingValue,
+            written: &str,
+        ) -> Setting {
             let start = text.find(written).expect("fixture holds the value");
             Setting {
                 field,
@@ -1472,11 +1694,38 @@ pub mod write {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("shot.rs");
             std::fs::write(&file, STATUS).unwrap();
-            let life = setting(&file, STATUS, SettingField::Life, SettingValue::Literal(30.0), "30)");
-            let life = Setting { span: life.span.start..life.span.end - 1, ..life };
-            let scale = setting(&file, STATUS, SettingField::Scale, SettingValue::Literal(1.6), "1.6f32");
-            let power = setting(&file, STATUS, SettingField::PowerMul, SettingValue::Literal(30.0), "30.0");
-            let gravity = setting(&file, STATUS, SettingField::Gravity, SettingValue::Literal(0.08), "0.08");
+            let life = setting(
+                &file,
+                STATUS,
+                SettingField::Life,
+                SettingValue::Literal(30.0),
+                "30)",
+            );
+            let life = Setting {
+                span: life.span.start..life.span.end - 1,
+                ..life
+            };
+            let scale = setting(
+                &file,
+                STATUS,
+                SettingField::Scale,
+                SettingValue::Literal(1.6),
+                "1.6f32",
+            );
+            let power = setting(
+                &file,
+                STATUS,
+                SettingField::PowerMul,
+                SettingValue::Literal(30.0),
+                "30.0",
+            );
+            let gravity = setting(
+                &file,
+                STATUS,
+                SettingField::Gravity,
+                SettingValue::Literal(0.08),
+                "0.08",
+            );
 
             let text = source_text(plan_setting_write(&life, 45.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("set_life(30)", "set_life(45)"));
@@ -1489,11 +1738,19 @@ pub mod write {
             assert_eq!(text, STATUS.replace("-0.08", "-0.1"));
             assert_eq!(text.matches("\r\n").count(), STATUS.matches("\r\n").count());
 
-            let error = plan_setting_write(&life, 45.5, 0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&life, 45.5, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("whole number"), "{error}");
-            let error = plan_setting_write(&gravity, -0.1, 0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&gravity, -0.1, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("negative"), "{error}");
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS, "planning writes nothing");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                STATUS,
+                "planning writes nothing"
+            );
         }
 
         /// The spans the reader gives for a real status agree with the writer.
@@ -1510,11 +1767,18 @@ pub mod write {
                 file: file.clone(),
                 span: 0..STATUS.len(),
             };
-            let settings = super::super::read_settings(&[(&site, STATUS.to_string())], &consts, &|_, _| None);
-            let gravity = settings.iter().find(|s| s.field == SettingField::Gravity).unwrap();
+            let settings =
+                super::super::read_settings(&[(&site, STATUS.to_string())], &consts, &|_, _| None);
+            let gravity = settings
+                .iter()
+                .find(|s| s.field == SettingField::Gravity)
+                .unwrap();
             let text = source_text(plan_setting_write(gravity, 0.5, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("-0.08", "-0.5"));
-            let life = settings.iter().find(|s| s.field == SettingField::Life).unwrap();
+            let life = settings
+                .iter()
+                .find(|s| s.field == SettingField::Life)
+                .unwrap();
             let text = source_text(plan_setting_write(life, 90.0, 0, &[]).unwrap());
             assert_eq!(text, STATUS.replace("set_life(30)", "set_life(90)"));
         }
@@ -1524,8 +1788,16 @@ pub mod write {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("shot.rs");
             std::fs::write(&file, STATUS.replace("1.6f32", "1.9f32")).unwrap();
-            let scale = setting(&file, STATUS, SettingField::Scale, SettingValue::Literal(1.6), "1.6f32");
-            let error = plan_setting_write(&scale, 2.0, 0, &[]).unwrap_err().to_string();
+            let scale = setting(
+                &file,
+                STATUS,
+                SettingField::Scale,
+                SettingValue::Literal(1.6),
+                "1.6f32",
+            );
+            let error = plan_setting_write(&scale, 2.0, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("changed"), "{error}");
         }
 
@@ -1541,7 +1813,9 @@ pub mod write {
                 SettingValue::Computed("charge_boost + 1.0".into()),
                 "30.0",
             );
-            let error = plan_setting_write(&computed, 2.0, 0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&computed, 2.0, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("worked out"), "{error}");
             assert_eq!(std::fs::read_to_string(&file).unwrap(), STATUS);
         }
@@ -1549,17 +1823,34 @@ pub mod write {
         #[test]
         fn const_setting_becomes_a_const_edit() {
             let file = PathBuf::from("shot.rs");
-            let value = SettingValue::Const { name: "FIREBALL_SCALE".into(), value: Some(1.4) };
-            let scale = setting(&file, "FIREBALL_SCALE", SettingField::Scale, value, "FIREBALL_SCALE");
+            let value = SettingValue::Const {
+                name: "FIREBALL_SCALE".into(),
+                value: Some(1.4),
+            };
+            let scale = setting(
+                &file,
+                "FIREBALL_SCALE",
+                SettingField::Scale,
+                value,
+                "FIREBALL_SCALE",
+            );
             assert_eq!(
                 plan_setting_write(&scale, 2.5, 0, &[]).unwrap(),
-                SettingWrite::Const(ConstEdit { name: "FIREBALL_SCALE".into(), value: "2.5".into() })
+                SettingWrite::Const(ConstEdit {
+                    name: "FIREBALL_SCALE".into(),
+                    value: "2.5".into()
+                })
             );
             let unknown = Setting {
-                value: SettingValue::Const { name: "FROM_ELSEWHERE".into(), value: None },
+                value: SettingValue::Const {
+                    name: "FROM_ELSEWHERE".into(),
+                    value: None,
+                },
                 ..scale
             };
-            let error = plan_setting_write(&unknown, 2.5, 0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&unknown, 2.5, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("FROM_ELSEWHERE"), "{error}");
 
             // The definition keeps its own spelling when the edit is applied.
@@ -1567,20 +1858,43 @@ pub mod write {
             let defs = dir.path().join("consts.rs");
             let text = "const FIREBALL_SCALE: f32 = 1.4f32;\nconst FIREBALL_LIFE: i32 = 180;\n";
             std::fs::write(&defs, text).unwrap();
-            let consts = crate::project_consts::ProjectConsts::scan(&[(defs.clone(), text.to_string())]);
+            let consts =
+                crate::project_consts::ProjectConsts::scan(&[(defs.clone(), text.to_string())]);
             let edits = [
-                ConstEdit { name: "FIREBALL_SCALE".into(), value: "2".into() },
-                ConstEdit { name: "FIREBALL_LIFE".into(), value: "200.5".into() },
+                ConstEdit {
+                    name: "FIREBALL_SCALE".into(),
+                    value: "2".into(),
+                },
+                ConstEdit {
+                    name: "FIREBALL_LIFE".into(),
+                    value: "200.5".into(),
+                },
             ];
             let (_, notes, changed) = crate::project_consts::apply_edits(&consts, &edits);
             assert_eq!(changed, 1, "{notes:?}");
-            assert!(notes.iter().any(|n| n.contains("FIREBALL_LIFE") && n.contains("whole-number")), "{notes:?}");
-            assert_eq!(std::fs::read_to_string(&defs).unwrap(), text.replace("1.4f32", "2.0f32"));
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.contains("FIREBALL_LIFE") && n.contains("whole-number")),
+                "{notes:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&defs).unwrap(),
+                text.replace("1.4f32", "2.0f32")
+            );
         }
 
         fn prc_with(path: &Path, fields: &[(&str, prc::ParamKind)]) {
-            let inner = prc::ParamStruct(fields.iter().map(|(n, v)| (hash40::hash40(n), v.clone())).collect());
-            let root = prc::ParamStruct(vec![(hash40::hash40("param_cshot"), prc::ParamKind::Struct(inner))]);
+            let inner = prc::ParamStruct(
+                fields
+                    .iter()
+                    .map(|(n, v)| (hash40::hash40(n), v.clone()))
+                    .collect(),
+            );
+            let root = prc::ParamStruct(vec![(
+                hash40::hash40("param_cshot"),
+                prc::ParamKind::Struct(inner),
+            )]);
             prc::save(path, &root).unwrap();
         }
 
@@ -1588,7 +1902,10 @@ pub mod write {
         fn param_setting_targets_existing_layer() {
             let dir = tempfile::tempdir().unwrap();
             let (dump, romfs) = (dir.path().join("dump.prc"), dir.path().join("romfs.prcxml"));
-            let dump_fields = [("speed", prc::ParamKind::Float(1.0)), ("life", prc::ParamKind::I32(60))];
+            let dump_fields = [
+                ("speed", prc::ParamKind::Float(1.0)),
+                ("life", prc::ParamKind::I32(60)),
+            ];
             prc_with(&dump, &dump_fields);
             let dump_bytes = std::fs::read(&dump).unwrap();
             std::fs::write(
@@ -1602,7 +1919,10 @@ pub mod write {
                     &file,
                     "x",
                     SettingField::SpeedX,
-                    SettingValue::Param { block: "param_cshot".into(), field: field.into() },
+                    SettingValue::Param {
+                        block: "param_cshot".into(),
+                        field: field.into(),
+                    },
                     "x",
                 )
             };
@@ -1610,31 +1930,63 @@ pub mod write {
             // The moveset's own prcxml has `speed`, and so does the dump: the prcxml is chosen.
             assert_eq!(
                 plan_setting_write(&param("speed"), 3.0, 0, &own).unwrap(),
-                SettingWrite::Param { file: romfs.clone(), block: "param_cshot".into(), field: "speed".into(), variant: 0 }
+                SettingWrite::Param {
+                    file: romfs.clone(),
+                    block: "param_cshot".into(),
+                    field: "speed".into(),
+                    variant: 0
+                }
             );
             // Only the dump has `life`: the dump is never chosen, and the error says what to do.
-            let error = plan_setting_write(&param("life"), 70.0, 0, &own).unwrap_err().to_string();
-            assert!(error.contains("`life` isn't in param_cshot in this moveset's own param file yet"), "{error}");
+            let error = plan_setting_write(&param("life"), 70.0, 0, &own)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("`life` isn't in param_cshot in this moveset's own param file yet"),
+                "{error}"
+            );
             assert!(error.contains(&romfs.display().to_string()), "{error}");
             // Not even when the moveset has no param file of its own.
-            let error = plan_setting_write(&param("life"), 70.0, 0, &[]).unwrap_err().to_string();
+            let error = plan_setting_write(&param("life"), 70.0, 0, &[])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("no param file of its own"), "{error}");
             // An own file above the one that has the field could not be read: which file the
             // game reads is unknown, so nothing is chosen.
             let broken = dir.path().join("broken.prc");
             std::fs::write(&broken, b"not a param file").unwrap();
-            let error = plan_setting_write(&param("speed"), 3.0, 0, &[romfs.clone(), broken]).unwrap_err().to_string();
+            let error = plan_setting_write(&param("speed"), 3.0, 0, &[romfs.clone(), broken])
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("could not read"), "{error}");
 
             // The planned write lands through the param writer, changing only that value.
-            let SettingWrite::Param { file, block, field, variant } =
-                plan_setting_write(&param("speed"), 3.0, 0, &own).unwrap()
+            let SettingWrite::Param {
+                file,
+                block,
+                field,
+                variant,
+            } = plan_setting_write(&param("speed"), 3.0, 0, &own).unwrap()
             else {
                 unreachable!()
             };
-            crate::articles::params::write_param_field(&file, &block, &field, variant, 3.0, &HashMap::new()).unwrap();
-            assert!(std::fs::read_to_string(&romfs).unwrap().contains("    <float hash=\"speed\">3</float>\r\n"));
-            assert_eq!(std::fs::read(&dump).unwrap(), dump_bytes, "the dump is untouched");
+            crate::articles::params::write_param_field(
+                &file,
+                &block,
+                &field,
+                variant,
+                3.0,
+                &HashMap::new(),
+            )
+            .unwrap();
+            assert!(std::fs::read_to_string(&romfs)
+                .unwrap()
+                .contains("    <float hash=\"speed\">3</float>\r\n"));
+            assert_eq!(
+                std::fs::read(&dump).unwrap(),
+                dump_bytes,
+                "the dump is untouched"
+            );
         }
 
         /// R11b: a list block's variant 2 of 3 is checked and written, not variant 0.
@@ -1649,20 +2001,49 @@ pub mod write {
                 &file,
                 "x",
                 SettingField::Life,
-                SettingValue::Param { block: "param_lativolt".into(), field: "life".into() },
+                SettingValue::Param {
+                    block: "param_lativolt".into(),
+                    field: "life".into(),
+                },
                 "x",
             );
             let own = [romfs.clone()];
             let planned = plan_setting_write(&life, 55.0, 2, &own).unwrap();
             assert_eq!(
                 planned,
-                SettingWrite::Param { file: romfs.clone(), block: "param_lativolt".into(), field: "life".into(), variant: 2 }
+                SettingWrite::Param {
+                    file: romfs.clone(),
+                    block: "param_lativolt".into(),
+                    field: "life".into(),
+                    variant: 2
+                }
             );
-            let error = plan_setting_write(&life, 55.0, 1, &own).unwrap_err().to_string();
+            let error = plan_setting_write(&life, 55.0, 1, &own)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("(list entry 1)"), "{error}");
-            let SettingWrite::Param { file, block, field, variant } = planned else { unreachable!() };
-            crate::articles::params::write_param_field(&file, &block, &field, variant, 55.0, &HashMap::new()).unwrap();
-            assert_eq!(std::fs::read_to_string(&romfs).unwrap(), before.replace(">40<", ">55<"));
+            let SettingWrite::Param {
+                file,
+                block,
+                field,
+                variant,
+            } = planned
+            else {
+                unreachable!()
+            };
+            crate::articles::params::write_param_field(
+                &file,
+                &block,
+                &field,
+                variant,
+                55.0,
+                &HashMap::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&romfs).unwrap(),
+                before.replace(">40<", ">55<")
+            );
         }
 
         #[test]
@@ -1701,7 +2082,10 @@ unsafe extern "C" fn carrot_main_loop(weapon: &mut L2CWeaponCommon) -> L2CValue 
                 (carrot_file.clone(), carrot_src.to_string()),
                 (other_file.clone(), other_src.to_string()),
             ]);
-            assert!(consts.get("LAUNCH_VY").is_none(), "project-wide LAUNCH_VY should be ambiguous");
+            assert!(
+                consts.get("LAUNCH_VY").is_none(),
+                "project-wide LAUNCH_VY should be ambiguous"
+            );
 
             let main_span = crate::acmd_src::function_item(carrot_src, "carrot_main").unwrap();
             let loop_span = crate::acmd_src::function_item(carrot_src, "carrot_main_loop").unwrap();
@@ -1717,25 +2101,49 @@ unsafe extern "C" fn carrot_main_loop(weapon: &mut L2CWeaponCommon) -> L2CValue 
                 &consts,
                 &|_caller, name| {
                     (name == "carrot_main_loop").then(|| {
-                        (carrot_file.clone(), loop_span.clone(), carrot_src[loop_span.clone()].to_string())
+                        (
+                            carrot_file.clone(),
+                            loop_span.clone(),
+                            carrot_src[loop_span.clone()].to_string(),
+                        )
                     })
                 },
             );
             let speed_y = settings
                 .iter()
-                .find(|s| s.field == SettingField::SpeedY && matches!(s.value, SettingValue::Const { .. }))
+                .find(|s| {
+                    s.field == SettingField::SpeedY && matches!(s.value, SettingValue::Const { .. })
+                })
                 .expect("carrot LAUNCH_VY should resolve from carrot.rs");
-            assert_eq!(speed_y.value, SettingValue::Const { name: "LAUNCH_VY".into(), value: Some(3.1) });
+            assert_eq!(
+                speed_y.value,
+                SettingValue::Const {
+                    name: "LAUNCH_VY".into(),
+                    value: Some(3.1)
+                }
+            );
             let gravity = settings
                 .iter()
                 .find(|s| s.field == SettingField::Gravity)
                 .expect("carrot_main_loop `current_vy - ARC_GRAVITY` should extract Gravity");
-            assert_eq!(gravity.value, SettingValue::Const { name: "ARC_GRAVITY".into(), value: Some(0.12) });
+            assert_eq!(
+                gravity.value,
+                SettingValue::Const {
+                    name: "ARC_GRAVITY".into(),
+                    value: Some(0.12)
+                }
+            );
             let life = settings
                 .iter()
                 .find(|s| s.field == SettingField::Life)
                 .expect("carrot LIFETIME_FRAMES should resolve from carrot.rs");
-            assert_eq!(life.value, SettingValue::Const { name: "LIFETIME_FRAMES".into(), value: Some(250.0) });
+            assert_eq!(
+                life.value,
+                SettingValue::Const {
+                    name: "LIFETIME_FRAMES".into(),
+                    value: Some(250.0)
+                }
+            );
         }
     }
 }

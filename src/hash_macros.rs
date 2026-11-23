@@ -207,7 +207,10 @@ impl HashMacros {
                 .find("Hash40::new(")
                 .map_or("", |at| &trimmed[..at])
                 .to_string();
-            let path = if path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+            let path = if path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            {
                 path
             } else {
                 String::new()
@@ -283,7 +286,11 @@ impl HashMacros {
 }
 
 /// Resolve a definition's body to fixed text and its own parameters.
-fn resolve(definitions: &HashMap<String, Definition>, body: &Body, depth: usize) -> Option<Vec<Part>> {
+fn resolve(
+    definitions: &HashMap<String, Definition>,
+    body: &Body,
+    depth: usize,
+) -> Option<Vec<Part>> {
     if depth > 8 {
         return None;
     }
@@ -348,7 +355,10 @@ fn parse_rules(rules: &str) -> Option<Definition> {
     }
     let matcher_end = call_end(rules, open + 1)?;
     let matcher = &rules[open + 1..matcher_end];
-    let rest = rules[matcher_end + 1..].trim_start().strip_prefix("=>")?.trim_start();
+    let rest = rules[matcher_end + 1..]
+        .trim_start()
+        .strip_prefix("=>")?
+        .trim_start();
     let body_open = rest.find(['(', '[', '{'])?;
     if body_open != 0 {
         return None;
@@ -382,7 +392,10 @@ fn parse_body(body: &str, params: &[String]) -> Option<Body> {
     }
     if let Some(at) = body.find("Hash40::new(") {
         let path = &body[..at];
-        if !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
             return None;
         }
         let open = at + "Hash40::new(".len();
@@ -440,7 +453,11 @@ fn parse_call(call: &str) -> Option<(&str, Vec<&str>)> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
-    if !path.trim_start_matches("$crate::").chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+    if !path
+        .trim_start_matches("$crate::")
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
         return None;
     }
     let rest = &call[bang + 1..];
@@ -610,16 +627,34 @@ macro_rules! two {
     #[test]
     fn shy_guys_sound_macros_resolve_to_their_names() {
         let macros = shy_guy();
-        assert_eq!(macros.expand_call(r#"cmn!("swing_06")"#).as_deref(), Some("se_common_swing_06"));
-        assert_eq!(macros.expand_call(r#"se!("jump01")"#).as_deref(), Some("se_pacman_jump01"));
-        assert_eq!(macros.expand_call(r#"vc!("attack01")"#).as_deref(), Some("vc_pacman_attack01"));
-        assert_eq!(macros.expand_call(r#"rb!("attackm")"#).as_deref(), Some("rbkind_attackm"));
         assert_eq!(
-            macros.expand_call(r#"crate::fighter_se!("mario", "x")"#).as_deref(),
+            macros.expand_call(r#"cmn!("swing_06")"#).as_deref(),
+            Some("se_common_swing_06")
+        );
+        assert_eq!(
+            macros.expand_call(r#"se!("jump01")"#).as_deref(),
+            Some("se_pacman_jump01")
+        );
+        assert_eq!(
+            macros.expand_call(r#"vc!("attack01")"#).as_deref(),
+            Some("vc_pacman_attack01")
+        );
+        assert_eq!(
+            macros.expand_call(r#"rb!("attackm")"#).as_deref(),
+            Some("rbkind_attackm")
+        );
+        assert_eq!(
+            macros
+                .expand_call(r#"crate::fighter_se!("mario", "x")"#)
+                .as_deref(),
             Some("se_mario_x")
         );
         assert_eq!(macros.expand_call(r#"two!("a")"#), None);
-        assert_eq!(macros.expand_call(r#"cmn!(TONE)"#), None, "only literals resolve");
+        assert_eq!(
+            macros.expand_call(r#"cmn!(TONE)"#),
+            None,
+            "only literals resolve"
+        );
     }
 
     #[test]
@@ -643,9 +678,15 @@ macro_rules! two {
         let macros = shy_guy();
         let file = r#"macros::PLAY_SE(agent, se!("jump01")); macros::PLAY_SE(agent, cmn!("a"));"#;
         // Same macro, new literal.
-        assert_eq!(macros.spell(r#"se!("jump01")"#, "se_pacman_jump02", file), r#"se!("jump02")"#);
+        assert_eq!(
+            macros.spell(r#"se!("jump01")"#, "se_pacman_jump02", file),
+            r#"se!("jump02")"#
+        );
         // Same family no longer fits: another of the project's macros does.
-        assert_eq!(macros.spell(r#"se!("jump01")"#, "se_common_swing_01", file), r#"cmn!("swing_01")"#);
+        assert_eq!(
+            macros.spell(r#"se!("jump01")"#, "se_common_swing_01", file),
+            r#"cmn!("swing_01")"#
+        );
         // A plain `Hash40::new` the author wrote stays one, even when a macro would fit.
         assert_eq!(
             macros.spell(r#"Hash40::new("se_pacman_x")"#, "se_pacman_y", file),
@@ -656,7 +697,13 @@ macro_rules! two {
             r#"smash::phx::Hash40::new("b")"#
         );
         // A macro call no macro can say any more falls back to the plain form.
-        assert_eq!(macros.spell(r#"se!("a")"#, "vc_mario_x", file), r#"Hash40::new("vc_mario_x")"#);
-        assert_eq!(macros.spell(r#"crate::se!("a")"#, "se_pacman_b", file), r#"crate::se!("b")"#);
+        assert_eq!(
+            macros.spell(r#"se!("a")"#, "vc_mario_x", file),
+            r#"Hash40::new("vc_mario_x")"#
+        );
+        assert_eq!(
+            macros.spell(r#"crate::se!("a")"#, "se_pacman_b", file),
+            r#"crate::se!("b")"#
+        );
     }
 }

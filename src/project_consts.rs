@@ -140,7 +140,8 @@ impl ProjectConsts {
                 found
                     .entry(name)
                     .and_modify(|known| {
-                        if known.as_ref().map(|k| (&k.value, &k.ty)) != Some((&def.value, &def.ty)) {
+                        if known.as_ref().map(|k| (&k.value, &k.ty)) != Some((&def.value, &def.ty))
+                        {
                             *known = None;
                         }
                     })
@@ -178,7 +179,10 @@ impl ProjectConsts {
             Some(_) => return None,
             None => text,
         };
-        if !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+        if !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
             return None;
         }
         let name = path.rsplit("::").next()?;
@@ -200,7 +204,8 @@ impl ProjectConsts {
                 continue;
             }
             let starts_ident = (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
-                && (i == 0 || !(is_ident(bytes[i - 1]) || bytes[i - 1] == b'.' || bytes[i - 1] == b':'));
+                && (i == 0
+                    || !(is_ident(bytes[i - 1]) || bytes[i - 1] == b'.' || bytes[i - 1] == b':'));
             if !starts_ident {
                 i += 1;
                 continue;
@@ -238,7 +243,8 @@ impl ProjectConsts {
                 .filter(|ty| is_numeric_type(ty));
             // Not a use as a value: a definition, a binding, a path into it.
             let before = body[..i].trim_end();
-            let declares = before.ends_with("const") || before.ends_with("let") || before.ends_with("static");
+            let declares =
+                before.ends_with("const") || before.ends_with("let") || before.ends_with("static");
             if declares || (cast.is_none() && !def.is_float() && names_an_id(name)) {
                 i = end;
                 continue;
@@ -264,7 +270,10 @@ impl ProjectConsts {
 
 /// Apply recorded definition edits to disk. Returns the files written and one note per const —
 /// including how many other places a shared const changes along with this one.
-pub fn apply_edits(consts: &ProjectConsts, edits: &[ConstEdit]) -> (Vec<PathBuf>, Vec<String>, usize) {
+pub fn apply_edits(
+    consts: &ProjectConsts,
+    edits: &[ConstEdit],
+) -> (Vec<PathBuf>, Vec<String>, usize) {
     let mut notes = Vec::new();
     let mut by_name: Vec<(&str, &str)> = Vec::new();
     for edit in edits {
@@ -284,14 +293,20 @@ pub fn apply_edits(consts: &ProjectConsts, edits: &[ConstEdit]) -> (Vec<PathBuf>
     let mut per_file: HashMap<&Path, Vec<(&str, &ConstDef, &str)>> = HashMap::new();
     for (name, value) in &by_name {
         if let Some(def) = consts.get(name) {
-            per_file.entry(def.file.as_path()).or_default().push((name, def, value));
+            per_file
+                .entry(def.file.as_path())
+                .or_default()
+                .push((name, def, value));
         }
     }
     let mut files = Vec::new();
     let mut changed = 0;
     for (file, mut edits) in per_file {
         let Ok(mut text) = std::fs::read_to_string(file) else {
-            notes.push(format!("could not read {} to change its consts", file.display()));
+            notes.push(format!(
+                "could not read {} to change its consts",
+                file.display()
+            ));
             continue;
         };
         edits.sort_by_key(|(_, def, _)| std::cmp::Reverse(def.value_span.start));
@@ -318,7 +333,10 @@ pub fn apply_edits(consts: &ProjectConsts, edits: &[ConstEdit]) -> (Vec<PathBuf>
             wrote = true;
             changed += 1;
             let shared = if def.uses > 1 {
-                format!("; it is used in {} places, and all of them now use the new value", def.uses)
+                format!(
+                    "; it is used in {} places, and all of them now use the new value",
+                    def.uses
+                )
             } else {
                 String::new()
             };
@@ -356,7 +374,9 @@ fn const_definitions(file: &Path, text: &str) -> Vec<(String, ConstDef)> {
         }
         i += "const ".len();
         let rest = &text[i..];
-        let name_len = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(0);
+        let name_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(0);
         if name_len == 0 {
             continue;
         }
@@ -404,7 +424,9 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
                 i = next;
                 continue;
             }
-            if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') && (i == 0 || !is_ident(bytes[i - 1])) {
+            if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+                && (i == 0 || !is_ident(bytes[i - 1]))
+            {
                 let start = i;
                 while i < text.len() && is_ident(bytes[i]) {
                     i += 1;
@@ -426,9 +448,12 @@ fn names_an_id(name: &str) -> bool {
         || upper.ends_with("_ID")
         || upper.starts_with("ID_")
         || upper.contains("_ID_")
-        || ["FLAG", "WORK", "KIND", "STATUS", "TERM", "INSTANCE", "ARTICLE", "GENERATE", "SLOT", "INDEX"]
-            .iter()
-            .any(|word| upper.contains(word))
+        || [
+            "FLAG", "WORK", "KIND", "STATUS", "TERM", "INSTANCE", "ARTICLE", "GENERATE", "SLOT",
+            "INDEX",
+        ]
+        .iter()
+        .any(|word| upper.contains(word))
 }
 
 fn is_ident(b: u8) -> bool {
@@ -438,7 +463,18 @@ fn is_ident(b: u8) -> bool {
 fn is_numeric_type(ty: &str) -> bool {
     matches!(
         ty,
-        "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize"
+        "f32"
+            | "f64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "isize"
     )
 }
 
@@ -478,7 +514,11 @@ fn integer_text(value: &str) -> String {
 
 /// `new` written the way `existing` is: same suffix, a decimal point when it had one.
 fn format_like(existing: &str, float: bool, new: f64) -> String {
-    let suffix = SUFFIXES.iter().find(|s| existing.ends_with(**s)).copied().unwrap_or("");
+    let suffix = SUFFIXES
+        .iter()
+        .find(|s| existing.ends_with(**s))
+        .copied()
+        .unwrap_or("");
     let body = if float || existing.contains('.') {
         let mut text = format!("{:.4}", new);
         while text.ends_with('0') && !text.ends_with(".0") {
@@ -545,10 +585,12 @@ fn format_radix_like(existing: &str, new: f64) -> Option<Option<String>> {
         return Some(None);
     }
     let rest = &body[2..];
-    let suffix = ["u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize"]
-        .into_iter()
-        .find(|suffix| rest.ends_with(suffix))
-        .unwrap_or("");
+    let suffix = [
+        "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
+    ]
+    .into_iter()
+    .find(|suffix| rest.ends_with(suffix))
+    .unwrap_or("");
     let digits = &rest[..rest.len() - suffix.len()];
     let separator = if digits.ends_with('_') { "_" } else { "" };
     let magnitude = new.abs() as u64;
@@ -609,10 +651,15 @@ mod tests {
             ("0x1E", 45.5, None),
         ];
         for (existing, new, expected) in cases {
-            assert_eq!(format_literal_like(existing, new).as_deref(), expected, "{existing} -> {new}");
+            assert_eq!(
+                format_literal_like(existing, new).as_deref(),
+                expected,
+                "{existing} -> {new}"
+            );
         }
         // Project consts are read in decimal only, so a hex const is never an edit target.
-        let hex = ProjectConsts::scan(&[(PathBuf::from("c.rs"), "const X: i32 = 0x1E;\n".to_string())]);
+        let hex =
+            ProjectConsts::scan(&[(PathBuf::from("c.rs"), "const X: i32 = 0x1E;\n".to_string())]);
         assert!(hex.get("X").is_none());
     }
 
@@ -637,12 +684,18 @@ mod tests {
     #[test]
     fn values_show_where_they_are_used_as_values_and_ids_keep_their_names() {
         let body = consts().substitute(SPECIALS).into_owned();
-        assert!(body.contains("frame(agent.lua_state_agent, 6.0);"), "{body}");
+        assert!(
+            body.contains("frame(agent.lua_state_agent, 6.0);"),
+            "{body}"
+        );
         assert!(
             body.contains("macros::ATTACK(agent, HITBOX_ID, 0, Hash40::new(\"top\"), 4.0, 70, 1);"),
             "{body}"
         );
-        assert!(body.contains("const WALK_LW_DAMAGE:       f32 = 4.0;"), "{body}");
+        assert!(
+            body.contains("const WALK_LW_DAMAGE:       f32 = 4.0;"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -651,7 +704,10 @@ mod tests {
         {
             let _scope = scope(Arc::clone(&consts));
             assert!(record_edit("WALK_LW_DAMAGE", 5.5));
-            assert!(record_edit("WALK_LW_ANGLE as u64", 70.0), "unchanged: recognised, nothing recorded");
+            assert!(
+                record_edit("WALK_LW_ANGLE as u64", 70.0),
+                "unchanged: recognised, nothing recorded"
+            );
             assert!(!record_edit("other", 1.0));
             assert_eq!(
                 take_pending(),
@@ -661,7 +717,10 @@ mod tests {
                 }]
             );
         }
-        assert!(!record_edit("WALK_LW_DAMAGE", 1.0), "no scope, no recording");
+        assert!(
+            !record_edit("WALK_LW_DAMAGE", 1.0),
+            "no scope, no recording"
+        );
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("specials.rs");
         std::fs::write(&file, SPECIALS).unwrap();
@@ -675,7 +734,10 @@ mod tests {
         );
         assert_eq!((files.len(), changed), (1, 1), "{notes:?}");
         let written = std::fs::read_to_string(&file).unwrap();
-        assert!(written.starts_with("const WALK_LW_DAMAGE:       f32 = 5.5;\n"), "{written}");
+        assert!(
+            written.starts_with("const WALK_LW_DAMAGE:       f32 = 5.5;\n"),
+            "{written}"
+        );
         assert_eq!(written.len(), SPECIALS.len(), "only the value changed");
     }
 }

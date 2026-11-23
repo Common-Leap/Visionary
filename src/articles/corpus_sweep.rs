@@ -90,7 +90,11 @@ fn subdirs(dir: &Path) -> Vec<String> {
 }
 
 fn line_of(text: &str, at: usize) -> usize {
-    text.as_bytes()[..at.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1
+    text.as_bytes()[..at.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// `agent` split into its owner and its article name, by the longest fighter name it starts with.
@@ -101,7 +105,11 @@ pub(super) fn split_agent(agent: &str, names: &[String]) -> Option<(String, Opti
     }
     names
         .iter()
-        .filter(|n| agent.len() > n.len() + 1 && agent.starts_with(n.as_str()) && agent.as_bytes()[n.len()] == b'_')
+        .filter(|n| {
+            agent.len() > n.len() + 1
+                && agent.starts_with(n.as_str())
+                && agent.as_bytes()[n.len()] == b'_'
+        })
         .max_by_key(|n| n.len())
         .map(|n| (n.clone(), Some(agent[n.len() + 1..].to_string())))
 }
@@ -145,9 +153,14 @@ pub(super) fn foreign_id_owner(symbol: &str, owner: &str, names: &[String]) -> O
 
 /// Why a clone listed under `fighter` is not that fighter's, if it isn't.
 pub(super) fn clone_owner_mismatch(article: &super::Article, fighter: &str) -> Option<String> {
-    let ArticleOrigin::Clone(decl) = &article.origin else { return None };
+    let ArticleOrigin::Clone(decl) = &article.origin else {
+        return None;
+    };
     (!decl.new_owner.eq_ignore_ascii_case(fighter)).then(|| {
-        format!("`{}` is listed under {fighter} but its clone_weapon names {} as its owner", article.agent, decl.new_owner)
+        format!(
+            "`{}` is listed under {fighter} but its clone_weapon names {} as its owner",
+            article.agent, decl.new_owner
+        )
     })
 }
 
@@ -182,7 +195,8 @@ pub(super) fn script_scope_check(
         text.match_indices(function).any(|(at, _)| {
             let before = text[..at].chars().next_back();
             let after = text[at + function.len()..].chars().next();
-            !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
         })
     };
     if sources
@@ -192,9 +206,17 @@ pub(super) fn script_scope_check(
         return Ok(());
     }
     let owned = |name: &String| split_agent(name, names).is_some_and(|(o, _)| o == owner);
-    let in_file: Vec<String> = sources.iter().filter(|(f, _)| f == file).flat_map(|(_, t)| agent_literals(t)).collect();
+    let in_file: Vec<String> = sources
+        .iter()
+        .filter(|(f, _)| f == file)
+        .flat_map(|(_, t)| agent_literals(t))
+        .collect();
     if !in_file.is_empty() {
-        return if in_file.iter().any(owned) { Ok(()) } else { Err(format!("its file names only {}", in_file.join(", "))) };
+        return if in_file.iter().any(owned) {
+            Ok(())
+        } else {
+            Err(format!("its file names only {}", in_file.join(", ")))
+        };
     }
     let mut dir = file.parent();
     while let Some(d) = dir {
@@ -207,7 +229,11 @@ pub(super) fn script_scope_check(
             return if here.iter().any(owned) {
                 Ok(())
             } else {
-                Err(format!("the nearest folder naming agents, `{}`, names only {}", d.display(), here.join(", ")))
+                Err(format!(
+                    "the nearest folder naming agents, `{}`, names only {}",
+                    d.display(),
+                    here.join(", ")
+                ))
             };
         }
         if d == root {
@@ -222,14 +248,21 @@ pub(super) fn script_scope_check(
 fn let_bindings(body: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for line in body.lines() {
-        let Some(rest) = line.trim().strip_prefix("let ") else { continue };
+        let Some(rest) = line.trim().strip_prefix("let ") else {
+            continue;
+        };
         let rest = rest.trim_start_matches("mut ").trim_start();
-        let Some((name, init)) = rest.split_once('=') else { continue };
+        let Some((name, init)) = rest.split_once('=') else {
+            continue;
+        };
         let name = name.split(':').next().unwrap_or("").trim();
         if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             continue;
         }
-        out.insert(name.to_string(), init.trim().trim_end_matches(';').trim().to_string());
+        out.insert(
+            name.to_string(),
+            init.trim().trim_end_matches(';').trim().to_string(),
+        );
     }
     out
 }
@@ -310,7 +343,10 @@ fn save_body(site: &ScriptSite, script: &str) -> Result<(PathBuf, usize, String)
         }
     };
     let text = std::fs::read_to_string(file).map_err(|e| format!("unreadable: {e}"))?;
-    let body = text.get(span.clone()).ok_or("span out of date")?.to_string();
+    let body = text
+        .get(span.clone())
+        .ok_or("span out of date")?
+        .to_string();
     Ok((file.clone(), line_of(&text, span.start), body))
 }
 
@@ -320,7 +356,13 @@ fn edit_one(call: &ArticleCall) -> ArticleCall {
     let mut out = call.clone();
     out.edited = true;
     let target = call.op.target_index();
-    let bump = |s: &str| if s.trim() == "1" { "2".to_string() } else { "1".to_string() };
+    let bump = |s: &str| {
+        if s.trim() == "1" {
+            "2".to_string()
+        } else {
+            "1".to_string()
+        }
+    };
     match (0..call.args.len()).find(|&i| Some(i) != target) {
         Some(i) => out.args[i] = bump(&call.args[i]),
         None => out.article = format!("{}_SWEEP", call.article.trim()),
@@ -338,7 +380,11 @@ fn round_trip(body: &str, label: &str) -> (Vec<String>, Vec<String>) {
     // Parse then emit: an unedited call saves its statement as written.
     for (_, call) in &calls {
         if call.edited || call.emit() != call.source {
-            failed.push(format!("{label}: unedited call emits `{}` for `{}`", call.emit(), call.source));
+            failed.push(format!(
+                "{label}: unedited call emits `{}` for `{}`",
+                call.emit(),
+                call.source
+            ));
         }
     }
     // An unedited save leaves the body as it is.
@@ -369,23 +415,43 @@ fn round_trip(body: &str, label: &str) -> (Vec<String>, Vec<String>) {
             }
         };
         if !report.skipped.is_empty() {
-            refused.push(format!("{label}: call #{} edit refused: {}", i + 1, report.skipped.join("; ")));
+            refused.push(format!(
+                "{label}: call #{} edit refused: {}",
+                i + 1,
+                report.skipped.join("; ")
+            ));
             continue;
         }
         if text == body {
             failed.push(format!("{label}: call #{} edit was not written", i + 1));
             continue;
         }
-        let prefix = text.bytes().zip(body.bytes()).take_while(|(a, b)| a == b).count();
-        let suffix = text.bytes().rev().zip(body.bytes().rev()).take_while(|(a, b)| a == b).count();
+        let prefix = text
+            .bytes()
+            .zip(body.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = text
+            .bytes()
+            .rev()
+            .zip(body.bytes().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
         if prefix < site.span.start || suffix < body.len() - site.span.end.min(body.len()) {
-            failed.push(format!("{label}: call #{} edit changed bytes outside its statement", i + 1));
+            failed.push(format!(
+                "{label}: call #{} edit changed bytes outside its statement",
+                i + 1
+            ));
             continue;
         }
         let back = match rewrite_editor_article_calls(&text, label, &edited, &calls) {
             Ok((back, report)) if report.skipped.is_empty() => back,
             Ok((_, report)) => {
-                failed.push(format!("{label}: call #{} revert refused: {}", i + 1, report.skipped.join("; ")));
+                failed.push(format!(
+                    "{label}: call #{} revert refused: {}",
+                    i + 1,
+                    report.skipped.join("; ")
+                ));
                 continue;
             }
             Err(e) => {
@@ -394,7 +460,10 @@ fn round_trip(body: &str, label: &str) -> (Vec<String>, Vec<String>) {
             }
         };
         if back != body {
-            failed.push(format!("{label}: call #{} edit then revert does not restore the script byte for byte", i + 1));
+            failed.push(format!(
+                "{label}: call #{} edit then revert does not restore the script byte for byte",
+                i + 1
+            ));
         }
     }
     let _ = crate::project_consts::take_pending();
@@ -403,7 +472,11 @@ fn round_trip(body: &str, label: &str) -> (Vec<String>, Vec<String>) {
 }
 
 fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
-    let mut out = Moveset { name: name.to_string(), root: root.to_path_buf(), ..Default::default() };
+    let mut out = Moveset {
+        name: name.to_string(),
+        root: root.to_path_buf(),
+        ..Default::default()
+    };
     let index = match SourceIndex::build(root) {
         Ok(index) => index,
         Err(e) => {
@@ -414,7 +487,10 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
     let short = |p: &Path| super::view::short_path(p, Some(root));
     // Fighter names as the app lists them: the dump's and the moveset's own, plus every vanilla
     // name so a fighter the local dump lacks is still recognised as an owner.
-    let mut names: BTreeSet<String> = crate::data::VANILLA_FIGHTERS.iter().map(|s| s.to_string()).collect();
+    let mut names: BTreeSet<String> = crate::data::VANILLA_FIGHTERS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     if let Some(dump) = dump {
         names.extend(subdirs(&dump.join("fighter")));
     }
@@ -431,11 +507,23 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
     let (clones, unresolved_clones) = super::clones::read_clones(&sources, &index.consts, &names);
     out.clones = clones.len();
     for u in &unresolved_clones {
-        out.unresolved_clones.push(format!("`{}:{}` `{}` — {}", short(&u.file), u.line, u.text.trim(), u.reason));
+        out.unresolved_clones.push(format!(
+            "`{}:{}` `{}` — {}",
+            short(&u.file),
+            u.line,
+            u.text.trim(),
+            u.reason
+        ));
     }
     for d in &clones {
         if let Some(note) = &d.id_note {
-            out.clone_notes.push(format!("`{}:{}` {}_{} — {note}", short(&d.file), d.line, d.new_owner, d.new_name));
+            out.clone_notes.push(format!(
+                "`{}:{}` {}_{} — {note}",
+                short(&d.file),
+                d.line,
+                d.new_owner,
+                d.new_name
+            ));
         }
     }
     let mut fighters: BTreeSet<String> = BTreeSet::new();
@@ -447,7 +535,9 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
             // smashline's agents for every fighter and every weapon, and the index's label for
             // scripts no module names a fighter for: none of them owns an article.
             None if matches!(agent.as_str(), "fighter" | "weapon" | "") => {}
-            None => out.unattributed_agents.push(format!("`{agent}` names no fighter")),
+            None => out
+                .unattributed_agents
+                .push(format!("`{agent}` names no fighter")),
         }
     }
     for d in &clones {
@@ -461,20 +551,34 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
     let mut listed_agents: BTreeSet<String> = BTreeSet::new();
     let no_locals = HashMap::new();
     for fighter in &fighters {
-        let dump_dir = dump.map(|d| d.join("fighter").join(fighter)).filter(|d| d.is_dir());
-        let fighter_dir = dump_dir.clone().unwrap_or_else(|| root.join("romfs").join("fighter").join(fighter));
+        let dump_dir = dump
+            .map(|d| d.join("fighter").join(fighter))
+            .filter(|d| d.is_dir());
+        let fighter_dir = dump_dir
+            .clone()
+            .unwrap_or_else(|| root.join("romfs").join("fighter").join(fighter));
         out.fighter_dirs.push((
             fighter.clone(),
-            if dump_dir.is_some() { "dump".into() } else { "not in the dump".into() },
+            if dump_dir.is_some() {
+                "dump".into()
+            } else {
+                "not in the dump".into()
+            },
         ));
         let catalog: ArticleCatalog = super::catalog_for(fighter, &index, &names, &fighter_dir);
         for a in &catalog.articles {
             if let Some(other) = owner_of_agent.insert(a.agent.clone(), a.owner.clone()) {
-                out.failures.push(format!("`{}` is listed under both {other} and {}", a.agent, a.owner));
+                out.failures.push(format!(
+                    "`{}` is listed under both {other} and {}",
+                    a.agent, a.owner
+                ));
             }
             listed_agents.insert(a.agent.clone());
             if a.owner != *fighter {
-                out.failures.push(format!("{fighter}'s catalog lists `{}` owned by {}", a.agent, a.owner));
+                out.failures.push(format!(
+                    "{fighter}'s catalog lists `{}` owned by {}",
+                    a.agent, a.owner
+                ));
             }
             if let Some(why) = clone_owner_mismatch(a, fighter) {
                 out.failures.push(why);
@@ -493,20 +597,49 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
             // Each of its scripts is written where its owner is named.
             if let Some(scripts) = index.fighters.get(&a.agent) {
                 for site in scripts.scripts.values() {
-                    if let Err(why) = script_scope_check(&a.agent, fighter, &site.file, &site.function, root, &all_sources, &names) {
-                        out.failures.push(format!("`{}:{}` {} is attributed to `{}`, but {why}", short(&site.file), line_of(&std::fs::read_to_string(&site.file).unwrap_or_default(), site.span.start), site.function, a.agent));
+                    if let Err(why) = script_scope_check(
+                        &a.agent,
+                        fighter,
+                        &site.file,
+                        &site.function,
+                        root,
+                        &all_sources,
+                        &names,
+                    ) {
+                        out.failures.push(format!(
+                            "`{}:{}` {} is attributed to `{}`, but {why}",
+                            short(&site.file),
+                            line_of(
+                                &std::fs::read_to_string(&site.file).unwrap_or_default(),
+                                site.span.start
+                            ),
+                            site.function,
+                            a.agent
+                        ));
                     }
                 }
             }
         }
-        let mut stats: Vec<ArticleStats> = catalog.articles.iter().map(|_| ArticleStats::default()).collect();
-        let at = |a: &super::Article| catalog.articles.iter().position(|b| b.agent == a.agent).unwrap();
+        let mut stats: Vec<ArticleStats> = catalog
+            .articles
+            .iter()
+            .map(|_| ArticleStats::default())
+            .collect();
+        let at = |a: &super::Article| {
+            catalog
+                .articles
+                .iter()
+                .position(|b| b.agent == a.agent)
+                .unwrap()
+        };
 
         // Scripts on the fighter and on each of its articles.
         let mut on: Vec<String> = vec![fighter.clone()];
         on.extend(catalog.articles.iter().map(|a| a.agent.clone()));
         for agent in &on {
-            let Some(scripts) = index.fighters.get(agent) else { continue };
+            let Some(scripts) = index.fighters.get(agent) else {
+                continue;
+            };
             let mut names_sorted: Vec<&String> = scripts.scripts.keys().collect();
             names_sorted.sort();
             for script in names_sorted {
@@ -525,7 +658,8 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                 };
                 let _agent = crate::acmd::agent_scope(&body);
                 let _consts = crate::project_consts::scope(std::sync::Arc::clone(&index.consts));
-                let _macros = crate::hash_macros::scope(std::sync::Arc::new(index.hash_macros.clone()));
+                let _macros =
+                    crate::hash_macros::scope(std::sync::Arc::new(index.hash_macros.clone()));
                 let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&index.helpers));
                 let calls = crate::acmd::parse_acmd_script(&body).to_article_calls();
                 if calls.is_empty() && !body.contains("ArticleModule") {
@@ -541,11 +675,18 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                     match catalog.resolve_id(&call.article, &no_locals) {
                         Some(a) => {
                             if a.owner != *fighter {
-                                out.failures.push(format!("{place} {agent}/{script}: `{}` resolves to {}'s {}", call.article, a.owner, a.name));
+                                out.failures.push(format!(
+                                    "{place} {agent}/{script}: `{}` resolves to {}'s {}",
+                                    call.article, a.owner, a.name
+                                ));
                             }
                             if let Some(other) = foreign_id_owner(&call.article, fighter, &names) {
                                 let line = format!("{place} {agent}/{script}: `{}` names {other} but resolves to {fighter}'s {}", call.article.trim(), a.name);
-                                if cross_fighter_ok(fighter, &other) { out.cross_ids.push(line) } else { out.failures.push(line) }
+                                if cross_fighter_ok(fighter, &other) {
+                                    out.cross_ids.push(line)
+                                } else {
+                                    out.failures.push(line)
+                                }
                             }
                             out.ids_resolved += 1;
                             let s = &mut stats[at(a)];
@@ -559,7 +700,11 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                                 Some(a) => format!("a local binding naming {}", a.name),
                                 None => unresolved_hint(&call.article, fighter, dump_dir.is_some()),
                             };
-                            out.ids_unresolved.push(format!("{place} {agent}/{script} `{}` ({}) — {hint}", call.article.trim(), call.op.name()));
+                            out.ids_unresolved.push(format!(
+                                "{place} {agent}/{script} `{}` ({}) — {hint}",
+                                call.article.trim(),
+                                call.op.name()
+                            ));
                         }
                     }
                 }
@@ -586,17 +731,27 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                     };
                     let place = format!("`{}:{}`", short(&site.file), first + offset);
                     let Some(call) = read else {
-                        out.status_unresolved.push(format!("{place} {agent} status: not a statement Visionary reads: `{}`", line.trim()));
+                        out.status_unresolved.push(format!(
+                            "{place} {agent} status: not a statement Visionary reads: `{}`",
+                            line.trim()
+                        ));
                         continue;
                     };
                     match catalog.resolve_id(&call.article, &no_locals) {
                         Some(a) => {
                             if a.owner != *fighter {
-                                out.failures.push(format!("{place} {agent} status: `{}` resolves to {}'s {}", call.article, a.owner, a.name));
+                                out.failures.push(format!(
+                                    "{place} {agent} status: `{}` resolves to {}'s {}",
+                                    call.article, a.owner, a.name
+                                ));
                             }
                             if let Some(other) = foreign_id_owner(&call.article, fighter, &names) {
                                 let line = format!("{place} {agent} status: `{}` names {other} but resolves to {fighter}'s {}", call.article.trim(), a.name);
-                                if cross_fighter_ok(fighter, &other) { out.cross_ids.push(line) } else { out.failures.push(line) }
+                                if cross_fighter_ok(fighter, &other) {
+                                    out.cross_ids.push(line)
+                                } else {
+                                    out.failures.push(line)
+                                }
                             }
                             out.status_resolved += 1;
                             stats[at(a)].status_rows += 1;
@@ -606,7 +761,11 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                                 Some(a) => format!("a local binding naming {}", a.name),
                                 None => unresolved_hint(&call.article, fighter, dump_dir.is_some()),
                             };
-                            out.status_unresolved.push(format!("{place} {agent} status `{}` ({}) — {hint}", call.article.trim(), call.op.name()));
+                            out.status_unresolved.push(format!(
+                                "{place} {agent} status `{}` ({}) — {hint}",
+                                call.article.trim(),
+                                call.op.name()
+                            ));
                         }
                     }
                 }
@@ -616,13 +775,23 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
         // Settings and param blocks, as the Settings card reads them.
         let (overrides, unread) = super::param_overrides_for(&index, fighter, &names);
         for u in unread {
-            let line = format!("`{}:{}` `{}` — {}", short(&u.file), u.line, u.text.trim(), u.reason);
+            let line = format!(
+                "`{}:{}` `{}` — {}",
+                short(&u.file),
+                u.line,
+                u.text.trim(),
+                u.reason
+            );
             if !out.unread_overrides.contains(&line) {
                 out.unread_overrides.push(line);
             }
         }
         let mut layers: Vec<PathBuf> = Vec::new();
-        for base in dump.into_iter().map(Path::to_path_buf).chain([root.join("romfs")]) {
+        for base in dump
+            .into_iter()
+            .map(Path::to_path_buf)
+            .chain([root.join("romfs")])
+        {
             for file in ["vl.prc", "vl.prcxml"] {
                 let path = base.join("fighter").join(fighter).join("param").join(file);
                 if path.is_file() {
@@ -647,10 +816,12 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                 stats[i].block_present = Some(block.present);
             }
             for c in &a.conflicts {
-                out.conflicts.push(format!("{}/{c} is registered more than once", a.agent));
+                out.conflicts
+                    .push(format!("{}/{c} is registered more than once", a.agent));
             }
         }
-        out.articles.extend(catalog.articles.iter().cloned().zip(stats));
+        out.articles
+            .extend(catalog.articles.iter().cloned().zip(stats));
     }
 
     // Statuses the index could not attribute, and agents with scripts no catalog lists.
@@ -677,7 +848,9 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
             } else {
                 format!("environment: {owner} is not in the local dump, so its vanilla articles are not listed")
             };
-            out.unattributed_agents.push(format!("`{agent}` ({scripts} scripts, {statuses} statuses): {why}"));
+            out.unattributed_agents.push(format!(
+                "`{agent}` ({scripts} scripts, {statuses} statuses): {why}"
+            ));
         }
     }
     out.failures.extend(out.rt_failed.iter().cloned());
@@ -695,7 +868,10 @@ fn unresolved_hint(expr: &str, fighter: &str, in_dump: bool) -> String {
         if !in_dump {
             return format!("environment: {fighter} is not in the local dump, so its vanilla `{}` is not listed", name.to_lowercase());
         }
-        return format!("{fighter} has no `{}` folder in the dump and no clone binds this name", name.to_lowercase());
+        return format!(
+            "{fighter} has no `{}` folder in the dump and no clone binds this name",
+            name.to_lowercase()
+        );
     }
     if ident.chars().all(|c| c.is_ascii_digit() || c == '-') {
         return "a number, which depends on the build".into();
@@ -722,9 +898,11 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
     );
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|");
     for m in sets {
-        let count = |f: fn(&ArticleOrigin) -> bool| m.articles.iter().filter(|(a, _)| f(&a.origin)).count();
+        let count =
+            |f: fn(&ArticleOrigin) -> bool| m.articles.iter().filter(|(a, _)| f(&a.origin)).count();
         let k = |name| m.settings_by_kind.get(name).copied().unwrap_or(0);
-        let _ = writeln!(
+        let _ =
+            writeln!(
             md,
             "| {} | {}/{}/{} | {} ({}) | {} / {} | {} / {} | {}/{}/{}/{} | {} ({}, {}) | {} | {} |",
             m.name,
@@ -751,7 +929,11 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
     for m in sets {
         let _ = writeln!(md, "\n## {}\n", m.name);
         let _ = writeln!(md, "Root `{}`. Fighters: {}.\n", m.root.display(), {
-            m.fighter_dirs.iter().map(|(f, d)| format!("{f} ({d})")).collect::<Vec<_>>().join(", ")
+            m.fighter_dirs
+                .iter()
+                .map(|(f, d)| format!("{f} ({d})"))
+                .collect::<Vec<_>>()
+                .join(", ")
         });
         let _ = writeln!(md, "| Article | Origin | Ids | Scripts | Rows (spawns) | Status rows | Param block | Settings |");
         let _ = writeln!(md, "|---|---|---|---|---|---|---|---|");
@@ -763,11 +945,19 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
                     "clone of {}/{}{}",
                     d.src_owner.as_deref().unwrap_or("?"),
                     d.src_kind,
-                    if d.use_original_code { ", original code" } else { "" }
+                    if d.use_original_code {
+                        ", original code"
+                    } else {
+                        ""
+                    }
                 ),
             };
             // Vanilla articles with nothing in the moveset are listed in the count only.
-            if matches!(a.origin, ArticleOrigin::Vanilla) && s.rows == 0 && s.status_rows == 0 && s.settings.is_empty() {
+            if matches!(a.origin, ArticleOrigin::Vanilla)
+                && s.rows == 0
+                && s.status_rows == 0
+                && s.settings.is_empty()
+            {
                 continue;
             }
             let settings = s
@@ -781,7 +971,11 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
                 "| {} | {} | {} | {} | {} ({}) | {} | {} | {} |",
                 a.agent,
                 origin,
-                if a.id_symbols.is_empty() { a.id_note.clone().unwrap_or("none".into()) } else { a.id_symbols.join(", ") },
+                if a.id_symbols.is_empty() {
+                    a.id_note.clone().unwrap_or("none".into())
+                } else {
+                    a.id_symbols.join(", ")
+                },
                 a.source_scripts.len(),
                 s.rows,
                 s.spawns,
@@ -825,13 +1019,18 @@ fn render(sets: &[Moveset], skipped: &[(String, String)], dump: Option<&Path>) -
 #[ignore = "reads every moveset under VISIONARY_MOVESETS; run with --ignored"]
 fn corpus_sweep_reports_every_article() {
     let Some(movesets) = std::env::var_os("VISIONARY_MOVESETS").map(PathBuf::from) else {
-        eprintln!("corpus sweep skipped: set VISIONARY_MOVESETS to the folder holding the movesets");
+        eprintln!(
+            "corpus sweep skipped: set VISIONARY_MOVESETS to the folder holding the movesets"
+        );
         return;
     };
     let dump = dump_root();
     let mut skipped = Vec::new();
     let mut sets = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&movesets).expect("VISIONARY_MOVESETS is readable").flatten().collect();
+    let mut entries: Vec<_> = std::fs::read_dir(&movesets)
+        .expect("VISIONARY_MOVESETS is readable")
+        .flatten()
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
@@ -862,12 +1061,19 @@ fn corpus_sweep_reports_every_article() {
                     .cloned()
                     .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                     .unwrap_or_default();
-                sets.push(Moveset { name, root, failures: vec![format!("the sweep panicked: {why}")], ..Default::default() });
+                sets.push(Moveset {
+                    name,
+                    root,
+                    failures: vec![format!("the sweep panicked: {why}")],
+                    ..Default::default()
+                });
             }
         }
     }
     let md = render(&sets, &skipped, dump.as_deref());
-    let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("article-corpus.md");
+    let out = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("article-corpus.md");
     std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     std::fs::write(&out, &md).unwrap();
     eprintln!("report written to {}", out.display());
@@ -888,7 +1094,11 @@ fn corpus_sweep_reports_every_article() {
                 + m.rt_refused.len()
         })
         .sum();
-    eprintln!("{} movesets, {} failures, {residue} residue items", sets.len(), failures.len());
+    eprintln!(
+        "{} movesets, {} failures, {residue} residue items",
+        sets.len(),
+        failures.len()
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -898,8 +1108,14 @@ mod tests {
 
     #[test]
     fn agent_splits_by_longest_fighter_name() {
-        let names: Vec<String> = ["mario", "mariod", "pacman"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(split_agent("mariod_drcapsule", &names), Some(("mariod".into(), Some("drcapsule".into()))));
+        let names: Vec<String> = ["mario", "mariod", "pacman"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            split_agent("mariod_drcapsule", &names),
+            Some(("mariod".into(), Some("drcapsule".into())))
+        );
         assert_eq!(split_agent("mario", &names), Some(("mario".into(), None)));
         assert_eq!(split_agent("pacman_", &names), None);
         assert_eq!(split_agent("toad", &names), None);
@@ -908,14 +1124,46 @@ mod tests {
     /// I-1: the misattribution checks catch a deliberate wrong attribution.
     #[test]
     fn wrong_attributions_fail_the_checks() {
-        let names: Vec<String> = ["mario", "samus", "kirby", "dedede", "murabito"].iter().map(|s| s.to_string()).collect();
+        let names: Vec<String> = ["mario", "samus", "kirby", "dedede", "murabito"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         // An id naming another fighter.
-        assert_eq!(foreign_id_owner("*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", "samus", &names).as_deref(), Some("mario"));
-        assert_eq!(foreign_id_owner("FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT", "Samus", &names), None);
-        assert_eq!(foreign_id_owner("WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", "mario", &names).as_deref(), Some("murabito"));
-        assert_eq!(foreign_id_owner("WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET", "murabito", &names), None);
+        assert_eq!(
+            foreign_id_owner("*FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL", "samus", &names)
+                .as_deref(),
+            Some("mario")
+        );
+        assert_eq!(
+            foreign_id_owner("FIGHTER_SAMUS_GENERATE_ARTICLE_LATIVOLT", "Samus", &names),
+            None
+        );
+        assert_eq!(
+            foreign_id_owner(
+                "WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET",
+                "mario",
+                &names
+            )
+            .as_deref(),
+            Some("murabito")
+        );
+        assert_eq!(
+            foreign_id_owner(
+                "WEAPON_MURABITO_SLINGSHOT_GENERATE_ARTICLE_BULLET",
+                "murabito",
+                &names
+            ),
+            None
+        );
         // A moveset's own name for a fighter (King Boo on dedede) names nobody else.
-        assert_eq!(foreign_id_owner("FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL", "dedede", &names), None);
+        assert_eq!(
+            foreign_id_owner(
+                "FIGHTER_KINGTERESA_GENERATE_ARTICLE_FIREBALL",
+                "dedede",
+                &names
+            ),
+            None
+        );
         assert!(cross_fighter_ok("kirby", "mario") && cross_fighter_ok("samusd", "samus"));
         assert!(!cross_fighter_ok("samus", "lucario"));
 
@@ -956,11 +1204,37 @@ mod tests {
             (root.join("mario/fireball.rs"), "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {}".to_string()),
         ];
         let names: Vec<String> = ["mario", "luigi"].iter().map(|s| s.to_string()).collect();
-        let wrong = script_scope_check("mario_fireball", "mario", &root.join("luigi/acmd.rs"), "game_fly", &root, &sources, &names);
+        let wrong = script_scope_check(
+            "mario_fireball",
+            "mario",
+            &root.join("luigi/acmd.rs"),
+            "game_fly",
+            &root,
+            &sources,
+            &names,
+        );
         assert!(wrong.unwrap_err().contains("luigi"));
         // Registered by that agent explicitly, or under a folder naming the owner: fine.
-        assert!(script_scope_check("mario_fireball", "mario", &root.join("mario/fireball.rs"), "game_x", &root, &sources, &names).is_ok());
-        assert!(script_scope_check("luigi_fireball", "luigi", &root.join("luigi/acmd.rs"), "game_fly", &root, &sources, &names).is_ok());
+        assert!(script_scope_check(
+            "mario_fireball",
+            "mario",
+            &root.join("mario/fireball.rs"),
+            "game_x",
+            &root,
+            &sources,
+            &names
+        )
+        .is_ok());
+        assert!(script_scope_check(
+            "luigi_fireball",
+            "luigi",
+            &root.join("luigi/acmd.rs"),
+            "game_fly",
+            &root,
+            &sources,
+            &names
+        )
+        .is_ok());
     }
 
     #[test]

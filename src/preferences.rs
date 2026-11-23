@@ -139,7 +139,10 @@ mod tests {
         assert!(preferences.world_axes);
         assert_eq!(preferences.navigation_scheme, NavigationScheme::Ssbh);
         assert_eq!(preferences.navigation_widget, NavigationWidget::Axes);
-        assert_eq!(preferences.home_camera(), crate::renderer::CameraView::default());
+        assert_eq!(
+            preferences.home_camera(),
+            crate::renderer::CameraView::default()
+        );
     }
 
     #[test]

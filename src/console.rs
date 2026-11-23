@@ -93,9 +93,9 @@ mod imp {
     pub fn set_visible(_show: bool) {}
 }
 
-pub use imp::{from_terminal, init, set_visible};
 #[cfg(windows)]
 use imp::has_console;
+pub use imp::{from_terminal, init, set_visible};
 
 /// Whether this platform has a console window Visionary can show or hide.
 pub const SUPPORTED: bool = cfg!(windows);

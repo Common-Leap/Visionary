@@ -2369,13 +2369,18 @@ mod older_project_tests {
     #[test]
     fn project_fighters_round_trip() {
         let mut project = ModProjectFile::default();
-        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project
+            .project_fighters
+            .insert(ProjectFighter::fighter("mario"));
         project
             .project_fighters
             .insert(ProjectFighter::character("pacman", "Shy Guy"));
 
         let json = serde_json::to_string(&ProjectFighter::fighter("mario")).unwrap();
-        assert!(!json.contains("character"), "a fighter's own row has no character key: {json}");
+        assert!(
+            !json.contains("character"),
+            "a fighter's own row has no character key: {json}"
+        );
 
         let reloaded: ModProjectFile =
             serde_json::from_str(&serde_json::to_string(&project).unwrap()).unwrap();
@@ -2385,11 +2390,15 @@ mod older_project_tests {
     #[test]
     fn seed_adds_edited_and_authored() {
         let mut project = ModProjectFile::default();
-        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
-            "attack_s3_s".into(),
-            crate::data::AcmdScript::default(),
-        );
-        project.fighters.insert("falco".into(), FighterMod::default());
+        project
+            .fighters
+            .entry("fox".into())
+            .or_default()
+            .sound_scripts
+            .insert("attack_s3_s".into(), crate::data::AcmdScript::default());
+        project
+            .fighters
+            .insert("falco".into(), FighterMod::default());
         project.roster.authored.push(AuthoredEntry {
             key: crate::roster::RosterKey::slot("pacman", 8),
             donor: "pacman".into(),
@@ -2419,10 +2428,12 @@ mod older_project_tests {
             version,
             ..Default::default()
         };
-        project.fighters.entry("fox".into()).or_default().sound_scripts.insert(
-            "attack_s3_s".into(),
-            crate::data::AcmdScript::default(),
-        );
+        project
+            .fighters
+            .entry("fox".into())
+            .or_default()
+            .sound_scripts
+            .insert("attack_s3_s".into(), crate::data::AcmdScript::default());
         project
     }
 
@@ -2430,14 +2441,18 @@ mod older_project_tests {
     fn v3_project_is_seeded_on_migrate() {
         let mut project = with_edited_fox(3);
         project.migrate().unwrap();
-        assert!(project.project_fighters.contains(&ProjectFighter::fighter("fox")));
+        assert!(project
+            .project_fighters
+            .contains(&ProjectFighter::fighter("fox")));
     }
 
     #[test]
     fn common_leap_v7_project_is_seeded_on_migrate() {
         let mut project = with_edited_fox(7);
         project.migrate().unwrap();
-        assert!(project.project_fighters.contains(&ProjectFighter::fighter("fox")));
+        assert!(project
+            .project_fighters
+            .contains(&ProjectFighter::fighter("fox")));
     }
 
     #[test]
@@ -2458,7 +2473,9 @@ mod older_project_tests {
     #[test]
     fn scope_only_project_is_empty() {
         let mut project = ModProjectFile::default();
-        project.project_fighters.insert(ProjectFighter::fighter("mario"));
+        project
+            .project_fighters
+            .insert(ProjectFighter::fighter("mario"));
         project.moveset_source = Some("C:/mods/my_moveset".into());
         assert!(project.is_empty());
     }

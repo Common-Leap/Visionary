@@ -248,9 +248,9 @@ fn agent_new(expr: &syn::Expr) -> Option<String> {
 fn chain_agent(expr: &syn::Expr, bindings: &HashMap<String, String>) -> Option<String> {
     match expr {
         syn::Expr::MethodCall(call) => chain_agent(&call.receiver, bindings),
-        syn::Expr::Path(path) if path.path.segments.len() == 1 => {
-            bindings.get(&path.path.segments[0].ident.to_string()).cloned()
-        }
+        syn::Expr::Path(path) if path.path.segments.len() == 1 => bindings
+            .get(&path.path.segments[0].ident.to_string())
+            .cloned(),
         syn::Expr::Reference(reference) => chain_agent(&reference.expr, bindings),
         syn::Expr::Paren(paren) => chain_agent(&paren.expr, bindings),
         _ => agent_new(expr),
@@ -342,7 +342,13 @@ struct Walker<'a> {
 }
 
 impl<'a> Walker<'a> {
-    fn walk_fn(&mut self, file: &'a Path, item: &'a syn::ItemFn, args: Vec<LocalVal>, depth: usize) {
+    fn walk_fn(
+        &mut self,
+        file: &'a Path,
+        item: &'a syn::ItemFn,
+        args: Vec<LocalVal>,
+        depth: usize,
+    ) {
         let name = item.sig.ident.to_string();
         if depth > MAX_DEPTH || !self.stack.insert(name.clone()) {
             return;
@@ -435,7 +441,10 @@ impl<'a> Walker<'a> {
                     .collect();
 
                 // 1. Direct `FighterUtil::set_hit_data(boma, idx, group, &p1, &p2, r, bone, ...)`.
-                if matches!(tail.as_slice(), ["FighterUtil", "set_hit_data"] | ["set_hit_data"]) {
+                if matches!(
+                    tail.as_slice(),
+                    ["FighterUtil", "set_hit_data"] | ["set_hit_data"]
+                ) {
                     if let Some(hurtbox) = self.parse_set_hit_data(call, file, env) {
                         self.record(hurtbox);
                     }

@@ -9,8 +9,8 @@ use egui::{Color32, DragValue, Grid, Id, RichText, ScrollArea, TextEdit, Ui};
 use rfd::FileDialog;
 
 use crate::motion_list::{
-    flag_mut, insert_motion_after, label, new_motion, parse_hash, rename_motion, unique_key,
-    Extra, Hash40, Motion, MotionListFile, FLAG_DESCRIPTIONS, FLAG_NAMES, MAX_ANIMATIONS,
+    flag_mut, insert_motion_after, label, new_motion, parse_hash, rename_motion, unique_key, Extra,
+    Hash40, Motion, MotionListFile, FLAG_DESCRIPTIONS, FLAG_NAMES, MAX_ANIMATIONS,
 };
 
 const XLU_HELP: &str = "Intangibility frames used by some fighter motions.";
@@ -114,8 +114,9 @@ impl MotionListEditor {
                             .on_hover_text("Load a \"0xhash,label\" CSV such as ParamLabels.csv.")
                             .clicked()
                         {
-                            if let Some(path) =
-                                FileDialog::new().add_filter("Labels", &["csv", "txt"]).pick_file()
+                            if let Some(path) = FileDialog::new()
+                                .add_filter("Labels", &["csv", "txt"])
+                                .pick_file()
                             {
                                 self.message = load_labels_csv(&path).err();
                             }
@@ -153,7 +154,11 @@ impl MotionListEditor {
                         ui.label("[Modified]");
                     }
                 });
-                ui.label(RichText::new(self.file.path.to_string_lossy()).weak().small());
+                ui.label(
+                    RichText::new(self.file.path.to_string_lossy())
+                        .weak()
+                        .small(),
+                );
                 if let Some(message) = &self.message {
                     ui.colored_label(ERROR_COLOR, message);
                 }
@@ -166,9 +171,11 @@ impl MotionListEditor {
                         changed |= self.entry_list(ui);
                     });
                 egui::CentralPanel::default().show(ui, |ui| {
-                    ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                        changed |= self.selected_motion(ui, anim_names);
-                    });
+                    ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            changed |= self.selected_motion(ui, anim_names);
+                        });
                 });
             });
 
@@ -214,7 +221,9 @@ impl MotionListEditor {
 
     fn entry_list(&mut self, ui: &mut Ui) -> bool {
         let mut changed = false;
-        let selected = self.selected.filter(|k| self.file.mlist.list.contains_key(k));
+        let selected = self
+            .selected
+            .filter(|k| self.file.mlist.list.contains_key(k));
 
         ui.horizontal(|ui| {
             let mlist = &mut self.file.mlist;
@@ -252,7 +261,8 @@ impl MotionListEditor {
                 .add_enabled(selected.is_some(), egui::Button::new("Delete"))
                 .clicked()
             {
-                if let Some((index, _, _)) = selected.and_then(|s| mlist.list.shift_remove_full(&s)) {
+                if let Some((index, _, _)) = selected.and_then(|s| mlist.list.shift_remove_full(&s))
+                {
                     // Keep a nearby entry selected to make deleting several in a row easier.
                     self.selected = mlist
                         .list
@@ -277,7 +287,11 @@ impl MotionListEditor {
             .iter()
             .filter_map(|(key, motion)| {
                 let name = label(*key);
-                let anim = motion.animations.first().map(|a| label(a.name)).unwrap_or_default();
+                let anim = motion
+                    .animations
+                    .first()
+                    .map(|a| label(a.name))
+                    .unwrap_or_default();
                 let matches = search.is_empty()
                     || name.to_lowercase().contains(&search)
                     || motion
@@ -293,7 +307,9 @@ impl MotionListEditor {
 
         let row_height = ui.spacing().interact_size.y;
         let scroll_to = if self.scroll_to_selected {
-            entries.iter().position(|(k, _, _)| Some(*k) == self.selected)
+            entries
+                .iter()
+                .position(|(k, _, _)| Some(*k) == self.selected)
         } else {
             None
         };
@@ -324,7 +340,10 @@ impl MotionListEditor {
     }
 
     fn selected_motion(&mut self, ui: &mut Ui, anim_names: &[String]) -> bool {
-        let Some(key) = self.selected.filter(|k| self.file.mlist.list.contains_key(k)) else {
+        let Some(key) = self
+            .selected
+            .filter(|k| self.file.mlist.list.contains_key(k))
+        else {
             ui.label("Select a motion to edit.");
             return false;
         };
@@ -357,13 +376,20 @@ impl MotionListEditor {
                     return;
                 };
 
-                ui.label("Game Script").on_hover_text("The ACMD game script for this motion.");
-                changed |=
-                    hash_edit(ui, Id::unique("game_script"), &mut motion.game_script, f32::INFINITY);
+                ui.label("Game Script")
+                    .on_hover_text("The ACMD game script for this motion.");
+                changed |= hash_edit(
+                    ui,
+                    Id::unique("game_script"),
+                    &mut motion.game_script,
+                    f32::INFINITY,
+                );
                 ui.end_row();
 
                 ui.label("Blend Frames").on_hover_text(BLEND_HELP);
-                changed |= ui.add(DragValue::new(&mut motion.blend_frames).range(0..=255)).changed();
+                changed |= ui
+                    .add(DragValue::new(&mut motion.blend_frames).range(0..=255))
+                    .changed();
                 ui.end_row();
             });
 
@@ -374,25 +400,29 @@ impl MotionListEditor {
 
         ui.add_space(SECTION_SPACING);
         ui.heading("Flags");
-        Grid::new("motion_list_flags").num_columns(3).show(ui, |ui| {
-            for i in 0..6 {
-                changed |= flag_checkbox(ui, motion, i);
-                if i % 3 == 2 {
-                    ui.end_row();
+        Grid::new("motion_list_flags")
+            .num_columns(3)
+            .show(ui, |ui| {
+                for i in 0..6 {
+                    changed |= flag_checkbox(ui, motion, i);
+                    if i % 3 == 2 {
+                        ui.end_row();
+                    }
                 }
-            }
-        });
+            });
         egui::CollapsingHeader::new("Unknown Flags")
             .id_salt("motion_list_unk_flags")
             .show(ui, |ui| {
-                Grid::new("motion_list_unk_flags_grid").num_columns(4).show(ui, |ui| {
-                    for i in 6..FLAG_NAMES.len() {
-                        changed |= flag_checkbox(ui, motion, i);
-                        if i % 4 == 1 {
-                            ui.end_row();
+                Grid::new("motion_list_unk_flags_grid")
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        for i in 6..FLAG_NAMES.len() {
+                            changed |= flag_checkbox(ui, motion, i);
+                            if i % 4 == 1 {
+                                ui.end_row();
+                            }
                         }
-                    }
-                });
+                    });
             });
 
         ui.add_space(SECTION_SPACING);
@@ -411,7 +441,12 @@ impl MotionListEditor {
                     .changed();
                 ui.label("Unk");
                 changed |= anim_name_menu(ui, &mut anim.name, anim_names);
-                changed |= hash_edit(ui, Id::unique(("motion_anim", i)), &mut anim.name, f32::INFINITY);
+                changed |= hash_edit(
+                    ui,
+                    Id::unique(("motion_anim", i)),
+                    &mut anim.name,
+                    f32::INFINITY,
+                );
             });
         }
         if let Some(i) = anim_to_remove {
@@ -419,7 +454,10 @@ impl MotionListEditor {
             changed = true;
         }
         if ui
-            .add_enabled(motion.animations.len() < MAX_ANIMATIONS, egui::Button::new("Add Animation"))
+            .add_enabled(
+                motion.animations.len() < MAX_ANIMATIONS,
+                egui::Button::new("Add Animation"),
+            )
             .clicked()
         {
             motion.animations.push(Default::default());
@@ -427,7 +465,8 @@ impl MotionListEditor {
         }
 
         ui.add_space(SECTION_SPACING);
-        ui.heading("Scripts").on_hover_text("Effect, sound and expression scripts for this motion.");
+        ui.heading("Scripts")
+            .on_hover_text("Effect, sound and expression scripts for this motion.");
         let mut script_to_remove = None;
         for (i, script) in motion.scripts.iter_mut().enumerate() {
             trailing_row(ui, |ui| {
@@ -559,17 +598,23 @@ fn extra_fields(ui: &mut Ui, extra: &mut Extra) -> bool {
         .min_col_width(LABEL_WIDTH)
         .show(ui, |ui| {
             ui.label("Cancel Frame").on_hover_text(CANCEL_HELP);
-            changed |= ui.add(DragValue::new(&mut extra.cancel_frame).range(0..=255)).changed();
+            changed |= ui
+                .add(DragValue::new(&mut extra.cancel_frame).range(0..=255))
+                .changed();
             ui.end_row();
-    
+
             ui.label("XLU Start").on_hover_text(XLU_HELP);
-            changed |= ui.add(DragValue::new(&mut extra.xlu_start).range(0..=255)).changed();
+            changed |= ui
+                .add(DragValue::new(&mut extra.xlu_start).range(0..=255))
+                .changed();
             ui.end_row();
-    
+
             ui.label("XLU End").on_hover_text(XLU_HELP);
-            changed |= ui.add(DragValue::new(&mut extra.xlu_end).range(0..=255)).changed();
+            changed |= ui
+                .add(DragValue::new(&mut extra.xlu_end).range(0..=255))
+                .changed();
             ui.end_row();
-    
+
             ui.label("No Stop Intp").on_hover_text(NO_STOP_INTP_HELP);
             changed |= ui.checkbox(&mut extra.no_stop_intp, "").changed();
             ui.end_row();
@@ -581,7 +626,10 @@ fn extra_fields(ui: &mut Ui, extra: &mut Extra) -> bool {
 /// that fills what is left. Keeps every row's buttons flush with the right edge.
 fn trailing_row(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add_contents);
+        ui.with_layout(
+            egui::Layout::right_to_left(egui::Align::Center),
+            add_contents,
+        );
     });
 }
 

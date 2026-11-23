@@ -78,7 +78,10 @@ pub fn plan(
             let toml = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
                 .with_context(|| format!("reading {}", crate_dir.join("Cargo.toml").display()))?;
             let Some(lib) = library_name(&toml) else {
-                bail!("{} names no package", crate_dir.join("Cargo.toml").display());
+                bail!(
+                    "{} names no package",
+                    crate_dir.join("Cargo.toml").display()
+                );
             };
             let nro_name = format!("lib{}.nro", lib.replace('-', "_"));
             let built = crate_dir
@@ -94,7 +97,9 @@ pub fn plan(
             (crate_dir, nro_name, built)
         }
     };
-    let mut targets = sd_root.map(|sd| deployed_copies(sd, &nro_name)).unwrap_or_default();
+    let mut targets = sd_root
+        .map(|sd| deployed_copies(sd, &nro_name))
+        .unwrap_or_default();
     if let Some(sd) = sd_root {
         if let Some(renamed) = fingerprinted_plugin(sd, &crate_dir, files) {
             targets.push(renamed);
@@ -168,7 +173,10 @@ pub fn run(plan: &Plan) -> Outcome {
     else {
         return Outcome {
             ok: false,
-            message: format!("the build succeeded but {} was not found under target/", plan.nro_name),
+            message: format!(
+                "the build succeeded but {} was not found under target/",
+                plan.nro_name
+            ),
             log,
         };
     };
@@ -196,7 +204,11 @@ pub fn run(plan: &Plan) -> Outcome {
             plan.nro_name,
             written.len()
         );
-        if plan.dev_reload.as_ref().is_some_and(|dev| written.contains(dev)) {
+        if plan
+            .dev_reload
+            .as_ref()
+            .is_some_and(|dev| written.contains(dev))
+        {
             message.push_str(" — press L + R + D-pad Up in the game's menus to hot-reload it");
         } else {
             message.push_str(" — restart the game to load it");
@@ -229,7 +241,10 @@ fn owning_crate(files: &[PathBuf]) -> Option<PathBuf> {
             None => counts.push((dir.to_path_buf(), 1)),
         }
     }
-    counts.into_iter().max_by_key(|(_, count)| *count).map(|(dir, _)| dir)
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(dir, _)| dir)
 }
 
 fn is_package(toml: &Path) -> bool {
@@ -247,7 +262,9 @@ fn library_name(toml: &str) -> Option<String> {
             section = line;
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if key.trim() != "name" {
             continue;
         }
@@ -269,7 +286,10 @@ fn fingerprinted_plugin(sd: &Path, crate_dir: &Path, files: &[PathBuf]) -> Optio
         .filter_map(|file| file.strip_prefix(crate_dir).ok())
         .flat_map(|relative| {
             let forward = relative.to_string_lossy().replace('\\', "/");
-            [forward.replace('/', "\\").into_bytes(), forward.into_bytes()]
+            [
+                forward.replace('/', "\\").into_bytes(),
+                forward.into_bytes(),
+            ]
         })
         .collect();
     if needles.is_empty() {
@@ -281,7 +301,9 @@ fn fingerprinted_plugin(sd: &Path, crate_dir: &Path, files: &[PathBuf]) -> Optio
     };
     for entry in mods.flatten() {
         let plugin = entry.path().join("plugin.nro");
-        let Ok(bytes) = std::fs::read(&plugin) else { continue };
+        let Ok(bytes) = std::fs::read(&plugin) else {
+            continue;
+        };
         let score = needles
             .iter()
             .filter(|needle| contains(&bytes, needle))
@@ -299,7 +321,10 @@ fn fingerprinted_plugin(sd: &Path, crate_dir: &Path, files: &[PathBuf]) -> Optio
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Every copy of `nro_name` the game would load from this SD (and the emulator's LayeredFS
@@ -319,7 +344,12 @@ fn deployed_copies(sd: &Path, nro_name: &str) -> Vec<PathBuf> {
         found.push(skyline);
     }
     if let Some(emulator) = sd.parent() {
-        find_named(&emulator.join("load").join(TITLE_ID), nro_name, 5, &mut found);
+        find_named(
+            &emulator.join("load").join(TITLE_ID),
+            nro_name,
+            5,
+            &mut found,
+        );
     }
     found.sort();
     found.dedup();
@@ -327,14 +357,19 @@ fn deployed_copies(sd: &Path, nro_name: &str) -> Vec<PathBuf> {
 }
 
 fn find_named(dir: &Path, name: &str, depth: usize, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             if depth > 0 {
                 find_named(&path, name, depth - 1, out);
             }
-        } else if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+        } else if path
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
             out.push(path);
         }
     }
@@ -344,10 +379,19 @@ fn find_named(dir: &Path, name: &str, depth: usize, out: &mut Vec<PathBuf>) {
 fn first_error(stderr: &str) -> String {
     let mut lines = stderr.lines().skip_while(|line| !line.starts_with("error"));
     let Some(head) = lines.next() else {
-        return stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+        return stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
     };
     match lines.find(|line| line.trim_start().starts_with("-->")) {
-        Some(at) => format!("{head} ({})", at.trim_start().trim_start_matches("-->").trim()),
+        Some(at) => format!(
+            "{head} ({})",
+            at.trim_start().trim_start_matches("-->").trim()
+        ),
         None => head.to_string(),
     }
 }
@@ -366,14 +410,30 @@ mod tests {
     fn the_plan_finds_the_crate_its_plugin_and_every_deployed_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        put(root, "plugin/Cargo.toml", "[package]\nname = \"shy-guy\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
-        put(root, "plugin/src/lib.rs", "#[no_mangle]\npub extern \"C\" fn smashline_install() {}\n");
-        put(root, "crates/hash_lookup/Cargo.toml", "[package]\nname = \"hash_lookup\"\n");
+        put(
+            root,
+            "plugin/Cargo.toml",
+            "[package]\nname = \"shy-guy\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        );
+        put(
+            root,
+            "plugin/src/lib.rs",
+            "#[no_mangle]\npub extern \"C\" fn smashline_install() {}\n",
+        );
+        put(
+            root,
+            "crates/hash_lookup/Cargo.toml",
+            "[package]\nname = \"hash_lookup\"\n",
+        );
         put(root, "crates/hash_lookup/src/lib.rs", "");
         let sd = root.join("emu/sdmc");
         put(&sd, "ultimate/mods/Shy Guy/libshy_guy.nro", "old");
         put(&sd, "ultimate/mods/Other/libother.nro", "old");
-        put(root, "emu/load/01006A800016E000/ShyGuy/romfs/skyline/plugins/libshy_guy.nro", "old");
+        put(
+            root,
+            "emu/load/01006A800016E000/ShyGuy/romfs/skyline/plugins/libshy_guy.nro",
+            "old",
+        );
 
         let files = vec![root.join("plugin/src/lib.rs")];
         let sources = vec![std::fs::read_to_string(&files[0]).unwrap()];
@@ -381,12 +441,23 @@ mod tests {
         assert_eq!(plan.crate_dir, root.join("plugin"));
         assert_eq!(plan.nro_name, "libshy_guy.nro");
         assert_eq!(plan.targets.len(), 2, "{:?}", plan.targets);
-        assert!(plan.dev_reload.as_ref().is_some_and(|p| p.ends_with("romfs/smashline/development.nro")));
+        assert!(plan
+            .dev_reload
+            .as_ref()
+            .is_some_and(|p| p.ends_with("romfs/smashline/development.nro")));
 
         // Renamed to `plugin.nro` by the mod: found by the crate's own paths, not by name. A
         // sibling built from a shared template matches only the shared files and loses.
-        put(&sd, "ultimate/mods/[Moveset] Shy Guy/plugin.nro", "....src\\lib.rs....src\\shyguy\\a.rs..src\\shyguy\\b.rs..src\\shyguy\\c.rs..");
-        put(&sd, "ultimate/mods/[Moveset] Sceptile/plugin.nro", "....src\\lib.rs....src\\sceptile\\a.rs..");
+        put(
+            &sd,
+            "ultimate/mods/[Moveset] Shy Guy/plugin.nro",
+            "....src\\lib.rs....src\\shyguy\\a.rs..src\\shyguy\\b.rs..src\\shyguy\\c.rs..",
+        );
+        put(
+            &sd,
+            "ultimate/mods/[Moveset] Sceptile/plugin.nro",
+            "....src\\lib.rs....src\\sceptile\\a.rs..",
+        );
         let mut files = files.clone();
         for name in ["a", "b", "c"] {
             let file = root.join(format!("plugin/src/shyguy/{name}.rs"));
@@ -395,14 +466,23 @@ mod tests {
         }
         let plan = super::plan(&files, &sources, Some(&sd), None).unwrap();
         assert!(
-            plan.targets.iter().any(|t| t.ends_with("[Moveset] Shy Guy/plugin.nro")),
+            plan.targets
+                .iter()
+                .any(|t| t.ends_with("[Moveset] Shy Guy/plugin.nro")),
             "{:?}",
             plan.targets
         );
-        assert!(!plan.targets.iter().any(|t| t.to_string_lossy().contains("Sceptile")));
+        assert!(!plan
+            .targets
+            .iter()
+            .any(|t| t.to_string_lossy().contains("Sceptile")));
 
         // Pretend cargo ran: deploy only.
-        put(root, "plugin/target/aarch64-skyline-switch/release/libshy_guy.nro", "new");
+        put(
+            root,
+            "plugin/target/aarch64-skyline-switch/release/libshy_guy.nro",
+            "new",
+        );
         let built = plan.built.iter().find(|p| p.is_file()).unwrap();
         assert!(built.starts_with(root.join("plugin")));
     }
@@ -413,12 +493,18 @@ mod tests {
             library_name("[package]\nname = \"a-b\" # x\n[lib]\nname = \"plugin\"\n").as_deref(),
             Some("plugin")
         );
-        assert_eq!(library_name("[package]\nname = \"a-b\"\n").as_deref(), Some("a-b"));
+        assert_eq!(
+            library_name("[package]\nname = \"a-b\"\n").as_deref(),
+            Some("a-b")
+        );
     }
 
     #[test]
     fn the_first_compiler_error_is_reported_with_its_location() {
         let stderr = "   Compiling x\nwarning: unused\nerror[E0425]: cannot find value `y`\n  --> src/lib.rs:3:5\n   |\n";
-        assert_eq!(first_error(stderr), "error[E0425]: cannot find value `y` (src/lib.rs:3:5)");
+        assert_eq!(
+            first_error(stderr),
+            "error[E0425]: cannot find value `y` (src/lib.rs:3:5)"
+        );
     }
 }

@@ -92,7 +92,9 @@ pub fn navigate(
         ]
         .into_iter()
         .find(|key| input.key_pressed(*key) && !input.modifiers.shift && !input.modifiers.alt)
-        .and_then(|key| crate::orientation_widget::numpad_view(key, input.modifiers.command, camera));
+        .and_then(|key| {
+            crate::orientation_widget::numpad_view(key, input.modifiers.command, camera)
+        });
         if let Some(rotation) = view {
             camera.turn_to(rotation);
             moved = true;
@@ -186,7 +188,7 @@ fn keyboard_pan(camera: &mut Camera, input: &egui::InputState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renderer::{CameraView, camera_rotation};
+    use crate::renderer::{camera_rotation, CameraView};
 
     #[test]
     fn blender_drags_pan_with_shift_and_zoom_with_ctrl() {
@@ -229,9 +231,15 @@ mod tests {
         let center = Vec3::new(32.0, 9.0, 4.0);
         camera.frame(center, 12.0);
         assert_eq!(camera.rotation, rotation);
-        let view = camera.transforms(800.0, 600.0).model_view_matrix.transform_point3(center);
+        let view = camera
+            .transforms(800.0, 600.0)
+            .model_view_matrix
+            .transform_point3(center);
         assert!(view.x.abs() < 1e-3 && view.y.abs() < 1e-3, "{view}");
-        assert!(view.z < -12.0, "the sphere is in front of the camera: {view}");
+        assert!(
+            view.z < -12.0,
+            "the sphere is in front of the camera: {view}"
+        );
         assert!(target_on_screen(&camera).abs_diff_eq(view, 1e-3));
     }
 

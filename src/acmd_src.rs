@@ -169,7 +169,9 @@ pub(crate) fn bare_macro_name_at(text: &str, i: usize, limit: usize) -> Option<R
         return None;
     }
     let mut end = i;
-    while end < limit && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_') {
+    while end < limit
+        && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
+    {
         end += 1;
     }
     if end - i < 4 || bytes.get(end) != Some(&b'(') {
@@ -817,13 +819,17 @@ impl SourceIndex {
         let mut scope_root = root.to_path_buf();
         if let Some(compiled) = compiled_files(root, &texts) {
             // Cargo spells paths its own way (drive-letter case, separators); compare by key.
-            let keys: HashSet<String> =
-                compiled.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let keys: HashSet<String> = compiled
+                .iter()
+                .map(|file| crate::cargo_project::path_key(file))
+                .collect();
             let built = |file: &PathBuf| keys.contains(&crate::cargo_project::path_key(file));
             sources.retain(|(file, _)| built(file));
             files.retain(built);
-            let linked: HashSet<String> =
-                files.iter().map(|file| crate::cargo_project::path_key(file)).collect();
+            let linked: HashSet<String> = files
+                .iter()
+                .map(|file| crate::cargo_project::path_key(file))
+                .collect();
             let mut outside: Vec<&PathBuf> = compiled
                 .iter()
                 .filter(|file| !linked.contains(&crate::cargo_project::path_key(file)))
@@ -838,7 +844,10 @@ impl SourceIndex {
                     let prefix = prefix.trim_end_matches(['\\', '/']);
                     let rest = key.strip_prefix(prefix)?;
                     rest.starts_with(['\\', '/']).then(|| {
-                        (ancestor, rest.split(['\\', '/']).filter(|s| !s.is_empty()).count())
+                        (
+                            ancestor,
+                            rest.split(['\\', '/']).filter(|s| !s.is_empty()).count(),
+                        )
                     })
                 }) else {
                     continue;
@@ -847,7 +856,9 @@ impl SourceIndex {
                 let Some(tail) = parts.len().checked_sub(depth).map(|start| &parts[start..]) else {
                     continue;
                 };
-                let respelled = tail.iter().fold(ancestor.to_path_buf(), |dir, part| dir.join(part));
+                let respelled = tail
+                    .iter()
+                    .fold(ancestor.to_path_buf(), |dir, part| dir.join(part));
                 let Ok(text) = std::fs::read_to_string(&respelled) else {
                     continue;
                 };
@@ -966,9 +977,8 @@ impl SourceIndex {
             |file| fighter_for_file(file, &scope_root, &fighter_scopes),
             &index.consts,
         );
-        index.param_scale = crate::fighter_scale::param_config_scale(
-            sources.iter().map(|(_, text)| text.as_str()),
-        );
+        index.param_scale =
+            crate::fighter_scale::param_config_scale(sources.iter().map(|(_, text)| text.as_str()));
         // One agent for every costume is enough to make the fighter's own slots modded too.
         index.costume_gated = gating
             .into_iter()
@@ -1155,10 +1165,21 @@ impl SourceIndex {
                 .filter(|name| !name.is_empty())
                 .collect();
             agents.sort_unstable();
-            let shown = agents.iter().take(6).copied().collect::<Vec<_>>().join(", ");
+            let shown = agents
+                .iter()
+                .take(6)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
             let more = agents.len().saturating_sub(6);
-            let more = if more > 0 { format!(" +{more}") } else { String::new() };
-            return format!("the linked source has no `{wanted}` scripts (it defines {shown}{more})");
+            let more = if more > 0 {
+                format!(" +{more}")
+            } else {
+                String::new()
+            };
+            return format!(
+                "the linked source has no `{wanted}` scripts (it defines {shown}{more})"
+            );
         }
         format!("the linked source does not define {wanted}/{move_name}")
     }
@@ -1366,7 +1387,8 @@ impl SourceIndex {
 
         let mut resolved = Vec::new();
         for entry in pending {
-            let item = &sources[file_at[entry.wrapper.file.as_path()]].1[entry.wrapper.span.clone()];
+            let item =
+                &sources[file_at[entry.wrapper.file.as_path()]].1[entry.wrapper.span.clone()];
             let delegate = match entry.callee {
                 Err(reason) => Delegate {
                     file: entry.wrapper.file.clone(),
@@ -1489,32 +1511,36 @@ impl SourceIndex {
                 .filter(|_| facts.definitions.get(&function.name).copied().unwrap_or(0) <= 1);
             // `(agent, script)` per script this function is. A known agent is the call's own
             // receiver; `None` falls back to the scopes below.
-            let targets: Vec<(Option<String>, String)> = if let Some(script) = function.script.clone() {
-                vec![(None, script)]
-            } else if let Some(targets) = named.get(function.name.as_str()) {
-                targets.clone()
-            } else if replaced.contains(function.name.as_str()) {
-                continue;
-            } else if let Some(scripts) = registrations {
-                scripts
-                    .iter()
-                    .map(|registered| {
-                        let agent = registered.exact.then(|| registered.fighter.clone()).flatten();
-                        (agent, registered.script.clone())
-                    })
-                    .collect()
-            } else if ["game_", "effect_", "sound_", "expression_"]
+            let targets: Vec<(Option<String>, String)> =
+                if let Some(script) = function.script.clone() {
+                    vec![(None, script)]
+                } else if let Some(targets) = named.get(function.name.as_str()) {
+                    targets.clone()
+                } else if replaced.contains(function.name.as_str()) {
+                    continue;
+                } else if let Some(scripts) = registrations {
+                    scripts
+                        .iter()
+                        .map(|registered| {
+                            let agent = registered
+                                .exact
+                                .then(|| registered.fighter.clone())
+                                .flatten();
+                            (agent, registered.script.clone())
+                        })
+                        .collect()
+                } else if ["game_", "effect_", "sound_", "expression_"]
                 .iter()
                 .any(|prefix| function.name.starts_with(prefix))
                 // Named like a script but never registered, while the project explicitly
                 // registers that script name to some other function: dead code, and the
                 // registered function is what the game runs.
                 && !facts.registered.contains(&function.name)
-            {
-                vec![(None, function.name.clone())]
-            } else {
-                continue;
-            };
+                {
+                    vec![(None, function.name.clone())]
+                } else {
+                    continue;
+                };
             // Narrowest scope that names exactly ONE fighter wins: the function's own
             // attribute, then its closest enclosing source module, then the whole project for
             // a single-character mod. A scope naming several fighters is ambiguous, and
@@ -1573,7 +1599,10 @@ impl SourceIndex {
         let mut defined: HashMap<String, Vec<(usize, Range<usize>)>> = HashMap::new();
         for (n, (_, text)) in sources.iter().enumerate() {
             for function in scan_plain_functions(text) {
-                defined.entry(function.name).or_default().push((n, function.span));
+                defined
+                    .entry(function.name)
+                    .or_default()
+                    .push((n, function.span));
             }
         }
         for (n, (file, text)) in sources.iter().enumerate() {
@@ -1607,13 +1636,20 @@ impl SourceIndex {
                 };
                 if !is_identifier(&registration.function) {
                     self.unresolved_statuses.push(UnresolvedStatus {
-                        reason: "registered with a closure or expression, not a named function".to_string(),
+                        reason: "registered with a closure or expression, not a named function"
+                            .to_string(),
                         ..unresolved
                     });
                     continue;
                 }
-                let candidates = defined.get(&registration.function).map(Vec::as_slice).unwrap_or(&[]);
-                let own = candidates.iter().filter(|(at, _)| *at == n).collect::<Vec<_>>();
+                let candidates = defined
+                    .get(&registration.function)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let own = candidates
+                    .iter()
+                    .filter(|(at, _)| *at == n)
+                    .collect::<Vec<_>>();
                 // `fly::bullet_seed_end` names the function in the `fly` module beside the
                 // registering file, however many other modules define the same name.
                 let in_module = registration.module.as_deref().map(|module| {
@@ -1624,7 +1660,8 @@ impl SourceIndex {
                         .filter(|(at, _)| {
                             let path = &sources[*at].0;
                             [dir, stem_dir.as_path()].iter().any(|base| {
-                                *path == base.join(format!("{module}.rs")) || *path == base.join(module).join("mod.rs")
+                                *path == base.join(format!("{module}.rs"))
+                                    || *path == base.join(module).join("mod.rs")
                             })
                         })
                         .collect::<Vec<_>>()
@@ -1652,7 +1689,10 @@ impl SourceIndex {
                             candidates.len()
                         )
                     };
-                    self.unresolved_statuses.push(UnresolvedStatus { reason, ..unresolved });
+                    self.unresolved_statuses.push(UnresolvedStatus {
+                        reason,
+                        ..unresolved
+                    });
                     continue;
                 };
                 let site = StatusSite {
@@ -1751,13 +1791,18 @@ fn fighter_for_file(
             // weapon: its registrations name it as their receiver, and it owns no module (King
             // Boo's `status/` holds one beside the statuses it installs on `dedede`).
             let generic = |name: &str| matches!(name, "fighter" | "weapon");
-            let fighters: Vec<&String> =
-                names.iter().filter(|name| !name.contains('_') && !generic(name)).collect();
+            let fighters: Vec<&String> = names
+                .iter()
+                .filter(|name| !name.contains('_') && !generic(name))
+                .collect();
             match fighters.as_slice() {
                 [] => {}
-                [fighter] if names.iter().all(|name| {
-                    *name == **fighter || name.starts_with(&format!("{fighter}_")) || generic(name)
-                }) =>
+                [fighter]
+                    if names.iter().all(|name| {
+                        *name == **fighter
+                            || name.starts_with(&format!("{fighter}_"))
+                            || generic(name)
+                    }) =>
                 {
                     return Some((*fighter).clone());
                 }
@@ -1794,7 +1839,11 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
         let stmt_start = text[..at].rfind([';', '{', '}']).map_or(0, |n| n + 1);
         let head = text[stmt_start..at].trim();
         if let Some(binding) = head.strip_prefix("let ") {
-            let binding = binding.trim_start().strip_prefix("mut ").unwrap_or(binding).trim_start();
+            let binding = binding
+                .trim_start()
+                .strip_prefix("mut ")
+                .unwrap_or(binding)
+                .trim_start();
             let end = ident_end(binding, 0);
             if end > 0 && binding[end..].trim_start().starts_with('=') {
                 bound.insert(binding[..end].to_string(), normalize_fighter(&name));
@@ -1811,14 +1860,18 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
     let Some(module_dir) = module_dir else {
         return Vec::new();
     };
-    let crate_dir = file.ancestors().skip(1).find(|dir| {
-        dir.join("lib.rs").is_file() || dir.join("main.rs").is_file()
-    });
+    let crate_dir = file
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("lib.rs").is_file() || dir.join("main.rs").is_file());
     let mut routes = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < text.len() {
-        if !text.is_char_boundary(i) || !is_ident_byte(bytes[i]) || (i > 0 && is_ident_byte(bytes[i - 1])) {
+        if !text.is_char_boundary(i)
+            || !is_ident_byte(bytes[i])
+            || (i > 0 && is_ident_byte(bytes[i - 1]))
+        {
             i += 1;
             continue;
         }
@@ -1853,7 +1906,11 @@ fn scan_install_routes(file: &Path, text: &str) -> Vec<(PathBuf, String)> {
             if let Some(name) = bound.get(arg) {
                 return Some(name.clone());
             }
-            let inner = arg.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+            let inner = arg
+                .split("Agent::new(")
+                .nth(1)?
+                .trim_start()
+                .strip_prefix('"')?;
             Some(normalize_fighter(&inner[..inner.find('"')?]))
         });
         if let Some(fighter) = fighter {
@@ -2067,7 +2124,10 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
                 .lines()
                 .map(str::trim)
                 .filter(|line| line.starts_with("path"))
-                .filter_map(|line| line.split_once('=').map(|(_, v)| v.trim().trim_matches('"')))
+                .filter_map(|line| {
+                    line.split_once('=')
+                        .map(|(_, v)| v.trim().trim_matches('"'))
+                })
                 .filter(|path| path.ends_with(".rs"))
                 .map(|path| manifest.join(path))
                 .collect::<Vec<_>>();
@@ -2104,12 +2164,20 @@ fn compiled_files(root: &Path, texts: &HashMap<PathBuf, &str>) -> Option<HashSet
         };
         let Some(stem_dir) = stem_dir else { continue };
         for child in module_declarations(text) {
-            let base = child.inline_parents.iter().fold(stem_dir.clone(), |dir, m| dir.join(m));
+            let base = child
+                .inline_parents
+                .iter()
+                .fold(stem_dir.clone(), |dir, m| dir.join(m));
             let candidates = match &child.path_attr {
                 // `#[path]` is relative to the declaring file's directory (inline modules nest).
                 Some(path) => vec![file
                     .parent()
-                    .map(|p| child.inline_parents.iter().fold(p.to_path_buf(), |d, m| d.join(m)))
+                    .map(|p| {
+                        child
+                            .inline_parents
+                            .iter()
+                            .fold(p.to_path_buf(), |d, m| d.join(m))
+                    })
                     .unwrap_or_default()
                     .join(path)],
                 None => vec![
@@ -2439,7 +2507,12 @@ fn last_registrations<'a>(
 ) -> HashMap<(Option<String>, &'a str), &'a str> {
     registrations
         .iter()
-        .map(|registration| ((registration.agent.clone(), registration.script), registration.function))
+        .map(|registration| {
+            (
+                (registration.agent.clone(), registration.script),
+                registration.function,
+            )
+        })
         .collect()
 }
 
@@ -2498,7 +2571,11 @@ fn scan_registrations(text: &str) -> Vec<Registration<'_>> {
     // earlier one, and callers rely on reading them in the order the game does.
     out.sort_by_key(|(at, _, _, _)| *at);
     out.into_iter()
-        .map(|(_, script, function, agent)| Registration { script, function, agent })
+        .map(|(_, script, function, agent)| Registration {
+            script,
+            function,
+            agent,
+        })
         .collect()
 }
 
@@ -2533,7 +2610,10 @@ fn function_module(text: &str) -> Option<String> {
 /// A path's last segment, unless the text is not a plain path (a closure), which stays as written.
 fn function_name(text: &str) -> String {
     let text = text.trim();
-    if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':') {
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    {
         text.rsplit("::").next().unwrap_or(text).to_string()
     } else {
         text.to_string()
@@ -2570,7 +2650,11 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
             let receiver = &text[statement_start(&boundaries, at)..at];
             // `$agent.status($phase, $kind, …)` is the body of a `macro_rules!`: its invocations
             // are the registrations (`noop_status!` ones are read below), not the template.
-            if args.iter().take(2).any(|arg| text[arg.clone()].trim_start().starts_with('$')) {
+            if args
+                .iter()
+                .take(2)
+                .any(|arg| text[arg.clone()].trim_start().starts_with('$'))
+            {
                 continue;
             }
             match (marker, args.len()) {
@@ -2595,8 +2679,15 @@ fn scan_status_registrations(text: &str) -> Vec<StatusRegistration> {
                 ("noop_status!(", 3..) => {
                     let agent = receiver_agent(&text[args[0].clone()], &bindings);
                     let kind_expr = text[args[1].clone()].trim().to_string();
-                    let phases = text[args[2].clone()].trim().trim_start_matches('[').trim_end_matches(']');
-                    for phase in phases.split(',').map(str::trim).filter(|phase| !phase.is_empty()) {
+                    let phases = text[args[2].clone()]
+                        .trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']');
+                    for phase in phases
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|phase| !phase.is_empty())
+                    {
                         out.push(StatusRegistration {
                             at,
                             agent: agent.clone(),
@@ -2641,7 +2732,11 @@ fn statement_start(boundaries: &[usize], at: usize) -> usize {
 
 /// The fighter named by the first `Agent::new("…")` in `text`, normalized.
 fn agent_literal(text: &str) -> Option<String> {
-    let rest = text.split("Agent::new(").nth(1)?.trim_start().strip_prefix('"')?;
+    let rest = text
+        .split("Agent::new(")
+        .nth(1)?
+        .trim_start()
+        .strip_prefix('"')?;
     Some(normalize_fighter(&rest[..rest.find('"')?]))
 }
 
@@ -2675,7 +2770,10 @@ fn receiver_agent(receiver: &str, bindings: &HashMap<String, String>) -> Option<
     if receiver.contains("Agent::new(") {
         return agent_literal(receiver);
     }
-    let receiver = receiver.strip_prefix("&mut").unwrap_or(receiver).trim_start();
+    let receiver = receiver
+        .strip_prefix("&mut")
+        .unwrap_or(receiver)
+        .trim_start();
     let receiver = receiver.strip_prefix('&').unwrap_or(receiver).trim_start();
     let receiver = receiver.strip_prefix('*').unwrap_or(receiver).trim_start();
     let end = ident_end(receiver, 0);
@@ -2729,14 +2827,18 @@ fn keyword_at(text: &str, at: usize, word: &str) -> bool {
     text.is_char_boundary(at)
         && text[at..].starts_with(word)
         && (at == 0 || !is_ident_byte(bytes[at - 1]))
-        && bytes.get(at + word.len()).is_some_and(|b| !is_ident_byte(*b))
+        && bytes
+            .get(at + word.len())
+            .is_some_and(|b| !is_ident_byte(*b))
 }
 
 /// The span (declaration line start through closing brace) of the one function named `name` in
 /// `text`. `None` when there is none, or more than one, since which one a call reaches would then
 /// depend on module scoping this does not model.
 pub(crate) fn function_item(text: &str, name: &str) -> Option<Range<usize>> {
-    let mut found = scan_plain_functions(text).into_iter().filter(|f| f.name == name);
+    let mut found = scan_plain_functions(text)
+        .into_iter()
+        .filter(|f| f.name == name);
     let first = found.next()?;
     found.next().is_none().then_some(first.span)
 }
@@ -2800,7 +2902,11 @@ fn scan_plain_functions(text: &str) -> Vec<PlainFunction> {
             .iter()
             .map(|span| {
                 let param = text[span.clone()].trim();
-                if param.trim_start_matches('&').trim_start_matches("mut ").trim() == "self"
+                if param
+                    .trim_start_matches('&')
+                    .trim_start_matches("mut ")
+                    .trim()
+                    == "self"
                     || param.ends_with("self") && !param.contains(':')
                 {
                     return Some(("self".to_string(), "Self".to_string()));
@@ -2875,39 +2981,37 @@ fn expand_same_file_effect_helpers(source: &str, file_text: &str) -> String {
             let trimmed = line.trim();
             let indent_len = line.len() - line.trim_start().len();
             let indent = &line[..indent_len];
-            let expanded = trimmed
-                .strip_suffix(';')
-                .and_then(|stmt| {
-                    let open = stmt.find('(')?;
-                    let close = stmt.rfind(')')?;
-                    if close + 1 != stmt.len() {
-                        return None;
+            let expanded = trimmed.strip_suffix(';').and_then(|stmt| {
+                let open = stmt.find('(')?;
+                let close = stmt.rfind(')')?;
+                if close + 1 != stmt.len() {
+                    return None;
+                }
+                let callee = stmt[..open].trim();
+                let arg = stmt[open + 1..close].trim();
+                if !is_identifier(callee) || !is_identifier(arg) || visited.contains(callee) {
+                    return None;
+                }
+                let (param, body) = helpers.get(callee)?;
+                let substituted = if param != arg {
+                    replace_identifier(body, param, arg)
+                } else {
+                    body.clone()
+                };
+                visited.insert(callee.to_string());
+                let nested = expand_rec(&substituted, helpers, visited, depth + 1);
+                visited.remove(callee);
+                let mut block = String::new();
+                for body_line in nested.lines() {
+                    let t = body_line.trim();
+                    if !t.is_empty() {
+                        block.push_str(indent);
+                        block.push_str(t);
+                        block.push('\n');
                     }
-                    let callee = stmt[..open].trim();
-                    let arg = stmt[open + 1..close].trim();
-                    if !is_identifier(callee) || !is_identifier(arg) || visited.contains(callee) {
-                        return None;
-                    }
-                    let (param, body) = helpers.get(callee)?;
-                    let substituted = if param != arg {
-                        replace_identifier(body, param, arg)
-                    } else {
-                        body.clone()
-                    };
-                    visited.insert(callee.to_string());
-                    let nested = expand_rec(&substituted, helpers, visited, depth + 1);
-                    visited.remove(callee);
-                    let mut block = String::new();
-                    for body_line in nested.lines() {
-                        let t = body_line.trim();
-                        if !t.is_empty() {
-                            block.push_str(indent);
-                            block.push_str(t);
-                            block.push('\n');
-                        }
-                    }
-                    Some(block)
-                });
+                }
+                Some(block)
+            });
             if let Some(block) = expanded {
                 out.push_str(&block);
                 changed = true;
@@ -3079,7 +3183,10 @@ fn parse_string_literal_list(inner: &str) -> Vec<String> {
         if t.is_empty() {
             continue;
         }
-        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && !t[1..t.len() - 1].contains('"')
+        if t.len() >= 2
+            && t.starts_with('"')
+            && t.ends_with('"')
+            && !t[1..t.len() - 1].contains('"')
         {
             items.push(t.to_string());
         } else {
@@ -3219,7 +3326,12 @@ fn parse_arms(text: &str) -> Option<Vec<MatchArm>> {
                 .split('|')
                 .map(|alternative| {
                     let alternative = alternative.trim();
-                    alternative.rsplit("::").next().unwrap_or(alternative).trim().to_string()
+                    alternative
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(alternative)
+                        .trim()
+                        .to_string()
                 })
                 .collect();
             Some((patterns, value.trim().to_string()))
@@ -3254,7 +3366,10 @@ fn parse_self_match(body: &str) -> Option<Vec<MatchArm>> {
 fn arm_for<'a>(arms: &'a [MatchArm], key: &str) -> Option<&'a str> {
     arms.iter()
         .find(|(patterns, _)| patterns.iter().any(|p| p == key))
-        .or_else(|| arms.iter().find(|(patterns, _)| patterns.iter().any(|p| p == "_")))
+        .or_else(|| {
+            arms.iter()
+                .find(|(patterns, _)| patterns.iter().any(|p| p == "_"))
+        })
         .map(|(_, value)| value.as_str())
 }
 
@@ -3291,7 +3406,10 @@ fn forwarding_call(item: &str) -> Option<Forward> {
     Some(Forward {
         callee: callee.to_string(),
         open: function.body.start,
-        args: args.iter().map(|span| inner[span.clone()].to_string()).collect(),
+        args: args
+            .iter()
+            .map(|span| inner[span.clone()].to_string())
+            .collect(),
         params: function
             .params
             .unwrap_or_default()
@@ -3713,7 +3831,8 @@ fn constant_product(text: &str, star: usize) -> Option<(Range<usize>, String)> {
     // Left operand, read backwards.
     let left_end = text[..star].trim_end().len();
     let mut left_start = left_end;
-    while left_start > 0 && (bytes[left_start - 1].is_ascii_digit() || bytes[left_start - 1] == b'.')
+    while left_start > 0
+        && (bytes[left_start - 1].is_ascii_digit() || bytes[left_start - 1] == b'.')
     {
         left_start -= 1;
     }
@@ -3767,7 +3886,10 @@ fn constant_product(text: &str, star: usize) -> Option<(Range<usize>, String)> {
         }
         formatted
     } else {
-        left.parse::<i64>().ok()?.checked_mul(right.parse::<i64>().ok()?)?.to_string()
+        left.parse::<i64>()
+            .ok()?
+            .checked_mul(right.parse::<i64>().ok()?)?
+            .to_string()
     };
     Some((left_start..right_end, product))
 }
@@ -5192,7 +5314,9 @@ fn canonicalize_effect_call_for_source(
     // A stop the editor never set is written with the defaults (see `acmd::emit_spawn_stop`),
     // which the parser then reads back as set. Compare both as the line the source holds; a
     // call with no stop has neither.
-    let trail = call.trail_command.is_some() || call.spawn_func == "AFTER_IMAGE_ON" || call.raw_line.is_some();
+    let trail = call.trail_command.is_some()
+        || call.spawn_func == "AFTER_IMAGE_ON"
+        || call.raw_line.is_some();
     let stopped = call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME;
     if stopped && trail {
         call.trail_off = Some(call.trail_off.unwrap_or(crate::data::TRAIL_OFF_DEFAULT));
@@ -5568,7 +5692,11 @@ pub fn rewrite_effect_calls(
                     .flatten()
                     .collect();
                     extra.sort_by_key(|site| site.span.start);
-                    calls.extend(extra.iter().map(|site| map(site.span.start)..map(site.span.end)));
+                    calls.extend(
+                        extra
+                            .iter()
+                            .map(|site| map(site.span.start)..map(site.span.end)),
+                    );
                 }
                 Some(crate::source_timing::EffectRetimed {
                     calls,
@@ -5580,8 +5708,10 @@ pub fn rewrite_effect_calls(
         let result = retimed
             .ok_or_else(|| "a retimed effect has no source call".to_string())
             .and_then(|retimed| {
-                let spawns: Vec<Range<usize>> =
-                    sites.iter().map(|site| map(site.span.start)..map(site.span.end)).collect();
+                let spawns: Vec<Range<usize>> = sites
+                    .iter()
+                    .map(|site| map(site.span.start)..map(site.span.end))
+                    .collect();
                 crate::source_timing::retime_effects(&valued, &spawns, &edited, &retimed)
             });
         match result {
@@ -5600,7 +5730,9 @@ pub fn rewrite_effect_calls(
             }
             Err(reason) => {
                 report.skipped.append(&mut timing_skipped);
-                report.skipped.push(format!("{label}: the effect retime was not written — {reason}"));
+                report.skipped.push(format!(
+                    "{label}: the effect retime was not written — {reason}"
+                ));
                 Some(valued.clone())
             }
         }
@@ -5645,7 +5777,12 @@ pub fn rewrite_effect_calls(
             }
             // A copy of a spawn that sat in a condition carries that condition only as verbatim
             // context lines, not as a guard; which arm the copy belongs in is unknown.
-            if call.leading.iter().chain(&call.trailing).any(|line| line.contains('{')) {
+            if call
+                .leading
+                .iter()
+                .chain(&call.trailing)
+                .any(|line| line.contains('{'))
+            {
                 report.skipped.push(format!(
                     "{label}: an added effect spawn copies one inside a condition in the source — source syncing cannot choose its execution context"
                 ));
@@ -6679,10 +6816,8 @@ pub fn rewrite_hitboxes(
                         .iter()
                         .filter(|site| {
                             site.name == "ATTACK_FP"
-                                && site_u32(text, site, 1)
-                                    == Some(before.id)
-                                && site_u32(text, site, 2)
-                                    == Some(before.part)
+                                && site_u32(text, site, 1) == Some(before.id)
+                                && site_u32(text, site, 2) == Some(before.part)
                         })
                         .collect()
                 });
@@ -6745,9 +6880,7 @@ pub fn rewrite_hitboxes(
             catches
                 .iter()
                 .copied()
-                .filter(|site| {
-                    site_u32(text, site, 1) == Some(before.id)
-                })
+                .filter(|site| site_u32(text, site, 1) == Some(before.id))
                 .collect()
         } else if is_search {
             searches
@@ -6755,8 +6888,7 @@ pub fn rewrite_hitboxes(
                 .copied()
                 .filter(|site| {
                     site_u32(text, site, 1) == Some(before.id)
-                        && site_u32(text, site, 2)
-                            == Some(before.part)
+                        && site_u32(text, site, 2) == Some(before.part)
                 })
                 .collect()
         } else {
@@ -6767,10 +6899,8 @@ pub fn rewrite_hitboxes(
                     // Family members share the id space but are not the same call, so an
                     // `ATTACK` hitbox never retunes an `ATTACK_IGNORE_THROW` beside it.
                     site.name == before.func
-                        && site_u32(text, site, 1)
-                            == Some(before.id)
-                        && site_u32(text, site, 2)
-                            == Some(before.part)
+                        && site_u32(text, site, 1) == Some(before.id)
+                        && site_u32(text, site, 2) == Some(before.part)
                 })
                 .collect()
         };
@@ -8506,7 +8636,11 @@ fn article_pairing_mismatch(
 ) -> Option<String> {
     let squash = |s: &str| s.split_whitespace().collect::<String>();
     if site.name != call.op.name() {
-        return Some(format!("the source calls `{}` where the list has `{}`", site.name, call.op.name()));
+        return Some(format!(
+            "the source calls `{}` where the list has `{}`",
+            site.name,
+            call.op.name()
+        ));
     }
     if site.args.len() != call.args.len() + 2 {
         return Some(format!(
@@ -8637,7 +8771,10 @@ pub fn rewrite_article_calls(
         }
         let mut replace = |span: &Range<usize>, value: String| {
             if text[span.clone()].trim() != value.trim() {
-                edits.push(Replacement { span: span.clone(), value });
+                edits.push(Replacement {
+                    span: span.clone(),
+                    value,
+                });
             }
         };
         if before.article != after.article {
@@ -8647,7 +8784,8 @@ pub fn rewrite_article_calls(
         let squash = |s: &str| s.split_whitespace().collect::<String>();
         for (slot, (was, now)) in before.args.iter().zip(&after.args).enumerate() {
             let span = &site.args[slot + 2];
-            if Some(slot) == target_slot && after.target != crate::data::ArticleTarget::Unspecified {
+            if Some(slot) == target_slot && after.target != crate::data::ArticleTarget::Unspecified
+            {
                 // By what it names only: the text in `args` may still be the spelling from before
                 // an edit that set `target`. Written in the file's own spelling, not the editor's.
                 if before.target != after.target {
@@ -8745,7 +8883,11 @@ pub fn article_calls_in_source_order(
     }
     // The file holds exactly the calls the editor loaded, in their order: call `i` is the `i`th,
     // even where several are the same call (Cuphead's four identical bullets in one frame).
-    if source.iter().zip(pristine).all(|(held, loaded)| article_call_unchanged(held, loaded)) {
+    if source
+        .iter()
+        .zip(pristine)
+        .all(|(held, loaded)| article_call_unchanged(held, loaded))
+    {
         return Ok(edited.to_vec());
     }
     let was: Vec<Vec<String>> = pristine.iter().map(article_call_fields).collect();
@@ -8771,7 +8913,8 @@ pub fn article_calls_in_source_order(
         Some((agree, agree == fields.len()))
     };
     let interchangeable = |a: usize, b: usize| {
-        article_call_unchanged(&pristine[a], &pristine[b]) && article_call_unchanged(&edited[a], &edited[b])
+        article_call_unchanged(&pristine[a], &pristine[b])
+            && article_call_unchanged(&edited[a], &edited[b])
     };
     let fields: Vec<Vec<String>> = source.iter().map(article_call_fields).collect();
 
@@ -8787,7 +8930,10 @@ pub fn article_calls_in_source_order(
                 }
                 let scored: Vec<(usize, usize, bool)> = (0..pristine.len())
                     .filter(|&index| !used[index])
-                    .filter_map(|index| score(call, &fields[position], index).map(|(agree, full)| (index, agree, full)))
+                    .filter_map(|index| {
+                        score(call, &fields[position], index)
+                            .map(|(agree, full)| (index, agree, full))
+                    })
                     .filter(|(_, _, full)| *full || !full_only)
                     .collect();
                 if scored.is_empty() {
@@ -8876,17 +9022,22 @@ fn article_call_fields((frame, call): &(u32, crate::data::ArticleCall)) -> Vec<S
     let target_slot = call.op.target_index();
     let mut fields = vec![frame.to_string(), squash(&call.article)];
     for (slot, arg) in call.args.iter().enumerate() {
-        fields.push(if Some(slot) == target_slot && call.target != crate::data::ArticleTarget::Unspecified {
-            format!("target {:?}", call.target)
-        } else {
-            squash(arg)
-        });
+        fields.push(
+            if Some(slot) == target_slot && call.target != crate::data::ArticleTarget::Unspecified {
+                format!("target {:?}", call.target)
+            } else {
+                squash(arg)
+            },
+        );
     }
     fields
 }
 
 /// Whether two calls do the same thing: `source`, `edited` and `origin` only say how one was read.
-fn article_call_unchanged(a: &(u32, crate::data::ArticleCall), b: &(u32, crate::data::ArticleCall)) -> bool {
+fn article_call_unchanged(
+    a: &(u32, crate::data::ArticleCall),
+    b: &(u32, crate::data::ArticleCall),
+) -> bool {
     a.1.op == b.1.op && article_call_fields(a) == article_call_fields(b)
 }
 
@@ -8923,14 +9074,20 @@ fn frame_order_unreliable(text: &str) -> Option<&'static str> {
                 after.trim_start().starts_with('(') || after.starts_with("_loop")
             });
             if wait_call {
-                return Some("the script uses `wait`, so a frame block's place does not say when it runs");
+                return Some(
+                    "the script uses `wait`, so a frame block's place does not say when it runs",
+                );
             }
             for keyword in ["for", "while", "loop"] {
                 let end = i + keyword.len();
                 if text[i..].starts_with(keyword)
-                    && bytes.get(end).is_some_and(|b| b.is_ascii_whitespace() || *b == b'{')
+                    && bytes
+                        .get(end)
+                        .is_some_and(|b| b.is_ascii_whitespace() || *b == b'{')
                 {
-                    return Some("the script has a loop, so its frame blocks can run more than once");
+                    return Some(
+                        "the script has a loop, so its frame blocks can run more than once",
+                    );
                 }
             }
         }
@@ -8983,13 +9140,17 @@ fn frame_arg_like(old: &str, frame: u32) -> String {
 ///
 /// Every byte moved keeps its own line endings and indentation. Returns the new text and where
 /// the moved call now starts, or why it cannot be moved.
-fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Result<(String, usize), String> {
+fn move_call_to_frame(
+    text: &str,
+    site: &MacroSite,
+    from: u32,
+    to: u32,
+) -> Result<(String, usize), String> {
     if let Some(reason) = frame_order_unreliable(text) {
         return Err(reason.into());
     }
-    let block = article_frame_block(text, site).ok_or(
-        "it is not directly inside a `frame(..)` statement's `is_excute` block",
-    )?;
+    let block = article_frame_block(text, site)
+        .ok_or("it is not directly inside a `frame(..)` statement's `is_excute` block")?;
     if block.frame != from {
         return Err(format!("its block is at frame {}, not {from}", block.frame));
     }
@@ -9055,14 +9216,19 @@ fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Resul
     let (removed, anchor, inserted, offset) = match &target {
         Some(target) => {
             let anchor = closing_line(target.execute_body.end)?.start;
-            let removed = if empty { block.range.clone() } else { statement.clone() };
+            let removed = if empty {
+                block.range.clone()
+            } else {
+                statement.clone()
+            };
             (removed, anchor, statement_text.to_string(), call_offset)
         }
         None => {
             let frame_arg = block.frame_arg.clone();
             let new_arg = frame_arg_like(&text[frame_arg.clone()], to);
             let (removed, chunk, offset) = if alone {
-                let relative = frame_arg.start - block.range.start..frame_arg.end - block.range.start;
+                let relative =
+                    frame_arg.start - block.range.start..frame_arg.end - block.range.start;
                 let mut chunk = text[block.range.clone()].to_string();
                 let growth = new_arg.len() as isize - relative.len() as isize;
                 chunk.replace_range(relative, &new_arg);
@@ -9083,12 +9249,24 @@ fn move_call_to_frame(text: &str, site: &MacroSite, from: u32, to: u32) -> Resul
                     &new_arg,
                 );
                 let offset = header.len() + call_offset;
-                let chunk = format!("{header}{statement_text}{}", &text[closer.start..block.range.end]);
+                let chunk = format!(
+                    "{header}{statement_text}{}",
+                    &text[closer.start..block.range.end]
+                );
                 (statement.clone(), chunk, offset)
             };
             // A block the call leaves behind keeps its frame line, which still orders the rest.
-            let moving = if alone { block.range.clone() } else { statement.clone() };
-            (removed, frame_insertion_point(text, to, &moving)?, chunk, offset)
+            let moving = if alone {
+                block.range.clone()
+            } else {
+                statement.clone()
+            };
+            (
+                removed,
+                frame_insertion_point(text, to, &moving)?,
+                chunk,
+                offset,
+            )
         }
     };
     if removed.start < anchor && anchor < removed.end {
@@ -9129,7 +9307,9 @@ fn frame_insertion_point(text: &str, frame: u32, moving: &Range<usize>) -> Resul
         if !text[line.clone()].trim_start().starts_with("frame(") {
             continue;
         }
-        let value = site.arg(text, 1).and_then(|value| value.trim().parse::<f32>().ok());
+        let value = site
+            .arg(text, 1)
+            .and_then(|value| value.trim().parse::<f32>().ok());
         let Some(value) = value else {
             return Err(format!(
                 "a `frame` statement is not a plain number (`{}`), so where frame {frame} goes is \
@@ -10279,7 +10459,9 @@ pub fn rewrite_work_flags(
 fn valid_work_transition_term_receiver(function: &str, receiver: &str) -> bool {
     match function {
         "WorkModule::enable_transition_term_group"
-        | "WorkModule::unable_transition_term_group_ex" => crate::acmd::is_agent_module_accessor(receiver),
+        | "WorkModule::unable_transition_term_group_ex" => {
+            crate::acmd::is_agent_module_accessor(receiver)
+        }
         "WorkModule::enable_transition_term" | "WorkModule::unable_transition_term" => {
             crate::acmd::is_module_accessor(receiver)
         }
@@ -11108,7 +11290,8 @@ fn insert_set_air_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    insert_styled(text,
+                    insert_styled(
+                        text,
                         close,
                         &format!("{body_indent}macros::SET_AIR(agent);{newline}"),
                     );
@@ -11466,7 +11649,9 @@ fn is_lone_agent_call(trimmed: &str, name: &str) -> bool {
     };
     let path = &trimmed[..at];
     if !(path.is_empty() || path.ends_with("::"))
-        || !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        || !path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
     {
         return false;
     }
@@ -11644,7 +11829,8 @@ fn insert_reverse_line(text: &mut String, frame: u32) -> bool {
                         })
                         .map(|body| line_indent(text, body).to_string())
                         .unwrap_or_else(|| format!("{}    ", line_indent(text, range)));
-                    insert_styled(text,
+                    insert_styled(
+                        text,
                         close,
                         &format!("{body_indent}macros::REVERSE_LR(agent);{newline}"),
                     );
@@ -12278,7 +12464,13 @@ pub fn rewrite_sounds(
     pristine: &[crate::data::SoundEvent],
     edited: &[crate::data::SoundEvent],
 ) -> Result<(String, SyncReport)> {
-    rewrite_sounds_with(text, label, pristine, edited, &crate::hash_macros::current())
+    rewrite_sounds_with(
+        text,
+        label,
+        pristine,
+        edited,
+        &crate::hash_macros::current(),
+    )
 }
 
 /// [`rewrite_sounds`] with the project's hash macros given explicitly, so an edited name is
@@ -12877,10 +13069,22 @@ pub fn install() {
         assert_eq!(reverse.covers, vec!["game_", "effect_"]);
         let body = &reverse.body;
         assert!(body.contains("fn game_attacks4reverse("), "{body}");
-        assert!(!body.contains("facing"), "every facing read resolves: {body}");
-        assert!(!body.contains("let ("), "the resolved binding is dropped: {body}");
-        assert!(body.contains("frame(agent.lua_state_agent, 24.0);"), "{body}");
-        assert!(body.contains("frame(agent.lua_state_agent, 28.0);"), "{body}");
+        assert!(
+            !body.contains("facing"),
+            "every facing read resolves: {body}"
+        );
+        assert!(
+            !body.contains("let ("),
+            "the resolved binding is dropped: {body}"
+        );
+        assert!(
+            body.contains("frame(agent.lua_state_agent, 24.0);"),
+            "{body}"
+        );
+        assert!(
+            body.contains("frame(agent.lua_state_agent, 28.0);"),
+            "{body}"
+        );
         assert!(body.contains("Some(-12.0)"), "{body}");
         assert!(body.contains("*ATTACK_LR_CHECK_B"), "{body}");
         // `-7.0 * -1.0`: the leading minus is the operand's sign.
@@ -12900,7 +13104,11 @@ pub fn install() {
         assert_eq!(hitboxes[0].damage, 21.0);
         assert_eq!(hitboxes[0].offset_z, 28.4);
         assert_eq!(hitboxes[0].active_start, 21);
-        assert!(forward.body.contains("*ATTACK_LR_CHECK_F"), "{}", forward.body);
+        assert!(
+            forward.body.contains("*ATTACK_LR_CHECK_F"),
+            "{}",
+            forward.body
+        );
     }
 
     #[test]
@@ -12910,9 +13118,15 @@ pub fn install() {
         let delegate = site.delegate.as_ref().expect("the wrapper forwards");
         assert_eq!(delegate.function, "game_attacks4_impl");
         assert_eq!(delegate.callers, 2);
-        assert_eq!(site.function, "game_attacks4reverse", "the wrapper keeps its own site");
+        assert_eq!(
+            site.function, "game_attacks4reverse",
+            "the wrapper keeps its own site"
+        );
 
-        let body = index.script_source("pacman", "attacks4reverse").unwrap().body;
+        let body = index
+            .script_source("pacman", "attacks4reverse")
+            .unwrap()
+            .body;
         let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
         let mut edited = pristine.clone();
         edited[0].damage = 30.0;
@@ -12962,7 +13176,11 @@ pub fn install() {
             "{:?}",
             reverse.notes
         );
-        assert!(reverse.body.contains("hit_frame"), "nothing is guessed: {}", reverse.body);
+        assert!(
+            reverse.body.contains("hit_frame"),
+            "nothing is guessed: {}",
+            reverse.body
+        );
     }
 
     #[test]
@@ -12990,8 +13208,14 @@ pub fn install() {
         let report = sync_hitboxes(&index, "mario", "attack_air_n", &pristine, &edited).unwrap();
         assert_eq!(report.changed, 1);
         let on_disk = std::fs::read_to_string(&file).unwrap();
-        assert!(on_disk.contains("    nair_impl(agent);\n"), "the wrapper is untouched");
-        assert!(on_disk.contains("Hash40::new(\"top\"), 9.5, 361"), "{on_disk}");
+        assert!(
+            on_disk.contains("    nair_impl(agent);\n"),
+            "the wrapper is untouched"
+        );
+        assert!(
+            on_disk.contains("Hash40::new(\"top\"), 9.5, 361"),
+            "{on_disk}"
+        );
     }
 
     #[test]
@@ -13213,11 +13437,19 @@ crate-type = [\"cdylib\"]
 ",
         );
         // A backup crate kept beside the live one; cargo never builds it.
-        write(tmp.path(), "plugin(old)/Cargo.toml", "[package]
+        write(
+            tmp.path(),
+            "plugin(old)/Cargo.toml",
+            "[package]
 name = \"empoleon\"
-");
-        write(tmp.path(), "plugin(old)/src/lib.rs", "mod aerials;
-");
+",
+        );
+        write(
+            tmp.path(),
+            "plugin(old)/src/lib.rs",
+            "mod aerials;
+",
+        );
         write(
             tmp.path(),
             "plugin(old)/src/aerials.rs",
@@ -13234,9 +13466,18 @@ name = \"empoleon\"
                 aerials,
                 "linked at {linked:?}"
             );
-            assert!(index.script("falco", "game_specialnstart").is_some(), "linked at {linked:?}");
-            assert!(index.script("falco_cannon", "game_fly").is_some(), "linked at {linked:?}");
-            assert!(index.script("falco_cannon", "game_attackairb").is_none(), "linked at {linked:?}");
+            assert!(
+                index.script("falco", "game_specialnstart").is_some(),
+                "linked at {linked:?}"
+            );
+            assert!(
+                index.script("falco_cannon", "game_fly").is_some(),
+                "linked at {linked:?}"
+            );
+            assert!(
+                index.script("falco_cannon", "game_attackairb").is_none(),
+                "linked at {linked:?}"
+            );
             assert!(!index.has_fighter("common"), "linked at {linked:?}");
             assert!(index.conflicts.is_empty(), "linked at {linked:?}");
         }
@@ -13284,10 +13525,22 @@ pub fn install(agent: &mut Agent) {
         for linked in ["", "src", "src/emperte"] {
             let index = SourceIndex::build(&tmp.path().join(linked)).unwrap();
             assert!(index.is_costume_gated("falco"), "linked at {linked:?}");
-            assert!(index.is_costume_gated("fighter_falco"), "attribute spelling");
-            assert!(!index.is_costume_gated("falco_cannon"), "linked at {linked:?}");
-            assert!(!index.is_costume_gated("mario"), "a commented-out line is not code");
-            assert!(index.script("falco", "game_attackairb").is_some(), "linked at {linked:?}");
+            assert!(
+                index.is_costume_gated("fighter_falco"),
+                "attribute spelling"
+            );
+            assert!(
+                !index.is_costume_gated("falco_cannon"),
+                "linked at {linked:?}"
+            );
+            assert!(
+                !index.is_costume_gated("mario"),
+                "a commented-out line is not code"
+            );
+            assert!(
+                index.script("falco", "game_attackairb").is_some(),
+                "linked at {linked:?}"
+            );
         }
     }
 
@@ -13987,7 +14240,10 @@ unsafe extern "C" fn my_custom_name(agent: &mut L2CAgentBase) {
             .filter(|call| call.effect_name == "shyguy_mace_arc_wind" && call.active_start == 17)
             .collect();
         assert_eq!(arcs.len(), 1, "{calls:#?}");
-        assert!(!arcs[0].follows_bone, "the live arc is the plain EFFECT, not the comment");
+        assert!(
+            !arcs[0].follows_bone,
+            "the live arc is the plain EFFECT, not the comment"
+        );
         // The structure still closes: the impact lands at its own frame.
         let impact = calls
             .iter()
@@ -14012,7 +14268,9 @@ unsafe extern "C" fn my_custom_name(agent: &mut L2CAgentBase) {
         assert_eq!(report.changed, 1, "{report:?}");
         assert!(report.skipped.is_empty(), "{report:?}");
         assert!(
-            after.contains(r#"Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 12.5, 28.4,"#),
+            after.contains(
+                r#"Hash40::new("sys_attack_impact"), Hash40::new("top"), 0, 12.5, 28.4,"#
+            ),
             "{after}"
         );
         // Everything else, comments included, is untouched.
@@ -14880,11 +15138,23 @@ visionary_set_speed(agent, 9, 10);
         edited.push(added);
 
         let (updated, report) = rewrite_effect_calls(text, "test", &pristine, &edited).unwrap();
-        assert!(report.skipped.is_empty(), "{report:?}
-{updated}");
-        assert_eq!(updated.matches("wait(agent.lua_state_agent, 1.0);").count(), 2, "{updated}");
+        assert!(
+            report.skipped.is_empty(),
+            "{report:?}
+{updated}"
+        );
+        assert_eq!(
+            updated.matches("wait(agent.lua_state_agent, 1.0);").count(),
+            2,
+            "{updated}"
+        );
         let calls = crate::acmd::parse_effect_script(&updated).to_effect_calls();
-        let frame_of = |name: &str| calls.iter().find(|c| c.effect_name == name).map(|c| c.active_start);
+        let frame_of = |name: &str| {
+            calls
+                .iter()
+                .find(|c| c.effect_name == name)
+                .map(|c| c.active_start)
+        };
         assert_eq!(frame_of("sys_first"), Some(5));
         assert_eq!(frame_of("sys_between"), Some(6));
         assert_eq!(frame_of("sys_second"), Some(7));
@@ -16531,7 +16801,9 @@ pub fn install(agent: &mut smashline::Agent) {
         let (after, report) =
             rewrite_effect_calls(unrelated, "unrelated", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
-        let frame_eight = after.find("frame(agent.lua_state_agent, 8.0);").expect("a frame-8 block");
+        let frame_eight = after
+            .find("frame(agent.lua_state_agent, 8.0);")
+            .expect("a frame-8 block");
         assert!(after.find("COL_PRI").unwrap() < frame_eight, "{after}");
         assert!(after.find("sys_attack").unwrap() > frame_eight, "{after}");
     }
@@ -16715,13 +16987,23 @@ pub fn install(agent: &mut smashline::Agent) {
         let (after, report) = rewrite_hitboxes(text, "t", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
         let moved = crate::acmd::parse_acmd_script(&after).to_hitboxes();
-        assert_eq!((moved[0].active_start, moved[0].damage), (9, 12.0), "{after}");
-        assert!(after.contains("frame(agent.lua_state_agent, 9.0);"), "{after}");
+        assert_eq!(
+            (moved[0].active_start, moved[0].damage),
+            (9, 12.0),
+            "{after}"
+        );
+        assert!(
+            after.contains("frame(agent.lua_state_agent, 9.0);"),
+            "{after}"
+        );
 
         // Timing that runs through a loop is not restructured: the retime is reported, and the
         // damage it was bundled with still lands.
         let looped = text
-            .replace("    frame(agent.lua_state_agent, 5.0);\n", "    for _ in 0..2 {\n    wait(agent.lua_state_agent, 5.0);\n")
+            .replace(
+                "    frame(agent.lua_state_agent, 5.0);\n",
+                "    for _ in 0..2 {\n    wait(agent.lua_state_agent, 5.0);\n",
+            )
             .replace("    }\n}\n", "    }\n    }\n}\n");
         let pristine = crate::acmd::parse_acmd_script(&looped).to_hitboxes();
         let mut edited = pristine.clone();
@@ -16729,9 +17011,15 @@ pub fn install(agent: &mut smashline::Agent) {
         edited[0].damage = 12.0;
         let (after, report) = rewrite_hitboxes(&looped, "t", &pristine, &edited).unwrap();
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("retimed") && report.skipped[0].contains("loop"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("retimed") && report.skipped[0].contains("loop"),
+            "{report:?}"
+        );
         assert!(after.contains("12.0, 361"), "{after}");
-        assert!(after.contains("wait(agent.lua_state_agent, 5.0);"), "{after}");
+        assert!(
+            after.contains("wait(agent.lua_state_agent, 5.0);"),
+            "{after}"
+        );
     }
 
     /// kirby/ThrowHi's `ATTACK_IGNORE_THROW`, which the archive writes without the capsule
@@ -18652,7 +18940,10 @@ pub fn install() {
         assert_eq!(bodies.len(), 1, "{:?}", index.statuses);
         let (site, body) = &bodies[0];
         assert_eq!(site.phase, "Main");
-        assert_eq!(site.kind_expr, "*WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT");
+        assert_eq!(
+            site.kind_expr,
+            "*WEAPON_KINGTERESA_FIREBALL_STATUS_KIND_SHOOT"
+        );
         assert_eq!(site.function, "shoot_main");
         assert!(body.contains("sv_kinetic_energy!"), "{body}");
     }
@@ -18687,9 +18978,15 @@ pub fn install() {
         let index = SourceIndex::build(root).unwrap();
         let sites = &index.statuses["pacman_trampoline"];
         assert_eq!(sites.len(), 3, "{sites:?}");
-        assert!(sites.iter().any(|s| s.phase == "Init" && s.kind_expr == "0" && s.function == "trampoline_init"));
-        assert!(sites.iter().any(|s| s.phase == "Main" && s.function == "jackbox_main"));
-        assert!(sites.iter().any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
+        assert!(sites
+            .iter()
+            .any(|s| s.phase == "Init" && s.kind_expr == "0" && s.function == "trampoline_init"));
+        assert!(sites
+            .iter()
+            .any(|s| s.phase == "Main" && s.function == "jackbox_main"));
+        assert!(sites
+            .iter()
+            .any(|s| s.phase == "Start" && s.kind_expr.is_empty()));
         assert_eq!(index.status_bodies("pacman_trampoline").len(), 3);
     }
 
@@ -18737,10 +19034,24 @@ pub fn install(agent: &mut smashline::Agent) {
         );
         let index = SourceIndex::build(root).unwrap();
         let bodies = index.status_bodies("dedede_fireball");
-        assert_eq!(bodies.len(), 2, "{:?} / {:?}", index.statuses, index.unresolved_statuses);
-        assert!(bodies.iter().any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
-        assert!(bodies.iter().any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
-        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "{:?} / {:?}",
+            index.statuses,
+            index.unresolved_statuses
+        );
+        assert!(bodies
+            .iter()
+            .any(|(site, body)| site.phase == "Main" && body.contains("sv_kinetic_energy!")));
+        assert!(bodies
+            .iter()
+            .any(|(site, _)| site.phase == "Start" && site.function == "fireball_start"));
+        assert!(
+            index.unresolved_statuses.is_empty(),
+            "{:?}",
+            index.unresolved_statuses
+        );
     }
 
     /// King-Boo-Moveset · src/kingteresa/mod.rs:47-52 hands `Agent::new("dedede")` to
@@ -18772,7 +19083,11 @@ pub fn install(agent: &mut smashline::Agent) {
             "unsafe extern \"C\" fn catched_pre(fighter: &mut L2CFighterCommon) -> L2CValue {\n    0.into()\n}\npub fn install(_agent: &mut smashline::Agent) {\n    Agent::new(\"fighter\")\n        .status(Pre, FIGHTER_STATUS_KIND_CATCHED_KINGTERESA_PORTRAIT, catched_pre)\n        .install();\n}\n",
         );
         let index = SourceIndex::build(root).unwrap();
-        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(
+            index.unresolved_statuses.is_empty(),
+            "{:?}",
+            index.unresolved_statuses
+        );
         let dedede = index.status_bodies("dedede");
         assert_eq!(dedede.len(), 1, "{:?}", index.statuses);
         assert_eq!(dedede[0].0.function, "kingteresa_attack_air_status_pre");
@@ -18803,10 +19118,18 @@ pub fn install(agent: &mut smashline::Agent) {
             "pub(super) unsafe extern \"C\" fn bullet_seed_end(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n",
         );
         let index = SourceIndex::build(root).unwrap();
-        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(
+            index.unresolved_statuses.is_empty(),
+            "{:?}",
+            index.unresolved_statuses
+        );
         let bodies = index.status_bodies("mario_bulletseed");
         assert_eq!(bodies.len(), 1);
-        assert!(bodies[0].0.file.ends_with("fly.rs"), "{:?}", bodies[0].0.file);
+        assert!(
+            bodies[0].0.file.ends_with("fly.rs"),
+            "{:?}",
+            bodies[0].0.file
+        );
         assert!(bodies[0].1.contains("-> L2CValue"));
     }
 
@@ -18828,7 +19151,11 @@ pub fn install(agent: &mut smashline::Agent) {
             "pub fn install() {\n    Agent::new(\"mario_orb\")\n        .status(Main, *WEAPON_KIND_X, super::status::orb_main)\n        .install();\n}\n",
         );
         let index = SourceIndex::build(root).unwrap();
-        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(
+            index.unresolved_statuses.is_empty(),
+            "{:?}",
+            index.unresolved_statuses
+        );
         assert_eq!(index.status_bodies("mario_orb").len(), 1);
 
         let tmp = tempfile::tempdir().unwrap();
@@ -18836,14 +19163,21 @@ pub fn install(agent: &mut smashline::Agent) {
         put(root, "shot/mod.rs", "mod imp;\nmod fly { pub use super::imp::shot_main; }\npub fn install() {\n    Agent::new(\"mario_shot\").status(Main, 0, fly::shot_main).install();\n}\n");
         put(root, "shot/imp.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    0.into()\n}\n");
         let index = SourceIndex::build(root).unwrap();
-        assert!(index.unresolved_statuses.is_empty(), "{:?}", index.unresolved_statuses);
+        assert!(
+            index.unresolved_statuses.is_empty(),
+            "{:?}",
+            index.unresolved_statuses
+        );
         assert!(index.status_bodies("mario_shot")[0].1.contains("shot_main"));
 
         // Defined twice and the path names neither: refused, with a reason that says so.
         put(root, "shot/other.rs", "pub unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\n    1.into()\n}\n");
         let index = SourceIndex::build(root).unwrap();
         let reason = &index.unresolved_statuses[0].reason;
-        assert!(reason.contains("defined in 2 places") && reason.contains("path doesn't say which"), "{reason}");
+        assert!(
+            reason.contains("defined in 2 places") && reason.contains("path doesn't say which"),
+            "{reason}"
+        );
     }
 
     /// Sceptile-Moveset · plugin/src/common/util.rs:1187-1191 defines `noop_status!` as
@@ -18861,7 +19195,9 @@ pub fn install(agent: &mut smashline::Agent) {
         let index = SourceIndex::build(root).unwrap();
         let unresolved = &index.unresolved_statuses;
         assert_eq!(unresolved.len(), 2, "{unresolved:?}");
-        assert!(unresolved.iter().all(|u| u.reason.contains("noop_status!") && u.kind_expr.starts_with('*')));
+        assert!(unresolved
+            .iter()
+            .all(|u| u.reason.contains("noop_status!") && u.kind_expr.starts_with('*')));
     }
 
     /// Closures, `noop_status!` (Shy Guy has eight) and a parameter nobody installs are not
@@ -18889,12 +19225,26 @@ pub fn install(agent: &mut smashline::Agent) {
         );
         let index = SourceIndex::build(root).unwrap();
         let unresolved = &index.unresolved_statuses;
-        let noops = unresolved.iter().filter(|u| u.reason.contains("noop_status!")).collect::<Vec<_>>();
+        let noops = unresolved
+            .iter()
+            .filter(|u| u.reason.contains("noop_status!"))
+            .collect::<Vec<_>>();
         assert_eq!(noops.len(), 3, "{unresolved:?}");
-        assert!(noops.iter().all(|u| u.agent_hint.as_deref() == Some("pacman_trampoline")));
-        assert!(unresolved.iter().any(|u| u.reason.contains("closure") && u.phase == "Main" && u.line == 4));
-        assert!(unresolved.iter().any(|u| u.reason.contains("not defined") && u.phase == "End"));
-        assert!(unresolved.iter().any(|u| u.kind_expr == "1" && u.reason.contains("parameter")), "{unresolved:?}");
+        assert!(noops
+            .iter()
+            .all(|u| u.agent_hint.as_deref() == Some("pacman_trampoline")));
+        assert!(unresolved
+            .iter()
+            .any(|u| u.reason.contains("closure") && u.phase == "Main" && u.line == 4));
+        assert!(unresolved
+            .iter()
+            .any(|u| u.reason.contains("not defined") && u.phase == "End"));
+        assert!(
+            unresolved
+                .iter()
+                .any(|u| u.kind_expr == "1" && u.reason.contains("parameter")),
+            "{unresolved:?}"
+        );
         assert!(index.statuses.is_empty(), "{:?}", index.statuses);
     }
 
@@ -18943,9 +19293,17 @@ mod moveset_layout_tests {
     fn chained_registrations_attribute_each_script_to_its_own_agent() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        put(root, "Cargo.toml", "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        put(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"empoleon\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        );
         put(root, "src/lib.rs", "mod emperte;\n");
-        put(root, "src/emperte/mod.rs", "mod acmd;\npub fn install() { acmd::install(); }\n");
+        put(
+            root,
+            "src/emperte/mod.rs",
+            "mod acmd;\npub fn install() { acmd::install(); }\n",
+        );
         put(root, "src/emperte/acmd/mod.rs", "mod normals;\nmod specials;\npub fn install() { normals::install(); specials::install(); }\n");
         put(
             root,
@@ -18982,19 +19340,36 @@ pub fn install() {
 "#,
         );
         let index = SourceIndex::build(root).unwrap();
-        for script in ["game_attack11", "game_specialsstart", "game_specialairsstart"] {
-            assert!(index.script("falco", script).is_some(), "falco/{script}: {:?}", index.fighters.keys());
+        for script in [
+            "game_attack11",
+            "game_specialsstart",
+            "game_specialairsstart",
+        ] {
+            assert!(
+                index.script("falco", script).is_some(),
+                "falco/{script}: {:?}",
+                index.fighters.keys()
+            );
         }
         assert!(index.script("falco_cannon", "game_fly").is_some());
-        assert!(index.script("falco", "game_fly").is_none(), "an article script is not the fighter's");
+        assert!(
+            index.script("falco", "game_fly").is_none(),
+            "an article script is not the fighter's"
+        );
         assert!(index.script("falco_ava", "game_regular").is_some());
         assert_eq!(index.conflict_count(), 0, "{:?}", index.conflicts);
 
         // A move it leaves vanilla, and a fighter it is not for, say which.
         let other = index.why_no_script("mario", "attack_11");
-        assert!(other.contains("no `mario` scripts") && other.contains("falco"), "{other}");
+        assert!(
+            other.contains("no `mario` scripts") && other.contains("falco"),
+            "{other}"
+        );
         let unmodded = index.why_no_script("falco", "attack_lw4");
-        assert!(unmodded.contains("does not define falco/attack_lw4"), "{unmodded}");
+        assert!(
+            unmodded.contains("does not define falco/attack_lw4"),
+            "{unmodded}"
+        );
     }
 
     /// Two agents registering the same script name in one file are two scripts, not a
@@ -19015,8 +19390,18 @@ pub fn install() {
 "#,
         );
         let index = SourceIndex::build(root).unwrap();
-        assert_eq!(index.script("falco_blaster_bullet", "game_fly").map(|s| s.function.as_str()), Some("fly_a"));
-        assert_eq!(index.script("falco_cannon", "game_fly").map(|s| s.function.as_str()), Some("fly_b"));
+        assert_eq!(
+            index
+                .script("falco_blaster_bullet", "game_fly")
+                .map(|s| s.function.as_str()),
+            Some("fly_a")
+        );
+        assert_eq!(
+            index
+                .script("falco_cannon", "game_fly")
+                .map(|s| s.function.as_str()),
+            Some("fly_b")
+        );
     }
 
     /// Point `VISIONARY_PROBE_SOURCE` at a real project to see how it indexes:
@@ -19029,9 +19414,17 @@ pub fn install() {
         };
         //NOCARGO
         let index = SourceIndex::build(Path::new(&root)).unwrap();
-        let mut fighters: Vec<_> = index.fighters.iter().map(|(name, f)| (name.clone(), f.scripts.len())).collect();
+        let mut fighters: Vec<_> = index
+            .fighters
+            .iter()
+            .map(|(name, f)| (name.clone(), f.scripts.len()))
+            .collect();
         fighters.sort();
-        println!("{} scripts, {} conflicts", index.script_count(), index.conflict_count());
+        println!(
+            "{} scripts, {} conflicts",
+            index.script_count(),
+            index.conflict_count()
+        );
         for (name, count) in fighters {
             println!("  {name:?}: {count}");
         }
@@ -19123,7 +19516,11 @@ pub(crate) fn install() {
             "mod tilts;\npub(super) fn install(agent: &mut Agent) { tilts::install(agent); }\n",
         );
         put(root, "plugin/src/shyguy/pacman/acmd/tilts.rs", TILTS);
-        put(root, "plugin/src/shyguy/articles/mod.rs", "pub mod trampoline;\n");
+        put(
+            root,
+            "plugin/src/shyguy/articles/mod.rs",
+            "pub mod trampoline;\n",
+        );
         put(
             root,
             "plugin/src/shyguy/articles/trampoline/mod.rs",
@@ -19143,15 +19540,28 @@ pub fn install(agent: &mut Agent) { agent.game_acmd("game_shoot", game_shoot, Pr
         assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
         let mut fighters: Vec<_> = index.fighters.keys().cloned().collect();
         fighters.sort();
-        assert_eq!(fighters, ["pacman", "pacman_trampoline"], "no `fighter` from a comment");
-        let game = index.script("pacman", "game_attacks3hop").expect("registered game script");
-        assert!(game.file.ends_with("plugin/src/shyguy/pacman/acmd/tilts.rs"), "{game:?}");
+        assert_eq!(
+            fighters,
+            ["pacman", "pacman_trampoline"],
+            "no `fighter` from a comment"
+        );
+        let game = index
+            .script("pacman", "game_attacks3hop")
+            .expect("registered game script");
+        assert!(
+            game.file
+                .ends_with("plugin/src/shyguy/pacman/acmd/tilts.rs"),
+            "{game:?}"
+        );
         // `.sound_acmd(` registrations count, under the registered name.
         assert!(index.script("pacman", "sound_attacks3hop").is_some());
         assert!(index.script("pacman", "sound_attack_s3_kick").is_none());
         assert!(index.script("pacman_trampoline", "game_shoot").is_some());
         assert!(
-            !index.files.iter().any(|f| f.to_string_lossy().contains("srcOLD")),
+            !index
+                .files
+                .iter()
+                .any(|f| f.to_string_lossy().contains("srcOLD")),
             "a backup copy outside the crate is not indexed"
         );
     }
@@ -19162,7 +19572,9 @@ pub fn install(agent: &mut Agent) { agent.game_acmd("game_shoot", game_shoot, Pr
         let index = SourceIndex::build(tmp.path()).unwrap();
         let project = index.script_source("pacman", "attacks3hop").unwrap();
         assert!(
-            project.body.contains(r#"Hash40::new("se_common_punch_kick_swing_m")"#),
+            project
+                .body
+                .contains(r#"Hash40::new("se_common_punch_kick_swing_m")"#),
             "{}",
             project.body
         );
@@ -19180,9 +19592,18 @@ pub fn install(agent: &mut Agent) { agent.game_acmd("game_shoot", game_shoot, Pr
         let (after, report) =
             rewrite_sounds_with(body, "t", &events, &edited, &index.hash_macros).unwrap();
         assert_eq!(report.changed, 2, "{:?}", report.skipped);
-        assert!(after.contains(r#"macros::PLAY_SE(agent, se!("special_n02"));"#), "{after}");
-        assert!(after.contains(r#"macros::PLAY_SE(agent, cmn!("swing_01"));"#), "{after}");
-        assert!(!after.contains("Hash40::new(\"se_"), "no line was restyled: {after}");
+        assert!(
+            after.contains(r#"macros::PLAY_SE(agent, se!("special_n02"));"#),
+            "{after}"
+        );
+        assert!(
+            after.contains(r#"macros::PLAY_SE(agent, cmn!("swing_01"));"#),
+            "{after}"
+        );
+        assert!(
+            !after.contains("Hash40::new(\"se_"),
+            "no line was restyled: {after}"
+        );
     }
 
     /// A project that glob-imports smash_script's macros calls them bare. Reads see the calls,
@@ -19248,11 +19669,21 @@ pub fn install() {
         let index = SourceIndex::build(root).unwrap();
         assert!(index.conflicts.is_empty(), "{:?}", index.conflicts);
         assert_eq!(
-            index.script("donkey", "game_landingairhi").unwrap().function,
+            index
+                .script("donkey", "game_landingairhi")
+                .unwrap()
+                .function,
             "game_attackairhi"
         );
-        assert_eq!(index.script("donkey", "effect_fall").unwrap().function, "effect_burst");
-        assert!(index.script("donkey", "effect_appeallwr").unwrap().file.ends_with("acmd.rs"));
+        assert_eq!(
+            index.script("donkey", "effect_fall").unwrap().function,
+            "effect_burst"
+        );
+        assert!(index
+            .script("donkey", "effect_appeallwr")
+            .unwrap()
+            .file
+            .ends_with("acmd.rs"));
     }
 
     /// An inserted line takes the file's own spelling. In a project that glob-imports the
@@ -19263,15 +19694,29 @@ pub fn install() {
         let mut text = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\r\n\tframe(fighter.lua_state_agent, 3);\r\n\tif is_excute(fighter) {\r\n\t\tATTACK(fighter, 0);\r\n\t}\r\n}\r\n".to_string();
         assert!(insert_reverse_line(&mut text, 3));
         assert!(insert_reverse_line(&mut text, 7));
-        assert!(text.contains("\t\tATTACK(fighter, 0);\r\n\t\tREVERSE_LR(fighter);\r\n\t}"), "{text:?}");
+        assert!(
+            text.contains("\t\tATTACK(fighter, 0);\r\n\t\tREVERSE_LR(fighter);\r\n\t}"),
+            "{text:?}"
+        );
         assert!(
             text.contains("\tframe(fighter.lua_state_agent, 7);\r\n\tif is_excute(fighter) {\r\n\t\tREVERSE_LR(fighter);\r\n\t}\r\n"),
             "{text:?}"
         );
-        assert!(!text.contains("macros::") && !text.contains("agent)"), "{text:?}");
-        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count(), "no bare LF");
+        assert!(
+            !text.contains("macros::") && !text.contains("agent)"),
+            "{text:?}"
+        );
+        assert_eq!(
+            text.matches('\n').count(),
+            text.matches("\r\n").count(),
+            "no bare LF"
+        );
         // And the line it wrote is recognised as the one to take back out.
-        let line = text.lines().find(|l| l.contains("REVERSE_LR")).unwrap().trim();
+        let line = text
+            .lines()
+            .find(|l| l.contains("REVERSE_LR"))
+            .unwrap()
+            .trim();
         assert!(is_lone_agent_call(line, "REVERSE_LR"));
     }
 
@@ -19282,11 +19727,18 @@ pub fn install() {
         let source = "unsafe extern \"C\" fn game_x(fighter: &mut L2CAgentBase) {\n    frame(fighter.lua_state_agent, 2.0);\n    macros::FT_MOTION_RATE(fighter, 0.5);\n    frame(fighter.lua_state_agent, 6.0);\n    if macros::is_excute(fighter) {\n        macros::SET_AIR(fighter);\n        macros::SET_AIR(other);\n    }\n}\n";
         let script = crate::acmd::parse_acmd_script(source);
         assert!(
-            script.stmts.iter().any(|s| matches!(s, crate::data::AcmdStmt::MotionRate(r) if *r == 0.5)),
+            script
+                .stmts
+                .iter()
+                .any(|s| matches!(s, crate::data::AcmdStmt::MotionRate(r) if *r == 0.5)),
             "{:?}",
             script.stmts
         );
-        assert_eq!(script.to_set_air_events().len(), 1, "only the fighter's own SET_AIR");
+        assert_eq!(
+            script.to_set_air_events().len(),
+            1,
+            "only the fighter's own SET_AIR"
+        );
         // Outside any scope, the name means nothing special again.
         assert!(!crate::acmd::is_agent_arg("fighter"));
     }
@@ -19304,7 +19756,11 @@ pub fn install() {
             "src/mario/mod.rs",
             "mod acmd;\nmod params;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n",
         );
-        put(root, "src/mario/params.rs", "pub const JAB_DAMAGE:   f32 = 3.0;\npub const JAB_ID: i32 = 0;\n");
+        put(
+            root,
+            "src/mario/params.rs",
+            "pub const JAB_DAMAGE:   f32 = 3.0;\npub const JAB_ID: i32 = 0;\n",
+        );
         let acmd = "use super::params::*;\nunsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK(agent, JAB_ID as u64, 0, Hash40::new(\"top\"), JAB_DAMAGE, 361, 100, 0, 20, 3.0, 0.0, 8.0, 6.0, None, None, None, 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);\n    }\n}\npub fn install(agent: &mut Agent) { agent.game_acmd(\"game_attack11\", game_attack11, Priority::Default); }\n";
         put(root, "src/mario/acmd.rs", acmd);
         let index = SourceIndex::build(root).unwrap();
@@ -19320,8 +19776,19 @@ pub fn install() {
             std::fs::read_to_string(root.join("src/mario/params.rs")).unwrap(),
             "pub const JAB_DAMAGE:   f32 = 4.5;\npub const JAB_ID: i32 = 0;\n"
         );
-        assert_eq!(std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(), acmd, "the call keeps its name");
-        assert!(report.skipped.iter().any(|note| note.contains("JAB_DAMAGE is a constant")), "{:?}", report.skipped);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(),
+            acmd,
+            "the call keeps its name"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("JAB_DAMAGE is a constant")),
+            "{:?}",
+            report.skipped
+        );
     }
 
     /// Shy Guy's `RUMBLE_HIT(agent, kind)` helper stands for `RUMBLE_HIT(agent, kind, 0)`. The
@@ -19365,9 +19832,14 @@ pub fn install() {
         };
         let report = sync_expressions(&index, "mario", "attack11", &events, &edited).unwrap();
         let written = std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap();
-        assert!(written.contains("        macros::RUMBLE_HIT(agent, rb!(\"attackl\"));\n"), "{written}");
         assert!(
-            written.contains("        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attackll\"), 0);\n"),
+            written.contains("        macros::RUMBLE_HIT(agent, rb!(\"attackl\"));\n"),
+            "{written}"
+        );
+        assert!(
+            written.contains(
+                "        macros::RUMBLE_HIT(agent, Hash40::new(\"rbkind_attackll\"), 0);\n"
+            ),
             "the vanilla-shaped call is the second site, not the first: {written}"
         );
         assert!(
@@ -19418,7 +19890,10 @@ mod rewrite_article_tests {
         crate::acmd::parse_acmd_script(text).to_article_calls()
     }
 
-    fn rewrite(text: &str, edit: impl FnOnce(&mut Vec<(u32, ArticleCall)>)) -> (String, SyncReport) {
+    fn rewrite(
+        text: &str,
+        edit: impl FnOnce(&mut Vec<(u32, ArticleCall)>),
+    ) -> (String, SyncReport) {
         let pristine = calls(text);
         let mut edited = pristine.clone();
         edit(&mut edited);
@@ -19432,7 +19907,11 @@ mod rewrite_article_tests {
             calls[1].1.target = ArticleTarget::All;
             calls[1].1.edited = true;
         });
-        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        assert_eq!(
+            out,
+            SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"),
+            "{report:?}"
+        );
         assert_eq!(report.changed, 1);
         assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(calls(&out)[1].1.target, ArticleTarget::All);
@@ -19461,7 +19940,11 @@ mod rewrite_article_tests {
             calls[0].1.args[0] = "true".into();
             calls[0].1.edited = true;
         });
-        assert_eq!(out, text.replace("CSHOT, false, -1", "CSHOT, true, -1"), "{report:?}");
+        assert_eq!(
+            out,
+            text.replace("CSHOT, false, -1", "CSHOT, true, -1"),
+            "{report:?}"
+        );
     }
 
     /// The only call in its frame block: the block is retimed and placed in frame order, the way
@@ -19501,7 +19984,10 @@ mod rewrite_article_tests {
         let moved = calls(&out);
         assert_eq!((moved[0].0, moved[1].0), (14, 20), "{out}\n{report:?}");
         assert!(out.contains("    }\n    frame(agent.lua_state_agent, 14.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);\n    }\n    frame(agent.lua_state_agent, 20.0);"), "{out}");
-        assert!(out.contains("10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("), "{out}");
+        assert!(
+            out.contains("10.0);\n    if macros::is_excute(agent) {\n        macros::ATTACK("),
+            "{out}"
+        );
         assert_eq!(crate::acmd::parse_acmd_script(&out).to_hitboxes().len(), 1);
         // Earlier than the block it leaves: the new block goes before that block's frame line.
         let (out, report) = rewrite(&shared, |calls| calls[0].0 = 5);
@@ -19525,10 +20011,17 @@ mod rewrite_article_tests {
                 "    frame(agent.lua_state_agent, 20.0); // fire\n",
             );
         let sites = article_call_sites(&text);
-        assert_eq!(sites.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["generate_article", "shoot"]);
+        assert_eq!(
+            sites.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["generate_article", "shoot"]
+        );
         let condition = "    if ArticleModule::is_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT) {\n    }\n";
         let with_condition = format!("{}{condition}}}\n", &SPECIAL_N[..SPECIAL_N.len() - 2]);
-        assert_eq!(article_call_sites(&with_condition).len(), 2, "{with_condition}");
+        assert_eq!(
+            article_call_sites(&with_condition).len(),
+            2,
+            "{with_condition}"
+        );
         assert_eq!(calls(&with_condition).len(), 2);
         let (out, report) = rewrite(&text, |calls| calls[0].0 = 14);
         assert_eq!(out, text.replace("10.0", "14.0"), "{report:?}");
@@ -19544,21 +20037,30 @@ mod rewrite_article_tests {
             "    frame(agent.lua_state_agent, 20.0);\n",
             "    if WorkModule::is_flag(agent.module_accessor, *FIGHTER_SAMUS_STATUS_SPECIAL_N_FLAG_CHARGE) {\n        ArticleModule::remove_exist(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, ArticleOperationTarget(*ARTICLE_OPE_TARGET_ALL));\n    }\n    frame(agent.lua_state_agent, 20.0);\n",
         );
-        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &edited).unwrap();
+        let (out, report) =
+            rewrite_article_calls(&text, "samus/specialn", &pristine, &edited).unwrap();
         assert_eq!(out, text);
         assert_eq!(report.changed, 0);
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("3 `ArticleModule` call(s)"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("3 `ArticleModule` call(s)"),
+            "{report:?}"
+        );
         assert!(report.skipped[0].contains("models 2"), "{report:?}");
 
         // Added or removed calls are structural too.
-        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited[..1]).unwrap();
+        let (out, report) =
+            rewrite_article_calls(SPECIAL_N, "samus/specialn", &pristine, &edited[..1]).unwrap();
         assert_eq!(out, SPECIAL_N);
         assert!(report.skipped[0].contains("added or removed"), "{report:?}");
 
         // Nothing edited: nothing reported, even where the counts disagree.
-        let (out, report) = rewrite_article_calls(&text, "samus/specialn", &pristine, &pristine).unwrap();
-        assert_eq!((out.as_str(), report), (text.as_str(), SyncReport::default()));
+        let (out, report) =
+            rewrite_article_calls(&text, "samus/specialn", &pristine, &pristine).unwrap();
+        assert_eq!(
+            (out.as_str(), report),
+            (text.as_str(), SyncReport::default())
+        );
     }
 
     /// Paired by position, but the call at that position is a different one: refused.
@@ -19569,33 +20071,52 @@ mod rewrite_article_tests {
         other[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
         let mut edited = other.clone();
         edited[1].1.target = ArticleTarget::All;
-        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        let (out, report) =
+            rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
         assert_eq!(out, SPECIAL_N);
-        assert!(report.skipped[0].contains("is not what the source holds there"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("is not what the source holds there"),
+            "{report:?}"
+        );
         assert!(report.skipped[0].contains("SUPERMISSILE"), "{report:?}");
         // An argument that differs is a different call too, not only the function or article.
         let mut other = pristine.clone();
         other[0].1.args[0] = "true".into();
-        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &other).unwrap();
+        let (out, report) =
+            rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &other).unwrap();
         assert_eq!(out, SPECIAL_N);
         assert!(report.skipped.is_empty(), "nothing edited: {report:?}");
         let mut edited = other.clone();
         edited[0].1.args[1] = "0".into();
-        let (out, report) = rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
+        let (out, report) =
+            rewrite_article_calls(SPECIAL_N, "samus/specialn", &other, &edited).unwrap();
         assert_eq!(out, SPECIAL_N);
-        assert!(report.skipped[0].contains("passes `false` where the list has `true`"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("passes `false` where the list has `true`"),
+            "{report:?}"
+        );
         // The editor's list in another order than the file's pairs each call with its own.
         let swapped = vec![pristine[1].clone(), pristine[0].clone()];
         let mut edited = swapped.clone();
         edited[0].1.target = ArticleTarget::All;
-        let (out, report) = rewrite_editor_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
-        assert_eq!(out, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"), "{report:?}");
+        let (out, report) =
+            rewrite_editor_article_calls(SPECIAL_N, "samus/specialn", &swapped, &edited).unwrap();
+        assert_eq!(
+            out,
+            SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"),
+            "{report:?}"
+        );
     }
 
     /// One editor session, synced after every edit: `pristine` stays the list loaded at the start,
     /// as the editor keeps it; the baseline is the file each time.
-    fn sync_each(text: &str, pristine: &[(u32, ArticleCall)], edited: &[(u32, ArticleCall)]) -> String {
-        let (out, report) = rewrite_editor_article_calls(text, "samus/specialn", pristine, edited).unwrap();
+    fn sync_each(
+        text: &str,
+        pristine: &[(u32, ArticleCall)],
+        edited: &[(u32, ArticleCall)],
+    ) -> String {
+        let (out, report) =
+            rewrite_editor_article_calls(text, "samus/specialn", pristine, edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}\n{out}");
         out
     }
@@ -19607,13 +20128,19 @@ mod rewrite_article_tests {
         let mut edited = pristine.clone();
         edited[0].0 = 25;
         let first = sync_each(SPECIAL_N, &pristine, &edited);
-        assert_eq!(sync_each(&first, &pristine, &edited), first, "re-running writes nothing");
+        assert_eq!(
+            sync_each(&first, &pristine, &edited),
+            first,
+            "re-running writes nothing"
+        );
         edited[1].1.target = ArticleTarget::All;
         edited[0].1.args[0] = "true".into();
         let second = sync_each(&first, &pristine, &edited);
         assert_eq!(
             second,
-            first.replace("TARGET_LAST", "TARGET_ALL").replace("CSHOT, false, -1", "CSHOT, true, -1")
+            first
+                .replace("TARGET_LAST", "TARGET_ALL")
+                .replace("CSHOT, false, -1", "CSHOT, true, -1")
         );
     }
 
@@ -19628,7 +20155,11 @@ mod rewrite_article_tests {
         let second = sync_each(&first, &pristine, &edited);
         let now = calls(&second);
         assert_eq!((now[0].0, now[1].0), (20, 30), "{second}");
-        assert_eq!(second.len(), SPECIAL_N.len(), "only the block moved and its frame changed: {second}");
+        assert_eq!(
+            second.len(),
+            SPECIAL_N.len(),
+            "only the block moved and its frame changed: {second}"
+        );
         assert!(second.ends_with("    frame(agent.lua_state_agent, 30.0);
     if macros::is_excute(agent) {
         ArticleModule::generate_article(agent.module_accessor, *FIGHTER_SAMUS_GENERATE_ARTICLE_CSHOT, false, -1);
@@ -19644,11 +20175,17 @@ mod rewrite_article_tests {
         let mut edited = pristine.clone();
         edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_SUPERMISSILE".into();
         let first = sync_each(SPECIAL_N, &pristine, &edited);
-        assert_eq!(first, SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1));
+        assert_eq!(
+            first,
+            SPECIAL_N.replacen("ARTICLE_CSHOT, false", "ARTICLE_SUPERMISSILE, false", 1)
+        );
         edited[0].1.article = "*FIGHTER_SAMUS_GENERATE_ARTICLE_MISSILE".into();
         edited[0].1.args[1] = "0".into();
         let second = sync_each(&first, &pristine, &edited);
-        assert_eq!(second, SPECIAL_N.replacen("ARTICLE_CSHOT, false, -1", "ARTICLE_MISSILE, false, 0", 1));
+        assert_eq!(
+            second,
+            SPECIAL_N.replacen("ARTICLE_CSHOT, false, -1", "ARTICLE_MISSILE, false, 0", 1)
+        );
     }
 
     /// Important A: two `generate_article` calls of the same article with different arguments.
@@ -19665,12 +20202,25 @@ mod rewrite_article_tests {
         let mut edited = pristine.clone();
         edited[0].0 = 20;
         let first = sync_each(&text, &pristine, &edited);
-        let lines: Vec<&str> = first.lines().filter(|line| line.contains("generate_article")).collect();
-        assert!(lines[0].contains("true, 7") && lines[1].contains("false, -1"), "{first}");
+        let lines: Vec<&str> = first
+            .lines()
+            .filter(|line| line.contains("generate_article"))
+            .collect();
+        assert!(
+            lines[0].contains("true, 7") && lines[1].contains("false, -1"),
+            "{first}"
+        );
         edited[0].1.args[1] = "3".into();
         let second = sync_each(&first, &pristine, &edited);
-        assert_eq!(second, first.replace("CSHOT, false, -1", "CSHOT, false, 3"), "{second}");
-        assert!(second.contains("CSHOT, true, 7"), "the other call is untouched: {second}");
+        assert_eq!(
+            second,
+            first.replace("CSHOT, false, -1", "CSHOT, false, 3"),
+            "{second}"
+        );
+        assert!(
+            second.contains("CSHOT, true, 7"),
+            "the other call is untouched: {second}"
+        );
     }
 
     /// Cuphead-Moveset · src/buddy/acmd/specials.rs:78-96 (`game_specialn2`, tier 1, smashline2)
@@ -19687,11 +20237,20 @@ mod rewrite_article_tests {
         assert_eq!(pristine.len(), 2);
         let mut edited = pristine.clone();
         edited[1].1.args[1] = "0".into();
-        let (out, report) = rewrite_editor_article_calls(&text, "buddy/specialn2", &pristine, &edited).unwrap();
+        let (out, report) =
+            rewrite_editor_article_calls(&text, "buddy/specialn2", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
         let second = text.rfind("false, -1").unwrap();
-        assert_eq!(out, format!("{}false, 0{}", &text[..second], &text[second + "false, -1".len()..]));
-        let (back, report) = rewrite_editor_article_calls(&out, "buddy/specialn2", &edited, &pristine).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}false, 0{}",
+                &text[..second],
+                &text[second + "false, -1".len()..]
+            )
+        );
+        let (back, report) =
+            rewrite_editor_article_calls(&out, "buddy/specialn2", &edited, &pristine).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
         assert_eq!(back, text);
     }
@@ -19706,8 +20265,14 @@ mod rewrite_article_tests {
         let edited = vec![(30, call.clone()), (40, call.clone())];
         let source = vec![(25, call.clone()), (35, call.clone())];
         let error = article_calls_in_source_order(&source, &pristine, &edited).unwrap_err();
-        assert!(error.contains("could be more than one of the editor's article calls"), "{error}");
-        assert!(!error.contains("  "), "one sentence, no stray spacing: {error}");
+        assert!(
+            error.contains("could be more than one of the editor's article calls"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("  "),
+            "one sentence, no stray spacing: {error}"
+        );
         // Told apart by frame, the same lists pair.
         let source = vec![(20, call.clone()), (30, call.clone())];
         let ordered = article_calls_in_source_order(&source, &pristine, &edited).unwrap();
@@ -19719,12 +20284,19 @@ mod rewrite_article_tests {
         let text = format!(
             "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 25.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n    frame(agent.lua_state_agent, 35.0);\n    if macros::is_excute(agent) {{\n        {line}\n    }}\n}}\n"
         );
-        let (out, report) = rewrite_editor_article_calls(&text, "samus/x", &pristine, &edited).unwrap();
+        let (out, report) =
+            rewrite_editor_article_calls(&text, "samus/x", &pristine, &edited).unwrap();
         assert_eq!(out, text);
-        assert!(report.skipped[0].contains("could be more than one"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("could be more than one"),
+            "{report:?}"
+        );
         // A different number of calls is refused too.
         let error = article_calls_in_source_order(&source[..1], &pristine, &edited).unwrap_err();
-        assert!(error.contains("1 article call(s) where the editor has 2"), "{error}");
+        assert!(
+            error.contains("1 article call(s) where the editor has 2"),
+            "{error}"
+        );
     }
 
     /// N1: an argument edited twice without a reload. The file holds a value from the first edit
@@ -19740,12 +20312,19 @@ mod rewrite_article_tests {
         let mut edited = pristine.clone();
         edited[0].1.args = vec!["true".into(), "5".into()];
         let first = sync_each(&text, &pristine, &edited);
-        assert_eq!(first, text.replacen("CSHOT, false, -1", "CSHOT, true, 5", 1));
+        assert_eq!(
+            first,
+            text.replacen("CSHOT, false, -1", "CSHOT, true, 5", 1)
+        );
         edited[0].1.args = vec!["false".into(), "3".into()];
-        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        let (second, report) =
+            rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
         assert_eq!(second, first, "nothing is written");
         assert_eq!(report.skipped.len(), 1, "{report:?}");
-        assert!(report.skipped[0].contains("matches none of the editor's article calls"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("matches none of the editor's article calls"),
+            "{report:?}"
+        );
     }
 
     /// N2: an edit that sets only `target` (its argument text still the old spelling) is kept
@@ -19755,12 +20334,20 @@ mod rewrite_article_tests {
         let pristine = calls(SPECIAL_N);
         let mut edited = pristine.clone();
         edited[1].1.target = ArticleTarget::All;
-        assert!(edited[1].1.args[0].contains("LAST"), "the argument text is stale on purpose");
+        assert!(
+            edited[1].1.args[0].contains("LAST"),
+            "the argument text is stale on purpose"
+        );
         let first = sync_each(SPECIAL_N, &pristine, &edited);
         assert_eq!(first, SPECIAL_N.replace("TARGET_LAST", "TARGET_ALL"));
         for _ in 0..2 {
-            let (again, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
-            assert_eq!((again.as_str(), report.changed), (first.as_str(), 0), "{report:?}");
+            let (again, report) =
+                rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+            assert_eq!(
+                (again.as_str(), report.changed),
+                (first.as_str(), 0),
+                "{report:?}"
+            );
             assert!(report.skipped.is_empty(), "{report:?}");
         }
     }
@@ -19774,11 +20361,16 @@ mod rewrite_article_tests {
         edited[0].1.args[0] = "true".into();
         let first = sync_each(SPECIAL_N, &pristine, &edited);
         assert_ne!(first, SPECIAL_N);
-        let (second, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &pristine).unwrap();
-        assert!(second == SPECIAL_N || !report.skipped.is_empty(), "silent: {report:?}\n{second}");
+        let (second, report) =
+            rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &pristine).unwrap();
+        assert!(
+            second == SPECIAL_N || !report.skipped.is_empty(),
+            "silent: {report:?}\n{second}"
+        );
         assert!(second == SPECIAL_N || second == first, "{second}");
         // A file that already holds the edited calls, in any order, has nothing to report.
-        let (_, report) = rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
+        let (_, report) =
+            rewrite_editor_article_calls(&first, "samus/specialn", &pristine, &edited).unwrap();
         assert!(report.skipped.is_empty(), "{report:?}");
     }
 
@@ -19791,7 +20383,10 @@ mod rewrite_article_tests {
         let first = sync_each(SPECIAL_N, &pristine, &edited);
         edited[0].1.args[1] = "0".into();
         let second = sync_each(&first, &pristine, &edited);
-        assert_eq!(second, first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0"));
+        assert_eq!(
+            second,
+            first.replace("SUPERMISSILE, false, -1", "SUPERMISSILE, false, 0")
+        );
     }
 
     /// The same two syncs through the project on disk, as the editor runs them.
@@ -19830,7 +20425,10 @@ mod rewrite_article_tests {
             calls[1].1.edited = true;
         });
         assert_eq!(out, SPECIAL_N);
-        assert!(report.skipped[0].contains("`shoot` to `shoot_exist`"), "{report:?}");
+        assert!(
+            report.skipped[0].contains("`shoot` to `shoot_exist`"),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -19843,7 +20441,11 @@ mod rewrite_article_tests {
         });
         assert_eq!(report.changed, 2, "{report:?}");
         assert!(out.contains("TARGET_ALL"));
-        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "{out:?}"
+        );
         assert_eq!(out.len(), text.len() - "LAST".len() + "ALL".len());
         let moved = calls(&out);
         assert_eq!((moved[0].0, moved[1].0), (20, 25), "{out:?}");
@@ -19853,7 +20455,11 @@ mod rewrite_article_tests {
             "-1);\r\n        macros::FT_MOTION_RATE(agent, 0.5);\r\n",
         );
         let (out, _) = rewrite(&shared, |calls| calls[0].0 = 14);
-        assert_eq!(out.matches('\n').count(), out.matches("\r\n").count(), "{out:?}");
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "{out:?}"
+        );
         assert_eq!(calls(&out)[0].0, 14, "{out:?}");
     }
 
@@ -19890,23 +20496,27 @@ unsafe extern "C" fn effect_special_air_lw(agent: &mut L2CAgentBase) {
     }
 }
 "#;
-        let start = file.find("unsafe extern \"C\" fn effect_special_air_lw").unwrap();
+        let start = file
+            .find("unsafe extern \"C\" fn effect_special_air_lw")
+            .unwrap();
         let source = &file[start..];
         let expanded =
             super::unroll_string_array_loops(&super::expand_same_file_effect_helpers(source, file));
         let calls = crate::acmd::parse_effect_script(&expanded).to_effect_calls();
-        assert_eq!(calls.len(), 2, "expected 2 trail calls, got {calls:?}\n{expanded}");
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected 2 trail calls, got {calls:?}\n{expanded}"
+        );
         assert_eq!(calls[0].bone_name, "stiltshoel");
         assert_eq!(calls[1].bone_name, "stiltshoer");
         assert_eq!((calls[0].active_start, calls[0].active_end), (14, 23));
         assert_eq!((calls[1].active_start, calls[1].active_end), (14, 23));
         assert!(crate::trail_preview::trail_geometry(&calls[0]).is_some());
-        assert!(
-            calls[0]
-                .raw_line
-                .as_deref()
-                .and_then(crate::preview_trail::parse)
-                .is_some()
-        );
+        assert!(calls[0]
+            .raw_line
+            .as_deref()
+            .and_then(crate::preview_trail::parse)
+            .is_some());
     }
 }

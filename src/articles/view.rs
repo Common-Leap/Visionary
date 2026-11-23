@@ -53,12 +53,18 @@ pub fn pascal_to_snake(name: &str) -> String {
 /// A move name compared without case or underscores: the source's `flythrowb` is the game's
 /// `fly_throw_b`.
 fn loose(name: &str) -> String {
-    name.chars().filter(|c| *c != '_').flat_map(char::to_lowercase).collect()
+    name.chars()
+        .filter(|c| *c != '_')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// [`object_rows`] with the game's own script names per agent (`dump`, Pascal case as the dump
 /// names its files) for the objects that are not clones.
-pub fn object_rows_with(catalog: &ArticleCatalog, dump: &HashMap<String, Vec<String>>) -> Vec<ObjectRow> {
+pub fn object_rows_with(
+    catalog: &ArticleCatalog,
+    dump: &HashMap<String, Vec<String>>,
+) -> Vec<ObjectRow> {
     let mut rows = object_rows(catalog);
     for (row, article) in rows.iter_mut().zip(&catalog.articles) {
         if matches!(article.origin, ArticleOrigin::Clone(_)) {
@@ -81,9 +87,9 @@ pub fn object_rows_with(catalog: &ArticleCatalog, dump: &HashMap<String, Vec<Str
 
 fn capitalized(word: &str) -> String {
     let mut letters = word.chars();
-    letters
-        .next()
-        .map_or_else(String::new, |first| first.to_uppercase().chain(letters).collect())
+    letters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
 }
 
 /// `WEAPON_KIND_MARIO_FIREBALL` with owner `mario` gives `fireball`.
@@ -175,11 +181,18 @@ pub fn clone_notes(article: &Article) -> Vec<String> {
         "Cloned at {}:{}{}",
         decl.file.display(),
         decl.line,
-        if decl.use_original_code { ", running the original's code" } else { "" }
+        if decl.use_original_code {
+            ", running the original's code"
+        } else {
+            ""
+        }
     )];
     out.extend(article.clone_conflicts.iter().cloned());
     for (file, line) in &article.also_declared {
-        out.push(format!("Also declared at {}:{line}, by another `clone_weapon` call for the same object", file.display()));
+        out.push(format!(
+            "Also declared at {}:{line}, by another `clone_weapon` call for the same object",
+            file.display()
+        ));
     }
     match clone_compat::lookup(&decl.src_kind) {
         Some(entry) => {
@@ -213,7 +226,11 @@ pub fn clone_notes(article: &Article) -> Vec<String> {
 }
 
 /// The sentence for a param block an article reads but its owner's file doesn't have.
-pub fn missing_block_note(article: &Article, block: &ParamBlock, settings: &[Setting]) -> Option<String> {
+pub fn missing_block_note(
+    article: &Article,
+    block: &ParamBlock,
+    settings: &[Setting],
+) -> Option<String> {
     if block.present {
         return None;
     }
@@ -260,7 +277,11 @@ fn article_name(expr: &str, catalog: &ArticleCatalog) -> Option<ResolvedArticleN
     }
     let lower_owner = id_owner.to_lowercase();
     let lower_name = name.to_lowercase();
-    let catalog_owner = catalog.articles.first().map(|a| a.owner.as_str()).unwrap_or("");
+    let catalog_owner = catalog
+        .articles
+        .first()
+        .map(|a| a.owner.as_str())
+        .unwrap_or("");
     if !catalog_owner.is_empty() && lower_owner != catalog_owner.to_lowercase() {
         Some(ResolvedArticleName::Foreign {
             id_owner: lower_owner,
@@ -309,16 +330,27 @@ fn hash_text(arg: &str) -> String {
 /// One article call in plain words: "Creates the fireball", "Shoots the last fireball".
 pub fn timeline_label(call: &ArticleCall, catalog: &ArticleCatalog) -> String {
     let name = article_name(&call.article, catalog);
-    let catalog_owner = catalog.articles.first().map(|a| a.owner.as_str()).unwrap_or("");
+    let catalog_owner = catalog
+        .articles
+        .first()
+        .map(|a| a.owner.as_str())
+        .unwrap_or("");
     let the = |det: &str| phrase(det, name.as_ref(), &call.article, catalog_owner);
-    let arg = |n: usize| call.args.get(n).map(|a| a.trim().to_string()).unwrap_or_default();
+    let arg = |n: usize| {
+        call.args
+            .get(n)
+            .map(|a| a.trim().to_string())
+            .unwrap_or_default()
+    };
     match &call.op {
         ArticleOp::Generate => format!("Creates {}", the("the")),
         ArticleOp::GenerateEnable => format!("Lets the fighter create {}", the("the")),
         ArticleOp::Remove | ArticleOp::RemoveExist => {
             format!("Removes {}", the(target_det(call.target)))
         }
-        ArticleOp::Shoot | ArticleOp::ShootExist => format!("Shoots {}", the(target_det(call.target))),
+        ArticleOp::Shoot | ArticleOp::ShootExist => {
+            format!("Shoots {}", the(target_det(call.target)))
+        }
         ArticleOp::ChangeMotion => format!("Plays `{}` on {}", hash_text(&arg(0)), the("the")),
         ArticleOp::ChangeStatus | ArticleOp::ChangeStatusExist => {
             format!("Changes the status of {} to `{}`", the("the"), arg(0))
@@ -389,7 +421,13 @@ fn param_origin(block: &str, field: &str, file: &Path, cx: &SettingContext) -> (
         .iter()
         .rev()
         .find(|o| o.block == block && o.field.as_deref() == Some(field))
-        .map(|o| format!("param_config in {}:{}", short_path(&o.file, cx.root), o.line))
+        .map(|o| {
+            format!(
+                "param_config in {}:{}",
+                short_path(&o.file, cx.root),
+                o.line
+            )
+        })
         .unwrap_or_else(|| "param_config".into());
     (place, false)
 }
@@ -419,7 +457,9 @@ fn param_text(value: &ParamValue) -> String {
 /// `path` relative to `root`, else its last two components, with `/` separators.
 pub fn short_path(path: &Path, root: Option<&Path>) -> String {
     let parts = |p: &Path| -> Vec<String> {
-        p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect()
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect()
     };
     match root.and_then(|root| path.strip_prefix(root).ok()) {
         Some(rel) => parts(rel).join("/"),
@@ -439,7 +479,13 @@ fn line_of(file: &Path, byte: usize, texts: &mut Texts) -> Option<usize> {
         .or_insert_with(|| std::fs::read_to_string(file).ok());
     let text = text.as_ref()?;
     let byte = byte.min(text.len());
-    Some(text.as_bytes()[..byte].iter().filter(|b| **b == b'\n').count() + 1)
+    Some(
+        text.as_bytes()[..byte]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count()
+            + 1,
+    )
 }
 
 fn site_text(file: &Path, byte: usize, root: Option<&Path>, texts: &mut Texts) -> String {
@@ -456,7 +502,9 @@ pub fn status_word(kind_expr: &str) -> String {
         return "on start".into();
     }
     let kind = kind.rsplit("::").next().unwrap_or(kind);
-    kind.split_once("STATUS_KIND_").map_or(kind, |(_, rest)| rest).to_lowercase()
+    kind.split_once("STATUS_KIND_")
+        .map_or(kind, |(_, rest)| rest)
+        .to_lowercase()
 }
 
 /// Where a param value was read: `samus vl.prc`, or `param_config` for an override.
@@ -464,20 +512,39 @@ fn layer_name(file: &Path) -> String {
     if file.as_os_str().is_empty() {
         return "param_config".into();
     }
-    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    match file.parent().and_then(Path::parent).and_then(Path::file_name) {
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match file
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+    {
         Some(owner) => format!("{} {name}", owner.to_string_lossy()),
         None => name,
     }
 }
 
-pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingContext) -> Vec<SettingRow> {
+pub fn setting_rows_in(
+    settings: &[Setting],
+    params: &ParamBlock,
+    cx: SettingContext,
+) -> Vec<SettingRow> {
     let mut texts = Texts::new();
     settings
         .iter()
         .map(|setting| {
-            let label = format!("{} · {}", setting.field.label(), status_word(&setting.status));
-            let facing = if setting.facing_factor { " × facing" } else { "" };
+            let label = format!(
+                "{} · {}",
+                setting.field.label(),
+                status_word(&setting.status)
+            );
+            let facing = if setting.facing_factor {
+                " × facing"
+            } else {
+                ""
+            };
             let at = site_text(&setting.file, setting.span.start, cx.root, &mut texts);
             if setting.field == SettingField::OtherMovement {
                 let text = match &setting.value {
@@ -529,7 +596,8 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
                             editable: false,
                         };
                     };
-                    let variant = setting_variant(setting, cx.block_name, cx.variant, cx.other_variants);
+                    let variant =
+                        setting_variant(setting, cx.block_name, cx.variant, cx.other_variants);
                     let fields = params.variants.get(variant).unwrap_or(&params.fields);
                     if !params.present {
                         return SettingRow {
@@ -546,7 +614,8 @@ pub fn setting_rows_in(settings: &[Setting], params: &ParamBlock, cx: SettingCon
                                 label,
                                 value: format!("{}{facing}", param_text(value)),
                                 origin: format!("{place} ({from})"),
-                                editable: writable && matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
+                                editable: writable
+                                    && matches!(value, ParamValue::Float(_) | ParamValue::Int(_)),
                             }
                         }
                         None => SettingRow {
@@ -581,14 +650,22 @@ pub fn setting_variant(
 ) -> usize {
     match &setting.value {
         SettingValue::Param { block, .. } if own_block.is_some_and(|own| own != block) => {
-            other_variants.and_then(|m| m.get(block)).copied().unwrap_or(0)
+            other_variants
+                .and_then(|m| m.get(block))
+                .copied()
+                .unwrap_or(0)
         }
         _ => own_variant,
     }
 }
 
 /// The fields of a param block nothing in the status code reads, so the card still shows them.
-pub fn unread_param_rows(settings: &[Setting], params: &ParamBlock, block_name: &str, cx: SettingContext) -> Vec<SettingRow> {
+pub fn unread_param_rows(
+    settings: &[Setting],
+    params: &ParamBlock,
+    block_name: &str,
+    cx: SettingContext,
+) -> Vec<SettingRow> {
     let fields = params.variants.get(cx.variant).unwrap_or(&params.fields);
     fields
         .iter()
@@ -650,7 +727,10 @@ pub fn status_call_rows(
             };
             out.push(StatusCallRow {
                 label,
-                origin: format!("in status code, `{}:{number}`", short_path(&site.file, root)),
+                origin: format!(
+                    "in status code, `{}:{number}`",
+                    short_path(&site.file, root)
+                ),
                 editable: false,
                 status: site.kind_expr.clone(),
                 file: site.file.clone(),
@@ -667,7 +747,9 @@ pub fn status_call_rows(
 /// (`if ArticleModule::is_exist(acc, ID) {`) is read as the call alone: its object is still named.
 pub fn status_line_call(line: &str) -> Option<Option<ArticleCall>> {
     let at = line.find("ArticleModule::")?;
-    if line.find("//").is_some_and(|comment| comment < at) || line.trim_start().starts_with(['*', '/']) {
+    if line.find("//").is_some_and(|comment| comment < at)
+        || line.trim_start().starts_with(['*', '/'])
+    {
         return None;
     }
     if let Some(call) = ArticleCall::parse(line) {
@@ -728,7 +810,10 @@ mod tests {
             src_owner: Some(owner.into()),
             src_kind: kind.into(),
             use_original_code: false,
-            id_bindings: vec![format!("FIGHTER_SAMUS_GENERATE_ARTICLE_{}", name.to_uppercase())],
+            id_bindings: vec![format!(
+                "FIGHTER_SAMUS_GENERATE_ARTICLE_{}",
+                name.to_uppercase()
+            )],
             kind_bindings: vec![],
             id_note: None,
             file: PathBuf::from("src/lib.rs"),
@@ -749,7 +834,10 @@ mod tests {
     }
 
     fn catalog(articles: Vec<Article>) -> ArticleCatalog {
-        ArticleCatalog { articles, unresolved_clones: vec![] }
+        ArticleCatalog {
+            articles,
+            unresolved_clones: vec![],
+        }
     }
 
     fn vanilla(owner: &str, name: &str) -> Article {
@@ -786,7 +874,11 @@ mod tests {
 
     #[test]
     fn clone_badge_names_the_source() {
-        let rows = object_rows(&catalog(vec![clone_of("WEAPON_KIND_MARIO_FIREBALL", "mario", "lativolt")]));
+        let rows = object_rows(&catalog(vec![clone_of(
+            "WEAPON_KIND_MARIO_FIREBALL",
+            "mario",
+            "lativolt",
+        )]));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "lativolt");
         assert_eq!(rows[0].badge, "Clone of Mario's fireball");
@@ -805,9 +897,17 @@ mod tests {
 
     #[test]
     fn uncloneable_kind_warns_with_verifier() {
-        let rows = object_rows(&catalog(vec![clone_of("WEAPON_KIND_BRAVE_CRASH", "brave", "crash2")]));
+        let rows = object_rows(&catalog(vec![clone_of(
+            "WEAPON_KIND_BRAVE_CRASH",
+            "brave",
+            "crash2",
+        )]));
         assert_eq!(rows[0].warnings.len(), 1, "{:?}", rows[0].warnings);
-        assert!(rows[0].warnings[0].contains("Hudson6CO"), "{}", rows[0].warnings[0]);
+        assert!(
+            rows[0].warnings[0].contains("Hudson6CO"),
+            "{}",
+            rows[0].warnings[0]
+        );
         assert_eq!(
             rows[0].warnings[0],
             "The clone sheet marks `BRAVE_CRASH` as not cloneable (verified by Hudson6CO)"
@@ -819,7 +919,10 @@ mod tests {
         let mut article = clone_of("WEAPON_KIND_MARIO_FIREBALL", "mario", "lativolt");
         article.id_note = Some("stored in a struct field".into());
         let rows = object_rows(&catalog(vec![article]));
-        assert!(rows[0].warnings.iter().any(|w| w.contains("stored in a struct field")));
+        assert!(rows[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("stored in a struct field")));
     }
 
     #[test]
@@ -870,25 +973,43 @@ mod tests {
 
     #[test]
     fn computed_setting_is_not_editable() {
-        let s = setting(SettingValue::Computed("speed_x".into()), PathBuf::from("f.rs"), 0..7);
-        let s = Setting { facing_factor: true, ..s };
+        let s = setting(
+            SettingValue::Computed("speed_x".into()),
+            PathBuf::from("f.rs"),
+            0..7,
+        );
+        let s = Setting {
+            facing_factor: true,
+            ..s
+        };
         let rows = setting_rows(&[s], &ParamBlock::default());
         assert!(!rows[0].editable);
-        assert!(rows[0].origin.starts_with("worked out:"), "{}", rows[0].origin);
+        assert!(
+            rows[0].origin.starts_with("worked out:"),
+            "{}",
+            rows[0].origin
+        );
         assert_eq!(rows[0].origin, "worked out: speed_x * lr");
     }
 
     #[test]
     fn missing_block_reads_missing() {
         let s = setting(
-            SettingValue::Param { block: "param_lativolt".into(), field: "speed".into() },
+            SettingValue::Param {
+                block: "param_lativolt".into(),
+                field: "speed".into(),
+            },
             PathBuf::from("f.rs"),
             0..1,
         );
         let rows = setting_rows(&[s], &ParamBlock::default());
         assert_eq!(rows[0].value, "missing");
         assert!(!rows[0].editable);
-        assert!(rows[0].origin.starts_with("param_lativolt › speed"), "{}", rows[0].origin);
+        assert!(
+            rows[0].origin.starts_with("param_lativolt › speed"),
+            "{}",
+            rows[0].origin
+        );
     }
 
     #[test]
@@ -896,10 +1017,18 @@ mod tests {
         use crate::articles::params::ParamValue;
         let tmp = tempfile::tempdir().unwrap();
         let prc = tmp.path().join("fighter/samus/param/vl.prc");
-        let mut block = ParamBlock { present: true, ..Default::default() };
-        block.fields.insert("speed".into(), (ParamValue::Float(1.5), prc));
+        let mut block = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        block
+            .fields
+            .insert("speed".into(), (ParamValue::Float(1.5), prc));
         let s = setting(
-            SettingValue::Param { block: "param_lativolt".into(), field: "speed".into() },
+            SettingValue::Param {
+                block: "param_lativolt".into(),
+                field: "speed".into(),
+            },
             PathBuf::from("f.rs"),
             0..1,
         );
@@ -913,7 +1042,14 @@ mod tests {
         std::fs::write(&file, "fn a() {\n    set(\n 2.0);\n}\n").unwrap();
         let at = "fn a() {\n    set(\n ".len();
         let s = setting(SettingValue::Literal(2.0), file, at..at + 3);
-        let rows = setting_rows_in(&[s], &block, SettingContext { root: Some(tmp.path()), ..Default::default() });
+        let rows = setting_rows_in(
+            &[s],
+            &block,
+            SettingContext {
+                root: Some(tmp.path()),
+                ..Default::default()
+            },
+        );
         assert_eq!(rows[0].value, "2");
         assert_eq!(rows[0].origin, "status/fly.rs:3");
         assert!(rows[0].editable);
@@ -934,7 +1070,11 @@ mod tests {
             span: start..text.len(),
         };
         let body = text[start..].to_string();
-        let rows = status_call_rows(&[(&site, body)], &catalog(vec![vanilla("mario", "fireball")]), Some(tmp.path()));
+        let rows = status_call_rows(
+            &[(&site, body)],
+            &catalog(vec![vanilla("mario", "fireball")]),
+            Some(tmp.path()),
+        );
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].editable);
         assert_eq!(rows[0].label, "Creates the fireball");
@@ -958,21 +1098,45 @@ mod tests {
             .unwrap();
         assert_eq!(call.article, "*FIGHTER_MASTER_GENERATE_ARTICLE_ARROW1");
         assert_eq!(status_line_call("    //    ArticleModule::remove_exist(module_accessor,FIGHTER_KAMUI_GENERATE_ARTICLE_WEAPON,ArticleOperationTarget(0));"), None);
-        assert_eq!(status_line_call("    let x = 1; // ArticleModule::shoot(..)"), None);
-        assert_eq!(status_line_call("    MotionModule::set_rate(boma, 1.0);"), None);
+        assert_eq!(
+            status_line_call("    let x = 1; // ArticleModule::shoot(..)"),
+            None
+        );
+        assert_eq!(
+            status_line_call("    MotionModule::set_rate(boma, 1.0);"),
+            None
+        );
         let line = "    ArticleModule::generate_article(fighter.module_accessor, *FIGHTER_MARIO_GENERATE_ARTICLE_FIREBALL, false, -1);";
         assert_eq!(status_line_call(line), Some(ArticleCall::parse(line)));
         // A call split over lines is kept as unread, never dropped.
-        assert_eq!(status_line_call("    ArticleModule::generate_article("), Some(None));
+        assert_eq!(
+            status_line_call("    ArticleModule::generate_article("),
+            Some(None)
+        );
     }
 
     #[test]
     fn status_kinds_map_to_moves() {
-        assert!(status_matches_move("*FIGHTER_STATUS_KIND_SPECIAL_N", "special_n"));
-        assert!(status_matches_move("*FIGHTER_STATUS_KIND_SPECIAL_N", "special_air_n"));
-        assert!(status_matches_move("*FIGHTER_SAMUS_STATUS_KIND_SPECIAL_N_C", "special_n_start"));
-        assert!(!status_matches_move("*FIGHTER_STATUS_KIND_SPECIAL_N", "special_s"));
-        assert!(status_matches_move("*FIGHTER_STATUS_KIND_ATTACK_S4", "attack_s4_s"));
+        assert!(status_matches_move(
+            "*FIGHTER_STATUS_KIND_SPECIAL_N",
+            "special_n"
+        ));
+        assert!(status_matches_move(
+            "*FIGHTER_STATUS_KIND_SPECIAL_N",
+            "special_air_n"
+        ));
+        assert!(status_matches_move(
+            "*FIGHTER_SAMUS_STATUS_KIND_SPECIAL_N_C",
+            "special_n_start"
+        ));
+        assert!(!status_matches_move(
+            "*FIGHTER_STATUS_KIND_SPECIAL_N",
+            "special_s"
+        ));
+        assert!(status_matches_move(
+            "*FIGHTER_STATUS_KIND_ATTACK_S4",
+            "attack_s4_s"
+        ));
         assert!(!status_matches_move("", "special_n"));
     }
 
@@ -980,21 +1144,39 @@ mod tests {
     /// their badges, and `special_n`'s object calls read in plain words.
     #[test]
     fn latios_moveset_objects() {
-        let root = Path::new("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset");
+        let root =
+            Path::new("C:/Users/notja/Documents/Coding/SSBU Modding/Movesets/Latios-Moveset");
         if !root.is_dir() {
             return;
         }
         let index = crate::acmd_src::SourceIndex::build(root).unwrap();
-        let names: Vec<String> =
-            ["samus", "mario", "luigi", "link", "koopajr", "miiswordsman"].map(String::from).to_vec();
+        let names: Vec<String> = ["samus", "mario", "luigi", "link", "koopajr", "miiswordsman"]
+            .map(String::from)
+            .to_vec();
         let empty = tempfile::tempdir().unwrap();
         let catalog = crate::articles::catalog_for("samus", &index, &names, empty.path());
         let rows = object_rows(&catalog);
-        let badge_of = |name: &str| rows.iter().find(|r| r.title == name).map(|r| r.badge.clone());
-        assert_eq!(badge_of("lativolt").as_deref(), Some("Clone of Mario's fireball"));
-        assert_eq!(badge_of("latisnow").as_deref(), Some("Clone of Luigi's fireball"));
-        assert_eq!(badge_of("latihado").as_deref(), Some("Clone of Link's sword_beam"));
-        assert_eq!(badge_of("latiball").as_deref(), Some("Clone of Koopajr's cannonball"));
+        let badge_of = |name: &str| {
+            rows.iter()
+                .find(|r| r.title == name)
+                .map(|r| r.badge.clone())
+        };
+        assert_eq!(
+            badge_of("lativolt").as_deref(),
+            Some("Clone of Mario's fireball")
+        );
+        assert_eq!(
+            badge_of("latisnow").as_deref(),
+            Some("Clone of Luigi's fireball")
+        );
+        assert_eq!(
+            badge_of("latihado").as_deref(),
+            Some("Clone of Link's sword_beam")
+        );
+        assert_eq!(
+            badge_of("latiball").as_deref(),
+            Some("Clone of Koopajr's cannonball")
+        );
         let mut labels = Vec::new();
         let mut moves: Vec<String> = index.fighters["samus"]
             .scripts
@@ -1004,8 +1186,13 @@ mod tests {
         moves.sort();
         for script in &moves {
             if let Some(project) = index.script_source("samus", script) {
-                for (frame, call) in crate::acmd::parse_acmd_script(&project.body).to_article_calls() {
-                    labels.push(format!("{script} f{frame}: {}", timeline_label(&call, &catalog)));
+                for (frame, call) in
+                    crate::acmd::parse_acmd_script(&project.body).to_article_calls()
+                {
+                    labels.push(format!(
+                        "{script} f{frame}: {}",
+                        timeline_label(&call, &catalog)
+                    ));
                 }
             }
         }
@@ -1027,33 +1214,78 @@ mod tests {
             ]
         );
         for row in status_call_rows(&index.status_bodies("samus"), &catalog, Some(root)) {
-            labels.push(format!("status {}: {} ({})", row.status, row.label, row.origin));
+            labels.push(format!(
+                "status {}: {} ({})",
+                row.status, row.label, row.origin
+            ));
         }
-        eprintln!("{}", labels.join("
-"));
-        assert!(labels.iter().all(|l| !l.contains("can't name")), "{labels:#?}");
+        eprintln!(
+            "{}",
+            labels.join(
+                "
+"
+            )
+        );
+        assert!(
+            labels.iter().all(|l| !l.contains("can't name")),
+            "{labels:#?}"
+        );
     }
 
     #[test]
     fn another_block_is_never_shown_as_the_articles_own() {
         use crate::articles::params::ParamValue;
-        let mut own = ParamBlock { present: true, ..Default::default() };
-        own.fields.insert("x".into(), (ParamValue::Float(1.0), PathBuf::from("fighter/samus/param/vl.prc")));
+        let mut own = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        own.fields.insert(
+            "x".into(),
+            (
+                ParamValue::Float(1.0),
+                PathBuf::from("fighter/samus/param/vl.prc"),
+            ),
+        );
         let s = setting(
-            SettingValue::Param { block: "param_special_n".into(), field: "x".into() },
+            SettingValue::Param {
+                block: "param_special_n".into(),
+                field: "x".into(),
+            },
             PathBuf::from("f.rs"),
             0..1,
         );
-        let cx = SettingContext { block_name: Some("param_lativolt"), ..Default::default() };
+        let cx = SettingContext {
+            block_name: Some("param_lativolt"),
+            ..Default::default()
+        };
         let rows = setting_rows_in(std::slice::from_ref(&s), &own, cx);
         assert_eq!(rows[0].value, "not read here");
         assert!(!rows[0].editable);
-        assert!(rows[0].origin.contains("Visionary doesn't read `param_special_n` here"), "{}", rows[0].origin);
+        assert!(
+            rows[0]
+                .origin
+                .contains("Visionary doesn't read `param_special_n` here"),
+            "{}",
+            rows[0].origin
+        );
 
-        let mut special = ParamBlock { present: true, ..Default::default() };
-        special.fields.insert("x".into(), (ParamValue::Float(7.0), PathBuf::from("fighter/samus/param/vl.prc")));
+        let mut special = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
+        special.fields.insert(
+            "x".into(),
+            (
+                ParamValue::Float(7.0),
+                PathBuf::from("fighter/samus/param/vl.prc"),
+            ),
+        );
         let others = HashMap::from([("param_special_n".to_string(), special)]);
-        let cx = SettingContext { block_name: Some("param_lativolt"), other_blocks: Some(&others), ..Default::default() };
+        let cx = SettingContext {
+            block_name: Some("param_lativolt"),
+            other_blocks: Some(&others),
+            ..Default::default()
+        };
         let rows = setting_rows_in(&[s], &own, cx);
         assert_eq!(rows[0].value, "7");
         assert_eq!(rows[0].origin, "param_special_n › x (samus vl.prc)");
@@ -1065,22 +1297,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("src/lib.rs");
         let text = "fn f(s: Vec<i32>) {\n    param_config::update_int_2(*FIGHTER_KIND_SAMUS, s.clone(), (smash::hash40(\"param_cshot\"), smash::hash40(\"life\"), 60));\n}\n";
-        let (overrides, _) = param_config_overrides(&[(lib, text.to_string())], &["samus".to_string()]);
-        let mut block = ParamBlock { present: true, ..Default::default() };
+        let (overrides, _) =
+            param_config_overrides(&[(lib, text.to_string())], &["samus".to_string()]);
+        let mut block = ParamBlock {
+            present: true,
+            ..Default::default()
+        };
         // `param_block` gives an override an empty path.
-        block.fields.insert("life".into(), (ParamValue::Int(60), PathBuf::new()));
+        block
+            .fields
+            .insert("life".into(), (ParamValue::Int(60), PathBuf::new()));
         let s = setting(
-            SettingValue::Param { block: "param_cshot".into(), field: "life".into() },
+            SettingValue::Param {
+                block: "param_cshot".into(),
+                field: "life".into(),
+            },
             PathBuf::from("f.rs"),
             0..1,
         );
-        let cx = SettingContext { root: Some(tmp.path()), overrides: &overrides, ..Default::default() };
+        let cx = SettingContext {
+            root: Some(tmp.path()),
+            overrides: &overrides,
+            ..Default::default()
+        };
         let rows = setting_rows_in(&[s], &block, cx);
         assert_eq!(rows[0].value, "60");
-        assert_eq!(rows[0].origin, "param_cshot › life (param_config in src/lib.rs:2)");
+        assert_eq!(
+            rows[0].origin,
+            "param_cshot › life (param_config in src/lib.rs:2)"
+        );
         assert!(!rows[0].editable);
         let unread = unread_param_rows(&[], &block, "param_cshot", cx);
-        assert_eq!(unread[0].origin, "param_cshot › life (param_config in src/lib.rs:2)");
+        assert_eq!(
+            unread[0].origin,
+            "param_cshot › life (param_config in src/lib.rs:2)"
+        );
         assert!(!unread[0].editable);
     }
 
@@ -1092,13 +1343,19 @@ mod tests {
         let clone = clone_of("WEAPON_KIND_MARIO_FIREBALL", "mario", "lativolt");
         let c = catalog(vec![rewritten, clone]);
         let dump = HashMap::from([
-            ("falco_blaster_bullet".to_string(), vec!["Fly".to_string(), "FlyThrowB".to_string()]),
+            (
+                "falco_blaster_bullet".to_string(),
+                vec!["Fly".to_string(), "FlyThrowB".to_string()],
+            ),
             ("samus_lativolt".to_string(), vec!["Regular".to_string()]),
         ]);
         let rows = object_rows_with(&c, &dump);
         assert_eq!(rows[0].scripts, ["fly"]);
         assert_eq!(rows[0].game_scripts, ["fly_throw_b"]);
-        assert!(rows[1].game_scripts.is_empty(), "a clone has no game scripts");
+        assert!(
+            rows[1].game_scripts.is_empty(),
+            "a clone has no game scripts"
+        );
     }
 
     /// A setting that reads another list block is shown from, and saved to, that block's own
@@ -1111,7 +1368,10 @@ mod tests {
         let before = "<struct>\n<list hash=\"param_special_n\">\n<struct index=\"0\"><float hash=\"speed\">1</float></struct>\n<struct index=\"1\"><float hash=\"speed\">2</float></struct>\n<struct index=\"2\"><float hash=\"speed\">3</float></struct>\n</list>\n</struct>\n";
         std::fs::write(&file, before).unwrap();
         let s = setting(
-            SettingValue::Param { block: "param_special_n".into(), field: "speed".into() },
+            SettingValue::Param {
+                block: "param_special_n".into(),
+                field: "speed".into(),
+            },
             PathBuf::from("f.rs"),
             0..1,
         );
@@ -1119,17 +1379,45 @@ mod tests {
         // The object's own block is on entry 1; the other block's choice (2) wins for this row.
         let variant = setting_variant(&s, Some("param_lativolt"), 1, Some(&chosen));
         assert_eq!(variant, 2);
-        let own_row = Setting { value: SettingValue::Param { block: "param_lativolt".into(), field: "x".into() }, ..s.clone() };
-        assert_eq!(setting_variant(&own_row, Some("param_lativolt"), 1, Some(&chosen)), 1);
+        let own_row = Setting {
+            value: SettingValue::Param {
+                block: "param_lativolt".into(),
+                field: "x".into(),
+            },
+            ..s.clone()
+        };
+        assert_eq!(
+            setting_variant(&own_row, Some("param_lativolt"), 1, Some(&chosen)),
+            1
+        );
 
-        let plan = crate::articles::settings::plan_setting_write(&s, 9.0, variant, std::slice::from_ref(&file)).unwrap();
-        let crate::articles::settings::SettingWrite::Param { file: to, block, field, variant: v } = plan else {
+        let plan = crate::articles::settings::plan_setting_write(
+            &s,
+            9.0,
+            variant,
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+        let crate::articles::settings::SettingWrite::Param {
+            file: to,
+            block,
+            field,
+            variant: v,
+        } = plan
+        else {
             panic!("not a param write: {plan:?}");
         };
         assert_eq!(v, 2);
-        crate::articles::params::write_param_field(&to, &block, &field, v, 9.0, &HashMap::new()).unwrap();
+        crate::articles::params::write_param_field(&to, &block, &field, v, 9.0, &HashMap::new())
+            .unwrap();
         let after = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(after, before.replace("<float hash=\"speed\">3</float>", "<float hash=\"speed\">9</float>"));
+        assert_eq!(
+            after,
+            before.replace(
+                "<float hash=\"speed\">3</float>",
+                "<float hash=\"speed\">9</float>"
+            )
+        );
 
         // And the row reads entry 2 of the other block.
         let others = HashMap::from([(

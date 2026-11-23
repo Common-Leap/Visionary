@@ -72,10 +72,7 @@ fn leak(s: &str) -> &'static str {
 
 static SHEET: LazyLock<Sheet> = LazyLock::new(|| {
     let rows = parse_csv(include_str!("../../assets/clone_compat.csv"));
-    let advice = rows
-        .first()
-        .and_then(|r| r.first())
-        .map_or("", |s| leak(s));
+    let advice = rows.first().and_then(|r| r.first()).map_or("", |s| leak(s));
     // Row 0 is the advice note, row 1 the header.
     let entries = rows
         .iter()
@@ -130,7 +127,10 @@ mod tests {
 
     #[test]
     fn samus_bomb_notes_mention_active_num() {
-        assert!(lookup("SAMUS_BOMB").unwrap().notes.contains("get_active_num"));
+        assert!(lookup("SAMUS_BOMB")
+            .unwrap()
+            .notes
+            .contains("get_active_num"));
     }
 
     #[test]
@@ -142,6 +142,9 @@ mod tests {
     fn sheet_has_all_rows_and_advice() {
         assert_eq!(SHEET.entries.len(), 67);
         assert!(ADVICE.contains("educated guesses"));
-        assert_eq!(ADVICE, SHEET.advice, "ADVICE must match the CSV's first row");
+        assert_eq!(
+            ADVICE, SHEET.advice,
+            "ADVICE must match the CSV's first row"
+        );
     }
 }
