@@ -2223,6 +2223,96 @@ fn timeline_frame_extent(
 
 const SCRUBBER_ROW_HEIGHT: f32 = 18.0;
 
+/// The clock of an effect played alone on the Effects page. It counts frames without wrapping:
+/// each time round the loop is a new spawn with its own random particles.
+struct EffectLoopClock {
+    frames: f32,
+    playing: bool,
+    tick: std::time::Instant,
+    /// The effect's length and its period with the gap before it plays again, from the
+    /// preview's last frame; `None` while it loads.
+    length: Option<(usize, usize)>,
+}
+
+impl Default for EffectLoopClock {
+    fn default() -> Self {
+        Self {
+            frames: 0.0,
+            playing: true,
+            tick: std::time::Instant::now(),
+            length: None,
+        }
+    }
+}
+
+impl EffectLoopClock {
+    fn restart(&mut self) {
+        self.frames = 0.0;
+        self.playing = true;
+        self.tick = std::time::Instant::now();
+    }
+
+    fn advance(&mut self, fps: f32) {
+        let now = std::time::Instant::now();
+        // A stall (a load, a dialog) carries on from here rather than racing to catch up.
+        let elapsed = now.duration_since(self.tick).as_secs_f32().min(0.25);
+        self.tick = now;
+        if self.playing {
+            self.frames += elapsed * fps.clamp(1.0, 60.0);
+        }
+    }
+
+    /// The zero-based frame within the current time round.
+    fn frame_in_loop(&self, period: usize) -> usize {
+        self.frames as usize % period.max(1)
+    }
+
+    /// Show `frame` (zero-based) of the current time round, paused.
+    fn seek(&mut self, frame: usize, period: usize) {
+        let period = period.max(1);
+        let round = self.frames as usize / period;
+        self.frames = (round * period + frame.min(period - 1)) as f32;
+        self.playing = false;
+    }
+}
+
+/// The frame numbers and tick lines along the top of a timeline of `total` frames.
+fn paint_timeline_ruler(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    grid_left: f32,
+    grid_width: f32,
+    total: u32,
+) {
+    for f in FIRST_GAME_FRAME..=total {
+        if f != FIRST_GAME_FRAME && f % 5 != 0 {
+            continue;
+        }
+        let x = grid_left + timeline_frame_start_fraction(f, total) * grid_width;
+        let major = f == FIRST_GAME_FRAME || f % 10 == 0;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(
+                1.0,
+                if major {
+                    Color32::from_gray(65)
+                } else {
+                    Color32::from_gray(35)
+                },
+            ),
+        );
+        if major {
+            painter.text(
+                egui::pos2(x + 2.0, rect.top() + 2.0),
+                egui::Align2::LEFT_TOP,
+                f.to_string(),
+                egui::FontId::monospace(9.0),
+                Color32::from_gray(135),
+            );
+        }
+    }
+}
+
 /// Height of the painted timeline itself. The bottom panel uses this to stop its resize handle
 /// above an empty stretch of timeline when the current filters leave only a few rows.
 fn scrubber_chart_height(row_count: usize) -> f32 {
@@ -3423,8 +3513,7 @@ fn made_effect_lookup(
 /// Whether `status` is the effect alias push's own success line, which says nothing the user
 /// acted on.
 fn alias_status_is_routine(status: &str) -> bool {
-    status.starts_with("Sent to the game:")
-        || status.starts_with("Goes to the game when it connects:")
+    status.starts_with("Sent to the game:") || status.starts_with("Ready for the game:")
 }
 
 /// Values worked out from every edit, kept until the edit revision they were worked out at
@@ -4925,8 +5014,8 @@ pub struct VisionaryApp {
     move_revealed: Option<u64>,
     /// Which moves spawn each effect, for the Effects page list.
     effect_uses: EffectUseIndex,
-    /// When the Effects page's looping play of the open effect started.
-    effect_loop_started: std::time::Instant,
+    /// The Effects page's looping play of the open effect, shown alone.
+    effect_loop: EffectLoopClock,
     effect_loop_for: Option<String>,
     /// How many times playback has come round to the move's start. The game spawns a move's
     /// effects anew each time it is played, each with its own random particles and offsets, so
@@ -5492,7 +5581,7 @@ impl VisionaryApp {
             preview_ledges: (String::new(), Vec::new()),
             move_revealed: None,
             effect_uses: EffectUseIndex::default(),
-            effect_loop_started: std::time::Instant::now(),
+            effect_loop: EffectLoopClock::default(),
             effect_loop_for: None,
             playthrough: 0,
             carrier_push_callers: Vec::new(),
@@ -12747,8 +12836,17 @@ impl VisionaryApp {
         let selected = self.eff_editor.selected_entry_name().map(str::to_owned);
         if selected != self.effect_loop_for {
             self.effect_loop_for = selected.clone();
-            self.effect_loop_started = std::time::Instant::now();
+            self.effect_loop.restart();
         }
+        self.effect_loop.advance(self.playback_fps);
+        self.effect_loop.length = frame.wgpu_render_state().and_then(|state| {
+            state
+                .renderer
+                .read()
+                .callback_resources
+                .get::<HitboxRenderState>()
+                .and_then(|rs| rs.vfx.looped())
+        });
         if selected.is_some() {
             ui.ctx().request_repaint();
         }
@@ -13010,8 +13108,7 @@ impl VisionaryApp {
                 self.eff_editor.selected_entry_name().map(str::to_owned),
                 self.effect_editor_draw_path(),
             ) {
-                let clock =
-                    (self.effect_loop_started.elapsed().as_secs_f32() * self.playback_fps) as usize;
+                let clock = self.effect_loop.frames as usize;
                 let colour = crate::effect_colour::draw_colour(None, &name, fighter_colour);
                 let placement = crate::vfx_preview::alone_placement(
                     &self.eff_editor.selected_spawn_bones().unwrap_or_default(),
@@ -26358,8 +26455,8 @@ impl VisionaryApp {
         slot: u8,
     ) {
         self.game_link.ensure_started();
-        if self.game_link.status() != crate::game_link::LinkStatus::Connected {
-            self.state.status = "Connect to the game before reloading the asset preview.".into();
+        if !self.game_link.status().is_connected() {
+            self.state.status = self.game_link.status().label().into();
             return;
         }
         // Refuse a model that would reach the game broken: invisible meshes, unknown shaders,
@@ -31189,10 +31286,13 @@ impl VisionaryApp {
         // Says whether the game is even listening. "Sent" and "the plugin is not connected" are
         // the two outcomes a user cannot tell apart from the game side, and confusing them is
         // what makes a live feature feel broken when it is merely unplugged.
-        self.state.status = if self.game_link.status() == crate::game_link::LinkStatus::Connected {
+        self.state.status = if self.game_link.status().is_connected() {
             format!("Sent {sent} playback-rate rule(s) live")
         } else {
-            format!("{sent} playback-rate rule(s) ready — not connected to the game yet")
+            format!(
+                "{sent} playback-rate rule(s) ready. {}",
+                self.game_link.status().label()
+            )
         };
     }
 
@@ -36092,10 +36192,10 @@ impl VisionaryApp {
                 carrier_dropped_textures.join(", ")
             );
         } else if carrier_added && !carrier_authored.is_empty() {
-            let sent = if self.game_link.status() == crate::game_link::LinkStatus::Connected {
+            let sent = if self.game_link.status().is_connected() {
                 "Sent to the game"
             } else {
-                "Goes to the game when it connects"
+                "Ready for the game"
             };
             self.state.status = format!(
                 "{sent}: {} borrowed and {} edited effect(s)",
@@ -38776,6 +38876,91 @@ impl VisionaryApp {
         );
     }
 
+    /// The timeline of an effect played alone: its loop, with a playhead to drag.
+    fn draw_effect_loop_scrubber(&mut self, ui: &mut Ui) {
+        let Some((length, period)) = self.effect_loop.length else {
+            self.playback_speed_slider(ui);
+            return;
+        };
+        let total = period.max(1) as u32;
+        let current = self.effect_loop.frame_in_loop(period) as u32 + FIRST_GAME_FRAME;
+        ui.horizontal_wrapped(|ui| {
+            let play_label = if self.effect_loop.playing {
+                "Pause"
+            } else {
+                "Play"
+            };
+            if ui.button(play_label).clicked() {
+                self.effect_loop.playing = !self.effect_loop.playing;
+            }
+            if ui.button("Start").clicked() {
+                self.effect_loop.seek(0, period);
+            }
+            ui.label(format!("Frame {current} / {total}"));
+            self.playback_speed_slider(ui);
+        });
+        let name = self
+            .eff_editor
+            .selected_entry_name()
+            .unwrap_or_default()
+            .to_owned();
+        let label_width = (ui.available_width() * 0.22).clamp(110.0, 180.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(1.0), scrubber_chart_height(1)),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 2.0, Color32::from_rgb(20, 20, 30));
+        let grid_left = rect.left() + label_width;
+        let grid_width = (rect.width() - label_width).max(1.0);
+        paint_timeline_ruler(&painter, rect, grid_left, grid_width, total);
+        let y = rect.top() + 22.0;
+        painter
+            .with_clip_rect(egui::Rect::from_min_max(
+                egui::pos2(rect.left(), y),
+                egui::pos2(grid_left - 2.0, y + SCRUBBER_ROW_HEIGHT),
+            ))
+            .text(
+                egui::pos2(rect.left() + 4.0, y + SCRUBBER_ROW_HEIGHT * 0.5),
+                egui::Align2::LEFT_CENTER,
+                &name,
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(120, 200, 255),
+            );
+        let end = (length.max(1) as u32).min(total);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(
+                grid_left + timeline_frame_start_fraction(FIRST_GAME_FRAME, total) * grid_width,
+                y + 3.0,
+            ),
+            egui::pos2(
+                grid_left + timeline_frame_end_fraction(end, total) * grid_width,
+                y + SCRUBBER_ROW_HEIGHT - 3.0,
+            ),
+        );
+        painter.rect_filled(
+            bar,
+            2.0,
+            Color32::from_rgba_unmultiplied(120, 200, 255, 170),
+        );
+        let playhead = grid_left + timeline_frame_start_fraction(current, total) * grid_width;
+        painter.line_segment(
+            [
+                egui::pos2(playhead, rect.top()),
+                egui::pos2(playhead, rect.bottom()),
+            ],
+            egui::Stroke::new(2.0, Color32::WHITE),
+        );
+        if response.dragged() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let fraction = ((pos.x - grid_left) / grid_width).clamp(0.0, 1.0);
+                let frame = timeline_frame_at_fraction(fraction, total);
+                self.effect_loop
+                    .seek((frame - FIRST_GAME_FRAME) as usize, period);
+            }
+        }
+    }
+
     fn draw_scrubber(&mut self, ui: &mut Ui) {
         let total = self.timeline_total_frames();
         if total == 0 {
@@ -38900,33 +39085,7 @@ impl VisionaryApp {
                 };
                 let frame_end_x =
                     |frame: u32| grid_left + timeline_frame_end_fraction(frame, total) * grid_width;
-                for f in FIRST_GAME_FRAME..=total {
-                    if f != FIRST_GAME_FRAME && f % 5 != 0 {
-                        continue;
-                    }
-                    let x = frame_x(f);
-                    let major = f == FIRST_GAME_FRAME || f % 10 == 0;
-                    painter.line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(
-                            1.0,
-                            if major {
-                                Color32::from_gray(65)
-                            } else {
-                                Color32::from_gray(35)
-                            },
-                        ),
-                    );
-                    if major {
-                        painter.text(
-                            egui::pos2(x + 2.0, rect.top() + 2.0),
-                            egui::Align2::LEFT_TOP,
-                            f.to_string(),
-                            egui::FontId::monospace(9.0),
-                            Color32::from_gray(135),
-                        );
-                    }
-                }
+                paint_timeline_ruler(&painter, rect, grid_left, grid_width, total);
                 for (index, row) in rows.iter().enumerate() {
                     let y = rect.top() + 22.0 + index as f32 * row_height;
                     if index % 2 == 0 {
@@ -39560,18 +39719,13 @@ impl eframe::App for VisionaryApp {
 
                 ui.separator();
                 // The live system: the running game, and what it holds.
-                let status = self.game_link.status();
-                egui::containers::menu::MenuButton::from_button(egui::Button::new(match status {
-                    crate::game_link::LinkStatus::Connected => egui::RichText::new("● Live in game").color(egui::Color32::from_rgb(90, 220, 90)),
-                    crate::game_link::LinkStatus::Connecting => egui::RichText::new("● Connecting").color(egui::Color32::YELLOW),
-                    crate::game_link::LinkStatus::Disconnected => egui::RichText::new("● Game offline").color(egui::Color32::from_rgb(220, 90, 90)),
-                }).frame(false))
+                let link_view = self.game_link.view();
+                let link_menu = egui::containers::menu::MenuButton::from_button(
+                    egui::Button::new(link_view.text(ui.visuals())).frame(false),
+                )
                     .config(menu_config)
                     .ui(ui, |ui| {
-                    ui.label(match status {
-                        crate::game_link::LinkStatus::Connected => "Edits reach the running game as you make them.",
-                        _ => "Start the game with Visionary's plugin installed; edits reach it as you make them.",
-                    });
+                    crate::game_link::link_address_row(ui, &self.game_link);
                     ui.separator();
                     if ui.button("Send effect edits now")
                         .on_hover_text("Effect file edits need the move played again to show")
@@ -39589,6 +39743,8 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                 });
+                link_menu.0.on_hover_text(link_view.hover());
+                crate::game_link::link_problem_and_action(ui, &self.game_link, &link_view);
                 ui.separator();
                 if ui
                     .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod"))
@@ -39712,7 +39868,7 @@ Click to see the code, or link your own project"),
                 .show(ui, |ui| {
                     ui.add_space(4.0);
                     if effect_alone {
-                        self.playback_speed_slider(ui);
+                        self.draw_effect_loop_scrubber(ui);
                     } else {
                         self.draw_scrubber(ui);
                     }
@@ -44484,7 +44640,10 @@ fn save_recent_effs(list: &[PathBuf]) {
 
 #[cfg(test)]
 mod editor_timeline_filter_tests {
-    use super::{timeline_frame_at_fraction, TimelineCategory, TimelineFilters, FIRST_GAME_FRAME};
+    use super::{
+        timeline_frame_at_fraction, EffectLoopClock, TimelineCategory, TimelineFilters,
+        FIRST_GAME_FRAME,
+    };
     #[allow(unused_imports)]
     use crate::ui::TestFrame;
 
@@ -44509,6 +44668,33 @@ mod editor_timeline_filter_tests {
         assert!(!filters.shows(TimelineCategory::Effects));
         assert!(filters.shows(TimelineCategory::MotionState));
         assert!(filters.shows(TimelineCategory::AudioFeedback));
+    }
+
+    #[test]
+    fn an_effect_alone_scrubs_within_its_current_time_round() {
+        // Third time round a 40-frame loop, 7 frames in.
+        let mut clock = EffectLoopClock {
+            frames: 87.5,
+            ..EffectLoopClock::default()
+        };
+        assert_eq!(clock.frame_in_loop(40), 7);
+        clock.seek(30, 40);
+        assert!(!clock.playing);
+        assert_eq!(clock.frames, 110.0);
+        assert_eq!(clock.frame_in_loop(40), 30);
+        // A frame past the loop lands on its last frame, still in the same round.
+        clock.seek(500, 40);
+        assert_eq!(clock.frames, 119.0);
+        // Paused, time passing does not move it; playing, it does.
+        clock.tick -= std::time::Duration::from_millis(100);
+        clock.advance(60.0);
+        assert_eq!(clock.frames, 119.0);
+        clock.playing = true;
+        clock.tick -= std::time::Duration::from_millis(100);
+        clock.advance(60.0);
+        assert!(clock.frames > 119.0);
+        clock.restart();
+        assert_eq!((clock.frames, clock.playing), (0.0, true));
     }
 
     #[test]
@@ -48204,7 +48390,7 @@ mod live_effect_capture_tests {
     #[test]
     fn a_routine_alias_line_does_not_replace_a_characters_status() {
         assert!(alias_status_is_routine(
-            "Goes to the game when it connects: 1 borrowed and 1 edited effect(s)"
+            "Ready for the game: 1 borrowed and 1 edited effect(s)"
         ));
         assert!(alias_status_is_routine(
             "Sent to the game: 0 borrowed and 2 edited effect(s)"
@@ -48229,7 +48415,7 @@ mod live_effect_capture_tests {
             .expect("flush_effect_aliases");
         assert!(flush.contains("if !report && alias_status_is_routine(&self.state.status)"));
         for line in [
-            "\"Goes to the game when it connects\"",
+            "\"Ready for the game\"",
             "\"Sent to the game\"",
             "\"{sent}: {} borrowed and {} edited effect(s)\"",
         ] {

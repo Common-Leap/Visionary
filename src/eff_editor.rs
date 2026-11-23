@@ -33,7 +33,7 @@ use crate::effects::{
     load_effect, ColorKey, EffEntryInfo, EffModelInfo, EffVariantInfo, EmitterDef, PtclFile,
     TextureInfo,
 };
-use crate::game_link::{GameLink, LinkStatus};
+use crate::game_link::GameLink;
 use crate::mod_project::{AuthoredEdit, EmitterFieldEdits, TransplantOp};
 
 /// A move that plays an effect, as the Effects page lists it.
@@ -2372,7 +2372,7 @@ impl EffEditor {
                     // Project just loaded: get the game showing it. Rebuild-and-reload, so
                     // every emitter lands where the project says — not an averaged tint.
                     // Edits merely carried across a reload we caused push nothing.
-                    if had_edits && push_live && link.status() == LinkStatus::Connected {
+                    if had_edits && push_live && link.status().is_connected() {
                         self.request_live_apply();
                     }
                 }
@@ -2411,7 +2411,7 @@ impl EffEditor {
         }
         // The texture of the part on the Look tab, and the game's view of the effect while one
         // is connected; with neither there is nothing to put there.
-        if self.emitter_tab != EmitterTab::Attributes && link.status() != LinkStatus::Connected {
+        if self.emitter_tab != EmitterTab::Attributes && !link.status().is_connected() {
             egui::CentralPanel::default().show(ui, |ui| self.draw_emitter_editor(ui));
             return;
         }
@@ -2433,7 +2433,7 @@ impl EffEditor {
             // second copy used to sit in the game panel reporting none of the phases below it,
             // so whichever one you happened to be looking at decided how much you were told
             // about a stalled send.
-            let connected = link.status() == LinkStatus::Connected;
+            let connected = link.status().is_connected();
             let unsent = self.eff_dirty_at.is_some();
             let btn = egui::Button::new(
                 egui::RichText::new(if unsent {
@@ -2458,14 +2458,14 @@ impl EffEditor {
                 .on_disabled_hover_text(if self.sending {
                     "Sending…".to_owned()
                 } else {
-                    match link.last_error() {
-                        Some(why) => format!("Connect to the running game first.\n\n{why}"),
-                        None => "Connect to the running game first.".to_owned(),
-                    }
+                    link.view().hover()
                 })
                 .clicked()
             {
                 self.request_live_apply();
+            }
+            if !connected {
+                crate::game_link::link_status_line(ui, link);
             }
             if self.sending || self.awaiting_game.is_some() {
                 ui.add(egui::Spinner::new().size(14.0));
@@ -2991,7 +2991,7 @@ impl EffEditor {
                     }
                     ui.horizontal(|ui| {
                         // Whether the game has spawned it, only while there is a game to ask.
-                        if link.status() == LinkStatus::Connected {
+                        if link.status().is_connected() {
                             let live = link.is_live(entry.hash);
                             let dot = if live {
                                 egui::Color32::from_rgb(90, 220, 90)
@@ -4683,7 +4683,7 @@ impl EffEditor {
         }
         // The rest is about the running game: what it has spawned and what has been sent to
         // it. Without a connection none of it says anything.
-        if link.status() != LinkStatus::Connected {
+        if !link.status().is_connected() {
             return;
         }
         ui.separator();

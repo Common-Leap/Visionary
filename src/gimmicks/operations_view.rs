@@ -3,7 +3,7 @@
 use egui::{RichText, Ui};
 
 use super::registry::{self, IdentifierKind, RegistryEntry};
-use crate::game_link::{GameLink, LinkStatus, LiveGimmickAgent};
+use crate::game_link::{link_status_line, GameLink, LinkStatus, LiveGimmickAgent};
 
 #[derive(Default)]
 pub struct OperationsView {
@@ -40,19 +40,10 @@ impl OperationsView {
         let fighters = live_fighters(&live, fighter);
         reconcile_selection(&mut self.fighter_boid, &fighters);
 
-        egui::CollapsingHeader::new("Live operations")
+        let header = egui::CollapsingHeader::new("Live operations")
             .id_salt("gimmick_live_operations")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Advanced game-thread requests for already-live objects. Object IDs are \
-                         runtime targets, not saved project data; the plugin rechecks ownership, \
-                         fighter kind, weapon kind, and every symbolic identifier.",
-                    )
-                    .small()
-                    .weak(),
-                );
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Fighter object");
                     if object_picker(
@@ -65,18 +56,20 @@ impl OperationsView {
                     ) {
                         self.weapon_boid = None;
                     }
-                    ui.label(
-                        RichText::new(link_summary(link, fighter, fighters.len()))
-                            .small()
-                            .weak(),
-                    );
-                });
-                if link.status() == LinkStatus::Disconnected {
-                    if let Some(error) = link.last_error() {
-                        ui.label(RichText::new("Connection details").small().weak())
-                            .on_hover_text(error);
+                    if link.status().is_connected() {
+                        ui.label(
+                            RichText::new(link_summary(link, fighter, fighters.len()))
+                                .small()
+                                .weak(),
+                        );
+                    } else {
+                        link_status_line(ui, link);
                     }
-                } else if let Some(error) = link.gimmick_agents_error() {
+                });
+                if let Some(error) = link
+                    .gimmick_agents_error()
+                    .filter(|_| link.status().is_connected())
+                {
                     ui.label(RichText::new("Roster details").small().weak())
                         .on_hover_text(error);
                 }
@@ -163,6 +156,11 @@ impl OperationsView {
                     ui.label(RichText::new(&self.message).small());
                 }
             });
+        header.header_response.on_hover_text(
+            "Advanced game-thread requests for already-live objects. Object IDs are runtime \
+             targets, not saved project data; the plugin rechecks ownership, fighter kind, \
+             weapon kind, and every symbolic identifier.",
+        );
     }
 
     fn run_article(&mut self, link: &GameLink, fighter: &str, generate: bool) {
@@ -331,34 +329,28 @@ fn reconcile_selection(selected: &mut Option<u32>, agents: &[&LiveGimmickAgent])
 
 fn link_summary(link: &GameLink, fighter: &str, fighter_count: usize) -> String {
     match link.status() {
-        LinkStatus::Disconnected => "Game offline".to_string(),
-        LinkStatus::Connecting => "Connecting to game…".to_string(),
-        LinkStatus::Connected
+        status @ (LinkStatus::NotConnected | LinkStatus::Connecting) => status.label().to_string(),
+        LinkStatus::Connected | LinkStatus::NotAnswering
             if !link.has_gimmick_agents_snapshot() && link.gimmick_agents_error().is_some() =>
         {
             "Live roster rejected; see details".to_string()
         }
-        LinkStatus::Connected if !link.has_gimmick_agents_snapshot() => {
-            "Connected; waiting for the live roster…".to_string()
+        status if !link.has_gimmick_agents_snapshot() => {
+            format!("{}; waiting for the live roster", status.label())
         }
-        LinkStatus::Connected if fighter_count == 0 => format!("No live {fighter} fighter"),
-        LinkStatus::Connected => format!("{fighter_count} live {fighter} target(s)"),
+        _ if fighter_count == 0 => format!("No live {fighter} fighter"),
+        _ => format!("{fighter_count} live {fighter} target(s)"),
     }
 }
 
 fn fighter_picker_placeholder(link: &GameLink, fighter: &str) -> String {
     match link.status() {
-        LinkStatus::Disconnected => "Game offline".to_string(),
-        LinkStatus::Connecting => "Connecting…".to_string(),
-        LinkStatus::Connected
-            if !link.has_gimmick_agents_snapshot() && link.gimmick_agents_error().is_some() =>
-        {
+        status @ (LinkStatus::NotConnected | LinkStatus::Connecting) => status.label().to_string(),
+        _ if !link.has_gimmick_agents_snapshot() && link.gimmick_agents_error().is_some() => {
             "Live roster rejected".to_string()
         }
-        LinkStatus::Connected if !link.has_gimmick_agents_snapshot() => {
-            "Waiting for live roster…".to_string()
-        }
-        LinkStatus::Connected => format!("No live {fighter} fighter"),
+        _ if !link.has_gimmick_agents_snapshot() => "Waiting for live roster".to_string(),
+        _ => format!("No live {fighter} fighter"),
     }
 }
 
@@ -367,11 +359,11 @@ fn weapon_picker_placeholder(
     fighter_boid: Option<u32>,
     weapon_kind: Option<u32>,
 ) -> String {
-    if link.status() != LinkStatus::Connected {
-        return "Game offline".to_string();
+    if !link.status().is_connected() {
+        return link.status().label().to_string();
     }
     if !link.has_gimmick_agents_snapshot() {
-        return "Waiting for live roster…".to_string();
+        return "Waiting for live roster".to_string();
     }
     if fighter_boid.is_none() {
         return "Choose a fighter first".to_string();

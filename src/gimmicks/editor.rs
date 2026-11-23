@@ -1069,7 +1069,7 @@ impl GimmicksEditor {
             ControllerAction::RemoveArticle { symbol } => (symbol, false),
             _ => return,
         };
-        let current = link.status() == crate::game_link::LinkStatus::Connected
+        let current = link.status().is_connected()
             && self.action_test_boid.is_some_and(|boid| {
                 link.gimmick_agents().iter().any(|agent| {
                     agent.category == 0
@@ -1077,7 +1077,7 @@ impl GimmicksEditor {
                         && agent.boid == boid
                 })
             });
-        if ui.add_enabled(current, egui::Button::new(if generate { "Spawn now" } else { "Remove now" }).small()).on_hover_text("One live test on the selected player. Does not start the timer or change saved behavior. Projectiles may disappear automatically.").clicked() {
+        if ui.add_enabled(current, egui::Button::new(if generate { "Spawn now" } else { "Remove now" }).small()).on_hover_text("One live test on the selected player. Does not start the timer or change saved behavior. Projectiles may disappear automatically.").on_disabled_hover_text(if link.status().is_connected() { "Choose a live player first" } else { link.status().label() }).clicked() {
             if let Some(boid) = self.action_test_boid {
                 let result = if generate { link.generate_gimmick_article(fighter, boid, symbol) } else { link.remove_gimmick_article(fighter, boid, symbol) };
                 self.status = match result { Ok(()) => format!("{} request queued for the selected player.", if generate { "Spawn" } else { "Remove" }), Err(error) => error.to_string() };

@@ -311,6 +311,8 @@ pub struct VfxPreview {
     /// until it lands, so an edit shows without waiting for the mouse to move.
     reloading: HashSet<PathBuf>,
     next_load: u64,
+    /// The last prepare's looping draw: its length and its period with the gap, in frames.
+    looped: Option<(usize, usize)>,
 }
 
 impl VfxPreview {
@@ -336,6 +338,7 @@ impl VfxPreview {
             lengths: HashMap::new(),
             reloading: HashSet::new(),
             next_load: 0,
+            looped: None,
         }
     }
 
@@ -348,6 +351,11 @@ impl VfxPreview {
     /// paint again shortly so it appears as soon as it is ready.
     pub fn waiting(&self) -> bool {
         self.waiting
+    }
+
+    /// The length and period, in frames, of the effect the last prepare played on a loop.
+    pub fn looped(&self) -> Option<(usize, usize)> {
+        self.looped
     }
 
     fn workers(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> &Workers {
@@ -568,6 +576,7 @@ impl VfxPreview {
         }
         let game_v = game_view(view);
         let game_view_proj = projection * game_v;
+        self.looped = None;
         self.collect_loaded();
         self.waiting = !self.reloading.is_empty();
         let rows = |m: Mat4| m.transpose().to_cols_array_2d();
@@ -623,6 +632,7 @@ impl VfxPreview {
                         .entry(key)
                         .or_insert_with(|| effect_loop(&file.emitters[set]));
                     let period = plan.length + 15;
+                    self.looped = Some((plan.length, period));
                     looped = vec![*at; clock % period + 1];
                     kill_at = plan.kill;
                     spawn = looped_spawn(draw.spawn, clock, period);
@@ -665,9 +675,9 @@ impl VfxPreview {
                         .or_else(|| shared.as_ref()?.meshes.get(&id))
                         .map(Some)
                 };
-                let Some(mesh) = find_mesh(emitter) else {
+                if find_mesh(emitter).is_none() {
                     continue;
-                };
+                }
                 let missing: Vec<Job> = file
                     .jobs(emitter)
                     .into_iter()
@@ -733,16 +743,10 @@ impl VfxPreview {
                     }
                     s.step_at(set);
                 }
-                let srt = s.emitter_srt(&placement);
-                let rt = s.emitter_rt(&rt);
-                let parts = std::iter::once((emitter, &s, mesh)).chain(
-                    emitter
-                        .children
-                        .iter()
-                        .zip(s.children())
-                        .filter_map(|(child, sim)| Some((child, sim, find_mesh(child)?))),
-                );
-                for (emitter, s, mesh) in parts {
+                for (emitter, s, matrices) in draw_parts(emitter, &s, &placement, &rt) {
+                    let Some(mesh) = find_mesh(emitter) else {
+                        continue;
+                    };
                     if s.count() > 0 {
                         self.prepare_emitter(
                             queue,
@@ -750,7 +754,7 @@ impl VfxPreview {
                             emitter,
                             s,
                             mesh,
-                            (&srt, &rt),
+                            (&matrices.0, &matrices.1),
                             draw,
                             &custom2,
                         );
@@ -1032,6 +1036,23 @@ fn load_file(
         meshes: eff_wgpu::mesh::meshes(ptcl_file),
         ptcl: ptcl_file.clone(),
     })
+}
+
+/// An emitter and its child emitters as they draw, each with its matrix (with scale and
+/// without) for a set at `placement` (`rt` without scale). A child draws on its own matrix,
+/// its parent's times its own (Smash 0x8090), not its parent's: Sephiroth's Scintilla wall is
+/// seven child rows of hexagons placed by their own translations, and on the parent's matrix
+/// all seven drew on one line.
+fn draw_parts<'a>(
+    emitter: &'a Emitter,
+    s: &'a sim::EmitterSim<'a>,
+    placement: &Mat4,
+    rt: &Mat4,
+) -> Vec<(&'a Emitter, &'a sim::EmitterSim<'a>, (Mat4, Mat4))> {
+    std::iter::once((emitter, s))
+        .chain(emitter.children.iter().zip(s.children()))
+        .map(|(e, s)| (e, s, (s.emitter_srt(placement), s.emitter_rt(rt))))
+        .collect()
 }
 
 /// An emitter as the preview runs it: from this spawn's seeds, with its child emitters, and
@@ -2013,6 +2034,60 @@ mod tests {
             with < without * 0.8,
             "{with} with the field, {without} without"
         );
+    }
+
+    /// Sephiroth's Scintilla (edge/SpecialLw: edge_senkou_shield on top at 0, 13, 9, turned
+    /// -125 about Y, scale 0.85). Its wall is seven child emitters of HexagonFlare01, one row
+    /// of hexagons each, placed by its own translation (9.9 down to -13.8). The preview drew
+    /// every child on its parent's matrix, so the seven rows fell on one line beside his chest.
+    /// Each row must draw at its own height in the set's space.
+    #[test]
+    fn scintilla_draws_each_row_of_its_wall_at_its_own_height() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        let bytes = std::fs::read(root.join("effect/fighter/edge/ef_edge.eff")).unwrap();
+        let file = effect_library::NamcoEffectFile::load(&bytes).unwrap();
+        let ptcl_file = file.ptcl_file.as_ref().unwrap();
+        let set = ptcl_file
+            .emitter_list
+            .emitter_sets
+            .iter()
+            .position(|s| s.name == "P_EdgeSenkouShield")
+            .unwrap();
+        let emitters = &set_emitters(ptcl_file)[set];
+        let at = emitters
+            .iter()
+            .position(|e| e.data.name.as_deref() == Some("HexagonFlare01"))
+            .unwrap();
+        let rotation = glam::Quat::from_rotation_y((-125f32).to_radians());
+        let offset = glam::Vec3::new(0.0, 13.0, 9.0);
+        let placement =
+            Mat4::from_scale_rotation_translation(glam::Vec3::splat(0.85), rotation, offset);
+        let rt = Mat4::from_rotation_translation(rotation, offset);
+        let mut s = emitter_sim(&emitters[at], &set_seeds(emitters, 0)[at]);
+        for _ in 0..8 {
+            s.step_at(&placement);
+        }
+        let parts = draw_parts(&emitters[at], &s, &placement, &rt);
+        // The parent itself has no transform of its own: it draws on the set's matrix.
+        assert_eq!(parts[0].2, (placement, rt));
+        let rows = [9.9, 5.9, 1.95, -1.95, -5.9, -9.9, -13.8];
+        assert_eq!(parts.len(), 1 + rows.len());
+        for ((_, child, (srt, _)), want) in parts[1..].iter().zip(rows) {
+            let positions = &child.streams()["sysLocalPosAttr"];
+            assert!(positions.len() >= 4, "{} hexagons", positions.len());
+            for p in positions {
+                let world = srt.transform_point3(glam::Vec3::new(p[0], p[1], p[2]));
+                let y = placement.inverse().transform_point3(world).y;
+                assert!(
+                    (y - want).abs() < 1e-3,
+                    "a hexagon at {y}, its row is at {want}"
+                );
+            }
+        }
     }
 
     /// The same charge on its own, as the preview camera sees it: from the side, the preview's

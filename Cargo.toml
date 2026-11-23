@@ -34,7 +34,7 @@ hash40 = "1.3"
 # `.eff` parsing, editing, and export. 1.1.4 also preserves NONE child offsets for empty
 # emitter sets, while retaining the BFRES and BNSH relocation-table fixes.
 effect_library = "1.1.4"
-eff_wgpu = { git = "https://github.com/Common-Leap/eff_wgpu", rev = "910b235c8af5ebd3c70e34d5aeb74872dc83c2f3" }
+eff_wgpu = { git = "https://github.com/Common-Leap/eff_wgpu", rev = "95e4293986a9773100e4e1542adddc6fd0531a5f" }
 # BNTX encode/decode, for importing your own PNG over an effect texture. Not published on
 # crates.io, so pin the upstream commit. `image_dds` does the BCn compression and must stay
 # on the same 0.7 line bntx builds against or the `Surface` types will not unify.
