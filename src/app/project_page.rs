@@ -940,7 +940,7 @@ impl VisionaryApp {
                 .eff_mods
                 .iter()
                 .filter(|(_, eff)| !eff.is_empty())
-                .map(|(owner, _)| owner.clone())
+                .map(|(owner, _)| self.moves_owner(owner))
                 .collect(),
             values: roster
                 .params
@@ -2165,10 +2165,7 @@ impl VisionaryApp {
     }
 
     fn fighter_index(&self, fighter: &str) -> Option<usize> {
-        self.state
-            .fighters
-            .iter()
-            .position(|entry| entry.name.eq_ignore_ascii_case(fighter))
+        super::own_row_index(&self.state.fighters, fighter)
     }
 
     /// Open `page` with `key`'s character active and its costume `costume` shown. Every page a

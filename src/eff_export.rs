@@ -23,20 +23,33 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::mod_project::{AuthoredEdit, EffMod, EmitterFieldEdits, TextureImport, TransplantOp};
 
-/// Rebuild the source .eff bytes with all authored edits applied. `donor_root` resolves
-/// cross-file transplant donors (the ArcExplorer export root the `src_file_rel`s are
-/// relative to); pass None to restrict to same-file duplication.
+/// Rebuild the source .eff bytes with all authored edits applied. Cross-file transplant donors,
+/// and the files added parts come from, are under `donor_root` (the ArcExplorer export root the
+/// `src_file_rel`s are relative to); pass None to restrict to same-file duplication.
 /// Applies EVERY transplant op regardless of costume scoping (the preview view).
 ///
 /// Cross-file transplants are stripped on the way out, as the carrier's are: one Pickel effect
 /// exported into `ef_mario.eff` measures 5.67 MB rather than 7.35 MB, because the merged shader
 /// library is cut from 492 variations to the 134 the file addresses.
+// The app finds each donor on its own (`…_resolving`); this single-root form is the tests'.
+#[cfg(test)]
 pub fn rebuild_eff_bytes(
     src_bytes: &[u8],
     eff: &EffMod,
     donor_root: Option<&std::path::Path>,
 ) -> Result<Vec<u8>> {
-    rebuild_eff_bytes_filtered(src_bytes, eff, donor_root, |_| true)
+    let donor = |rel: &str| donor_root.map(|root| root.join(rel));
+    rebuild_eff_bytes_resolving(src_bytes, eff, &donor)
+}
+
+/// [`rebuild_eff_bytes`] with each donor file located by `resolve_donor`: the vanilla dump, a
+/// mod's folder and the project's own files each hold some.
+pub fn rebuild_eff_bytes_resolving(
+    src_bytes: &[u8],
+    eff: &EffMod,
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> Result<Vec<u8>> {
+    rebuild_eff_bytes_filtered(src_bytes, eff, resolve_donor, |_| true)
 }
 
 /// ONE-SLOT-scoped rebuild for export: `slot` None = the base file (only transplants with
@@ -49,10 +62,10 @@ pub fn rebuild_eff_bytes(
 pub fn rebuild_eff_bytes_for_slot(
     src_bytes: &[u8],
     eff: &EffMod,
-    donor_root: Option<&std::path::Path>,
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
     slot: Option<u8>,
 ) -> Result<Vec<u8>> {
-    rebuild_eff_bytes_filtered(src_bytes, eff, donor_root, |op| match slot {
+    rebuild_eff_bytes_filtered(src_bytes, eff, resolve_donor, |op| match slot {
         None => op.one_slot_slots.is_empty(),
         Some(s) => op.one_slot_slots.is_empty() || op.one_slot_slots.contains(&s),
     })
@@ -467,14 +480,7 @@ fn apply_carrier_rosters(
         .map(|(roster, home)| (roster, Some(home.as_deref().unwrap_or(""))))
         .collect();
     let mut missing = Vec::new();
-    let foreign = graft_foreign_parts(
-        carrier,
-        "",
-        &homes,
-        Some(resolve_donor),
-        donors,
-        &mut missing,
-    )?;
+    let foreign = graft_foreign_parts(carrier, "", &homes, resolve_donor, donors, &mut missing)?;
     let ptcl = carrier
         .ptcl_file
         .as_mut()
@@ -1402,7 +1408,7 @@ fn shader_index_fits(index: i32, variations: usize) -> bool {
 fn rebuild_eff_bytes_filtered(
     src_bytes: &[u8],
     eff: &EffMod,
-    donor_root: Option<&std::path::Path>,
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
     keep: impl Fn(&TransplantOp) -> bool,
 ) -> Result<Vec<u8>> {
     let mut namco = effect_library::NamcoEffectFile::load(src_bytes)
@@ -1420,14 +1426,14 @@ fn rebuild_eff_bytes_filtered(
         if same_file {
             apply_transplant_same_file(&mut namco, op)?;
         } else {
-            let root = donor_root.ok_or_else(|| {
+            let path = resolve_donor(&op.src_file_rel).ok_or_else(|| {
                 anyhow!(
-                    "transplant '{}': cross-file donor '{}' needs the game dump",
+                    "transplant '{}': cross-file donor '{}' was not found",
                     op.new_entry_name,
                     op.src_file_rel
                 )
             })?;
-            let donor_bytes = std::fs::read(root.join(&op.src_file_rel)).with_context(|| {
+            let donor_bytes = std::fs::read(path).with_context(|| {
                 format!(
                     "cross-file transplant donor '{}' unreadable",
                     op.src_file_rel
@@ -1454,16 +1460,11 @@ fn rebuild_eff_bytes_filtered(
         let homes: Vec<(&crate::mod_project::EmitterRoster, Option<&str>)> =
             eff.rosters.iter().map(|roster| (roster, None)).collect();
         let mut missing = Vec::new();
-        let under_root =
-            donor_root.map(|root| move |rel: &str| Some::<std::path::PathBuf>(root.join(rel)));
-        let resolve = under_root
-            .as_ref()
-            .map(|r| r as &dyn Fn(&str) -> Option<std::path::PathBuf>);
         let foreign = graft_foreign_parts(
             &mut namco,
             &eff.source_rel,
             &homes,
-            resolve,
+            resolve_donor,
             &mut Vec::new(),
             &mut missing,
         )?;
@@ -2543,8 +2544,8 @@ struct MissingPart {
 ///
 /// `homes` pairs each roster with the file it was authored against: `None` when that is `namco`
 /// itself (an export of the file), `Some(rel)` when `namco` is somewhere else (the live carrier,
-/// which holds a copy of the effect). Files are read from `donor_root` once each, through
-/// `donors` (lowercase rel to parsed file), which the caller may have filled already.
+/// which holds a copy of the effect). Files are read from where `resolve_donor` finds them, once
+/// each, through `donors` (lowercase rel to parsed file), which the caller may have filled.
 ///
 /// Every source is resolved before any roster is applied, so a part copied from an effect whose
 /// own list is also being edited is the file's part, as the editor showed it.
@@ -2553,7 +2554,7 @@ fn graft_foreign_parts(
     namco: &mut effect_library::NamcoEffectFile,
     own_rel: &str,
     homes: &[(&crate::mod_project::EmitterRoster, Option<&str>)],
-    resolve_donor: Option<&dyn Fn(&str) -> Option<std::path::PathBuf>>,
+    resolve_donor: &dyn Fn(&str) -> Option<std::path::PathBuf>,
     donors: &mut Vec<(String, effect_library::NamcoEffectFile)>,
     missing: &mut Vec<MissingPart>,
 ) -> Result<ForeignParts> {
@@ -2589,8 +2590,7 @@ fn graft_foreign_parts(
                 None => Some(&*namco),
                 Some(key) => {
                     if !donors.iter().any(|(k, _)| k == key) {
-                        let loaded = resolve_donor
-                            .and_then(|resolve| resolve(file.as_deref().unwrap_or_default()))
+                        let loaded = resolve_donor(file.as_deref().unwrap_or_default())
                             .and_then(|path| std::fs::read(path).ok())
                             .and_then(|bytes| effect_library::NamcoEffectFile::load(&bytes).ok());
                         if let Some(loaded) = loaded {

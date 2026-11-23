@@ -505,7 +505,10 @@ impl EffEditor {
         if rel.eq_ignore_ascii_case(SHARED_FILE_REL) {
             return self.shared_file(true);
         }
-        let path = self.export_root.join(rel);
+        // Found as the export and the live carrier find it: a part added from a costume's own
+        // effect file is in the mod's files, not in the game folder.
+        let path = crate::app::find_effect_file(&self.effect_roots, rel)
+            .unwrap_or_else(|| self.export_root.join(rel));
         PartFile::read(&path, rel.to_owned()).ok().map(Arc::new)
     }
 
@@ -1679,6 +1682,28 @@ mod tests {
                 starter.set
             );
         }
+    }
+
+    /// A part saved from a costume's own effect file is read from the mod that has it, which the
+    /// game folder doesn't: the editor looks where the export and the live carrier look.
+    #[test]
+    fn a_part_from_a_costume_file_is_found_in_the_mod() {
+        let Some(root) = std::env::var_os("VISIONARY_EFF_ROOT").map(PathBuf::from) else {
+            eprintln!("skipped: set VISIONARY_EFF_ROOT to the extracted effect/ tree");
+            return;
+        };
+        const COSTUME: &str = "effect/fighter/pacman/ef_pacman_c40.eff";
+        let mod_root = tempfile::tempdir().unwrap();
+        let file = mod_root.path().join(COSTUME);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::copy(root.join("effect/fighter/pacman/ef_pacman.eff"), file).unwrap();
+        let mut editor = EffEditor {
+            export_root: root.clone(),
+            ..Default::default()
+        };
+        assert!(editor.part_file(COSTUME).is_none(), "only the mod has it");
+        editor.effect_roots = vec![root, mod_root.path().to_path_buf()];
+        assert!(editor.part_file(COSTUME).is_some());
     }
 
     /// A starter added to a fighter's effect brings its texture into the file: listed, numbered,

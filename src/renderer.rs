@@ -76,7 +76,7 @@ impl Camera {
             near: view.near,
             far: view.far,
         };
-        camera.target = camera.centred_point();
+        camera.target_centre();
         camera
     }
 
@@ -105,6 +105,15 @@ impl Camera {
         self.translation = view - camera_rotation(rotation).transform_vector3(self.target);
     }
 
+    /// Turn the camera around the fighter: sideways drags turn it around, vertical drags tilt
+    /// it up or down, short of looking straight down. A view already past that, such as the
+    /// top view, is not pulled back to it.
+    pub fn orbit(&mut self, delta_x: f32, delta_y: f32) {
+        let limit = self.rotation.x.abs().max(1.4);
+        self.rotation.y += delta_x * 0.01;
+        self.rotation.x = (self.rotation.x + delta_y * 0.01).clamp(-limit, limit);
+    }
+
     /// Orbit like dragging the scene: right turns right, up tilts up.
     pub fn rotate(&mut self, delta_x: f32, delta_y: f32) {
         self.turn_to(self.rotation + Vec3::new(delta_y * 0.01, delta_x * 0.01, 0.0));
@@ -116,6 +125,19 @@ impl Camera {
         self.target -= camera_rotation(self.rotation)
             .inverse()
             .transform_vector3(shift);
+    }
+
+    /// Pan in the camera plane (left/right and up/down) while keeping rotation fixed.
+    /// Moves in world X (left/right) and world Y (up/down) regardless of camera rotation.
+    pub fn pan_camera(&mut self, delta_x: f32, delta_y: f32) {
+        let speed = self.translation.z.abs() * 0.001;
+        self.translation.x -= delta_x * speed;
+        self.translation.y += delta_y * speed;
+    }
+
+    /// Make whatever is straight ahead what orbiting and view snaps turn about.
+    pub fn target_centre(&mut self) {
+        self.target = self.centred_point();
     }
 
     /// Pan in the view plane so the model follows the pointer. The viewport height and
@@ -169,7 +191,7 @@ impl Camera {
         self.near = values.near_clip;
         self.far = values.far_clip;
         self.follow = Vec3::ZERO;
-        self.target = self.centred_point();
+        self.target_centre();
     }
 
     pub fn transforms(&self, width: f32, height: f32) -> CameraTransforms {
@@ -213,8 +235,9 @@ pub struct HitboxRenderState {
     cached_default_anim: Option<(std::path::PathBuf, Option<ssbh_data::anim_data::AnimData>)>,
     /// Cached skeleton data — reloaded only when the path changes
     cached_skel: Option<(std::path::PathBuf, ssbh_data::skel_data::SkelData)>,
-    /// The loaded model's `model.nuhlpb`. Applied to the mesh and to the overlay's bone
-    /// matrices while [`Self::helper_bones`] is on, as the game applies it every frame.
+    /// The loaded model's `model.nuhlpb`, which bends the mesh while [`Self::helper_bones`] is
+    /// on. Not the overlay's bone matrices: the game's `ModelModule` joints, which hitboxes and
+    /// effects sit on, leave helper bones as the animation has them.
     model_hlpb: Option<ssbh_data::hlpb_data::HlpbData>,
     /// The loaded model's `model.numatb`, which material tracks in a move's `.nuanmb` animate.
     model_matl: Option<ssbh_data::matl_data::MatlData>,
@@ -225,6 +248,9 @@ pub struct HitboxRenderState {
     /// the moveset's frame callback sets. Applied at the skeleton's root, so the mesh and every
     /// bone the overlay reads grow together. Set through [`Self::set_model_scale`].
     model_scale: f32,
+    /// The bone matrices of frames asked for before, while the animation, skeletons and scale
+    /// they were evaluated with stand.
+    poses: PoseCache,
     /// Weapon skeletons: (weapon_name, skel, attach_bone_name)
     /// attach_bone_name is the character bone the weapon root attaches to (e.g. "haver")
     weapon_skels: Vec<(String, ssbh_data::skel_data::SkelData, String)>,
@@ -254,9 +280,9 @@ pub struct HitboxRenderState {
     /// The stage floor under grounded moves, and its colour as stored in the scene.
     floor: crate::preview_floor::PreviewFloor,
     floor_color: [f32; 4],
-    /// The X and Z lines through the origin on the ground, while Settings shows them.
+    /// The lines on the ground, and which of them Settings shows.
     axes: crate::preview_axes::PreviewAxes,
-    world_axes: bool,
+    axis_lines: crate::preview_axes::Lines,
     /// Body meshes hidden for a visibility set, to show again when the set switches back.
     set_hidden: std::collections::HashSet<usize>,
     /// Where the models and effects are drawn before going on screen.
@@ -264,6 +290,8 @@ pub struct HitboxRenderState {
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
+    /// What [`Self::apply_preferences`] last applied.
+    preferences: Option<crate::preferences::Preferences>,
 }
 
 impl HitboxRenderState {
@@ -272,37 +300,20 @@ impl HitboxRenderState {
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        /// The viewport's backdrop, linear, as it appears on screen.
-        const VIEWPORT_BACKDROP_LINEAR: [f32; 3] = [0.05, 0.05, 0.1];
-        /// The floor under grounded moves, a shade darker than the backdrop.
-        const FLOOR_LINEAR: [f32; 3] = [0.028, 0.028, 0.055];
         let mut renderer = SsbhRenderer::new(
             device,
             queue,
             1,
             1,
             1.0,
-            [
-                VIEWPORT_BACKDROP_LINEAR[0] as f64,
-                VIEWPORT_BACKDROP_LINEAR[1] as f64,
-                VIEWPORT_BACKDROP_LINEAR[2] as f64,
-                1.0,
-            ],
+            [0.0, 0.0, 0.0, 1.0],
             surface_format,
         );
         let shared_data = SharedRenderData::new(device, queue);
         // The game's post pass: bloom, then the stage's colour grading. Effects draw into the
         // scene before it (see `prepare`), so they glow as they do in game. The backdrop is
-        // part of the scene, as a stage is, so it is cleared opaque at the value the post pass
-        // turns into the backdrop colour.
+        // part of the scene, as a stage is.
         renderer.update_color_lut_rgba(device, queue, &crate::post_grading::training_lut());
-        let scene_backdrop = crate::post_grading::scene_value_for(VIEWPORT_BACKDROP_LINEAR);
-        renderer.set_scene_clear_color(wgpu::Color {
-            r: scene_backdrop[0] as f64,
-            g: scene_backdrop[1] as f64,
-            b: scene_backdrop[2] as f64,
-            a: 1.0,
-        });
         // Use Shaded mode for full PBR rendering with textures
         let render_settings = RenderSettings {
             render_bloom: true,
@@ -310,7 +321,7 @@ impl HitboxRenderState {
             ..RenderSettings::default()
         };
         renderer.update_render_settings(queue, &render_settings);
-        Self {
+        let mut state = Self {
             renderer,
             render_settings,
             shared_data,
@@ -327,6 +338,7 @@ impl HitboxRenderState {
             model_matl: None,
             helper_bones: true,
             model_scale: 1.0,
+            poses: PoseCache::default(),
             weapon_skels: Vec::new(),
             last_frame: -1.0,
             last_anim_path: None,
@@ -366,38 +378,51 @@ impl HitboxRenderState {
                 ssbh_wgpu::DEPTH_FORMAT,
                 ssbh_wgpu::MSAA_SAMPLE_COUNT,
             ),
-            world_axes: true,
+            axis_lines: Default::default(),
             set_hidden: std::collections::HashSet::new(),
-            floor_color: {
-                let [r, g, b] = crate::post_grading::scene_value_for(FLOOR_LINEAR);
-                [r, g, b, 1.0]
-            },
+            floor_color: [0.0; 4],
             target: crate::viewport_target::ViewportTarget::new(device, surface_format),
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
-        }
+            preferences: None,
+        };
+        state.apply_preferences(queue, &crate::preferences::Preferences::default());
+        state
     }
 
     /// Viewport preferences from the Settings window: background, floor grid, world axes and
-    /// bloom.
+    /// bloom. Called every paint; only a change does anything.
     pub fn apply_preferences(
         &mut self,
         queue: &wgpu::Queue,
         preferences: &crate::preferences::Preferences,
     ) {
-        let [r, g, b, a] = preferences.viewport_clear_color();
-        self.renderer.set_clear_color([r, g, b, a]);
-        // The backdrop is part of the scene and goes through the post pass, so clear it at the
-        // value that comes out as the chosen colour (see `new`).
-        let scene = crate::post_grading::scene_value_for([r as f32, g as f32, b as f32]);
+        if self.preferences.as_ref() == Some(preferences) {
+            return;
+        }
+        self.preferences = Some(preferences.clone());
+        let (backdrop, floor) = preferences.viewport_colors();
+        self.renderer.set_clear_color([
+            backdrop[0] as f64,
+            backdrop[1] as f64,
+            backdrop[2] as f64,
+            1.0,
+        ]);
+        // The backdrop and the floor are part of the scene and go through the post pass, so
+        // each is stored as the value that comes out as its colour.
+        let scene = crate::post_grading::scene_value_for(backdrop);
         self.renderer.set_scene_clear_color(wgpu::Color {
             r: scene[0] as f64,
             g: scene[1] as f64,
             b: scene[2] as f64,
-            a,
+            a: 1.0,
         });
-        self.model_render_options.draw_floor_grid = preferences.floor_grid;
-        self.world_axes = preferences.world_axes;
+        let [r, g, b] = crate::post_grading::scene_value_for(floor);
+        self.floor_color = [r, g, b, 1.0];
+        self.axis_lines = crate::preview_axes::Lines {
+            grid: preferences.floor_grid,
+            axes: preferences.world_axes,
+        };
         if self.render_settings.render_bloom != preferences.bloom {
             self.render_settings.render_bloom = preferences.bloom;
             self.renderer
@@ -432,6 +457,7 @@ impl HitboxRenderState {
         self.set_hidden.clear();
         self.object_dirs.clear();
         self.weapon_skels.clear();
+        self.poses.clear();
         // `folder` holds the files ARCropolis would load here (see `read_costume_model`).
         if folder.meshes.is_empty() && folder.skels.is_empty() {
             eprintln!("[MODEL] no model files for {:?}", model_dir);
@@ -512,6 +538,7 @@ impl HitboxRenderState {
             self.cached_anim = None;
             self.cached_default_anim = None;
             self.cached_vis_meshes = meshes_key;
+            self.poses.clear();
         }
         self.update_default_animation(default_anim_path, &meshes);
 
@@ -523,6 +550,7 @@ impl HitboxRenderState {
                 .map(|(p, _)| p != path)
                 .unwrap_or(true);
             if needs_load {
+                self.poses.clear();
                 self.cached_anim =
                     ssbh_data::anim_data::AnimData::from_file(path)
                         .ok()
@@ -531,8 +559,8 @@ impl HitboxRenderState {
                             (path.to_path_buf(), a)
                         });
             }
-        } else {
-            self.cached_anim = None;
+        } else if self.cached_anim.take().is_some() {
+            self.poses.clear();
         }
 
         // Reload skel only when path changes
@@ -543,17 +571,17 @@ impl HitboxRenderState {
                 .map(|(p, _)| p != path)
                 .unwrap_or(true);
             if needs_load {
+                self.poses.clear();
                 self.cached_skel = ssbh_data::skel_data::SkelData::from_file(path)
                     .ok()
                     .map(|s| (path.to_path_buf(), s));
             }
-        } else {
-            self.cached_skel = None;
+        } else if self.cached_skel.take().is_some() {
+            self.poses.clear();
         }
 
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         let skel = self.cached_skel.as_ref().map(|(_, s)| s);
-        // Field borrows rather than `active_hlpb()`: the loop below borrows `render_models`.
         let hlpb = self.model_hlpb.as_ref().filter(|_| self.helper_bones);
         let matl = self.model_matl.as_ref();
 
@@ -882,7 +910,7 @@ impl HitboxRenderState {
         self.model_hlpb.is_some()
     }
 
-    /// Turn helper bone constraints on or off for both the mesh and the overlay.
+    /// Turn helper bone constraints on or off.
     pub fn set_helper_bones(&mut self, enabled: bool) {
         if self.helper_bones != enabled {
             self.helper_bones = enabled;
@@ -900,17 +928,20 @@ impl HitboxRenderState {
         };
         if self.model_scale != scale {
             self.model_scale = scale;
+            self.poses.clear();
             self.last_frame = -1.0;
         }
     }
 
-    fn active_hlpb(&self) -> Option<&ssbh_data::hlpb_data::HlpbData> {
-        self.model_hlpb.as_ref().filter(|_| self.helper_bones)
+    /// The scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
+    pub fn model_scale(&self) -> f32 {
+        self.model_scale
     }
 
     /// Eagerly load skeleton data so bone_world_matrices_at() returns valid results
     /// immediately, without waiting for the first prepare() call.
     pub fn load_skeleton(&mut self, skel_path: &Path) {
+        self.poses.clear();
         self.cached_skel = ssbh_data::skel_data::SkelData::from_file(skel_path)
             .ok()
             .map(|s| (skel_path.to_path_buf(), s));
@@ -919,35 +950,80 @@ impl HitboxRenderState {
     /// Bone name -> world matrix (body and weapon skeletons) at an explicit `frame`.
     /// The offset from ACMD should be transformed by this matrix (not just added). Use this from the simulation code so bone
     /// positions are correct on the very first frame (no 1-frame delay).
-    pub fn bone_world_matrices_at(
-        &self,
-        frame: f32,
-    ) -> std::collections::HashMap<String, glam::Mat4> {
-        let skel = match self.cached_skel.as_ref() {
-            Some((_, s)) => s,
-            None => {
-                if crate::debug_enabled() {
-                    eprintln!("[BONE] cached_skel is NONE — returning empty map");
-                }
-                return std::collections::HashMap::new();
+    pub fn bone_world_matrices_at(&self, frame: f32) -> Pose {
+        let Some((_, skel)) = self.cached_skel.as_ref() else {
+            if crate::debug_enabled() {
+                eprintln!("[BONE] cached_skel is NONE — returning empty map");
             }
+            return Default::default();
         };
-        let anim = self.cached_anim.as_ref().map(|(_, a)| a);
-        let mut matrices =
-            compute_bone_world_matrices(skel, anim, self.active_hlpb(), &self.weapon_skels, frame);
-        if self.model_scale != 1.0 {
-            // The same as scaling the root bone, which is what the mesh gets.
+        self.poses.at(frame, true, || {
+            let anim = self.cached_anim.as_ref().map(|(_, a)| a);
+            let mut matrices =
+                compute_bone_world_matrices(skel, anim, None, &self.weapon_skels, frame);
+            // The same as scaling the root bone, which is what the mesh gets: in game every
+            // joint sits at exactly the model scale times its unscaled place.
             let scale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale));
             for matrix in matrices.values_mut() {
                 *matrix = scale * *matrix;
             }
-        }
-        matrices
+            matrices
+        })
     }
 
-    /// The model scale the mesh and [`Self::bone_world_matrices_at`] are drawn at.
-    pub fn model_scale(&self) -> f32 {
-        self.model_scale
+    /// [`Self::bone_world_matrices_at`] with every axis at its unscaled length: where the scaled
+    /// fighter's bones are, for what is placed on them without taking its scale.
+    pub fn joint_matrices_at(&self, frame: f32) -> Pose {
+        let scaled = self.bone_world_matrices_at(frame);
+        if self.model_scale == 1.0 {
+            return scaled;
+        }
+        self.poses.at(frame, false, || {
+            let unscale = glam::Mat4::from_scale(glam::Vec3::splat(self.model_scale.recip()));
+            let joint = |(name, matrix): (&String, &glam::Mat4)| (name.clone(), *matrix * unscale);
+            scaled.iter().map(joint).collect()
+        })
+    }
+}
+
+/// Bone matrices by frame. Evaluating a skeleton sorts its bones and builds a map of their
+/// names, and one paint asks for the same frames many times over: the overlays for the open
+/// one, and a weapon trail for a dozen samples of each frame it covers.
+#[derive(Default)]
+struct PoseCache {
+    poses: std::sync::Mutex<Poses>,
+}
+
+/// A frame's bone matrices by name.
+pub type Pose = std::sync::Arc<std::collections::HashMap<String, glam::Mat4>>;
+/// By frame, and whether the axes carry the fighter's scale.
+type Poses = std::collections::HashMap<(u32, bool), Pose>;
+
+impl PoseCache {
+    /// Enough for every sample of a long trail and the frames around it.
+    const MOST: usize = 512;
+
+    fn at(
+        &self,
+        frame: f32,
+        scaled: bool,
+        evaluate: impl FnOnce() -> std::collections::HashMap<String, glam::Mat4>,
+    ) -> Pose {
+        let key = (frame.to_bits(), scaled);
+        if let Some(pose) = self.poses.lock().unwrap().get(&key) {
+            return pose.clone();
+        }
+        let pose = Pose::new(evaluate());
+        let mut poses = self.poses.lock().unwrap();
+        if poses.len() >= Self::MOST {
+            poses.clear();
+        }
+        poses.insert(key, pose.clone());
+        pose
+    }
+
+    fn clear(&mut self) {
+        self.poses.get_mut().unwrap().clear();
     }
 }
 
@@ -1238,6 +1314,80 @@ mod tests {
         }
     }
 
+    /// Settings' floor grid is drawn with the ground lines, before the effects. ssbh_wgpu's own
+    /// grid is drawn after them, over particles, so it stays off whatever is picked; and with
+    /// nothing picked the view draws no lines and keeps its bloom, backdrop and floor.
+    #[test]
+    fn the_floor_grid_is_never_drawn_over_the_effects() {
+        let Some((device, queue)) = crate::preview_trail::tests::gpu() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let mut state =
+            super::HitboxRenderState::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert!(!state.axis_lines.any());
+        assert!(state.render_settings.render_bloom);
+        let [r, g, b] = crate::post_grading::scene_value_for([0.028, 0.028, 0.055]);
+        assert_eq!(state.floor_color, [r, g, b, 1.0]);
+        let all = crate::preferences::Preferences {
+            floor_grid: true,
+            world_axes: true,
+            bloom: false,
+            viewport_color: Some([200, 40, 90]),
+            ..Default::default()
+        };
+        state.apply_preferences(&queue, &all);
+        assert!(state.axis_lines.grid && state.axis_lines.axes);
+        assert!(!state.model_render_options.draw_floor_grid);
+        assert!(!state.render_settings.render_bloom);
+        assert_ne!(state.floor_color, [r, g, b, 1.0]);
+        state.apply_preferences(&queue, &Default::default());
+        assert!(!state.axis_lines.any());
+        assert_eq!(state.floor_color, [r, g, b, 1.0]);
+    }
+
+    /// A frame's bones are evaluated once, however often a paint asks for them, and again after
+    /// anything they depend on changes.
+    #[test]
+    fn a_frames_bones_are_evaluated_once() {
+        let evaluated = std::cell::Cell::new(0);
+        let mut poses = super::PoseCache::default();
+        // One paint of an eight frame trail: the overlays at the open frame, twelve samples of
+        // each trail frame for the ribbon and three for its outline. Sixty paints of it.
+        let paint = |poses: &super::PoseCache| {
+            let ask = |frame: f32| {
+                poses.at(frame, true, || {
+                    evaluated.set(evaluated.get() + 1);
+                    std::collections::HashMap::from([(
+                        "top".to_owned(),
+                        glam::Mat4::from_translation(glam::Vec3::splat(frame)),
+                    )])
+                })
+            };
+            for _ in 0..4 {
+                assert_eq!(ask(8.0)["top"].w_axis.x, 8.0);
+            }
+            for i in 0..=8 * 12 {
+                ask(i as f32 / 12.0);
+            }
+            for i in 0..=8 * 3 {
+                ask(i as f32 * 4.0 / 12.0);
+            }
+        };
+        for _ in 0..60 {
+            paint(&poses);
+        }
+        assert_eq!(evaluated.get(), 97);
+        poses.clear();
+        paint(&poses);
+        assert_eq!(evaluated.get(), 2 * 97);
+        // It never grows past its limit.
+        for i in 0..5000 {
+            poses.at(i as f32, true, Default::default);
+        }
+        assert!(poses.poses.lock().unwrap().len() <= super::PoseCache::MOST);
+    }
+
     /// Bone positions are evaluated through the hierarchy, whatever order the skeleton lists
     /// bones in, and a helper bone file without constraints moves nothing.
     #[test]
@@ -1307,6 +1457,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Helper bones bend the mesh only. The game's joints leave them as the animation has them
+    /// (Wolf's `h_elbowr` in wait: 0.4 degrees from the animation's turn, 53 from the helper's),
+    /// so nothing the view draws on a bone may turn with them.
+    #[test]
+    fn helper_bones_leave_the_overlays_bones_alone() {
+        use glam::{Quat, Vec3};
+        use ssbh_data::hlpb_data::{HlpbData, OrientConstraintData};
+        let Some((device, queue)) = crate::preview_trail::tests::gpu() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let skel = ssbh_data::skel_data::SkelData {
+            major_version: 1,
+            minor_version: 0,
+            bones: vec![
+                bone("ShoulderR", None, Vec3::ZERO),
+                bone("ArmR", Some(0), Vec3::X),
+                bone("H_ElbowR", Some(0), Vec3::X),
+            ],
+        };
+        let anim = ssbh_data::anim_data::AnimData {
+            major_version: 2,
+            minor_version: 0,
+            final_frame_index: 0.0,
+            groups: vec![ssbh_data::anim_data::GroupData {
+                group_type: ssbh_data::anim_data::GroupType::Transform,
+                nodes: vec![transform_track(
+                    "ArmR",
+                    vec![(Vec3::X, Quat::from_rotation_z(1.0))],
+                )],
+            }],
+        };
+        let hlpb = HlpbData {
+            major_version: 1,
+            minor_version: 1,
+            aim_constraints: Vec::new(),
+            orient_constraints: vec![OrientConstraintData {
+                name: "elbow".into(),
+                parent_bone_name1: "ShoulderR".into(),
+                parent_bone_name2: "ShoulderR".into(),
+                source_bone_name: "ArmR".into(),
+                target_bone_name: "H_ElbowR".into(),
+                unk_type: 1,
+                constraint_axes: Vec3::splat(0.5),
+                quat1: Quat::IDENTITY,
+                quat2: Quat::IDENTITY,
+                range_min: Vec3::splat(-180.0),
+                range_max: Vec3::splat(180.0),
+            }],
+        };
+        let evaluate =
+            |hlpb| super::compute_bone_world_matrices(&skel, Some(&anim), hlpb, &[], 0.0);
+        let plain = evaluate(None);
+        let bent = evaluate(Some(&hlpb));
+        assert!(!bent["H_ElbowR"].abs_diff_eq(plain["H_ElbowR"], 0.1));
+        let mut state =
+            super::HitboxRenderState::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb);
+        state.cached_skel = Some((Default::default(), skel.clone()));
+        state.cached_anim = Some((Default::default(), anim.clone()));
+        state.model_hlpb = Some(hlpb.clone());
+        state.set_helper_bones(true);
+        let drawn = state.bone_world_matrices_at(0.0);
+        assert!(drawn["H_ElbowR"].abs_diff_eq(plain["H_ElbowR"], 1e-5));
     }
 
     /// Against real data: a fighter's helper bones move once their constraints apply, and the
@@ -1785,9 +2000,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some(floor) = floor {
                 floor.update(queue, t.mvp_matrix, state.floor_color);
             }
-            let axes = state.world_axes.then_some(&state.axes);
+            let axes = state.axis_lines.any().then_some(&state.axes);
             if let Some(axes) = axes {
-                axes.update(queue, t.mvp_matrix, t.camera_pos);
+                axes.update(queue, t.mvp_matrix, t.camera_pos, state.axis_lines);
             }
             // The stage's models are drawn with the fighter's, in one list for the renderer;
             // they go back to their own list afterwards.

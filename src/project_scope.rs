@@ -374,11 +374,17 @@ pub fn absorb_authored_characters(
 
 /// The fighters `project` holds edits for.
 pub fn edited_fighters(project: &ModProjectFile) -> BTreeSet<String> {
+    // A costume's own effect file is edited under the costume's key, and belongs to its row.
+    let costume_files = project.characters.iter().filter(|(key, edits)| {
+        let character = crate::character::CharacterKey::made((*key).clone());
+        edits.has_edits() && character.costume_file(&project.roster).is_some()
+    });
     project
         .fighters
         .iter()
         .filter(|(_, fighter)| fighter.has_edits())
         .map(|(name, _)| name.clone())
+        .chain(costume_files.map(|(key, _)| key.as_str().to_owned()))
         .collect()
 }
 
@@ -680,6 +686,26 @@ mod tests {
                 MembershipReason::HasEdits,
             ]
         );
+    }
+
+    /// Editing the effects of a mod's character on a costume adds its row, not its fighter's.
+    #[test]
+    fn a_costume_files_edits_belong_to_its_own_row() {
+        let mut project = ModProjectFile::default();
+        let key = crate::roster::RosterKey::slot("pacman", 40);
+        project.characters.entry(key).or_default().eff = Some(crate::mod_project::EffMod {
+            source_rel: "effect/fighter/pacman/ef_pacman_c40.eff".into(),
+            textures_removed: vec!["x".into()],
+            ..Default::default()
+        });
+        let shy_guy = ProjectFighter::character("pacman", "Shy Guy");
+        let mut set = BTreeSet::new();
+        let edited = absorb_edited_fighters(&mut set, &BTreeSet::new(), &project, |owner| {
+            assert_eq!(owner, "pacman#c40");
+            vec![shy_guy.clone()]
+        });
+        assert_eq!(set, BTreeSet::from([shy_guy]));
+        assert_eq!(edited, BTreeSet::from(["pacman#c40".to_owned()]));
     }
 
     #[test]

@@ -72,6 +72,7 @@ mod ui;
 mod user_files;
 mod vfx_preview;
 mod viewport_navigation;
+mod viewport_overlays;
 mod viewport_target;
 #[cfg(target_os = "linux")]
 mod wayland_icon;

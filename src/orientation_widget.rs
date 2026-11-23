@@ -2,14 +2,11 @@
 //! Clicking an axis or face looks along it, and dragging orbits like the viewport.
 //!
 //! Ported from SSBH Studio (MIT), with its numpad view keys.
-use crate::preferences::NavigationWidget;
+use crate::preferences::{NavigationScheme, NavigationWidget};
 use crate::renderer::{camera_rotation, Camera};
 use egui::{Color32, Id, Order, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use glam::{Mat4, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI};
-
-/// Distance from the viewport edges and from the toolbar.
-const MARGIN: f32 = 8.0;
 
 const RADIUS: f32 = 32.0;
 const BALL: f32 = 9.0;
@@ -25,7 +22,8 @@ const FACE_INSET: f32 = 0.85;
 /// Corner rounding for the cube's faces and silhouette, in points.
 const CUBE_ROUNDING: f32 = 5.0;
 
-fn widget_size(style: NavigationWidget) -> Option<Vec2> {
+/// The space the widget takes, or `None` when it is hidden.
+pub fn widget_size(style: NavigationWidget) -> Option<Vec2> {
     match style {
         NavigationWidget::Axes => Some(Vec2::splat(AXES_SIZE)),
         NavigationWidget::Cube => Some(Vec2::splat(CUBE_AREA)),
@@ -119,32 +117,29 @@ fn clicked_rotation(camera: &Camera, index: usize) -> Vec3 {
     }
 }
 
-/// Draws and interacts only inside the viewport, below `header` (the viewport toolbar) when
-/// it reaches the corner. Returns whether the camera changed.
+/// Draws the widget in `rect` (see [`crate::viewport_overlays`]), inside `viewport`. Returns
+/// whether the camera changed.
 pub fn orientation_widget(
     ui: &Ui,
     viewport: Rect,
-    header: Option<Rect>,
+    rect: Rect,
     style: NavigationWidget,
+    scheme: NavigationScheme,
     camera: &mut Camera,
 ) -> bool {
     let viewport = viewport.intersect(ui.clip_rect());
-    let Some(rect) = widget_rect(viewport, header, style) else {
-        return false;
-    };
     egui::Area::new(Id::unique("viewport_orientation"))
         .order(Order::Middle)
         .movable(false)
         // Screen-wide Area constraints can move the widget outside an inset viewport.
-        // Placement is already clamped to the viewport, including after a style change.
         .constrain_to(viewport)
         .constrain(false)
         .fixed_pos(rect.min)
         .show(ui.ctx(), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(viewport));
             match style {
-                NavigationWidget::Axes => axes_widget(ui, rect.size(), camera),
-                NavigationWidget::Cube => cube_widget(ui, rect.size(), camera),
+                NavigationWidget::Axes => axes_widget(ui, rect.size(), scheme, camera),
+                NavigationWidget::Cube => cube_widget(ui, rect.size(), scheme, camera),
                 NavigationWidget::Hidden => false,
             }
         })
@@ -219,7 +214,7 @@ fn axis_label(
 }
 
 /// Orbits like dragging the viewport. Returns `true` if the camera moved.
-fn drag_orbit(response: &egui::Response, camera: &mut Camera) -> bool {
+fn drag_orbit(response: &egui::Response, scheme: NavigationScheme, camera: &mut Camera) -> bool {
     if !response.dragged() {
         return false;
     }
@@ -227,11 +222,11 @@ fn drag_orbit(response: &egui::Response, camera: &mut Camera) -> bool {
     if delta == Vec2::ZERO {
         return false;
     }
-    camera.rotate(delta.x, delta.y);
+    crate::viewport_navigation::turn(camera, scheme, delta);
     true
 }
 
-fn axes_widget(ui: &mut Ui, size: Vec2, camera: &mut Camera) -> bool {
+fn axes_widget(ui: &mut Ui, size: Vec2, scheme: NavigationScheme, camera: &mut Camera) -> bool {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let center = rect.center();
     let rotation = view_rotation(camera);
@@ -306,7 +301,7 @@ fn axes_widget(ui: &mut Ui, size: Vec2, camera: &mut Camera) -> bool {
         ),
         None => "Click an axis to look along it. Drag to orbit.".to_owned(),
     });
-    if drag_orbit(&response, camera) {
+    if drag_orbit(&response, scheme, camera) {
         return true;
     }
     if let Some(i) = hovered.filter(|_| response.clicked()) {
@@ -440,7 +435,7 @@ fn convex_hull(mut points: Vec<Pos2>) -> Vec<Pos2> {
 
 /// A chamfered cube: rounded faces sit just inside a darker silhouette, so thin seams read
 /// as beveled edges. Faces shade by how much they turn toward a light at the upper left.
-fn cube_widget(ui: &mut Ui, size: Vec2, camera: &mut Camera) -> bool {
+fn cube_widget(ui: &mut Ui, size: Vec2, scheme: NavigationScheme, camera: &mut Camera) -> bool {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let center = rect.center();
     let rotation = view_rotation(camera);
@@ -582,7 +577,7 @@ fn cube_widget(ui: &mut Ui, size: Vec2, camera: &mut Camera) -> bool {
         ),
         _ => "Click a face to look at it. Drag to orbit.".to_owned(),
     });
-    if drag_orbit(&response, camera) {
+    if drag_orbit(&response, scheme, camera) {
         return true;
     }
     if response.clicked() {
@@ -619,62 +614,9 @@ pub fn numpad_view(key: egui::Key, ctrl: bool, camera: &Camera) -> Option<Vec3> 
     Some(VIEWS[if ctrl { index ^ 1 } else { index }].rotation)
 }
 
-/// Prefer the top right, below the toolbar when it reaches that far, but never leave the
-/// viewport. A viewport too small for the widget, or a hidden one, has none.
-fn widget_rect(viewport: Rect, header: Option<Rect>, style: NavigationWidget) -> Option<Rect> {
-    let size = widget_size(style)?;
-    if !viewport.is_finite() || viewport.width() < size.x || viewport.height() < size.y {
-        return None;
-    }
-    let padding = ((viewport.size() - size) * 0.5).min(Vec2::splat(MARGIN));
-    let min = viewport.min + padding;
-    let max = viewport.max - padding - size;
-    let x = max.x;
-    let preferred_y = match header {
-        Some(header) if header.max.x + MARGIN > x => header.max.y + MARGIN,
-        _ => min.y,
-    };
-    let y = preferred_y.clamp(min.y, max.y);
-    Some(Rect::from_min_size(Pos2::new(x, y), size))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_widget_stays_inside_the_viewport_and_moves_below_a_wide_toolbar() {
-        for style in [NavigationWidget::Axes, NavigationWidget::Cube] {
-            let size = widget_size(style).unwrap();
-            for width in [0.0, 40.0, 86.0, 136.0, 300.0, 900.0] {
-                for height in [0.0, 40.0, 86.0, 136.0, 300.0, 600.0] {
-                    let viewport =
-                        Rect::from_min_size(Pos2::new(350.0, 75.0), Vec2::new(width, height));
-                    for toolbar_height in [0.0, 32.0, 120.0, 800.0] {
-                        let toolbar =
-                            Rect::from_min_size(viewport.min, Vec2::new(width, toolbar_height));
-                        match widget_rect(viewport, Some(toolbar), style) {
-                            Some(rect) => {
-                                assert!(viewport.contains_rect(rect), "{style:?} {rect:?}");
-                                assert_eq!(rect.size(), size);
-                            }
-                            None => assert!(width < size.x || height < size.y),
-                        }
-                    }
-                }
-            }
-        }
-        let viewport = Rect::from_min_size(Pos2::new(200.0, 50.0), Vec2::new(600.0, 500.0));
-        let short = Rect::from_min_size(viewport.min, Vec2::new(100.0, 32.0));
-        let wide = Rect::from_min_size(viewport.min, Vec2::new(600.0, 96.0));
-        for style in [NavigationWidget::Axes, NavigationWidget::Cube] {
-            let top = |toolbar| widget_rect(viewport, toolbar, style).unwrap().top();
-            assert_eq!(top(None), viewport.top() + MARGIN);
-            assert_eq!(top(Some(short)), viewport.top() + MARGIN);
-            assert_eq!(top(Some(wide)), wide.bottom() + MARGIN);
-        }
-        assert_eq!(widget_rect(viewport, None, NavigationWidget::Hidden), None);
-    }
 
     fn camera_with(rotation: Vec3) -> Camera {
         Camera::from_view(&crate::renderer::CameraView {

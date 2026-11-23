@@ -470,7 +470,7 @@ fn upload(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -552,7 +552,7 @@ mod tests {
 
     /// The device a GPU test draws on, `None` on a machine with no adapter. wgpu's native
     /// requests are ready on their first poll.
-    fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+    pub(crate) fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         fn ready<T>(f: impl std::future::Future<Output = T>) -> T {
             let mut f = std::pin::pin!(f);
             let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -565,7 +565,13 @@ mod tests {
         }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = ready(instance.request_adapter(&Default::default())).ok()?;
-        ready(adapter.request_device(&Default::default())).ok()
+        // What the app asks for (see `main`): the model renderer needs more than the defaults.
+        let device = wgpu::DeviceDescriptor {
+            required_features: adapter.features() & ssbh_wgpu::REQUIRED_FEATURES,
+            required_limits: adapter.limits(),
+            ..Default::default()
+        };
+        ready(adapter.request_device(&device)).ok()
     }
 
     /// One pixel of a ribbon that fills the view, drawn over clear black with a one-texel

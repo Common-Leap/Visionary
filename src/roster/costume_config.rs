@@ -268,6 +268,41 @@ fn merge(object: &mut Map<String, Value>, key: &str, values: BTreeMap<String, Va
     }
 }
 
+/// Add everything `other` describes to `config`, keeping what `config` already says: two
+/// `config.json` files made for one mod folder.
+pub fn combine(config: &mut Value, other: Value) {
+    if !config.is_object() {
+        *config = json!({});
+    }
+    let object = config.as_object_mut().expect("made an object above");
+    let Value::Object(other) = other else {
+        return;
+    };
+    for (key, value) in other {
+        match (object.get_mut(&key), value) {
+            (Some(Value::Array(known)), Value::Array(more)) => {
+                for item in more {
+                    if !known.contains(&item) {
+                        known.push(item);
+                    }
+                }
+            }
+            (Some(Value::Object(known)), Value::Object(more)) => {
+                // A share or an entry both have keeps this one's word on it.
+                let more = more
+                    .into_iter()
+                    .filter(|(name, value)| value.is_array() || !known.contains_key(name))
+                    .collect();
+                merge(object, &key, more);
+            }
+            (Some(_), _) => {}
+            (None, value) => {
+                object.insert(key, value);
+            }
+        }
+    }
+}
+
 /// The costume an effect file belongs to, from its path under the mod root:
 /// `effect/fighter/mario/ef_mario_c03.eff` and `effect/fighter/mario/trail_c03/x.nutexb` are
 /// costume `c03` of `mario`. The game loads these only through One-Slot Effects, which finds
@@ -400,6 +435,49 @@ mod tests {
             [costume, trail]
         );
         assert_eq!(config["new-dir-files"]["kept"][0], "as it was");
+    }
+
+    /// Two configs for one mod folder add up: the export's entry for a costume's effect file and
+    /// what the project's own files say of theirs.
+    #[test]
+    fn two_configs_for_one_mod_add_up() {
+        let mut ours = json!({});
+        declare(
+            &mut ours,
+            "pacman",
+            40,
+            &["effect/fighter/pacman/ef_pacman_c40.eff".to_owned()],
+        );
+        combine(
+            &mut ours,
+            json!({
+                "new-dir-infos": ["fighter/pacman/c40"],
+                "new-dir-infos-base": {"fighter/pacman/c40/cmn": "fighter/pacman/c00/cmn"},
+                "share-to-vanilla": {"fighter/pacman/model/body/c00/model.xmb":
+                    ["fighter/pacman/model/body/c40/model.xmb"]},
+                "new-dir-files": {
+                    "fighter/pacman/c40": ["fighter/pacman/model/body/c40/model.numdlb"],
+                    "fighter/pacman/c41": ["fighter/pacman/model/body/c41/model.numdlb"],
+                },
+            }),
+        );
+        assert_eq!(
+            strings(&ours["new-dir-files"]["fighter/pacman/c40"]),
+            [
+                "effect/fighter/pacman/ef_pacman_c40.eff",
+                "fighter/pacman/model/body/c40/model.numdlb",
+            ]
+        );
+        assert_eq!(strings(&ours["new-dir-infos"]), ["fighter/pacman/c40"]);
+        assert_eq!(
+            ours["new-dir-infos-base"]["fighter/pacman/c40/cmn"],
+            "fighter/pacman/c00/cmn"
+        );
+        assert!(ours["share-to-vanilla"]["fighter/pacman/model/body/c00/model.xmb"].is_array());
+        // Once more changes nothing.
+        let once = ours.clone();
+        combine(&mut ours, once.clone());
+        assert_eq!(ours, once);
     }
 
     /// Lucina's ninth costume standing on her first, with only a model file of its own.
