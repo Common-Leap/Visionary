@@ -566,7 +566,7 @@ pub fn setting_rows_in(
                     editable: true,
                 },
                 SettingValue::Const { name, value } => {
-                    let def = cx.consts.and_then(|consts| consts.get(name));
+                    let def = cx.consts.and_then(|consts| consts.only(name));
                     let value = def.and_then(|d| d.number()).or(*value);
                     SettingRow {
                         label,
@@ -1316,7 +1316,7 @@ mod tests {
             panic!("not a param write: {plan:?}");
         };
         assert_eq!(v, 2);
-        crate::articles::params::write_param_field(&to, &block, &field, v, 9.0, &HashMap::new())
+        crate::articles::params::write_param_field(&to, &block, &field, v, 9.0, before.as_bytes())
             .unwrap();
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(

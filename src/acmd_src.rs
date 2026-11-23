@@ -3978,7 +3978,8 @@ pub fn create_script(
     };
     let text = std::fs::read_to_string(&anchor.file)
         .with_context(|| format!("reading {}", anchor.file.display()))?;
-    if anchor.after > text.len() {
+    let follows = text.get(..anchor.after);
+    if !follows.is_some_and(|before| before.ends_with('}')) {
         bail!(
             "{} changed on disk since it was indexed — rescan and try again",
             anchor.file.display()
@@ -4048,7 +4049,7 @@ pub fn create_script(
         }
     }
     inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
-    let mut updated = text;
+    let mut updated = text.clone();
     for (at, insert) in inserts {
         if at > updated.len() || !updated.is_char_boundary(at) {
             bail!(
@@ -4058,8 +4059,11 @@ pub fn create_script(
         }
         updated.insert_str(at, &insert);
     }
-    std::fs::write(&anchor.file, &updated)
-        .with_context(|| format!("writing {}", anchor.file.display()))?;
+    crate::user_files::write_all(&[crate::user_files::Rewrite::text(
+        &anchor.file,
+        &text,
+        updated,
+    )])?;
     Ok(CreatedScript {
         file: anchor.file,
         note,
@@ -6019,7 +6023,11 @@ fn sync_script(
     // A function whose agent is `fighter` has its `FT_MOTION_RATE(fighter, …)` read as the
     // agent's own; the rewriters must count the same calls the parser typed.
     let _agent = crate::acmd::agent_scope(body);
-    let _consts = crate::project_consts::scope(std::sync::Arc::clone(&current.consts));
+    let used = crate::project_consts::ConstUse {
+        file: file.clone(),
+        span: span.clone(),
+    };
+    let _consts = crate::project_consts::scope(std::sync::Arc::clone(&current.consts), used);
     let _macros = crate::hash_macros::scope(std::sync::Arc::new(current.hash_macros.clone()));
     let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&current.helpers));
     let (updated_body, mut report) = rewrite(body)?;
@@ -6031,27 +6039,24 @@ fn sync_script(
              the helper itself"
         ));
     }
-    // Values written as project consts change at the const's definition, wherever that is.
+    // Values written as project consts change at the const's definition, wherever that is. The
+    // script and every definition are one edit: planned together, then written together.
     let pending = crate::project_consts::take_pending();
-    if !pending.is_empty() {
-        let (files, notes, changed) = crate::project_consts::apply_edits(&current.consts, &pending);
-        report.changed += changed;
-        report.skipped.extend(notes);
-        for written in files {
-            if !report.files.contains(&written) {
-                report.files.push(written);
-            }
-        }
-    }
-    if updated_body == body {
-        return Ok(report);
-    }
-    let mut updated = String::with_capacity(text.len());
-    updated.push_str(&text[..span.start]);
-    updated.push_str(&updated_body);
-    updated.push_str(&text[span.end..]);
-    std::fs::write(file, &updated).with_context(|| format!("writing {}", file.display()))?;
-    report.files.push(file.clone());
+    let plan = crate::project_consts::plan_edits(&current.consts, &pending);
+    report.skipped.extend(plan.refused);
+    let script = (updated_body != body).then(|| crate::project_consts::ScriptEdit {
+        file,
+        text: &text,
+        span,
+        body: updated_body,
+    });
+    let rewrites = plan.edits.rewrites(script)?;
+    crate::user_files::write_all(&rewrites)?;
+    report.changed += plan.notes.len();
+    report.skipped.extend(plan.notes);
+    report
+        .files
+        .extend(rewrites.into_iter().map(|rewrite| rewrite.file));
     Ok(report)
 }
 
@@ -19771,6 +19776,286 @@ pub fn install() {
             "{:?}",
             report.skipped
         );
+    }
+
+    /// Mario's own jab (game_attack11, hitbox 0) with its damage and size as given.
+    fn jab(script: &str, damage: &str, size: &str) -> String {
+        format!("unsafe extern \"C\" fn game_{script}(agent: &mut L2CAgentBase) {{\n    frame(agent.lua_state_agent, 2.0);\n    if macros::is_excute(agent) {{\n        macros::ATTACK(agent, 0, 0, Hash40::new(\"top\"), {damage}, 361, 30, 0, 20, {size}, 0.0, 6.3, 6.0, None, None, None, 1.8, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, false, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new(\"collision_attr_normal\"), *ATTACK_SOUND_LEVEL_S, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);\n    }}\n}}\n")
+    }
+
+    const MARIO_MOD: &str = "mod acmd;\npub fn install() { let agent = &mut Agent::new(\"mario\"); acmd::install(agent); }\n";
+
+    fn sync_jab(
+        root: &Path,
+        move_name: &str,
+        edit: impl Fn(&mut crate::data::Hitbox),
+    ) -> Result<SyncReport> {
+        let index = SourceIndex::build(root).unwrap();
+        let body = index.script_source("mario", move_name).unwrap().body;
+        let pristine = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        assert_eq!(pristine.len(), 1, "{body}");
+        let mut edited = pristine.clone();
+        edit(&mut edited[0]);
+        sync_hitboxes(&index, "mario", move_name, &pristine, &edited)
+    }
+
+    /// The constant and the script that uses it share a file, and one sync changes both: before
+    /// the function, after it, and inside it.
+    #[test]
+    fn a_const_and_a_literal_in_one_file_are_both_written() {
+        let function = jab("attack11", "JAB_DAMAGE", "2.5");
+        let declared = "const JAB_DAMAGE: f32 = 2.2;\n";
+        let inside = function.replacen(
+            "    frame(",
+            "    const JAB_DAMAGE: f32 = 2.2;\n    frame(",
+            1,
+        );
+        for acmd in [
+            format!("{declared}{function}"),
+            format!("{function}{declared}"),
+            inside,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+            put(root, "src/lib.rs", "mod mario;\n");
+            put(root, "src/mario/mod.rs", MARIO_MOD);
+            put(root, "src/mario/acmd.rs", &acmd);
+            let report = sync_jab(root, "attack11", |hitbox| {
+                hitbox.damage = 5.5;
+                hitbox.size = 3.75;
+            })
+            .unwrap();
+            let written = std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap();
+            let expected = acmd
+                .replace("JAB_DAMAGE: f32 = 2.2", "JAB_DAMAGE: f32 = 5.5")
+                .replace(" 20, 2.5,", " 20, 3.75,");
+            assert_eq!(written, expected);
+            assert_eq!(report.changed, 2, "{:?}", report.skipped);
+            assert_eq!(report.files, [root.join("src/mario/acmd.rs")]);
+        }
+    }
+
+    /// Two moves with a constant of the same name and value each: an edit lands on the one the
+    /// edited move uses.
+    #[test]
+    fn a_const_is_changed_where_the_edited_script_takes_it_from() {
+        // Each move's constant beside it, and each move's constant imported from its own folder.
+        for imported in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+            put(root, "src/lib.rs", "mod mario;\n");
+            put(root, "src/mario/mod.rs", MARIO_MOD);
+            put(
+                root,
+                "src/mario/acmd/mod.rs",
+                "mod attack11;\nmod attackhi3;\npub fn install(agent: &mut Agent) { agent.game_acmd(\"game_attack11\", attack11::game_attack11, Priority::Default); agent.game_acmd(\"game_attackhi3\", attackhi3::game_attackhi3, Priority::Default); }\n",
+            );
+            for name in ["attack11", "attackhi3"] {
+                let function = jab(name, "DAMAGE", "2.5");
+                let constant = "pub const DAMAGE: f32 = 4.0;\n";
+                if imported {
+                    let text = format!("mod params;\nuse self::params::*;\n{function}");
+                    put(root, &format!("src/mario/acmd/{name}/mod.rs"), &text);
+                    put(root, &format!("src/mario/acmd/{name}/params.rs"), constant);
+                } else {
+                    put(
+                        root,
+                        &format!("src/mario/acmd/{name}.rs"),
+                        &format!("{constant}{function}"),
+                    );
+                }
+            }
+            let constant_of = |name: &str| {
+                let file = if imported {
+                    format!("src/mario/acmd/{name}/params.rs")
+                } else {
+                    format!("src/mario/acmd/{name}.rs")
+                };
+                std::fs::read_to_string(root.join(file)).unwrap()
+            };
+            // The second of the two, which is not the one found first.
+            let report = sync_jab(root, "attackhi3", |hitbox| hitbox.damage = 6.0).unwrap();
+            assert_eq!(report.changed, 1, "{:?}", report.skipped);
+            assert!(constant_of("attackhi3").contains("DAMAGE: f32 = 6.0;"));
+            assert!(constant_of("attack11").contains("DAMAGE: f32 = 4.0;"));
+        }
+    }
+
+    /// Which of two same-named constants a call uses cannot be told (both modules are imported
+    /// whole): neither file is written, and the sync says why.
+    #[test]
+    fn a_const_that_cannot_be_told_apart_is_not_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\nmod a;\nmod b;\n");
+        put(root, "src/a.rs", "pub const DAMAGE: f32 = 4.0;\n");
+        put(root, "src/b.rs", "pub const DAMAGE: f32 = 4.0;\n");
+        put(root, "src/mario/mod.rs", MARIO_MOD);
+        let acmd = format!(
+            "use crate::{{a::*, b::*}};\n{}",
+            jab("attack11", "DAMAGE", "2.5")
+        );
+        put(root, "src/mario/acmd.rs", &acmd);
+        let report = sync_jab(root, "attack11", |hitbox| hitbox.damage = 6.0).unwrap();
+        assert_eq!((report.changed, report.files.len()), (0, 0));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("a.rs, b.rs")),
+            "{:?}",
+            report.skipped
+        );
+        // A path that says which one is followed.
+        put(
+            root,
+            "src/mario/acmd.rs",
+            &jab("attack11", "crate::b::DAMAGE", "2.5"),
+        );
+        let report = sync_jab(root, "attack11", |hitbox| hitbox.damage = 6.0).unwrap();
+        assert_eq!(
+            report.files,
+            [root.join("src/b.rs")],
+            "{:?}",
+            report.skipped
+        );
+    }
+
+    /// A whole-number constant takes no fraction: it is refused, not rounded.
+    #[test]
+    fn a_whole_number_const_is_never_rounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\n");
+        put(root, "src/mario/mod.rs", MARIO_MOD);
+        let acmd = format!(
+            "const JAB_SIZE: i32 = 4;\n{}",
+            jab("attack11", "2.2", "JAB_SIZE as f32")
+        );
+        put(root, "src/mario/acmd.rs", &acmd);
+        let report = sync_jab(root, "attack11", |hitbox| hitbox.size = 4.5).unwrap();
+        assert_eq!((report.changed, report.files.len()), (0, 0));
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("JAB_SIZE") && note.contains("can't hold 4.5")),
+            "{:?}",
+            report.skipped
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(),
+            acmd
+        );
+        let report = sync_jab(root, "attack11", |hitbox| hitbox.size = 5.0).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
+        let written = std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap();
+        assert_eq!(written, acmd.replace("i32 = 4", "i32 = 5"));
+    }
+
+    /// A script is added after one whose file has changed since it was indexed: what was the end
+    /// of a function is now inside one.
+    #[test]
+    fn a_script_is_not_added_into_a_file_that_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\n");
+        put(root, "src/mario/mod.rs", MARIO_MOD);
+        let acmd = jab("attack11", "2.2", "2.5");
+        put(root, "src/mario/acmd.rs", &acmd);
+        let index = SourceIndex::build(root).unwrap();
+        let added = jab("attack12", "2.2", "2.5");
+        let changed = acmd.replace("2.0);", "2.0); // two frames in");
+        put(root, "src/mario/acmd.rs", &changed);
+        assert!(create_script(&index, "mario", "game_attack12", &added).is_err());
+        let file = root.join("src/mario/acmd.rs");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), changed);
+        put(root, "src/mario/acmd.rs", &acmd);
+        create_script(&index, "mario", "game_attack12", &added).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with(&acmd));
+    }
+
+    /// One edit over two files: the definition cannot be written, so the script is not either.
+    #[test]
+    fn an_edit_over_two_files_is_written_whole_or_not_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        put(root, "Cargo.toml", "[package]\nname = \"m\"\n");
+        put(root, "src/lib.rs", "mod mario;\nmod params;\n");
+        put(root, "src/params.rs", "pub const DAMAGE: f32 = 4.0;\n");
+        put(root, "src/mario/mod.rs", MARIO_MOD);
+        let acmd = jab("attack11", "crate::params::DAMAGE", "2.5");
+        put(root, "src/mario/acmd.rs", &acmd);
+        let params = root.join("src/params.rs");
+        let locked = |readonly: bool| {
+            let mut permissions = std::fs::metadata(&params).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(&params, permissions).unwrap();
+        };
+        let edit = |hitbox: &mut crate::data::Hitbox| {
+            hitbox.damage = 6.0;
+            hitbox.size = 3.75;
+        };
+        locked(true);
+        let error = sync_jab(root, "attack11", edit).unwrap_err();
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/mario/acmd.rs")).unwrap(),
+            acmd
+        );
+        locked(false);
+        let report = sync_jab(root, "attack11", edit).unwrap();
+        assert_eq!((report.changed, report.files.len()), (2, 2));
+    }
+
+    /// The linked folder is a link to a crate inside a workspace: cargo names the files by where
+    /// it leads, and they are still the folder's.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_folder_that_is_a_symlink_is_indexed() {
+        crate::cargo_project::tests::enable();
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        put(
+            &real,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"plugin\"]\nresolver = \"2\"\n[workspace.package]\nversion = \"0.1.0\"\n",
+        );
+        put(
+            &real,
+            "plugin/Cargo.toml",
+            "[package]\nname = \"m\"\nversion.workspace = true\nedition = \"2021\"\n[lib]\npath = \"code/entry.rs\"\n",
+        );
+        put(&real, "plugin/code/entry.rs", "mod mario;\n");
+        put(&real, "plugin/code/mario/mod.rs", MARIO_MOD);
+        put(
+            &real,
+            "plugin/code/mario/acmd.rs",
+            &jab("attack11", "2.2", "2.5"),
+        );
+        put(
+            &real,
+            "plugin/code/old/acmd.rs",
+            &jab("attack11", "9.9", "2.5"),
+        );
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(real.join("plugin"), &link).unwrap();
+        let index = SourceIndex::build(&link).unwrap();
+        assert_eq!(index.root, link);
+        let script = index.script("mario", "game_attack11");
+        assert!(
+            script.is_some_and(|site| site.file.ends_with("code/mario/acmd.rs")),
+            "{:?} {:?}",
+            index.files,
+            index.conflicts
+        );
+        let report = sync_jab(&link, "attack11", |hitbox| hitbox.damage = 4.5).unwrap();
+        assert_eq!(report.changed, 1, "{:?}", report.skipped);
     }
 
     /// Shy Guy's `RUMBLE_HIT(agent, kind)` helper stands for `RUMBLE_HIT(agent, kind, 0)`. The

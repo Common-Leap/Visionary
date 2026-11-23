@@ -113,7 +113,7 @@ pub fn load_last_project(config_dir: &Path) -> Option<PathBuf> {
 
 pub fn save_last_project(config_dir: &Path, path: &Path) {
     let _ = std::fs::create_dir_all(config_dir);
-    let _ = std::fs::write(last_path(config_dir), path.to_string_lossy().as_bytes());
+    let _ = crate::user_files::write(&last_path(config_dir), path.to_string_lossy().as_bytes());
 }
 
 pub fn load_recent_projects(config_dir: &Path) -> Vec<PathBuf> {
@@ -134,7 +134,7 @@ pub fn save_recent_projects(config_dir: &Path, recent: &[PathBuf]) {
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    let _ = std::fs::write(recent_path(config_dir), body);
+    let _ = crate::user_files::write(&recent_path(config_dir), body);
 }
 
 /// Record a project open/save: it becomes last and leads recents (deduped,
@@ -1537,8 +1537,13 @@ in game; Project > Export Mod Folder packages your edits.\n";
 
 /// Create a workspace folder: `modproject.json` (if missing), `assets/`,
 /// `reference/`, `romfs/` plus a README explaining the manual drop zones.
-/// Returns the `modproject.json` path. Idempotent — rerunning keeps edits.
+/// Returns the `modproject.json` path. A folder that already holds a project is refused: the new
+/// one would be saved over it.
 pub fn scaffold_workspace(workspace: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let file = workspace_file(workspace);
+    if file.exists() {
+        bail!("{} is already a project", workspace.display());
+    }
     std::fs::create_dir_all(workspace)?;
     std::fs::create_dir_all(workspace.join("assets"))?;
     std::fs::create_dir_all(workspace.join("reference"))?;
@@ -1547,16 +1552,12 @@ pub fn scaffold_workspace(workspace: &Path, name: &str) -> anyhow::Result<PathBu
     if !readme.is_file() {
         std::fs::write(&readme, WORKSPACE_README)?;
     }
-    let file = workspace_file(workspace);
-    if !file.is_file() {
-        let project = crate::mod_project::ModProjectFile {
-            version: crate::mod_project::PROJECT_VERSION,
-            name: crate::mod_export::slugify(name),
-            ..Default::default()
-        };
-        let json = serde_json::to_string_pretty(&project)?;
-        std::fs::write(&file, json)?;
-    }
+    let project = crate::mod_project::ModProjectFile {
+        version: crate::mod_project::PROJECT_VERSION,
+        name: crate::mod_export::slugify(name),
+        ..Default::default()
+    };
+    crate::user_files::write(&file, serde_json::to_string_pretty(&project)?)?;
     Ok(file)
 }
 
@@ -1742,10 +1743,10 @@ mod tests {
         assert!(workspace.join("reference").is_dir());
         assert!(workspace.join("romfs").is_dir());
         assert!(workspace.join("README.txt").is_file());
-        // Rerunning keeps edits (idempotent).
+        // A folder that is a project already is not made a new one of, which the app would then
+        // save over it.
         std::fs::write(&file, b"{\"kept\":true}").unwrap();
-        let again = scaffold_workspace(&workspace, "My Mod").unwrap();
-        assert_eq!(again, file);
+        assert!(scaffold_workspace(&workspace, "My Mod").is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"{\"kept\":true}");
     }
 

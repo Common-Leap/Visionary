@@ -1508,13 +1508,14 @@ pub mod write {
     use anyhow::{bail, Context, Result};
 
     use super::{Setting, SettingField, SettingValue};
-    use crate::project_consts::ConstEdit;
+    use crate::project_consts::{ConstEdit, ConstUse};
+    use crate::user_files::Rewrite;
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum SettingWrite {
-        /// `file`'s whole new text: only the literal's bytes differ.
-        Source { file: PathBuf, text: String },
-        /// Change the const's definition (through [`crate::project_consts::apply_edits`], which
+        /// The file's whole new text: only the literal's bytes differ.
+        Source(Rewrite),
+        /// Change the const's definition (through [`crate::project_consts::plan_edits`], which
         /// spells the number the way the definition is written).
         Const(ConstEdit),
         /// Write `variant` of `block.field` in `file`, one of the moveset's own param files
@@ -1562,32 +1563,30 @@ pub mod write {
             ),
             SettingValue::Literal(old) => {
                 let file = &setting.file;
-                let mut text = std::fs::read_to_string(file)
+                let read = std::fs::read_to_string(file)
                     .with_context(|| format!("reading {}", file.display()))?;
-                let Some(written) = text.get(setting.span.clone()).map(str::to_string) else {
+                let Some(written) = read.get(setting.span.clone()) else {
                     bail!(
                         "{} changed since it was read — rescan and try again",
                         file.display()
                     );
                 };
-                if literal_value(&written).is_none_or(|value| (value - old).abs() > 1e-9) {
+                if literal_value(written).is_none_or(|value| (value - old).abs() > 1e-9) {
                     bail!(
                         "{} changed since it was read (the value there is now `{written}`) — rescan and \
                          try again",
                         file.display()
                     );
                 }
-                let Some(value) = crate::project_consts::format_literal_like(&written, new) else {
+                let Some(value) = crate::project_consts::format_literal_like(written, new) else {
                     bail!(
                         "{} is written as a whole number (`{written}`), so it can't hold {new}",
                         setting.field.label()
                     );
                 };
+                let mut text = read.clone();
                 text.replace_range(setting.span.clone(), &value);
-                Ok(SettingWrite::Source {
-                    file: file.clone(),
-                    text,
-                })
+                Ok(SettingWrite::Source(Rewrite::text(file, &read, text)))
             }
             SettingValue::Const { name, value } => {
                 if value.is_none() {
@@ -1596,10 +1595,18 @@ pub mod write {
                          change it; change it where it is defined"
                     );
                 }
-                // Plain digits: `apply_edits` spells them the way the definition is written.
+                // As the status code writes it: `params::SPEED` says more than `SPEED`.
+                let written = std::fs::read_to_string(&setting.file)
+                    .ok()
+                    .and_then(|text| Some(text.get(setting.span.clone())?.trim().to_string()))
+                    .filter(|written| written.rsplit("::").next() == Some(name));
                 Ok(SettingWrite::Const(ConstEdit {
-                    name: name.clone(),
-                    value: new.to_string(),
+                    path: written.unwrap_or_else(|| name.clone()),
+                    value: new,
+                    used: ConstUse {
+                        file: setting.file.clone(),
+                        span: setting.span.clone(),
+                    },
                 }))
             }
             SettingValue::Param { block, field } => {
@@ -1660,7 +1667,6 @@ pub mod write {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::collections::HashMap;
         use std::path::Path;
 
         const STATUS: &str = "unsafe extern \"C\" fn shot_main(weapon: &mut L2CWeaponCommon) -> L2CValue {\r\n    weapon.set_life(30);\r\n    ModelModule::set_scale(weapon.module_accessor, 1.6f32);\r\n    AttackModule::set_power_mul(weapon.module_accessor, 30.0);\r\n    sv_kinetic_energy!(set_accel, weapon, WEAPON_KINETIC_ENERGY_RESERVE_ID_NORMAL, 0.0, -0.08);\r\n    0.into()\r\n}\r\n";
@@ -1687,7 +1693,7 @@ pub mod write {
 
         fn source_text(write: SettingWrite) -> String {
             match write {
-                SettingWrite::Source { text, .. } => text,
+                SettingWrite::Source(rewrite) => String::from_utf8(rewrite.write).unwrap(),
                 other => panic!("expected a source write, got {other:?}"),
             }
         }
@@ -1826,31 +1832,40 @@ pub mod write {
 
         #[test]
         fn const_setting_becomes_a_const_edit() {
-            let file = PathBuf::from("shot.rs");
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.rs");
+            let status = "fn f() { set(consts::FIREBALL_SCALE) }\n";
+            std::fs::write(&file, status).unwrap();
             let value = SettingValue::Const {
                 name: "FIREBALL_SCALE".into(),
                 value: Some(1.4),
             };
             let scale = setting(
                 &file,
-                "FIREBALL_SCALE",
+                status,
                 SettingField::Scale,
                 value,
-                "FIREBALL_SCALE",
+                "consts::FIREBALL_SCALE",
             );
+            let edit = |path: &str, value: f64| ConstEdit {
+                path: path.into(),
+                value,
+                used: ConstUse {
+                    file: scale.file.clone(),
+                    span: scale.span.clone(),
+                },
+            };
+            let planned = edit("consts::FIREBALL_SCALE", 2.0);
             assert_eq!(
-                plan_setting_write(&scale, 2.5, 0, &[]).unwrap(),
-                SettingWrite::Const(ConstEdit {
-                    name: "FIREBALL_SCALE".into(),
-                    value: "2.5".into()
-                })
+                plan_setting_write(&scale, 2.0, 0, &[]).unwrap(),
+                SettingWrite::Const(planned.clone())
             );
             let unknown = Setting {
                 value: SettingValue::Const {
                     name: "FROM_ELSEWHERE".into(),
                     value: None,
                 },
-                ..scale
+                ..scale.clone()
             };
             let error = plan_setting_write(&unknown, 2.5, 0, &[])
                 .unwrap_err()
@@ -1858,30 +1873,23 @@ pub mod write {
             assert!(error.contains("FROM_ELSEWHERE"), "{error}");
 
             // The definition keeps its own spelling when the edit is applied.
-            let dir = tempfile::tempdir().unwrap();
             let defs = dir.path().join("consts.rs");
             let text = "const FIREBALL_SCALE: f32 = 1.4f32;\nconst FIREBALL_LIFE: i32 = 180;\n";
             std::fs::write(&defs, text).unwrap();
             let consts =
                 crate::project_consts::ProjectConsts::scan(&[(defs.clone(), text.to_string())]);
-            let edits = [
-                ConstEdit {
-                    name: "FIREBALL_SCALE".into(),
-                    value: "2".into(),
-                },
-                ConstEdit {
-                    name: "FIREBALL_LIFE".into(),
-                    value: "200.5".into(),
-                },
-            ];
-            let (_, notes, changed) = crate::project_consts::apply_edits(&consts, &edits);
-            assert_eq!(changed, 1, "{notes:?}");
+            let edits = [planned, edit("FIREBALL_LIFE", 200.5)];
+            let plan = crate::project_consts::plan_edits(&consts, &edits);
+            assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
             assert!(
-                notes
+                plan.refused
                     .iter()
                     .any(|n| n.contains("FIREBALL_LIFE") && n.contains("whole-number")),
-                "{notes:?}"
+                "{:?}",
+                plan.refused
             );
+            let rewrites = plan.edits.rewrites(None).unwrap();
+            crate::user_files::write_all(&rewrites).unwrap();
             assert_eq!(
                 std::fs::read_to_string(&defs).unwrap(),
                 text.replace("1.4f32", "2.0f32")
@@ -1980,7 +1988,7 @@ pub mod write {
                 &field,
                 variant,
                 3.0,
-                &HashMap::new(),
+                &std::fs::read(&file).unwrap(),
             )
             .unwrap();
             assert!(std::fs::read_to_string(&romfs)
@@ -2041,7 +2049,7 @@ pub mod write {
                 &field,
                 variant,
                 55.0,
-                &HashMap::new(),
+                &std::fs::read(&file).unwrap(),
             )
             .unwrap();
             assert_eq!(

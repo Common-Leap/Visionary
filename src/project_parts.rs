@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 /// The file beside `modproject.json` holding which characters the project shows and where
@@ -146,14 +147,22 @@ impl ProjectParts {
 
     pub fn save(&self, workspace: &Path) -> anyhow::Result<()> {
         let path = workspace.join(PARTS_FILE);
+        // One that cannot be read was loaded as empty; saving would put that in its place.
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice::<Self>(&bytes)
+                    .with_context(|| format!("{} could not be read", path.display()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        }
         if *self == Self::default() {
             if path.exists() {
                 std::fs::remove_file(path)?;
             }
             return Ok(());
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        crate::user_files::write(&path, serde_json::to_string_pretty(self)?)
     }
 
     fn key(part: Part, slot: u8) -> Option<u8> {
@@ -418,6 +427,12 @@ mod tests {
         // An empty layout leaves no file behind.
         ProjectParts::default().save(&workspace).unwrap();
         assert!(!workspace.join(PARTS_FILE).exists());
+        // One that cannot be read is not replaced with what was loaded in its place: nothing.
+        std::fs::write(workspace.join(PARTS_FILE), "{ \"links\": [").unwrap();
+        let read = ProjectParts::load(&workspace);
+        assert!(read.save(&workspace).is_err());
+        assert!(parts.save(&workspace).is_err());
+        assert!(workspace.join(PARTS_FILE).exists());
     }
 
     #[test]

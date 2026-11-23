@@ -646,7 +646,7 @@ pub fn save(library: &ModLibrary) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(body) = serde_json::to_string_pretty(library) {
-        let _ = std::fs::write(&path, body);
+        let _ = crate::user_files::write(&path, body);
     }
 }
 

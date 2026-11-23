@@ -692,6 +692,12 @@ struct ArticleSettingsCard {
     other_variants: HashMap<String, usize>,
     /// The moveset's own param files for the object's owner: the only files a save may change.
     own: Vec<PathBuf>,
+    /// What each of them held when the values shown were read.
+    own_read: HashMap<PathBuf, Vec<u8>>,
+    /// The rows of `settings` and of the block's other params, for the variants in `rows_shown`.
+    rows: Vec<crate::articles::view::SettingRow>,
+    extra: Vec<crate::articles::view::SettingRow>,
+    rows_shown: Option<(usize, HashMap<String, usize>)>,
 }
 
 /// The selected fighter's objects, read off the UI thread once per change of the source files.
@@ -5039,6 +5045,7 @@ pub struct VisionaryApp {
     helper_bones: bool,
     /// Application preferences edited in the Settings window.
     preferences: crate::preferences::Preferences,
+    preferences_unsaved: bool,
     settings_open: bool,
     /// Where the viewport toolbar was drawn last frame, so a click on it doesn't also pick the
     /// hitbox underneath (picking reads the raw pointer before the toolbar is laid out).
@@ -5792,6 +5799,7 @@ impl VisionaryApp {
             show_hurtboxes: load_hurtbox_visibility(),
             helper_bones: load_helper_bones(),
             preferences,
+            preferences_unsaved: false,
             settings_open: false,
             viewport_toolbar_rect: None,
             nav_drag: None,
@@ -6307,6 +6315,7 @@ impl VisionaryApp {
             return;
         }
         save_config_path("data_root", &path);
+        crate::user_files::set_game_dump(Some(&path));
         // The fighter list is left in place for `reindex_fighters`, which re-finds the selected
         // row by name in the new dump (and reloads it there); clearing it here first made the
         // selection a stale index into the new list.
@@ -7907,12 +7916,19 @@ impl VisionaryApp {
             );
             return;
         }
+        // Lines typed here end in `\n`; they take the endings the function has.
+        let lines = buffer.original.matches('\n').count();
+        if lines > 0 && buffer.original.matches("\r\n").count() == lines {
+            buffer.text = buffer.text.replace("\r\n", "\n").replace('\n', "\r\n");
+            buffer.synced.clone_from(&buffer.text);
+        }
         let mut updated = String::with_capacity(text.len());
         updated.push_str(&text[..buffer.span.start]);
         updated.push_str(&buffer.text);
         updated.push_str(&text[buffer.span.end..]);
-        if let Err(e) = std::fs::write(&buffer.file, &updated) {
-            self.state.status = format!("Could not write {}: {e}", buffer.file.display());
+        let rewrite = crate::user_files::Rewrite::text(&buffer.file, &text, updated);
+        if let Err(e) = crate::user_files::write_all(&[rewrite]) {
+            self.state.status = format!("Not saved: {e:#}");
             return;
         }
         buffer.span = buffer.span.start..buffer.span.start + buffer.text.len();
@@ -8384,10 +8400,13 @@ impl VisionaryApp {
         let _agent = crate::acmd::agent_scope(&buffer.text);
         // Values written as project consts are recognised, but this buffer is one function:
         // their definitions are changed by syncing to the project, not by mirroring here.
-        let _consts = self
-            .acmd_src
-            .as_ref()
-            .map(|index| crate::project_consts::scope(std::sync::Arc::clone(&index.consts)));
+        let _consts = self.acmd_src.as_ref().map(|index| {
+            let used = crate::project_consts::ConstUse {
+                file: buffer.file.clone(),
+                span: buffer.span.clone(),
+            };
+            crate::project_consts::scope(std::sync::Arc::clone(&index.consts), used)
+        });
         let _helpers = self
             .acmd_src
             .as_ref()
@@ -8582,7 +8601,8 @@ impl VisionaryApp {
                 for edit in crate::project_consts::take_pending() {
                     report.skipped.push(format!(
                         "{} is a constant — sync to the project to change its definition to {}",
-                        edit.name, edit.value
+                        edit.name(),
+                        edit.value as f32
                     ));
                 }
                 buffer.note = (!report.skipped.is_empty()).then(|| report.skipped.join("; "));
@@ -13575,8 +13595,7 @@ impl VisionaryApp {
             });
         if self.preview_stage != before {
             if let Some(path) = config_path("preview_stage") {
-                let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
-                let _ = std::fs::write(path, self.preview_stage.clone().unwrap_or_default());
+                save_config(&path, self.preview_stage.clone().unwrap_or_default());
             }
             ui.ctx().request_repaint();
         }
@@ -19076,7 +19095,14 @@ impl VisionaryApp {
         let zoom = ctx.zoom_factor();
         if (zoom - self.preferences.ui_scale).abs() > 1e-3 {
             self.preferences.ui_scale = zoom;
-            self.preferences.save();
+            self.preferences_unsaved = true;
+        }
+        // Once a slider or colour is let go, not at every step of it.
+        if self.preferences_unsaved && !ctx.input(|i| i.pointer.any_down()) {
+            self.preferences_unsaved = false;
+            if let Err(error) = self.preferences.save() {
+                self.state.status = format!("Settings not saved: {error:#}");
+            }
         }
         if !self.settings_open {
             return;
@@ -19311,7 +19337,7 @@ impl VisionaryApp {
             });
         self.settings_open = open;
         if self.preferences != before {
-            self.preferences.save();
+            self.preferences_unsaved = true;
             ctx.request_repaint();
         }
     }
@@ -22248,6 +22274,10 @@ impl VisionaryApp {
             other_blocks: HashMap::new(),
             other_variants: HashMap::new(),
             own: Vec::new(),
+            own_read: HashMap::new(),
+            rows: Vec::new(),
+            extra: Vec::new(),
+            rows_shown: None,
         };
         self.reload_article_settings(&mut card);
         self.article_settings = Some(card);
@@ -22269,6 +22299,10 @@ impl VisionaryApp {
             .map(|index| crate::articles::settings_for(index, &article.agent))
             .unwrap_or_default();
         let (layers, own) = self.article_param_layers(&article.owner);
+        card.own_read = own
+            .iter()
+            .filter_map(|file| Some((file.clone(), std::fs::read(file).ok()?)))
+            .collect();
         let overrides: Vec<crate::articles::params::ParamOverride> = self
             .article_catalog
             .as_ref()
@@ -22302,6 +22336,7 @@ impl VisionaryApp {
             })
             .collect();
         card.own = own;
+        card.rows_shown = None;
         if card.variant >= card.block.variants.len().max(1) {
             card.variant = 0;
         }
@@ -22328,25 +22363,32 @@ impl VisionaryApp {
             crate::articles::settings::plan_setting_write(setting, value, variant, &card.own);
         let result: anyhow::Result<String> = match plan {
             Err(error) => Err(error),
-            Ok(crate::articles::settings::SettingWrite::Source { file, text }) => {
-                std::fs::write(&file, text)
-                    .map(|_| format!("Saved {} in {}", setting.field.label(), file.display()))
-                    .map_err(Into::into)
+            Ok(crate::articles::settings::SettingWrite::Source(rewrite)) => {
+                let said = format!(
+                    "Saved {} in {}",
+                    setting.field.label(),
+                    rewrite.file.display()
+                );
+                crate::user_files::write_all(&[rewrite]).map(|()| said)
             }
             Ok(crate::articles::settings::SettingWrite::Const(edit)) => {
                 let Some(index) = self.acmd_src.as_ref() else {
                     return;
                 };
-                let (files, notes, _) = crate::project_consts::apply_edits(&index.consts, &[edit]);
-                if files.is_empty() {
-                    Err(anyhow::anyhow!("nothing was written: {}", notes.join("; ")))
+                let plan = crate::project_consts::plan_edits(&index.consts, &[edit]);
+                if !plan.refused.is_empty() {
+                    Err(anyhow::anyhow!(plan.refused.join("; ")))
                 } else {
-                    let mut said =
-                        format!("Saved {} in {}", setting.field.label(), files[0].display());
-                    if !notes.is_empty() {
-                        said.push_str(&format!(" — {}", notes.join("; ")));
-                    }
-                    Ok(said)
+                    plan.edits
+                        .rewrites(None)
+                        .and_then(|rewrites| crate::user_files::write_all(&rewrites))
+                        .map(|()| {
+                            format!(
+                                "Saved {} — {}",
+                                setting.field.label(),
+                                plan.notes.join("; ")
+                            )
+                        })
                 }
             }
             Ok(crate::articles::settings::SettingWrite::Param {
@@ -22360,7 +22402,7 @@ impl VisionaryApp {
                 &field,
                 variant,
                 value,
-                &self.state.labels,
+                card.own_read.get(&file).map_or(&[][..], Vec::as_slice),
             )
             .map(|_| format!("Saved {block} › {field} in {}", file.display())),
         };
@@ -22636,7 +22678,9 @@ impl VisionaryApp {
                         crate::articles::clone_compat::SOURCE_URL,
                     );
                 }
-                if let Some(note) = crate::articles::view::missing_block_note(&article, &card.block, &card.settings) {
+                if let Some(note) =
+                    crate::articles::view::missing_block_note(&article, &card.block, &card.settings)
+                {
                     ui.colored_label(egui::Color32::from_rgb(235, 170, 90), note);
                 }
                 let variants = card.block.variants.len();
@@ -22646,17 +22690,25 @@ impl VisionaryApp {
                             .selected_text(format!("variant {} of {variants}", card.variant))
                             .show_ui(ui, |ui| {
                                 for v in 0..variants {
-                                    if ui.selectable_label(card.variant == v, format!("variant {v}")).clicked() {
+                                    if ui
+                                        .selectable_label(card.variant == v, format!("variant {v}"))
+                                        .clicked()
+                                    {
                                         card.variant = v;
                                         card.edits.clear();
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text(crate::articles::view::VARIANT_NOTE);
                     });
-                    ui.label(RichText::new(crate::articles::view::VARIANT_NOTE).small().weak());
                 }
                 for (path, reason) in &card.block.skipped {
-                    ui.label(RichText::new(format!("Not read: {path} — {reason}")).small().weak());
+                    ui.label(
+                        RichText::new(format!("Not read: {path} — {reason}"))
+                            .small()
+                            .weak(),
+                    );
                 }
                 // Each other list block a setting reads has its own entry picker.
                 let mut others: Vec<(&String, usize)> = card
@@ -22671,13 +22723,17 @@ impl VisionaryApp {
                     let mut picked = current;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(name.as_str()).small());
-                        egui::ComboBox::from_id_salt(("article_other_variant", card.agent.as_str(), name.as_str()))
-                            .selected_text(format!("variant {current} of {count}"))
-                            .show_ui(ui, |ui| {
-                                for v in 0..count {
-                                    ui.selectable_value(&mut picked, v, format!("variant {v}"));
-                                }
-                            });
+                        egui::ComboBox::from_id_salt((
+                            "article_other_variant",
+                            card.agent.as_str(),
+                            name.as_str(),
+                        ))
+                        .selected_text(format!("variant {current} of {count}"))
+                        .show_ui(ui, |ui| {
+                            for v in 0..count {
+                                ui.selectable_value(&mut picked, v, format!("variant {v}"));
+                            }
+                        });
                     });
                     if picked != current {
                         card.other_variants.insert(name.clone(), picked);
@@ -22693,9 +22749,21 @@ impl VisionaryApp {
                     other_variants: Some(&card.other_variants),
                     overrides: &overrides,
                 };
-                let rows = crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
-                // Params nothing in the status code reads still show, editable the same way.
-                let extra = crate::articles::view::unread_param_rows(&card.settings, &card.block, &block_name, cx);
+                // Built again only when what they show changes: they read the source files.
+                let shown = (card.variant, card.other_variants.clone());
+                if card.rows_shown.as_ref() != Some(&shown) {
+                    card.rows =
+                        crate::articles::view::setting_rows_in(&card.settings, &card.block, cx);
+                    // Params nothing in the status code reads still show, editable the same way.
+                    card.extra = crate::articles::view::unread_param_rows(
+                        &card.settings,
+                        &card.block,
+                        &block_name,
+                        cx,
+                    );
+                    card.rows_shown = Some(shown);
+                }
+                let (rows, extra) = (&card.rows, &card.extra);
                 let extra_settings: Vec<crate::articles::settings::Setting> = extra
                     .iter()
                     .map(|row| crate::articles::settings::Setting {
@@ -22713,47 +22781,56 @@ impl VisionaryApp {
                     })
                     .collect();
                 if rows.is_empty() && extra.is_empty() {
-                    ui.weak("Nothing in the linked source or the param files sets this object's size, speed or life.");
+                    ui.weak("No settings found");
                 }
-                ScrollArea::vertical().id_salt("article_settings_rows").show(ui, |ui| {
-                    egui::Grid::new(("article_settings_grid", card.agent.as_str()))
-                        .striped(true)
-                        .num_columns(4)
-                        .show(ui, |ui| {
-                            let all = rows
-                                .iter()
-                                .zip(card.settings.iter())
-                                .chain(extra.iter().zip(extra_settings.iter()));
-                            for (n, (row, setting)) in all.enumerate() {
-                                ui.label(&row.label);
-                                if row.editable {
-                                    let text = card.edits.entry(n).or_insert_with(|| {
-                                        row.value.trim_end_matches(" × facing").to_string()
-                                    });
-                                    let response = ui.add(egui::TextEdit::singleline(text).desired_width(80.0));
-                                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                        save = Some((setting.clone(), text.clone()));
-                                    }
-                                } else {
-                                    ui.label(&row.value);
-                                }
-                                ui.label(RichText::new(&row.origin).small().weak());
-                                ui.horizontal(|ui| {
-                                    if row.editable && ui.small_button("Save").clicked() {
-                                        if let Some(text) = card.edits.get(&n) {
+                ScrollArea::vertical()
+                    .id_salt("article_settings_rows")
+                    .show(ui, |ui| {
+                        egui::Grid::new(("article_settings_grid", card.agent.as_str()))
+                            .striped(true)
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                let all = rows
+                                    .iter()
+                                    .zip(card.settings.iter())
+                                    .chain(extra.iter().zip(extra_settings.iter()));
+                                for (n, (row, setting)) in all.enumerate() {
+                                    ui.label(&row.label);
+                                    if row.editable {
+                                        let text = card.edits.entry(n).or_insert_with(|| {
+                                            row.value.trim_end_matches(" × facing").to_string()
+                                        });
+                                        let response = ui.add(
+                                            egui::TextEdit::singleline(text).desired_width(80.0),
+                                        );
+                                        if response.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
                                             save = Some((setting.clone(), text.clone()));
                                         }
+                                    } else {
+                                        ui.label(&row.value);
                                     }
-                                    if !setting.file.as_os_str().is_empty()
-                                        && ui.small_button("Open").on_hover_text(setting.file.display().to_string()).clicked()
-                                    {
-                                        reveal = Some(setting.file.clone());
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                        });
-                });
+                                    ui.label(RichText::new(&row.origin).small().weak());
+                                    ui.horizontal(|ui| {
+                                        if row.editable && ui.small_button("Save").clicked() {
+                                            if let Some(text) = card.edits.get(&n) {
+                                                save = Some((setting.clone(), text.clone()));
+                                            }
+                                        }
+                                        if !setting.file.as_os_str().is_empty()
+                                            && ui
+                                                .small_button("Open")
+                                                .on_hover_text(setting.file.display().to_string())
+                                                .clicked()
+                                        {
+                                            reveal = Some(setting.file.clone());
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            });
+                    });
                 if let Some(message) = &card.message {
                     ui.separator();
                     ui.label(message);
@@ -44755,9 +44832,6 @@ fn save_timeline_filters(filters: TimelineFilters) {
     let Some(dest) = config_path("editor_timeline_filters") else {
         return;
     };
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let body = format!(
         "v2,{},{},{},{},{}",
         u8::from(filters.hurtboxes),
@@ -44766,7 +44840,7 @@ fn save_timeline_filters(filters: TimelineFilters) {
         u8::from(filters.motion_state),
         u8::from(filters.audio_feedback)
     );
-    let _ = std::fs::write(dest, body);
+    save_config(&dest, body);
 }
 
 fn load_timeline_filters() -> TimelineFilters {
@@ -44807,10 +44881,7 @@ fn save_hurtbox_visibility(visible: bool) {
     let Some(dest) = config_path("editor_viewport_hurtboxes") else {
         return;
     };
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(dest, encode_viewport_flag(visible));
+    save_config(&dest, encode_viewport_flag(visible));
 }
 
 fn load_hurtbox_visibility() -> bool {
@@ -44931,10 +45002,7 @@ fn save_thrown_victim(pref: &ThrownVictimPref) {
     let Some(dest) = config_path("editor_thrown_victim") else {
         return;
     };
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(dest, encode_thrown_victim(pref));
+    save_config(&dest, encode_thrown_victim(pref));
 }
 
 fn load_thrown_victim() -> ThrownVictimPref {
@@ -45022,10 +45090,7 @@ fn save_helper_bones(enabled: bool) {
     let Some(dest) = config_path("editor_viewport_helper_bones") else {
         return;
     };
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(dest, encode_viewport_flag(enabled));
+    save_config(&dest, encode_viewport_flag(enabled));
 }
 
 fn load_helper_bones() -> bool {
@@ -45093,12 +45158,19 @@ pub(crate) enum SourceRow {
 /// plugin. When set, its scripts are read in preference to the dumped-script mirror.
 pub(crate) const ACMD_SRC_CONFIG_KEY: &str = "acmd_src_root";
 
+/// Write one of Visionary's own settings files. A failure costs only the setting.
+fn save_config(dest: &std::path::Path, body: impl AsRef<[u8]>) {
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(error) = crate::user_files::write(dest, body) {
+        eprintln!("[visionary] {error:#}");
+    }
+}
+
 pub(crate) fn save_config_path(key: &str, path: &std::path::Path) {
     if let Some(dest) = config_path(key) {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&dest, path.to_string_lossy().as_bytes());
+        save_config(&dest, path.to_string_lossy().as_bytes());
     }
 }
 
@@ -45200,15 +45272,12 @@ impl WindowGeometry {
 /// later does not mean adding another config key.
 fn save_window_geometry(all: &std::collections::BTreeMap<String, WindowGeometry>) {
     if let Some(dest) = config_path("window_geometry") {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let body = all
             .iter()
             .map(|(k, g)| format!("{k}={}", g.encode()))
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = std::fs::write(&dest, body);
+        save_config(&dest, body);
     }
 }
 
@@ -45280,15 +45349,12 @@ fn follow_stop_rules(
 /// a list needs its own format because `save_config_path` stores exactly one path).
 fn save_mod_roots(roots: &[std::path::PathBuf]) {
     if let Some(dest) = config_path("mod_roots") {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let body = roots
             .iter()
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = std::fs::write(&dest, body);
+        save_config(&dest, body);
     }
 }
 
@@ -45347,11 +45413,8 @@ fn load_forgotten_fighters() -> BTreeSet<String> {
 
 fn save_forgotten_fighters(fighters: &BTreeSet<String>) {
     if let Some(dest) = config_path("forgotten_fighters") {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let body = fighters.iter().cloned().collect::<Vec<_>>().join("\n");
-        let _ = std::fs::write(dest, body);
+        save_config(&dest, body);
     }
 }
 
@@ -45402,15 +45465,12 @@ fn load_recent_effs() -> Vec<PathBuf> {
 
 fn save_recent_effs(list: &[PathBuf]) {
     if let Some(dest) = config_path("recent_effs") {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let body: String = list
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = std::fs::write(&dest, body);
+        save_config(&dest, body);
     }
 }
 

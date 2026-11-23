@@ -471,21 +471,21 @@ fn read_xml_block(path: &Path, target: u64) -> std::result::Result<Option<LayerB
 /// Set `block.field` of `variant` (`block` a full `param_…` name; `field` a label or `0x…` hash;
 /// `variant` 0 for a plain struct) to `value` in `file`, keeping the field's type. A `.prcxml` has
 /// only that element's text replaced, so every other byte (CRLF and padding included) is kept and no
-/// binary `.prc` appears beside it; anything else is rewritten through `prc::save`. The block,
-/// variant and field must already exist.
+/// binary `.prc` appears beside it; anything else is rewritten through `prc`. The block, variant and
+/// field must already exist. `file` must still hold `read`, which the value shown came from. `file` must still hold `read`, what the value shown came from.
 pub fn write_param_field(
     file: &Path,
     block: &str,
     field: &str,
     variant: usize,
     value: f64,
-    _labels: &HashMap<u64, String>,
+    read: &[u8],
 ) -> Result<()> {
     let (block_h, field_h) = (hash_of(block), hash_of(field));
     if is_xml(file) {
         let src =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let found = xml_block(&src, block_h)
+            std::str::from_utf8(read).with_context(|| format!("reading {}", file.display()))?;
+        let found = xml_block(src, block_h)
             .ok_or_else(|| anyhow!("{block} is not in {}", file.display()))?;
         let (leaves, _) = found
             .variants
@@ -504,9 +504,10 @@ pub fn write_param_field(
             other => bail!("{field} is a {other}, not a number"),
         };
         let out = format!("{}{text}{}", &src[..range.start], &src[range.end..]);
-        return std::fs::write(file, out).with_context(|| format!("writing {}", file.display()));
+        return write_param_file(file, read, out.into_bytes());
     }
-    let mut root = prc::open(file).map_err(|e| anyhow!("reading {}: {e}", file.display()))?;
+    let mut root = prc::read_stream(&mut std::io::Cursor::new(read))
+        .map_err(|e| anyhow!("reading {}: {e}", file.display()))?;
     let value_of_block = root
         .0
         .iter_mut()
@@ -542,7 +543,17 @@ pub fn write_param_field(
         prc::ParamKind::U32(v) => *v = whole_number(field, "uint", value)? as u32,
         _ => bail!("{field} is not a number"),
     }
-    prc::save(file, &root).map_err(|e| anyhow!("writing {}: {e}", file.display()))
+    let mut out = std::io::Cursor::new(Vec::new());
+    prc::write_stream(&mut out, &root).map_err(|e| anyhow!("writing {}: {e}", file.display()))?;
+    write_param_file(file, read, out.into_inner())
+}
+
+fn write_param_file(file: &Path, read: &[u8], write: Vec<u8>) -> Result<()> {
+    crate::user_files::write_all(&[crate::user_files::Rewrite {
+        file: file.to_path_buf(),
+        read: read.to_vec(),
+        write,
+    }])
 }
 
 /// Whether `file` holds `block.field` in `variant` (`block` a full `param_…` name; `field` a label
@@ -574,9 +585,9 @@ fn float_text(field: &str, value: f64) -> Result<String> {
     Ok(single.to_string())
 }
 
-/// `value` rounded to a whole number, refused when the param's type (`sbyte`, `byte`, `short`,
-/// `ushort`, `int`, `uint`, as a prcxml names them) cannot hold it rather than clamped to the
-/// nearest value it can.
+/// `value` as a whole number, refused when it has a fraction or when the param's type (`sbyte`,
+/// `byte`, `short`, `ushort`, `int`, `uint`, as a prcxml names them) cannot hold it, rather than
+/// changed to the nearest value it can.
 fn whole_number(field: &str, kind: &str, value: f64) -> Result<i64> {
     let (min, max, words) = match kind {
         "sbyte" => (i8::MIN as i64, i8::MAX as i64, "a small whole number"),
@@ -591,11 +602,10 @@ fn whole_number(field: &str, kind: &str, value: f64) -> Result<i64> {
         "uint" => (0, u32::MAX as i64, "a whole number that can't be negative"),
         other => bail!("{field} is a {other}, not a number"),
     };
-    let rounded = value.round();
-    if !rounded.is_finite() || rounded < min as f64 || rounded > max as f64 {
+    if value.fract() != 0.0 || value < min as f64 || value > max as f64 {
         bail!("{field} holds {words} from {min} to {max}, so it can't be set to {value}");
     }
-    Ok(rounded as i64)
+    Ok(value as i64)
 }
 
 /// One `param_config` call in a moveset's source that sets a param over its param files:
@@ -1013,19 +1023,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("vl.prc");
         prc::save(&file, &list_root(&[2.8, 0.5, 7.0])).unwrap();
-        write_param_field(&file, "param_x", "speed", 2, 1.25, &labels()).unwrap();
+        write_param_field(
+            &file,
+            "param_x",
+            "speed",
+            2,
+            1.25,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
         assert_eq!(prc::open(&file).unwrap(), list_root(&[2.8, 0.5, 1.25]));
-        assert!(write_param_field(&file, "param_x", "speed", 3, 1.0, &labels()).is_err());
+        assert!(write_param_field(
+            &file,
+            "param_x",
+            "speed",
+            3,
+            1.0,
+            &std::fs::read(&file).unwrap()
+        )
+        .is_err());
 
         let xml = dir.path().join("vl.prcxml");
         let before = "<struct>\n<list size=\"3\" hash=\"param_x\">\n<struct index=\"0\"><float hash=\"speed\">2.8</float></struct>\n<struct index=\"1\"><float hash=\"speed\">0.5</float></struct>\n<struct index=\"2\"><float hash=\"speed\">7</float></struct>\n</list>\n</struct>";
         std::fs::write(&xml, before).unwrap();
-        write_param_field(&xml, "param_x", "speed", 2, 1.25, &labels()).unwrap();
+        write_param_field(
+            &xml,
+            "param_x",
+            "speed",
+            2,
+            1.25,
+            &std::fs::read(&xml).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&xml).unwrap(),
             before.replace(">7<", ">1.25<")
         );
-        assert!(write_param_field(&xml, "param_x", "speed", 3, 1.0, &labels()).is_err());
+        assert!(write_param_field(
+            &xml,
+            "param_x",
+            "speed",
+            3,
+            1.0,
+            &std::fs::read(&xml).unwrap()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1096,7 +1138,15 @@ mod tests {
     fn prc_write_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let file = prc_file(dir.path(), "vl.prc", "param_x", 1.0);
-        write_param_field(&file, "param_x", "speed", 0, 4.5, &labels()).unwrap();
+        write_param_field(
+            &file,
+            "param_x",
+            "speed",
+            0,
+            4.5,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
         let block = param_block(&[file], &[], "x", &labels());
         assert_eq!(block.fields["speed"].0, ParamValue::Float(4.5));
     }
@@ -1131,7 +1181,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("vl.prc");
         prc::save(&file, &mixed_root(1.0)).unwrap();
-        write_param_field(&file, "param_x", "speed", 0, 4.5, &labels()).unwrap();
+        write_param_field(
+            &file,
+            "param_x",
+            "speed",
+            0,
+            4.5,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
         assert_eq!(prc::open(&file).unwrap(), mixed_root(4.5));
     }
 
@@ -1160,13 +1218,47 @@ mod tests {
         assert_eq!(block.fields["speed"].0, ParamValue::Float(1.6));
         assert_eq!(block.fields["life"].0, ParamValue::Int(60));
 
-        write_param_field(&file, "param_lativolt", "speed", 0, 2.5, &labels()).unwrap();
+        write_param_field(
+            &file,
+            "param_lativolt",
+            "speed",
+            0,
+            2.5,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             after,
             before.replace("<float hash=\"speed\">1.6<", "<float hash=\"speed\">2.5<")
         );
         assert!(!dir.path().join("vl.prc").exists());
+    }
+
+    /// Something else changed the file after the card read it: its change is not lost.
+    #[test]
+    fn a_param_file_changed_since_it_was_read_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let prc = prc_file(dir.path(), "vl.prc", "param_x", 1.0);
+        let xml = dir.path().join("vl.prcxml");
+        let text =
+            "<struct><struct hash=\"param_x\"><float hash=\"speed\">1</float></struct></struct>";
+        std::fs::write(&xml, text).unwrap();
+        for (file, changed) in [
+            (&prc, {
+                let mut out = std::io::Cursor::new(Vec::new());
+                prc::write_stream(&mut out, &mixed_root(3.0)).unwrap();
+                out.into_inner()
+            }),
+            (&xml, text.replace('1', "3").into_bytes()),
+        ] {
+            let read = std::fs::read(file).unwrap();
+            std::fs::write(file, &changed).unwrap();
+            let error = write_param_field(file, "param_x", "speed", 0, 4.5, &read).unwrap_err();
+            assert!(error.to_string().contains("changed on disk"), "{error}");
+            assert_eq!(std::fs::read(file).unwrap(), changed);
+            write_param_field(file, "param_x", "speed", 0, 4.5, &changed).unwrap();
+        }
     }
 
     #[test]
@@ -1179,7 +1271,15 @@ mod tests {
             param_block(std::slice::from_ref(&file), &[], "x", &labels()).fields["speed"].0,
             ParamValue::Float(1.6)
         );
-        write_param_field(&file, "param_x", "speed", 0, 2.5, &labels()).unwrap();
+        write_param_field(
+            &file,
+            "param_x",
+            "speed",
+            0,
+            2.5,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             before.replace("1.6", "2.5")
@@ -1193,9 +1293,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("vl.prc");
         prc::save(&file, &mixed_root(1.0)).unwrap();
-        for value in [300.0, -1.0, f64::NAN] {
-            let error =
-                write_param_field(&file, "param_x", "tiny", 0, value, &labels()).unwrap_err();
+        for value in [300.0, -1.0, 4.5, f64::NAN] {
+            let error = write_param_field(
+                &file,
+                "param_x",
+                "tiny",
+                0,
+                value,
+                &std::fs::read(&file).unwrap(),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("can't be set to"), "{error}");
         }
         assert_eq!(
@@ -1203,8 +1310,24 @@ mod tests {
             mixed_root(1.0),
             "a refused write changes nothing"
         );
-        write_param_field(&file, "param_x", "tiny", 0, 255.0, &labels()).unwrap();
-        let error = write_param_field(&file, "param_x", "life", 0, 3e9, &labels()).unwrap_err();
+        write_param_field(
+            &file,
+            "param_x",
+            "tiny",
+            0,
+            255.0,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap();
+        let error = write_param_field(
+            &file,
+            "param_x",
+            "life",
+            0,
+            3e9,
+            &std::fs::read(&file).unwrap(),
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("from -2147483648 to 2147483647"),
             "{error}"
@@ -1214,10 +1337,27 @@ mod tests {
         let before =
             "<struct><struct hash=\"param_x\"><byte hash=\"tiny\">7</byte></struct></struct>";
         std::fs::write(&xml, before).unwrap();
-        let error = write_param_field(&xml, "param_x", "tiny", 0, 300.0, &labels()).unwrap_err();
-        assert!(error.to_string().contains("can't be set to 300"), "{error}");
+        for value in ["300", "4.5"] {
+            let number = value.parse().unwrap();
+            let error = write_param_field(&xml, "param_x", "tiny", 0, number, before.as_bytes())
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("can't be set to {value}")),
+                "{error}"
+            );
+        }
         assert_eq!(std::fs::read_to_string(&xml).unwrap(), before);
-        write_param_field(&xml, "param_x", "tiny", 0, 200.0, &labels()).unwrap();
+        write_param_field(
+            &xml,
+            "param_x",
+            "tiny",
+            0,
+            200.0,
+            &std::fs::read(&xml).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&xml).unwrap(),
             before.replace(">7<", ">200<")
@@ -1265,7 +1405,15 @@ mod tests {
                 *number += 1.0;
                 let (block, field) = (format!("{:#x}", block.0), format!("{field:#x}"));
                 let value = f64::from(*number);
-                write_param_field(&copy, &block, &field, variant, value, &labels()).unwrap();
+                write_param_field(
+                    &copy,
+                    &block,
+                    &field,
+                    variant,
+                    value,
+                    &std::fs::read(&copy).unwrap(),
+                )
+                .unwrap();
                 written += 1;
             }
             assert!(prc::open(&copy).unwrap() == expected, "{}", file.display());

@@ -657,7 +657,13 @@ fn sweep_one(name: &str, root: &Path, dump: Option<&Path>) -> Moveset {
                     }
                 };
                 let _agent = crate::acmd::agent_scope(&body);
-                let _consts = crate::project_consts::scope(std::sync::Arc::clone(&index.consts));
+                let _consts = crate::project_consts::scope(
+                    std::sync::Arc::clone(&index.consts),
+                    crate::project_consts::ConstUse {
+                        file: site.file.clone(),
+                        span: site.span.clone(),
+                    },
+                );
                 let _macros =
                     crate::hash_macros::scope(std::sync::Arc::new(index.hash_macros.clone()));
                 let _helpers = crate::project_helpers::scope(std::sync::Arc::clone(&index.helpers));

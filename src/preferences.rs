@@ -82,7 +82,7 @@ impl Preferences {
 
     pub fn load() -> Self {
         Self::path()
-            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|path| crate::user_files::read_settings(&path))
             .map(|bytes| Self::parse(&bytes))
             .unwrap_or_default()
     }
@@ -98,21 +98,11 @@ impl Preferences {
         preferences
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> anyhow::Result<()> {
         let Some(path) = Self::path() else {
-            return;
+            return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(error) = std::fs::write(&path, json) {
-                    eprintln!("[visionary] Could not save preferences to {path:?}: {error}");
-                }
-            }
-            Err(error) => eprintln!("[visionary] Could not serialize preferences: {error}"),
-        }
+        crate::user_files::save_settings(&path, serde_json::to_vec_pretty(self)?)
     }
 
     /// The viewport colour as the renderer's clear colour. egui converts the final image to

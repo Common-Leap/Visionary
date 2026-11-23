@@ -24,15 +24,24 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::acmd_src::skip_trivia;
+use crate::user_files::Rewrite;
 
 /// One `const NAME: TYPE = VALUE;`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstDef {
     pub file: PathBuf,
+    /// The module it is in, as the path its file would have: `src/mario/params` for
+    /// `src/mario/params.rs`, for `src/mario/params/mod.rs`, and for a `mod params { … }` in
+    /// `src/mario/mod.rs`.
+    module: PathBuf,
+    /// The bytes of the function or block it is local to.
+    block: Option<Range<usize>>,
     /// Byte span of VALUE in `file`.
     pub value_span: Range<usize>,
     /// VALUE as written (`4.0`, `-3`, `60`).
@@ -52,27 +61,42 @@ impl ConstDef {
     }
 }
 
-/// Every resolvable numeric const in a project, by name.
+/// Every numeric const in a project, by name.
 #[derive(Debug, Default, Clone)]
 pub struct ProjectConsts {
-    defs: HashMap<String, ConstDef>,
+    defs: HashMap<String, Vec<ConstDef>>,
+}
+
+/// Where a const's name is written: the file, and the bytes of the function or value around it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstUse {
+    pub file: PathBuf,
+    pub span: Range<usize>,
 }
 
 /// A value edit that belongs in a const's definition rather than at the call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstEdit {
-    pub name: String,
-    pub value: String,
+    /// The const as the call writes it: `NAME` or `path::NAME`.
+    pub path: String,
+    pub value: f64,
+    pub used: ConstUse,
+}
+
+impl ConstEdit {
+    pub fn name(&self) -> &str {
+        self.path.rsplit("::").next().unwrap_or(&self.path)
+    }
 }
 
 thread_local! {
-    static SCOPE: RefCell<Option<Arc<ProjectConsts>>> = const { RefCell::new(None) };
+    static SCOPE: RefCell<Option<(Arc<ProjectConsts>, ConstUse)>> = const { RefCell::new(None) };
     static PENDING: RefCell<Vec<ConstEdit>> = const { RefCell::new(Vec::new()) };
 }
 
 /// While alive, value edits on a const reference are recorded for [`take_pending`] instead of
 /// being dropped.
-pub struct ConstScope(Option<Arc<ProjectConsts>>);
+pub struct ConstScope(Option<(Arc<ProjectConsts>, ConstUse)>);
 
 impl Drop for ConstScope {
     fn drop(&mut self) {
@@ -81,9 +105,10 @@ impl Drop for ConstScope {
     }
 }
 
-pub fn scope(consts: Arc<ProjectConsts>) -> ConstScope {
+/// `used` is the function being edited.
+pub fn scope(consts: Arc<ProjectConsts>, used: ConstUse) -> ConstScope {
     PENDING.with(|pending| pending.borrow_mut().clear());
-    let previous = SCOPE.with(|scope| scope.borrow_mut().replace(consts));
+    let previous = SCOPE.with(|scope| scope.borrow_mut().replace((consts, used)));
     ConstScope(previous)
 }
 
@@ -98,25 +123,26 @@ pub fn take_pending() -> Vec<ConstEdit> {
 pub(crate) fn record_edit(current: &str, new_value: f64) -> bool {
     SCOPE.with(|scope| {
         let scope = scope.borrow();
-        let Some(consts) = scope.as_ref() else {
+        let Some((consts, used)) = scope.as_ref() else {
             return false;
         };
-        let Some((name, def)) = consts.reference(current) else {
+        let Some((path, def)) = consts.reference(current) else {
             return false;
         };
         let Some(old) = def.number() else {
             return false;
         };
-        let value = format_like(&def.value, def.is_float(), new_value);
-        if (old - new_value).abs() < 1e-6 || value == def.value {
-            return true;
+        let unchanged = (old - new_value).abs() < 1e-6
+            || respell_like_definition(def, new_value).is_ok_and(|value| value == def.value);
+        if !unchanged {
+            PENDING.with(|pending| {
+                pending.borrow_mut().push(ConstEdit {
+                    path: path.to_string(),
+                    value: new_value,
+                    used: used.clone(),
+                })
+            });
         }
-        PENDING.with(|pending| {
-            pending.borrow_mut().push(ConstEdit {
-                name: name.to_string(),
-                value,
-            })
-        });
         true
     })
 }
@@ -125,52 +151,104 @@ pub(crate) fn record_edit(current: &str, new_value: f64) -> bool {
 pub(crate) fn resolve_in_scope(text: &str) -> Option<f64> {
     SCOPE.with(|scope| {
         let scope = scope.borrow();
-        let (_, def) = scope.as_ref()?.reference(text)?;
+        let (_, def) = scope.as_ref()?.0.reference(text)?;
         def.number()
     })
 }
 
 impl ProjectConsts {
-    /// Read every numeric const in `sources`. A name defined twice with different values is
-    /// dropped: which one a call sees depends on module scoping this does not model.
+    /// Read every numeric const in `sources`.
     pub fn scan(sources: &[(PathBuf, String)]) -> Self {
-        let mut found: HashMap<String, Option<ConstDef>> = HashMap::new();
+        let mut defs: HashMap<String, Vec<ConstDef>> = HashMap::new();
         for (file, text) in sources {
             for (name, def) in const_definitions(file, text) {
-                found
-                    .entry(name)
-                    .and_modify(|known| {
-                        if known.as_ref().map(|k| (&k.value, &k.ty)) != Some((&def.value, &def.ty))
-                        {
-                            *known = None;
-                        }
-                    })
-                    .or_insert(Some(def));
+                defs.entry(name).or_default().push(def);
             }
         }
-        let mut defs: HashMap<String, ConstDef> = found
-            .into_iter()
-            .filter_map(|(name, def)| Some((name, def?)))
-            .collect();
+        let mut uses: HashMap<&str, usize> = HashMap::new();
         for (_, text) in sources {
             for name in identifiers(text) {
-                if let Some(def) = defs.get_mut(name) {
-                    def.uses += 1;
+                if defs.contains_key(name) {
+                    *uses.entry(name).or_default() += 1;
                 }
             }
         }
-        // The definition names itself once.
-        for def in defs.values_mut() {
-            def.uses = def.uses.saturating_sub(1);
+        for (name, defs) in &mut defs {
+            // Each definition names itself once.
+            let uses = uses.get(name.as_str()).copied().unwrap_or(0);
+            let uses = uses.saturating_sub(defs.len());
+            defs.iter_mut().for_each(|def| def.uses = uses);
         }
         ProjectConsts { defs }
     }
 
+    /// A const's value: none for a name defined twice with different values, since which one a
+    /// call sees depends on where it is called from ([`Self::definition`]).
     pub fn get(&self, name: &str) -> Option<&ConstDef> {
-        self.defs.get(name)
+        let (first, rest) = self.defs.get(name)?.split_first()?;
+        rest.iter()
+            .all(|def| (&def.value, &def.ty) == (&first.value, &first.ty))
+            .then_some(first)
     }
 
-    /// `(name, definition)` when `text` is exactly a reference — `NAME`, `path::NAME`, or either
+    /// The definition `path` names where it is written, or why it cannot be told.
+    pub fn definition(&self, path: &str, used: &ConstUse) -> Result<&ConstDef, String> {
+        let mut segments: Vec<&str> = path.split("::").map(str::trim).collect();
+        let name = segments.pop().unwrap_or(path);
+        let defs = self.defs.get(name).map_or(&[][..], Vec::as_slice);
+        if let [only] = defs {
+            return Ok(only);
+        }
+        let here = used_module(used);
+        let mut found: Vec<&ConstDef>;
+        if segments.is_empty() {
+            let inside =
+                |block: &Range<usize>| block.start <= used.span.end && used.span.start <= block.end;
+            let local =
+                |def: &&ConstDef| def.file == used.file && def.block.as_ref().is_some_and(inside);
+            found = defs.iter().filter(local).collect();
+            if found.is_empty() {
+                found = module_consts(defs, &here);
+            }
+            if found.is_empty() {
+                for module in imported_modules(&used.file, name) {
+                    let module: Vec<&str> = module.iter().map(String::as_str).collect();
+                    for def in consts_at(defs, &here, &module) {
+                        if !found.contains(&def) {
+                            found.push(def);
+                        }
+                    }
+                }
+            }
+        } else {
+            found = consts_at(defs, &here, &segments);
+        }
+        match (found.as_slice(), defs) {
+            ([only], _) => Ok(only),
+            (_, []) => Err(format!("{name} is not a number this project defines")),
+            _ => {
+                let mut files: Vec<String> = defs.iter().map(|def| file_label(&def.file)).collect();
+                files.sort();
+                files.dedup();
+                Err(format!(
+                    "{name} is defined in {} places ({}) and it is not clear which one this uses, \
+                     so it was not changed",
+                    defs.len(),
+                    files.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// `name`'s definition, when the project has one only.
+    pub fn only(&self, name: &str) -> Option<&ConstDef> {
+        match self.defs.get(name)?.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// `(path, definition)` when `text` is exactly a reference — `NAME`, `path::NAME`, or either
     /// with an `as TYPE` cast.
     pub fn reference<'a>(&'a self, text: &'a str) -> Option<(&'a str, &'a ConstDef)> {
         let text = text.trim();
@@ -186,7 +264,7 @@ impl ProjectConsts {
             return None;
         }
         let name = path.rsplit("::").next()?;
-        self.defs.get(name).map(|def| (name, def))
+        self.get(name).map(|def| (path, def))
     }
 
     /// `body` with the consts it uses as values spelled as their values.
@@ -199,7 +277,7 @@ impl ProjectConsts {
         let mut last = 0;
         let mut i = 0;
         while i < body.len() {
-            if let Some(next) = skip_literal_or_comment(body, i) {
+            if let Some(next) = skip_trivia(body, i) {
                 i = next;
                 continue;
             }
@@ -226,7 +304,7 @@ impl ProjectConsts {
             }
             let path = &body[i..end];
             let name = path.rsplit("::").next().unwrap_or(path);
-            let Some(def) = self.defs.get(name) else {
+            let Some(def) = self.get(name) else {
                 i = end;
                 continue;
             };
@@ -268,100 +346,310 @@ impl ProjectConsts {
     }
 }
 
-/// Apply recorded definition edits to disk. Returns the files written and one note per const —
-/// including how many other places a shared const changes along with this one.
-pub fn apply_edits(
-    consts: &ProjectConsts,
-    edits: &[ConstEdit],
-) -> (Vec<PathBuf>, Vec<String>, usize) {
-    let mut notes = Vec::new();
-    let mut by_name: Vec<(&str, &str)> = Vec::new();
-    for edit in edits {
-        match by_name.iter().find(|(name, _)| *name == edit.name) {
-            Some((_, value)) if *value != edit.value => {
-                notes.push(format!(
-                    "{} was given two different values in one edit ({} and {}); a const has one \
-                     value, so neither was written",
-                    edit.name, value, edit.value
-                ));
-                by_name.retain(|(name, _)| *name != edit.name);
+/// Bytes of a file to replace, and with what.
+type Change = (Range<usize>, String);
+
+/// Changes to the files that define consts: what each holds, and what to change in it.
+#[derive(Debug, Default)]
+pub struct DefinitionEdits(BTreeMap<PathBuf, (String, Vec<Change>)>);
+
+/// A script's new body, to be written along with the definitions it uses.
+pub struct ScriptEdit<'a> {
+    pub file: &'a Path,
+    /// What `file` held when the body was read.
+    pub text: &'a str,
+    pub span: Range<usize>,
+    pub body: String,
+}
+
+impl DefinitionEdits {
+    /// Every file to write, the script's own included once whatever else changes in it.
+    pub fn rewrites(mut self, script: Option<ScriptEdit>) -> anyhow::Result<Vec<Rewrite>> {
+        if let Some(mut script) = script {
+            let (text, changes) = self
+                .0
+                .entry(script.file.to_path_buf())
+                .or_insert_with(|| (script.text.to_string(), Vec::new()));
+            if text != script.text {
+                anyhow::bail!(
+                    "{} changed on disk while it was being read — try again",
+                    script.file.display()
+                );
             }
-            Some(_) => {}
-            None => by_name.push((&edit.name, &edit.value)),
+            // A const defined inside the script moves with its new body.
+            for (at, value) in std::mem::take(changes) {
+                if at.start < script.span.start || at.end > script.span.end {
+                    changes.push((at, value));
+                    continue;
+                }
+                let line = text[..at.start].rfind('\n').map_or(0, |n| n + 1);
+                let (declares, old) = (&text[line..at.start], &text[line..at.end]);
+                if script.body.matches(old).count() != 1 {
+                    anyhow::bail!(
+                        "`{}` is defined inside the script and could not be found in it again — \
+                         nothing was written",
+                        old.trim()
+                    );
+                }
+                script.body = script.body.replacen(old, &format!("{declares}{value}"), 1);
+            }
+            changes.push((script.span, script.body));
+        }
+        Ok(self
+            .0
+            .into_iter()
+            .map(|(file, (read, mut changes))| {
+                changes.sort_by_key(|(at, _)| std::cmp::Reverse(at.start));
+                let mut write = read.clone();
+                for (at, value) in changes {
+                    write.replace_range(at, &value);
+                }
+                Rewrite::text(&file, &read, write)
+            })
+            .collect())
+    }
+}
+
+/// What recorded definition edits come to, before anything is written.
+#[derive(Debug, Default)]
+pub struct ConstPlan {
+    pub edits: DefinitionEdits,
+    /// Edits that were not made, and why.
+    pub refused: Vec<String>,
+    /// One line per const changed, including how many other places change along with this one.
+    pub notes: Vec<String>,
+}
+
+/// Plan recorded definition edits against the files as they are now.
+pub fn plan_edits(consts: &ProjectConsts, edits: &[ConstEdit]) -> ConstPlan {
+    let mut plan = ConstPlan::default();
+    // One const is one definition, however many calls use it and however they spell its path.
+    let mut wanted: Vec<(&str, &ConstDef, Vec<f64>)> = Vec::new();
+    for edit in edits {
+        match consts.definition(&edit.path, &edit.used) {
+            Err(reason) => plan.refused.push(reason),
+            Ok(def) => match wanted.iter_mut().find(|(_, known, _)| *known == def) {
+                Some((_, _, values)) => values.push(edit.value),
+                None => wanted.push((edit.name(), def, vec![edit.value])),
+            },
         }
     }
-    let mut per_file: HashMap<&Path, Vec<(&str, &ConstDef, &str)>> = HashMap::new();
-    for (name, value) in &by_name {
-        if let Some(def) = consts.get(name) {
-            per_file
-                .entry(def.file.as_path())
-                .or_default()
-                .push((name, def, value));
-        }
-    }
-    let mut files = Vec::new();
-    let mut changed = 0;
-    for (file, mut edits) in per_file {
-        let Ok(mut text) = std::fs::read_to_string(file) else {
-            notes.push(format!(
-                "could not read {} to change its consts",
-                file.display()
+    for (name, def, values) in wanted {
+        let spelled = values
+            .iter()
+            .map(|value| respell_like_definition(def, *value))
+            .collect::<Result<Vec<_>, _>>();
+        let spelled = match spelled {
+            Ok(mut all) => {
+                all.dedup();
+                all
+            }
+            Err(reason) => {
+                plan.refused
+                    .push(format!("{name} {reason}; it was not changed"));
+                continue;
+            }
+        };
+        let [spelled] = spelled.as_slice() else {
+            plan.refused.push(format!(
+                "{name} was given different values in one edit ({}); a const has one value, so \
+                 none was written",
+                spelled.join(", ")
             ));
             continue;
         };
-        edits.sort_by_key(|(_, def, _)| std::cmp::Reverse(def.value_span.start));
-        let mut wrote = false;
-        for (name, def, value) in edits {
-            if text.get(def.value_span.clone()) != Some(def.value.as_str()) {
-                notes.push(format!(
-                    "{name} in {} changed on disk since it was read — rescan and try again",
-                    file.display()
-                ));
-                continue;
-            }
-            // An edit may carry a plain number (`plan_setting_write` has no definition to spell
-            // it like): it is written the way the definition is, and an integer const refuses a
-            // fraction rather than rounding it.
-            let Some(value) = respell_like_definition(def, value) else {
-                notes.push(format!(
-                    "{name} is a whole-number constant, so it can't hold {value}; it was not changed"
-                ));
-                continue;
-            };
-            let value = value.as_str();
-            text.replace_range(def.value_span.clone(), value);
-            wrote = true;
-            changed += 1;
-            let shared = if def.uses > 1 {
-                format!(
-                    "; it is used in {} places, and all of them now use the new value",
-                    def.uses
-                )
-            } else {
-                String::new()
-            };
-            notes.push(format!(
-                "{name} is a constant — changed its definition in {} to {value}{shared}",
-                file.file_name().unwrap_or_default().to_string_lossy()
+        let file = def.file.as_path();
+        let read = match plan.edits.0.get(file) {
+            Some((read, _)) => read.clone(),
+            None => std::fs::read_to_string(file).unwrap_or_default(),
+        };
+        if read.get(def.value_span.clone()) != Some(def.value.as_str()) {
+            plan.refused.push(format!(
+                "{name} in {} changed on disk since it was read — rescan and try again",
+                file.display()
             ));
+            continue;
         }
-        if wrote {
-            if std::fs::write(file, &text).is_ok() {
-                files.push(file.to_path_buf());
-            } else {
-                notes.push(format!("could not write {}", file.display()));
+        plan.edits
+            .0
+            .entry(file.to_path_buf())
+            .or_insert_with(|| (read, Vec::new()))
+            .1
+            .push((def.value_span.clone(), spelled.clone()));
+        let defined = consts.defs.get(name).map_or(1, Vec::len);
+        let shared = match (def.uses, defined) {
+            (uses, 1) if uses > 1 => {
+                format!("; it is used in {uses} places, and all of them now use the new value")
             }
+            (uses, 2..) if uses > 1 => {
+                "; every place that uses this one now uses the new value".to_string()
+            }
+            _ => String::new(),
+        };
+        plan.notes.push(format!(
+            "{name} is a constant — changed its definition in {} to {spelled}{shared}",
+            file_label(file)
+        ));
+    }
+    plan
+}
+
+fn file_label(file: &Path) -> String {
+    file.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The module a source file is, as a path: the file without its extension, or its folder for a
+/// `mod.rs`, `lib.rs` or `main.rs`.
+fn file_module(file: &Path) -> PathBuf {
+    match file.file_stem().and_then(|stem| stem.to_str()) {
+        Some("mod" | "lib" | "main") => file.parent().unwrap_or(file).to_path_buf(),
+        _ => file.with_extension(""),
+    }
+}
+
+/// The module the code at `used` is in, inline modules included.
+fn used_module(used: &ConstUse) -> PathBuf {
+    let module = file_module(&used.file);
+    let text = std::fs::read_to_string(&used.file).unwrap_or_default();
+    let inline = scopes(&text)
+        .into_iter()
+        .filter(|scope| scope.range.start < used.span.start && used.span.end <= scope.range.end)
+        .map_while(|scope| scope.module)
+        .collect::<PathBuf>();
+    module.join(inline)
+}
+
+/// The consts of `defs` that are items of `module` itself.
+fn module_consts<'a>(defs: &'a [ConstDef], module: &Path) -> Vec<&'a ConstDef> {
+    defs.iter()
+        .filter(|def| def.block.is_none() && def.module == module)
+        .collect()
+}
+
+/// The consts of `defs` that `path` reaches from the module `here` (`super::params`,
+/// `crate::mario::params`, `params`).
+fn consts_at<'a>(defs: &'a [ConstDef], here: &Path, path: &[&str]) -> Vec<&'a ConstDef> {
+    let mut base = here.to_path_buf();
+    let mut rest = path;
+    let mut relative = false;
+    while let Some((first, tail)) = rest.split_first() {
+        match *first {
+            "self" => {}
+            "super" => {
+                base.pop();
+            }
+            _ => break,
+        }
+        relative = true;
+        rest = tail;
+    }
+    let rooted = rest.first() == Some(&"crate");
+    if rooted {
+        rest = &rest[1..];
+    }
+    let tail: PathBuf = rest.iter().collect();
+    if !rooted {
+        let exact = module_consts(defs, &base.join(&tail));
+        if relative || !exact.is_empty() {
+            return exact;
         }
     }
-    (files, notes, changed)
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    // From the crate root, or through a module imported by name: the one module ending that way.
+    defs.iter()
+        .filter(|def| def.block.is_none() && def.module.ends_with(&tail))
+        .collect()
+}
+
+/// The module paths `file` imports `name` from: `use super::params::*`, `use crate::p::{NAME}`.
+fn imported_modules(file: &Path, name: &str) -> Vec<Vec<String>> {
+    fn flatten(tree: &syn::UseTree, name: &str, at: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                at.push(path.ident.to_string());
+                flatten(&path.tree, name, at, out);
+                at.pop();
+            }
+            syn::UseTree::Name(item) if item.ident == name => out.push(at.clone()),
+            syn::UseTree::Glob(_) => out.push(at.clone()),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    flatten(item, name, at, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let Ok(parsed) = syn::parse_file(&text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in &parsed.items {
+        if let syn::Item::Use(import) = item {
+            flatten(&import.tree, name, &mut Vec::new(), &mut out);
+        }
+    }
+    out
+}
+
+/// One `{ … }` of a source file.
+struct Scope {
+    range: Range<usize>,
+    /// The name of the module it is the body of.
+    module: Option<String>,
+}
+
+/// Every brace pair of `text`, outermost first.
+fn scopes(text: &str) -> Vec<Scope> {
+    let bytes = text.as_bytes();
+    let mut open: Vec<(usize, Option<String>)> = Vec::new();
+    let mut out = Vec::new();
+    // Where the item now being read starts: after the last `;`, `{` or `}`.
+    let mut item = 0;
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(next) = skip_trivia(text, i) {
+            i = next;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => {
+                let mut words = text[item..i].split_whitespace().rev();
+                let name = words.next().filter(|_| words.next() == Some("mod"));
+                open.push((i, name.map(str::to_string)));
+                item = i + 1;
+            }
+            b'}' => {
+                if let Some((start, module)) = open.pop() {
+                    out.push(Scope {
+                        range: start..i + 1,
+                        module,
+                    });
+                }
+                item = i + 1;
+            }
+            b';' => item = i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    out.sort_by_key(|scope| scope.range.start);
+    out
 }
 
 fn const_definitions(file: &Path, text: &str) -> Vec<(String, ConstDef)> {
     let bytes = text.as_bytes();
+    let mut scopes_here: Option<Vec<Scope>> = None;
     let mut out = Vec::new();
     let mut i = 0;
     while i < text.len() {
-        if let Some(next) = skip_literal_or_comment(text, i) {
+        if let Some(next) = skip_trivia(text, i) {
             i = next;
             continue;
         }
@@ -400,10 +688,25 @@ fn const_definitions(file: &Path, text: &str) -> Vec<(String, ConstDef)> {
             continue;
         }
         let value_start = text.len() - after_ty.len() + (raw.len() - raw.trim_start().len());
+        let around: Vec<&Scope> = scopes_here
+            .get_or_insert_with(|| scopes(text))
+            .iter()
+            .filter(|scope| scope.range.contains(&value_start))
+            .collect();
         out.push((
             name.to_string(),
             ConstDef {
                 file: file.to_path_buf(),
+                module: file_module(file).join(
+                    around
+                        .iter()
+                        .map_while(|scope| scope.module.clone())
+                        .collect::<PathBuf>(),
+                ),
+                block: around
+                    .iter()
+                    .rfind(|scope| scope.module.is_none())
+                    .map(|scope| scope.range.clone()),
                 value_span: value_start..value_start + value.len(),
                 value: value.to_string(),
                 ty: ty.to_string(),
@@ -420,7 +723,7 @@ fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     let mut i = 0;
     std::iter::from_fn(move || {
         while i < text.len() {
-            if let Some(next) = skip_literal_or_comment(text, i) {
+            if let Some(next) = skip_trivia(text, i) {
                 i = next;
                 continue;
             }
@@ -512,35 +815,70 @@ fn integer_text(value: &str) -> String {
     numeric_value(value).map_or_else(|| value.to_string(), |v| format!("{}", v.trunc() as i64))
 }
 
-/// `new` written the way `existing` is: same suffix, a decimal point when it had one.
-fn format_like(existing: &str, float: bool, new: f64) -> String {
+/// `new` written as a decimal number, with the suffix `existing` has.
+fn format_float_like(existing: &str, new: f64) -> String {
     let suffix = SUFFIXES
         .iter()
         .find(|s| existing.ends_with(**s))
         .copied()
         .unwrap_or("");
-    let body = if float || existing.contains('.') {
-        let mut text = format!("{:.4}", new);
-        while text.ends_with('0') && !text.ends_with(".0") {
-            text.pop();
-        }
-        text
-    } else {
-        format!("{}", new.round() as i64)
-    };
-    format!("{body}{suffix}")
+    let mut text = format!("{:.4}", new);
+    while text.ends_with('0') && !text.ends_with(".0") {
+        text.pop();
+    }
+    format!("{text}{suffix}")
 }
 
-/// `value` spelled like `def`'s value. A value that is not a plain number is kept as given; a
-/// fraction for an integer const is `None`.
-fn respell_like_definition(def: &ConstDef, value: &str) -> Option<String> {
-    let Some(number) = numeric_value(value) else {
-        return Some(value.to_string());
-    };
-    if def.is_float() {
-        return Some(format_like(&def.value, true, number));
+/// A number as a message says it: `4.3`, not the digits an `f32` adds when widened.
+fn shown(value: f64) -> String {
+    let single = value as f32;
+    if single.is_finite() && (f64::from(single) - value).abs() < 1e-6 * value.abs().max(1.0) {
+        single.to_string()
+    } else {
+        value.to_string()
     }
-    format_literal_like(&def.value, number)
+}
+
+/// `value` spelled like `def`'s value, or why its type cannot hold it: a whole-number const is
+/// never rounded to fit.
+fn respell_like_definition(def: &ConstDef, value: f64) -> Result<String, String> {
+    if !value.is_finite() {
+        return Err(format!("can't hold {}", shown(value)));
+    }
+    if def.is_float() {
+        return Ok(format_float_like(&def.value, value));
+    }
+    if value.fract() != 0.0 {
+        return Err(format!(
+            "is a whole-number constant, so it can't hold {}",
+            shown(value)
+        ));
+    }
+    let whole = format!("{value:.0}");
+    let fits = match def.ty.as_str() {
+        "i8" => whole.parse::<i8>().is_ok(),
+        "i16" => whole.parse::<i16>().is_ok(),
+        "i32" => whole.parse::<i32>().is_ok(),
+        "u8" => whole.parse::<u8>().is_ok(),
+        "u16" => whole.parse::<u16>().is_ok(),
+        "u32" => whole.parse::<u32>().is_ok(),
+        "u64" | "usize" => whole.parse::<u64>().is_ok(),
+        _ => whole.parse::<i64>().is_ok(),
+    };
+    if !fits {
+        return Err(format!(
+            "is a {}, so it can't hold {}",
+            def.ty,
+            shown(value)
+        ));
+    }
+    format_literal_like(&def.value, value).ok_or_else(|| {
+        format!(
+            "is written as `{}`, so it can't hold {}",
+            def.value,
+            shown(value)
+        )
+    })
 }
 
 /// `new` written in the style of the numeric literal `existing`: `30` gives `45`, `30.0` gives
@@ -558,11 +896,11 @@ pub(crate) fn format_literal_like(existing: &str, new: f64) -> Option<String> {
     let has_point = plain.contains('.') || plain.contains(['e', 'E']);
     let float_suffix = existing.ends_with("f32") || existing.ends_with("f64");
     if has_point {
-        return Some(format_like(existing, true, new));
+        return Some(format_float_like(existing, new));
     }
     if new.fract() != 0.0 {
         // `30f32` holds a fraction; a bare `30` or `30u8` does not.
-        return float_suffix.then(|| format_like(existing, true, new));
+        return float_suffix.then(|| format_float_like(existing, new));
     }
     let suffix = &existing[plain.len()..];
     Some(format!("{}{suffix}", new as i64))
@@ -571,7 +909,7 @@ pub(crate) fn format_literal_like(existing: &str, new: f64) -> Option<String> {
 /// For a `0x`/`0o`/`0b` integer literal, `new` in the same base, letter case and integer suffix
 /// (`0x1E` → `0x2D`, `0x1eu8` → `0x2du8`), or `Some(None)` when `new` has a fraction. `None` when
 /// `existing` is not such a literal. In these bases `e`, `E` and `f32` are digits, not an exponent
-/// or a float suffix. (Project consts are only read in decimal, so `format_like` never meets one.)
+/// or a float suffix. (Project consts are only read in decimal, so none is ever one of these.)
 fn format_radix_like(existing: &str, new: f64) -> Option<Option<String>> {
     let body = existing.strip_prefix('-').unwrap_or(existing);
     let prefix = body.get(..2)?;
@@ -602,31 +940,6 @@ fn format_radix_like(existing: &str, new: f64) -> Option<Option<String>> {
     };
     let sign = if new < 0.0 { "-" } else { "" };
     Some(Some(format!("{sign}{prefix}{value}{separator}{suffix}")))
-}
-
-fn skip_literal_or_comment(text: &str, i: usize) -> Option<usize> {
-    if !text.is_char_boundary(i) {
-        return None;
-    }
-    let rest = &text[i..];
-    if let Some(body) = rest.strip_prefix("//") {
-        return Some(i + 2 + body.find('\n').map_or(body.len(), |n| n + 1));
-    }
-    if let Some(body) = rest.strip_prefix("/*") {
-        return Some(body.find("*/").map_or(text.len(), |end| i + 4 + end));
-    }
-    if rest.starts_with('"') {
-        let mut escaped = false;
-        for (offset, ch) in rest.char_indices().skip(1) {
-            match ch {
-                '\\' if !escaped => escaped = true,
-                '"' if !escaped => return Some(i + offset + 1),
-                _ => escaped = false,
-            }
-        }
-        return Some(text.len());
-    }
-    None
 }
 
 #[cfg(test)]
@@ -700,44 +1013,99 @@ mod tests {
 
     #[test]
     fn an_edit_on_a_const_is_recorded_against_its_definition() {
-        let consts = Arc::new(consts());
-        {
-            let _scope = scope(Arc::clone(&consts));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("specials.rs");
+        std::fs::write(&file, SPECIALS).unwrap();
+        let consts = Arc::new(ProjectConsts::scan(&[(file.clone(), SPECIALS.to_string())]));
+        let used = ConstUse {
+            file: file.clone(),
+            span: SPECIALS.find("fn game_x").unwrap()..SPECIALS.len(),
+        };
+        let edits = {
+            let _scope = scope(Arc::clone(&consts), used.clone());
             assert!(record_edit("WALK_LW_DAMAGE", 5.5));
             assert!(
                 record_edit("WALK_LW_ANGLE as u64", 70.0),
                 "unchanged: recognised, nothing recorded"
             );
             assert!(!record_edit("other", 1.0));
-            assert_eq!(
-                take_pending(),
-                [ConstEdit {
-                    name: "WALK_LW_DAMAGE".into(),
-                    value: "5.5".into()
-                }]
-            );
-        }
+            take_pending()
+        };
+        assert_eq!(
+            edits,
+            [ConstEdit {
+                path: "WALK_LW_DAMAGE".into(),
+                value: 5.5,
+                used,
+            }]
+        );
         assert!(
             !record_edit("WALK_LW_DAMAGE", 1.0),
             "no scope, no recording"
         );
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("specials.rs");
-        std::fs::write(&file, SPECIALS).unwrap();
-        let consts = ProjectConsts::scan(&[(file.clone(), SPECIALS.to_string())]);
-        let (files, notes, changed) = apply_edits(
-            &consts,
-            &[ConstEdit {
-                name: "WALK_LW_DAMAGE".into(),
-                value: "5.5".into(),
-            }],
+        let plan = plan_edits(&consts, &edits);
+        assert_eq!((plan.notes.len(), plan.refused.len()), (1, 0));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            SPECIALS,
+            "planned, not written"
         );
-        assert_eq!((files.len(), changed), (1, 1), "{notes:?}");
+        let rewrites = plan.edits.rewrites(None).unwrap();
+        crate::user_files::write_all(&rewrites).unwrap();
         let written = std::fs::read_to_string(&file).unwrap();
         assert!(
             written.starts_with("const WALK_LW_DAMAGE:       f32 = 5.5;\n"),
             "{written}"
         );
         assert_eq!(written.len(), SPECIALS.len(), "only the value changed");
+    }
+
+    /// Dedede and Mario both keep an `INIT_DAMAGE` in `status::params`, as inline modules of one
+    /// file: each path reaches its own, and a value its type cannot hold is refused.
+    #[test]
+    fn a_path_reaches_the_module_it_names() {
+        let text = "pub mod dedede {\n    pub mod params { pub const INIT_DAMAGE: u8 = 4; }\n}\npub mod mario {\n    pub mod params { pub const INIT_DAMAGE: u8 = 4; }\n    fn status() { super::dedede::params::INIT_DAMAGE; params::INIT_DAMAGE; }\n}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("src/status.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+        let consts = ProjectConsts::scan(&[(file.clone(), text.to_string())]);
+        let start = text.find("fn status").unwrap();
+        let used = ConstUse {
+            file,
+            span: start..start + text[start..].find('}').unwrap(),
+        };
+        let first = text.find("= 4").unwrap() + 2;
+        let second = text.rfind("= 4").unwrap() + 2;
+        for (path, at) in [
+            ("params::INIT_DAMAGE", Some(second)),
+            ("self::params::INIT_DAMAGE", Some(second)),
+            ("super::dedede::params::INIT_DAMAGE", Some(first)),
+            ("crate::status::dedede::params::INIT_DAMAGE", Some(first)),
+            ("crate::params::INIT_DAMAGE", None),
+            ("INIT_DAMAGE", None),
+        ] {
+            let found = consts.definition(path, &used).ok();
+            assert_eq!(found.map(|def| def.value_span.start), at, "{path}");
+        }
+        let edit = |value: f64| ConstEdit {
+            path: "params::INIT_DAMAGE".into(),
+            value,
+            used: used.clone(),
+        };
+        for value in [4.5, 256.0, -1.0, f64::NAN] {
+            let plan = plan_edits(&consts, &[edit(value)]);
+            assert_eq!((plan.refused.len(), plan.notes.len()), (1, 0), "{value}");
+            assert!(plan.edits.rewrites(None).unwrap().is_empty());
+        }
+        let plan = plan_edits(&consts, &[edit(9.0), edit(9.0)]);
+        let rewrites = plan.edits.rewrites(None).unwrap();
+        let written = String::from_utf8(rewrites[0].write.clone()).unwrap();
+        assert_eq!(written.matches("= 9;").count(), 1);
+        assert!(written.rfind("= 9;") > written.find("= 4;"), "{written}");
+        assert_eq!(
+            plan_edits(&consts, &[edit(8.0), edit(9.0)]).refused.len(),
+            1
+        );
     }
 }

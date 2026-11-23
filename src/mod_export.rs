@@ -1369,8 +1369,7 @@ pub fn write_portable_project(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let portable = make_portable_project(project, parent, asset_dir_name)?;
-    let json = serde_json::to_string_pretty(&portable)?;
-    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+    crate::user_files::write(path, serde_json::to_string_pretty(&portable)?)
 }
 
 /// Resolve portable texture paths against the loaded project's directory for all in-memory
